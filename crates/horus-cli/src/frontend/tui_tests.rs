@@ -406,6 +406,35 @@ fn composer_rejects_input_over_the_protocol_limit() {
 }
 
 #[test]
+fn option_backspace_deletes_the_previous_word_and_trailing_space() {
+    let mut state = state();
+    state.input = "hello   world  ".into();
+    state.cursor = state.input.len();
+
+    state.handle_key(
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        &default_catalog(),
+    );
+
+    assert_eq!((state.input.as_str(), state.cursor), ("hello   ", 8));
+}
+
+#[test]
+fn option_backspace_deletes_a_collapsed_paste_atomically() {
+    let mut state = state();
+    state.input = "foo.".into();
+    state.cursor = state.input.len();
+    state.insert_paste("pasted\ncontent");
+
+    state.handle_key(
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        &default_catalog(),
+    );
+
+    assert_eq!((state.input.as_str(), state.pastes.len()), ("foo.", 0));
+}
+
+#[test]
 fn arrow_up_recalls_composer_history_and_ctrl_t_toggles_transcript() {
     let catalog = default_catalog();
     let mut state = state();

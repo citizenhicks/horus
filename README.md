@@ -157,3 +157,4 @@ Licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for attribution to
 [OpenAI Codex](https://github.com/openai/codex), Ratatui-derived work, and the
 [Sora](https://github.com/Aejkatappaja/sora) color palette.
 
+

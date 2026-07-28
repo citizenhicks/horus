@@ -23,6 +23,7 @@ use horus::protocol::ReviewDecision;
 
 const COLLAPSED_PASTE_BYTES: usize = 200;
 const SCROLL_ROWS: usize = 3;
+const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 
 #[derive(Debug, PartialEq)]
 pub(super) enum UiAction {
@@ -141,7 +142,11 @@ impl TuiState {
             }
             KeyCode::Esc => UiAction::None,
             KeyCode::Backspace => {
-                let previous = previous_boundary(&self.input, self.cursor);
+                let previous = if key.modifiers.contains(KeyModifiers::ALT) {
+                    previous_word_boundary(&self.input, self.cursor)
+                } else {
+                    previous_boundary(&self.input, self.cursor)
+                };
                 self.input.drain(previous..self.cursor);
                 self.cursor = previous;
                 self.prune_pastes();
@@ -631,6 +636,33 @@ fn previous_boundary(value: &str, cursor: usize) -> usize {
         .char_indices()
         .next_back()
         .map_or(0, |(index, _)| index)
+}
+
+fn previous_word_boundary(value: &str, cursor: usize) -> usize {
+    let mut characters = value[..cursor].char_indices().rev();
+    let Some((mut start, last)) =
+        characters.find(|(_, character)| character.is_control() || !character.is_whitespace())
+    else {
+        return 0;
+    };
+    if last.is_control() {
+        return start;
+    }
+    let separator = is_word_separator(last);
+    for (index, character) in characters {
+        if character.is_whitespace()
+            || character.is_control()
+            || is_word_separator(character) != separator
+        {
+            break;
+        }
+        start = index;
+    }
+    start
+}
+
+fn is_word_separator(character: char) -> bool {
+    WORD_SEPARATORS.contains(character)
 }
 
 fn next_boundary(value: &str, cursor: usize) -> usize {
