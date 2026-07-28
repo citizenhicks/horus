@@ -146,7 +146,7 @@ fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect) {
 }
 
 pub(super) fn live_transcript_lines(
-    state: &TuiState,
+    state: &mut TuiState,
     start: usize,
     width: u16,
 ) -> Vec<Line<'static>> {
@@ -155,7 +155,7 @@ pub(super) fn live_transcript_lines(
         .and_then(|index| state.transcript.get(index))
         .and_then(|entry| entry.group.clone());
     let mut lines = transcript_lines(
-        state.transcript.iter().skip(start),
+        state.transcript.iter_mut().skip(start),
         width,
         previous_group,
         start > 0,
@@ -187,10 +187,15 @@ pub(super) fn render_preview(frame: &mut Frame<'_>, state: &mut TuiState) {
     if area.width < 3 || area.height < 3 {
         return;
     }
-    let Some(preview) = state.preview.as_ref() else {
-        return;
+    let (title, live) = {
+        let Some(preview) = state.preview.as_ref() else {
+            return;
+        };
+        (
+            preview.title.clone(),
+            matches!(&preview.content, PreviewContent::LiveTranscript),
+        )
     };
-    let title = preview.title.clone();
     let block = Block::bordered()
         .style(theme.style(Role::Canvas))
         .border_style(theme.style(Role::Info))
@@ -199,11 +204,14 @@ pub(super) fn render_preview(frame: &mut Frame<'_>, state: &mut TuiState) {
             theme.style(Role::Accent).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
-    let mut lines = match &preview.content {
-        PreviewContent::LiveTranscript => live_transcript_lines(state, 0, inner.width),
-        PreviewContent::Snapshot(transcript) => {
-            transcript_lines(transcript.iter(), inner.width, None, false)
-        }
+    let mut lines = if live {
+        live_transcript_lines(state, 0, inner.width)
+    } else if let Some(PreviewContent::Snapshot(transcript)) =
+        state.preview.as_mut().map(|preview| &mut preview.content)
+    {
+        transcript_lines(transcript.iter_mut(), inner.width, None, false)
+    } else {
+        Vec::new()
     };
     if lines.is_empty() {
         lines.push(Line::styled(
@@ -226,7 +234,7 @@ pub(super) fn render_preview(frame: &mut Frame<'_>, state: &mut TuiState) {
 }
 
 fn transcript_lines<'a>(
-    entries: impl Iterator<Item = &'a TranscriptEntry>,
+    entries: impl Iterator<Item = &'a mut TranscriptEntry>,
     width: u16,
     mut previous_group: Option<String>,
     mut has_previous: bool,
@@ -244,17 +252,28 @@ fn transcript_lines<'a>(
                 lines.push(Line::default());
             }
         }
-        let text = if matches!(entry.tone, TranscriptTone::Welcome)
-            && entry
-                .text
-                .lines()
-                .any(|line| Line::from(line).width() > usize::from(width))
+        if entry
+            .rendered
+            .as_ref()
+            .is_none_or(|(cached_width, _)| *cached_width != width)
         {
-            "◉ HORUS · type / for commands"
-        } else {
-            &entry.text
-        };
-        push_lines(&mut lines, text, entry.tone, entry.format, width);
+            let text = if matches!(entry.tone, TranscriptTone::Welcome)
+                && entry
+                    .text
+                    .lines()
+                    .any(|line| Line::from(line).width() > usize::from(width))
+            {
+                "◉ HORUS · type / for commands"
+            } else {
+                &entry.text
+            };
+            let mut rendered = Vec::new();
+            push_lines(&mut rendered, text, entry.tone, entry.format, width);
+            entry.rendered = Some((width, rendered));
+        }
+        if let Some((_, rendered)) = &entry.rendered {
+            lines.extend(rendered.iter().cloned());
+        }
         previous_group.clone_from(&entry.group);
         has_previous = true;
     }

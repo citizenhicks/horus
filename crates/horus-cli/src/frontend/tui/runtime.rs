@@ -5,6 +5,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::SynchronizedUpdate;
 use ratatui::crossterm::event::Event as TerminalEvent;
+use ratatui::crossterm::event::KeyEventKind;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::style::Print;
 use tokio::sync::mpsc;
@@ -25,7 +26,6 @@ use horus::protocol::EventMsg;
 use horus::protocol::FrontendBlock;
 use horus::protocol::Op;
 
-const SHIMMER_INTERVAL: Duration = Duration::from_millis(32);
 const ELAPSED_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_EVENT_BATCH: usize = 64;
 const CLEAR_SCREEN_AND_SCROLLBACK: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
@@ -44,8 +44,6 @@ pub(in crate::frontend) async fn run(agent: Agent, catalog: UiCatalog) -> Result
     terminal.clear()?;
     let mut tick = tokio::time::interval(INPUT_POLL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut shimmer = tokio::time::interval(SHIMMER_INTERVAL);
-    shimmer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut elapsed = tokio::time::interval(ELAPSED_INTERVAL);
     elapsed.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut events_open = true;
@@ -92,18 +90,26 @@ pub(in crate::frontend) async fn run(agent: Agent, catalog: UiCatalog) -> Result
                     let Some(event) = poll_event()? else {
                         break;
                     };
-                    dirty = true;
                     let action = match event {
-                        TerminalEvent::Key(key) => state.handle_key(key, &catalog),
+                        TerminalEvent::Key(key) => {
+                            dirty |= matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat);
+                            state.handle_key(key, &catalog)
+                        }
                         TerminalEvent::Paste(text) => {
                             if state.preview.is_none() && state.picker.is_none() {
+                                let before = (state.input.len(), state.input_limit_reached);
                                 state.insert_paste(&text);
+                                dirty |=
+                                    before != (state.input.len(), state.input_limit_reached);
                             }
                             UiAction::None
                         }
-                        TerminalEvent::Resize(_, _) => UiAction::None,
+                        TerminalEvent::Resize(_, _) => {
+                            dirty = true;
+                            UiAction::None
+                        }
                         TerminalEvent::Mouse(mouse) => {
-                            state.handle_mouse(mouse);
+                            dirty |= state.handle_mouse(mouse);
                             UiAction::None
                         }
                         TerminalEvent::FocusGained
@@ -137,9 +143,6 @@ pub(in crate::frontend) async fn run(agent: Agent, catalog: UiCatalog) -> Result
                         }
                     }
                 }
-            }
-            _ = shimmer.tick(), if state.is_working() => {
-                dirty = true;
             }
             _ = elapsed.tick(), if state.active_turn.is_some() => {
                 dirty = true;

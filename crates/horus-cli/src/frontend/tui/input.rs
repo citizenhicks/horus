@@ -229,18 +229,20 @@ impl TuiState {
         UiAction::None
     }
 
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         let viewport = self
             .preview
             .as_mut()
             .map_or(&mut self.transcript_viewport, |preview| {
                 &mut preview.viewport
             });
+        let before = viewport.effective_scroll();
         match mouse.kind {
             MouseEventKind::ScrollUp => viewport.scroll_up(SCROLL_ROWS),
             MouseEventKind::ScrollDown => viewport.scroll_down(SCROLL_ROWS),
             _ => {}
         }
+        viewport.effective_scroll() != before
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent) -> UiAction {

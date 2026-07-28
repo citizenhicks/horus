@@ -12,6 +12,8 @@ mod view;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
+use ratatui::text::Line;
+
 use self::events::UsageStatus;
 #[cfg(test)]
 use self::events::handle_event;
@@ -60,7 +62,6 @@ impl From<FrontendTone> for TranscriptTone {
     }
 }
 
-#[derive(Clone)]
 struct TranscriptEntry {
     id: Option<String>,
     group: Option<String>,
@@ -68,6 +69,7 @@ struct TranscriptEntry {
     format: FrontendBlockFormat,
     tone: TranscriptTone,
     pending: bool,
+    rendered: Option<(u16, Vec<Line<'static>>)>,
 }
 
 struct PickerState {
@@ -352,6 +354,7 @@ impl TuiState {
                 entry.group = block.group;
             }
             entry.pending = block.pending;
+            entry.rendered = None;
             return;
         }
         if block.append {
@@ -364,6 +367,7 @@ impl TuiState {
             format: block.format,
             tone: block.tone.into(),
             pending: block.pending,
+            rendered: None,
         });
         self.trim_transcript();
     }
@@ -440,6 +444,7 @@ impl TuiState {
             format: FrontendBlockFormat::PlainText,
             tone,
             pending: false,
+            rendered: None,
         });
         self.trim_transcript();
     }

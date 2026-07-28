@@ -188,39 +188,48 @@ async fn run_state(mut state: SetupState) -> Result<SetupState> {
                     let Some(event) = poll_event()? else {
                         break;
                     };
-                    dirty = true;
                     if pending_login.is_some() {
-                        if cancels_login(&event) {
+                        if matches!(&event, Event::Resize(_, _)) {
+                            dirty = true;
+                        } else if cancels_login(&event) {
                             pending_login = None;
                             state.oauth_url = None;
                             state.error = Some("stopped waiting for browser login".into());
+                            dirty = true;
                         }
                         continue;
                     }
                     match event {
-                        Event::Key(key) => match state.handle_key(key) {
-                            Flow::Continue => {}
-                            Flow::Finish => return Ok(state),
-                            Flow::Cancel => {
-                                return Err(Error::Config("setup cancelled".into()));
+                        Event::Key(key) => {
+                            dirty |= matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat);
+                            match state.handle_key(key) {
+                                Flow::Continue => {}
+                                Flow::Finish => return Ok(state),
+                                Flow::Cancel => {
+                                    return Err(Error::Config("setup cancelled".into()));
+                                }
+                                Flow::Authenticate => {
+                                    let ProviderAuth::Browser(auth) = state.provider().auth() else {
+                                        return Err(Error::Config(
+                                            "provider does not support browser login".into(),
+                                        ));
+                                    };
+                                    let login = auth.start().await?;
+                                    state.oauth_url = Some(login.url().to_string());
+                                    login.open_browser();
+                                    pending_login =
+                                        Some(login.complete(state.auth_path.clone()));
+                                }
                             }
-                            Flow::Authenticate => {
-                                let ProviderAuth::Browser(auth) = state.provider().auth() else {
-                                    return Err(Error::Config(
-                                        "provider does not support browser login".into(),
-                                    ));
-                                };
-                                let login = auth.start().await?;
-                                state.oauth_url = Some(login.url().to_string());
-                                login.open_browser();
-                                pending_login = Some(login.complete(state.auth_path.clone()));
+                        }
+                        Event::Paste(text) => {
+                            if state.is_text_entry() {
+                                state.paste(&text);
+                                dirty = true;
                             }
-                        },
-                        Event::Paste(text) => state.paste(&text),
-                        Event::Resize(_, _)
-                        | Event::FocusGained
-                        | Event::FocusLost
-                        | Event::Mouse(_) => {}
+                        }
+                        Event::Resize(_, _) => dirty = true,
+                        Event::FocusGained | Event::FocusLost | Event::Mouse(_) => {}
                     }
                 }
             }

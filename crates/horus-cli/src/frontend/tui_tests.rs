@@ -247,7 +247,9 @@ fn completed_edit_replaces_the_tool_log_with_a_styled_diff() {
     let frontend = frontend();
     let mut state = state();
     state.transcript.clear();
-    for event in [
+    handle_event(
+        &mut state,
+        &frontend,
         EventMsg::ToolCallBegin(horus::protocol::ToolCallBeginEvent {
             turn_id: "turn".into(),
             call_id: "edit".into(),
@@ -258,6 +260,19 @@ fn completed_edit_replaces_the_tool_log_with_a_styled_diff() {
                 "new_text": "new"
             }),
         }),
+    );
+    view::live_transcript_lines(&mut state, 0, 80);
+    assert_eq!(
+        state
+            .transcript
+            .front()
+            .and_then(|entry| entry.rendered.as_ref())
+            .map(|(width, _)| *width),
+        Some(80)
+    );
+    handle_event(
+        &mut state,
+        &frontend,
         EventMsg::ToolCallEnd(horus::protocol::ToolCallEndEvent {
             turn_id: "turn".into(),
             call_id: "edit".into(),
@@ -265,15 +280,19 @@ fn completed_edit_replaces_the_tool_log_with_a_styled_diff() {
             output: "--- note.rs\n+++ note.rs\n@@ -1,5 +1,5 @@\n-fn old_name() {}\n+fn new_name() {}\n keep_one();\n-let removed = false;\n keep_two();\n+let added = true;\n keep_three();\n".into(),
             is_error: false,
         }),
-    ] {
-        handle_event(&mut state, &frontend, event);
-    }
+    );
+    assert!(
+        state
+            .transcript
+            .front()
+            .is_some_and(|entry| entry.rendered.is_none())
+    );
 
     assert_eq!(
         state.transcript.front().map(|entry| entry.format),
         Some(FrontendBlockFormat::UnifiedDiff)
     );
-    let lines = view::live_transcript_lines(&state, 0, 80);
+    let lines = view::live_transcript_lines(&mut state, 0, 80);
     let text = rendered_text(&lines);
     assert!(text.contains("◉ Edited note.rs (+2 -2)"), "{text}");
     assert!(text.contains("    1 -fn old_name() {}"), "{text}");
@@ -318,6 +337,23 @@ fn completed_edit_replaces_the_tool_log_with_a_styled_diff() {
     assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
         span.content == "fn" && span.style.fg != Some(current().color(Role::Text))
     }));
+
+    let narrow_lines = view::live_transcript_lines(&mut state, 0, 40);
+    let narrow_insert = narrow_lines
+        .iter()
+        .find(|line| rendered_text(std::slice::from_ref(line)).contains("+fn new_name"))
+        .expect("narrow insert");
+    assert_eq!(
+        (
+            state
+                .transcript
+                .front()
+                .and_then(|entry| entry.rendered.as_ref())
+                .map(|(width, _)| *width),
+            narrow_insert.width(),
+        ),
+        (Some(40), 40)
+    );
 }
 
 #[test]
@@ -525,12 +561,18 @@ fn snapshot_preview_scrolls_with_the_mouse_wheel() {
     let bottom = terminal.backend().to_string();
     assert!(bottom.contains("subagent row 29"), "{bottom}");
 
-    state.handle_mouse(MouseEvent {
+    assert!(!state.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    }));
+    assert!(state.handle_mouse(MouseEvent {
         kind: MouseEventKind::ScrollUp,
         column: 0,
         row: 0,
         modifiers: KeyModifiers::NONE,
-    });
+    }));
     terminal
         .draw(|frame| view::render_preview(frame, &mut state))
         .expect("scrolled preview draw");
