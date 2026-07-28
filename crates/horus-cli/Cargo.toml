@@ -1,0 +1,39 @@
+[package]
+name = "horus-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A minimal terminal coding agent built with Horus"
+license = "Apache-2.0"
+repository = "https://github.com/citizenhicks/horus"
+readme = "README.md"
+publish = ["crates-io"]
+keywords = ["agent", "ai", "cli", "llm", "tui"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "horus"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+diffy = "0.4.2"
+horus = { version = "0.1.0", path = "../.." }
+pulldown-cmark = { version = "0.10", default-features = false }
+ratatui = { version = "0.30.2", features = [
+    "scrolling-regions",
+    "unstable-rendered-line-info",
+] }
+serde = { version = "1", features = ["derive"] }
+syntect = "5"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+toml = "0.9"
+two-face = { version = "0.5", default-features = false, features = ["syntect-default-onig"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

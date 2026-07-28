@@ -1,0 +1,235 @@
+use std::time::Duration;
+
+use reqwest::Client;
+use reqwest::Response;
+
+use crate::Error;
+use crate::ProviderError;
+use crate::Result;
+
+pub(super) const MAX_ERROR_BYTES: usize = 64 * 1024;
+pub(super) const MAX_SSE_FRAME_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Builds the streaming HTTP client shared by provider construction.
+///
+/// Clone the returned client freely: every clone shares one connection pool.
+pub fn streaming_client() -> Result<Client> {
+    streaming_client_with_idle_timeout(STREAM_IDLE_TIMEOUT)
+}
+
+fn streaming_client_with_idle_timeout(idle_timeout: Duration) -> Result<Client> {
+    Ok(Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(idle_timeout)
+        .build()?)
+}
+
+pub(super) fn account_stream_bytes(total: &mut usize, added: usize, provider: &str) -> Result<()> {
+    *total = total
+        .checked_add(added)
+        .filter(|total| *total <= MAX_STREAM_BYTES)
+        .ok_or_else(|| Error::Provider(format!("{provider} stream exceeded size limit").into()))?;
+    Ok(())
+}
+
+pub(super) fn push_sse_chunk(
+    buffer: &mut Vec<u8>,
+    total: &mut usize,
+    chunk: &[u8],
+    provider: &str,
+) -> Result<()> {
+    account_stream_bytes(total, chunk.len(), provider)?;
+    buffer.extend_from_slice(chunk);
+    Ok(())
+}
+
+pub(super) fn take_sse_frame(bytes: &mut Vec<u8>) -> Result<Option<String>> {
+    let separators = [b"\r\n\r\n".as_slice(), b"\n\n".as_slice()];
+    let Some((index, width)) = separators
+        .iter()
+        .filter_map(|separator| {
+            bytes
+                .windows(separator.len())
+                .position(|window| window == *separator)
+                .map(|index| (index, separator.len()))
+        })
+        .min_by_key(|(index, _)| *index)
+    else {
+        return Ok(None);
+    };
+    if index > MAX_SSE_FRAME_BYTES {
+        return Err(Error::Provider("SSE frame exceeded size limit".into()));
+    }
+    let rest = bytes.split_off(index + width);
+    let mut frame = std::mem::replace(bytes, rest);
+    frame.truncate(index);
+    String::from_utf8(frame)
+        .map(Some)
+        .map_err(|error| Error::Provider(format!("invalid SSE UTF-8: {error}").into()))
+}
+
+pub(super) fn frame_data(frame: &str) -> Option<String> {
+    let data = frame
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        .collect::<Vec<_>>();
+    (!data.is_empty()).then(|| data.join("\n"))
+}
+
+pub(super) async fn read_limited(
+    mut response: Response,
+    limit: usize,
+    provider: &str,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(Error::Provider(
+                format!("{provider} response body exceeded size limit").into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+pub(super) async fn status_error(mut response: Response, provider: &str) -> Error {
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let mut bytes = Vec::new();
+    while bytes.len() < MAX_ERROR_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = MAX_ERROR_BYTES - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                return Error::Provider(ProviderError::http(
+                    format!("{provider} HTTP {status}: {error}"),
+                    status.as_u16(),
+                    retry_after,
+                ));
+            }
+        }
+    }
+    Error::Provider(ProviderError::http(
+        format!(
+            "{provider} HTTP {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        ),
+        status.as_u16(),
+        retry_after,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn sse_framing_handles_crlf_and_multiline_data_without_copying_the_remainder() {
+        let mut bytes = b"event: message\r\ndata: one\r\ndata: two\r\n\r\ndata: next\n\n".to_vec();
+
+        let first = take_sse_frame(&mut bytes)
+            .expect("valid frame")
+            .expect("first frame");
+        assert_eq!(frame_data(&first).as_deref(), Some("one\ntwo"));
+        assert_eq!(
+            frame_data(
+                &take_sse_frame(&mut bytes)
+                    .expect("valid frame")
+                    .expect("second frame")
+            )
+            .as_deref(),
+            Some("next")
+        );
+    }
+
+    #[test]
+    fn aggregate_stream_limit_rejects_the_first_excess_byte() {
+        let mut total = MAX_STREAM_BYTES;
+        assert!(account_stream_bytes(&mut total, 1, "test").is_err());
+    }
+
+    #[test]
+    fn aggregate_stream_limit_counts_frames_without_data() {
+        let mut bytes = Vec::new();
+        let mut total = MAX_STREAM_BYTES;
+
+        assert!(push_sse_chunk(&mut bytes, &mut total, b": keep-alive\n\n", "test").is_err());
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_error_preserves_retry_metadata() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("test connection");
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\n\
+                      Content-Length: 4\r\nConnection: close\r\n\r\nslow",
+                )
+                .await
+                .expect("test response");
+        });
+        let response = streaming_client()
+            .expect("client")
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .expect("response");
+
+        let Error::Provider(error) = status_error(response, "test").await else {
+            panic!("expected provider error");
+        };
+
+        assert_eq!(
+            (error.status(), error.is_retryable(), error.retry_after()),
+            (Some(429), true, Some("7"))
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_timeout_is_idle_not_whole_stream_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("test connection");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
+                .await
+                .expect("test headers");
+            std::future::pending::<()>().await;
+        });
+        let mut response = streaming_client_with_idle_timeout(Duration::from_millis(10))
+            .expect("client")
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .expect("response headers");
+
+        let error = response
+            .chunk()
+            .await
+            .expect_err("idle response should time out");
+        server.abort();
+
+        assert!(error.is_timeout());
+    }
+}
