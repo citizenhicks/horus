@@ -198,7 +198,14 @@ impl LocalSandbox {
             }
             command.arg("--ro-bind").arg(&path).arg(&path);
         }
-        command.args(["--unshare-user", "--unshare-pid"]);
+        command.args([
+            "--unshare-user",
+            "--uid",
+            "0",
+            "--gid",
+            "0",
+            "--unshare-pid",
+        ]);
         if network_access == NetworkAccess::Denied {
             command.arg("--unshare-net");
         }
