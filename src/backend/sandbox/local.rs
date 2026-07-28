@@ -400,7 +400,7 @@ fn atomic_write(root: Dir, relative: &Path, content: &[u8], requested: &str) -> 
         file.sync_all()?;
         drop(file);
         parent.rename(&temporary, &parent, target)?;
-        parent.try_clone()?.into_std_file().sync_all()?;
+        sync_directory(&parent)?;
         Ok(())
     })();
     if result.is_err() {
@@ -759,9 +759,8 @@ fn current_uid() -> Result<u32> {
     Ok(std::fs::metadata("/proc/self")?.uid())
 }
 
-#[cfg(target_os = "linux")]
 fn sync_directory(directory: &Dir) -> Result<()> {
-    directory.try_clone()?.into_std_file().sync_all()?;
+    directory.open(".")?.sync_all()?;
     Ok(())
 }
 
