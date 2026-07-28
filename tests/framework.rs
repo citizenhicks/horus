@@ -739,11 +739,11 @@ async fn local_sandbox_confines_command_writes_to_the_workspace() {
     }
 
     assert_ne!(output.exit_code, 0);
-    assert_eq!(
-        std::fs::read_to_string(workspace.path().join("command.txt"))
-            .expect("read workspace output"),
-        "horus"
-    );
+    let workspace_output = std::fs::read_to_string(workspace.path().join("command.txt"))
+        .unwrap_or_else(|error| {
+            panic!("read workspace output: {error}; command output: {output:?}")
+        });
+    assert_eq!(workspace_output, "horus");
     assert!(!escaped);
 }
 
