@@ -709,7 +709,7 @@ fn capped_composer_keeps_a_wide_wrapped_cursor_visible() {
 #[test]
 fn session_card_keeps_the_eye_and_session_details() {
     let mut state = state();
-    state.cwd = "/Users/citizenhicks/Documents/horus.nosync".into();
+    state.cwd = "/work/horus.nosync".into();
     let card = view::welcome_card(&state);
 
     assert!(card.contains("⣠⡤⢶"));
