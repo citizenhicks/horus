@@ -81,11 +81,12 @@ The Sora-themed TUI uses the full terminal. The mouse wheel and Page Up/Page Dow
 Ctrl-T opens its full-screen transcript view. Arrow, page, and wheel input navigate an open preview;
 Up/Down and Ctrl-P/Ctrl-N navigate composer history.
 
-The local command sandbox uses `/usr/bin/sandbox-exec` on macOS and `bwrap` on Linux. The
-`/permissions` command changes the sandbox policy between approval prompts, no-prompt execution
-without network, and no-prompt execution with network. Bash may write only in the workspace and
-its private temporary directory in every mode. Command execution fails closed when the platform
-sandbox is unavailable.
+The local command sandbox uses `/usr/bin/sandbox-exec` on macOS and `bwrap` on Linux. Linux must
+permit the selected `bwrap` binary to create user, PID, and network namespaces; AppArmor-restricted
+hosts need a matching Bubblewrap profile. The `/permissions` command changes the sandbox policy
+between approval prompts, no-prompt execution without network, and no-prompt execution with
+network. Bash may write only in the workspace and its private temporary directory in every mode.
+Command execution fails closed when the platform sandbox is unavailable.
 
 ## License
 

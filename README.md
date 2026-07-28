@@ -129,10 +129,12 @@ Checkpoint backends expose cursor-paginated session catalogs and sequence-bounde
 pages. `AgentConfig::initial_replay_batches` controls the recent history rendered on resume;
 the complete compacted model checkpoint is loaded independently.
 
-The local command sandbox currently uses Seatbelt on macOS and Bubblewrap on Linux. If the
-platform sandbox is unavailable, command execution fails closed. The sandbox offers three
-approval policies: prompt before dangerous tools, allow tools without network, or allow tools with
-network. Filesystem confinement remains active in every mode.
+The local command sandbox currently uses Seatbelt on macOS and Bubblewrap on Linux. Linux must
+permit the selected `bwrap` binary to create user, PID, and network namespaces; AppArmor-restricted
+hosts need a matching Bubblewrap profile. If the platform sandbox is unavailable, command
+execution fails closed. The sandbox offers three approval policies: prompt before dangerous
+tools, allow tools without network, or allow tools with network. Filesystem confinement remains
+active in every mode.
 
 ## Contributing
 
@@ -156,5 +158,4 @@ initial crates.io publications.
 Licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for attribution to
 [OpenAI Codex](https://github.com/openai/codex), Ratatui-derived work, and the
 [Sora](https://github.com/Aejkatappaja/sora) color palette.
-
 
