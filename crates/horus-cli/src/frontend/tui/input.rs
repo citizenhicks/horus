@@ -17,6 +17,7 @@ use crate::frontend::catalog::CommandContext;
 use crate::frontend::catalog::GatewayAction;
 use crate::frontend::catalog::MenuItem;
 use crate::frontend::catalog::UiCatalog;
+use crate::frontend::setup::SetupMode;
 use horus::protocol::EventMsg;
 use horus::protocol::MAX_USER_INPUT_BYTES;
 use horus::protocol::Op;
@@ -31,6 +32,7 @@ pub(super) enum UiAction {
     None,
     Submit(Op),
     Gateway(GatewayAction),
+    Setup(SetupMode),
     Exit,
     New(String),
     Clear(String),
@@ -546,6 +548,7 @@ impl TuiState {
                     UiAction::Submit(op)
                 }
                 CommandAction::Gateway(action) => UiAction::Gateway(action),
+                CommandAction::Setup(mode) => UiAction::Setup(mode),
                 CommandAction::Frontend(event) => {
                     self.handle_agent_event(EventMsg::Frontend(event), Vec::new());
                     UiAction::None

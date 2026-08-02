@@ -1,9 +1,11 @@
+use std::env;
 use std::path::PathBuf;
 
+use horus::backend::model::provider::{ProviderAuth, ProviderDefinition, provider};
 use horus::{Error, Result};
 use horus_gateway::wire::{
     AgentComposition, ArtifactRecord, ClientMessage, CronRun, CronTask, ProfileSnapshot,
-    ProviderStatus, ReadyPayload, ServerMessage,
+    ProviderAuthKind, ProviderStatus, ReadyPayload, ServerMessage,
 };
 use uuid::Uuid;
 
@@ -36,7 +38,7 @@ pub(super) fn prepare(action: GatewayAction, ready: &ReadyPayload) -> Result<Pre
         GatewayAction::Agent(arguments) => prepare_agent(&arguments, ready),
         GatewayAction::Workspace(arguments) => prepare_workspace(&arguments),
         GatewayAction::Providers => Ok(PreparedAction::Print(render_providers(&ready.providers))),
-        GatewayAction::Login(arguments) => prepare_login(&arguments),
+        GatewayAction::Login(arguments) => prepare_login(&arguments, &ready.providers),
         GatewayAction::Pair => Ok(send(ResponseKind::Pairing, |request_id| {
             ClientMessage::CreatePairingCode { request_id }
         })),
@@ -50,9 +52,17 @@ pub(super) fn prepare(action: GatewayAction, ready: &ReadyPayload) -> Result<Pre
     }
 }
 
-fn prepare_login(arguments: &str) -> Result<PreparedAction> {
+fn prepare_login(arguments: &str, providers: &[ProviderStatus]) -> Result<PreparedAction> {
+    prepare_login_with(arguments, providers, |name| env::var(name).ok())
+}
+
+fn prepare_login_with(
+    arguments: &str,
+    providers: &[ProviderStatus],
+    environment: impl Fn(&str) -> Option<String>,
+) -> Result<PreparedAction> {
     let mut parts = arguments.split_ascii_whitespace();
-    let provider = required(
+    let provider_id = required(
         parts.next().unwrap_or_default(),
         "usage: /login <provider> [env:NAME]",
     )?;
@@ -60,30 +70,79 @@ fn prepare_login(arguments: &str) -> Result<PreparedAction> {
     if parts.next().is_some() {
         return Err(Error::Config("usage: /login <provider> [env:NAME]".into()));
     }
-    let Some(name) = credential.and_then(|value| value.strip_prefix("env:")) else {
+    let definition = validated_provider(provider_id, providers)?;
+    let ProviderAuth::ApiKey(default_environment) = definition.auth() else {
         if credential.is_some() {
-            return Err(Error::Config(
-                "API keys must be supplied as env:NAME".into(),
-            ));
+            return Err(Error::Config(format!(
+                "provider `{provider_id}` uses device login; run `/login {provider_id}`"
+            )));
         }
         return Ok(send(ResponseKind::ProviderAuth, |request_id| {
             ClientMessage::StartProviderLogin {
                 request_id,
-                provider: provider.into(),
+                provider: provider_id.into(),
             }
         }));
     };
-    let api_key = std::env::var(name)
-        .ok()
+
+    let environment_name = match credential {
+        Some(value) => value
+            .strip_prefix("env:")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "provider `{provider_id}` requires `env:NAME`; run `/login {provider_id} env:NAME`"
+                ))
+            })?,
+        None => default_environment,
+    };
+    let retry = credential.map_or_else(
+        || format!("/login {provider_id}"),
+        |_| format!("/login {provider_id} env:{environment_name}"),
+    );
+    let api_key = environment(environment_name)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::Config(format!("environment variable {name} is not set")))?;
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "provider `{provider_id}` requires API key environment variable `{environment_name}`; set it before starting horus, then run `{retry}` again"
+            ))
+        })?;
     Ok(send(ResponseKind::ProviderAuth, |request_id| {
         ClientMessage::SetProviderCredential {
             request_id,
-            provider: provider.into(),
+            provider: provider_id.into(),
             api_key,
         }
     }))
+}
+
+pub(super) fn validated_provider(
+    provider_id: &str,
+    advertised: &[ProviderStatus],
+) -> Result<&'static ProviderDefinition> {
+    let definition = provider(provider_id).map_err(|_| {
+        Error::Config(format!(
+            "unknown provider `{provider_id}`; run `/providers` to list available providers"
+        ))
+    })?;
+    let status = advertised
+        .iter()
+        .find(|status| status.provider == provider_id)
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "provider `{provider_id}` is not advertised by this gateway"
+            ))
+        })?;
+    let local_auth = match definition.auth() {
+        ProviderAuth::ApiKey(_) => ProviderAuthKind::ApiKey,
+        ProviderAuth::Browser(_) => ProviderAuthKind::DeviceCode,
+    };
+    if status.auth != local_auth {
+        return Err(Error::Config(format!(
+            "provider `{provider_id}` authentication does not match this CLI"
+        )));
+    }
+    Ok(definition)
 }
 
 pub(super) fn render_response(message: &ServerMessage) -> Option<String> {
@@ -422,7 +481,37 @@ fn render_cron_history(runs: &[CronRun]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use horus::backend::model::provider::HostedWebSearch;
+
     use super::*;
+
+    fn provider_status(
+        provider: &str,
+        auth: ProviderAuthKind,
+        default_api_key_env: Option<&str>,
+    ) -> ProviderStatus {
+        ProviderStatus {
+            provider: provider.into(),
+            label: provider.into(),
+            configured: false,
+            auth,
+            default_model: None,
+            default_base_url: None,
+            default_api_key_env: default_api_key_env.map(str::to_owned),
+            default_reasoning_effort: None,
+            default_web_search: HostedWebSearch::Off,
+        }
+    }
+
+    fn config_error(result: Result<PreparedAction>) -> String {
+        match result {
+            Err(Error::Config(message)) => message,
+            Err(error) => panic!("expected configuration error, got {error}"),
+            Ok(_) => panic!("expected configuration error"),
+        }
+    }
 
     #[test]
     fn cron_parser_covers_remote_scheduler_operations() {
@@ -485,5 +574,102 @@ mod tests {
             ClientMessage::SetWorkspace { path, .. }
                 if path == std::path::Path::new("/srv/horus/project")
         ));
+    }
+
+    #[test]
+    fn login_uses_only_the_local_manifest_default_environment() {
+        let advertised = [provider_status(
+            "kimi",
+            ProviderAuthKind::ApiKey,
+            Some("AWS_SECRET_ACCESS_KEY"),
+        )];
+
+        let PreparedAction::Send { message, .. } =
+            prepare_login_with("kimi", &advertised, |name| {
+                assert_eq!(name, "MOONSHOT_API_KEY");
+                Some("moonshot-secret".into())
+            })
+            .expect("prepare login")
+        else {
+            panic!("API-key login must send a credential");
+        };
+
+        assert!(matches!(
+            message,
+            ClientMessage::SetProviderCredential { provider, api_key, .. }
+                if provider == "kimi" && api_key == "moonshot-secret"
+        ));
+    }
+
+    #[test]
+    fn custom_endpoint_uses_its_manifest_default_environment() {
+        let advertised = [provider_status(
+            "responses",
+            ProviderAuthKind::ApiKey,
+            Some("OPENAI_API_KEY"),
+        )];
+        let lookups = Cell::new(0);
+
+        let PreparedAction::Send { message, .. } =
+            prepare_login_with("responses", &advertised, |name| {
+                lookups.set(lookups.get() + 1);
+                assert_eq!(name, "OPENAI_API_KEY");
+                Some("responses-secret".into())
+            })
+            .expect("prepare custom login")
+        else {
+            panic!("custom login must send a credential");
+        };
+
+        assert_eq!(lookups.get(), 1);
+        assert!(matches!(
+            message,
+            ClientMessage::SetProviderCredential { provider, api_key, .. }
+                if provider == "responses" && api_key == "responses-secret"
+        ));
+    }
+
+    #[test]
+    fn browser_login_does_not_read_an_environment_variable() {
+        let advertised = [provider_status(
+            "openai_codex",
+            ProviderAuthKind::DeviceCode,
+            None,
+        )];
+
+        let PreparedAction::Send { message, .. } =
+            prepare_login_with("openai_codex", &advertised, |_| {
+                panic!("device login must not read an environment variable")
+            })
+            .expect("prepare device login")
+        else {
+            panic!("device login must send a request");
+        };
+
+        assert!(matches!(
+            message,
+            ClientMessage::StartProviderLogin { provider, .. } if provider == "openai_codex"
+        ));
+    }
+
+    #[test]
+    fn missing_default_environment_names_the_requirement_and_retry() {
+        let advertised = [provider_status("kimi", ProviderAuthKind::ApiKey, None)];
+
+        let message = config_error(prepare_login_with("kimi", &advertised, |_| None));
+
+        assert!(message.contains("MOONSHOT_API_KEY"));
+        assert!(message.contains("/login kimi"));
+    }
+
+    #[test]
+    fn authentication_mismatch_fails_before_reading_a_secret() {
+        let advertised = [provider_status("kimi", ProviderAuthKind::DeviceCode, None)];
+
+        let message = config_error(prepare_login_with("kimi", &advertised, |_| {
+            panic!("mismatched provider must not read an environment variable")
+        }));
+
+        assert!(message.contains("authentication does not match"));
     }
 }

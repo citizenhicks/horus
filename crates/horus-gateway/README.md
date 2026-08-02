@@ -24,8 +24,20 @@ horus-gateway init --workspace /path/to/repository \
 ```
 
 By default, owner-only state is stored under `~/.horus/gateway`. Set
-`HORUS_GATEWAY_STATE_DIR` for both `init` and `serve` to use another location.
+`HORUS_GATEWAY_STATE_DIR` or pass `--state-dir` to use another location.
 Provider secrets remain on the gateway and are never returned to clients.
+
+On macOS or Linux, inspect or gracefully stop the configured gateway from
+another terminal:
+
+```sh
+horus-gateway status
+horus-gateway exit
+```
+
+Status prints the configured workspace and endpoint together with `running` or
+`stopped`. Exit verifies the gateway's locked process record before sending
+SIGINT and waits up to five seconds for shutdown.
 
 Pair the terminal client with the printed code:
 

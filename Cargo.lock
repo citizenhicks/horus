@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "horus-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "diffy",
  "horus",
@@ -851,11 +851,12 @@ dependencies = [
 
 [[package]]
 name = "horus-gateway"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "croner",
  "horus",
+ "nix",
  "rustls",
  "rustls-pemfile",
  "serde",

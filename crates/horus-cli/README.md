@@ -88,10 +88,15 @@ horus cron history [task-id]
 Inside the TUI, `/cron` exposes the same add, list, reschedule, delete, run, and history operations.
 Every scheduled execution is a normal durable gateway session.
 
-`/providers` shows frontend-safe provider status. `/login <provider>` starts device login;
-`/login <provider> env:NAME` securely sends the named environment variable as an API key. Secrets
-are never returned by the gateway. `/agent` prints the current composition, and `/agent <json>`
-validates, persists, and restarts that composition on the gateway while preserving the session.
+`/providers` shows frontend-safe provider status. `/login` opens the guided provider login screen,
+where API keys can be pasted into a masked field and device-login providers show their login flow.
+`/agent` opens the same guided flow and adds provider, endpoint, and model selection. Secrets are
+sent directly to the gateway and never returned to the CLI.
+
+For a direct setup, `/login <provider>` reads that provider's standard environment variable or
+starts its device login. `/login <provider> env:NAME` reads an explicitly named variable, and
+`/agent <json>` validates, persists, and restarts an advanced composition while preserving the
+session.
 
 API-key providers use their standard environment variables:
 

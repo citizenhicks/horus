@@ -15,6 +15,8 @@ use horus::protocol::FrontendPickerOption;
 use horus::protocol::FrontendWidget;
 use horus::protocol::Op;
 
+use super::setup::SetupMode;
+
 const COMMAND_PREFIX: char = '/';
 const WORKSPACE_REFERENCE_TRIGGER: char = '@';
 const MAX_FILES: usize = 20_000;
@@ -88,6 +90,7 @@ pub(crate) struct CommandContext<'a> {
 pub(crate) enum CommandAction {
     Submit(Op),
     Gateway(GatewayAction),
+    Setup(SetupMode),
     Frontend(FrontendEvent),
     ShowMenu,
     Print(String),
@@ -210,6 +213,10 @@ impl UiCatalog {
         &self.model_choices
     }
 
+    pub(crate) fn replace_model_choices(&mut self, choices: &[ModelChoice]) {
+        self.model_choices = choices.to_vec();
+    }
+
     pub(crate) fn workspace(&self) -> &Path {
         &self.workspace
     }
@@ -323,11 +330,13 @@ impl UiCatalog {
         }
         Some(match &command.handler {
             CommandHandler::Help => CommandAction::ShowMenu,
+            CommandHandler::Agent if arguments.is_empty() => CommandAction::Setup(SetupMode::Agent),
             CommandHandler::Agent => CommandAction::Gateway(GatewayAction::Agent(arguments.into())),
             CommandHandler::Workspace => {
                 CommandAction::Gateway(GatewayAction::Workspace(arguments.into()))
             }
             CommandHandler::Providers => CommandAction::Gateway(GatewayAction::Providers),
+            CommandHandler::Login if arguments.is_empty() => CommandAction::Setup(SetupMode::Login),
             CommandHandler::Login => CommandAction::Gateway(GatewayAction::Login(arguments.into())),
             CommandHandler::Pair => CommandAction::Gateway(GatewayAction::Pair),
             CommandHandler::Profile => CommandAction::Gateway(GatewayAction::Profile),
@@ -391,7 +400,7 @@ fn cli_commands() -> Vec<UiCommand> {
         UiCommand {
             name: "agent".into(),
             arguments: "[<composition-json>]".into(),
-            description: "show or change gateway agent composition".into(),
+            description: "set up the gateway agent".into(),
             requires_idle: true,
             handler: CommandHandler::Agent,
         },
@@ -405,8 +414,8 @@ fn cli_commands() -> Vec<UiCommand> {
         command("providers", "show gateway provider configuration", false, CommandHandler::Providers),
         UiCommand {
             name: "login".into(),
-            arguments: "<provider> [env:NAME]".into(),
-            description: "configure provider authentication on the gateway".into(),
+            arguments: "[<provider> [env:NAME]]".into(),
+            description: "set up provider authentication".into(),
             requires_idle: true,
             handler: CommandHandler::Login,
         },
@@ -716,6 +725,30 @@ mod tests {
             references: Vec::new(),
             active_input: None,
         }
+    }
+
+    #[test]
+    fn bare_login_and_agent_commands_open_setup() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let catalog = UiCatalog::build(&[], &[], workspace.path()).expect("catalog");
+        let context = CommandContext {
+            active_turn: None,
+            status: "idle",
+            model_route: "kimi",
+        };
+
+        assert_eq!(
+            catalog.dispatch("/login", context),
+            Some(CommandAction::Setup(SetupMode::Login))
+        );
+        assert_eq!(
+            catalog.dispatch("/agent", context),
+            Some(CommandAction::Setup(SetupMode::Agent))
+        );
+        assert_eq!(
+            catalog.dispatch("/login kimi", context),
+            Some(CommandAction::Gateway(GatewayAction::Login("kimi".into())))
+        );
     }
 
     #[test]

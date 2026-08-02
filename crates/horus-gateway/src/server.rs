@@ -400,7 +400,29 @@ async fn handle_message(
             request_id,
             provider,
             api_key,
-        } => match host.set_credential(provider.clone(), api_key).await {
+        } => match host.set_credential(provider.clone(), api_key, None).await {
+            Ok(()) => {
+                write_frame(
+                    writer,
+                    &ServerFrame::new(ServerMessage::ProviderCredentialStatus {
+                        request_id,
+                        provider,
+                        configured: true,
+                    }),
+                )
+                .await
+            }
+            Err(rejection) => write_rejection(writer, request_id, rejection).await,
+        },
+        ClientMessage::SetProviderEndpointCredential {
+            request_id,
+            provider,
+            base_url,
+            api_key,
+        } => match host
+            .set_credential(provider.clone(), api_key, Some(base_url))
+            .await
+        {
             Ok(()) => {
                 write_frame(
                     writer,

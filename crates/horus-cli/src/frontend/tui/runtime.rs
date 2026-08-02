@@ -18,6 +18,7 @@ use super::view::render_preview;
 use crate::frontend::FrontendExit;
 use crate::frontend::catalog::UiCatalog;
 use crate::frontend::gateway_actions::{PreparedAction, prepare, render_response};
+use crate::frontend::setup;
 use crate::frontend::terminal::{INPUT_POLL, MAX_INPUT_BATCH, TerminalGuard, poll_event};
 use horus::backend::model::ModelInfo;
 use horus::protocol::{Op, Submission};
@@ -33,7 +34,7 @@ pub(in crate::frontend) async fn run(
     sender: GatewaySender,
     mut events: GatewayEvents,
     mut ready: ReadyPayload,
-    catalog: UiCatalog,
+    mut catalog: UiCatalog,
     local_gateway: bool,
 ) -> Result<(FrontendExit, GatewaySender, GatewayEvents)> {
     let mut workspace_inventory = catalog.start_workspace_inventory(local_gateway);
@@ -91,10 +92,18 @@ pub(in crate::frontend) async fn run(
                                 );
                             }
                             ServerMessage::Ready { payload } => {
-                                exit = FrontendExit::Reload(Box::new(payload));
-                                break 'ui;
+                                if payload.workspace.id == ready.workspace.id
+                                    && payload.session.session_id == ready.session.session_id
+                                    && payload.config.revision == ready.config.revision
+                                    && payload.contributions == ready.contributions
+                                {
+                                    refresh_ready(&mut state, &mut catalog, &mut ready, payload);
+                                } else {
+                                    exit = FrontendExit::Reload(Box::new(payload));
+                                    break 'ui;
+                                }
                             }
-                            ServerMessage::ConfigChanged { snapshot } => ready.config = snapshot,
+                            ServerMessage::ConfigChanged { .. } => {}
                             ServerMessage::Artifacts { artifacts, .. } => {
                                 for artifact in artifacts {
                                     state.push(artifact.title, TranscriptTone::Neutral);
@@ -200,6 +209,31 @@ pub(in crate::frontend) async fn run(
                             }
                             Err(error) => state.push(error.to_string(), TranscriptTone::Error),
                         },
+                        UiAction::Setup(mode) => {
+                            let workspace = ready.workspace.id.clone();
+                            let session = ready.session.session_id.clone();
+                            let contributions = ready.contributions.clone();
+                            let result = setup::run(
+                                &mut terminal,
+                                mode,
+                                &sender,
+                                &mut events,
+                                &mut ready,
+                            )
+                            .await;
+                            if ready.workspace.id != workspace
+                                || ready.session.session_id != session
+                                || ready.contributions != contributions
+                            {
+                                exit = FrontendExit::Reload(Box::new(ready));
+                                break 'ui;
+                            }
+                            sync_ready(&mut state, &mut catalog, &ready);
+                            if let Err(error) = result {
+                                state.push(error.to_string(), TranscriptTone::Error);
+                            }
+                            dirty = true;
+                        }
                     }
                 }
             }
@@ -220,6 +254,29 @@ pub(in crate::frontend) async fn run(
         execute!(io::stdout(), Print(CLEAR_SCREEN_AND_SCROLLBACK))?;
     }
     Ok((exit, sender, events))
+}
+
+fn refresh_ready(
+    state: &mut TuiState,
+    catalog: &mut UiCatalog,
+    ready: &mut ReadyPayload,
+    payload: ReadyPayload,
+) {
+    sync_ready(state, catalog, &payload);
+    *ready = payload;
+}
+
+fn sync_ready(state: &mut TuiState, catalog: &mut UiCatalog, ready: &ReadyPayload) {
+    state.model.model = super::terminal_text(&ready.session.model.model);
+    state.model.reasoning_effort = ready
+        .session
+        .model
+        .reasoning_effort
+        .as_deref()
+        .map(super::terminal_text);
+    state.model_route.clone_from(&ready.session.model.route);
+    state.model_choices.clone_from(&ready.model_choices);
+    catalog.replace_model_choices(&ready.model_choices);
 }
 
 async fn send_op(sender: &horus_gateway::client::GatewaySender, op: Op) -> Result<()> {

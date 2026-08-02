@@ -150,6 +150,7 @@ enum HostCommand {
     SetCredential {
         provider: String,
         api_key: String,
+        base_url: Option<String>,
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
     StartProviderLogin {
@@ -332,11 +333,13 @@ impl HostHandle {
         &self,
         provider: String,
         api_key: String,
+        base_url: Option<String>,
     ) -> std::result::Result<(), Rejection> {
         let (reply, receiver) = oneshot::channel();
         self.send(HostCommand::SetCredential {
             provider,
             api_key,
+            base_url,
             reply,
         })
         .await?;
@@ -469,9 +472,12 @@ impl HostState {
             HostCommand::SetCredential {
                 provider,
                 api_key,
+                base_url,
                 reply,
             } => {
-                let result = self.set_credential(&provider, &api_key).await;
+                let result = self
+                    .set_credential(&provider, &api_key, base_url.as_deref())
+                    .await;
                 let _ = reply.send(result);
             }
             HostCommand::StartProviderLogin {
@@ -882,23 +888,38 @@ impl HostState {
         &mut self,
         provider_id: &str,
         api_key: &str,
+        base_url: Option<&str>,
     ) -> std::result::Result<(), Rejection> {
         self.require_idle()?;
         let definition = provider(provider_id).map_err(invalid_config)?;
-        let base_url = if definition.configurable_base_url() {
+        let base_url = base_url.or_else(|| {
+            if !definition.configurable_base_url() {
+                return None;
+            }
             if self.config.agent.config.provider.provider == provider_id {
                 self.config.agent.config.provider.base_url.as_deref()
             } else {
                 None
             }
             .or_else(|| definition.default_base_url())
+        });
+        definition
+            .validate_base_url(base_url)
+            .map_err(invalid_config)?;
+        let active = &self.config.agent.config.provider;
+        let active_base_url = if definition.configurable_base_url() {
+            active
+                .base_url
+                .as_deref()
+                .or_else(|| definition.default_base_url())
         } else {
             None
         };
+        let restart = active.provider == provider_id && active_base_url == base_url;
         self.credentials
             .set(provider_id, api_key, base_url)
             .map_err(invalid_config)?;
-        if self.config.agent.config.provider.provider == provider_id {
+        if restart {
             let session_id = Some(self.running.session_id.clone());
             self.restart(session_id, "horus-gateway").await?;
         }
@@ -1928,6 +1949,53 @@ mod tests {
         })
         .await
         .expect("sessions timeout")
+    }
+
+    #[tokio::test]
+    async fn credential_endpoints_are_validated_and_persisted() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        let state = root.path().join("state");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let (store, config) =
+            ConfigStore::initialize(state, workspace, listen, None).expect("config");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
+        let cron = Arc::new(CronStore::open(store.state_dir(), &config.workspace).expect("cron"));
+        let host = HostHandle::start(store, config, Arc::clone(&credentials), cron)
+            .await
+            .expect("host");
+        let custom_endpoint = "https://example.com/v1";
+
+        host.set_credential(
+            "responses".into(),
+            "custom-secret".into(),
+            Some(custom_endpoint.into()),
+        )
+        .await
+        .expect("store custom credential");
+        let error = host
+            .set_credential(
+                "kimi".into(),
+                "fixed-secret".into(),
+                Some(custom_endpoint.into()),
+            )
+            .await
+            .expect_err("fixed provider endpoint must be rejected");
+
+        assert_eq!(
+            credentials
+                .get("responses", Some(custom_endpoint))
+                .expect("custom credential"),
+            Some("custom-secret".into())
+        );
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("fixed API endpoint"));
+        assert_eq!(
+            credentials.get("kimi", None).expect("fixed credential"),
+            None
+        );
     }
 
     #[tokio::test]

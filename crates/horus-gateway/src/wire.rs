@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use crate::{Error, Result};
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
@@ -107,6 +107,12 @@ pub enum ClientMessage {
     SetProviderCredential {
         request_id: String,
         provider: String,
+        api_key: String,
+    },
+    SetProviderEndpointCredential {
+        request_id: String,
+        provider: String,
+        base_url: String,
         api_key: String,
     },
     CreatePairingCode {

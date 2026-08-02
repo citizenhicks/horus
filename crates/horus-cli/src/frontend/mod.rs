@@ -9,6 +9,7 @@ use horus_gateway::wire::ReadyPayload;
 mod catalog;
 mod gateway_actions;
 mod headless;
+mod setup;
 mod terminal;
 mod theme;
 mod tui;
