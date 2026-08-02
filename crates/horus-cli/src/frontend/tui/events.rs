@@ -14,6 +14,7 @@ use horus::protocol::FrontendBlock;
 use horus::protocol::FrontendEvent;
 use horus::protocol::Op;
 use horus::protocol::TokenUsageInfo;
+use horus_gateway::wire::{RenderedEvent, RenderedPreview};
 
 impl TuiState {
     pub(super) fn handle_agent_event(&mut self, event: EventMsg, blocks: Vec<FrontendBlock>) {
@@ -74,7 +75,7 @@ impl TuiState {
                 self.usage.context_remaining = None;
             }
             EventMsg::SessionResumeRequested(request) => {
-                self.requested_resume = Some(request.session_id);
+                self.requested_resume = Some(request);
             }
             EventMsg::WebSearchBegin(_) => {
                 self.push("◉ searching the web", TranscriptTone::Warning);
@@ -160,6 +161,7 @@ impl TuiState {
         }
     }
 
+    #[cfg(test)]
     fn open_preview<R>(&mut self, title: String, events: Vec<EventMsg>, render: &R)
     where
         R: Fn(&EventMsg) -> Vec<FrontendBlock>,
@@ -200,6 +202,7 @@ impl UsageStatus {
     }
 }
 
+#[cfg(test)]
 pub(super) fn handle_event<R>(state: &mut TuiState, render: &R, event: EventMsg)
 where
     R: Fn(&EventMsg) -> Vec<FrontendBlock>,
@@ -225,6 +228,53 @@ where
     }
 }
 
+pub(super) fn handle_gateway_event(
+    state: &mut TuiState,
+    event: EventMsg,
+    blocks: Vec<FrontendBlock>,
+    history: Option<Vec<RenderedEvent>>,
+    preview: Option<RenderedPreview>,
+) {
+    if let Some(preview) = preview {
+        let mut replay = TuiState::default();
+        for rendered in preview.events {
+            replay_gateway_event(&mut replay, rendered.event, rendered.blocks);
+        }
+        replay.commit_reasoning();
+        replay.commit_stream();
+        state.preview = Some(PreviewState::new(
+            preview.title,
+            PreviewContent::Snapshot(replay.transcript),
+        ));
+    } else if let Some(history) = history {
+        for rendered in history {
+            if let EventMsg::UserMessage(message) = &rendered.event {
+                state.remember_composer_input(message.message.clone());
+            }
+            replay_gateway_event(state, rendered.event, rendered.blocks);
+        }
+        state.commit_reasoning();
+        state.commit_stream();
+    } else {
+        replay_gateway_event(state, event, blocks);
+    }
+}
+
+fn replay_gateway_event(state: &mut TuiState, event: EventMsg, blocks: Vec<FrontendBlock>) {
+    match event {
+        EventMsg::SessionHistory(history) => {
+            for event in history.events {
+                replay_gateway_event(state, event, Vec::new());
+            }
+            state.commit_reasoning();
+            state.commit_stream();
+        }
+        EventMsg::Frontend(FrontendEvent::Preview { .. }) => {}
+        event => state.handle_agent_event(event, blocks),
+    }
+}
+
+#[cfg(test)]
 fn replay_preview_events<R>(state: &mut TuiState, render: &R, events: Vec<EventMsg>)
 where
     R: Fn(&EventMsg) -> Vec<FrontendBlock>,

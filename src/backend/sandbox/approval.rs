@@ -310,6 +310,7 @@ fn widget(policy: ApprovalPolicy) -> FrontendWidget {
         } else {
             FrontendTone::Warning
         },
+        action: None,
     }
 }
 

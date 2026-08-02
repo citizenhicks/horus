@@ -1,35 +1,97 @@
 # Horus CLI
 
-`horus-cli` is the reference terminal coding agent built with the
-[`horus`](https://crates.io/crates/horus) framework. It owns the executable, setup and local
-configuration, and the Ratatui frontend; the agent loop and capabilities remain in the framework
-crate.
+`horus-cli` is the reference Ratatui client for a `horus-gateway`. The gateway owns agent
+composition, providers, sessions, sandboxing, usage, and scheduled work.
 
-## Run
+## Install the client
 
-Download the matching archive and checksum from
+Download matching `horus-cli` and `horus-gateway` archives and checksums from
 [GitHub Releases](https://github.com/citizenhicks/horus/releases):
 
 - Apple Silicon macOS: `aarch64-apple-darwin`
 - x86_64 Linux: `x86_64-unknown-linux-gnu`
 
-Verify with `shasum -a 256 -c FILE.sha256`, extract the archive, and put `horus` on your
-`PATH`. Rust users and other macOS or Linux architectures can build locally with Rust 1.89 or
-newer:
+Verify with `shasum -a 256 -c FILE.sha256`, extract both binaries into the same directory,
+and put it on your `PATH`. Rust users and other macOS or Linux architectures can install both
+with Rust 1.89 or newer:
 
 ```sh
-cargo install horus-cli
+cargo install horus-gateway horus-cli
 ```
 
-Run `horus`. To run from a source checkout:
+## Gateway prerequisite
+
+`horus-gateway` is the CLI's only extra runtime prerequisite; the core `horus` crate is linked
+into the binaries. Run the CLI from the workspace the local gateway should own:
 
 ```sh
+cd /path/to/repository
+horus
+```
+
+With no explicit gateway endpoint or token, the first run initializes the default loopback
+gateway for that directory, pairs the CLI, saves its token, and starts `horus-gateway` in the
+background. Subsequent runs reconnect to that gateway or restart it without changing its
+workspace. For a source checkout, build the sibling gateway binary first:
+
+```sh
+cargo build -p horus-gateway
 cargo run -p horus-cli
 ```
 
-The first interactive launch opens setup for a provider, model, optional middleware, and sandbox
-approval policy. Built-in providers are OpenAI by API key, OpenAI with ChatGPT login, Kimi,
-OpenRouter, Anthropic, and a configurable OpenAI-compatible Responses endpoint.
+Plaintext is restricted to loopback. A gateway reachable over the network must use TLS; point the
+client at that exact endpoint before pairing and connecting. Explicit endpoint or token settings
+disable automatic local management:
+
+```sh
+horus pair tls://gateway.example:443 <pairing-code>
+export HORUS_GATEWAY_ENDPOINT=tls://gateway.example:443
+horus
+```
+
+If local state already exists without a saved CLI token, stop the gateway and pair manually:
+
+```sh
+horus-gateway pair-code
+horus-gateway serve # keep this running in another terminal
+horus pair tcp://127.0.0.1:8741 <pairing-code>
+```
+
+Run one task file without the TUI:
+
+```sh
+horus run path/to/task.md
+# From a source checkout:
+cargo run -p horus-cli -- run path/to/task.md
+```
+
+The gateway workspace—not the CLI process—is the command and file boundary. An approval prompt
+aborts a headless run, so scheduled work that edits files or runs commands needs an appropriate
+gateway approval policy.
+
+Register that task with the gateway scheduler, for example every day at 03:00:
+
+```sh
+horus cron --task /path/to/repository/task.md --schedule "0 3 * * *"
+```
+
+The schedule must be quoted so the shell does not expand `*`:
+
+```sh
+horus cron list
+horus cron reschedule <task-id> --schedule "0 5 * * *"
+horus cron delete <task-id>
+horus cron run <task-id>
+horus cron history [task-id]
+```
+
+Inside the TUI, `/cron` exposes the same add, list, reschedule, delete, run, and history operations.
+Every scheduled execution is a normal durable gateway session.
+
+`/providers` shows frontend-safe provider status. `/login <provider>` starts device login;
+`/login <provider> env:NAME` securely sends the named environment variable as an API key. Secrets
+are never returned by the gateway. `/agent` prints the current composition, and `/agent <json>`
+validates, persists, and restarts that composition on the gateway while preserving the session.
 
 API-key providers use their standard environment variables:
 
@@ -40,27 +102,9 @@ export OPENROUTER_API_KEY=...
 export ANTHROPIC_API_KEY=...
 ```
 
-If a key is pasted into setup, Horus stores it in its local TOML configuration. ChatGPT login
-stores refreshable OAuth credentials in `auth.json`; it does not read or modify Codex CLI
-credentials. On Unix, Horus writes configuration and authentication files with owner-only
-permissions.
-
-## Local state
-
-The first launch creates `~/.horus`. It contains:
-
-- `config.toml` — model routes, middleware, sandbox, and checkpoint settings.
-- `auth.json` — ChatGPT credentials, when configured.
-- `horus.sqlite3` — session checkpoints and catalog state.
-
-The supported overrides are:
-
-- `HORUS_CONFIG` — an alternate configuration file.
-- `HORUS_STATE_DIR` — an alternate state directory.
-- `HORUS_SESSION_ID` — a session to resume at startup.
-
-Each normal launch starts a fresh session. Use the middleware-provided `/resume` command to select
-an existing session when session middleware is enabled.
+The CLI stores only an owner-readable endpoint-to-token map at
+`~/.horus/gateway-tokens.json`. `HORUS_GATEWAY_TOKEN` overrides it explicitly;
+`HORUS_GATEWAY_TOKEN_FILE` changes its path.
 
 ## Terminal contributions
 
@@ -69,24 +113,18 @@ The TUI is a thin subscriber to the framework capability catalog:
 - Capabilities own their commands, status widgets, references, and capability-specific rendering.
 - `/` opens both CLI shell commands and commands contributed by framework capabilities.
 - `$` references are contributed by skills middleware.
-- `@` workspace-file completion belongs to the CLI because it is terminal composer behavior.
+- `@` workspace-file completion is available for a local plaintext gateway; TLS gateways do not
+  scan similarly named paths on the client machine.
 
-The CLI itself owns only shell lifecycle and presentation commands: `/help`, `/login`, `/new`,
-`/clear`, `/model`, `/reasoning`, `/status`, `/interrupt`, and `/exit`. `/new` starts a fresh
-session; `/clear` also clears the underlying terminal scrollback. The menu changes with the
-installed capabilities. Sending ordinary text while a turn is active steers the turn when steering
-middleware is installed.
+The CLI owns only shell lifecycle and presentation commands: `/help`, `/agent`, `/providers`,
+`/login`, `/pair`, `/profile`, `/artifacts`, `/new`, `/clear`, `/model`, `/reasoning`, `/cron`,
+`/status`, `/interrupt`, and `/exit`. The menu changes with the installed gateway capabilities.
 
 The Sora-themed TUI uses the full terminal. The mouse wheel and Page Up/Page Down scroll the chat;
 Ctrl-T opens its full-screen transcript view. Arrow, page, and wheel input navigate an open preview;
 Up/Down and Ctrl-P/Ctrl-N navigate composer history.
 
-The local command sandbox uses `/usr/bin/sandbox-exec` on macOS and `bwrap` on Linux. Linux must
-permit the selected `bwrap` binary to create user, PID, and network namespaces; AppArmor-restricted
-hosts need a matching Bubblewrap profile. The `/permissions` command changes the sandbox policy
-between approval prompts, no-prompt execution without network, and no-prompt execution with
-network. Bash may write only in the workspace and its private temporary directory in every mode.
-Command execution fails closed when the platform sandbox is unavailable.
+Sandboxing runs on the gateway host and fails closed when its platform sandbox is unavailable.
 
 ## License
 

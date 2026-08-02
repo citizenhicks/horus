@@ -5,7 +5,7 @@ use ratatui::crossterm::event::{MouseEvent, MouseEventKind};
 use ratatui::style::Color;
 
 use super::*;
-use crate::frontend::catalog::UiCatalog;
+use crate::frontend::catalog::{GatewayAction, UiCatalog};
 use crate::frontend::theme::{Role, current};
 use horus::backend::model::ModelChoice;
 use horus::middleware::Middleware;
@@ -13,6 +13,7 @@ use horus::middleware::steering::Steering;
 use horus::protocol::{
     FrontendBlockFormat, FrontendSlot, FrontendTone, FrontendWidget, ReviewDecision,
 };
+use horus_gateway::wire::RenderedEvent;
 
 fn catalog(workspace: &std::path::Path) -> UiCatalog {
     let steering = Steering::default().frontend();
@@ -378,7 +379,7 @@ async fn workspace_reference_menu_inserts_a_file() {
     std::fs::write(workspace.path().join("src/lib.rs"), "").expect("source file");
     let catalog = catalog(workspace.path());
     catalog
-        .start_workspace_inventory()
+        .start_workspace_inventory(true)
         .await
         .expect("workspace inventory");
     let mut state = state();
@@ -388,6 +389,34 @@ async fn workspace_reference_menu_inserts_a_file() {
     state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &catalog);
 
     assert_eq!(state.input, "review src/lib.rs");
+}
+
+#[tokio::test]
+async fn remote_workspace_inventory_does_not_read_the_client_filesystem() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("client-only.rs"), "").expect("client file");
+    let catalog = catalog(workspace.path());
+    catalog
+        .start_workspace_inventory(false)
+        .await
+        .expect("disabled workspace inventory");
+
+    assert!(catalog.reference_suggestions('@', "client").is_empty());
+}
+
+#[test]
+fn pasted_agent_json_remains_a_command() {
+    let catalog = default_catalog();
+    let mut state = state();
+    let config = "{\n  \"provider\": {\"provider\": \"openai\"}\n}";
+    state.input = "/agent ".into();
+    state.cursor = state.input.len();
+    state.insert_paste(config);
+
+    assert_eq!(
+        state.submit_input(&catalog),
+        UiAction::Gateway(GatewayAction::Agent(config.into()))
+    );
 }
 
 #[test]
@@ -472,6 +501,7 @@ fn capability_header_is_live_styled_and_transparent() {
             slot: FrontendSlot::Header,
             text: "skills 2".into(),
             tone: FrontendTone::Neutral,
+            action: None,
         },
     );
     let mut terminal = Terminal::new(TestBackend::new(50, 15)).expect("terminal");
@@ -787,6 +817,41 @@ fn final_message_replaces_an_incomplete_stream() {
         state.transcript.back().map(|entry| entry.text.as_str()),
         Some("complete answer")
     );
+}
+
+#[test]
+fn gateway_history_preserves_child_diff_rendering() {
+    let mut state = state();
+    let message = EventMsg::AgentMessage(horus::protocol::AgentMessageEvent {
+        message: "changed the file".into(),
+        phase: Some(AgentMessagePhase::FinalAnswer),
+    });
+    let history_event = EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent {
+        events: vec![message.clone()],
+    });
+
+    events::handle_gateway_event(
+        &mut state,
+        history_event,
+        Vec::new(),
+        Some(vec![RenderedEvent {
+            event: message,
+            blocks: vec![FrontendBlock {
+                id: None,
+                group: None,
+                append: false,
+                pending: false,
+                text: "--- a/file\n+++ b/file\n-old\n+new".into(),
+                format: FrontendBlockFormat::UnifiedDiff,
+                tone: FrontendTone::Neutral,
+            }],
+        }]),
+        None,
+    );
+
+    let entry = state.transcript.back().expect("rendered history entry");
+    assert_eq!(entry.format, FrontendBlockFormat::UnifiedDiff);
+    assert_eq!(entry.text, "--- a/file\n+++ b/file\n-old\n+new");
 }
 
 #[test]

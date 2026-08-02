@@ -19,8 +19,6 @@ use super::SessionEndContext;
 use super::tools::Catalog;
 use super::tools::Tool;
 use super::tools::ToolContext;
-use super::tools::labeled_tool_heading;
-use super::tools::render_tool_event;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
@@ -31,8 +29,6 @@ use crate::backend::model::ToolDefinition;
 use crate::backend::model::internal_message_kind;
 use crate::backend::model::internal_user_message;
 use crate::backend::model::is_internal_message;
-use crate::protocol::EventMsg;
-use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendCommand;
 use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendEvent;
@@ -42,7 +38,6 @@ use crate::protocol::Op;
 use self::runtime::Followup;
 use self::runtime::MAX_MESSAGE_BYTES;
 use self::runtime::Shared;
-use self::runtime::initial_widget;
 use self::runtime::monitor_agent;
 
 mod runtime;
@@ -168,6 +163,7 @@ impl AgentScope {
         let mut checkpoint = Checkpoint::empty(&session_id);
         checkpoint.catalog_visible = false;
         checkpoint.context = fork_context(&context, turns);
+        checkpoint.session_context = parent.session_context;
         self.checkpoints
             .fork(&self.session_id, parent_sequence, &checkpoint)
             .await?;
@@ -334,21 +330,10 @@ impl Middleware for Subagents {
                 arguments: String::new(),
                 description: "open a subagent thread".into(),
             }],
-            widgets: vec![initial_widget()],
+            widgets: Vec::new(),
             references: Vec::new(),
             active_input: None,
         }
-    }
-
-    fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
-        render_tool_event(
-            event,
-            |name| subagent_tool_presentation(name).is_some(),
-            |name, arguments| {
-                let (label, detail) = subagent_tool_presentation(name).unwrap_or(("Subagent", ""));
-                labeled_tool_heading(label, detail, arguments)
-            },
-        )
     }
 
     fn command<'a>(
@@ -433,18 +418,6 @@ impl Middleware for Subagents {
             }
             Ok(())
         })
-    }
-}
-
-fn subagent_tool_presentation(name: &str) -> Option<(&'static str, &'static str)> {
-    match name {
-        "spawn_agent" => Some(("Subagent", "task_name")),
-        "send_message" => Some(("Message", "target")),
-        "followup_task" => Some(("Follow-up", "target")),
-        "list_agents" => Some(("Agents", "")),
-        "interrupt_agent" => Some(("Interrupt", "target")),
-        "wait_agent" => Some(("Wait", "")),
-        _ => None,
     }
 }
 

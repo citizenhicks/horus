@@ -15,6 +15,7 @@ use rusqlite::TransactionBehavior;
 use rusqlite::params;
 use serde_json::Value;
 
+use super::CHECKPOINT_VERSION;
 use super::Checkpoint;
 use super::CheckpointStore;
 use super::SessionCursor;
@@ -27,8 +28,9 @@ use super::TranscriptPageRequest;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
+use crate::protocol::SessionContext;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SCHEMA: &str = "
@@ -45,6 +47,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     parent_sequence INTEGER CHECK (parent_sequence IS NULL OR parent_sequence >= 0),
     latest_sequence INTEGER NOT NULL CHECK (latest_sequence >= 0),
     latest_checkpoint_json TEXT NOT NULL,
+    session_context_json TEXT NOT NULL,
     catalog_visible INTEGER NOT NULL CHECK (catalog_visible IN (0, 1)),
     first_user_message TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -60,7 +63,7 @@ CREATE TABLE IF NOT EXISTS transcript_delta (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS sessions_recent_idx
     ON sessions(updated_at DESC, latest_sequence DESC, session_id DESC);
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 COMMIT;
 ";
 
@@ -164,6 +167,7 @@ impl CheckpointStore for SqliteCheckpoint {
                 Error::Checkpoint("checkpoint sequence exceeds SQLite INTEGER".into())
             })?;
             let checkpoint_json = serde_json::to_string(&checkpoint)?;
+            let session_context_json = serde_json::to_string(&checkpoint.session_context)?;
             let transcript_json = (!transcript_delta.is_empty())
                 .then(|| serde_json::to_string(&transcript_delta))
                 .transpose()?;
@@ -171,12 +175,11 @@ impl CheckpointStore for SqliteCheckpoint {
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             store_checkpoint(
                 &transaction,
-                &checkpoint.session_id,
+                &checkpoint,
                 sequence,
                 &checkpoint_json,
-                checkpoint.catalog_visible,
+                &session_context_json,
                 transcript_json.as_deref(),
-                checkpoint.first_user_message.as_deref(),
             )?;
             transaction.commit()?;
             Ok(())
@@ -213,7 +216,8 @@ impl CheckpointStore for SqliteCheckpoint {
                     "SELECT sessions.session_id, sessions.parent_session_id,
                             sessions.parent_sequence, sessions.latest_sequence,
                             sessions.catalog_visible, sessions.first_user_message,
-                            sessions.created_at, sessions.updated_at
+                            sessions.session_context_json, sessions.created_at,
+                            sessions.updated_at
                      FROM sessions
                      WHERE ?1 IS NULL
                         OR (
@@ -350,6 +354,7 @@ impl CheckpointStore for SqliteCheckpoint {
             validation?;
             self.run(move |connection| {
                 let checkpoint_json = serde_json::to_string(&checkpoint)?;
+                let session_context_json = serde_json::to_string(&checkpoint.session_context)?;
                 let context_json = (!checkpoint.context.is_empty())
                     .then(|| serde_json::to_string(&checkpoint.context))
                     .transpose()?;
@@ -370,14 +375,16 @@ impl CheckpointStore for SqliteCheckpoint {
                 transaction.execute(
                     "INSERT INTO sessions (
                          session_id, parent_session_id, parent_sequence, latest_sequence,
-                         latest_checkpoint_json, catalog_visible, first_user_message
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                         latest_checkpoint_json, session_context_json, catalog_visible,
+                         first_user_message
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         session_id,
                         parent_session_id,
                         parent_sequence,
                         sequence,
                         checkpoint_json,
+                        session_context_json,
                         catalog_visible,
                         checkpoint.first_user_message,
                     ],
@@ -393,7 +400,8 @@ impl CheckpointStore for SqliteCheckpoint {
                     "SELECT sessions.session_id, sessions.parent_session_id,
                             sessions.parent_sequence, sessions.latest_sequence,
                             sessions.catalog_visible, sessions.first_user_message,
-                            sessions.created_at, sessions.updated_at
+                            sessions.session_context_json, sessions.created_at,
+                            sessions.updated_at
                      FROM sessions
                      WHERE sessions.session_id = ?1",
                     [&session_id],
@@ -463,31 +471,32 @@ fn configure_connection(connection: &Connection) -> Result<()> {
 
 fn store_checkpoint(
     transaction: &Transaction<'_>,
-    session_id: &str,
+    checkpoint: &Checkpoint,
     sequence: i64,
     json: &str,
-    catalog_visible: bool,
+    session_context_json: &str,
     transcript_json: Option<&str>,
-    first_user_message: Option<&str>,
 ) -> Result<()> {
     let changed = transaction.execute(
         "INSERT INTO sessions (
-             session_id, latest_sequence, latest_checkpoint_json, catalog_visible,
-             first_user_message
-         ) VALUES (?1, ?2, ?3, ?4, ?5)
+             session_id, latest_sequence, latest_checkpoint_json, session_context_json,
+             catalog_visible, first_user_message
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(session_id) DO UPDATE SET
              latest_sequence = excluded.latest_sequence,
              latest_checkpoint_json = excluded.latest_checkpoint_json,
+             session_context_json = excluded.session_context_json,
              catalog_visible = excluded.catalog_visible,
              first_user_message = COALESCE(sessions.first_user_message, excluded.first_user_message),
              updated_at = unixepoch()
          WHERE excluded.latest_sequence > sessions.latest_sequence",
         params![
-            session_id,
+            checkpoint.session_id,
             sequence,
             json,
-            catalog_visible,
-            first_user_message
+            session_context_json,
+            checkpoint.catalog_visible,
+            checkpoint.first_user_message,
         ],
     )?;
     if changed == 0 {
@@ -501,7 +510,7 @@ fn store_checkpoint(
     transaction.execute(
         "INSERT INTO transcript_delta (session_id, sequence, items_json)
          VALUES (?1, ?2, ?3)",
-        params![session_id, sequence, transcript_json],
+        params![checkpoint.session_id, sequence, transcript_json],
     )?;
     Ok(())
 }
@@ -513,6 +522,7 @@ type SessionRow = (
     i64,
     bool,
     Option<String>,
+    String,
     i64,
     i64,
 );
@@ -527,12 +537,15 @@ fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
     ))
 }
 
 fn summary_from_row(row: SessionRow) -> Result<SessionSummary> {
+    let session_context: SessionContext = serde_json::from_str(&row.6)?;
     Ok(SessionSummary {
         session_id: row.0,
+        session_context,
         parent_session_id: row.1,
         parent_sequence: row
             .2
@@ -543,8 +556,8 @@ fn summary_from_row(row: SessionRow) -> Result<SessionSummary> {
             .map_err(|_| Error::Checkpoint("session has a negative sequence".into()))?,
         catalog_visible: row.4,
         first_user_message: row.5,
-        created_at: row.6,
-        updated_at: row.7,
+        created_at: row.7,
+        updated_at: row.8,
     })
 }
 
@@ -570,7 +583,7 @@ fn decode_checkpoint(session_id: &str, sequence: i64, json: &str) -> Result<Chec
 }
 
 fn validate_checkpoint(checkpoint: &Checkpoint) -> Result<()> {
-    if checkpoint.version != 1 {
+    if checkpoint.version != CHECKPOINT_VERSION {
         return Err(Error::Checkpoint(format!(
             "unsupported checkpoint version {}",
             checkpoint.version
@@ -674,6 +687,87 @@ mod tests {
             store.load("session").await.expect("load checkpoint"),
             Some(checkpoint)
         );
+    }
+
+    #[tokio::test]
+    async fn session_context_round_trips_through_save_catalog_and_fork() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+        let context = crate::protocol::SessionContext {
+            workspace_id: Some("workspace-1".into()),
+            workspace_label: Some("Project One".into()),
+            origin_label: Some("cron".into()),
+            ..crate::protocol::SessionContext::default()
+        };
+        let mut parent = Checkpoint::empty("parent");
+        parent.session_context.clone_from(&context);
+        store.save(&parent, &[]).await.expect("save parent");
+        let mut child = Checkpoint::empty("child");
+        child.session_context.clone_from(&context);
+
+        let fork = store
+            .fork(&parent.session_id, parent.sequence, &child)
+            .await
+            .expect("fork session");
+        let page = store
+            .list_sessions_page(SessionPageRequest {
+                cursor: None,
+                limit: 10,
+            })
+            .await
+            .expect("list sessions");
+
+        assert_eq!(
+            (
+                store
+                    .load(&parent.session_id)
+                    .await
+                    .expect("load parent")
+                    .expect("parent checkpoint")
+                    .session_context,
+                fork.session_context,
+                page.sessions
+                    .iter()
+                    .map(|session| &session.session_context)
+                    .collect::<Vec<_>>(),
+            ),
+            (context.clone(), context.clone(), vec![&context, &context])
+        );
+    }
+
+    #[tokio::test]
+    async fn session_catalog_reads_context_without_decoding_the_checkpoint() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+        let context = SessionContext {
+            workspace_id: Some("workspace-1".into()),
+            ..SessionContext::default()
+        };
+        let mut checkpoint = Checkpoint::empty("session");
+        checkpoint.session_context.clone_from(&context);
+        store.save(&checkpoint, &[]).await.expect("save session");
+        store
+            .run(|connection| {
+                connection.execute(
+                    "UPDATE sessions SET latest_checkpoint_json = ?1 WHERE session_id = ?2",
+                    ["invalid", "session"],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("replace full checkpoint payload");
+
+        let page = store
+            .list_sessions_page(SessionPageRequest {
+                cursor: None,
+                limit: 1,
+            })
+            .await
+            .expect("list sessions");
+
+        assert_eq!(page.sessions[0].session_context, context);
     }
 
     #[tokio::test]

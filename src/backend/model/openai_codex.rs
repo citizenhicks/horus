@@ -19,6 +19,7 @@ use std::time::UNIX_EPOCH;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::Client;
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -29,6 +30,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
+use tokio::time::sleep;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -39,6 +42,7 @@ use super::openai_socket::OpenAiSocket;
 use super::openai_socket::SEARCH;
 use super::provider::BrowserAuth;
 use super::provider::BrowserLogin;
+use super::provider::DeviceLogin;
 use super::provider::HostedWebSearch;
 use super::provider::ProviderAuth;
 use super::provider::ProviderBuildConfig;
@@ -55,6 +59,10 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+const DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const SCOPE: &str = "openid profile email offline_access";
 const JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 const CALLBACK_LIMIT: usize = 16 * 1024;
@@ -78,6 +86,13 @@ struct ChatGptLogin {
     client: Client,
 }
 
+struct ChatGptDeviceLogin {
+    user_code: String,
+    device_auth_id: String,
+    interval: Duration,
+    client: Client,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OAuthCredential {
@@ -92,6 +107,32 @@ struct TokenResponse {
     access_token: String,
     refresh_token: String,
     expires_in: u64,
+}
+
+#[derive(Serialize)]
+struct DeviceUserCodeRequest {
+    client_id: &'static str,
+}
+
+#[derive(Deserialize)]
+struct DeviceUserCodeResponse {
+    device_auth_id: String,
+    #[serde(alias = "usercode")]
+    user_code: String,
+    interval: String,
+}
+
+#[derive(Serialize)]
+struct DeviceTokenRequest<'a> {
+    device_auth_id: &'a str,
+    user_code: &'a str,
+}
+
+#[derive(Deserialize)]
+struct DeviceTokenResponse {
+    authorization_code: String,
+    code_challenge: String,
+    code_verifier: String,
 }
 
 type AuthFile = BTreeMap<String, OAuthCredential>;
@@ -191,14 +232,116 @@ impl ChatGptLogin {
         .await
         .map_err(|_| Error::Auth("ChatGPT login timed out".into()))??;
         let credential = exchange_code(&self.client, &code, &self.verifier, REDIRECT_URI).await?;
-        tokio::task::spawn_blocking(move || {
-            let _lock = acquire_lock(&path)?;
-            write_credential(&path, &credential)
-        })
-        .await
-        .map_err(|error| Error::Auth(format!("credential lock task failed: {error}")))??;
-        Ok(())
+        save_login_credential(path, credential).await
     }
+}
+
+impl ChatGptDeviceLogin {
+    async fn start() -> Result<Self> {
+        let client = http_client()?;
+        let response = client
+            .post(DEVICE_USER_CODE_URL)
+            .json(&DeviceUserCodeRequest {
+                client_id: CLIENT_ID,
+            })
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::Auth(format!(
+                "ChatGPT device-code login is unavailable (HTTP {status})"
+            )));
+        }
+        let response: DeviceUserCodeResponse = bounded_json(response, "device-code").await?;
+        if response.device_auth_id.trim().is_empty() || response.user_code.trim().is_empty() {
+            return Err(Error::Auth(
+                "ChatGPT device-code response omitted its code".into(),
+            ));
+        }
+        let interval = response
+            .interval
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| Error::Auth("ChatGPT device-code interval was invalid".into()))?
+            .clamp(1, 30);
+        Ok(Self {
+            user_code: response.user_code,
+            device_auth_id: response.device_auth_id,
+            interval: Duration::from_secs(interval),
+            client,
+        })
+    }
+
+    async fn finish(self, path: PathBuf) -> Result<()> {
+        let started = Instant::now();
+        let response = loop {
+            let response = self
+                .client
+                .post(DEVICE_TOKEN_URL)
+                .json(&DeviceTokenRequest {
+                    device_auth_id: &self.device_auth_id,
+                    user_code: &self.user_code,
+                })
+                .send()
+                .await?;
+            let status = response.status();
+            if status.is_success() {
+                break bounded_json::<DeviceTokenResponse>(response, "device-token").await?;
+            }
+            if !matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
+                return Err(Error::Auth(format!(
+                    "ChatGPT device-code login failed with HTTP {status}"
+                )));
+            }
+            let remaining = CALLBACK_TIMEOUT.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(Error::Auth("ChatGPT device-code login timed out".into()));
+            }
+            sleep(self.interval.min(remaining)).await;
+        };
+        if response.authorization_code.trim().is_empty()
+            || response.code_challenge.trim().is_empty()
+            || response.code_verifier.trim().is_empty()
+        {
+            return Err(Error::Auth(
+                "ChatGPT device-token response omitted authorization data".into(),
+            ));
+        }
+        let credential = exchange_code(
+            &self.client,
+            &response.authorization_code,
+            &response.code_verifier,
+            DEVICE_REDIRECT_URI,
+        )
+        .await?;
+        save_login_credential(path, credential).await
+    }
+}
+
+async fn bounded_json<T>(mut response: reqwest::Response, operation: &str) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > TOKEN_LIMIT {
+            return Err(Error::Auth(format!(
+                "ChatGPT {operation} response was too large"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|_| Error::Auth(format!("ChatGPT {operation} response was invalid")))
+}
+
+async fn save_login_credential(path: PathBuf, credential: OAuthCredential) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let _lock = acquire_lock(&path)?;
+        write_credential(&path, &credential)
+    })
+    .await
+    .map_err(|error| Error::Auth(format!("credential lock task failed: {error}")))?
 }
 
 fn http_client() -> Result<Client> {
@@ -616,12 +759,27 @@ impl BrowserLogin for ChatGptLogin {
     }
 }
 
+impl DeviceLogin for ChatGptDeviceLogin {
+    fn verification_url(&self) -> &str {
+        DEVICE_VERIFICATION_URL
+    }
+
+    fn user_code(&self) -> &str {
+        &self.user_code
+    }
+
+    fn complete(self: Box<Self>, path: PathBuf) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async move { self.finish(path).await })
+    }
+}
+
 static BROWSER_AUTH: BrowserAuth = BrowserAuth::new(
     "ChatGPT",
     browser_configured,
     browser_credential,
     browser_login,
-);
+)
+.with_device_login(device_login);
 
 fn browser_configured(path: &Path) -> Result<bool> {
     ChatGptAuth::configured(path)
@@ -635,6 +793,10 @@ fn browser_credential(path: &Path) -> Result<ProviderCredential> {
 
 fn browser_login() -> BoxFuture<'static, Result<Box<dyn BrowserLogin>>> {
     Box::pin(async { Ok(Box::new(ChatGptLogin::start().await?) as Box<dyn BrowserLogin>) })
+}
+
+fn device_login() -> BoxFuture<'static, Result<Box<dyn DeviceLogin>>> {
+    Box::pin(async { Ok(Box::new(ChatGptDeviceLogin::start().await?) as Box<dyn DeviceLogin>) })
 }
 
 pub(super) const fn provider() -> ProviderDefinition {

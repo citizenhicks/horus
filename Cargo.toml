@@ -1,6 +1,6 @@
 [package]
 name = "horus"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "A small, modular Rust framework for building coding agents"
@@ -11,12 +11,13 @@ readme = "README.md"
 publish = ["crates-io"]
 keywords = ["agent", "ai", "llm", "openai", "tools"]
 categories = ["asynchronous", "development-tools"]
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE", "/NOTICE"]
 
 [lints]
 workspace = true
 
 [workspace]
-members = ["crates/horus-cli"]
+members = ["crates/horus-cli", "crates/horus-gateway"]
 default-members = ["crates/horus-cli"]
 resolver = "3"
 

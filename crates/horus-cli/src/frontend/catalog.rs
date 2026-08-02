@@ -52,11 +52,18 @@ struct UiCommand {
 #[derive(Clone)]
 enum CommandHandler {
     Help,
-    Setup,
+    Agent,
+    Workspace,
+    Providers,
+    Login,
+    Pair,
+    Profile,
+    Artifacts,
     New,
     Clear,
     Model,
     Reasoning,
+    Cron,
     Status,
     Interrupt,
     Exit,
@@ -80,13 +87,36 @@ pub(crate) struct CommandContext<'a> {
 #[derive(Debug, PartialEq)]
 pub(crate) enum CommandAction {
     Submit(Op),
+    Gateway(GatewayAction),
     Frontend(FrontendEvent),
     ShowMenu,
     Print(String),
     Exit,
     New,
     Clear,
-    Setup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GatewayAction {
+    Agent(String),
+    Workspace(String),
+    Providers,
+    Login(String),
+    Pair,
+    Profile,
+    Artifacts,
+    Cron(CronAction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CronAction {
+    Slash(String),
+    Add { task: PathBuf, schedule: String },
+    List,
+    Reschedule { id: String, schedule: String },
+    Delete(String),
+    Run(String),
+    History(Option<String>),
 }
 
 impl UiCatalog {
@@ -145,12 +175,19 @@ impl UiCatalog {
         })
     }
 
-    pub(crate) fn start_workspace_inventory(&self) -> tokio::task::JoinHandle<()> {
+    pub(crate) fn start_workspace_inventory(
+        &self,
+        local_gateway: bool,
+    ) -> tokio::task::JoinHandle<()> {
         let workspace = self.workspace.clone();
         let references = Arc::clone(&self.workspace_references);
         tokio::task::spawn_blocking(move || {
-            let items = workspace_inventory(&workspace)
-                .unwrap_or_default()
+            let paths = if local_gateway {
+                workspace_inventory(&workspace).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let items = paths
                 .into_iter()
                 .map(|path| UiReference {
                     trigger: WORKSPACE_REFERENCE_TRIGGER,
@@ -171,6 +208,10 @@ impl UiCatalog {
 
     pub(crate) fn model_choices(&self) -> &[ModelChoice] {
         &self.model_choices
+    }
+
+    pub(crate) fn workspace(&self) -> &Path {
+        &self.workspace
     }
 
     pub(crate) fn active_input(&self) -> Option<&FrontendActiveInput> {
@@ -282,11 +323,22 @@ impl UiCatalog {
         }
         Some(match &command.handler {
             CommandHandler::Help => CommandAction::ShowMenu,
-            CommandHandler::Setup => CommandAction::Setup,
+            CommandHandler::Agent => CommandAction::Gateway(GatewayAction::Agent(arguments.into())),
+            CommandHandler::Workspace => {
+                CommandAction::Gateway(GatewayAction::Workspace(arguments.into()))
+            }
+            CommandHandler::Providers => CommandAction::Gateway(GatewayAction::Providers),
+            CommandHandler::Login => CommandAction::Gateway(GatewayAction::Login(arguments.into())),
+            CommandHandler::Pair => CommandAction::Gateway(GatewayAction::Pair),
+            CommandHandler::Profile => CommandAction::Gateway(GatewayAction::Profile),
+            CommandHandler::Artifacts => CommandAction::Gateway(GatewayAction::Artifacts),
             CommandHandler::New => CommandAction::New,
             CommandHandler::Clear => CommandAction::Clear,
             CommandHandler::Model => model_picker(&self.model_choices),
             CommandHandler::Reasoning => reasoning_picker(context.model_route, &self.model_choices),
+            CommandHandler::Cron => {
+                CommandAction::Gateway(GatewayAction::Cron(CronAction::Slash(arguments.into())))
+            }
             CommandHandler::Status => CommandAction::Print(context.status.to_string()),
             CommandHandler::Interrupt => context.active_turn.map_or_else(
                 || CommandAction::Print("no active turn to interrupt".into()),
@@ -336,7 +388,41 @@ impl UiReference {
 fn cli_commands() -> Vec<UiCommand> {
     vec![
         command("help", "show commands", false, CommandHandler::Help),
-        command("login", "add a model provider", true, CommandHandler::Setup),
+        UiCommand {
+            name: "agent".into(),
+            arguments: "[<composition-json>]".into(),
+            description: "show or change gateway agent composition".into(),
+            requires_idle: true,
+            handler: CommandHandler::Agent,
+        },
+        UiCommand {
+            name: "workspace".into(),
+            arguments: "<gateway-path>".into(),
+            description: "change the gateway workspace".into(),
+            requires_idle: true,
+            handler: CommandHandler::Workspace,
+        },
+        command("providers", "show gateway provider configuration", false, CommandHandler::Providers),
+        UiCommand {
+            name: "login".into(),
+            arguments: "<provider> [env:NAME]".into(),
+            description: "configure provider authentication on the gateway".into(),
+            requires_idle: true,
+            handler: CommandHandler::Login,
+        },
+        command("profile", "show gateway usage statistics", false, CommandHandler::Profile),
+        command(
+            "pair",
+            "create a pairing code for another client",
+            false,
+            CommandHandler::Pair,
+        ),
+        command(
+            "artifacts",
+            "show code diff and subagent artifacts",
+            false,
+            CommandHandler::Artifacts,
+        ),
         command("new", "start a new session", true, CommandHandler::New),
         command(
             "clear",
@@ -356,6 +442,13 @@ fn cli_commands() -> Vec<UiCommand> {
             true,
             CommandHandler::Reasoning,
         ),
+        UiCommand {
+            name: "cron".into(),
+            arguments: "[list|add <task> <schedule>|reschedule <id> <schedule>|delete <id>|run <id>|history [id]]".into(),
+            description: "list or manage scheduled tasks".into(),
+            requires_idle: false,
+            handler: CommandHandler::Cron,
+        },
         command(
             "status",
             "show turn, token, and capability status",
@@ -657,7 +750,7 @@ mod tests {
         let catalog =
             UiCatalog::build(&[contribution], &model_choices(), workspace.path()).expect("catalog");
         catalog
-            .start_workspace_inventory()
+            .start_workspace_inventory(true)
             .await
             .expect("workspace inventory");
         let commands = catalog.menu();
@@ -666,6 +759,10 @@ mod tests {
         assert!(
             commands.contains("/inspect")
                 && commands.contains("/model")
+                && commands.contains("/workspace")
+                && commands.contains("/cron")
+                && commands.contains("/pair")
+                && commands.contains("/artifacts")
                 && references
                     .iter()
                     .any(|item| item.value == "\"source file.rs\"")

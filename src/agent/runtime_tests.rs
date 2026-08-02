@@ -24,6 +24,7 @@ use crate::middleware::MiddlewareStack;
 use crate::protocol::EventMsg;
 use crate::protocol::MAX_USER_INPUT_BYTES;
 use crate::protocol::Op;
+use crate::protocol::SessionContext;
 use crate::protocol::ToolCallEndEvent;
 
 struct TestModel;
@@ -76,8 +77,17 @@ fn config(
     checkpoints: Arc<dyn CheckpointStore>,
     session_id: &str,
 ) -> AgentConfig {
+    config_with_route(workspace, checkpoints, session_id, "test")
+}
+
+fn config_with_route(
+    workspace: &Path,
+    checkpoints: Arc<dyn CheckpointStore>,
+    session_id: &str,
+    route: &str,
+) -> AgentConfig {
     AgentConfig::new(
-        Arc::new(ModelRouter::new("test", Arc::new(TestModel))),
+        Arc::new(ModelRouter::new(route, Arc::new(TestModel))),
         Arc::new(Sandbox::new(
             Arc::new(LocalSandbox::new(workspace).expect("local sandbox")),
             ApprovalPolicy::On,
@@ -87,6 +97,57 @@ fn config(
         "test prompt",
     )
     .session_id(session_id)
+}
+
+#[tokio::test]
+async fn restart_falls_back_when_the_saved_model_route_was_removed() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let mut original = create_agent(config_with_route(
+        workspace.path(),
+        checkpoint_store,
+        "target",
+        "old",
+    ))
+    .await
+    .expect("create original agent");
+    original.next_event().await.expect("configured event");
+    drop(original);
+
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let mut restarted = create_agent(config_with_route(
+        workspace.path(),
+        checkpoint_store,
+        "target",
+        "new",
+    ))
+    .await
+    .expect("restart with replacement route");
+    let EventMsg::SessionConfigured(configured) = restarted
+        .next_event()
+        .await
+        .expect("replacement configured event")
+        .msg
+    else {
+        panic!("expected configured event");
+    };
+    let saved = checkpoints
+        .load("target")
+        .await
+        .expect("load checkpoint")
+        .expect("saved checkpoint");
+
+    assert_eq!(
+        (
+            configured.model.route.as_str(),
+            saved.model_route.as_deref()
+        ),
+        ("new", Some("new"))
+    );
 }
 
 #[tokio::test]
@@ -128,6 +189,103 @@ async fn stale_save_does_not_leapfrog_winning_checkpoint() {
             .expect("load checkpoint")
             .expect("winning checkpoint"),
         winner
+    );
+}
+
+#[tokio::test]
+async fn resumed_agent_uses_the_durable_session_context() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let durable_context = SessionContext {
+        workspace_label: Some("Project One".into()),
+        origin_label: Some("cron".into()),
+        ..SessionContext::default()
+    };
+    let mut agent = create_agent(
+        config(workspace.path(), checkpoint_store, "target")
+            .session_context(durable_context.clone()),
+    )
+    .await
+    .expect("create agent");
+    let EventMsg::SessionConfigured(created) =
+        agent.next_event().await.expect("created session event").msg
+    else {
+        panic!("expected configured session");
+    };
+    drop(agent);
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints;
+    let mut resumed = create_agent(
+        config(workspace.path(), checkpoint_store, "target").session_context(SessionContext {
+            workspace_label: Some("wrong workspace".into()),
+            ..SessionContext::default()
+        }),
+    )
+    .await
+    .expect("resume agent");
+    let EventMsg::SessionConfigured(restored) = resumed
+        .next_event()
+        .await
+        .expect("resumed session event")
+        .msg
+    else {
+        panic!("expected configured session");
+    };
+
+    assert_eq!(
+        (created.context, restored.context),
+        (durable_context.clone(), durable_context)
+    );
+}
+
+#[tokio::test]
+async fn resume_request_carries_the_target_session_context() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let target_context = SessionContext {
+        workspace_id: Some("workspace-two".into()),
+        workspace_label: Some("Project Two".into()),
+        origin_label: Some("cron".into()),
+        ..SessionContext::default()
+    };
+    let mut target = Checkpoint::empty("target");
+    target.session_context.clone_from(&target_context);
+    target.model_route = Some("foreign-workspace-route".into());
+    checkpoints
+        .save(&target, &[])
+        .await
+        .expect("save target session");
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints;
+    let agent = create_agent(config(workspace.path(), checkpoint_store, "current"))
+        .await
+        .expect("create current agent");
+    let (sender, mut events) = agent.into_parts();
+    events.recv().await.expect("configured session event");
+    let submission_id = sender
+        .submit(Op::ResumeSession {
+            session_id: "target".into(),
+        })
+        .expect("request resume");
+
+    let event = loop {
+        let event = events.recv().await.expect("resume requested event");
+        if event.submission_id.as_deref() == Some(&submission_id) {
+            break event;
+        }
+    };
+    let EventMsg::SessionResumeRequested(request) = event.msg else {
+        panic!("expected resume request");
+    };
+
+    assert_eq!(
+        (event.submission_id, request.session_id, request.context),
+        (Some(submission_id), "target".into(), target_context)
     );
 }
 

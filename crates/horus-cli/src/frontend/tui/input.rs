@@ -14,6 +14,7 @@ use super::view::terminal_text;
 use super::view::widget_status;
 use crate::frontend::catalog::CommandAction;
 use crate::frontend::catalog::CommandContext;
+use crate::frontend::catalog::GatewayAction;
 use crate::frontend::catalog::MenuItem;
 use crate::frontend::catalog::UiCatalog;
 use horus::protocol::EventMsg;
@@ -29,10 +30,10 @@ const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 pub(super) enum UiAction {
     None,
     Submit(Op),
+    Gateway(GatewayAction),
     Exit,
     New(String),
     Clear(String),
-    Setup,
 }
 
 impl TuiState {
@@ -511,6 +512,7 @@ impl TuiState {
 
     pub(super) fn submit_input(&mut self, catalog: &UiCatalog) -> UiAction {
         let had_pastes = !self.pastes.is_empty();
+        let pasted_agent_config = had_pastes && self.input.starts_with("/agent ");
         let line = self.expanded_input();
         if line.len() > MAX_USER_INPUT_BYTES {
             self.input_limit_reached = true;
@@ -526,7 +528,7 @@ impl TuiState {
             line.trim()
         };
         let status = self.status();
-        if !had_pastes
+        if (!had_pastes || pasted_agent_config)
             && let Some(action) = catalog.dispatch(
                 line,
                 CommandContext {
@@ -543,6 +545,7 @@ impl TuiState {
                     }
                     UiAction::Submit(op)
                 }
+                CommandAction::Gateway(action) => UiAction::Gateway(action),
                 CommandAction::Frontend(event) => {
                     self.handle_agent_event(EventMsg::Frontend(event), Vec::new());
                     UiAction::None
@@ -558,7 +561,6 @@ impl TuiState {
                 CommandAction::Exit => UiAction::Exit,
                 CommandAction::New => UiAction::New(self.model_route.clone()),
                 CommandAction::Clear => UiAction::Clear(self.model_route.clone()),
-                CommandAction::Setup => UiAction::Setup,
             };
         }
         if let Some(id) = self.approval.take() {

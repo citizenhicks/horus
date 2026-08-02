@@ -212,6 +212,7 @@ impl Middleware for Skills {
                 slot: FrontendSlot::Header,
                 text: format!("skills {}", self.skills.len()),
                 tone: FrontendTone::Neutral,
+                action: None,
             }],
             references: self
                 .skills

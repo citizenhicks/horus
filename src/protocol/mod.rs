@@ -19,7 +19,7 @@ pub struct Submission {
     pub op: Op,
 }
 
-/// Frontend-visible labels for the session owner and workspace.
+/// Frontend-visible context for the session owner, workspace, and origin.
 ///
 /// These values are correlation metadata, not authentication or authorization.
 /// A remote host must derive them after authentication and inject tenant-scoped
@@ -38,6 +38,12 @@ pub struct SessionContext {
     /// Opaque workspace identifier; this is not a filesystem path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// Optional frontend-facing workspace label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_label: Option<String>,
+    /// Optional label describing what created the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_label: Option<String>,
 }
 
 /// Commands supported by the agent.
@@ -236,6 +242,9 @@ pub struct FrontendWidget {
     pub slot: FrontendSlot,
     pub text: String,
     pub tone: FrontendTone,
+    /// Optional operation invoked when a frontend activates this widget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<Op>,
 }
 
 /// Stable locations a thin frontend shell makes available to capabilities.
@@ -292,7 +301,7 @@ pub struct FrontendPickerOption {
 
 /// Generic capability UI updates understood by every frontend.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "frontend_type", rename_all = "snake_case")]
 pub enum FrontendEvent {
     Render {
         capability: String,
@@ -407,6 +416,7 @@ pub struct ModelChangedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionResumeRequestedEvent {
     pub session_id: String,
+    pub context: SessionContext,
 }
 
 /// Responses API message phases understood by frontends.
@@ -537,6 +547,8 @@ mod tests {
                 user_id: Some("user-1".into()),
                 user_name: Some("Ada".into()),
                 workspace_id: Some("workspace-1".into()),
+                workspace_label: Some("Project One".into()),
+                origin_label: Some("cron".into()),
             },
             model: ModelChangedEvent {
                 route: "default".into(),
@@ -555,7 +567,9 @@ mod tests {
                     "tenant_id": "tenant-1",
                     "user_id": "user-1",
                     "user_name": "Ada",
-                    "workspace_id": "workspace-1"
+                    "workspace_id": "workspace-1",
+                    "workspace_label": "Project One",
+                    "origin_label": "cron"
                 },
                 "model": {
                     "route": "default",
@@ -564,6 +578,52 @@ mod tests {
                     "model_context_window": 128_000
                 }
             })
+        );
+    }
+
+    #[test]
+    fn session_resume_request_carries_the_target_context() {
+        let event = EventMsg::SessionResumeRequested(SessionResumeRequestedEvent {
+            session_id: "session-2".into(),
+            context: SessionContext {
+                workspace_label: Some("Project Two".into()),
+                origin_label: Some("cron".into()),
+                ..SessionContext::default()
+            },
+        });
+
+        assert_eq!(
+            serde_json::to_value(event).expect("serialize resume event"),
+            json!({
+                "type": "session_resume_requested",
+                "session_id": "session-2",
+                "context": {
+                    "workspace_label": "Project Two",
+                    "origin_label": "cron"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn frontend_event_has_a_distinct_nested_discriminator() {
+        let event = EventMsg::Frontend(FrontendEvent::Widget {
+            capability: "subagents".into(),
+            item: FrontendWidget {
+                id: "status".into(),
+                slot: FrontendSlot::ComposerHeader,
+                text: "2 agents".into(),
+                tone: FrontendTone::Neutral,
+                action: None,
+            },
+        });
+        let value = serde_json::to_value(&event).expect("serialize frontend event");
+
+        assert_eq!(value["type"], "frontend");
+        assert_eq!(value["frontend_type"], "widget");
+        assert_eq!(
+            serde_json::from_value::<EventMsg>(value).expect("deserialize frontend event"),
+            event
         );
     }
 

@@ -24,6 +24,13 @@ pub use approval::ApprovalPolicy;
 
 use approval::Approval;
 
+/// Deny-by-default macOS Seatbelt prelude shared by first-party sandbox backends.
+///
+/// Backends must append their own filesystem allow rules before using it.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base_policy.sbpl");
+
 /// Whether a sandbox backend permits network access for one command.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

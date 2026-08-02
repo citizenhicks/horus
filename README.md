@@ -1,51 +1,51 @@
 # Horus
 
-Horus is a small Rust framework for building coding agents. It provides one asynchronous agent
-loop, an ordered middleware pipeline, a frontend-neutral protocol, and replaceable model,
-sandbox, and checkpoint backends.
+Horus is a small Rust coding-agent framework with one headless gateway and a
+thin terminal client. The gateway owns the agent, provider credentials,
+sandbox, sessions, artifacts, usage statistics, and scheduled work.
 
 | Package | Purpose |
 | --- | --- |
 | [`horus`](https://crates.io/crates/horus) | Frontend-neutral agent framework |
-| [`horus-cli`](https://crates.io/crates/horus-cli) | Reference terminal coding agent |
+| [`horus-gateway`](https://crates.io/crates/horus-gateway) | Headless authenticated agent host |
+| [`horus-cli`](https://crates.io/crates/horus-cli) | Terminal gateway client |
 
-```mermaid
-flowchart LR
-    UI["Consumer-owned frontend"] <-->|"Op / Event"| Protocol["protocol"]
-    Protocol <--> Agent["agent loop"]
-    Agent --> Middleware["middleware stack"]
-    Agent --> Backend["backend traits"]
-    Middleware --> Backend
-    Middleware -. "commands · widgets · render blocks" .-> UI
-```
+## Run a local gateway
 
-## Install
-
-Download the matching archive and checksum from
-[GitHub Releases](https://github.com/citizenhicks/horus/releases):
-
-- Apple Silicon macOS: `aarch64-apple-darwin`
-- x86_64 Linux: `x86_64-unknown-linux-gnu`
-
-Verify with `shasum -a 256 -c FILE.sha256`, extract the archive, and put `horus` on your
-`PATH`. Rust users and other macOS or Linux architectures can build locally:
+Download matching `horus-gateway` and `horus-cli` archives and checksums from
+[GitHub Releases](https://github.com/citizenhicks/horus/releases), placing both
+binaries in the same directory, or install them with Rust 1.89 or newer:
 
 ```sh
-cargo install horus-cli
+cargo install horus-gateway horus-cli
 ```
 
-Run `horus`. The first launch opens the provider and middleware setup flow, then creates
-`~/.horus/config.toml` and `~/.horus/horus.sqlite3`.
-
-To run the workspace directly:
+Then run `horus` from the workspace it should own:
 
 ```sh
+cd /path/to/repository
+horus
+```
+
+On first use, the CLI initializes the default local gateway for that directory,
+pairs itself, saves its token, and starts the gateway in the background. Later
+runs reconnect to it or restart it without changing its workspace. The core
+`horus` crate is linked into the binaries and is not a separate runtime
+prerequisite.
+
+Plaintext is limited to loopback. A remote gateway must listen with a TLS
+certificate and clients pair with `tls://host:port`; setting an explicit
+`HORUS_GATEWAY_ENDPOINT` disables automatic local management. See the
+[gateway guide](https://github.com/citizenhicks/horus/blob/main/crates/horus-gateway/README.md),
+[CLI guide](https://github.com/citizenhicks/horus/blob/main/crates/horus-cli/README.md)
+for manual and remote setup.
+
+To run the Rust binaries from this checkout:
+
+```sh
+cargo build -p horus-gateway
 cargo run -p horus-cli
 ```
-
-See the
-[CLI guide](https://github.com/citizenhicks/horus/blob/main/crates/horus-cli/README.md)
-for providers, local state, and TUI behavior.
 
 ## Framework
 
@@ -138,24 +138,24 @@ active in every mode.
 
 ## Contributing
 
-Read [AGENTS.md](AGENTS.md) before changing the framework. It defines module ownership,
+Read [AGENTS.md](https://github.com/citizenhicks/horus/blob/main/AGENTS.md) before changing the framework. It defines module ownership,
 capability extension points, required checks, and the no-compatibility rule for this initial
 release.
 
 Release tags are intentionally separate:
 
 - `horus-vX.Y.Z` publishes the framework crate and creates its GitHub Release.
+- `horus-gateway-vX.Y.Z` publishes the gateway crate and attaches server binaries.
 - `horus-cli-vX.Y.Z` publishes the CLI crate and attaches downloadable binaries to a GitHub
   Release.
 
-Publish `horus` first and wait for it to appear in the crates.io index, because `horus-cli`
-depends on that release. Creating a tag is a release action; ordinary pushes and pull requests
-only run CI. The release workflow expects a `CARGO_REGISTRY_TOKEN` repository secret for the
-initial crates.io publications.
+Publish `horus`, then `horus-gateway`, then `horus-cli`, waiting for each dependency to appear in
+the crates.io index. Creating a tag is a release action; ordinary pushes and pull requests only
+run CI. The release workflow expects a `CARGO_REGISTRY_TOKEN` repository secret for the initial
+crates.io publications.
 
 ## License
 
 Licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for attribution to
 [OpenAI Codex](https://github.com/openai/codex), Ratatui-derived work, and the
 [Sora](https://github.com/Aejkatappaja/sora) color palette.
-

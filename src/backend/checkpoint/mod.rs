@@ -9,9 +9,12 @@ use crate::Error;
 use crate::Result;
 use crate::backend::model::ToolCall;
 use crate::backend::sandbox::NetworkAccess;
+use crate::protocol::SessionContext;
 use crate::protocol::TokenUsage;
 
 pub mod sqlite;
+
+pub(crate) const CHECKPOINT_VERSION: u32 = 2;
 
 /// A tool batch waiting for a frontend decision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -32,6 +35,7 @@ pub struct PendingApproval {
 pub struct Checkpoint {
     pub version: u32,
     pub session_id: String,
+    pub session_context: SessionContext,
     pub catalog_visible: bool,
     pub first_user_message: Option<String>,
     pub model_route: Option<String>,
@@ -50,8 +54,9 @@ impl Checkpoint {
     #[must_use]
     pub fn empty(session_id: impl Into<String>) -> Self {
         Self {
-            version: 1,
+            version: CHECKPOINT_VERSION,
             session_id: session_id.into(),
+            session_context: SessionContext::default(),
             catalog_visible: true,
             first_user_message: None,
             model_route: None,
@@ -71,6 +76,7 @@ impl Checkpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session_id: String,
+    pub session_context: SessionContext,
     pub parent_session_id: Option<String>,
     pub parent_sequence: Option<u64>,
     pub sequence: u64,

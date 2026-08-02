@@ -66,6 +66,7 @@ impl Steering {
                 slot: FrontendSlot::ComposerHeader,
                 text: format!("steering queued{queued} · {}", preview(message)),
                 tone: FrontendTone::Neutral,
+                action: None,
             },
         }
     }

@@ -127,7 +127,9 @@ impl Shared {
             if identity.depth == 0 {
                 let mut root = root.state.lock().await;
                 root.frontend = context.frontend;
-                emit_status(&root);
+                if !root.tree.agents.is_empty() {
+                    emit_status(&root);
+                }
             }
             return Ok(());
         }
@@ -155,7 +157,7 @@ impl Shared {
         };
         if changed {
             persist(&root_id, &root).await?;
-        } else {
+        } else if !root.tree.agents.is_empty() {
             emit_status(&root);
         }
         self.roots.lock().await.entry(root_id).or_insert_with(|| {
@@ -509,10 +511,6 @@ fn ensure_concurrency_available(tree: &Tree, max_concurrency: usize) -> Result<(
     Ok(())
 }
 
-pub(super) fn initial_widget() -> FrontendWidget {
-    status_widget(&Tree::default())
-}
-
 fn status_widget(tree: &Tree) -> FrontendWidget {
     let active = active_count(tree);
     let failed = tree
@@ -530,13 +528,25 @@ fn status_widget(tree: &Tree) -> FrontendWidget {
         } else {
             FrontendTone::Neutral
         },
+        action: Some(Op::CapabilityCommand {
+            capability: "subagents".into(),
+            command: "subagents".into(),
+            arguments: String::new(),
+        }),
     }
 }
 
 fn emit_status(root: &Root) {
-    (root.frontend)(FrontendEvent::Widget {
-        capability: "subagents".into(),
-        item: status_widget(&root.tree),
+    (root.frontend)(if root.tree.agents.is_empty() {
+        FrontendEvent::RemoveWidget {
+            capability: "subagents".into(),
+            id: "status".into(),
+        }
+    } else {
+        FrontendEvent::Widget {
+            capability: "subagents".into(),
+            item: status_widget(&root.tree),
+        }
     });
 }
 
@@ -570,6 +580,18 @@ mod tests {
         saves: AtomicUsize,
         retry_started: Notify,
         release_retry: Notify,
+    }
+
+    #[test]
+    fn status_widget_owns_its_frontend_action() {
+        assert!(matches!(
+            status_widget(&Tree::default()).action,
+            Some(Op::CapabilityCommand {
+                capability,
+                command,
+                arguments,
+            }) if capability == "subagents" && command == "subagents" && arguments.is_empty()
+        ));
     }
 
     impl CheckpointStore for BlockingRetryStore {
@@ -696,6 +718,55 @@ mod tests {
             (failed, after_failure, retried, after_retry),
             (true, 0, true, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn empty_initial_tree_is_silent_and_empty_transition_removes_widget() {
+        let shared = test_shared();
+        let checkpoints: Arc<dyn CheckpointStore> = Arc::new(FailOnceStore {
+            fail_next_save: AtomicBool::new(false),
+            saved_state: StdMutex::new(None),
+        });
+        let frontend_events = Arc::new(StdMutex::new(Vec::new()));
+        let events = Arc::clone(&frontend_events);
+        shared
+            .initialize(test_context(
+                checkpoints,
+                Arc::new(move |event| events.lock().expect("frontend events").push(event)),
+            ))
+            .await
+            .expect("initialize runtime");
+        assert!(frontend_events.lock().expect("frontend events").is_empty());
+
+        shared
+            .reserve(
+                "root",
+                "/root/child",
+                "/root",
+                "child".into(),
+                1,
+                "test".into(),
+            )
+            .await
+            .expect("reserve child");
+        shared
+            .remove("root", "/root/child")
+            .await
+            .expect("remove child");
+
+        let events = frontend_events.lock().expect("frontend events");
+        assert!(matches!(
+            events.as_slice(),
+            [
+                FrontendEvent::Widget { capability, .. },
+                FrontendEvent::RemoveWidget {
+                    capability: removed_capability,
+                    id,
+                },
+            ] if capability == "subagents"
+                && removed_capability == "subagents"
+                && id == "status"
+        ));
     }
 
     #[tokio::test]

@@ -828,7 +828,7 @@ fn render_menu(frame: &mut Frame<'_>, area: Rect, items: &[MenuItem], selected: 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-pub(super) fn terminal_text(value: &str) -> String {
+pub(crate) fn terminal_text(value: &str) -> String {
     value
         .chars()
         .filter(|character| matches!(character, '\n' | '\t') || !character.is_control())

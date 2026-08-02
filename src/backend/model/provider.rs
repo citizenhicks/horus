@@ -87,12 +87,22 @@ pub trait BrowserLogin: Send {
 
 type BrowserLoginStart = fn() -> BoxFuture<'static, Result<Box<dyn BrowserLogin>>>;
 
+/// One provider-owned device-code authentication flow.
+pub trait DeviceLogin: Send {
+    fn verification_url(&self) -> &str;
+    fn user_code(&self) -> &str;
+    fn complete(self: Box<Self>, path: PathBuf) -> BoxFuture<'static, Result<()>>;
+}
+
+type DeviceLoginStart = fn() -> BoxFuture<'static, Result<Box<dyn DeviceLogin>>>;
+
 /// Provider-owned browser authentication hooks consumed generically by applications.
 pub struct BrowserAuth {
     label: &'static str,
     configured: fn(&Path) -> Result<bool>,
     load: fn(&Path) -> Result<ProviderCredential>,
     start: BrowserLoginStart,
+    start_device: Option<DeviceLoginStart>,
 }
 
 impl BrowserAuth {
@@ -107,7 +117,15 @@ impl BrowserAuth {
             configured,
             load,
             start,
+            start_device: None,
         }
+    }
+
+    /// Adds a cross-device login flow for headless provider hosts.
+    #[must_use]
+    pub const fn with_device_login(mut self, start: DeviceLoginStart) -> Self {
+        self.start_device = Some(start);
+        self
     }
 
     #[must_use]
@@ -125,6 +143,24 @@ impl BrowserAuth {
 
     pub fn start(&self) -> BoxFuture<'static, Result<Box<dyn BrowserLogin>>> {
         (self.start)()
+    }
+
+    /// Reports whether the provider supports cross-device authentication.
+    #[must_use]
+    pub const fn supports_device_login(&self) -> bool {
+        self.start_device.is_some()
+    }
+
+    /// Starts a cross-device login without binding a browser callback on the host.
+    pub fn start_device(&self) -> BoxFuture<'static, Result<Box<dyn DeviceLogin>>> {
+        match self.start_device {
+            Some(start) => start(),
+            None => Box::pin(async {
+                Err(Error::Auth(
+                    "provider does not support device-code login".into(),
+                ))
+            }),
+        }
     }
 }
 

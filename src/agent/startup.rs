@@ -14,6 +14,7 @@ use super::Runner;
 use super::try_send_event;
 use crate::Error;
 use crate::Result;
+use crate::backend::checkpoint::CHECKPOINT_VERSION;
 use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::TranscriptPageRequest;
 use crate::backend::model::user_message;
@@ -48,6 +49,16 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         Some(state) => (state, false),
         None => (Checkpoint::empty(&config.session_id), true),
     };
+    if state.version != CHECKPOINT_VERSION || state.session_id != config.session_id {
+        return Err(Error::Checkpoint(
+            "checkpoint does not match the requested session".into(),
+        ));
+    }
+    if is_new {
+        state.session_context.clone_from(&config.session_context);
+    } else {
+        config.session_context.clone_from(&state.session_context);
+    }
     let mut replay = if is_new {
         Vec::new()
     } else {
@@ -88,6 +99,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
     let route = state
         .model_route
         .clone()
+        .filter(|route| config.model.choices().any(|choice| choice.route == *route))
         .or(preferred_route)
         .unwrap_or_else(|| config.provider.clone());
     let choice = config.select_model(&route)?;

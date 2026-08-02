@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::Error;
 use crate::Result;
+use crate::backend::checkpoint::CHECKPOINT_VERSION;
 use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::model::ModelChoice;
@@ -432,27 +433,21 @@ impl Runner {
                 .load(&session_id)
                 .await?
                 .ok_or_else(|| Error::Unknown(format!("session `{session_id}`")))?;
-            if checkpoint.version != 1 || checkpoint.session_id != session_id {
+            if checkpoint.version != CHECKPOINT_VERSION || checkpoint.session_id != session_id {
                 return Err(Error::Checkpoint(
                     "checkpoint does not match the requested session".into(),
                 ));
             }
-            if let Some(route) = checkpoint.model_route
-                && !self
-                    .config
-                    .model
-                    .choices()
-                    .any(|choice| choice.route == route)
-            {
-                return Err(Error::Unknown(format!("model route `{route}`")));
-            }
-            Ok(())
+            Ok(checkpoint.session_context)
         }
         .await;
         match result {
-            Ok(()) => self.emit(
+            Ok(context) => self.emit(
                 submission_id,
-                EventMsg::SessionResumeRequested(SessionResumeRequestedEvent { session_id }),
+                EventMsg::SessionResumeRequested(SessionResumeRequestedEvent {
+                    session_id,
+                    context,
+                }),
             ),
             Err(error) => self.emit(
                 submission_id,

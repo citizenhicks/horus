@@ -8,37 +8,48 @@ use ratatui::crossterm::event::Event as TerminalEvent;
 use ratatui::crossterm::event::KeyEventKind;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::style::Print;
-use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use super::TranscriptTone;
 use super::TuiState;
-use super::events::handle_event;
+use super::events::handle_gateway_event;
 use super::input::UiAction;
 use super::view::render_preview;
 use crate::frontend::FrontendExit;
 use crate::frontend::catalog::UiCatalog;
+use crate::frontend::gateway_actions::{PreparedAction, prepare, render_response};
 use crate::frontend::terminal::{INPUT_POLL, MAX_INPUT_BATCH, TerminalGuard, poll_event};
-use horus::Result;
-use horus::agent::Agent;
-use horus::protocol::Event;
-use horus::protocol::EventMsg;
-use horus::protocol::FrontendBlock;
-use horus::protocol::Op;
+use horus::backend::model::ModelInfo;
+use horus::protocol::{Op, Submission};
+use horus::{Error, Result};
+use horus_gateway::client::{GatewayEvents, GatewaySender};
+use horus_gateway::wire::{ClientMessage, ReadyPayload, ServerMessage};
+use uuid::Uuid;
 
 const ELAPSED_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_EVENT_BATCH: usize = 64;
 const CLEAR_SCREEN_AND_SCROLLBACK: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
 
-pub(in crate::frontend) async fn run(agent: Agent, catalog: UiCatalog) -> Result<FrontendExit> {
-    let mut workspace_inventory = catalog.start_workspace_inventory();
+pub(in crate::frontend) async fn run(
+    sender: GatewaySender,
+    mut events: GatewayEvents,
+    mut ready: ReadyPayload,
+    catalog: UiCatalog,
+    local_gateway: bool,
+) -> Result<(FrontendExit, GatewaySender, GatewayEvents)> {
+    let mut workspace_inventory = catalog.start_workspace_inventory(local_gateway);
     let mut workspace_inventory_pending = true;
-    let frontend = agent.frontend().clone();
-    let render = |event: &EventMsg| frontend.render(event);
-    let model = agent.model().clone();
-    let model_route = agent.model_route().to_string();
-    let mut state = TuiState::new(&catalog, std::env::current_dir()?, model, model_route);
-    let (sender, mut events) = agent.into_parts();
+    let model = ModelInfo {
+        model: ready.session.model.model.clone(),
+        reasoning_effort: ready.session.model.reasoning_effort.clone(),
+    };
+    let model_route = ready.session.model.route.clone();
+    let workspace_id = ready.workspace.id.clone();
+    let mut state = TuiState::new(
+        &catalog,
+        catalog.workspace().to_path_buf(),
+        model,
+        model_route,
+    );
     let guard = TerminalGuard::alternate()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
@@ -66,21 +77,62 @@ pub(in crate::frontend) async fn run(agent: Agent, catalog: UiCatalog) -> Result
             dirty = false;
         }
         tokio::select! {
-            event = events.recv(), if events_open => {
+            event = events.next(), if events_open => {
                 match event {
-                    Some(event) => {
-                        handle_event_batch(&mut state, &render, event, &mut events);
-                        if let Some(session_id) = state.requested_resume.take() {
-                            clear_on_exit = true;
-                            exit = FrontendExit::Resume(session_id);
-                            break 'ui;
+                    Ok(Some(frame)) => {
+                        match frame.message {
+                            ServerMessage::AgentEvent { event, blocks, history, preview, .. } => {
+                                handle_gateway_event(
+                                    &mut state,
+                                    event.msg,
+                                    blocks,
+                                    history,
+                                    preview,
+                                );
+                            }
+                            ServerMessage::Ready { payload } => {
+                                exit = FrontendExit::Reload(Box::new(payload));
+                                break 'ui;
+                            }
+                            ServerMessage::ConfigChanged { snapshot } => ready.config = snapshot,
+                            ServerMessage::Artifacts { artifacts, .. } => {
+                                for artifact in artifacts {
+                                    state.push(artifact.title, TranscriptTone::Neutral);
+                                    state.apply_block(artifact.block);
+                                }
+                            }
+                            message => {
+                                if let Some(message) = render_response(&message) {
+                                    state.push(message, TranscriptTone::Neutral);
+                                }
+                            }
+                        }
+                        if let Some(request) = state.requested_resume.take() {
+                            if same_workspace(
+                                Some(&workspace_id),
+                                request.context.workspace_id.as_deref(),
+                            ) {
+                                clear_on_exit = true;
+                                exit = FrontendExit::Resume(request.session_id);
+                                break 'ui;
+                            }
+                            state.push(
+                                "session belongs to another workspace · start Horus there to resume",
+                                TranscriptTone::Warning,
+                            );
                         }
                     }
-                    None => {
+                    Ok(None) => {
                         events_open = false;
                         state.disconnected = true;
                         state.finish_turn();
-                        state.push("agent disconnected · press q to exit", TranscriptTone::Error);
+                        state.push("gateway disconnected · press q to exit", TranscriptTone::Error);
+                    }
+                    Err(error) => {
+                        events_open = false;
+                        state.disconnected = true;
+                        state.finish_turn();
+                        state.push(error.to_string(), TranscriptTone::Error);
                     }
                 }
                 dirty = true;
@@ -119,7 +171,7 @@ pub(in crate::frontend) async fn run(agent: Agent, catalog: UiCatalog) -> Result
                         UiAction::None => {}
                         UiAction::Exit => {
                             if let Some(turn_id) = state.active_turn.clone() {
-                                let _ = sender.submit(Op::Interrupt { turn_id });
+                                let _ = send_op(&sender, Op::Interrupt { turn_id }).await;
                             }
                             break 'ui;
                         }
@@ -132,15 +184,22 @@ pub(in crate::frontend) async fn run(agent: Agent, catalog: UiCatalog) -> Result
                             exit = FrontendExit::New(model_route);
                             break 'ui;
                         }
-                        UiAction::Setup => {
-                            exit = FrontendExit::Setup;
-                            break 'ui;
-                        }
                         UiAction::Submit(op) => {
-                            if let Err(error) = sender.submit(op) {
+                            if let Err(error) = send_op(&sender, op).await {
                                 state.push(error.to_string(), TranscriptTone::Error);
                             }
                         }
+                        UiAction::Gateway(action) => match prepare(action, &ready) {
+                            Ok(PreparedAction::Print(message)) => {
+                                state.push(message, TranscriptTone::Neutral);
+                            }
+                            Ok(PreparedAction::Send { message, .. }) => {
+                                if let Err(error) = sender.send(message).await {
+                                    state.push(error.to_string(), TranscriptTone::Error);
+                                }
+                            }
+                            Err(error) => state.push(error.to_string(), TranscriptTone::Error),
+                        },
                     }
                 }
             }
@@ -160,25 +219,33 @@ pub(in crate::frontend) async fn run(agent: Agent, catalog: UiCatalog) -> Result
     if clear_on_exit {
         execute!(io::stdout(), Print(CLEAR_SCREEN_AND_SCROLLBACK))?;
     }
-    Ok(exit)
+    Ok((exit, sender, events))
 }
 
-fn handle_event_batch<R>(
-    state: &mut TuiState,
-    render: &R,
-    first: Event,
-    events: &mut mpsc::Receiver<Event>,
-) where
-    R: Fn(&EventMsg) -> Vec<FrontendBlock>,
-{
-    handle_event(state, render, first.msg);
-    for _ in 1..MAX_EVENT_BATCH {
-        if state.requested_resume.is_some() {
-            break;
-        }
-        let Ok(event) = events.try_recv() else {
-            break;
-        };
-        handle_event(state, render, event.msg);
+async fn send_op(sender: &horus_gateway::client::GatewaySender, op: Op) -> Result<()> {
+    sender
+        .send(ClientMessage::Submit {
+            submission: Submission {
+                id: Uuid::new_v4().to_string(),
+                op,
+            },
+        })
+        .await
+        .map_err(|error| Error::Stopped(error.to_string()))
+}
+
+fn same_workspace(current: Option<&str>, target: Option<&str>) -> bool {
+    current.is_some() && current == target
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_workspace;
+
+    #[test]
+    fn resume_requires_matching_known_workspace_ids() {
+        assert!(same_workspace(Some("workspace-a"), Some("workspace-a")));
+        assert!(!same_workspace(Some("workspace-a"), Some("workspace-b")));
+        assert!(!same_workspace(None, None));
     }
 }

@@ -27,6 +27,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use super::CommandOutput;
+#[cfg(target_os = "macos")]
+use super::MACOS_SEATBELT_BASE_POLICY;
 use super::NetworkAccess;
 use super::SandboxBackend;
 use crate::BoxFuture;
@@ -44,9 +46,7 @@ const MAX_JOURNAL_BYTES: u64 = 512;
 #[cfg(target_os = "linux")]
 const PROTECTION_STATE_PARENT: &str = "/var/tmp";
 #[cfg(target_os = "macos")]
-const SEATBELT_POLICY: &str = concat!(
-    include_str!("seatbelt_base_policy.sbpl"),
-    r#"
+const SEATBELT_POLICY_SUFFIX: &str = r#"
 (allow file-read*)
 (allow file-write*
   (subpath (param "TEMP_ROOT"))
@@ -58,8 +58,7 @@ const SEATBELT_POLICY: &str = concat!(
     (require-not (subpath (param "AGENTS_PATH")))
     (require-not (literal (param "CODEX_PATH")))
     (require-not (subpath (param "CODEX_PATH")))))
-"#
-);
+"#;
 
 /// Restricts file operations to one canonical workspace root.
 pub struct LocalSandbox {
@@ -218,11 +217,10 @@ impl LocalSandbox {
         }
         let temp = std::fs::canonicalize(self.temp.path())?;
         let mut command = Command::new(executable);
-        let policy = if network_access == NetworkAccess::Allowed {
-            format!("{SEATBELT_POLICY}\n(allow network*)")
-        } else {
-            SEATBELT_POLICY.to_string()
-        };
+        let mut policy = format!("{MACOS_SEATBELT_BASE_POLICY}{SEATBELT_POLICY_SUFFIX}");
+        if network_access == NetworkAccess::Allowed {
+            policy.push_str("\n(allow network*)");
+        }
         command.arg("-p").arg(policy);
         for (name, path) in [
             ("WRITABLE_ROOT", self.root.clone()),
