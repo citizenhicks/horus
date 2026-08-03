@@ -6,7 +6,10 @@ use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 use horus::backend::sandbox::MACOS_SEATBELT_BASE_POLICY;
-use horus::backend::sandbox::{CommandOutput, NetworkAccess, SandboxBackend, local::LocalSandbox};
+use horus::backend::sandbox::{
+    CommandOutput, CommandOutputSink, CommandStream, NetworkAccess, ProcessGroupGuard,
+    SandboxBackend, local::LocalSandbox,
+};
 use horus::{BoxFuture, Error, Result};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::Command;
@@ -221,22 +224,28 @@ impl GatewaySandbox {
         &self,
         script: &str,
         network_access: NetworkAccess,
+        output: CommandOutputSink,
     ) -> Result<CommandOutput> {
         if script.trim().is_empty() {
             return Err(Error::Sandbox("command is empty".into()));
         }
         let command = self.command(script, network_access, true)?;
-        self.run_command(command).await
+        self.run_command(command, output).await
     }
 
     pub(crate) async fn execute_git(&self, args: &[&str]) -> Result<CommandOutput> {
         let git = find_executable("git", &self.root, &self.state_dir)?;
         let mut command = self.command(GIT_SCRIPT, NetworkAccess::Denied, false)?;
         command.arg(git).args(args);
-        self.run_command(command).await
+        self.run_command(command, CommandOutputSink::default())
+            .await
     }
 
-    async fn run_command(&self, mut command: Command) -> Result<CommandOutput> {
+    async fn run_command(
+        &self,
+        mut command: Command,
+        output_sink: CommandOutputSink,
+    ) -> Result<CommandOutput> {
         let inherited = [
             "PATH",
             "USER",
@@ -273,8 +282,11 @@ impl GatewaySandbox {
             .take()
             .ok_or_else(|| Error::Sandbox("command stderr unavailable".into()))?;
         let result = tokio::time::timeout(self.command_timeout, async {
-            let (stdout, stderr, status) =
-                tokio::join!(read_output(stdout), read_output(stderr), child.wait());
+            let (stdout, stderr, status) = tokio::join!(
+                read_output(stdout, CommandStream::Stdout, output_sink.clone()),
+                read_output(stderr, CommandStream::Stderr, output_sink),
+                child.wait()
+            );
             Ok(CommandOutput {
                 exit_code: status?.code().unwrap_or(-1),
                 stdout: stdout?,
@@ -310,40 +322,9 @@ impl SandboxBackend for GatewaySandbox {
         &'a self,
         script: &'a str,
         network_access: NetworkAccess,
+        output: CommandOutputSink,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
-        Box::pin(self.execute_command(script, network_access))
-    }
-}
-
-struct ProcessGroupGuard {
-    id: u32,
-    armed: bool,
-}
-
-impl ProcessGroupGuard {
-    fn new(child: &tokio::process::Child) -> Result<Self> {
-        let id = child
-            .id()
-            .ok_or_else(|| Error::Sandbox("command process ID unavailable".into()))?;
-        Ok(Self { id, armed: true })
-    }
-
-    fn kill(&mut self) {
-        if self.armed {
-            let _ = std::process::Command::new("/bin/kill")
-                .args(["-KILL", "--", &format!("-{}", self.id)])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            self.armed = false;
-        }
-    }
-}
-
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        self.kill();
+        Box::pin(self.execute_command(script, network_access, output))
     }
 }
 
@@ -367,7 +348,11 @@ fn find_executable(name: &str, workspace: &Path, state_dir: &Path) -> Result<Pat
         .ok_or_else(|| Error::Sandbox(format!("{name} is unavailable outside protected paths")))
 }
 
-async fn read_output(mut reader: impl AsyncRead + Unpin) -> Result<String> {
+async fn read_output(
+    mut reader: impl AsyncRead + Unpin,
+    stream: CommandStream,
+    sink: CommandOutputSink,
+) -> Result<String> {
     let mut output = Vec::new();
     let mut buffer = [0; 8192];
     let mut truncated = false;
@@ -376,6 +361,7 @@ async fn read_output(mut reader: impl AsyncRead + Unpin) -> Result<String> {
         if read == 0 {
             break;
         }
+        sink.write(stream, &buffer[..read]);
         let remaining = MAX_COMMAND_OUTPUT_BYTES.saturating_sub(output.len());
         output.extend_from_slice(&buffer[..read.min(remaining)]);
         truncated |= read > remaining;
@@ -458,7 +444,7 @@ mod tests {
         let script = format!("cat {}/sentinel", state.path().display());
 
         let output = sandbox
-            .execute(&script, NetworkAccess::Denied)
+            .execute(&script, NetworkAccess::Denied, CommandOutputSink::default())
             .await
             .expect("blocked command still returns status");
 

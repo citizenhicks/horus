@@ -68,8 +68,11 @@ async fn parallel_tool_panic_preserves_call_identity() {
         backend,
         crate::backend::sandbox::ApprovalPolicy::On,
     ));
-    let permissions =
-        SandboxPermissions::restore(crate::backend::sandbox::NetworkAccess::Denied, Vec::new());
+    let permissions = SandboxPermissions::restore(
+        "session",
+        crate::backend::sandbox::NetworkAccess::Denied,
+        Vec::new(),
+    );
 
     assert_eq!(
         execute_batch(&catalog, &calls, sandbox, &permissions).await,
@@ -121,6 +124,7 @@ async fn apply_patch_returns_a_unified_diff_after_writing() {
         crate::backend::sandbox::ApprovalPolicy::On,
     ));
     let permissions = SandboxPermissions::restore(
+        "session",
         crate::backend::sandbox::NetworkAccess::Denied,
         ["call-1".into(), "call-2".into()],
     );
@@ -184,4 +188,22 @@ async fn apply_patch_returns_a_unified_diff_after_writing() {
 #[test]
 fn tools_do_not_claim_footer_space() {
     assert!(Tools::coding().frontend().widgets.is_empty());
+}
+
+#[test]
+fn only_starting_a_background_command_requires_approval() {
+    let mut catalog = Catalog::default();
+    catalog
+        .register(Arc::new(StartCommand))
+        .expect("start command");
+    catalog
+        .register(Arc::new(PollCommand))
+        .expect("poll command");
+    catalog
+        .register(Arc::new(StopCommand))
+        .expect("stop command");
+
+    assert!(catalog.requires_approval("start_command"));
+    assert!(!catalog.requires_approval("poll_command"));
+    assert!(!catalog.requires_approval("stop_command"));
 }

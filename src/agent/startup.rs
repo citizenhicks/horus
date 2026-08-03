@@ -242,7 +242,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
     }
     .await;
     if let Err(error) = initialized {
-        if let Err(rollback) = config.sandbox.shutdown(&config.session_id) {
+        if let Err(rollback) = config.sandbox.shutdown(&config.session_id).await {
             return Err(Error::Rollback {
                 primary: Box::new(error),
                 rollback: Box::new(rollback),
@@ -266,7 +266,11 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
     tokio::spawn(async move {
         let run = runner.run(command_rx).await;
         let shutdown = runner.config.middleware.shutdown(end_context).await;
-        let sandbox_shutdown = runner.config.sandbox.shutdown(&runner.config.session_id);
+        let sandbox_shutdown = runner
+            .config
+            .sandbox
+            .shutdown(&runner.config.session_id)
+            .await;
         if let Some(error) = run
             .err()
             .or_else(|| shutdown.err())

@@ -26,6 +26,7 @@ use horus::backend::model::ModelOutput;
 use horus::backend::model::ModelRequest;
 use horus::backend::model::ModelRouter;
 use horus::backend::sandbox::ApprovalPolicy;
+use horus::backend::sandbox::CommandOutputSink;
 use horus::backend::sandbox::NetworkAccess;
 use horus::backend::sandbox::Sandbox;
 use horus::backend::sandbox::SandboxBackend;
@@ -730,6 +731,7 @@ async fn local_sandbox_confines_command_writes_to_the_workspace() {
                 outside.file_name().expect("outside name").to_string_lossy()
             ),
             NetworkAccess::Denied,
+            CommandOutputSink::default(),
         )
         .await
         .expect("execute sandboxed command");

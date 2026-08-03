@@ -26,11 +26,11 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use super::CommandOutput;
 #[cfg(target_os = "macos")]
 use super::MACOS_SEATBELT_BASE_POLICY;
 use super::NetworkAccess;
 use super::SandboxBackend;
+use super::{CommandOutput, CommandOutputSink, CommandStream, ProcessGroupGuard};
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
@@ -273,6 +273,7 @@ impl SandboxBackend for LocalSandbox {
         &'a self,
         script: &'a str,
         network_access: NetworkAccess,
+        output_sink: CommandOutputSink,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
         Box::pin(async move {
             if script.trim().is_empty() {
@@ -310,7 +311,11 @@ impl SandboxBackend for LocalSandbox {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true);
+                #[cfg(unix)]
+                command.process_group(0);
                 let mut child = command.spawn()?;
+                #[cfg(unix)]
+                let mut process_group = ProcessGroupGuard::new(&child)?;
                 let stdout = child
                     .stdout
                     .take()
@@ -320,8 +325,11 @@ impl SandboxBackend for LocalSandbox {
                     .take()
                     .ok_or_else(|| Error::Sandbox("command stderr unavailable".into()))?;
                 match tokio::time::timeout(self.command_timeout, async {
-                    let (stdout, stderr, status) =
-                        tokio::join!(read_output(stdout), read_output(stderr), child.wait());
+                    let (stdout, stderr, status) = tokio::join!(
+                        read_output(stdout, CommandStream::Stdout, output_sink.clone()),
+                        read_output(stderr, CommandStream::Stderr, output_sink),
+                        child.wait()
+                    );
                     Ok(CommandOutput {
                         exit_code: status?.code().unwrap_or(-1),
                         stdout: stdout?,
@@ -330,8 +338,14 @@ impl SandboxBackend for LocalSandbox {
                 })
                 .await
                 {
-                    Ok(output) => output,
+                    Ok(output) => {
+                        #[cfg(unix)]
+                        process_group.kill();
+                        output
+                    }
                     Err(_) => {
+                        #[cfg(unix)]
+                        process_group.kill();
                         let _ = child.kill().await;
                         Err(Error::Sandbox(format!(
                             "command exceeded {} seconds",
@@ -975,7 +989,11 @@ fn command_temp(private_temp: &Path) -> &Path {
     private_temp
 }
 
-async fn read_output(mut reader: impl AsyncRead + Unpin) -> Result<String> {
+async fn read_output(
+    mut reader: impl AsyncRead + Unpin,
+    stream: CommandStream,
+    sink: CommandOutputSink,
+) -> Result<String> {
     let mut output = Vec::new();
     let mut buffer = [0; 8192];
     let mut truncated = false;
@@ -984,6 +1002,7 @@ async fn read_output(mut reader: impl AsyncRead + Unpin) -> Result<String> {
         if read == 0 {
             break;
         }
+        sink.write(stream, &buffer[..read]);
         let remaining = MAX_COMMAND_OUTPUT_BYTES.saturating_sub(output.len());
         output.extend_from_slice(&buffer[..read.min(remaining)]);
         truncated |= read > remaining;
@@ -1200,7 +1219,11 @@ mod tests {
         let sandbox = local_sandbox(workspace.path());
 
         let output = sandbox
-            .execute("mkdir .git .agents .codex", NetworkAccess::Denied)
+            .execute(
+                "mkdir .git .agents .codex",
+                NetworkAccess::Denied,
+                CommandOutputSink::default(),
+            )
             .await
             .expect("sandboxed command");
 

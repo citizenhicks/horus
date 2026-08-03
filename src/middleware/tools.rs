@@ -17,6 +17,7 @@ use crate::Error;
 use crate::Result;
 use crate::backend::model::ToolCall;
 use crate::backend::model::ToolDefinition;
+use crate::backend::sandbox::BackgroundCommandPoll;
 use crate::backend::sandbox::Sandbox;
 use crate::backend::sandbox::SandboxPermissions;
 use crate::backend::sandbox::ToolPermissions;
@@ -313,7 +314,7 @@ impl Tools {
         Self { tools, names }
     }
 
-    /// Creates the default read, write, patch, and sandboxed-bash tool set.
+    /// Creates the default file, foreground command, and background command tools.
     #[must_use]
     pub fn coding() -> Self {
         Self::new(vec![
@@ -321,6 +322,9 @@ impl Tools {
             Arc::new(WriteFile),
             Arc::new(ApplyPatch),
             Arc::new(Bash),
+            Arc::new(StartCommand),
+            Arc::new(PollCommand),
+            Arc::new(StopCommand),
         ])
     }
 }
@@ -412,6 +416,9 @@ fn tool_heading(name: &str, arguments: &Value) -> String {
         "write_file" => ("Write", "path"),
         "apply_patch" => ("Patch", "path"),
         "bash" => ("Bash", "command"),
+        "start_command" => ("Start", "command"),
+        "poll_command" => ("Poll", "command_id"),
+        "stop_command" => ("Stop", "command_id"),
         _ => return format!("◉ {name} {}", preview_json(arguments)),
     };
     labeled_tool_heading(label, detail, arguments)
@@ -603,11 +610,7 @@ impl Tool for Bash {
     fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let arguments: BashArgs = serde_json::from_value(arguments)?;
-            if arguments.command.len() > MAX_COMMAND_BYTES {
-                return Err(Error::Tool(format!(
-                    "command exceeds {MAX_COMMAND_BYTES} bytes"
-                )));
-            }
+            validate_command(&arguments.command)?;
             let output = context
                 .sandbox
                 .execute(&arguments.command, &context.permissions)
@@ -618,6 +621,132 @@ impl Tool for Bash {
             ))
         })
     }
+}
+
+struct StartCommand;
+
+impl Tool for StartCommand {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "start_command".into(),
+            description: "Start a sandboxed command in the background and return an opaque ID."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn approval(&self) -> ApprovalRequirement {
+        ApprovalRequirement::Always
+    }
+
+    fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let arguments: BashArgs = serde_json::from_value(arguments)?;
+            validate_command(&arguments.command)?;
+            let id = context
+                .sandbox
+                .start_background(arguments.command, &context.permissions)?;
+            Ok(serde_json::json!({"command_id": id, "status": "running"}).to_string())
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct CommandIdArgs {
+    command_id: String,
+}
+
+struct PollCommand;
+
+impl Tool for PollCommand {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "poll_command".into(),
+            description: "Read incremental background command output; completion consumes the ID."
+                .into(),
+            parameters: command_id_schema(),
+        }
+    }
+
+    fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let arguments: CommandIdArgs = serde_json::from_value(arguments)?;
+            validate_command_id(&arguments.command_id)?;
+            let output = context
+                .sandbox
+                .poll_background(&arguments.command_id, &context.permissions)
+                .await?;
+            Ok(background_output(output))
+        })
+    }
+}
+
+struct StopCommand;
+
+impl Tool for StopCommand {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "stop_command".into(),
+            description: "Stop an owned background command and consume its ID.".into(),
+            parameters: command_id_schema(),
+        }
+    }
+
+    fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let arguments: CommandIdArgs = serde_json::from_value(arguments)?;
+            validate_command_id(&arguments.command_id)?;
+            let output = context
+                .sandbox
+                .stop_background(&arguments.command_id, &context.permissions)
+                .await?;
+            Ok(background_output(output))
+        })
+    }
+}
+
+fn validate_command(command: &str) -> Result<()> {
+    if command.trim().is_empty() {
+        return Err(Error::Tool("command cannot be empty".into()));
+    }
+    if command.len() > MAX_COMMAND_BYTES {
+        return Err(Error::Tool(format!(
+            "command exceeds {MAX_COMMAND_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_command_id(id: &str) -> Result<()> {
+    uuid::Uuid::parse_str(id)
+        .map(|_| ())
+        .map_err(|_| Error::Tool("command_id must be a UUID".into()))
+}
+
+fn command_id_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {"command_id": {"type": "string", "format": "uuid"}},
+        "required": ["command_id"],
+        "additionalProperties": false
+    })
+}
+
+fn background_output(output: BackgroundCommandPoll) -> String {
+    serde_json::json!({
+        "status": output.status.as_str(),
+        "exit_code": output.exit_code,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "truncated": output.truncated,
+        "error": output.error
+    })
+    .to_string()
 }
 
 #[cfg(test)]
