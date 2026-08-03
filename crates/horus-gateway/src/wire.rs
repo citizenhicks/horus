@@ -1,5 +1,6 @@
 //! Versioned, bounded JSON frames shared by gateway clients and the server.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use horus::backend::checkpoint::SessionSummary;
@@ -18,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use crate::{Error, Result};
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
@@ -334,6 +335,7 @@ pub struct ReadyPayload {
     pub providers: Vec<ProviderStatus>,
     pub default_config: Option<VersionedAgentConfig>,
     pub models: Vec<ModelChoice>,
+    pub middleware_features: Vec<MiddlewareFeature>,
     pub max_active_sessions: usize,
 }
 
@@ -439,15 +441,43 @@ pub enum ProviderAuthKind {
     DeviceCode,
 }
 
-/// Built-in middleware switches in observable declaration order.
+/// Enabled optional middleware IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MiddlewareConfig {
-    pub tools: bool,
-    pub skills: bool,
-    pub subagents: bool,
-    pub steering: bool,
-    pub compaction: bool,
+    pub(crate) enabled: BTreeSet<String>,
+}
+
+impl MiddlewareConfig {
+    /// Returns whether one advertised optional middleware is enabled.
+    #[must_use]
+    pub fn enabled(&self, id: &str) -> bool {
+        self.enabled.contains(id)
+    }
+
+    /// Updates one advertised optional middleware before gateway validation.
+    pub fn set_enabled(&mut self, id: impl Into<String>, enabled: bool) {
+        let id = id.into();
+        if enabled {
+            self.enabled.insert(id);
+        } else {
+            self.enabled.remove(&id);
+        }
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &str> {
+        self.enabled.iter().map(String::as_str)
+    }
+}
+
+/// Gateway-owned middleware presentation and selection policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiddlewareFeature {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub required: bool,
 }
 
 /// Capability-rendered preview whose inner events remain provider-neutral.
@@ -973,6 +1003,7 @@ mod tests {
                     config: AgentComposition::default(),
                 }),
                 models: Vec::new(),
+                middleware_features: Vec::new(),
                 max_active_sessions: 32,
             },
         });
@@ -1036,13 +1067,9 @@ mod tests {
                             "reasoning_effort": null,
                             "web_search": "off"
                         },
-                        "middleware": {
-                            "tools": true,
-                            "skills": true,
-                            "subagents": true,
-                            "steering": true,
-                            "compaction": true
-                        },
+                        "middleware": {"enabled": [
+                            "compaction", "skills", "steering", "subagents", "tools"
+                        ]},
                         "approval": "on",
                         "system_prompt": "test"
                     }

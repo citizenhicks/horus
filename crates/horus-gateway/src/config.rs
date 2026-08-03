@@ -18,13 +18,13 @@ use serde_json::Value;
 use sha2::Digest as _;
 
 use crate::wire::{
-    AgentComposition, DailyUsage, MiddlewareConfig, ProfileSnapshot, ProviderConfig,
-    VersionedAgentConfig, WorkspaceInfo,
+    AgentComposition, DailyUsage, ProfileSnapshot, ProviderConfig, VersionedAgentConfig,
+    WorkspaceInfo,
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 3;
-const CHAT_SPEC_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 4;
+const CHAT_SPEC_VERSION: u32 = 2;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
 const CONFIG_FILE: &str = "gateway.json";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -107,13 +107,7 @@ impl Default for AgentComposition {
                 reasoning_effort: Some("medium".into()),
                 web_search: horus::backend::model::provider::HostedWebSearch::Off,
             },
-            middleware: MiddlewareConfig {
-                tools: true,
-                skills: true,
-                subagents: true,
-                steering: true,
-                compaction: true,
-            },
+            middleware: crate::middleware_manifest::default_config(),
             approval: horus::backend::sandbox::ApprovalPolicy::On,
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
         }
@@ -573,7 +567,8 @@ pub fn validate_agent_composition(config: &AgentComposition) -> Result<()> {
             "system prompt must be 1–{MAX_SYSTEM_PROMPT_BYTES} bytes"
         )));
     }
-    validate_provider_config(&config.provider)
+    validate_provider_config(&config.provider)?;
+    crate::middleware_manifest::validate(&config.middleware)
 }
 
 fn validate_provider_config(config: &ProviderConfig) -> Result<()> {

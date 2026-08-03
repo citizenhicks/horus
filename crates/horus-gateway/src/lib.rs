@@ -7,6 +7,7 @@ pub mod command;
 pub mod config;
 pub mod cron;
 mod host;
+mod middleware_manifest;
 pub mod sandbox;
 pub mod server;
 pub mod wire;

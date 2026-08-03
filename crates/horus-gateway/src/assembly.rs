@@ -23,8 +23,9 @@ use horus::protocol::SessionContext;
 
 use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig, local_user_name};
 use crate::cron::{ConversationalCron, CronStore};
+use crate::middleware_manifest::{BuiltinMiddleware, MIDDLEWARE};
 use crate::sandbox::GatewaySandbox;
-use crate::wire::{ProviderAuthKind, ProviderConfig, ProviderStatus};
+use crate::wire::{MiddlewareConfig, ProviderAuthKind, ProviderConfig, ProviderStatus};
 use crate::{Error, Result};
 
 const DEFAULT_CONTEXT_WINDOW: i64 = 272_000;
@@ -70,7 +71,7 @@ pub(crate) async fn assemble(
         .agent
         .config
         .middleware
-        .subagents
+        .enabled("subagents")
         .then(|| Arc::new(OnceLock::<AgentConfig>::new()));
     let launcher = template.as_ref().map(subagent_launcher);
     let middleware = build_middleware(
@@ -550,34 +551,37 @@ fn unavailable_models(selection: &ProviderConfig) -> Result<(Arc<ModelRouter>, i
 }
 
 fn build_middleware(
-    settings: &crate::wire::MiddlewareConfig,
+    settings: &MiddlewareConfig,
     workspace: &std::path::Path,
     launcher: Option<SubagentLauncher>,
     cron: Arc<CronStore>,
 ) -> Result<MiddlewareStack> {
     let mut entries: Vec<Arc<dyn Middleware>> = Vec::new();
-    if settings.tools {
-        entries.push(Arc::new(Tools::coding()));
+    for feature in MIDDLEWARE
+        .iter()
+        .filter(|feature| feature.required || settings.enabled(feature.id))
+    {
+        let middleware: Arc<dyn Middleware> = match feature.kind {
+            BuiltinMiddleware::Tools => Arc::new(Tools::coding()),
+            BuiltinMiddleware::Cron => Arc::new(ConversationalCron::new(Arc::clone(&cron))),
+            BuiltinMiddleware::Skills => Arc::new(Skills::discover_installed([
+                workspace.join(".agents/skills"),
+                workspace.join(".codex/skills"),
+            ])?),
+            BuiltinMiddleware::Subagents => Arc::new(Subagents::new(
+                4,
+                8,
+                32,
+                launcher
+                    .clone()
+                    .ok_or_else(|| Error::Config("subagent launcher is missing".into()))?,
+            )?),
+            BuiltinMiddleware::Steering => Arc::new(Steering::default()),
+            BuiltinMiddleware::Compaction => Arc::new(Compaction::default()),
+            BuiltinMiddleware::Sessions => Arc::new(Sessions::default()),
+        };
+        entries.push(middleware);
     }
-    entries.push(Arc::new(ConversationalCron::new(cron)));
-    if settings.skills {
-        entries.push(Arc::new(Skills::discover_installed([
-            workspace.join(".agents/skills"),
-            workspace.join(".codex/skills"),
-        ])?));
-    }
-    if settings.subagents {
-        let launcher =
-            launcher.ok_or_else(|| Error::Config("subagent launcher is missing".into()))?;
-        entries.push(Arc::new(Subagents::new(4, 8, 32, launcher)?));
-    }
-    if settings.steering {
-        entries.push(Arc::new(Steering::default()));
-    }
-    if settings.compaction {
-        entries.push(Arc::new(Compaction::default()));
-    }
-    entries.push(Arc::new(Sessions::default()));
     Ok(MiddlewareStack::new(entries)?)
 }
 
@@ -762,7 +766,7 @@ mod tests {
             .await
             .expect("seed checkpoint");
         let mut composition = original.agent.config.clone();
-        composition.middleware.tools = false;
+        composition.middleware.set_enabled("tools", false);
         let updated = original
             .replacing_agent(1, composition, store.state_dir(), None)
             .expect("updated chat spec");
@@ -796,6 +800,6 @@ mod tests {
             serde_json::json!({"identity": "preserved"})
         );
         assert_eq!(saved.agent.revision, 2);
-        assert!(!saved.agent.config.middleware.tools);
+        assert!(!saved.agent.config.middleware.enabled("tools"));
     }
 }

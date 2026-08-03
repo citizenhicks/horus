@@ -8,8 +8,8 @@ use horus::backend::sandbox::ApprovalPolicy;
 use horus::{Error, Result};
 use horus_gateway::client::{GatewayEvents, GatewaySender, MAX_PENDING_FRAMES};
 use horus_gateway::wire::{
-    AgentComposition, ClientMessage, MiddlewareConfig, ProviderConfig, ProviderStatus,
-    ReadyPayload, ServerFrame, ServerMessage, SessionReadyPayload,
+    AgentComposition, ClientMessage, MiddlewareConfig, MiddlewareFeature, ProviderConfig,
+    ProviderStatus, ReadyPayload, ServerFrame, ServerMessage, SessionReadyPayload,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -72,66 +72,6 @@ enum Page {
     Agent,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Feature {
-    Tools,
-    Skills,
-    Subagents,
-    Steering,
-    Compaction,
-}
-
-const FEATURES: [Feature; 5] = [
-    Feature::Tools,
-    Feature::Skills,
-    Feature::Subagents,
-    Feature::Steering,
-    Feature::Compaction,
-];
-
-impl Feature {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Tools => "Tools",
-            Self::Skills => "Skills",
-            Self::Subagents => "Subagents",
-            Self::Steering => "Steering",
-            Self::Compaction => "Compaction",
-        }
-    }
-
-    const fn description(self) -> &'static str {
-        match self {
-            Self::Tools => "Run workspace and command tools",
-            Self::Skills => "Discover local SKILL.md capabilities",
-            Self::Subagents => "Run independent work asynchronously",
-            Self::Steering => "Accept guidance during an active turn",
-            Self::Compaction => "Compact long conversations as context fills",
-        }
-    }
-
-    const fn enabled(self, middleware: &MiddlewareConfig) -> bool {
-        match self {
-            Self::Tools => middleware.tools,
-            Self::Skills => middleware.skills,
-            Self::Subagents => middleware.subagents,
-            Self::Steering => middleware.steering,
-            Self::Compaction => middleware.compaction,
-        }
-    }
-
-    fn toggle(self, middleware: &mut MiddlewareConfig) {
-        let enabled = !self.enabled(middleware);
-        match self {
-            Self::Tools => middleware.tools = enabled,
-            Self::Skills => middleware.skills = enabled,
-            Self::Subagents => middleware.subagents = enabled,
-            Self::Steering => middleware.steering = enabled,
-            Self::Compaction => middleware.compaction = enabled,
-        }
-    }
-}
-
 struct ApprovalChoice {
     label: &'static str,
     description: &'static str,
@@ -183,6 +123,7 @@ struct SetupState {
     model: usize,
     custom_model: String,
     reasoning: usize,
+    features: Vec<MiddlewareFeature>,
     middleware: MiddlewareConfig,
     approval: usize,
     row: usize,
@@ -200,6 +141,7 @@ impl SetupState {
         let mut state = Self::from_parts(
             mode,
             validated_providers(&gateway.providers)?,
+            gateway.middleware_features.clone(),
             session.config.config.clone(),
         )?;
         if let Some(provider) = preferred_provider {
@@ -211,6 +153,7 @@ impl SetupState {
     fn from_parts(
         mode: SetupMode,
         providers: Vec<ProviderEntry>,
+        features: Vec<MiddlewareFeature>,
         original: AgentComposition,
     ) -> Result<Self> {
         if providers.is_empty() {
@@ -249,6 +192,7 @@ impl SetupState {
             model: 0,
             custom_model: String::new(),
             reasoning: 0,
+            features,
             middleware,
             approval,
             row: 0,
@@ -297,7 +241,7 @@ impl SetupState {
             Page::Provider => self.providers.len(),
             Page::Authentication => 0,
             Page::Models => self.model_choice_count() + self.reasoning_choice_count(),
-            Page::Agent => FEATURES.len() + 1,
+            Page::Agent => self.features.len() + 1,
         }
     }
 
@@ -429,13 +373,17 @@ impl SetupState {
             KeyCode::Esc => return Flow::Cancel,
             KeyCode::Up | KeyCode::BackTab => self.move_selection(-1),
             KeyCode::Down | KeyCode::Tab => self.move_selection(1),
-            KeyCode::Char(' ') if self.row < FEATURES.len() => {
-                FEATURES[self.row].toggle(&mut self.middleware);
+            KeyCode::Char(' ') if self.row < self.features.len() => {
+                let feature = &self.features[self.row];
+                if !feature.required {
+                    self.middleware
+                        .set_enabled(&feature.id, !self.middleware.enabled(&feature.id));
+                }
             }
-            KeyCode::Char(' ') | KeyCode::Right if self.row == FEATURES.len() => {
+            KeyCode::Char(' ') | KeyCode::Right if self.row == self.features.len() => {
                 self.approval = (self.approval + 1) % APPROVALS.len();
             }
-            KeyCode::Left if self.row == FEATURES.len() => {
+            KeyCode::Left if self.row == self.features.len() => {
                 self.approval = (self.approval + APPROVALS.len() - 1) % APPROVALS.len();
             }
             KeyCode::Enter => return self.finish(),
@@ -1452,13 +1400,13 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState) {
             }
         }
         Page::Agent => {
-            for (index, feature) in FEATURES.iter().copied().enumerate() {
+            for (index, feature) in state.features.iter().enumerate() {
                 choice(
                     lines,
-                    feature.label(),
-                    feature.description(),
+                    &feature.label,
+                    &feature.description,
                     state.row == index,
-                    if feature.enabled(&state.middleware) {
+                    if feature.required || state.middleware.enabled(&feature.id) {
                         "[x]"
                     } else {
                         "[ ]"
@@ -1470,7 +1418,7 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState) {
                 lines,
                 &format!("Approval  ‹ {} ›", APPROVALS[state.approval].label),
                 APPROVALS[state.approval].description,
-                state.row == FEATURES.len(),
+                state.row == state.features.len(),
                 "",
             );
         }
@@ -1607,7 +1555,23 @@ mod tests {
                 .default_base_url()
                 .map(str::to_string);
         }
-        SetupState::from_parts(mode, providers, original).expect("setup state")
+        SetupState::from_parts(mode, providers, features(), original).expect("setup state")
+    }
+
+    fn features() -> Vec<MiddlewareFeature> {
+        [
+            ("tools", "Tools", false),
+            ("sessions", "Sessions", true),
+            ("skills", "Skills", false),
+        ]
+        .into_iter()
+        .map(|(id, label, required)| MiddlewareFeature {
+            id: id.into(),
+            label: label.into(),
+            description: label.into(),
+            required,
+        })
+        .collect()
     }
 
     #[test]
@@ -1661,8 +1625,8 @@ mod tests {
             .definition
             .default_base_url()
             .map(str::to_string);
-        let mut state =
-            SetupState::from_parts(SetupMode::Login, providers, original).expect("setup state");
+        let mut state = SetupState::from_parts(SetupMode::Login, providers, features(), original)
+            .expect("setup state");
 
         state.select_provider("kimi").expect("select Kimi");
 
@@ -1699,7 +1663,12 @@ mod tests {
         let mut state = state(SetupMode::Agent, "openai_socket", true);
         state.original.provider.web_search = HostedWebSearch::Live;
         state.original.system_prompt = "Keep this system prompt".into();
-        Feature::Skills.toggle(&mut state.middleware);
+        state.row = state
+            .features
+            .iter()
+            .position(|feature| feature.id == "skills")
+            .expect("skills feature");
+        state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         state.approval = APPROVALS
             .iter()
             .position(|choice| choice.policy == ApprovalPolicy::AllowNetwork)
@@ -1716,9 +1685,30 @@ mod tests {
             .expect("agent composition");
 
         assert_eq!(configured.provider, original.provider);
-        assert!(!configured.middleware.skills);
+        assert!(!configured.middleware.enabled("skills"));
         assert_eq!(configured.approval, ApprovalPolicy::AllowNetwork);
         assert_eq!(configured.system_prompt, "Keep this system prompt");
+    }
+
+    #[test]
+    fn required_features_are_visible_but_cannot_be_toggled() {
+        let mut state = state(SetupMode::Agent, "openai_socket", true);
+        state.row = state
+            .features
+            .iter()
+            .position(|feature| feature.id == "sessions")
+            .expect("sessions feature");
+
+        state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        assert!(!state.middleware.enabled("sessions"));
+        let mut lines = Vec::new();
+        render_page(&mut lines, &state);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("[x] Sessions"))
+        );
     }
 
     #[test]

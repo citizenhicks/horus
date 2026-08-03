@@ -1703,6 +1703,7 @@ async fn gateway_ready(state: &GatewayState) -> std::result::Result<ReadyPayload
         models: configured_model_choices(&config, &state.store, &state.credentials)
             .map_err(internal)?,
         default_config: config.default_agent,
+        middleware_features: crate::middleware_manifest::features(),
         max_active_sessions: MAX_ACTIVE_SESSIONS,
     })
 }
@@ -2655,7 +2656,7 @@ mod tests {
             .expect("second snapshot")
             .ready;
         let mut composition = first_before.config.config.clone();
-        composition.middleware.tools = false;
+        composition.middleware.set_enabled("tools", false);
 
         first_host
             .configure(first_before.config.revision, composition)
@@ -2673,7 +2674,7 @@ mod tests {
             .ready;
 
         assert_ne!(first_after.workspace, second_after.workspace);
-        assert!(!first_after.config.config.middleware.tools);
+        assert!(!first_after.config.config.middleware.enabled("tools"));
         assert!(
             first_after
                 .contributions
