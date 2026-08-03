@@ -105,14 +105,14 @@ fn only_wholly_interruptible_batches_stop_for_active_input() {
 }
 
 #[tokio::test]
-async fn edit_file_returns_a_unified_diff_after_writing() {
+async fn apply_patch_returns_a_unified_diff_after_writing() {
     let workspace = tempfile::tempdir().expect("workspace");
     let path = workspace.path().join("note.txt");
     std::fs::write(&path, "first\nold\nlast\n").expect("write fixture");
     let mut catalog = Catalog::default();
     catalog
-        .register(Arc::new(EditFile))
-        .expect("register edit tool");
+        .register(Arc::new(ApplyPatch))
+        .expect("register patch tool");
     let sandbox = Arc::new(Sandbox::new(
         Arc::new(
             crate::backend::sandbox::local::LocalSandbox::new(workspace.path())
@@ -129,11 +129,10 @@ async fn edit_file_returns_a_unified_diff_after_writing() {
         &catalog,
         &[ToolCall {
             call_id: "call-1".into(),
-            name: "edit_file".into(),
+            name: "apply_patch".into(),
             arguments: serde_json::json!({
                 "path": "note.txt",
-                "old_text": "old",
-                "new_text": "new"
+                "patch": "--- ignored.txt\n+++ ignored.txt\n@@ -1,3 +1,3 @@\n first\n-old\n+new\n last\n"
             }),
         }],
         Arc::clone(&sandbox),
@@ -163,11 +162,10 @@ async fn edit_file_returns_a_unified_diff_after_writing() {
         &catalog,
         &[ToolCall {
             call_id: "call-2".into(),
-            name: "edit_file".into(),
+            name: "apply_patch".into(),
             arguments: serde_json::json!({
                 "path": "note.txt",
-                "old_text": "new",
-                "new_text": "new"
+                "patch": "--- ignored.txt\n+++ ignored.txt\n@@ -1,3 +1,3 @@\n first\n-new\n+new\n last\n"
             }),
         }],
         sandbox,

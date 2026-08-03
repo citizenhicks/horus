@@ -244,7 +244,7 @@ fn session_history_uses_normal_reasoning_and_tool_rendering() {
 }
 
 #[test]
-fn completed_edit_replaces_the_tool_log_with_a_styled_diff() {
+fn completed_patch_replaces_the_tool_log_with_a_styled_diff() {
     let frontend = frontend();
     let mut state = state();
     state.transcript.clear();
@@ -253,12 +253,11 @@ fn completed_edit_replaces_the_tool_log_with_a_styled_diff() {
         &frontend,
         EventMsg::ToolCallBegin(horus::protocol::ToolCallBeginEvent {
             turn_id: "turn".into(),
-            call_id: "edit".into(),
-            name: "edit_file".into(),
+            call_id: "patch".into(),
+            name: "apply_patch".into(),
             arguments: serde_json::json!({
                 "path": "note.txt",
-                "old_text": "old",
-                "new_text": "new"
+                "patch": "--- note.txt\n+++ note.txt\n@@ -1 +1 @@\n-old\n+new\n"
             }),
         }),
     );
@@ -276,8 +275,8 @@ fn completed_edit_replaces_the_tool_log_with_a_styled_diff() {
         &frontend,
         EventMsg::ToolCallEnd(horus::protocol::ToolCallEndEvent {
             turn_id: "turn".into(),
-            call_id: "edit".into(),
-            name: "edit_file".into(),
+            call_id: "patch".into(),
+            name: "apply_patch".into(),
             output: "--- note.rs\n+++ note.rs\n@@ -1,5 +1,5 @@\n-fn old_name() {}\n+fn new_name() {}\n keep_one();\n-let removed = false;\n keep_two();\n+let added = true;\n keep_three();\n".into(),
             is_error: false,
         }),

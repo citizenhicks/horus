@@ -313,13 +313,13 @@ impl Tools {
         Self { tools, names }
     }
 
-    /// Creates the default read, write, edit, and sandboxed-bash tool set.
+    /// Creates the default read, write, patch, and sandboxed-bash tool set.
     #[must_use]
     pub fn coding() -> Self {
         Self::new(vec![
             Arc::new(ReadFile),
             Arc::new(WriteFile),
-            Arc::new(EditFile),
+            Arc::new(ApplyPatch),
             Arc::new(Bash),
         ])
     }
@@ -365,10 +365,10 @@ pub(crate) fn render_tool_event(
             tone: FrontendTone::Neutral,
         }),
         EventMsg::ToolCallEnd(result) if owns(&result.name) => {
-            let is_edit_diff = !result.is_error
-                && result.name == "edit_file"
+            let is_patch_diff = !result.is_error
+                && result.name == "apply_patch"
                 && diffy::Patch::from_str(&result.output).is_ok();
-            if is_edit_diff {
+            if is_patch_diff {
                 return Some(FrontendBlock {
                     id: Some(format!("{}/{}", result.turn_id, result.call_id)),
                     group: tool_group(&result.name, &result.turn_id),
@@ -410,7 +410,7 @@ fn tool_heading(name: &str, arguments: &Value) -> String {
     let (label, detail) = match name {
         "read_file" => ("Read", "path"),
         "write_file" => ("Write", "path"),
-        "edit_file" => ("Edit", "path"),
+        "apply_patch" => ("Patch", "path"),
         "bash" => ("Bash", "command"),
         _ => return format!("◉ {name} {}", preview_json(arguments)),
     };
@@ -512,27 +512,25 @@ impl Tool for WriteFile {
 }
 
 #[derive(Deserialize)]
-struct EditArgs {
+struct ApplyPatchArgs {
     path: String,
-    old_text: String,
-    new_text: String,
+    patch: String,
 }
 
-struct EditFile;
+struct ApplyPatch;
 
-impl Tool for EditFile {
+impl Tool for ApplyPatch {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "edit_file".into(),
-            description: "Replace one exact occurrence in a workspace file.".into(),
+            name: "apply_patch".into(),
+            description: "Apply a unified diff to one existing workspace file.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "old_text": {"type": "string"},
-                    "new_text": {"type": "string"}
+                    "patch": {"type": "string"}
                 },
-                "required": ["path", "old_text", "new_text"],
+                "required": ["path", "patch"],
                 "additionalProperties": false
             }),
         }
@@ -544,30 +542,20 @@ impl Tool for EditFile {
 
     fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
-            let arguments: EditArgs = serde_json::from_value(arguments)?;
-            if arguments.old_text.is_empty() {
-                return Err(Error::Tool("old_text cannot be empty".into()));
-            }
-            if arguments.old_text == arguments.new_text {
-                return Err(Error::Tool("new_text must differ from old_text".into()));
-            }
-            if arguments
-                .old_text
-                .len()
-                .saturating_add(arguments.new_text.len())
-                > MAX_MUTATION_BYTES
-            {
+            let arguments: ApplyPatchArgs = serde_json::from_value(arguments)?;
+            if arguments.patch.len() > MAX_MUTATION_BYTES {
                 return Err(Error::Tool(format!(
-                    "edit exceeds {MAX_MUTATION_BYTES} bytes"
+                    "patch exceeds {MAX_MUTATION_BYTES} bytes"
                 )));
             }
             let content = context.sandbox.read(&arguments.path).await?;
-            if content.match_indices(&arguments.old_text).count() != 1 {
-                return Err(Error::Tool(
-                    "old_text must occur exactly once in the file".into(),
-                ));
+            let patch = diffy::Patch::from_str(&arguments.patch)
+                .map_err(|error| Error::Tool(format!("invalid unified diff: {error}")))?;
+            let updated = diffy::apply(&content, &patch)
+                .map_err(|error| Error::Tool(format!("patch does not apply: {error}")))?;
+            if updated == content {
+                return Err(Error::Tool("patch must change the file".into()));
             }
-            let updated = content.replacen(&arguments.old_text, &arguments.new_text, 1);
             let mut options = DiffOptions::new();
             options
                 .set_original_filename(arguments.path.clone())
@@ -580,7 +568,7 @@ impl Tool for EditFile {
             Ok(if diff.len() <= MAX_TOOL_OUTPUT_BYTES {
                 diff
             } else {
-                format!("edited {} (diff too large to display)", arguments.path)
+                format!("patched {} (diff too large to display)", arguments.path)
             })
         })
     }
