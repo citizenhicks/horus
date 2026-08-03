@@ -140,10 +140,10 @@ final class AppModel {
     var selectedAccountID: UUID?
     var connectionState: ConnectionState = .disconnected
     var destination: AppDestination? = .chat
-    var workspace: WorkspaceSummary?
+    var workspace: WorkspaceInfo?
     var gitStatus: GitStatus?
     var gitDiff = ""
-    var sessions: [SessionSummary] = []
+    var sessions: [SessionRecord] = []
     var selectedSessionID: String?
     var transcript: [TranscriptEntry] = []
     var composer = ""
@@ -157,6 +157,7 @@ final class AppModel {
     var modelContextWindow: Int64?
     var pendingApproval: PendingApproval?
     var modelChoices: [ModelChoice] = []
+    var middlewareFeatures: [MiddlewareFeature] = []
     var selectedModelRoute = ""
     var contributions: [FrontendContribution] = []
     var mountedWidgets: [MountedWidget] = []
@@ -171,7 +172,6 @@ final class AppModel {
     var cronTasks: [CronTask] = []
     var cronRuns: [CronRun] = []
     var cronTaskDraft = ""
-    var cronScheduleDraft = ""
     var cronError: String?
     var workspaceError: String?
     var isChangingWorkspace = false
@@ -179,10 +179,6 @@ final class AppModel {
     var directoryListing: DirectoryListing?
     var directoryError: String?
     var isLoadingDirectories = false
-    var showsCronTaskBrowser = false
-    var cronDirectoryListing: DirectoryListing?
-    var cronDirectoryError: String?
-    var isLoadingCronDirectories = false
 
     var agentSnapshot: VersionedAgentConfig?
     var agentDraft: AgentComposition?
@@ -205,19 +201,19 @@ final class AppModel {
     @ObservationIgnored private var pendingPairingAccount: GatewayAccount?
     @ObservationIgnored private var pendingDrafts: [String: String] = [:]
     @ObservationIgnored private var sessionRequestID: String?
+    private var sessionMutationRequestID: String?
+    @ObservationIgnored private var sessionToRestoreID: String?
     @ObservationIgnored private var configRequestID: String?
     @ObservationIgnored private var approvalRequestID: String?
-    @ObservationIgnored private var workspaceRequestID: String?
     @ObservationIgnored private var directoryRequestID: String?
-    @ObservationIgnored private var cronDirectoryRequestID: String?
     @ObservationIgnored private var gitDiffRequestID: String?
     @ObservationIgnored private var credentialRequestID: String?
     @ObservationIgnored private var pairingCodeRequestID: String?
     @ObservationIgnored private var pairingCodeExpiryTask: Task<Void, Never>?
     @ObservationIgnored private var providerLoginRequestID: String?
+    @ObservationIgnored private var providerRegistrationRequestID: String?
     @ObservationIgnored private var cronRequestIDs: Set<String> = []
     @ObservationIgnored private var latestSequence: UInt64?
-    @ObservationIgnored private var sequenceSaveTask: Task<Void, Never>?
     @ObservationIgnored private var inspectorPickerSubmissionID: String?
     @ObservationIgnored private var steeringSubmissionID: String?
 
@@ -236,7 +232,6 @@ final class AppModel {
     deinit {
         eventTask?.cancel()
         pairingCodeExpiryTask?.cancel()
-        sequenceSaveTask?.cancel()
     }
 
     var selectedAccount: GatewayAccount? {
@@ -247,8 +242,14 @@ final class AppModel {
         connectionState.isReady
             && activeTurnID == nil
             && pendingApproval == nil
+            && pendingDrafts.isEmpty
             && sessionRequestID == nil
+            && sessionMutationRequestID == nil
+            && applyState != .applying
+            && applyState != .restarting
     }
+
+    var canCreateSession: Bool { canOpenSession }
 
     var contextFillFraction: Double {
         guard let modelContextWindow, modelContextWindow > 0 else { return 0 }
@@ -300,16 +301,13 @@ final class AppModel {
             }
             let account = accounts.first(where: { $0.endpoint == endpoint })
                 ?? GatewayAccount(endpoint: endpoint)
-            flushLatestSequence()
+            let sessionID = account.id == selectedAccountID ? selectedSessionID : nil
             let generation = resetGatewayState(preservingDrafts: account.id == selectedAccountID)
+            sessionToRestoreID = sessionID
             pendingPairingAccount = account
             beginConnection(to: endpoint, generation: generation) { [weak self] in
                 guard let self, self.connectionGeneration == generation else { return }
-                try await self.client.send(.pair(
-                    code: code,
-                    clientLabel: "Horus Apple",
-                    lastSequence: nil
-                ))
+                try await self.client.send(.pair(code: code, clientLabel: "Horus Apple"))
             }
         } catch {
             pairingError = error.localizedDescription
@@ -343,22 +341,25 @@ final class AppModel {
             workspaceError = "Choose a folder on the gateway host."
             return
         }
-        guard path != workspace?.label else { return }
-        let id = requestID("workspace")
-        workspaceRequestID = id
+        guard canCreateSession else { return }
+        sessionToRestoreID = nil
+        let id = requestID("create")
+        sessionRequestID = id
         workspaceError = nil
         isChangingWorkspace = true
-        transmit(.setWorkspace(requestID: id, path: path)) { [weak self] message in
-            self?.workspaceRequestID = nil
+        connectionState = .loading
+        transmit(.createSession(requestID: id, workspace: path)) { [weak self] message in
+            self?.sessionRequestID = nil
             self?.isChangingWorkspace = false
+            self?.connectionState = .ready
             self?.workspaceError = message
         }
     }
 
     func openWorkspaceBrowser() {
-        guard connectionState.isReady, let path = workspace?.label else { return }
+        guard canCreateSession else { return }
         showsWorkspaceBrowser = true
-        loadDirectory(path)
+        loadDirectory(workspace?.path ?? "/")
     }
 
     func loadDirectory(_ path: String) {
@@ -374,35 +375,9 @@ final class AppModel {
         }
     }
 
-    func openCronTaskBrowser() {
-        guard connectionState.isReady, let path = workspace?.label else { return }
-        showsCronTaskBrowser = true
-        loadCronDirectory(path)
-    }
-
-    func loadCronDirectory(_ path: String) {
-        let id = requestID("cron-directories")
-        cronDirectoryRequestID = id
-        cronDirectoryError = nil
-        isLoadingCronDirectories = true
-        transmit(.listDirectories(requestID: id, path: path, includeFiles: true)) { [weak self] message in
-            guard self?.cronDirectoryRequestID == id else { return }
-            self?.cronDirectoryRequestID = nil
-            self?.isLoadingCronDirectories = false
-            self?.cronDirectoryError = message
-        }
-    }
-
-    func chooseCronTask(_ path: String) {
-        cronTaskDraft = path
-        cronError = nil
-        showsCronTaskBrowser = false
-    }
-
     func forgetSelectedGateway() {
         guard let account = selectedAccount else { return }
         do {
-            flushLatestSequence()
             try store.remove(account)
             accounts.removeAll { $0.id == account.id }
             selectedAccountID = nil
@@ -422,59 +397,79 @@ final class AppModel {
     }
 
     func openNewSession() {
-        openSession(nil)
+        openWorkspaceBrowser()
     }
 
-    func openSession(_ sessionID: String?) {
-        guard canOpenSession else { return }
+    func openSession(_ sessionID: String) {
+        guard canOpenSession, sessionID != selectedSessionID else { return }
+        sessionToRestoreID = nil
         let id = requestID("open")
         sessionRequestID = id
-        transmit(.openSession(requestID: id, sessionID: sessionID)) { [weak self] message in
+        connectionState = .loading
+        transmit(.openSession(
+            requestID: id,
+            sessionID: sessionID,
+            lastSequence: nil
+        )) { [weak self] message in
             guard self?.sessionRequestID == id else { return }
             self?.sessionRequestID = nil
+            self?.connectionState = .ready
             self?.errorMessage = message
         }
     }
 
-    func renameSession(_ session: SessionSummary, title: String) {
+    func renameSession(_ session: SessionRecord, title: String) {
+        guard session.sessionId == selectedSessionID, sessionMutationRequestID == nil else { return }
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else { return }
+        let id = requestID("session-rename")
+        sessionMutationRequestID = id
         transmit(.renameSession(
-            requestID: requestID("session-rename"),
+            requestID: id,
             sessionID: session.sessionId,
             title: title
-        ))
+        )) { [weak self] message in
+            if self?.sessionMutationRequestID == id { self?.sessionMutationRequestID = nil }
+            self?.errorMessage = message
+        }
     }
 
-    func setSessionPinned(_ session: SessionSummary, pinned: Bool) {
+    func setSessionPinned(_ session: SessionRecord, pinned: Bool) {
+        guard session.sessionId == selectedSessionID, sessionMutationRequestID == nil else { return }
+        let id = requestID("session-pin")
+        sessionMutationRequestID = id
         transmit(.setSessionPinned(
-            requestID: requestID("session-pin"),
+            requestID: id,
             sessionID: session.sessionId,
             pinned: pinned
-        ))
+        )) { [weak self] message in
+            if self?.sessionMutationRequestID == id { self?.sessionMutationRequestID = nil }
+            self?.errorMessage = message
+        }
     }
 
-    func deleteSession(_ session: SessionSummary) {
-        guard session.sessionId != selectedSessionID else { return }
+    func deleteSession(_ session: SessionRecord) {
+        guard session.sessionId == selectedSessionID, sessionMutationRequestID == nil else { return }
+        let id = requestID("session-delete")
+        sessionMutationRequestID = id
         transmit(.deleteSession(
-            requestID: requestID("session-delete"),
+            requestID: id,
             sessionID: session.sessionId
-        ))
-    }
-
-    func selectGitBranch(_ branch: String) {
-        guard branch != gitStatus?.currentBranch else { return }
-        transmit(.setGitBranch(requestID: requestID("git-branch"), branch: branch))
+        )) { [weak self] message in
+            if self?.sessionMutationRequestID == id { self?.sessionMutationRequestID = nil }
+            self?.errorMessage = message
+        }
     }
 
     func refreshGitDiff() {
-        guard connectionState.isReady else { return }
+        guard connectionState.isReady, let sessionID = selectedSessionID else { return }
         let id = requestID("git-diff")
         gitDiffRequestID = id
-        transmit(.getGitDiff(requestID: id))
+        transmit(.getGitDiff(requestID: id, sessionID: sessionID))
     }
 
     func sendMessage() {
+        guard let sessionID = selectedSessionID else { return }
         let text = composer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         guard text.utf8.count <= maximumComposerBytes else {
@@ -492,7 +487,7 @@ final class AppModel {
         }
         pendingDrafts[id] = text
         composer = ""
-        transmit(.submit(Submission(id: id, op: op))) { [weak self] message in
+        transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: op))) { [weak self] message in
             self?.restoreDraft(id: id)
             if self?.steeringSubmissionID == id {
                 self?.steeringSubmissionID = nil
@@ -503,45 +498,61 @@ final class AppModel {
     }
 
     func submitWidget(_ mounted: MountedWidget, presentsPickerInInspector: Bool = false) {
-        guard let action = mounted.widget.action else { return }
+        guard let sessionID = selectedSessionID, let action = mounted.widget.action else { return }
         let id = requestID("widget")
         if presentsPickerInInspector {
             pendingPicker = nil
             inspectorPickerSubmissionID = id
             inspectorSection = .subagents
         }
-        transmit(.submit(Submission(id: id, op: action))) { [weak self] message in
+        transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: action))) { [weak self] message in
             if self?.inspectorPickerSubmissionID == id { self?.inspectorPickerSubmissionID = nil }
             self?.errorMessage = message
         }
     }
 
     func submitPickerOption(_ option: FrontendPickerOption) {
+        guard let sessionID = selectedSessionID else { return }
         pendingPicker = nil
-        transmit(.submit(Submission(id: requestID("picker"), op: option.op)))
+        transmit(.submit(
+            sessionID: sessionID,
+            submission: Submission(id: requestID("picker"), op: option.op)
+        ))
     }
 
     func selectModel(_ route: String) {
-        guard route != selectedModelRoute else { return }
-        transmit(.submit(Submission(id: requestID("model"), op: .setModel(route: route))))
+        guard let sessionID = selectedSessionID, route != selectedModelRoute else { return }
+        transmit(.submit(
+            sessionID: sessionID,
+            submission: Submission(id: requestID("model"), op: .setModel(route: route))
+        ))
     }
 
     func interrupt() {
-        guard let activeTurnID else { return }
-        transmit(.submit(Submission(
-            id: requestID("interrupt"),
-            op: .interrupt(turnID: activeTurnID)
-        )))
+        guard let sessionID = selectedSessionID, let activeTurnID else { return }
+        transmit(.submit(
+            sessionID: sessionID,
+            submission: Submission(
+                id: requestID("interrupt"),
+                op: .interrupt(turnID: activeTurnID)
+            )
+        ))
     }
 
     func resolveApproval(_ decision: ReviewDecision) {
-        guard let approval = pendingApproval, approvalRequestID == nil else { return }
+        guard let sessionID = selectedSessionID,
+              let approval = pendingApproval,
+              approvalRequestID == nil
+        else { return }
         let id = requestID("approval")
         approvalRequestID = id
-        transmit(.submit(Submission(
-            id: id,
-            op: .execApproval(id: approval.id, decision: decision)
-        ))) { [weak self] message in
+        transmit(.submit(
+            sessionID: sessionID,
+            submission: Submission(
+                id: id,
+                op: .execApproval(id: approval.id, decision: decision)
+            )
+        )) { [weak self] message in
             guard self?.approvalRequestID == id else { return }
             self?.approvalRequestID = nil
             self?.errorMessage = message
@@ -570,31 +581,47 @@ final class AppModel {
     }
 
     func openInspectorPickerOption(_ option: FrontendPickerOption) {
-        transmit(.submit(Submission(id: requestID("picker"), op: option.op)))
+        guard let sessionID = selectedSessionID else { return }
+        transmit(.submit(
+            sessionID: sessionID,
+            submission: Submission(id: requestID("picker"), op: option.op)
+        ))
     }
 
     func forkSession() {
-        guard canOpenSession,
+        guard canOpenSession, let sessionID = selectedSessionID,
               let contribution = contributions.first(where: { contribution in
                   contribution.commands.contains { $0.name == "fork" }
               })
         else { return }
-        transmit(.submit(Submission(
-            id: requestID("fork"),
-            op: .capabilityCommand(capability: contribution.capability, command: "fork", arguments: "")
-        )))
+        transmit(.submit(
+            sessionID: sessionID,
+            submission: Submission(
+                id: requestID("fork"),
+                op: .capabilityCommand(
+                    capability: contribution.capability,
+                    command: "fork",
+                    arguments: ""
+                )
+            )
+        ))
     }
 
     func applyAgentConfiguration() {
-        guard let snapshot = agentSnapshot, let draft = agentDraft else { return }
+        guard let sessionID = selectedSessionID,
+              let snapshot = agentSnapshot,
+              let draft = agentDraft
+        else { return }
         let id = requestID("configure")
         configRequestID = id
         applyState = .applying
-        transmit(.configureAgent(
+        transmit(.configureSession(
             requestID: id,
+            sessionID: sessionID,
             expectedRevision: snapshot.revision,
             config: draft
         )) { [weak self] message in
+            self?.configRequestID = nil
             self?.applyState = .failed(message)
         }
     }
@@ -617,11 +644,10 @@ final class AppModel {
 
     func selectProvider(_ provider: String) {
         guard let status = providerStatuses.first(where: { $0.provider == provider }) else { return }
-        agentDraft?.provider = ProviderSelection(
+        agentDraft?.provider = ProviderConfig(
             provider: status.provider,
             model: status.defaultModel ?? "",
             baseUrl: status.defaultBaseUrl,
-            apiKeyEnv: nil,
             reasoningEffort: status.defaultReasoningEffort,
             webSearch: status.defaultWebSearch
         )
@@ -638,8 +664,30 @@ final class AppModel {
         let id = requestID("credential")
         credentialRequestID = id
         providerActionState = .savingCredential(provider)
-        transmit(.setProviderCredential(requestID: id, provider: provider, apiKey: key)) { [weak self] message in
+        let request: GatewayRequest
+        if let baseURL = agentDraft?.provider.baseUrl {
+            request = .setProviderEndpointCredential(
+                requestID: id,
+                provider: provider,
+                baseURL: baseURL,
+                apiKey: key
+            )
+        } else {
+            request = .setProviderCredential(requestID: id, provider: provider, apiKey: key)
+        }
+        transmit(request) { [weak self] message in
             self?.providerActionState = .failed(message)
+        }
+    }
+
+    func applyProviderConfiguration() {
+        guard selectedSessionID != nil, let config = agentDraft?.provider else { return }
+        let id = requestID("provider")
+        providerRegistrationRequestID = id
+        applyState = .applying
+        transmit(.registerProvider(requestID: id, config: config)) { [weak self] message in
+            self?.providerRegistrationRequestID = nil
+            self?.applyState = .failed(message)
         }
     }
 
@@ -663,54 +711,68 @@ final class AppModel {
         }
     }
 
-    func addCron() {
+    func startCronSetup() {
+        guard let sessionID = selectedSessionID else { return }
         let task = cronTaskDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        let schedule = cronScheduleDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !task.isEmpty, !schedule.isEmpty else {
-            cronError = "Choose a task file and enter a schedule."
-            return
-        }
-        let id = requestID("cron-add")
+        let id = requestID("cron-setup")
         cronRequestIDs.insert(id)
         cronError = nil
-        transmit(.addCron(requestID: id, task: task, schedule: schedule)) { [weak self] message in
+        destination = .chat
+        transmit(.startCronSetup(
+            requestID: id,
+            sessionID: sessionID,
+            task: task.isEmpty ? nil : task
+        )) { [weak self] message in
             self?.cronRequestIDs.remove(id)
             self?.cronError = message
         }
     }
 
     func rescheduleCron(_ task: CronTask, schedule: String) {
+        guard let sessionID = selectedSessionID else { return }
         let value = schedule.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
         let request = requestID("cron-reschedule")
         cronRequestIDs.insert(request)
-        transmit(.rescheduleCron(requestID: request, id: task.id, schedule: value)) { [weak self] message in
+        transmit(.rescheduleCron(
+            requestID: request,
+            sessionID: sessionID,
+            id: task.id,
+            schedule: value
+        )) { [weak self] message in
             self?.cronRequestIDs.remove(request)
             self?.cronError = message
         }
     }
 
     func deleteCron(_ task: CronTask) {
+        guard let sessionID = selectedSessionID else { return }
         let request = requestID("cron-delete")
         cronRequestIDs.insert(request)
-        transmit(.deleteCron(requestID: request, id: task.id)) { [weak self] message in
+        transmit(.deleteCron(requestID: request, sessionID: sessionID, id: task.id)) { [weak self] message in
             self?.cronRequestIDs.remove(request)
             self?.cronError = message
         }
     }
 
     func runCron(_ task: CronTask) {
+        guard let sessionID = selectedSessionID else { return }
         let request = requestID("cron-run")
         cronRequestIDs.insert(request)
-        transmit(.runCron(requestID: request, id: task.id)) { [weak self] message in
+        transmit(.runCron(requestID: request, sessionID: sessionID, id: task.id)) { [weak self] message in
             self?.cronRequestIDs.remove(request)
             self?.cronError = message
         }
     }
 
     func refreshCron() {
-        transmit(.listCron(requestID: requestID("cron-list")))
-        transmit(.listCronHistory(requestID: requestID("cron-history"), id: nil))
+        guard let sessionID = selectedSessionID else { return }
+        transmit(.listCron(requestID: requestID("cron-list"), sessionID: sessionID))
+        transmit(.listCronHistory(
+            requestID: requestID("cron-history"),
+            sessionID: sessionID,
+            id: nil
+        ))
     }
 
     func setTheme(_ theme: ThemePreference) {
@@ -719,12 +781,11 @@ final class AppModel {
     }
 
     private func connect(to account: GatewayAccount) {
-        flushLatestSequence()
+        let sessionID = account.id == selectedAccountID ? selectedSessionID : nil
         let generation = resetGatewayState(preservingDrafts: account.id == selectedAccountID)
+        sessionToRestoreID = sessionID
         selectedAccountID = account.id
         store.select(account)
-        let lastSequence = store.lastSequence(for: account)
-        latestSequence = lastSequence
         connectionState = .connecting
         Task { [weak self] in
             guard let self, self.connectionGeneration == generation else { return }
@@ -734,10 +795,7 @@ final class AppModel {
                 let token = try self.store.token(for: account)
                 self.beginConnection(to: account.endpoint, generation: generation) { [weak self] in
                     guard let self, self.connectionGeneration == generation else { return }
-                    try await self.client.send(.authenticate(
-                        token: token,
-                        lastSequence: lastSequence
-                    ))
+                    try await self.client.send(.authenticate(token: token))
                 }
             } catch {
                 self.connectionState = .failed(error.localizedDescription)
@@ -817,22 +875,31 @@ final class AppModel {
         case .authenticated:
             connectionState = .loading
         case .ready(let payload):
-            applyReady(payload)
+            applyGatewayReady(payload)
+        case .sessionOpened(let requestID, let payload):
+            guard requestID == sessionRequestID else { break }
+            applySessionReady(payload, opened: true)
+        case .sessionChanged(let payload):
+            guard payload.session.sessionId == selectedSessionID else { break }
+            applySessionReady(payload, opened: false)
+        case .gatewayConfigured(let requestID, let payload):
+            applyGatewayReady(payload)
+            if requestID == providerRegistrationRequestID {
+                providerRegistrationRequestID = nil
+                applyAgentConfiguration()
+            }
         case .accepted(let requestID):
             handleAccepted(requestID)
         case .rejected(let rejection):
             handleRejected(rejection)
-        case .agentEvent(let sequence, let event, let blocks, let history, let preview):
+        case .agentEvent(let sessionID, let sequence, let event, let blocks, let history, let preview):
+            guard sessionID == selectedSessionID else { break }
             guard latestSequence.map({ sequence > $0 }) ?? true else { return }
             latestSequence = sequence
-            if let account = selectedAccount { scheduleSequenceSave(sequence, for: account) }
             reduce(event: event, blocks: blocks, history: history, preview: preview)
-        case .sessions(let sessions):
-            self.sessions = sessions.filter(\.catalogVisible)
-        case .configChanged(let snapshot):
-            agentSnapshot = snapshot
-            agentDraft = snapshot.config
-            if applyState == .applying || applyState == .restarting { applyState = .restarting }
+        case .sessions(let requestID, let sessions):
+            if requestID == sessionMutationRequestID { sessionMutationRequestID = nil }
+            applySessions(sessions)
         case .providerCredentialStatus(let requestID, let provider, let configured):
             if let index = providerStatuses.firstIndex(where: { $0.provider == provider }) {
                 providerStatuses[index].configured = configured
@@ -853,57 +920,50 @@ final class AppModel {
                 code,
                 expiresAt: Date(timeIntervalSince1970: TimeInterval(expiresAt))
             )
-        case .providerLoginStarted(_, _, let provider, let url, let code):
+        case .providerLoginStarted(let requestID, _, let provider, let url, let code):
+            guard requestID == providerLoginRequestID else { break }
             providerActionState = .deviceCode(
                 provider: provider,
                 url: url,
                 code: code
             )
-        case .providerLoginFinished(_, _, let provider):
-            providerLoginRequestID = nil
-            providerActionState = .loginFinished(provider)
+        case .providerLoginFinished(let requestID, _, let provider):
+            if requestID == providerLoginRequestID {
+                providerLoginRequestID = nil
+                providerActionState = .loginFinished(provider)
+            }
             if let index = providerStatuses.firstIndex(where: { $0.provider == provider }) {
                 providerStatuses[index].configured = true
             }
         case .profile(_, let profile):
             self.profile = profile
-        case .artifacts(_, let artifacts):
+        case .artifacts(_, let sessionID, let artifacts):
+            guard sessionID == selectedSessionID else { break }
             let remoteIDs = Set(artifacts.map(\.id))
             let previews = self.artifacts.filter { $0.kind == "preview" && !remoteIDs.contains($0.id) }
             self.artifacts = artifacts + previews
             if selectedArtifactID == nil || !self.artifacts.contains(where: { $0.id == selectedArtifactID }) {
                 selectedArtifactID = self.artifacts.first?.id
             }
-        case .gitDiff(let requestID, let diff):
-            guard requestID == gitDiffRequestID else { break }
+        case .gitDiff(let requestID, let sessionID, let diff):
+            guard requestID == gitDiffRequestID, sessionID == selectedSessionID else { break }
             gitDiffRequestID = nil
             gitDiff = diff
         case .directories(let requestID, let listing):
-            if requestID == directoryRequestID {
-                directoryRequestID = nil
-                directoryListing = listing
-                directoryError = nil
-                isLoadingDirectories = false
-            } else if requestID == cronDirectoryRequestID {
-                cronDirectoryRequestID = nil
-                cronDirectoryListing = listing
-                cronDirectoryError = nil
-                isLoadingCronDirectories = false
-            }
-        case .cronTasks(let requestID, let tasks):
+            guard requestID == directoryRequestID else { break }
+            directoryRequestID = nil
+            directoryListing = listing
+            directoryError = nil
+            isLoadingDirectories = false
+        case .cronTasks(let requestID, let sessionID, let tasks):
+            guard sessionID == selectedSessionID else { break }
             cronRequestIDs.remove(requestID)
             cronTasks = tasks
-        case .cronHistory(let requestID, let runs):
+        case .cronHistory(let requestID, let sessionID, let runs):
+            guard sessionID == selectedSessionID else { break }
             cronRequestIDs.remove(requestID)
             cronRuns = runs
         case .error(let failure):
-            if failure.code == "replay_unavailable" {
-                sequenceSaveTask?.cancel()
-                sequenceSaveTask = nil
-                resetSessionState()
-                latestSequence = nil
-                if let account = selectedAccount { store.clearLastSequence(for: account) }
-            }
             if pendingPairingAccount != nil { pairingError = failure.message }
             if failure.code == "unauthorized", pendingPairingAccount == nil {
                 repairSelectedGateway()
@@ -913,31 +973,48 @@ final class AppModel {
                 restorePendingDrafts()
                 connectionState = .failed(failure.message)
             }
-        case .unknown:
-            break
         }
     }
 
-    private func applyReady(_ payload: ReadyPayload) {
-        sessionRequestID = nil
+    private func applyGatewayReady(_ payload: ReadyPayload) {
+        providerStatuses = payload.providers
+        modelChoices = payload.models
+        middlewareFeatures = payload.middlewareFeatures
+        if sessionRequestID == nil { connectionState = .ready }
+        errorMessage = nil
+        applySessions(payload.sessions)
+        transmit(.getProfile(requestID: requestID("profile")))
+        if selectedSessionID == nil, sessionRequestID == nil {
+            if let sessionToRestoreID {
+                if let session = sessions.first(where: { $0.sessionId == sessionToRestoreID }) {
+                    openSession(session.sessionId)
+                } else {
+                    errorMessage = "The previously selected chat is no longer available."
+                }
+            } else if let session = sessions.first {
+                openSession(session.sessionId)
+            }
+        }
+    }
+
+    private func applySessionReady(
+        _ payload: SessionReadyPayload,
+        opened: Bool
+    ) {
         if selectedSessionID != payload.session.sessionId {
             restorePendingDrafts()
             resetSessionState()
         }
-        let workspaceChanged = workspaceRequestID != nil
+        if opened { latestSequence = nil }
+        sessionRequestID = nil
         workspace = payload.workspace
         gitStatus = payload.git
-        if workspaceChanged {
-            workspaceRequestID = nil
-            workspaceError = nil
-            isChangingWorkspace = false
-            showsWorkspaceBrowser = false
-        }
-        sessions = payload.sessions.filter(\.catalogVisible)
+        workspaceError = nil
+        isChangingWorkspace = false
+        showsWorkspaceBrowser = false
         selectedSessionID = payload.session.sessionId
         selectedModelRoute = payload.session.model.route
         modelContextWindow = payload.session.model.modelContextWindow
-        modelChoices = payload.modelChoices
         contributions = payload.contributions
         mountedWidgets = payload.contributions.flatMap { contribution in
             contribution.widgets.map { MountedWidget(capability: contribution.capability, widget: $0) }
@@ -949,18 +1026,37 @@ final class AppModel {
             incomingSnapshot: payload.config
         )
         agentSnapshot = payload.config
-        providerStatuses = payload.providers
         connectionState = .ready
         errorMessage = nil
         if applyState == .restarting { applyState = .applied }
-        requestWorkspaceData()
+        if opened { requestSessionData() }
     }
 
-    private func requestWorkspaceData() {
-        transmit(.getProfile(requestID: requestID("profile")))
-        transmit(.listArtifacts(requestID: requestID("artifacts")))
+    private func applySessions(_ records: [SessionRecord]) {
+        sessions = records.filter(\.catalogVisible)
+        guard let selectedSessionID,
+              !sessions.contains(where: { $0.sessionId == selectedSessionID }),
+              sessionRequestID == nil
+        else { return }
+        if let next = sessions.first {
+            openSession(next.sessionId)
+        } else {
+            clearSelectedSession()
+        }
+    }
+
+    private func requestSessionData() {
+        guard let sessionID = selectedSessionID else { return }
+        transmit(.listArtifacts(requestID: requestID("artifacts"), sessionID: sessionID))
         refreshGitDiff()
         refreshCron()
+    }
+
+    private func clearSelectedSession() {
+        latestSequence = nil
+        selectedSessionID = nil
+        resetSessionState()
+        connectionState = .ready
     }
 
     private func handleAccepted(_ requestID: String) {
@@ -972,9 +1068,16 @@ final class AppModel {
             applyState = .restarting
             configRequestID = nil
         }
+        if requestID == sessionMutationRequestID {
+            transmit(.listSessions(requestID: requestID)) { [weak self] message in
+                if self?.sessionMutationRequestID == requestID {
+                    self?.sessionMutationRequestID = nil
+                }
+                self?.errorMessage = message
+            }
+        }
         if cronRequestIDs.remove(requestID) != nil {
             cronTaskDraft = ""
-            cronScheduleDraft = ""
             refreshCron()
         }
     }
@@ -997,22 +1100,18 @@ final class AppModel {
         }
         if rejection.requestId == sessionRequestID {
             sessionRequestID = nil
+            connectionState = .ready
+            if isChangingWorkspace { workspaceError = rejection.message }
+            isChangingWorkspace = false
             errorMessage = rejection.message
         }
-        if rejection.requestId == workspaceRequestID {
-            workspaceError = rejection.message
-            workspaceRequestID = nil
-            isChangingWorkspace = false
+        if rejection.requestId == sessionMutationRequestID {
+            sessionMutationRequestID = nil
         }
         if rejection.requestId == directoryRequestID {
             directoryError = rejection.message
             directoryRequestID = nil
             isLoadingDirectories = false
-        }
-        if rejection.requestId == cronDirectoryRequestID {
-            cronDirectoryError = rejection.message
-            cronDirectoryRequestID = nil
-            isLoadingCronDirectories = false
         }
         if rejection.requestId == gitDiffRequestID {
             gitDiffRequestID = nil
@@ -1027,6 +1126,10 @@ final class AppModel {
         if rejection.requestId == providerLoginRequestID {
             providerActionState = .failed(rejection.message)
             providerLoginRequestID = nil
+        }
+        if rejection.requestId == providerRegistrationRequestID {
+            applyState = .failed(rejection.message)
+            providerRegistrationRequestID = nil
         }
         if rejection.requestId == pairingCodeRequestID {
             errorMessage = rejection.message
@@ -1132,7 +1235,6 @@ final class AppModel {
             }
         case "task_complete":
             finishPendingTranscriptEntries()
-            flushLatestSequence()
             activeTurnID = nil
             finishGeneration()
             refreshGitDiff()
@@ -1142,7 +1244,6 @@ final class AppModel {
             approvalRequestID = nil
         case "turn_aborted":
             finishPendingTranscriptEntries()
-            flushLatestSequence()
             activeTurnID = nil
             finishGeneration()
             refreshGitDiff()
@@ -1293,23 +1394,6 @@ final class AppModel {
         }
     }
 
-    private func scheduleSequenceSave(_ sequence: UInt64, for account: GatewayAccount) {
-        sequenceSaveTask?.cancel()
-        sequenceSaveTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(250))
-            guard !Task.isCancelled, let self else { return }
-            self.store.saveLastSequence(sequence, for: account)
-            self.sequenceSaveTask = nil
-        }
-    }
-
-    private func flushLatestSequence() {
-        sequenceSaveTask?.cancel()
-        sequenceSaveTask = nil
-        guard let latestSequence, let account = selectedAccount else { return }
-        store.saveLastSequence(latestSequence, for: account)
-    }
-
     private func setPairingCode(_ code: String, expiresAt: Date) {
         pairingCodeExpiryTask?.cancel()
         guard expiresAt > .now else {
@@ -1389,7 +1473,6 @@ final class AppModel {
 
     private func connectionEnded(generation: UUID, message: String) {
         guard connectionGeneration == generation else { return }
-        flushLatestSequence()
         restorePendingDrafts()
         connectionState = .failed(message)
         if pendingPairingAccount != nil { pairingError = message }
@@ -1407,8 +1490,6 @@ final class AppModel {
         connectionGeneration = UUID()
         eventTask?.cancel()
         eventTask = nil
-        sequenceSaveTask?.cancel()
-        sequenceSaveTask = nil
         latestSequence = nil
         if preservingDrafts {
             restorePendingDrafts()
@@ -1419,45 +1500,27 @@ final class AppModel {
         pendingPairingAccount = nil
         connectionState = .disconnected
         errorMessage = nil
-        workspace = nil
-        gitStatus = nil
-        gitDiff = ""
-        gitDiffRequestID = nil
         sessionRequestID = nil
-        configRequestID = nil
+        sessionMutationRequestID = nil
+        sessionToRestoreID = nil
         workspaceError = nil
-        workspaceRequestID = nil
         isChangingWorkspace = false
         showsWorkspaceBrowser = false
         directoryListing = nil
         directoryError = nil
         directoryRequestID = nil
         isLoadingDirectories = false
-        showsCronTaskBrowser = false
-        cronDirectoryListing = nil
-        cronDirectoryError = nil
-        cronDirectoryRequestID = nil
-        isLoadingCronDirectories = false
         sessions = []
         selectedSessionID = nil
         profile = nil
-        cronTasks = []
-        cronRuns = []
-        cronTaskDraft = ""
-        cronScheduleDraft = ""
-        cronError = nil
-        cronRequestIDs.removeAll()
         modelChoices = []
-        selectedModelRoute = ""
-        contributions = []
-        agentSnapshot = nil
-        agentDraft = nil
-        applyState = .idle
+        middlewareFeatures = []
         providerStatuses = []
         providerAPIKey = ""
         providerActionState = .idle
         credentialRequestID = nil
         providerLoginRequestID = nil
+        providerRegistrationRequestID = nil
         pairingCodeRequestID = nil
         pairingCodeExpiryTask?.cancel()
         pairingCodeExpiryTask = nil
@@ -1469,6 +1532,21 @@ final class AppModel {
     }
 
     private func resetSessionState() {
+        workspace = nil
+        gitStatus = nil
+        gitDiff = ""
+        gitDiffRequestID = nil
+        selectedModelRoute = ""
+        contributions = []
+        agentSnapshot = nil
+        agentDraft = nil
+        applyState = .idle
+        configRequestID = nil
+        cronTasks = []
+        cronRuns = []
+        cronTaskDraft = ""
+        cronError = nil
+        cronRequestIDs.removeAll()
         transcript = []
         activeTurnID = nil
         activeOperation = nil

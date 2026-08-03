@@ -38,11 +38,6 @@ struct AppShell: View {
                         .frame(idealWidth: 520, idealHeight: 620)
                         .presentationDetents([.medium, .large])
                 }
-                .sheet(isPresented: $model.showsCronTaskBrowser) {
-                    CronTaskBrowserView()
-                        .frame(idealWidth: 520, idealHeight: 620)
-                        .presentationDetents([.medium, .large])
-                }
             }
         }
         .preferredColorScheme(preferredColorScheme)
@@ -82,7 +77,7 @@ private struct WorkspaceBrowserView: View {
                 if let listing = model.directoryListing {
                     DirectoryBrowserHeader(
                         path: listing.path,
-                        title: "Choose workspace",
+                        title: "Choose a workspace for the new chat",
                         parent: listing.parent,
                         onParent: model.loadDirectory
                     )
@@ -129,67 +124,7 @@ private struct WorkspaceBrowserView: View {
                     .disabled(
                         model.directoryListing?.parent == nil
                             || model.isChangingWorkspace
-                            || model.directoryListing?.path == model.workspace?.label
                     )
-                }
-            }
-        }
-    }
-}
-
-private struct CronTaskBrowserView: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
-    @Environment(\.horusPalette) private var palette
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                if let listing = model.cronDirectoryListing {
-                    DirectoryBrowserHeader(
-                        path: listing.path,
-                        title: "Choose task file",
-                        parent: listing.path == model.workspace?.label ? nil : listing.parent,
-                        onParent: model.loadCronDirectory
-                    )
-                    List {
-                        ForEach(listing.entries) { entry in
-                            Button {
-                                if entry.isDirectory { model.loadCronDirectory(entry.path) }
-                                else { model.chooseCronTask(entry.path) }
-                            } label: {
-                                HorusLabel(title: entry.name, icon: entry.isDirectory ? "folder" : "file")
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .listRowSeparator(.hidden)
-                        }
-                        if listing.entries.isEmpty && !model.isLoadingCronDirectories {
-                            Text("No files")
-                                .foregroundStyle(palette.muted)
-                                .listRowSeparator(.hidden)
-                        }
-                        if let error = model.cronDirectoryError {
-                            HorusLabel(title: error, icon: "triangle-alert", iconColor: palette.danger)
-                                .foregroundStyle(palette.danger)
-                                .listRowSeparator(.hidden)
-                        }
-                    }
-                    .listStyle(.plain)
-                    .scrollContentBackground(.hidden)
-                }
-            }
-            .font(HorusStyle.bodyFont)
-            .overlay {
-                if model.isLoadingCronDirectories { ProgressView() }
-            }
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        model.showsCronTaskBrowser = false
-                        dismiss()
-                    }
                 }
             }
         }
@@ -240,9 +175,9 @@ struct SidebarView: View {
     @Environment(\.horusPalette) private var palette
     let showDetail: () -> Void
     @State private var collapsedWorkspaces: Set<String> = []
-    @State private var sessionToRename: SessionSummary?
+    @State private var sessionToRename: SessionRecord?
     @State private var renameDraft = ""
-    @State private var sessionToDelete: SessionSummary?
+    @State private var sessionToDelete: SessionRecord?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -340,7 +275,7 @@ struct SidebarView: View {
                 .buttonStyle(.glassProminent)
                 .buttonBorderShape(.capsule)
                 .controlSize(.large)
-                .disabled(!model.canOpenSession)
+                .disabled(!model.canCreateSession)
                 .help("New chat")
                 Spacer()
                 Button {
@@ -468,8 +403,9 @@ struct SidebarView: View {
         }
     }
 
-    private func sessionRow(_ session: SessionSummary) -> some View {
-        HStack(spacing: 4) {
+    private func sessionRow(_ session: SessionRecord) -> some View {
+        let isSelected = session.sessionId == model.selectedSessionID
+        return HStack(spacing: 4) {
             Button {
                 model.openSession(session.sessionId)
                 model.destination = .chat
@@ -492,15 +428,17 @@ struct SidebarView: View {
                 Button(session.pinned ? "Unpin" : "Pin", lucideIcon: session.pinned ? "pin-off" : "pin") {
                     model.setSessionPinned(session, pinned: !session.pinned)
                 }
+                .disabled(!isSelected)
                 Button("Rename", lucideIcon: "pencil") {
                     renameDraft = session.displayTitle
                     sessionToRename = session
                 }
+                .disabled(!isSelected)
                 Divider()
                 Button("Delete", lucideIcon: "trash-2", role: .destructive) {
                     sessionToDelete = session
                 }
-                .disabled(session.sessionId == model.selectedSessionID)
+                .disabled(!isSelected)
             } label: {
                 HorusIcon(name: "ellipsis", size: 14)
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
@@ -533,7 +471,7 @@ private struct WorkspaceSessions: Identifiable {
     let id: String
     let name: String
     let path: String
-    let sessions: [SessionSummary]
+    let sessions: [SessionRecord]
 }
 
 struct PairingView: View {
@@ -596,7 +534,7 @@ struct PairingView: View {
 
                 VStack(spacing: 14) {
                     HorusLabel(
-                        title: "4-byte framed JSON · protocol v1",
+                        title: "4-byte framed JSON · protocol v\(gatewayProtocolVersion)",
                         icon: "shield-check",
                         iconColor: palette.muted
                     )
@@ -630,7 +568,7 @@ private extension String {
     }
 }
 
-private extension SessionSummary {
+private extension SessionRecord {
     var displayTitle: String {
         title?.nonEmpty ?? firstUserMessage?.nonEmpty ?? "Untitled chat"
     }

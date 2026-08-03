@@ -1,6 +1,6 @@
 import Foundation
 
-let gatewayProtocolVersion = 1
+let gatewayProtocolVersion = 5
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 
@@ -116,7 +116,6 @@ enum AgentOperation: Codable, Sendable {
     case capabilityCommand(capability: String, command: String, arguments: String)
     case setModel(route: String)
     case resumeSession(sessionID: String)
-    case unknown(JSONValue)
 
     init(from decoder: Decoder) throws {
         try self.init(json: JSONValue(from: decoder))
@@ -162,15 +161,11 @@ enum AgentOperation: Codable, Sendable {
         case "resume_session":
             self = .resumeSession(sessionID: try required("sessionId"))
         default:
-            self = .unknown(value)
+            throw GatewayWireError.invalidFrame("unknown agent operation \(type)")
         }
     }
 
     func encode(to encoder: Encoder) throws {
-        if case .unknown(let value) = self {
-            try value.encode(to: encoder)
-            return
-        }
         var container = encoder.container(keyedBy: DynamicCodingKey.self)
         switch self {
         case .userInput(let text):
@@ -199,8 +194,6 @@ enum AgentOperation: Codable, Sendable {
         case .resumeSession(let sessionID):
             try container.encode("resume_session", forKey: "type")
             try container.encode(sessionID, forKey: "sessionId")
-        case .unknown:
-            break
         }
     }
 }
@@ -251,47 +244,65 @@ enum ReviewDecision: Codable, Sendable {
 }
 
 enum GatewayRequest: Encodable, Sendable {
-    case pair(code: String, clientLabel: String, lastSequence: UInt64?)
-    case authenticate(token: String, lastSequence: UInt64?)
-    case openSession(requestID: String, sessionID: String?)
+    case pair(code: String, clientLabel: String)
+    case authenticate(token: String)
+    case listSessions(requestID: String)
+    case createSession(requestID: String, workspace: String)
+    case openSession(requestID: String, sessionID: String, lastSequence: UInt64?)
     case renameSession(requestID: String, sessionID: String, title: String)
     case setSessionPinned(requestID: String, sessionID: String, pinned: Bool)
     case deleteSession(requestID: String, sessionID: String)
-    case submit(Submission)
-    case configureAgent(requestID: String, expectedRevision: UInt64, config: AgentComposition)
-    case setWorkspace(requestID: String, path: String)
-    case setGitBranch(requestID: String, branch: String)
+    case submit(sessionID: String, submission: Submission)
+    case configureSession(
+        requestID: String,
+        sessionID: String,
+        expectedRevision: UInt64,
+        config: AgentComposition
+    )
+    case getGitDiff(requestID: String, sessionID: String)
     case listDirectories(requestID: String, path: String, includeFiles: Bool)
     case setProviderCredential(requestID: String, provider: String, apiKey: String)
+    case setProviderEndpointCredential(
+        requestID: String,
+        provider: String,
+        baseURL: String,
+        apiKey: String
+    )
+    case registerProvider(requestID: String, config: ProviderConfig)
     case createPairingCode(requestID: String)
     case startProviderLogin(requestID: String, provider: String)
     case getProfile(requestID: String)
-    case listArtifacts(requestID: String)
-    case getGitDiff(requestID: String)
-    case addCron(requestID: String, task: String, schedule: String)
-    case listCron(requestID: String)
-    case rescheduleCron(requestID: String, id: String, schedule: String)
-    case deleteCron(requestID: String, id: String)
-    case runCron(requestID: String, id: String)
-    case listCronHistory(requestID: String, id: String?)
+    case listArtifacts(requestID: String, sessionID: String)
+    case startCronSetup(requestID: String, sessionID: String, task: String?)
+    case listCron(requestID: String, sessionID: String)
+    case rescheduleCron(requestID: String, sessionID: String, id: String, schedule: String)
+    case deleteCron(requestID: String, sessionID: String, id: String)
+    case runCron(requestID: String, sessionID: String, id: String)
+    case listCronHistory(requestID: String, sessionID: String, id: String?)
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: DynamicCodingKey.self)
         try container.encode(gatewayProtocolVersion, forKey: "version")
         switch self {
-        case .pair(let code, let clientLabel, let lastSequence):
+        case .pair(let code, let clientLabel):
             try container.encode("pair", forKey: "type")
             try container.encode(code, forKey: "code")
             try container.encode(clientLabel, forKey: "clientLabel")
-            try container.encodeIfPresent(lastSequence, forKey: "lastSequence")
-        case .authenticate(let token, let lastSequence):
+        case .authenticate(let token):
             try container.encode("authenticate", forKey: "type")
             try container.encode(token, forKey: "token")
-            try container.encodeIfPresent(lastSequence, forKey: "lastSequence")
-        case .openSession(let requestID, let sessionID):
+        case .listSessions(let requestID):
+            try container.encode("list_sessions", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+        case .createSession(let requestID, let workspace):
+            try container.encode("create_session", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(workspace, forKey: "workspace")
+        case .openSession(let requestID, let sessionID, let lastSequence):
             try container.encode("open_session", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
-            try container.encodeIfPresent(sessionID, forKey: "sessionId")
+            try container.encode(sessionID, forKey: "sessionId")
+            try container.encode(lastSequence, forKey: "lastSequence")
         case .renameSession(let requestID, let sessionID, let title):
             try container.encode("rename_session", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -306,22 +317,20 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode("delete_session", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
-        case .submit(let submission):
+        case .submit(let sessionID, let submission):
             try container.encode("submit", forKey: "type")
+            try container.encode(sessionID, forKey: "sessionId")
             try container.encode(submission, forKey: "submission")
-        case .configureAgent(let requestID, let expectedRevision, let config):
-            try container.encode("configure_agent", forKey: "type")
+        case .configureSession(let requestID, let sessionID, let expectedRevision, let config):
+            try container.encode("configure_session", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
             try container.encode(expectedRevision, forKey: "expectedRevision")
             try container.encode(config, forKey: "config")
-        case .setWorkspace(let requestID, let path):
-            try container.encode("set_workspace", forKey: "type")
+        case .getGitDiff(let requestID, let sessionID):
+            try container.encode("get_git_diff", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
-            try container.encode(path, forKey: "path")
-        case .setGitBranch(let requestID, let branch):
-            try container.encode("set_git_branch", forKey: "type")
-            try container.encode(requestID, forKey: "requestId")
-            try container.encode(branch, forKey: "branch")
+            try container.encode(sessionID, forKey: "sessionId")
         case .listDirectories(let requestID, let path, let includeFiles):
             try container.encode("list_directories", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -332,6 +341,16 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(requestID, forKey: "requestId")
             try container.encode(provider, forKey: "provider")
             try container.encode(apiKey, forKey: "apiKey")
+        case .setProviderEndpointCredential(let requestID, let provider, let baseURL, let apiKey):
+            try container.encode("set_provider_endpoint_credential", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(provider, forKey: "provider")
+            try container.encode(baseURL, forKey: "baseUrl")
+            try container.encode(apiKey, forKey: "apiKey")
+        case .registerProvider(let requestID, let config):
+            try container.encode("register_provider", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(config, forKey: "config")
         case .createPairingCode(let requestID):
             try container.encode("create_pairing_code", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -342,37 +361,40 @@ enum GatewayRequest: Encodable, Sendable {
         case .getProfile(let requestID):
             try container.encode("get_profile", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
-        case .listArtifacts(let requestID):
+        case .listArtifacts(let requestID, let sessionID):
             try container.encode("list_artifacts", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
-        case .getGitDiff(let requestID):
-            try container.encode("get_git_diff", forKey: "type")
+            try container.encode(sessionID, forKey: "sessionId")
+        case .startCronSetup(let requestID, let sessionID, let task):
+            try container.encode("start_cron_setup", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
-        case .addCron(let requestID, let task, let schedule):
-            try container.encode("add_cron", forKey: "type")
-            try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
             try container.encode(task, forKey: "task")
-            try container.encode(schedule, forKey: "schedule")
-        case .listCron(let requestID):
+        case .listCron(let requestID, let sessionID):
             try container.encode("list_cron", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
-        case .rescheduleCron(let requestID, let id, let schedule):
+            try container.encode(sessionID, forKey: "sessionId")
+        case .rescheduleCron(let requestID, let sessionID, let id, let schedule):
             try container.encode("reschedule_cron", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
             try container.encode(id, forKey: "id")
             try container.encode(schedule, forKey: "schedule")
-        case .deleteCron(let requestID, let id):
+        case .deleteCron(let requestID, let sessionID, let id):
             try container.encode("delete_cron", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
             try container.encode(id, forKey: "id")
-        case .runCron(let requestID, let id):
+        case .runCron(let requestID, let sessionID, let id):
             try container.encode("run_cron", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
             try container.encode(id, forKey: "id")
-        case .listCronHistory(let requestID, let id):
+        case .listCronHistory(let requestID, let sessionID, let id):
             try container.encode("list_cron_history", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
-            try container.encodeIfPresent(id, forKey: "id")
+            try container.encode(sessionID, forKey: "sessionId")
+            try container.encode(id, forKey: "id")
         }
     }
 }
@@ -381,17 +403,20 @@ enum GatewayEnvelope: Decodable, Sendable {
     case paired(clientID: String, token: String)
     case authenticated
     case ready(ReadyPayload)
+    case sessionOpened(requestID: String, payload: SessionReadyPayload)
+    case sessionChanged(SessionReadyPayload)
+    case gatewayConfigured(requestID: String, payload: ReadyPayload)
     case accepted(requestID: String)
     case rejected(GatewayRejection)
     case agentEvent(
+        sessionID: String,
         sequence: UInt64,
         event: AgentEventRecord,
         blocks: [FrontendBlock],
         history: [RenderedEventRecord]?,
         preview: RenderedPreview?
     )
-    case sessions([SessionSummary])
-    case configChanged(VersionedAgentConfig)
+    case sessions(requestID: String?, sessions: [SessionRecord])
     case providerCredentialStatus(requestID: String, provider: String, configured: Bool)
     case pairingCode(requestID: String, code: String, expiresAt: Int64)
     case providerLoginStarted(
@@ -403,13 +428,12 @@ enum GatewayEnvelope: Decodable, Sendable {
     )
     case providerLoginFinished(requestID: String, loginID: String, provider: String)
     case profile(requestID: String, profile: ProfileSnapshot)
-    case artifacts(requestID: String, artifacts: [ArtifactRecord])
-    case gitDiff(requestID: String, diff: String)
+    case artifacts(requestID: String, sessionID: String, artifacts: [ArtifactRecord])
+    case gitDiff(requestID: String, sessionID: String, diff: String)
     case directories(requestID: String, listing: DirectoryListing)
-    case cronTasks(requestID: String, tasks: [CronTask])
-    case cronHistory(requestID: String, runs: [CronRun])
+    case cronTasks(requestID: String, sessionID: String, tasks: [CronTask])
+    case cronHistory(requestID: String, sessionID: String, runs: [CronRun])
     case error(GatewayFailure)
-    case unknown(type: String)
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: DynamicCodingKey.self)
@@ -428,12 +452,27 @@ enum GatewayEnvelope: Decodable, Sendable {
             self = .authenticated
         case "ready":
             self = .ready(try container.decode(ReadyPayload.self, forKey: "payload"))
+        case "session_opened":
+            self = .sessionOpened(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                payload: try container.decode(SessionReadyPayload.self, forKey: "payload")
+            )
+        case "session_changed":
+            self = .sessionChanged(
+                try container.decode(SessionReadyPayload.self, forKey: "payload")
+            )
+        case "gateway_configured":
+            self = .gatewayConfigured(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                payload: try container.decode(ReadyPayload.self, forKey: "payload")
+            )
         case "accepted":
             self = .accepted(requestID: try container.decode(String.self, forKey: "requestId"))
         case "rejected":
             self = .rejected(try GatewayRejection(from: decoder))
         case "agent_event":
             self = .agentEvent(
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
                 sequence: try container.decode(UInt64.self, forKey: "sequence"),
                 event: try container.decode(AgentEventRecord.self, forKey: "event"),
                 blocks: try container.decode([FrontendBlock].self, forKey: "blocks"),
@@ -441,9 +480,10 @@ enum GatewayEnvelope: Decodable, Sendable {
                 preview: try container.decodeIfPresent(RenderedPreview.self, forKey: "preview")
             )
         case "sessions":
-            self = .sessions(try container.decode([SessionSummary].self, forKey: "sessions"))
-        case "config_changed":
-            self = .configChanged(try container.decode(VersionedAgentConfig.self, forKey: "snapshot"))
+            self = .sessions(
+                requestID: try container.decodeIfPresent(String.self, forKey: "requestId"),
+                sessions: try container.decode([SessionRecord].self, forKey: "sessions")
+            )
         case "provider_credential_status":
             self = .providerCredentialStatus(
                 requestID: try container.decode(String.self, forKey: "requestId"),
@@ -478,11 +518,13 @@ enum GatewayEnvelope: Decodable, Sendable {
         case "artifacts":
             self = .artifacts(
                 requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
                 artifacts: try container.decode([ArtifactRecord].self, forKey: "artifacts")
             )
         case "git_diff":
             self = .gitDiff(
                 requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
                 diff: try container.decode(String.self, forKey: "diff")
             )
         case "directories":
@@ -493,17 +535,19 @@ enum GatewayEnvelope: Decodable, Sendable {
         case "cron_tasks":
             self = .cronTasks(
                 requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
                 tasks: try container.decode([CronTask].self, forKey: "tasks")
             )
         case "cron_history":
             self = .cronHistory(
                 requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
                 runs: try container.decode([CronRun].self, forKey: "runs")
             )
         case "error":
             self = .error(try GatewayFailure(from: decoder))
         default:
-            self = .unknown(type: type)
+            throw GatewayWireError.invalidFrame("unknown gateway message \(type)")
         }
     }
 }
@@ -522,25 +566,30 @@ struct GatewayFailure: Decodable, Sendable {
 }
 
 struct ReadyPayload: Decodable, Sendable {
-    let latestSequence: UInt64
-    let workspace: WorkspaceSummary
-    let session: SessionConfigured
-    let sessions: [SessionSummary]
-    let modelChoices: [ModelChoice]
-    let contributions: [FrontendContribution]
-    let config: VersionedAgentConfig
+    let sessions: [SessionRecord]
     let providers: [ProviderStatus]
-    let git: GitStatus?
+    let defaultConfig: VersionedAgentConfig?
+    let models: [ModelChoice]
+    let middlewareFeatures: [MiddlewareFeature]
+    let maxActiveSessions: Int
 }
 
-struct WorkspaceSummary: Identifiable, Codable, Hashable, Sendable {
+struct SessionReadyPayload: Decodable, Sendable {
+    let latestSequence: UInt64
+    let workspace: WorkspaceInfo
+    let git: GitStatus?
+    let session: SessionConfigured
+    let contributions: [FrontendContribution]
+    let config: VersionedAgentConfig
+}
+
+struct WorkspaceInfo: Identifiable, Codable, Hashable, Sendable {
     let id: String
-    let label: String
+    let path: String
 }
 
 struct GitStatus: Codable, Equatable, Sendable {
     let currentBranch: String
-    let branches: [String]
 }
 
 struct DirectoryListing: Codable, Equatable, Sendable {
@@ -579,7 +628,7 @@ struct ModelChanged: Codable, Hashable, Sendable {
     let modelContextWindow: Int64?
 }
 
-struct SessionSummary: Identifiable, Codable, Hashable, Sendable {
+struct SessionRecord: Identifiable, Codable, Hashable, Sendable {
     var id: String { sessionId }
 
     let sessionId: String
@@ -756,8 +805,8 @@ func refreshedAgentDraft(
 }
 
 struct AgentComposition: Codable, Equatable, Sendable {
-    var provider: ProviderSelection
-    var middleware: MiddlewareSelection
+    var provider: ProviderConfig
+    var middleware: MiddlewareConfig
     var approval: ApprovalPolicy
     var systemPrompt: String
 }
@@ -770,22 +819,23 @@ enum ApprovalPolicy: String, Codable, CaseIterable, Identifiable, Sendable {
     var id: Self { self }
 }
 
-struct ProviderSelection: Codable, Equatable, Sendable {
+struct ProviderConfig: Codable, Equatable, Sendable {
     var provider: String
     var model: String
     var baseUrl: String?
-    var apiKeyEnv: String?
     var reasoningEffort: String?
     var webSearch: String
 }
 
-struct MiddlewareSelection: Codable, Equatable, Sendable {
-    var tools: Bool
-    var skills: Bool
-    var subagents: Bool
-    var steering: Bool
-    var compaction: Bool
-    var sessions: Bool
+struct MiddlewareConfig: Codable, Equatable, Sendable {
+    var enabled: Set<String>
+}
+
+struct MiddlewareFeature: Identifiable, Codable, Equatable, Sendable {
+    let id: String
+    let label: String
+    let description: String
+    let required: Bool
 }
 
 struct ProviderStatus: Identifiable, Codable, Equatable, Sendable {
@@ -797,6 +847,7 @@ struct ProviderStatus: Identifiable, Codable, Equatable, Sendable {
     let auth: String
     let defaultModel: String?
     let defaultBaseUrl: String?
+    let defaultApiKeyEnv: String?
     let defaultReasoningEffort: String?
     let defaultWebSearch: String
 }
@@ -812,7 +863,6 @@ struct TokenUsage: Codable, Equatable, Sendable {
 
 struct ProfileSnapshot: Codable, Equatable, Sendable {
     let userName: String?
-    let workspace: WorkspaceSummary
     let dailyUsage: [DailyUsage]
 }
 
@@ -831,6 +881,7 @@ struct ArtifactRecord: Identifiable, Codable, Equatable, Sendable {
 
 struct CronTask: Identifiable, Codable, Equatable, Sendable {
     let id: String
+    let sessionId: String
     let task: String
     let schedule: String
 }
@@ -838,6 +889,7 @@ struct CronTask: Identifiable, Codable, Equatable, Sendable {
 struct CronRun: Identifiable, Codable, Equatable, Sendable {
     let id: String
     let taskId: String
+    let sourceSessionId: String
     let startedAt: Int64
     let finishedAt: Int64?
     let status: String

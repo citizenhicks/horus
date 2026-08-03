@@ -41,19 +41,6 @@ final class GatewayStore {
         defaults.set(account.id.uuidString, forKey: selectedAccountKey)
     }
 
-    func lastSequence(for account: GatewayAccount) -> UInt64? {
-        let value = defaults.object(forKey: sequenceKey(account.id)) as? NSNumber
-        return value?.uint64Value
-    }
-
-    func saveLastSequence(_ sequence: UInt64, for account: GatewayAccount) {
-        defaults.set(NSNumber(value: sequence), forKey: sequenceKey(account.id))
-    }
-
-    func clearLastSequence(for account: GatewayAccount) {
-        defaults.removeObject(forKey: sequenceKey(account.id))
-    }
-
     func token(for account: GatewayAccount) throws -> String {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
@@ -86,7 +73,6 @@ final class GatewayStore {
         }
         let accounts = loadAccounts().filter { $0.id != account.id }
         defaults.set(try encoder.encode(accounts), forKey: accountsKey)
-        defaults.removeObject(forKey: sequenceKey(account.id))
         if selectedAccountID() == account.id {
             defaults.removeObject(forKey: selectedAccountKey)
         }
@@ -112,10 +98,6 @@ final class GatewayStore {
         let item = query.merging(attributes) { _, new in new }
         let addStatus = SecItemAdd(item as CFDictionary, nil)
         guard addStatus == errSecSuccess else { throw StoreError.keychain(addStatus) }
-    }
-
-    private func sequenceKey(_ accountID: UUID) -> String {
-        "gateway-sequence-\(accountID.uuidString)"
     }
 }
 

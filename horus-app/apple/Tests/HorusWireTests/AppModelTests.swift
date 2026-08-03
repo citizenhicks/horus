@@ -46,6 +46,7 @@ final class AppModelTests: XCTestCase {
             reason: "Run the command?",
             calls: [ApprovalCall(id: "call-1", name: "shell", arguments: "{}")]
         )
+        model.selectedSessionID = "chat-1"
         model.pendingApproval = approval
 
         model.resolveApproval(.approved)

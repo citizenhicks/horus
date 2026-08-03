@@ -21,12 +21,9 @@ struct AgentSettingsView: View {
                 }
 
                 Section("Capabilities") {
-                    capabilityToggle("Workspace tools", detail: "Read, edit, and run commands", binding: middleware(\.tools))
-                    capabilityToggle("Skills", detail: "Discover gateway-installed instructions", binding: middleware(\.skills))
-                    capabilityToggle("Subagents", detail: "Delegate bounded concurrent work", binding: middleware(\.subagents))
-                    capabilityToggle("Steering", detail: "Accept input while a turn is active", binding: middleware(\.steering))
-                    capabilityToggle("Compaction", detail: "Manage long context automatically", binding: middleware(\.compaction))
-                    capabilityToggle("Sessions", detail: "Resume and fork durable chats", binding: middleware(\.sessions))
+                    ForEach(model.middlewareFeatures, id: \.id) { feature in
+                        capabilityToggle(feature)
+                    }
                 }
                 .toggleStyle(.switch)
 
@@ -121,14 +118,15 @@ struct AgentSettingsView: View {
         }
     }
 
-    private func capabilityToggle(_ title: String, detail: String, binding: Binding<Bool>) -> some View {
+    private func capabilityToggle(_ feature: MiddlewareFeature) -> some View {
         LabeledContent {
-            Toggle(title, isOn: binding)
+            Toggle(feature.label, isOn: middleware(feature))
                 .labelsHidden()
+                .disabled(feature.required)
         } label: {
             VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(HorusStyle.controlFont)
-                Text(detail).font(HorusStyle.bodyFont).foregroundStyle(palette.muted)
+                Text(feature.label).font(HorusStyle.controlFont)
+                Text(feature.description).font(HorusStyle.bodyFont).foregroundStyle(palette.muted)
             }
         }
         .frame(maxWidth: .infinity)
@@ -141,10 +139,17 @@ struct AgentSettingsView: View {
         )
     }
 
-    private func middleware(_ keyPath: WritableKeyPath<MiddlewareSelection, Bool>) -> Binding<Bool> {
+    private func middleware(_ feature: MiddlewareFeature) -> Binding<Bool> {
         Binding(
-            get: { model.agentDraft?.middleware[keyPath: keyPath] ?? false },
-            set: { model.agentDraft?.middleware[keyPath: keyPath] = $0 }
+            get: {
+                feature.required || (model.agentDraft?.middleware.enabled.contains(feature.id) ?? false)
+            },
+            set: { isEnabled in
+                guard !feature.required, var enabled = model.agentDraft?.middleware.enabled else { return }
+                if isEnabled { enabled.insert(feature.id) }
+                else { enabled.remove(feature.id) }
+                model.agentDraft?.middleware.enabled = enabled
+            }
         )
     }
 
@@ -241,7 +246,7 @@ struct ProvidersView: View {
 
                 providerActionStatus
 
-                Button(action: model.applyAgentConfiguration) {
+                Button(action: model.applyProviderConfiguration) {
                     Text("Apply provider and restart")
                         .frame(maxWidth: settingsActionMaxWidth)
                 }
@@ -411,35 +416,22 @@ struct CronView: View {
             title: "Schedules",
             detail: "Run durable Horus tasks on the gateway workspace, even when this app is closed."
         ) {
-            Section("Add schedule") {
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Task file")
-                            .font(HorusStyle.controlFont)
-                        Text(model.cronTaskDraft.isEmpty ? "No file selected" : model.cronTaskDraft)
-                            .font(HorusStyle.bodyFont)
-                            .foregroundStyle(palette.muted)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    Spacer(minLength: 12)
-                    Button("Choose", lucideIcon: "folder-open", action: model.openCronTaskBrowser)
-                        .buttonStyle(.glass)
-                        .buttonBorderShape(.capsule)
-                        .controlSize(.large)
-                }
-                TextField("Cron expression · e.g. 15 2 * * 1-5", text: Binding(
-                    get: { model.cronScheduleDraft }, set: { model.cronScheduleDraft = $0 }
-                ))
-                .textFieldStyle(.roundedBorder)
-                .font(HorusStyle.bodyFont.monospaced())
+            Section("New schedule") {
+                TextField("Optional task instructions", text: Binding(
+                    get: { model.cronTaskDraft }, set: { model.cronTaskDraft = $0 }
+                ), axis: .vertical)
+                .lineLimit(2...5)
+                Text("Continue in chat to describe the schedule and confirm the task.")
+                    .font(HorusStyle.bodyFont)
+                    .foregroundStyle(palette.muted)
             }
 
-            Button(action: model.addCron) {
-                HorusLabel(title: "Add schedule", icon: "plus")
+            Button(action: model.startCronSetup) {
+                HorusLabel(title: "Start setup", icon: "plus")
                     .frame(maxWidth: settingsActionMaxWidth)
             }
             .settingsPrimaryAction()
+            .disabled(!model.connectionState.isReady || model.selectedSessionID == nil)
             .settingsStandaloneRow()
 
             if let error = model.cronError {
@@ -758,7 +750,7 @@ struct GatewayView: View {
                 }
                 LabeledContent("Endpoint", value: model.selectedAccount?.endpoint.rawValue ?? "—")
                 LabeledContent("Transport", value: model.selectedAccount?.endpoint.usesTLS == true ? "TLS" : "Loopback TCP")
-                LabeledContent("Protocol", value: "Horus gateway v1")
+                LabeledContent("Protocol", value: "Horus gateway v\(gatewayProtocolVersion)")
             }
 
             GlassEffectContainer(spacing: 8) {

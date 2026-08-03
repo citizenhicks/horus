@@ -61,15 +61,9 @@ private struct ChatOptionsMenu: View {
         let totals = diffTotals(model.gitDiff)
         Menu {
             Section("Workspace") {
-                Button(model.workspace?.label ?? "Choose workspace", action: model.openWorkspaceBrowser)
-                .disabled(!model.connectionState.isReady)
+                Text(model.workspace?.path ?? "No chat selected")
                 if let git = model.gitStatus, !git.currentBranch.isEmpty {
-                    Menu {
-                        ForEach(git.branches, id: \.self) { branch in
-                            Button(branch) { model.selectGitBranch(branch) }
-                                .disabled(branch == git.currentBranch)
-                        }
-                    } label: { Text(git.currentBranch) }
+                    Text("Branch · \(git.currentBranch)")
                 }
             }
             Section("Session") {
@@ -501,27 +495,20 @@ private struct ComposerActivityView: View {
         GlassEffectContainer(spacing: 8) {
             HStack(spacing: 8) {
                 #if os(macOS)
-                Button("Choose workspace", lucideIcon: "folder", action: model.openWorkspaceBrowser)
-                    .labelStyle(.iconOnly)
-                    .buttonStyle(HorusIconButtonStyle())
-                    .help(model.workspace?.label ?? "Choose workspace")
-                    .accessibilityLabel("Workspace")
-                    .accessibilityValue(model.workspace?.label ?? "Not selected")
+                if let workspace = model.workspace {
+                    HorusIcon(name: "folder", foreground: palette.muted)
+                        .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                        .help(workspace.path)
+                        .accessibilityLabel("Workspace")
+                        .accessibilityValue(workspace.path)
+                }
 
                 if let git = model.gitStatus, !git.currentBranch.isEmpty {
-                    Menu {
-                        ForEach(git.branches, id: \.self) { branch in
-                            Button(branch) { model.selectGitBranch(branch) }
-                                .disabled(branch == git.currentBranch)
-                        }
-                    } label: {
-                        HorusLabel(title: "Git branch", icon: "git-branch")
-                            .labelStyle(.iconOnly)
-                    }
-                    .buttonStyle(HorusIconButtonStyle())
-                    .help(git.currentBranch)
-                    .accessibilityLabel("Git branch")
-                    .accessibilityValue(git.currentBranch)
+                    HorusIcon(name: "git-branch", foreground: palette.muted)
+                        .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                        .help(git.currentBranch)
+                        .accessibilityLabel("Git branch")
+                        .accessibilityValue(git.currentBranch)
                 }
                 #endif
 
