@@ -15,6 +15,7 @@ use crate::Result;
 use crate::protocol::TokenUsage;
 
 pub mod anthropic;
+pub mod deepseek;
 pub mod kimi;
 pub mod openai;
 mod openai_auth;

@@ -381,6 +381,7 @@ pub(super) fn validate_base_url(base_url: &str) -> Result<()> {
 static PROVIDERS: &[ProviderDefinition] = &[
     super::openai_socket::provider(),
     super::openai_codex::provider(),
+    super::deepseek::provider(),
     super::kimi::provider(),
     super::openrouter::provider(),
     super::anthropic::provider(),

@@ -662,7 +662,14 @@ mod tests {
                 .is_some_and(|choice| choice.route.starts_with("kimi::"))
         );
         assert_eq!(resolved, custom);
-        assert!(custom_route.group.starts_with("Custom Responses · "));
+        assert_eq!(
+            custom_route.group,
+            format!(
+                "{} · {}",
+                provider("responses").expect("provider").label(),
+                custom.model
+            )
+        );
     }
 
     #[test]

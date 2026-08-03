@@ -40,6 +40,19 @@ fn responses_input_strips_only_top_level_provider_metadata() {
 }
 
 #[test]
+fn responses_decode_preserves_reasoning_content_for_replay() {
+    let decoded = decode_response(serde_json::json!({
+        "output": [{
+            "type": "reasoning",
+            "content": [{"type": "reasoning_text", "text": "Plan."}]
+        }]
+    }))
+    .expect("decode response");
+
+    assert_eq!(decoded.output()[0][REPLAY_REASONING_FIELD], "Plan.");
+}
+
+#[test]
 fn responses_decode_normalizes_tool_calls_usage_and_errors() {
     let decoded = decode_response(serde_json::json!({
         "output": [
@@ -71,6 +84,31 @@ fn responses_decode_normalizes_tool_calls_usage_and_errors() {
     assert_eq!(
         response_error(&serde_json::json!({"error": {"message": "bad request"}})),
         "bad request"
+    );
+}
+
+#[test]
+fn responses_emits_reasoning_text_deltas() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_seen = Arc::clone(&seen);
+    let events: ModelEventSink = Arc::new(move |event| {
+        sink_seen.lock().expect("events lock").push(event);
+        Ok(())
+    });
+
+    assert!(
+        emit_reasoning_event(
+            &serde_json::json!({
+                "type": "response.reasoning_text.delta",
+                "delta": "Plan."
+            }),
+            &events,
+        )
+        .expect("reasoning event")
+    );
+    assert_eq!(
+        *seen.lock().expect("events lock"),
+        vec![ModelEvent::ReasoningDelta("Plan.".into())]
     );
 }
 
