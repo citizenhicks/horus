@@ -1,0 +1,33 @@
+//! Authenticated, frontend-neutral access to independent Horus chats.
+
+mod assembly;
+pub mod auth;
+pub mod client;
+pub mod command;
+pub mod config;
+pub mod cron;
+mod host;
+mod middleware_manifest;
+pub mod sandbox;
+pub mod server;
+pub mod wire;
+
+/// Errors returned by the gateway library.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("gateway configuration error: {0}")]
+    Config(String),
+    #[error("gateway protocol error: {0}")]
+    Protocol(String),
+    #[error("gateway authentication failed")]
+    Unauthorized,
+    #[error(transparent)]
+    Horus(#[from] horus::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
+/// Result type shared by gateway modules.
+pub type Result<T> = std::result::Result<T, Error>;

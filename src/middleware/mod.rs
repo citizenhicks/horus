@@ -25,10 +25,12 @@ use crate::protocol::SessionContext;
 use crate::protocol::TokenUsage;
 
 pub mod compaction;
+pub mod instructions;
 pub mod sessions;
 pub mod skills;
 pub mod steering;
 pub mod subagents;
+pub mod tasks;
 pub mod tools;
 
 use tools::Catalog;

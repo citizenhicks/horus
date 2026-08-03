@@ -18,11 +18,31 @@ use crate::protocol::FrontendEvent;
 use crate::protocol::ReviewDecision;
 
 mod approval;
+mod background;
 pub mod local;
+mod process_group;
+
+pub(crate) const MAX_FILE_BYTES: usize = 1024 * 1024;
 
 pub use approval::ApprovalPolicy;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use process_group::MACOS_COMMAND_WRAPPER;
+#[doc(hidden)]
+pub use process_group::ProcessGroupGuard;
 
 use approval::Approval;
+pub(crate) use background::BackgroundCommandPoll;
+#[cfg(test)]
+pub(crate) use background::BackgroundCommandStatus;
+use background::BackgroundCommands;
+
+/// Deny-by-default macOS Seatbelt prelude shared by first-party sandbox backends.
+///
+/// Backends must append their own filesystem allow rules before using it.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base_policy.sbpl");
 
 /// Whether a sandbox backend permits network access for one command.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +61,43 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 
+/// One byte stream emitted by a sandboxed command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandStream {
+    Stdout,
+    Stderr,
+}
+
+/// Whether command execution has a foreground deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandMode {
+    Foreground,
+    Background,
+}
+
+/// Optional observer for bounded command output consumers.
+#[derive(Clone, Default)]
+pub struct CommandOutputSink {
+    callback: Option<Arc<CommandOutputCallback>>,
+}
+
+type CommandOutputCallback = dyn Fn(CommandStream, &[u8]) + Send + Sync;
+
+impl CommandOutputSink {
+    pub(crate) fn new(callback: impl Fn(CommandStream, &[u8]) + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Some(Arc::new(callback)),
+        }
+    }
+
+    /// Publishes one output chunk while the backend continues draining the stream.
+    pub fn write(&self, stream: CommandStream, bytes: &[u8]) {
+        if let Some(callback) = &self.callback {
+            callback(stream, bytes);
+        }
+    }
+}
+
 /// Implements one sandbox execution environment.
 pub trait SandboxBackend: Send + Sync {
     /// Reads a UTF-8 file.
@@ -49,11 +106,13 @@ pub trait SandboxBackend: Send + Sync {
     /// Writes a UTF-8 file.
     fn write<'a>(&'a self, path: &'a str, content: &'a str) -> BoxFuture<'a, Result<()>>;
 
-    /// Runs a shell command under the requested network isolation.
+    /// Runs a shell command and forwards drained output under the requested isolation.
     fn execute<'a>(
         &'a self,
         command: &'a str,
         network_access: NetworkAccess,
+        mode: CommandMode,
+        output: CommandOutputSink,
     ) -> BoxFuture<'a, Result<CommandOutput>>;
 }
 
@@ -61,6 +120,7 @@ pub trait SandboxBackend: Send + Sync {
 pub struct Sandbox {
     backend: Arc<dyn SandboxBackend>,
     approval: Approval,
+    background: BackgroundCommands,
 }
 
 impl Sandbox {
@@ -70,6 +130,7 @@ impl Sandbox {
         Self {
             backend,
             approval: Approval::new(policy),
+            background: BackgroundCommands::default(),
         }
     }
 
@@ -92,6 +153,9 @@ impl Sandbox {
                 ))
             });
         }
+        if content.len() > MAX_FILE_BYTES {
+            return Box::pin(async { Err(Error::Sandbox("file exceeds write limit".into())) });
+        }
         self.backend.write(path, content)
     }
 
@@ -108,7 +172,46 @@ impl Sandbox {
                 ))
             });
         }
-        self.backend.execute(command, permissions.network_access)
+        self.backend.execute(
+            command,
+            permissions.network_access,
+            CommandMode::Foreground,
+            CommandOutputSink::default(),
+        )
+    }
+
+    pub(crate) fn start_background(
+        &self,
+        command: String,
+        permissions: &ToolPermissions,
+    ) -> Result<String> {
+        if !permissions.mutation {
+            return Err(Error::Sandbox(
+                "tool call is not authorized to execute commands".into(),
+            ));
+        }
+        self.background.start(
+            &permissions.session_id,
+            Arc::clone(&self.backend),
+            command,
+            permissions.network_access,
+        )
+    }
+
+    pub(crate) async fn poll_background(
+        &self,
+        id: &str,
+        permissions: &ToolPermissions,
+    ) -> Result<BackgroundCommandPoll> {
+        self.background.poll(&permissions.session_id, id).await
+    }
+
+    pub(crate) async fn stop_background(
+        &self,
+        id: &str,
+        permissions: &ToolPermissions,
+    ) -> Result<BackgroundCommandPoll> {
+        self.background.stop(&permissions.session_id, id).await
     }
 
     pub(crate) fn name(&self) -> &'static str {
@@ -165,34 +268,40 @@ impl Sandbox {
             .resolve(session_id, calls, approval_call_ids, decision, permissions)
     }
 
-    pub(crate) fn shutdown(&self, session_id: &str) -> Result<()> {
-        self.approval.shutdown(session_id)
+    pub(crate) async fn shutdown(&self, session_id: &str) -> Result<()> {
+        let approval = self.approval.shutdown(session_id);
+        let background = self.background.shutdown(session_id).await;
+        approval.and(background)
     }
 }
 
 /// Batch authority issued by the sandbox approval policy.
 #[derive(Debug)]
 pub(crate) struct SandboxPermissions {
+    session_id: String,
     network_access: NetworkAccess,
     mutation_call_ids: BTreeSet<String>,
 }
 
 impl SandboxPermissions {
     fn new(
+        session_id: impl Into<String>,
         network_access: NetworkAccess,
         mutation_call_ids: impl IntoIterator<Item = String>,
     ) -> Self {
         Self {
+            session_id: session_id.into(),
             network_access,
             mutation_call_ids: mutation_call_ids.into_iter().collect(),
         }
     }
 
     pub(crate) fn restore(
+        session_id: impl Into<String>,
         network_access: NetworkAccess,
         mutation_call_ids: impl IntoIterator<Item = String>,
     ) -> Self {
-        Self::new(network_access, mutation_call_ids)
+        Self::new(session_id, network_access, mutation_call_ids)
     }
 
     pub(crate) fn network_access(&self) -> NetworkAccess {
@@ -205,6 +314,7 @@ impl SandboxPermissions {
 
     pub(crate) fn for_call(&self, call_id: &str) -> ToolPermissions {
         ToolPermissions {
+            session_id: self.session_id.clone(),
             network_access: self.network_access,
             mutation: self.mutation_call_ids.contains(call_id),
         }
@@ -217,6 +327,7 @@ impl SandboxPermissions {
 
 /// Opaque authority attached to exactly one tool call.
 pub struct ToolPermissions {
+    session_id: String,
     network_access: NetworkAccess,
     mutation: bool,
 }
@@ -247,7 +358,7 @@ mod tests {
             Arc::new(LocalSandbox::new(workspace.path()).expect("backend")),
             ApprovalPolicy::On,
         );
-        let permissions = SandboxPermissions::new(NetworkAccess::Allowed, Vec::new());
+        let permissions = SandboxPermissions::new("session", NetworkAccess::Allowed, Vec::new());
 
         assert!(
             sandbox

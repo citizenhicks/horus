@@ -1,4 +1,4 @@
-//! Session catalog and durable forking middleware.
+//! Chat catalog and durable forking middleware.
 
 use uuid::Uuid;
 
@@ -22,7 +22,7 @@ use crate::protocol::Op;
 
 const DEFAULT_PAGE_SIZE: usize = 100;
 
-/// Adds session discovery and branching without changing the core loop.
+/// Adds chat discovery and branching without changing the core loop.
 pub struct Sessions {
     page_size: usize,
 }
@@ -32,7 +32,7 @@ impl Sessions {
     pub fn new(page_size: usize) -> Result<Self> {
         if page_size == 0 {
             return Err(Error::Config(
-                "session catalog page size must be positive".into(),
+                "chat catalog page size must be positive".into(),
             ));
         }
         Ok(Self { page_size })
@@ -59,12 +59,12 @@ impl Middleware for Sessions {
                 FrontendCommand {
                     name: "resume".into(),
                     arguments: String::new(),
-                    description: "resume a saved session".into(),
+                    description: "resume a saved chat".into(),
                 },
                 FrontendCommand {
                     name: "fork".into(),
                     arguments: String::new(),
-                    description: "create a resumable branch from this session".into(),
+                    description: "create a resumable branch from this chat".into(),
                 },
             ],
             widgets: Vec::new(),
@@ -95,11 +95,7 @@ async fn fork(context: MiddlewareCommandContext<'_>) -> Result<MiddlewareCommand
             FrontendTone::Warning,
         ));
     }
-    let mut checkpoint = Checkpoint::empty(Uuid::new_v4().to_string());
-    checkpoint.context.clone_from(&context.checkpoint.context);
-    checkpoint
-        .model_route
-        .clone_from(&context.checkpoint.model_route);
+    let checkpoint = manual_fork_checkpoint(context.checkpoint);
     context
         .checkpoints
         .fork(
@@ -108,14 +104,45 @@ async fn fork(context: MiddlewareCommandContext<'_>) -> Result<MiddlewareCommand
             &checkpoint,
         )
         .await?;
-    Ok(MiddlewareCommandOutput::render(
-        "sessions",
-        format!(
-            "◇ forked session {} · open with resume",
-            compact_id(&checkpoint.session_id)
-        ),
-        FrontendTone::Success,
-    ))
+    Ok(MiddlewareCommandOutput::events(vec![
+        FrontendEvent::Render {
+            capability: "sessions".into(),
+            block: crate::protocol::FrontendBlock {
+                id: None,
+                group: None,
+                append: false,
+                pending: false,
+                text: format!("◇ forked chat {}", compact_id(&checkpoint.session_id)),
+                format: crate::protocol::FrontendBlockFormat::PlainText,
+                tone: FrontendTone::Success,
+            },
+        },
+        FrontendEvent::Picker {
+            title: "Fork created".into(),
+            options: vec![FrontendPickerOption {
+                label: "Open fork".into(),
+                description: "Continue in the new chat".into(),
+                op: Op::ResumeSession {
+                    session_id: checkpoint.session_id,
+                },
+            }],
+        },
+    ]))
+}
+
+fn manual_fork_checkpoint(parent: &Checkpoint) -> Checkpoint {
+    let mut checkpoint = Checkpoint::empty(Uuid::new_v4().to_string());
+    checkpoint.context.clone_from(&parent.context);
+    checkpoint
+        .first_user_message
+        .clone_from(&parent.first_user_message);
+    checkpoint.model_route.clone_from(&parent.model_route);
+    checkpoint
+        .session_context
+        .clone_from(&parent.session_context);
+    checkpoint.metadata.clone_from(&parent.metadata);
+    checkpoint.session_context.origin_label = None;
+    checkpoint
 }
 
 async fn resume(
@@ -141,13 +168,13 @@ async fn resume(
     if options.is_empty() {
         return Ok(MiddlewareCommandOutput::render(
             "sessions",
-            "no saved sessions",
+            "no saved chats",
             FrontendTone::Neutral,
         ));
     }
     Ok(MiddlewareCommandOutput::events(vec![
         FrontendEvent::Picker {
-            title: "Resume session".into(),
+            title: "Resume chat".into(),
             options,
         },
     ]))
@@ -183,7 +210,7 @@ fn resume_page_options(
         .collect::<Vec<_>>();
     if let Some(cursor) = page.next_cursor {
         options.push(FrontendPickerOption {
-            label: "More sessions…".into(),
+            label: "More chats…".into(),
             description: String::new(),
             op: Op::CapabilityCommand {
                 capability: "sessions".into(),
@@ -199,14 +226,22 @@ fn resume_option(
     session: SessionSummary,
     current_session_id: &str,
 ) -> Option<FrontendPickerOption> {
-    if !session.catalog_visible
-        || session.session_id == current_session_id
-        || (session.sequence == 0 && session.parent_session_id.is_none())
-    {
+    if !session.catalog_visible || session.session_id == current_session_id {
         return None;
     }
+    let description = session_description(&session);
     let label = session.first_user_message.map_or_else(
-        || format!("Fork {}", compact_id(&session.session_id)),
+        || {
+            format!(
+                "{} {}",
+                if session.parent_session_id.is_some() {
+                    "Fork"
+                } else {
+                    "Chat"
+                },
+                compact_id(&session.session_id)
+            )
+        },
         |message| {
             message
                 .split_whitespace()
@@ -221,11 +256,24 @@ fn resume_option(
     );
     Some(FrontendPickerOption {
         label,
-        description: format!("created at Unix time {}", session.created_at),
+        description,
         op: Op::ResumeSession {
             session_id: session.session_id,
         },
     })
+}
+
+fn session_description(session: &SessionSummary) -> String {
+    let mut details = [
+        session.session_context.workspace_label.as_deref(),
+        session.session_context.origin_label.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    details.push(format!("created at Unix time {}", session.created_at));
+    details.join(" · ")
 }
 
 #[cfg(test)]
@@ -238,9 +286,10 @@ mod tests {
     }
 
     #[test]
-    fn resume_lists_fresh_forks_but_not_empty_roots() {
+    fn resume_lists_fresh_forks() {
         let summary = |session_id: &str, parent_session_id: Option<&str>| SessionSummary {
             session_id: session_id.into(),
+            session_context: Default::default(),
             parent_session_id: parent_session_id.map(str::to_string),
             parent_sequence: parent_session_id.map(|_| 4),
             sequence: 0,
@@ -255,7 +304,163 @@ mod tests {
                 .map(|option| option.label),
             Some("Fork branch-i".into())
         );
-        assert!(resume_option(summary("empty", None), "current").is_none());
+    }
+
+    #[test]
+    fn resume_lists_empty_durable_root_chats() {
+        let option = resume_option(
+            SessionSummary {
+                session_id: "empty-root".into(),
+                session_context: Default::default(),
+                parent_session_id: None,
+                parent_sequence: None,
+                sequence: 0,
+                catalog_visible: true,
+                first_user_message: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+            "current",
+        );
+
+        assert_eq!(
+            option.map(|option| option.label),
+            Some("Chat empty-ro".into())
+        );
+    }
+
+    #[test]
+    fn resume_lists_catalog_visible_chats_across_workspaces() {
+        let summary = |session_id: &str, workspace: &str| SessionSummary {
+            session_id: session_id.into(),
+            session_context: crate::protocol::SessionContext {
+                workspace_id: Some(workspace.into()),
+                workspace_label: Some(workspace.into()),
+                ..crate::protocol::SessionContext::default()
+            },
+            parent_session_id: None,
+            parent_sequence: None,
+            sequence: 1,
+            catalog_visible: true,
+            first_user_message: Some(format!("Work in {workspace}")),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let options = resume_page_options(
+            SessionPage {
+                sessions: vec![
+                    summary("workspace-a-chat", "Workspace A"),
+                    summary("workspace-b-chat", "Workspace B"),
+                ],
+                next_cursor: None,
+            },
+            "current",
+        )
+        .expect("resume options");
+        let session_ids = options
+            .into_iter()
+            .map(|option| match option.op {
+                Op::ResumeSession { session_id } => session_id,
+                operation => panic!("expected resume operation, got {operation:?}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(session_ids, ["workspace-a-chat", "workspace-b-chat"]);
+    }
+
+    #[test]
+    fn resume_excludes_only_current_and_explicitly_hidden_chats() {
+        let summary = |session_id: &str, catalog_visible: bool| SessionSummary {
+            session_id: session_id.into(),
+            session_context: Default::default(),
+            parent_session_id: None,
+            parent_sequence: None,
+            sequence: 0,
+            catalog_visible,
+            first_user_message: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let options = resume_page_options(
+            SessionPage {
+                sessions: vec![
+                    summary("current", true),
+                    summary("hidden", false),
+                    summary("visible", true),
+                ],
+                next_cursor: None,
+            },
+            "current",
+        )
+        .expect("resume options");
+        let session_ids = options
+            .into_iter()
+            .map(|option| match option.op {
+                Op::ResumeSession { session_id } => session_id,
+                operation => panic!("expected resume operation, got {operation:?}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(session_ids, ["visible"]);
+    }
+
+    #[test]
+    fn resume_description_includes_workspace_and_origin_labels() {
+        let option = resume_option(
+            SessionSummary {
+                session_id: "scheduled".into(),
+                session_context: crate::protocol::SessionContext {
+                    workspace_label: Some("Project One".into()),
+                    origin_label: Some("cron".into()),
+                    ..crate::protocol::SessionContext::default()
+                },
+                parent_session_id: None,
+                parent_sequence: None,
+                sequence: 1,
+                catalog_visible: true,
+                first_user_message: Some("Update dependencies".into()),
+                created_at: 42,
+                updated_at: 42,
+            },
+            "current",
+        )
+        .expect("resume option");
+
+        assert_eq!(
+            option.description,
+            "Project One · cron · created at Unix time 42"
+        );
+    }
+
+    #[test]
+    fn manual_fork_keeps_context_workspace_and_metadata_but_clears_origin() {
+        let mut parent = Checkpoint::empty("parent");
+        parent.context = vec![serde_json::json!({"role": "user", "content": "Hello"})];
+        parent.first_user_message = Some("Hello".into());
+        parent.metadata.insert(
+            "gateway.chat".into(),
+            serde_json::json!({"workspace": "/srv/project"}),
+        );
+        parent.session_context = crate::protocol::SessionContext {
+            workspace_id: Some("workspace-1".into()),
+            workspace_label: Some("Project One".into()),
+            origin_label: Some("cron".into()),
+            ..crate::protocol::SessionContext::default()
+        };
+
+        let fork = manual_fork_checkpoint(&parent);
+
+        assert_eq!(fork.context, parent.context);
+        assert_eq!(fork.first_user_message, parent.first_user_message);
+        assert_eq!(fork.metadata, parent.metadata);
+        assert_eq!(
+            fork.session_context,
+            crate::protocol::SessionContext {
+                workspace_id: Some("workspace-1".into()),
+                workspace_label: Some("Project One".into()),
+                ..crate::protocol::SessionContext::default()
+            }
+        );
     }
 
     #[test]

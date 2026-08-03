@@ -22,12 +22,16 @@ pub(super) fn poll_event() -> Result<Option<Event>> {
         .map_err(Into::into)
 }
 
-pub(super) struct TerminalGuard;
+pub(super) struct TerminalGuard {
+    mouse_capture: bool,
+}
 
 impl TerminalGuard {
     pub(super) fn alternate() -> Result<Self> {
         enable_raw_mode()?;
-        let guard = Self;
+        let guard = Self {
+            mouse_capture: true,
+        };
         execute!(
             io::stdout(),
             EnterAlternateScreen,
@@ -36,6 +40,19 @@ impl TerminalGuard {
             Hide
         )?;
         Ok(guard)
+    }
+
+    pub(super) fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
+        if self.mouse_capture == enabled {
+            return Ok(());
+        }
+        if enabled {
+            execute!(io::stdout(), EnableMouseCapture)?;
+        } else {
+            execute!(io::stdout(), DisableMouseCapture)?;
+        }
+        self.mouse_capture = enabled;
+        Ok(())
     }
 }
 

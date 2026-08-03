@@ -13,6 +13,7 @@ use horus::middleware::steering::Steering;
 use horus::protocol::{
     FrontendBlockFormat, FrontendSlot, FrontendTone, FrontendWidget, ReviewDecision,
 };
+use horus_gateway::wire::RenderedEvent;
 
 fn catalog(workspace: &std::path::Path) -> UiCatalog {
     let steering = Steering::default().frontend();
@@ -100,7 +101,7 @@ fn new_and_clear_keep_distinct_terminal_semantics() {
 
     assert_eq!(
         (new.submit_input(&catalog), clear.submit_input(&catalog)),
-        (UiAction::New("kimi".into()), UiAction::Clear("kimi".into()))
+        (UiAction::New, UiAction::Clear)
     );
 }
 
@@ -157,7 +158,7 @@ fn generic_picker_submits_the_selected_operation() {
     let mut state = state();
     state.handle_agent_event(
         EventMsg::Frontend(FrontendEvent::Picker {
-            title: "Resume session".into(),
+            title: "Resume chat".into(),
             options: vec![
                 horus::protocol::FrontendPickerOption {
                     label: "first".into(),
@@ -243,7 +244,7 @@ fn session_history_uses_normal_reasoning_and_tool_rendering() {
 }
 
 #[test]
-fn completed_edit_replaces_the_tool_log_with_a_styled_diff() {
+fn completed_patch_replaces_the_tool_log_with_a_styled_diff() {
     let frontend = frontend();
     let mut state = state();
     state.transcript.clear();
@@ -252,12 +253,11 @@ fn completed_edit_replaces_the_tool_log_with_a_styled_diff() {
         &frontend,
         EventMsg::ToolCallBegin(horus::protocol::ToolCallBeginEvent {
             turn_id: "turn".into(),
-            call_id: "edit".into(),
-            name: "edit_file".into(),
+            call_id: "patch".into(),
+            name: "apply_patch".into(),
             arguments: serde_json::json!({
                 "path": "note.txt",
-                "old_text": "old",
-                "new_text": "new"
+                "patch": "--- note.txt\n+++ note.txt\n@@ -1 +1 @@\n-old\n+new\n"
             }),
         }),
     );
@@ -275,8 +275,8 @@ fn completed_edit_replaces_the_tool_log_with_a_styled_diff() {
         &frontend,
         EventMsg::ToolCallEnd(horus::protocol::ToolCallEndEvent {
             turn_id: "turn".into(),
-            call_id: "edit".into(),
-            name: "edit_file".into(),
+            call_id: "patch".into(),
+            name: "apply_patch".into(),
             output: "--- note.rs\n+++ note.rs\n@@ -1,5 +1,5 @@\n-fn old_name() {}\n+fn new_name() {}\n keep_one();\n-let removed = false;\n keep_two();\n+let added = true;\n keep_three();\n".into(),
             is_error: false,
         }),
@@ -378,7 +378,7 @@ async fn workspace_reference_menu_inserts_a_file() {
     std::fs::write(workspace.path().join("src/lib.rs"), "").expect("source file");
     let catalog = catalog(workspace.path());
     catalog
-        .start_workspace_inventory()
+        .start_workspace_inventory(true)
         .await
         .expect("workspace inventory");
     let mut state = state();
@@ -388,6 +388,19 @@ async fn workspace_reference_menu_inserts_a_file() {
     state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &catalog);
 
     assert_eq!(state.input, "review src/lib.rs");
+}
+
+#[tokio::test]
+async fn remote_workspace_inventory_does_not_read_the_client_filesystem() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("client-only.rs"), "").expect("client file");
+    let catalog = catalog(workspace.path());
+    catalog
+        .start_workspace_inventory(false)
+        .await
+        .expect("disabled workspace inventory");
+
+    assert!(catalog.reference_suggestions('@', "client").is_empty());
 }
 
 #[test]
@@ -472,6 +485,7 @@ fn capability_header_is_live_styled_and_transparent() {
             slot: FrontendSlot::Header,
             text: "skills 2".into(),
             tone: FrontendTone::Neutral,
+            action: None,
         },
     );
     let mut terminal = Terminal::new(TestBackend::new(50, 15)).expect("terminal");
@@ -787,6 +801,41 @@ fn final_message_replaces_an_incomplete_stream() {
         state.transcript.back().map(|entry| entry.text.as_str()),
         Some("complete answer")
     );
+}
+
+#[test]
+fn gateway_history_preserves_child_diff_rendering() {
+    let mut state = state();
+    let message = EventMsg::AgentMessage(horus::protocol::AgentMessageEvent {
+        message: "changed the file".into(),
+        phase: Some(AgentMessagePhase::FinalAnswer),
+    });
+    let history_event = EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent {
+        events: vec![message.clone()],
+    });
+
+    events::handle_gateway_event(
+        &mut state,
+        history_event,
+        Vec::new(),
+        Some(vec![RenderedEvent {
+            event: message,
+            blocks: vec![FrontendBlock {
+                id: None,
+                group: None,
+                append: false,
+                pending: false,
+                text: "--- a/file\n+++ b/file\n-old\n+new".into(),
+                format: FrontendBlockFormat::UnifiedDiff,
+                tone: FrontendTone::Neutral,
+            }],
+        }]),
+        None,
+    );
+
+    let entry = state.transcript.back().expect("rendered history entry");
+    assert_eq!(entry.format, FrontendBlockFormat::UnifiedDiff);
+    assert_eq!(entry.text, "--- a/file\n+++ b/file\n-old\n+new");
 }
 
 #[test]

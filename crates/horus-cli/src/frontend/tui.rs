@@ -21,7 +21,7 @@ use self::events::handle_event;
 use self::input::UiAction;
 use self::view::bounded_terminal_text;
 use self::view::initial_widgets;
-use self::view::terminal_text;
+pub(crate) use self::view::terminal_text;
 use super::catalog::{MenuItem, UiCatalog};
 use horus::backend::model::ModelChoice;
 use horus::backend::model::ModelInfo;
@@ -30,6 +30,7 @@ use horus::protocol::FrontendBlockFormat;
 use horus::protocol::FrontendPickerOption;
 use horus::protocol::FrontendTone;
 use horus::protocol::FrontendWidget;
+use horus::protocol::SessionResumeRequestedEvent;
 #[cfg(test)]
 use horus::protocol::{AgentMessagePhase, EventMsg, FrontendEvent, Op};
 
@@ -197,7 +198,7 @@ struct TuiState {
     reference_cache: Option<(char, String, Vec<MenuItem>)>,
     picker: Option<PickerState>,
     preview: Option<PreviewState>,
-    requested_resume: Option<String>,
+    requested_resume: Option<SessionResumeRequestedEvent>,
 }
 
 impl TuiState {

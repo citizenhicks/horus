@@ -1,5 +1,28 @@
 use super::*;
 
+#[test]
+fn provider_advertises_cross_device_login() {
+    assert!(BROWSER_AUTH.supports_device_login());
+}
+
+#[test]
+fn device_code_response_accepts_the_upstream_usercode_alias() {
+    let response: DeviceUserCodeResponse = serde_json::from_value(serde_json::json!({
+        "device_auth_id": "device-1",
+        "usercode": "ABCD-1234",
+        "interval": "5"
+    }))
+    .expect("device-code response");
+
+    assert_eq!(
+        (
+            response.device_auth_id.as_str(),
+            response.user_code.as_str()
+        ),
+        ("device-1", "ABCD-1234")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn saved_auth_is_owner_only() {

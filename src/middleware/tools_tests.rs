@@ -68,8 +68,11 @@ async fn parallel_tool_panic_preserves_call_identity() {
         backend,
         crate::backend::sandbox::ApprovalPolicy::On,
     ));
-    let permissions =
-        SandboxPermissions::restore(crate::backend::sandbox::NetworkAccess::Denied, Vec::new());
+    let permissions = SandboxPermissions::restore(
+        "session",
+        crate::backend::sandbox::NetworkAccess::Denied,
+        Vec::new(),
+    );
 
     assert_eq!(
         execute_batch(&catalog, &calls, sandbox, &permissions).await,
@@ -105,14 +108,14 @@ fn only_wholly_interruptible_batches_stop_for_active_input() {
 }
 
 #[tokio::test]
-async fn edit_file_returns_a_unified_diff_after_writing() {
+async fn apply_patch_returns_a_unified_diff_after_writing() {
     let workspace = tempfile::tempdir().expect("workspace");
     let path = workspace.path().join("note.txt");
     std::fs::write(&path, "first\nold\nlast\n").expect("write fixture");
     let mut catalog = Catalog::default();
     catalog
-        .register(Arc::new(EditFile))
-        .expect("register edit tool");
+        .register(Arc::new(ApplyPatch))
+        .expect("register patch tool");
     let sandbox = Arc::new(Sandbox::new(
         Arc::new(
             crate::backend::sandbox::local::LocalSandbox::new(workspace.path())
@@ -121,6 +124,7 @@ async fn edit_file_returns_a_unified_diff_after_writing() {
         crate::backend::sandbox::ApprovalPolicy::On,
     ));
     let permissions = SandboxPermissions::restore(
+        "session",
         crate::backend::sandbox::NetworkAccess::Denied,
         ["call-1".into(), "call-2".into()],
     );
@@ -129,11 +133,10 @@ async fn edit_file_returns_a_unified_diff_after_writing() {
         &catalog,
         &[ToolCall {
             call_id: "call-1".into(),
-            name: "edit_file".into(),
+            name: "apply_patch".into(),
             arguments: serde_json::json!({
                 "path": "note.txt",
-                "old_text": "old",
-                "new_text": "new"
+                "patch": "--- ignored.txt\n+++ ignored.txt\n@@ -1,3 +1,3 @@\n first\n-old\n+new\n last\n"
             }),
         }],
         Arc::clone(&sandbox),
@@ -163,11 +166,10 @@ async fn edit_file_returns_a_unified_diff_after_writing() {
         &catalog,
         &[ToolCall {
             call_id: "call-2".into(),
-            name: "edit_file".into(),
+            name: "apply_patch".into(),
             arguments: serde_json::json!({
                 "path": "note.txt",
-                "old_text": "new",
-                "new_text": "new"
+                "patch": "--- ignored.txt\n+++ ignored.txt\n@@ -1,3 +1,3 @@\n first\n-new\n+new\n last\n"
             }),
         }],
         sandbox,
@@ -184,6 +186,92 @@ async fn edit_file_returns_a_unified_diff_after_writing() {
 }
 
 #[test]
+fn apply_patch_rejects_pathological_fuzzy_matching() {
+    let content = "same\n".repeat(20_000);
+    let mut patch = String::from("--- ignored\n+++ ignored\n@@ -1,1000 +1,1000 @@\n");
+    patch.push_str(&" same\n".repeat(999));
+    patch.push_str("-same\n+changed\n");
+    let patch = Patch::from_str(&patch).expect("patch");
+
+    assert!(validate_patch_complexity(&content, &patch).is_err());
+}
+
+#[tokio::test]
+async fn apply_patch_cannot_make_a_file_unreadable() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let path = workspace.path().join("full.txt");
+    std::fs::write(&path, "x".repeat(crate::backend::sandbox::MAX_FILE_BYTES))
+        .expect("write fixture");
+    let sandbox = Arc::new(Sandbox::new(
+        Arc::new(
+            crate::backend::sandbox::local::LocalSandbox::new(workspace.path())
+                .expect("local sandbox"),
+        ),
+        crate::backend::sandbox::ApprovalPolicy::On,
+    ));
+    let context = ToolContext {
+        sandbox,
+        permissions: SandboxPermissions::restore(
+            "session",
+            crate::backend::sandbox::NetworkAccess::Denied,
+            ["patch".into()],
+        )
+        .for_call("patch"),
+    };
+
+    let error = ApplyPatch
+        .call(
+            context,
+            serde_json::json!({
+                "path": "full.txt",
+                "patch": "--- ignored\n+++ ignored\n@@ -0,0 +1 @@\n+y\n"
+            }),
+        )
+        .await
+        .expect_err("oversized result");
+
+    assert!(error.to_string().contains("write limit"));
+    assert_eq!(
+        std::fs::metadata(path).expect("metadata").len(),
+        1024 * 1024
+    );
+}
+
+#[test]
 fn tools_do_not_claim_footer_space() {
     assert!(Tools::coding().frontend().widgets.is_empty());
+}
+
+#[test]
+fn only_starting_a_background_command_requires_approval() {
+    let mut catalog = Catalog::default();
+    catalog
+        .register(Arc::new(StartCommand))
+        .expect("start command");
+    catalog
+        .register(Arc::new(PollCommand))
+        .expect("poll command");
+    catalog
+        .register(Arc::new(StopCommand))
+        .expect("stop command");
+
+    assert!(catalog.requires_approval("start_command"));
+    assert!(!catalog.requires_approval("poll_command"));
+    assert!(!catalog.requires_approval("stop_command"));
+}
+
+#[test]
+fn background_output_remains_valid_json_at_its_limit() {
+    let rendered = background_output(BackgroundCommandPoll {
+        status: crate::backend::sandbox::BackgroundCommandStatus::Running,
+        exit_code: None,
+        stdout: "\0".repeat(6_000),
+        stderr: String::new(),
+        truncated: false,
+        error: Some("\0".repeat(512)),
+    });
+
+    assert!(rendered.len() <= MAX_TOOL_OUTPUT_BYTES);
+    let value: Value = serde_json::from_str(&rendered).expect("valid JSON");
+    assert_eq!(value["status"], "running");
 }

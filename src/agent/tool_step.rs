@@ -109,6 +109,7 @@ impl Runner {
             &approval_call_ids,
             &decision,
             SandboxPermissions::restore(
+                &self.config.session_id,
                 pending.network_access,
                 pending.authorized_call_ids.clone(),
             ),

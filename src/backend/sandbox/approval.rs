@@ -218,7 +218,7 @@ impl Approval {
                 requested.push(call_id.clone());
             }
         }
-        let permissions = SandboxPermissions::new(policy.network_access(), approved);
+        let permissions = SandboxPermissions::new(session_id, policy.network_access(), approved);
         if requested.is_empty() {
             return Ok(SandboxAuthorization::Execute(permissions));
         }
@@ -310,6 +310,7 @@ fn widget(policy: ApprovalPolicy) -> FrontendWidget {
         } else {
             FrontendTone::Warning
         },
+        action: None,
     }
 }
 

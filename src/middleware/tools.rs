@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use diffy::DiffOptions;
+use diffy::{DiffOptions, Line, Patch};
 use futures_util::FutureExt;
 use futures_util::future::join_all;
 use serde::Deserialize;
@@ -17,6 +17,7 @@ use crate::Error;
 use crate::Result;
 use crate::backend::model::ToolCall;
 use crate::backend::model::ToolDefinition;
+use crate::backend::sandbox::BackgroundCommandPoll;
 use crate::backend::sandbox::Sandbox;
 use crate::backend::sandbox::SandboxPermissions;
 use crate::backend::sandbox::ToolPermissions;
@@ -32,6 +33,7 @@ const MAX_TOOL_UI_BYTES: usize = 512;
 const MAX_TOOL_UI_LINES: usize = 5;
 const MAX_MUTATION_BYTES: usize = 40_000;
 const MAX_COMMAND_BYTES: usize = 8_000;
+const MAX_PATCH_MATCH_WORK: usize = 32 * 1024 * 1024;
 
 /// Whether a tool can overlap other calls in its model-produced batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,14 +315,17 @@ impl Tools {
         Self { tools, names }
     }
 
-    /// Creates the default read, write, edit, and sandboxed-bash tool set.
+    /// Creates the default file, foreground command, and background command tools.
     #[must_use]
     pub fn coding() -> Self {
         Self::new(vec![
             Arc::new(ReadFile),
             Arc::new(WriteFile),
-            Arc::new(EditFile),
+            Arc::new(ApplyPatch),
             Arc::new(Bash),
+            Arc::new(StartCommand),
+            Arc::new(PollCommand),
+            Arc::new(StopCommand),
         ])
     }
 }
@@ -365,10 +370,10 @@ pub(crate) fn render_tool_event(
             tone: FrontendTone::Neutral,
         }),
         EventMsg::ToolCallEnd(result) if owns(&result.name) => {
-            let is_edit_diff = !result.is_error
-                && result.name == "edit_file"
+            let is_patch_diff = !result.is_error
+                && result.name == "apply_patch"
                 && diffy::Patch::from_str(&result.output).is_ok();
-            if is_edit_diff {
+            if is_patch_diff {
                 return Some(FrontendBlock {
                     id: Some(format!("{}/{}", result.turn_id, result.call_id)),
                     group: tool_group(&result.name, &result.turn_id),
@@ -410,8 +415,11 @@ fn tool_heading(name: &str, arguments: &Value) -> String {
     let (label, detail) = match name {
         "read_file" => ("Read", "path"),
         "write_file" => ("Write", "path"),
-        "edit_file" => ("Edit", "path"),
+        "apply_patch" => ("Patch", "path"),
         "bash" => ("Bash", "command"),
+        "start_command" => ("Start", "command"),
+        "poll_command" => ("Poll", "command_id"),
+        "stop_command" => ("Stop", "command_id"),
         _ => return format!("◉ {name} {}", preview_json(arguments)),
     };
     labeled_tool_heading(label, detail, arguments)
@@ -512,27 +520,25 @@ impl Tool for WriteFile {
 }
 
 #[derive(Deserialize)]
-struct EditArgs {
+struct ApplyPatchArgs {
     path: String,
-    old_text: String,
-    new_text: String,
+    patch: String,
 }
 
-struct EditFile;
+struct ApplyPatch;
 
-impl Tool for EditFile {
+impl Tool for ApplyPatch {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "edit_file".into(),
-            description: "Replace one exact occurrence in a workspace file.".into(),
+            name: "apply_patch".into(),
+            description: "Apply a unified diff to one existing workspace file.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "old_text": {"type": "string"},
-                    "new_text": {"type": "string"}
+                    "patch": {"type": "string"}
                 },
-                "required": ["path", "old_text", "new_text"],
+                "required": ["path", "patch"],
                 "additionalProperties": false
             }),
         }
@@ -544,30 +550,21 @@ impl Tool for EditFile {
 
     fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
-            let arguments: EditArgs = serde_json::from_value(arguments)?;
-            if arguments.old_text.is_empty() {
-                return Err(Error::Tool("old_text cannot be empty".into()));
-            }
-            if arguments.old_text == arguments.new_text {
-                return Err(Error::Tool("new_text must differ from old_text".into()));
-            }
-            if arguments
-                .old_text
-                .len()
-                .saturating_add(arguments.new_text.len())
-                > MAX_MUTATION_BYTES
-            {
+            let arguments: ApplyPatchArgs = serde_json::from_value(arguments)?;
+            if arguments.patch.len() > MAX_MUTATION_BYTES {
                 return Err(Error::Tool(format!(
-                    "edit exceeds {MAX_MUTATION_BYTES} bytes"
+                    "patch exceeds {MAX_MUTATION_BYTES} bytes"
                 )));
             }
             let content = context.sandbox.read(&arguments.path).await?;
-            if content.match_indices(&arguments.old_text).count() != 1 {
-                return Err(Error::Tool(
-                    "old_text must occur exactly once in the file".into(),
-                ));
+            let patch = diffy::Patch::from_str(&arguments.patch)
+                .map_err(|error| Error::Tool(format!("invalid unified diff: {error}")))?;
+            validate_patch_complexity(&content, &patch)?;
+            let updated = diffy::apply(&content, &patch)
+                .map_err(|error| Error::Tool(format!("patch does not apply: {error}")))?;
+            if updated == content {
+                return Err(Error::Tool("patch must change the file".into()));
             }
-            let updated = content.replacen(&arguments.old_text, &arguments.new_text, 1);
             let mut options = DiffOptions::new();
             options
                 .set_original_filename(arguments.path.clone())
@@ -580,10 +577,40 @@ impl Tool for EditFile {
             Ok(if diff.len() <= MAX_TOOL_OUTPUT_BYTES {
                 diff
             } else {
-                format!("edited {} (diff too large to display)", arguments.path)
+                format!("patched {} (diff too large to display)", arguments.path)
             })
         })
     }
+}
+
+fn validate_patch_complexity(content: &str, patch: &Patch<'_, str>) -> Result<()> {
+    let image_lines = content.lines().count().saturating_add(
+        patch
+            .hunks()
+            .iter()
+            .map(|hunk| hunk.new_range().len())
+            .sum::<usize>(),
+    );
+    let work = patch.hunks().iter().fold(0_usize, |total, hunk| {
+        let mut preimage_lines = 0_usize;
+        let mut preimage_bytes = 0_usize;
+        for line in hunk.lines() {
+            if let Line::Context(value) | Line::Delete(value) = line {
+                preimage_lines = preimage_lines.saturating_add(1);
+                preimage_bytes = preimage_bytes.saturating_add(value.len());
+            }
+        }
+        let hunk_work = if preimage_lines == 0 {
+            hunk.lines().len()
+        } else {
+            image_lines.saturating_mul(preimage_bytes.saturating_add(hunk.lines().len()))
+        };
+        total.saturating_add(hunk_work)
+    });
+    if work > MAX_PATCH_MATCH_WORK {
+        return Err(Error::Tool("patch is too expensive to match safely".into()));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -615,11 +642,7 @@ impl Tool for Bash {
     fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let arguments: BashArgs = serde_json::from_value(arguments)?;
-            if arguments.command.len() > MAX_COMMAND_BYTES {
-                return Err(Error::Tool(format!(
-                    "command exceeds {MAX_COMMAND_BYTES} bytes"
-                )));
-            }
+            validate_command(&arguments.command)?;
             let output = context
                 .sandbox
                 .execute(&arguments.command, &context.permissions)
@@ -630,6 +653,146 @@ impl Tool for Bash {
             ))
         })
     }
+}
+
+struct StartCommand;
+
+impl Tool for StartCommand {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "start_command".into(),
+            description: "Start a sandboxed command in the background and return an opaque ID."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn approval(&self) -> ApprovalRequirement {
+        ApprovalRequirement::Always
+    }
+
+    fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let arguments: BashArgs = serde_json::from_value(arguments)?;
+            validate_command(&arguments.command)?;
+            let id = context
+                .sandbox
+                .start_background(arguments.command, &context.permissions)?;
+            Ok(serde_json::json!({"command_id": id, "status": "running"}).to_string())
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct CommandIdArgs {
+    command_id: String,
+}
+
+struct PollCommand;
+
+impl Tool for PollCommand {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "poll_command".into(),
+            description: "Read incremental background command output; completion consumes the ID."
+                .into(),
+            parameters: command_id_schema(),
+        }
+    }
+
+    fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let arguments: CommandIdArgs = serde_json::from_value(arguments)?;
+            validate_command_id(&arguments.command_id)?;
+            let output = context
+                .sandbox
+                .poll_background(&arguments.command_id, &context.permissions)
+                .await?;
+            Ok(background_output(output))
+        })
+    }
+}
+
+struct StopCommand;
+
+impl Tool for StopCommand {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "stop_command".into(),
+            description: "Stop an owned background command and consume its ID.".into(),
+            parameters: command_id_schema(),
+        }
+    }
+
+    fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let arguments: CommandIdArgs = serde_json::from_value(arguments)?;
+            validate_command_id(&arguments.command_id)?;
+            let output = context
+                .sandbox
+                .stop_background(&arguments.command_id, &context.permissions)
+                .await?;
+            Ok(background_output(output))
+        })
+    }
+}
+
+fn validate_command(command: &str) -> Result<()> {
+    if command.trim().is_empty() {
+        return Err(Error::Tool("command cannot be empty".into()));
+    }
+    if command.len() > MAX_COMMAND_BYTES {
+        return Err(Error::Tool(format!(
+            "command exceeds {MAX_COMMAND_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_command_id(id: &str) -> Result<()> {
+    uuid::Uuid::parse_str(id)
+        .map(|_| ())
+        .map_err(|_| Error::Tool("command_id must be a UUID".into()))
+}
+
+fn command_id_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {"command_id": {"type": "string", "format": "uuid"}},
+        "required": ["command_id"],
+        "additionalProperties": false
+    })
+}
+
+fn background_output(output: BackgroundCommandPoll) -> String {
+    let status = output.status.as_str();
+    let exit_code = output.exit_code;
+    let rendered = serde_json::json!({
+        "status": status,
+        "exit_code": exit_code,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "truncated": output.truncated,
+        "error": output.error
+    })
+    .to_string();
+    if rendered.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return rendered;
+    }
+    serde_json::json!({
+        "status": status,
+        "exit_code": exit_code,
+        "stdout": "",
+        "stderr": "",
+        "truncated": true,
+        "error": "background output exceeded its serialized limit"
+    })
+    .to_string()
 }
 
 #[cfg(test)]

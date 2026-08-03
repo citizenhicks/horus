@@ -8,40 +8,73 @@ use ratatui::crossterm::event::Event as TerminalEvent;
 use ratatui::crossterm::event::KeyEventKind;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::style::Print;
-use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use super::TranscriptTone;
 use super::TuiState;
-use super::events::handle_event;
+use super::events::handle_gateway_event;
 use super::input::UiAction;
 use super::view::render_preview;
 use crate::frontend::FrontendExit;
 use crate::frontend::catalog::UiCatalog;
+use crate::frontend::gateway;
+use crate::frontend::gateway_actions::{prepare, render_response};
+use crate::frontend::setup;
 use crate::frontend::terminal::{INPUT_POLL, MAX_INPUT_BATCH, TerminalGuard, poll_event};
-use horus::Result;
-use horus::agent::Agent;
-use horus::protocol::Event;
-use horus::protocol::EventMsg;
-use horus::protocol::FrontendBlock;
-use horus::protocol::Op;
+use horus::backend::model::ModelInfo;
+use horus::protocol::{Op, Submission};
+use horus::{Error, Result};
+use horus_gateway::client::{GatewayEvents, GatewaySender};
+use horus_gateway::wire::{ClientMessage, ReadyPayload, ServerMessage, SessionReadyPayload};
+use uuid::Uuid;
 
 const ELAPSED_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_EVENT_BATCH: usize = 64;
 const CLEAR_SCREEN_AND_SCROLLBACK: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
 
-pub(in crate::frontend) async fn run(agent: Agent, catalog: UiCatalog) -> Result<FrontendExit> {
-    let mut workspace_inventory = catalog.start_workspace_inventory();
-    let mut workspace_inventory_pending = true;
-    let frontend = agent.frontend().clone();
-    let render = |event: &EventMsg| frontend.render(event);
-    let model = agent.model().clone();
-    let model_route = agent.model_route().to_string();
-    let mut state = TuiState::new(&catalog, std::env::current_dir()?, model, model_route);
-    let (sender, mut events) = agent.into_parts();
-    let guard = TerminalGuard::alternate()?;
+pub(in crate::frontend) async fn run(
+    sender: GatewaySender,
+    mut events: GatewayEvents,
+    gateway: &mut ReadyPayload,
+    session: &mut SessionReadyPayload,
+    mut catalog: UiCatalog,
+    local_gateway: bool,
+    gateway_endpoint: String,
+) -> Result<(FrontendExit, GatewaySender, GatewayEvents)> {
+    let mut guard = TerminalGuard::alternate()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
+    if gateway.default_config.is_none() || gateway.models.is_empty() {
+        setup::run(
+            &mut terminal,
+            setup::SetupMode::Login,
+            None,
+            &sender,
+            &mut events,
+            gateway,
+            session,
+        )
+        .await?;
+        if gateway.default_config.is_none() || gateway.models.is_empty() {
+            drop(terminal);
+            drop(guard);
+            return Ok((FrontendExit::Discard, sender, events));
+        }
+        catalog.replace_model_choices(&gateway.models);
+    }
+    let mut workspace_inventory = catalog.start_workspace_inventory(local_gateway);
+    let mut workspace_inventory_pending = true;
+    let model = ModelInfo {
+        model: session.session.model.model.clone(),
+        reasoning_effort: session.session.model.reasoning_effort.clone(),
+    };
+    let model_route = session.session.model.route.clone();
+    let session_id = session.session.session_id.clone();
+    let mut state = TuiState::new(
+        &catalog,
+        catalog.workspace().to_path_buf(),
+        model,
+        model_route,
+    );
     let mut tick = tokio::time::interval(INPUT_POLL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut elapsed = tokio::time::interval(ELAPSED_INTERVAL);
@@ -66,21 +99,82 @@ pub(in crate::frontend) async fn run(agent: Agent, catalog: UiCatalog) -> Result
             dirty = false;
         }
         tokio::select! {
-            event = events.recv(), if events_open => {
+            event = events.next(), if events_open => {
                 match event {
-                    Some(event) => {
-                        handle_event_batch(&mut state, &render, event, &mut events);
-                        if let Some(session_id) = state.requested_resume.take() {
+                    Ok(Some(frame)) => {
+                        match frame.message {
+                            ServerMessage::AgentEvent {
+                                session_id: actual,
+                                event,
+                                blocks,
+                                history,
+                                preview,
+                                ..
+                            } if actual == session_id => {
+                                handle_gateway_event(
+                                    &mut state,
+                                    event.msg,
+                                    blocks,
+                                    history,
+                                    preview,
+                                );
+                            }
+                            ServerMessage::SessionOpened { payload, .. } => {
+                                *session = payload;
+                                exit = FrontendExit::Reload;
+                                break 'ui;
+                            }
+                            ServerMessage::Ready { payload } => {
+                                *gateway = payload;
+                                sync_gateway_models(&mut state, &mut catalog, gateway);
+                            }
+                            ServerMessage::SessionChanged { payload }
+                                if payload.session.session_id == session_id
+                                    && payload.config.revision >= session.config.revision =>
+                            {
+                                if payload.workspace.id == session.workspace.id
+                                    && payload.contributions == session.contributions
+                                {
+                                    refresh_session(&mut state, session, payload);
+                                } else {
+                                    *session = payload;
+                                    exit = FrontendExit::Reload;
+                                    break 'ui;
+                                }
+                            }
+                            ServerMessage::Artifacts {
+                                session_id: actual,
+                                artifacts,
+                                ..
+                            } if actual == session_id => {
+                                for artifact in artifacts {
+                                    state.push(artifact.title, TranscriptTone::Neutral);
+                                    state.apply_block(artifact.block);
+                                }
+                            }
+                            message => {
+                                if let Some(message) = render_response(&message, &session_id) {
+                                    state.push(message, TranscriptTone::Neutral);
+                                }
+                            }
+                        }
+                        if let Some(request) = state.requested_resume.take() {
                             clear_on_exit = true;
-                            exit = FrontendExit::Resume(session_id);
+                            exit = FrontendExit::Resume(request.session_id);
                             break 'ui;
                         }
                     }
-                    None => {
+                    Ok(None) => {
                         events_open = false;
                         state.disconnected = true;
                         state.finish_turn();
-                        state.push("agent disconnected · press q to exit", TranscriptTone::Error);
+                        state.push("gateway disconnected · press q to exit", TranscriptTone::Error);
+                    }
+                    Err(error) => {
+                        events_open = false;
+                        state.disconnected = true;
+                        state.finish_turn();
+                        state.push(error.to_string(), TranscriptTone::Error);
                     }
                 }
                 dirty = true;
@@ -119,27 +213,72 @@ pub(in crate::frontend) async fn run(agent: Agent, catalog: UiCatalog) -> Result
                         UiAction::None => {}
                         UiAction::Exit => {
                             if let Some(turn_id) = state.active_turn.clone() {
-                                let _ = sender.submit(Op::Interrupt { turn_id });
+                                let _ = send_op(&sender, &session_id, Op::Interrupt { turn_id }).await;
                             }
                             break 'ui;
                         }
-                        UiAction::New(model_route) => {
-                            exit = FrontendExit::New(model_route);
+                        UiAction::New => {
+                            exit = FrontendExit::New;
                             break 'ui;
                         }
-                        UiAction::Clear(model_route) => {
+                        UiAction::Clear => {
                             clear_on_exit = true;
-                            exit = FrontendExit::New(model_route);
-                            break 'ui;
-                        }
-                        UiAction::Setup => {
-                            exit = FrontendExit::Setup;
+                            exit = FrontendExit::New;
                             break 'ui;
                         }
                         UiAction::Submit(op) => {
-                            if let Err(error) = sender.submit(op) {
+                            if let Err(error) = send_op(&sender, &session_id, op).await {
                                 state.push(error.to_string(), TranscriptTone::Error);
                             }
+                        }
+                        UiAction::Gateway(action) => match prepare(action, &session_id) {
+                            Ok(message) => {
+                                if let Err(error) = sender.send(*message).await {
+                                    state.push(error.to_string(), TranscriptTone::Error);
+                                }
+                            }
+                            Err(error) => state.push(error.to_string(), TranscriptTone::Error),
+                        },
+                        UiAction::GatewaySettings => {
+                            match gateway::run(&mut terminal, &gateway_endpoint).await {
+                                Ok(true) => {
+                                    exit = FrontendExit::Reconnect;
+                                    break 'ui;
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    state.push(error.to_string(), TranscriptTone::Error);
+                                }
+                            }
+                            dirty = true;
+                        }
+                        UiAction::Setup { mode, provider } => {
+                            let workspace = session.workspace.id.clone();
+                            let selected = session.session.session_id.clone();
+                            let contributions = session.contributions.clone();
+                            let result = setup::run(
+                                &mut terminal,
+                                mode,
+                                provider.as_deref(),
+                                &sender,
+                                &mut events,
+                                gateway,
+                                session,
+                            )
+                            .await;
+                            if session.workspace.id != workspace
+                                || session.session.session_id != selected
+                                || session.contributions != contributions
+                            {
+                                exit = FrontendExit::Reload;
+                                break 'ui;
+                            }
+                            sync_gateway_models(&mut state, &mut catalog, gateway);
+                            sync_session(&mut state, session);
+                            if let Err(error) = result {
+                                state.push(error.to_string(), TranscriptTone::Error);
+                            }
+                            dirty = true;
                         }
                     }
                 }
@@ -154,31 +293,54 @@ pub(in crate::frontend) async fn run(agent: Agent, catalog: UiCatalog) -> Result
                 dirty = true;
             }
         }
+        guard.set_mouse_capture(state.preview.is_none())?;
     }
     drop(terminal);
     drop(guard);
     if clear_on_exit {
         execute!(io::stdout(), Print(CLEAR_SCREEN_AND_SCROLLBACK))?;
     }
-    Ok(exit)
+    Ok((exit, sender, events))
 }
 
-fn handle_event_batch<R>(
+fn refresh_session(
     state: &mut TuiState,
-    render: &R,
-    first: Event,
-    events: &mut mpsc::Receiver<Event>,
-) where
-    R: Fn(&EventMsg) -> Vec<FrontendBlock>,
-{
-    handle_event(state, render, first.msg);
-    for _ in 1..MAX_EVENT_BATCH {
-        if state.requested_resume.is_some() {
-            break;
-        }
-        let Ok(event) = events.try_recv() else {
-            break;
-        };
-        handle_event(state, render, event.msg);
-    }
+    session: &mut SessionReadyPayload,
+    payload: SessionReadyPayload,
+) {
+    sync_session(state, &payload);
+    *session = payload;
+}
+
+fn sync_session(state: &mut TuiState, session: &SessionReadyPayload) {
+    state.model.model = super::terminal_text(&session.session.model.model);
+    state.model.reasoning_effort = session
+        .session
+        .model
+        .reasoning_effort
+        .as_deref()
+        .map(super::terminal_text);
+    state.model_route.clone_from(&session.session.model.route);
+}
+
+fn sync_gateway_models(state: &mut TuiState, catalog: &mut UiCatalog, gateway: &ReadyPayload) {
+    state.model_choices.clone_from(&gateway.models);
+    catalog.replace_model_choices(&gateway.models);
+}
+
+async fn send_op(
+    sender: &horus_gateway::client::GatewaySender,
+    session_id: &str,
+    op: Op,
+) -> Result<()> {
+    sender
+        .send(ClientMessage::Submit {
+            session_id: session_id.into(),
+            submission: Submission {
+                id: Uuid::new_v4().to_string(),
+                op,
+            },
+        })
+        .await
+        .map_err(|error| Error::Stopped(error.to_string()))
 }

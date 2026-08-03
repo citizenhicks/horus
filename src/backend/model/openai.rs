@@ -370,8 +370,8 @@ const SEARCH: &[HostedWebSearch] = &[HostedWebSearch::Off];
 pub(super) const fn generic_provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "responses",
-        "Custom Responses",
-        "Any OpenAI-compatible Responses endpoint",
+        "Local and Other",
+        "Any local or remote OpenAI-compatible Responses endpoint",
         ProviderAuth::ApiKey("OPENAI_API_KEY"),
         MODELS,
         SEARCH,
@@ -384,7 +384,7 @@ fn build_generic(config: ProviderBuildConfig) -> Result<std::sync::Arc<dyn Model
     let api_key = config.credential.into_api_key("responses")?;
     let base_url = config
         .base_url
-        .ok_or_else(|| Error::Config("custom Responses requires a base URL".into()))?;
+        .ok_or_else(|| Error::Config("Responses provider requires a base URL".into()))?;
     let provider = OpenAi::with_client(api_key, base_url, config.model, config.http)?;
     let provider = match config.reasoning_effort {
         Some(effort) => provider.with_reasoning_effort(effort)?,
@@ -424,7 +424,10 @@ pub(super) fn emit_web_event(
 }
 
 pub(super) fn emit_reasoning_event(event: &Value, events: &ModelEventSink) -> Result<bool> {
-    if event.get("type").and_then(Value::as_str) != Some("response.reasoning_summary_text.delta") {
+    if !matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta")
+    ) {
         return Ok(false);
     }
     if let Some(delta) = event.get("delta").and_then(Value::as_str)
@@ -522,14 +525,21 @@ pub(super) fn decode_response(response: Value) -> Result<ModelOutput> {
         if item.get("type").and_then(Value::as_str) != Some("reasoning") {
             continue;
         }
-        let reasoning = item
-            .get("summary")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = |field| {
+            item.get(field)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let reasoning = text("summary");
+        let reasoning = if reasoning.is_empty() {
+            text("content")
+        } else {
+            reasoning
+        };
         if !reasoning.is_empty() {
             item[super::REPLAY_REASONING_FIELD] = Value::String(reasoning);
         }

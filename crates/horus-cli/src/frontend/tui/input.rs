@@ -14,8 +14,10 @@ use super::view::terminal_text;
 use super::view::widget_status;
 use crate::frontend::catalog::CommandAction;
 use crate::frontend::catalog::CommandContext;
+use crate::frontend::catalog::GatewayAction;
 use crate::frontend::catalog::MenuItem;
 use crate::frontend::catalog::UiCatalog;
+use crate::frontend::setup::SetupMode;
 use horus::protocol::EventMsg;
 use horus::protocol::MAX_USER_INPUT_BYTES;
 use horus::protocol::Op;
@@ -29,10 +31,15 @@ const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 pub(super) enum UiAction {
     None,
     Submit(Op),
+    Gateway(GatewayAction),
+    GatewaySettings,
+    Setup {
+        mode: SetupMode,
+        provider: Option<String>,
+    },
     Exit,
-    New(String),
-    Clear(String),
-    Setup,
+    New,
+    Clear,
 }
 
 impl TuiState {
@@ -543,6 +550,9 @@ impl TuiState {
                     }
                     UiAction::Submit(op)
                 }
+                CommandAction::Gateway(action) => UiAction::Gateway(action),
+                CommandAction::GatewaySettings => UiAction::GatewaySettings,
+                CommandAction::Setup { mode, provider } => UiAction::Setup { mode, provider },
                 CommandAction::Frontend(event) => {
                     self.handle_agent_event(EventMsg::Frontend(event), Vec::new());
                     UiAction::None
@@ -556,9 +566,8 @@ impl TuiState {
                     UiAction::None
                 }
                 CommandAction::Exit => UiAction::Exit,
-                CommandAction::New => UiAction::New(self.model_route.clone()),
-                CommandAction::Clear => UiAction::Clear(self.model_route.clone()),
-                CommandAction::Setup => UiAction::Setup,
+                CommandAction::New => UiAction::New,
+                CommandAction::Clear => UiAction::Clear,
             };
         }
         if let Some(id) = self.approval.take() {
