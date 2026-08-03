@@ -1,0 +1,119 @@
+//! Bounded workspace instruction discovery.
+
+use std::io::Read as _;
+use std::path::Path;
+
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
+
+use super::Middleware;
+use crate::{Error, Result};
+
+const OVERRIDE_FILE: &str = "AGENTS.override.md";
+const INSTRUCTIONS_FILE: &str = "AGENTS.md";
+const MAX_INSTRUCTIONS_BYTES: u64 = 40_000;
+
+/// Optional root workspace instructions composed into the system prompt once.
+pub struct Instructions {
+    fragment: Option<String>,
+}
+
+impl Instructions {
+    /// Loads `AGENTS.override.md`, falling back to `AGENTS.md` when absent.
+    pub fn discover(workspace: impl AsRef<Path>) -> Result<Self> {
+        let workspace = Dir::open_ambient_dir(workspace, ambient_authority())?;
+        for name in [OVERRIDE_FILE, INSTRUCTIONS_FILE] {
+            let Some(content) = read_optional(&workspace, name)? else {
+                continue;
+            };
+            let content = content.trim();
+            return Ok(Self {
+                fragment: (!content.is_empty()).then(|| {
+                    format!(
+                        "<workspace_instructions source=\"{name}\">\n{content}\n</workspace_instructions>"
+                    )
+                }),
+            });
+        }
+        Ok(Self { fragment: None })
+    }
+}
+
+impl Middleware for Instructions {
+    fn name(&self) -> &'static str {
+        "instructions"
+    }
+
+    fn prompt_fragment(&self, _runtime: &super::RuntimeContext) -> Result<Option<String>> {
+        Ok(self.fragment.clone())
+    }
+}
+
+fn read_optional(directory: &Dir, name: &str) -> Result<Option<String>> {
+    let metadata = match directory.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_symlink() || !metadata.is_file() {
+        return Err(Error::Config(format!(
+            "workspace instruction `{name}` must be a regular file"
+        )));
+    }
+    let file = directory.open(name)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::Config(format!(
+            "workspace instruction `{name}` must be a regular file"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_INSTRUCTIONS_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_INSTRUCTIONS_BYTES {
+        return Err(Error::Config(format!(
+            "workspace instruction `{name}` exceeds {MAX_INSTRUCTIONS_BYTES} bytes"
+        )));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| Error::Config(format!("workspace instruction `{name}` is not valid UTF-8")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn override_wins_and_missing_files_are_optional() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            Instructions::discover(workspace.path())
+                .expect("empty workspace")
+                .fragment
+                .is_none()
+        );
+        std::fs::write(workspace.path().join(INSTRUCTIONS_FILE), "base").expect("base");
+        std::fs::write(workspace.path().join(OVERRIDE_FILE), "override").expect("override");
+
+        let instructions = Instructions::discover(workspace.path()).expect("instructions");
+
+        assert_eq!(
+            instructions.fragment.as_deref(),
+            Some(
+                "<workspace_instructions source=\"AGENTS.override.md\">\noverride\n</workspace_instructions>"
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instruction_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::NamedTempFile::new().expect("outside");
+        symlink(outside.path(), workspace.path().join(INSTRUCTIONS_FILE)).expect("symlink");
+
+        assert!(Instructions::discover(workspace.path()).is_err());
+    }
+}

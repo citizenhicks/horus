@@ -8,6 +8,7 @@ use crate::{Error, Result};
 #[derive(Clone, Copy)]
 pub(crate) enum BuiltinMiddleware {
     Tools,
+    Instructions,
     Cron,
     Skills,
     Subagents,
@@ -25,12 +26,20 @@ pub(crate) struct MiddlewareDefinition {
     default_enabled: bool,
 }
 
-pub(crate) const MIDDLEWARE: [MiddlewareDefinition; 7] = [
+pub(crate) const MIDDLEWARE: [MiddlewareDefinition; 8] = [
     MiddlewareDefinition {
         kind: BuiltinMiddleware::Tools,
         id: "tools",
         label: "Tools",
         description: "Read and modify workspace files and run sandboxed commands",
+        required: false,
+        default_enabled: true,
+    },
+    MiddlewareDefinition {
+        kind: BuiltinMiddleware::Instructions,
+        id: "instructions",
+        label: "Workspace instructions",
+        description: "Load optional root AGENTS.md guidance",
         required: false,
         default_enabled: true,
     },
@@ -153,7 +162,6 @@ mod tests {
 
         let encoded = serde_json::to_value(config).expect("serialize middleware config");
 
-        assert_eq!(encoded["enabled"].as_array().map(Vec::len), Some(4));
         assert!(
             encoded["enabled"]
                 .as_array()

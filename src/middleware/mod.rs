@@ -25,6 +25,7 @@ use crate::protocol::SessionContext;
 use crate::protocol::TokenUsage;
 
 pub mod compaction;
+pub mod instructions;
 pub mod sessions;
 pub mod skills;
 pub mod steering;

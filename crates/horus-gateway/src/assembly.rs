@@ -13,6 +13,7 @@ use horus::backend::model::{
 };
 use horus::backend::sandbox::{Sandbox, SandboxBackend};
 use horus::middleware::compaction::Compaction;
+use horus::middleware::instructions::Instructions;
 use horus::middleware::sessions::Sessions;
 use horus::middleware::skills::Skills;
 use horus::middleware::steering::Steering;
@@ -563,6 +564,7 @@ fn build_middleware(
     {
         let middleware: Arc<dyn Middleware> = match feature.kind {
             BuiltinMiddleware::Tools => Arc::new(Tools::coding()),
+            BuiltinMiddleware::Instructions => Arc::new(Instructions::discover(workspace)?),
             BuiltinMiddleware::Cron => Arc::new(ConversationalCron::new(Arc::clone(&cron))),
             BuiltinMiddleware::Skills => Arc::new(Skills::discover_installed([
                 workspace.join(".agents/skills"),
