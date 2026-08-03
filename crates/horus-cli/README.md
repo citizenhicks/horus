@@ -88,7 +88,8 @@ separate environment-name setting. The final page confirms the provider's model 
 choice. The gateway owns the complete configured-model catalog and
 new-chat default; `/model` only changes the selected chat to one of those available routes.
 `/agent` opens a one-page capability and approval-policy editor without changing the selected
-provider or system prompt. Secrets are sent directly to the gateway and never returned to the CLI.
+provider or system prompt. Required gateway capabilities remain visible but cannot be deselected.
+Secrets are sent directly to the gateway and never returned to the CLI.
 `/gateway` lists saved endpoints and opens a second page to pair a new endpoint; reconnect and
 delete act on the selected saved gateway. Explicit endpoint or token environment variables make
 that screen read-only until they are unset.

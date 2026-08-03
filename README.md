@@ -62,7 +62,7 @@ Horus requires Rust 1.89 or newer.
 
 ```toml
 [dependencies]
-horus = "0.1"
+horus = "0.2"
 ```
 
 The caller owns composition:
@@ -122,15 +122,16 @@ distinct.
 | Module | Owns |
 | --- | --- |
 | `agent` | Session handles and the linear command/model/tool loop |
-| `middleware` | Lifecycle hooks, tools, skills, steering, compaction, sessions, and subagents |
+| `middleware` | Lifecycle hooks, tools, instructions, skills, tasks, steering, compaction, sessions, and subagents |
 | `protocol` | Commands, events, approvals, usage, and UI-neutral contribution records |
 | `backend` | Model, sandbox, and checkpoint interfaces plus built-in adapters |
 
 Middleware declaration order is execution order. A loop may run with no optional middleware.
 The sandbox enforces approval policy for every approval-required tool.
 Static middleware prompt fragments are composed into the system prompt once when an agent is
-created; runtime hooks do not repeatedly append them to conversation state. Built-in middleware
-that contributes instructions exposes a `prompt` builder override while retaining its own default.
+created; runtime hooks do not repeatedly append them to conversation state. Skills and subagents
+expose `prompt` builder overrides, while workspace instructions load a bounded root
+`AGENTS.override.md` or `AGENTS.md` when that middleware is installed.
 Subagents may set default model and reasoning choices at construction, with per-spawn overrides.
 Compaction defaults to 250,000 tokens. Its middleware uses a provider's native endpoint when
 advertised; otherwise it creates a rolling summary while retaining recent raw context.
@@ -143,7 +144,9 @@ permit the selected `bwrap` binary to create user, PID, and network namespaces; 
 hosts need a matching Bubblewrap profile. If the platform sandbox is unavailable, command
 execution fails closed. The sandbox offers three approval policies: prompt before dangerous
 tools, allow tools without network, or allow tools with network. Filesystem confinement remains
-active in every mode.
+active in every mode. `Tools::coding` includes foreground execution plus bounded, session-owned
+background start, poll, and stop operations; background jobs end on completion, explicit stop, or
+session shutdown.
 
 ## Contributing
 

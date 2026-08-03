@@ -1,6 +1,6 @@
 [package]
 name = "horus-gateway"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Headless authenticated gateway for Horus frontends"
@@ -18,7 +18,7 @@ path = "src/lib.rs"
 [dependencies]
 chrono = "0.4"
 croner = "3"
-horus = { version = "=0.1.3", path = "../.." }
+horus = { version = "=0.2.0", path = "../.." }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
