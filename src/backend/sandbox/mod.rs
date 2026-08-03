@@ -22,6 +22,8 @@ mod background;
 pub mod local;
 mod process_group;
 
+pub(crate) const MAX_FILE_BYTES: usize = 1024 * 1024;
+
 pub use approval::ApprovalPolicy;
 #[doc(hidden)]
 pub use process_group::ProcessGroupGuard;
@@ -137,6 +139,9 @@ impl Sandbox {
                     "tool call is not authorized to mutate the workspace".into(),
                 ))
             });
+        }
+        if content.len() > MAX_FILE_BYTES {
+            return Box::pin(async { Err(Error::Sandbox("file exceeds write limit".into())) });
         }
         self.backend.write(path, content)
     }

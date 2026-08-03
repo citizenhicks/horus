@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use diffy::DiffOptions;
+use diffy::{DiffOptions, Line, Patch};
 use futures_util::FutureExt;
 use futures_util::future::join_all;
 use serde::Deserialize;
@@ -33,6 +33,7 @@ const MAX_TOOL_UI_BYTES: usize = 512;
 const MAX_TOOL_UI_LINES: usize = 5;
 const MAX_MUTATION_BYTES: usize = 40_000;
 const MAX_COMMAND_BYTES: usize = 8_000;
+const MAX_PATCH_MATCH_WORK: usize = 32 * 1024 * 1024;
 
 /// Whether a tool can overlap other calls in its model-produced batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -558,6 +559,7 @@ impl Tool for ApplyPatch {
             let content = context.sandbox.read(&arguments.path).await?;
             let patch = diffy::Patch::from_str(&arguments.patch)
                 .map_err(|error| Error::Tool(format!("invalid unified diff: {error}")))?;
+            validate_patch_complexity(&content, &patch)?;
             let updated = diffy::apply(&content, &patch)
                 .map_err(|error| Error::Tool(format!("patch does not apply: {error}")))?;
             if updated == content {
@@ -579,6 +581,36 @@ impl Tool for ApplyPatch {
             })
         })
     }
+}
+
+fn validate_patch_complexity(content: &str, patch: &Patch<'_, str>) -> Result<()> {
+    let image_lines = content.lines().count().saturating_add(
+        patch
+            .hunks()
+            .iter()
+            .map(|hunk| hunk.new_range().len())
+            .sum::<usize>(),
+    );
+    let work = patch.hunks().iter().fold(0_usize, |total, hunk| {
+        let mut preimage_lines = 0_usize;
+        let mut preimage_bytes = 0_usize;
+        for line in hunk.lines() {
+            if let Line::Context(value) | Line::Delete(value) = line {
+                preimage_lines = preimage_lines.saturating_add(1);
+                preimage_bytes = preimage_bytes.saturating_add(value.len());
+            }
+        }
+        let hunk_work = if preimage_lines == 0 {
+            hunk.lines().len()
+        } else {
+            image_lines.saturating_mul(preimage_bytes.saturating_add(hunk.lines().len()))
+        };
+        total.saturating_add(hunk_work)
+    });
+    if work > MAX_PATCH_MATCH_WORK {
+        return Err(Error::Tool("patch is too expensive to match safely".into()));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]

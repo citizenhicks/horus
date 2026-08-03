@@ -186,6 +186,58 @@ async fn apply_patch_returns_a_unified_diff_after_writing() {
 }
 
 #[test]
+fn apply_patch_rejects_pathological_fuzzy_matching() {
+    let content = "same\n".repeat(20_000);
+    let mut patch = String::from("--- ignored\n+++ ignored\n@@ -1,1000 +1,1000 @@\n");
+    patch.push_str(&" same\n".repeat(999));
+    patch.push_str("-same\n+changed\n");
+    let patch = Patch::from_str(&patch).expect("patch");
+
+    assert!(validate_patch_complexity(&content, &patch).is_err());
+}
+
+#[tokio::test]
+async fn apply_patch_cannot_make_a_file_unreadable() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let path = workspace.path().join("full.txt");
+    std::fs::write(&path, "x".repeat(crate::backend::sandbox::MAX_FILE_BYTES))
+        .expect("write fixture");
+    let sandbox = Arc::new(Sandbox::new(
+        Arc::new(
+            crate::backend::sandbox::local::LocalSandbox::new(workspace.path())
+                .expect("local sandbox"),
+        ),
+        crate::backend::sandbox::ApprovalPolicy::On,
+    ));
+    let context = ToolContext {
+        sandbox,
+        permissions: SandboxPermissions::restore(
+            "session",
+            crate::backend::sandbox::NetworkAccess::Denied,
+            ["patch".into()],
+        )
+        .for_call("patch"),
+    };
+
+    let error = ApplyPatch
+        .call(
+            context,
+            serde_json::json!({
+                "path": "full.txt",
+                "patch": "--- ignored\n+++ ignored\n@@ -0,0 +1 @@\n+y\n"
+            }),
+        )
+        .await
+        .expect_err("oversized result");
+
+    assert!(error.to_string().contains("write limit"));
+    assert_eq!(
+        std::fs::metadata(path).expect("metadata").len(),
+        1024 * 1024
+    );
+}
+
+#[test]
 fn tools_do_not_claim_footer_space() {
     assert!(Tools::coding().frontend().widgets.is_empty());
 }

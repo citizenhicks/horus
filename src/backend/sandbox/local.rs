@@ -30,12 +30,11 @@ use tokio::process::Command;
 use super::MACOS_SEATBELT_BASE_POLICY;
 use super::NetworkAccess;
 use super::SandboxBackend;
-use super::{CommandOutput, CommandOutputSink, CommandStream, ProcessGroupGuard};
+use super::{CommandOutput, CommandOutputSink, CommandStream, MAX_FILE_BYTES, ProcessGroupGuard};
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
 
-const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 40_000;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const PROTECTED_METADATA: [&str; 3] = [".git", ".agents", ".codex"];
@@ -258,6 +257,9 @@ impl SandboxBackend for LocalSandbox {
 
     fn write<'a>(&'a self, path: &'a str, content: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            if content.len() > MAX_FILE_BYTES {
+                return Err(Error::Sandbox("file exceeds write limit".into()));
+            }
             validate_root(&self.root, &self.root_dir)?;
             let relative = self.relative(path)?;
             let root = self.root_dir.try_clone()?;
@@ -377,8 +379,9 @@ fn read_file(root: Dir, relative: &Path, requested: &str) -> Result<String> {
         return Err(Error::Sandbox(requested.to_string()));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_FILE_BYTES {
+    file.take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_FILE_BYTES {
         return Err(Error::Sandbox("file exceeds read limit".into()));
     }
     String::from_utf8(bytes).map_err(|_| Error::Sandbox(format!("{requested} is not valid UTF-8")))
