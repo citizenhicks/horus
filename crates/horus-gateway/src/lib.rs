@@ -1,8 +1,9 @@
-//! Authenticated, frontend-neutral access to one Horus agent workspace.
+//! Authenticated, frontend-neutral access to independent Horus chats.
 
 mod assembly;
 pub mod auth;
 pub mod client;
+pub mod command;
 pub mod config;
 pub mod cron;
 mod host;

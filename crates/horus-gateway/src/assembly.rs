@@ -21,13 +21,15 @@ use horus::middleware::tools::Tools;
 use horus::middleware::{Middleware, MiddlewareStack};
 use horus::protocol::SessionContext;
 
-use crate::config::{ConfigStore, CredentialStore, GatewayConfig, local_user_name};
+use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig, local_user_name};
+use crate::cron::{ConversationalCron, CronStore};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{ProviderAuthKind, ProviderConfig, ProviderStatus};
 use crate::{Error, Result};
 
 const DEFAULT_CONTEXT_WINDOW: i64 = 272_000;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_MODEL_ROUTE_BYTES: usize = 4 * 1024;
 
 pub(crate) struct BuiltAgent {
     pub(crate) agent: Agent,
@@ -35,50 +37,71 @@ pub(crate) struct BuiltAgent {
     pub(crate) subagent_template: Option<Arc<OnceLock<AgentConfig>>>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the headless composition root keeps its runtime dependencies explicit"
+)]
 pub(crate) async fn assemble(
-    config: &GatewayConfig,
+    gateway: &GatewayConfig,
+    chat: &ChatSpec,
     store: &ConfigStore,
     credentials: Arc<CredentialStore>,
+    cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     session_id: Option<String>,
     origin_label: &str,
+    override_saved_model_route: bool,
 ) -> Result<BuiltAgent> {
     let (models, context_window) =
-        if credential_is_configured(&config.agent.config.provider, store, &credentials)? {
-            build_models(&config.agent.config.provider, store, &credentials)?
+        if credential_is_configured(&chat.agent.config.provider, store, &credentials)? {
+            build_models(&chat.agent.config.provider, store, &credentials)?
         } else {
-            unavailable_models(&config.agent.config.provider)?
+            unavailable_models(&chat.agent.config.provider)?
         };
     let gateway_sandbox = Arc::new(GatewaySandbox::new(
-        &config.workspace,
+        &chat.workspace,
         store.state_dir(),
-        config.tls.as_ref().map(|tls| tls.private_key.as_path()),
+        gateway.tls.as_ref().map(|tls| tls.private_key.as_path()),
         COMMAND_TIMEOUT,
     )?);
     let backend: Arc<dyn SandboxBackend> = gateway_sandbox.clone();
-    let sandbox = Arc::new(Sandbox::new(backend, config.agent.config.approval));
-    let template = config
+    let sandbox = Arc::new(Sandbox::new(backend, chat.agent.config.approval));
+    let template = chat
         .agent
         .config
         .middleware
         .subagents
         .then(|| Arc::new(OnceLock::<AgentConfig>::new()));
     let launcher = template.as_ref().map(subagent_launcher);
-    let middleware =
-        build_middleware(&config.agent.config.middleware, &config.workspace, launcher)?;
-    let workspace = config.workspace_info();
+    let middleware = build_middleware(
+        &chat.agent.config.middleware,
+        &chat.workspace,
+        launcher,
+        cron,
+    )?;
+    let mut metadata = match session_id.as_deref() {
+        Some(session_id) => checkpoints
+            .load(session_id)
+            .await?
+            .map(|checkpoint| checkpoint.metadata)
+            .unwrap_or_default(),
+        None => Default::default(),
+    };
+    metadata.extend(chat.metadata()?);
+    let workspace = chat.workspace_info();
     let mut agent_config = AgentConfig::new(
         models,
         sandbox,
         checkpoints,
         middleware,
-        config.agent.config.system_prompt.clone(),
+        chat.agent.config.system_prompt.clone(),
     )
     .context_window(context_window)
+    .metadata(metadata)
     .session_context(SessionContext {
         user_name: local_user_name(),
         workspace_id: Some(workspace.id),
-        workspace_label: Some(workspace.label),
+        workspace_label: Some(workspace.path.display().to_string()),
         origin_label: Some(origin_label.into()),
         ..SessionContext::default()
     });
@@ -87,6 +110,9 @@ pub(crate) async fn assemble(
             return Err(Error::Config("session ID must be 1–4096 bytes".into()));
         }
         agent_config = agent_config.session_id(session_id);
+    }
+    if override_saved_model_route {
+        agent_config = agent_config.override_saved_model_route();
     }
     if let Some(template) = &template {
         template
@@ -119,6 +145,121 @@ pub(crate) fn provider_statuses(
             Ok(provider_status(definition, configured))
         })
         .collect()
+}
+
+pub(crate) fn configured_model_choices(
+    gateway: &GatewayConfig,
+    store: &ConfigStore,
+    credentials: &CredentialStore,
+) -> Result<Vec<ModelChoice>> {
+    Ok(configured_model_routes(gateway, store, credentials)?
+        .into_iter()
+        .map(|route| route.choice)
+        .collect())
+}
+
+pub(crate) fn configured_provider_for_route(
+    gateway: &GatewayConfig,
+    store: &ConfigStore,
+    credentials: &CredentialStore,
+    route: &str,
+) -> Result<ProviderConfig> {
+    if route.trim().is_empty() || route.len() > MAX_MODEL_ROUTE_BYTES {
+        return Err(Error::Config(format!(
+            "model route must be 1–{MAX_MODEL_ROUTE_BYTES} bytes"
+        )));
+    }
+    configured_model_routes(gateway, store, credentials)?
+        .into_iter()
+        .find(|candidate| candidate.choice.route == route)
+        .map(|candidate| candidate.provider)
+        .ok_or_else(|| Error::Config("model route is not in the configured gateway catalog".into()))
+}
+
+fn configured_model_routes(
+    gateway: &GatewayConfig,
+    store: &ConfigStore,
+    credentials: &CredentialStore,
+) -> Result<Vec<CatalogRoute>> {
+    let mut routes = Vec::new();
+    let default_provider = gateway
+        .default_agent
+        .as_ref()
+        .map(|default| default.config.provider.provider.as_str());
+    let mut definitions = providers().iter().collect::<Vec<_>>();
+    definitions.sort_by_key(|definition| Some(definition.id()) != default_provider);
+    for definition in definitions {
+        let Some(selection) = gateway.configured_providers.get(definition.id()) else {
+            continue;
+        };
+        if credential_is_configured(selection, store, credentials)? {
+            routes.extend(catalog_routes(definition, selection));
+        }
+    }
+    Ok(routes)
+}
+
+fn catalog_routes(
+    definition: &ProviderDefinition,
+    selection: &ProviderConfig,
+) -> Vec<CatalogRoute> {
+    let mut models = definition
+        .models()
+        .iter()
+        .map(|preset| (preset.id, Some(preset)))
+        .collect::<Vec<_>>();
+    if models.iter().all(|(model, _)| *model != selection.model) {
+        models.insert(0, (selection.model.as_str(), None));
+    } else {
+        models.sort_by_key(|(model, _)| *model != selection.model);
+    }
+
+    let mut routes = Vec::new();
+    for (model, preset) in models {
+        let preferred = if model == selection.model {
+            selection
+                .reasoning_effort
+                .as_deref()
+                .or_else(|| preset.and_then(|preset| preset.default_reasoning))
+        } else {
+            preset.and_then(|preset| preset.default_reasoning)
+        };
+        let mut efforts = vec![preferred];
+        for reasoning in preset.into_iter().flat_map(|preset| preset.reasoning) {
+            let effort = Some(reasoning.id);
+            if !efforts.contains(&effort) {
+                efforts.push(effort);
+            }
+        }
+        for effort in efforts {
+            let mut provider = selection.clone();
+            provider.model = model.into();
+            provider.reasoning_effort = effort.map(str::to_string);
+            let route = route_id(definition.id(), model, effort);
+            routes.push(CatalogRoute {
+                choice: ModelChoice {
+                    route,
+                    group: format!(
+                        "{} · {}",
+                        definition.label(),
+                        preset.map_or(model, |preset| preset.label)
+                    ),
+                    model: model.into(),
+                    reasoning_effort: effort.map(str::to_string),
+                    context_window: Some(
+                        preset.map_or(DEFAULT_CONTEXT_WINDOW, |preset| preset.context_window),
+                    ),
+                },
+                provider,
+            });
+        }
+    }
+    routes
+}
+
+struct CatalogRoute {
+    choice: ModelChoice,
+    provider: ProviderConfig,
 }
 
 fn provider_status(definition: &ProviderDefinition, configured: bool) -> ProviderStatus {
@@ -178,13 +319,7 @@ fn build_models(
     } else {
         None
     };
-    let credential = resolve_credential(
-        definition,
-        selection,
-        base_url.as_deref(),
-        store,
-        credentials,
-    )?;
+    let credential = resolve_credential(definition, base_url.as_deref(), store, credentials)?;
     let http = streaming_client()?;
     let mut models = definition.models().iter().collect::<Vec<_>>();
     models.sort_by_key(|model| model.id != selection.model);
@@ -256,7 +391,6 @@ fn build_models(
 
 fn resolve_credential(
     definition: &ProviderDefinition,
-    selection: &ProviderConfig,
     base_url: Option<&str>,
     store: &ConfigStore,
     credentials: &CredentialStore,
@@ -272,13 +406,12 @@ fn resolve_credential(
                     definition.id()
                 )));
             }
-            let name = selection.api_key_env.as_deref().unwrap_or(default_env);
-            let value = std::env::var(name).map_err(|_| {
+            let value = std::env::var(default_env).map_err(|_| {
                 Error::Config(format!("set a credential for `{}`", definition.id()))
             })?;
             if value.trim().is_empty() {
                 return Err(Error::Config(format!(
-                    "credential environment variable {name} is empty"
+                    "credential environment variable {default_env} is empty"
                 )));
             }
             Ok(ProviderCredential::ApiKey(value))
@@ -287,7 +420,7 @@ fn resolve_credential(
     }
 }
 
-fn credential_is_configured(
+pub(crate) fn credential_is_configured(
     selection: &ProviderConfig,
     store: &ConfigStore,
     credentials: &CredentialStore,
@@ -309,8 +442,7 @@ fn credential_is_configured(
             if definition.configurable_base_url() {
                 return Ok(false);
             }
-            let name = selection.api_key_env.as_deref().unwrap_or(default_env);
-            Ok(std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+            Ok(std::env::var(default_env).is_ok_and(|value| !value.trim().is_empty()))
         }
         ProviderAuth::Browser(auth) => auth
             .configured(&store.provider_auth_path())
@@ -330,12 +462,7 @@ struct RouteSpec<'a> {
 }
 
 fn build_route(spec: RouteSpec<'_>) -> Result<RouteValue> {
-    let id = format!(
-        "{}::{}::{}",
-        spec.definition.id(),
-        spec.model,
-        spec.effort.unwrap_or("default")
-    );
+    let id = route_id(spec.definition.id(), spec.model, spec.effort);
     let model = spec.definition.build(ProviderBuildConfig {
         credential: spec.credential,
         model: spec.model.into(),
@@ -355,6 +482,10 @@ fn build_route(spec: RouteSpec<'_>) -> Result<RouteValue> {
         id,
         model,
     })
+}
+
+fn route_id(provider: &str, model: &str, effort: Option<&str>) -> String {
+    format!("{provider}::{model}::{}", effort.unwrap_or("default"))
 }
 
 struct RouteValue {
@@ -422,11 +553,13 @@ fn build_middleware(
     settings: &crate::wire::MiddlewareConfig,
     workspace: &std::path::Path,
     launcher: Option<SubagentLauncher>,
+    cron: Arc<CronStore>,
 ) -> Result<MiddlewareStack> {
     let mut entries: Vec<Arc<dyn Middleware>> = Vec::new();
     if settings.tools {
         entries.push(Arc::new(Tools::coding()));
     }
+    entries.push(Arc::new(ConversationalCron::new(cron)));
     if settings.skills {
         entries.push(Arc::new(Skills::discover_installed([
             workspace.join(".agents/skills"),
@@ -444,14 +577,14 @@ fn build_middleware(
     if settings.compaction {
         entries.push(Arc::new(Compaction::default()));
     }
-    if settings.sessions {
-        entries.push(Arc::new(Sessions::default()));
-    }
+    entries.push(Arc::new(Sessions::default()));
     Ok(MiddlewareStack::new(entries)?)
 }
 
 #[cfg(test)]
 mod tests {
+    use horus::backend::checkpoint::{Checkpoint, sqlite::SqliteCheckpoint};
+
     use super::*;
 
     #[test]
@@ -478,14 +611,66 @@ mod tests {
     }
 
     #[test]
-    fn custom_responses_does_not_load_host_environment_credentials() {
+    fn configured_catalog_resolves_manifest_and_opaque_custom_routes() {
         let root = tempfile::tempdir().expect("root");
-        let workspace = root.path().join("workspace");
         let state = root.path().join("state");
-        std::fs::create_dir(&workspace).expect("workspace");
+        let (store, config) = ConfigStore::initialize(
+            state,
+            "127.0.0.1:8741".parse().expect("listen address"),
+            None,
+        )
+        .expect("config");
+        let credentials =
+            CredentialStore::open(store.credentials_path()).expect("credential store");
+        credentials
+            .set("kimi", "kimi-secret", None)
+            .expect("Kimi credential");
+        credentials
+            .set("responses", "custom-secret", Some("https://example.com/v1"))
+            .expect("custom credential");
+        let kimi = ProviderConfig {
+            provider: "kimi".into(),
+            model: "kimi-k3".into(),
+            base_url: None,
+            reasoning_effort: Some("max".into()),
+            web_search: HostedWebSearch::Off,
+        };
+        let custom = ProviderConfig {
+            provider: "responses".into(),
+            model: "vendor/model::opaque".into(),
+            base_url: Some("https://example.com/v1".into()),
+            reasoning_effort: Some("provider-defined".into()),
+            web_search: HostedWebSearch::Off,
+        };
+        let config = config
+            .registering_provider(kimi)
+            .and_then(|config| config.registering_provider(custom.clone()))
+            .expect("register providers");
+
+        let choices = configured_model_choices(&config, &store, &credentials).expect("catalog");
+        let custom_route = choices
+            .iter()
+            .find(|choice| choice.model == custom.model)
+            .expect("custom choice");
+        let resolved =
+            configured_provider_for_route(&config, &store, &credentials, &custom_route.route)
+                .expect("resolve custom route");
+
+        assert!(
+            choices
+                .first()
+                .is_some_and(|choice| choice.route.starts_with("kimi::"))
+        );
+        assert_eq!(resolved, custom);
+        assert!(custom_route.group.starts_with("Custom Responses · "));
+    }
+
+    #[test]
+    fn custom_responses_requires_an_endpoint_bound_stored_credential() {
+        let root = tempfile::tempdir().expect("root");
+        let state = root.path().join("state");
         let (store, _) = ConfigStore::initialize(
             state,
-            workspace,
             "127.0.0.1:8741".parse().expect("listen address"),
             None,
         )
@@ -496,14 +681,12 @@ mod tests {
             provider: "responses".into(),
             model: "custom-model".into(),
             base_url: Some("https://example.com/v1".into()),
-            api_key_env: Some("PATH".into()),
             reasoning_effort: None,
             web_search: HostedWebSearch::Off,
         };
 
         let error = resolve_credential(
             provider("responses").expect("provider"),
-            &selection,
             selection.base_url.as_deref(),
             &store,
             &credentials,
@@ -527,12 +710,85 @@ mod tests {
         assert!(
             resolve_credential(
                 provider("responses").expect("provider"),
-                &selection,
                 selection.base_url.as_deref(),
                 &store,
                 &credentials,
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn updating_the_chat_recipe_preserves_capability_metadata() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let (store, gateway) = ConfigStore::initialize(
+            root.path().join("state"),
+            "127.0.0.1:8741".parse().expect("listen address"),
+            None,
+        )
+        .expect("config");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let checkpoints: Arc<dyn CheckpointStore> =
+            Arc::new(SqliteCheckpoint::new(store.checkpoints_path()).expect("checkpoints"));
+        let original = ChatSpec::new(
+            &workspace,
+            crate::wire::VersionedAgentConfig {
+                revision: 1,
+                config: crate::wire::AgentComposition::default(),
+            },
+            store.state_dir(),
+            None,
+        )
+        .expect("chat spec");
+        let mut checkpoint = Checkpoint::empty("chat");
+        checkpoint.metadata = original.metadata().expect("chat metadata");
+        checkpoint.metadata.insert(
+            "capability.test".into(),
+            serde_json::json!({"identity": "preserved"}),
+        );
+        checkpoints
+            .save(&checkpoint, &[])
+            .await
+            .expect("seed checkpoint");
+        let mut composition = original.agent.config.clone();
+        composition.middleware.tools = false;
+        let updated = original
+            .replacing_agent(1, composition, store.state_dir(), None)
+            .expect("updated chat spec");
+
+        let built = assemble(
+            &gateway,
+            &updated,
+            &store,
+            credentials,
+            cron,
+            Arc::clone(&checkpoints),
+            Some("chat".into()),
+            "test",
+            true,
+        )
+        .await
+        .expect("assemble chat");
+        let (sender, mut events) = built.agent.into_parts();
+        drop(sender);
+        while events.recv().await.is_some() {}
+        let checkpoint = checkpoints
+            .load("chat")
+            .await
+            .expect("load checkpoint")
+            .expect("saved checkpoint");
+        let saved = ChatSpec::from_metadata(&checkpoint.metadata, store.state_dir(), None)
+            .expect("saved chat spec");
+
+        assert_eq!(
+            checkpoint.metadata["capability.test"],
+            serde_json::json!({"identity": "preserved"})
+        );
+        assert_eq!(saved.agent.revision, 2);
+        assert!(!saved.agent.config.middleware.tools);
     }
 }

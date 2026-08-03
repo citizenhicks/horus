@@ -32,10 +32,14 @@ pub(super) enum UiAction {
     None,
     Submit(Op),
     Gateway(GatewayAction),
-    Setup(SetupMode),
+    GatewaySettings,
+    Setup {
+        mode: SetupMode,
+        provider: Option<String>,
+    },
     Exit,
-    New(String),
-    Clear(String),
+    New,
+    Clear,
 }
 
 impl TuiState {
@@ -514,7 +518,6 @@ impl TuiState {
 
     pub(super) fn submit_input(&mut self, catalog: &UiCatalog) -> UiAction {
         let had_pastes = !self.pastes.is_empty();
-        let pasted_agent_config = had_pastes && self.input.starts_with("/agent ");
         let line = self.expanded_input();
         if line.len() > MAX_USER_INPUT_BYTES {
             self.input_limit_reached = true;
@@ -530,7 +533,7 @@ impl TuiState {
             line.trim()
         };
         let status = self.status();
-        if (!had_pastes || pasted_agent_config)
+        if !had_pastes
             && let Some(action) = catalog.dispatch(
                 line,
                 CommandContext {
@@ -548,7 +551,8 @@ impl TuiState {
                     UiAction::Submit(op)
                 }
                 CommandAction::Gateway(action) => UiAction::Gateway(action),
-                CommandAction::Setup(mode) => UiAction::Setup(mode),
+                CommandAction::GatewaySettings => UiAction::GatewaySettings,
+                CommandAction::Setup { mode, provider } => UiAction::Setup { mode, provider },
                 CommandAction::Frontend(event) => {
                     self.handle_agent_event(EventMsg::Frontend(event), Vec::new());
                     UiAction::None
@@ -562,8 +566,8 @@ impl TuiState {
                     UiAction::None
                 }
                 CommandAction::Exit => UiAction::Exit,
-                CommandAction::New => UiAction::New(self.model_route.clone()),
-                CommandAction::Clear => UiAction::Clear(self.model_route.clone()),
+                CommandAction::New => UiAction::New,
+                CommandAction::Clear => UiAction::Clear,
             };
         }
         if let Some(id) = self.approval.take() {

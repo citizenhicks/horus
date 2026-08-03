@@ -1,12 +1,14 @@
-//! Single-agent ownership, event sequencing, replay, and authenticated operations.
+//! Per-chat agent ownership, event sequencing, replay, and authenticated operations.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::{Component, Path};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use horus::agent::{AgentConfig, AgentSender};
-use horus::backend::checkpoint::{CheckpointStore, SessionPageRequest, sqlite::SqliteCheckpoint};
+use horus::backend::checkpoint::{
+    Checkpoint, CheckpointStore, SessionPageRequest, sqlite::SqliteCheckpoint,
+};
 use horus::backend::model::provider::{ProviderAuth, provider};
 use horus::backend::sandbox::CommandOutput;
 use horus::middleware::FrontendExtensions;
@@ -15,16 +17,20 @@ use horus::protocol::{
     Submission,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::assembly::{BuiltAgent, assemble, provider_statuses};
-use crate::config::{ConfigStore, CredentialStore, GatewayConfig};
+use crate::assembly::{
+    BuiltAgent, assemble, configured_model_choices, configured_provider_for_route,
+    credential_is_configured, provider_statuses,
+};
+use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig};
 use crate::cron::{ActiveCronRun, BeginRun, CronStore};
 use crate::sandbox::{GatewaySandbox, MAX_COMMAND_OUTPUT_BYTES};
 use crate::wire::{
     AgentComposition, ArtifactKind, ArtifactRecord, CronRunStatus, GitStatus, ProfileSnapshot,
-    ReadyPayload, RenderedEvent, RenderedPreview, ServerFrame, ServerMessage, SessionRecord,
+    ProviderConfig, ReadyPayload, RenderedEvent, RenderedPreview, ServerFrame, ServerMessage,
+    SessionReadyPayload, SessionRecord, VersionedAgentConfig,
 };
 use crate::{Error, Result};
 
@@ -39,6 +45,7 @@ const MAX_SESSION_TITLE_BYTES: usize = 256;
 const MAX_SESSION_PREVIEW_BYTES: usize = 512;
 const MAX_GIT_DIFF_BYTES: usize = MAX_COMMAND_OUTPUT_BYTES;
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const MAX_ACTIVE_SESSIONS: usize = 32;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct SessionMetadata {
@@ -51,12 +58,36 @@ type SessionCatalogMetadata = BTreeMap<String, SessionMetadata>;
 
 #[derive(Clone)]
 pub(crate) struct HostHandle {
+    inner: Arc<HostInner>,
+}
+
+struct HostInner {
+    session_id: Arc<str>,
     commands: mpsc::Sender<HostCommand>,
     events: broadcast::Sender<ServerFrame>,
 }
 
+/// Machine-wide chat registry. A session has at most one resident agent owner.
+#[derive(Clone)]
+pub(crate) struct GatewayHost {
+    state: Arc<Mutex<GatewayState>>,
+    events: broadcast::Sender<ServerFrame>,
+}
+
+struct GatewayState {
+    store: ConfigStore,
+    config: Arc<StdMutex<GatewayConfig>>,
+    credentials: Arc<CredentialStore>,
+    cron: Arc<CronStore>,
+    checkpoints: Arc<dyn CheckpointStore>,
+    // ponytail: one lock is enough for at most 32 tiny catalog writes.
+    catalog_lock: Arc<Mutex<()>>,
+    provider_login: Arc<StdMutex<Option<String>>>,
+    sessions: HashMap<String, HostHandle>,
+}
+
 pub(crate) struct HostSnapshot {
-    pub(crate) ready: ReadyPayload,
+    pub(crate) ready: SessionReadyPayload,
     pub(crate) replay: Vec<ServerFrame>,
 }
 
@@ -69,15 +100,16 @@ pub(crate) struct Rejection {
 
 struct HostState {
     store: ConfigStore,
-    config: GatewayConfig,
+    gateway: Arc<StdMutex<GatewayConfig>>,
+    spec: ChatSpec,
     credentials: Arc<CredentialStore>,
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
+    catalog_lock: Arc<Mutex<()>>,
     running: RunningAgent,
     pending_turns: usize,
     approval_active: bool,
     restart_after_turn: bool,
-    provider_login: Option<String>,
     suppress_history_broadcast: bool,
     pending_startup: Vec<ServerFrame>,
     active_cron: Option<ActiveCron>,
@@ -85,8 +117,8 @@ struct HostState {
     replay: VecDeque<ServerFrame>,
     artifacts: VecDeque<ArtifactRecord>,
     commands: mpsc::Receiver<HostCommand>,
-    command_sender: mpsc::WeakSender<HostCommand>,
     events: broadcast::Sender<ServerFrame>,
+    idle_waiters: Vec<oneshot::Sender<()>>,
 }
 
 struct RunningAgent {
@@ -95,7 +127,6 @@ struct RunningAgent {
     events: mpsc::Receiver<Event>,
     frontend: FrontendExtensions,
     session: horus::protocol::SessionConfiguredEvent,
-    model_choices: Vec<horus::backend::model::ModelChoice>,
     gateway_sandbox: Arc<GatewaySandbox>,
     subagent_template: Option<Arc<OnceLock<AgentConfig>>>,
 }
@@ -104,7 +135,6 @@ struct ActiveCron {
     run: ActiveCronRun,
     submission_id: String,
     turn_id: Option<String>,
-    return_session_id: String,
     failure: Option<String>,
 }
 
@@ -112,10 +142,6 @@ enum HostCommand {
     Snapshot {
         last_sequence: Option<u64>,
         reply: oneshot::Sender<std::result::Result<HostSnapshot, Rejection>>,
-    },
-    OpenSession {
-        session_id: Option<String>,
-        reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
     RenameSession {
         session_id: String,
@@ -135,44 +161,40 @@ enum HostCommand {
         submission: Submission,
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
+    StartCronSetup {
+        task: Option<String>,
+        reply: oneshot::Sender<std::result::Result<(), Rejection>>,
+    },
     Configure {
         expected_revision: u64,
         config: AgentComposition,
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
-    SetWorkspace {
-        path: PathBuf,
+    SetModel {
+        route: String,
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
     GitDiff {
         reply: oneshot::Sender<std::result::Result<String, Rejection>>,
     },
-    SetCredential {
+    RefreshProvider {
         provider: String,
-        api_key: String,
         base_url: Option<String>,
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
-    },
-    StartProviderLogin {
-        request_id: String,
-        provider: String,
-        reply: oneshot::Sender<std::result::Result<(), Rejection>>,
-    },
-    ProviderLoginCompleted {
-        request_id: String,
-        login_id: String,
-        provider: String,
-        result: std::result::Result<(), String>,
-    },
-    Profile {
-        reply: oneshot::Sender<ProfileSnapshot>,
     },
     Artifacts {
         reply: oneshot::Sender<Vec<ArtifactRecord>>,
     },
     RunCron {
-        id: String,
+        run: ActiveCronRun,
+        input: String,
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
+    },
+    WaitIdle {
+        reply: oneshot::Sender<()>,
+    },
+    StopIfIdle {
+        reply: oneshot::Sender<bool>,
     },
 }
 
@@ -181,8 +203,8 @@ enum Next {
     Event(Option<Event>),
 }
 
-impl HostHandle {
-    pub(crate) async fn start(
+impl GatewayHost {
+    pub(crate) fn start(
         store: ConfigStore,
         config: GatewayConfig,
         credentials: Arc<CredentialStore>,
@@ -190,28 +212,531 @@ impl HostHandle {
     ) -> Result<Self> {
         let checkpoints: Arc<dyn CheckpointStore> =
             Arc::new(SqliteCheckpoint::new(store.checkpoints_path())?);
+        let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
+        Ok(Self {
+            state: Arc::new(Mutex::new(GatewayState {
+                store,
+                config: Arc::new(StdMutex::new(config)),
+                credentials,
+                cron,
+                checkpoints,
+                catalog_lock: Arc::new(Mutex::new(())),
+                provider_login: Arc::new(StdMutex::new(None)),
+                sessions: HashMap::new(),
+            })),
+            events,
+        })
+    }
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ServerFrame> {
+        self.events.subscribe()
+    }
+
+    pub(crate) async fn ready(&self) -> std::result::Result<ReadyPayload, Rejection> {
+        let state = self.state.lock().await;
+        gateway_ready(&state).await
+    }
+
+    pub(crate) async fn set_credential(
+        &self,
+        provider_id: String,
+        api_key: String,
+        base_url: Option<String>,
+    ) -> std::result::Result<(), Rejection> {
+        let base_url = {
+            let state = self.state.lock().await;
+            let definition = provider(&provider_id).map_err(invalid_config)?;
+            let base_url = if definition.configurable_base_url() {
+                base_url.or_else(|| definition.default_base_url().map(str::to_owned))
+            } else {
+                base_url
+            };
+            definition
+                .validate_base_url(base_url.as_deref())
+                .map_err(invalid_config)?;
+            state
+                .credentials
+                .set(&provider_id, &api_key, base_url.as_deref())
+                .map_err(invalid_config)?;
+            base_url
+        };
+        self.refresh_provider_sessions(&provider_id, base_url.as_deref())
+            .await
+    }
+
+    pub(crate) async fn start_provider_login(
+        &self,
+        request_id: String,
+        provider_id: String,
+    ) -> std::result::Result<(), Rejection> {
+        let definition = provider(&provider_id).map_err(invalid_config)?;
+        let ProviderAuth::Browser(auth) = definition.auth() else {
+            return Err(Rejection {
+                code: "invalid_provider_auth",
+                message: "the selected provider uses an API key".into(),
+                fatal: false,
+            });
+        };
+        if !auth.supports_device_login() {
+            return Err(Rejection {
+                code: "device_login_unavailable",
+                message: "the selected provider does not support device-code login".into(),
+                fatal: false,
+            });
+        }
+        let (login_guard, path) = {
+            let state = self.state.lock().await;
+            (
+                Arc::clone(&state.provider_login),
+                state.store.provider_auth_path(),
+            )
+        };
+        let login_id = Uuid::new_v4().to_string();
+        reserve_provider_login(&login_guard, &login_id)?;
+        let login = match auth.start_device().await {
+            Ok(login) => login,
+            Err(error) => {
+                release_provider_login(&login_guard, &login_id)?;
+                return Err(internal(error));
+            }
+        };
+        self.broadcast(ServerMessage::ProviderLoginStarted {
+            request_id: request_id.clone(),
+            login_id: login_id.clone(),
+            provider: provider_id.clone(),
+            verification_url: login.verification_url().into(),
+            user_code: login.user_code().into(),
+        });
+        let gateway = self.clone();
+        tokio::spawn(async move {
+            let result = login
+                .complete(path)
+                .await
+                .map_err(|error| error.to_string());
+            gateway
+                .finish_provider_login(request_id, login_id, provider_id, result)
+                .await;
+        });
+        Ok(())
+    }
+
+    async fn finish_provider_login(
+        &self,
+        request_id: String,
+        login_id: String,
+        provider: String,
+        result: std::result::Result<(), String>,
+    ) {
+        let login_guard = Arc::clone(&self.state.lock().await.provider_login);
+        match release_provider_login(&login_guard, &login_id) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(rejection) => {
+                self.broadcast(ServerMessage::Error {
+                    code: rejection.code.into(),
+                    message: rejection.message,
+                    fatal: rejection.fatal,
+                });
+                return;
+            }
+        }
+        if let Err(message) = result {
+            self.broadcast(ServerMessage::Rejected {
+                request_id,
+                code: "provider_login_failed".into(),
+                message,
+                fatal: false,
+            });
+            return;
+        }
+        let refresh = self.refresh_provider_sessions(&provider, None).await;
+        self.broadcast(ServerMessage::ProviderLoginFinished {
+            request_id,
+            login_id,
+            provider,
+        });
+        if let Err(rejection) = refresh {
+            self.broadcast(ServerMessage::Error {
+                code: rejection.code.into(),
+                message: rejection.message,
+                fatal: rejection.fatal,
+            });
+        }
+    }
+
+    async fn refresh_provider_sessions(
+        &self,
+        provider: &str,
+        base_url: Option<&str>,
+    ) -> std::result::Result<(), Rejection> {
+        let sessions = self
+            .state
+            .lock()
+            .await
+            .sessions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failure = None;
+        for host in sessions {
+            if let Err(rejection) = host
+                .refresh_provider(provider.into(), base_url.map(str::to_owned))
+                .await
+            {
+                failure.get_or_insert(rejection);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn broadcast(&self, message: ServerMessage) {
+        let _ = self.events.send(ServerFrame::new(message));
+    }
+
+    pub(crate) async fn register_provider(
+        &self,
+        selection: ProviderConfig,
+    ) -> std::result::Result<ReadyPayload, Rejection> {
+        let state = self.state.lock().await;
+        if !credential_is_configured(&selection, &state.store, &state.credentials)
+            .map_err(invalid_config)?
+        {
+            return Err(invalid_config(Error::Config(format!(
+                "provider `{}` is not configured on this gateway",
+                selection.provider
+            ))));
+        }
+        {
+            let mut current = state
+                .config
+                .lock()
+                .map_err(|_| internal("gateway configuration lock is poisoned"))?;
+            let next = current
+                .registering_provider(selection)
+                .map_err(invalid_config)?;
+            state.store.save(&next).map_err(internal)?;
+            *current = next;
+        }
+        let payload = gateway_ready(&state).await?;
+        let frame = ServerFrame::new(ServerMessage::Ready {
+            payload: payload.clone(),
+        });
+        let _ = self.events.send(frame);
+        Ok(payload)
+    }
+
+    pub(crate) async fn sessions(&self) -> std::result::Result<Vec<SessionRecord>, Rejection> {
+        let state = self.state.lock().await;
+        session_catalog(&state.checkpoints).await.map_err(internal)
+    }
+
+    pub(crate) async fn create_session(
+        &self,
+        workspace: &Path,
+    ) -> std::result::Result<HostHandle, Rejection> {
+        let mut state = self.state.lock().await;
+        state.ensure_capacity().await?;
+        let (default_agent, tls) = {
+            let config = state
+                .config
+                .lock()
+                .map_err(|_| internal("gateway configuration lock is poisoned"))?;
+            (
+                config
+                    .default_agent
+                    .clone()
+                    .unwrap_or_else(setup_agent_config),
+                config.tls.clone(),
+            )
+        };
+        let spec = ChatSpec::new(
+            workspace,
+            default_agent,
+            state.store.state_dir(),
+            tls.as_ref(),
+        )
+        .map_err(invalid_workspace)?;
+        let session_id = Uuid::new_v4().to_string();
+        let host = HostHandle::start(
+            state.store.clone(),
+            Arc::clone(&state.config),
+            spec,
+            Arc::clone(&state.credentials),
+            Arc::clone(&state.cron),
+            Arc::clone(&state.checkpoints),
+            Arc::clone(&state.catalog_lock),
+            session_id.clone(),
+            "horus-gateway",
+        )
+        .await
+        .map_err(internal)?;
+        state.sessions.insert(session_id, host.clone());
+        Ok(host)
+    }
+
+    pub(crate) async fn open_session(
+        &self,
+        session_id: &str,
+    ) -> std::result::Result<HostHandle, Rejection> {
+        let mut state = self.state.lock().await;
+        if let Some(host) = state.sessions.get(session_id) {
+            return Ok(host.clone());
+        }
+        state.ensure_capacity().await?;
+        let checkpoint = state
+            .checkpoints
+            .load(session_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(unknown_session)?;
+        let tls = state
+            .config
+            .lock()
+            .map_err(|_| internal("gateway configuration lock is poisoned"))?
+            .tls
+            .clone();
+        let spec =
+            ChatSpec::from_metadata(&checkpoint.metadata, state.store.state_dir(), tls.as_ref())
+                .map_err(invalid_config)?;
+        let workspace = spec.workspace_info();
+        let workspace_label = workspace.path.display().to_string();
+        if checkpoint.session_context.workspace_id.as_deref() != Some(workspace.id.as_str())
+            || checkpoint.session_context.workspace_label.as_deref()
+                != Some(workspace_label.as_str())
+        {
+            return Err(invalid_session_workspace());
+        }
+        let host = HostHandle::start(
+            state.store.clone(),
+            Arc::clone(&state.config),
+            spec,
+            Arc::clone(&state.credentials),
+            Arc::clone(&state.cron),
+            Arc::clone(&state.checkpoints),
+            Arc::clone(&state.catalog_lock),
+            session_id.into(),
+            "horus-gateway",
+        )
+        .await
+        .map_err(internal)?;
+        state.sessions.insert(session_id.into(), host.clone());
+        Ok(host)
+    }
+
+    pub(crate) async fn run_cron(
+        &self,
+        source_session_id: String,
+        task_id: String,
+    ) -> std::result::Result<(), Rejection> {
+        let mut state = self.state.lock().await;
+        let task = state
+            .cron
+            .task(&source_session_id, &task_id)
+            .map_err(invalid_cron)?;
+        let (_, input) = state.cron.task_input(&task.id).map_err(invalid_cron)?;
+        if let Err(rejection) = state.ensure_capacity().await {
+            state
+                .cron
+                .skip_run(&task.id, "the gateway active-chat limit was reached")
+                .map_err(internal)?;
+            return Err(rejection);
+        }
+        let checkpoint = state
+            .checkpoints
+            .load(&source_session_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(unknown_session)?;
+        let tls = state
+            .config
+            .lock()
+            .map_err(|_| internal("gateway configuration lock is poisoned"))?
+            .tls
+            .clone();
+        let spec =
+            ChatSpec::from_metadata(&checkpoint.metadata, state.store.state_dir(), tls.as_ref())
+                .map_err(invalid_config)?;
+        let workspace = spec.workspace_info();
+        let workspace_label = workspace.path.display().to_string();
+        if checkpoint.session_context.workspace_id.as_deref() != Some(workspace.id.as_str())
+            || checkpoint.session_context.workspace_label.as_deref()
+                != Some(workspace_label.as_str())
+        {
+            return Err(invalid_session_workspace());
+        }
+        let source_sequence = checkpoint.sequence;
+        let session_id = Uuid::new_v4().to_string();
+        let label = format!("cron · {}", task.id.get(..8).unwrap_or(&task.id));
+        let run = match state.cron.begin_run(&task.id).map_err(invalid_cron)? {
+            BeginRun::Started(run) => run,
+            BeginRun::Skipped => {
+                return Err(Rejection {
+                    code: "cron_overlap",
+                    message: format!("cron task {} is already running", task.id),
+                    fatal: false,
+                });
+            }
+        };
+        let checkpoint = cron_execution_checkpoint(&checkpoint, &session_id, &label);
+        if let Err(error) = state
+            .checkpoints
+            .fork(&source_session_id, source_sequence, &checkpoint)
+            .await
+        {
+            let message = error.to_string();
+            state
+                .cron
+                .finish_run(run, CronRunStatus::Failed, Some(message.clone()))
+                .map_err(internal)?;
+            return Err(internal(message));
+        }
+        if let Err(error) = state.cron.attach_execution_session(&run, &session_id) {
+            let message = error.to_string();
+            state
+                .cron
+                .finish_run(run, CronRunStatus::Failed, Some(message.clone()))
+                .map_err(internal)?;
+            hide_checkpoint(&state.checkpoints, &session_id)
+                .await
+                .map_err(internal)?;
+            return Err(invalid_cron(message));
+        }
+        let host = match HostHandle::start(
+            state.store.clone(),
+            Arc::clone(&state.config),
+            spec,
+            Arc::clone(&state.credentials),
+            Arc::clone(&state.cron),
+            Arc::clone(&state.checkpoints),
+            Arc::clone(&state.catalog_lock),
+            session_id.clone(),
+            &label,
+        )
+        .await
+        {
+            Ok(host) => host,
+            Err(error) => {
+                let message = error.to_string();
+                state
+                    .cron
+                    .finish_run(run, CronRunStatus::Failed, Some(message.clone()))
+                    .map_err(internal)?;
+                hide_checkpoint(&state.checkpoints, &session_id)
+                    .await
+                    .map_err(internal)?;
+                return Err(internal(message));
+            }
+        };
+        let cron = Arc::clone(&state.cron);
+        let checkpoints = Arc::clone(&state.checkpoints);
+        state.sessions.insert(session_id.clone(), host.clone());
+        drop(state);
+        match host.run_cron(run, input, &cron).await {
+            Ok(()) => {
+                let gateway = self.clone();
+                tokio::spawn(async move {
+                    host.wait_idle().await;
+                    gateway.state.lock().await.sessions.remove(&session_id);
+                });
+                Ok(())
+            }
+            Err(rejection) => {
+                let _ = host.stop_if_idle().await;
+                self.state.lock().await.sessions.remove(&session_id);
+                hide_checkpoint(&checkpoints, &session_id)
+                    .await
+                    .map_err(internal)?;
+                Err(rejection)
+            }
+        }
+    }
+
+    pub(crate) async fn profile(&self) -> std::result::Result<ProfileSnapshot, Rejection> {
+        let state = self.state.lock().await;
+        let profile = state
+            .config
+            .lock()
+            .map_err(|_| internal("gateway configuration lock is poisoned"))?
+            .profile();
+        Ok(profile)
+    }
+}
+
+impl GatewayState {
+    async fn ensure_capacity(&mut self) -> std::result::Result<(), Rejection> {
+        if self.sessions.len() < MAX_ACTIVE_SESSIONS {
+            return Ok(());
+        }
+        let candidates = self
+            .sessions
+            .iter()
+            .filter(|(_, host)| host.is_unreferenced())
+            .map(|(id, host)| (id.clone(), host.clone()))
+            .collect::<Vec<_>>();
+        for (id, host) in candidates {
+            if host.stop_if_idle().await {
+                self.sessions.remove(&id);
+                if self.sessions.len() < MAX_ACTIVE_SESSIONS {
+                    return Ok(());
+                }
+            }
+        }
+        Err(Rejection {
+            code: "session_limit",
+            message: format!(
+                "this gateway already has {MAX_ACTIVE_SESSIONS} connected or running chats"
+            ),
+            fatal: false,
+        })
+    }
+}
+
+impl HostHandle {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one chat actor receives each owned gateway dependency explicitly"
+    )]
+    pub(crate) async fn start(
+        store: ConfigStore,
+        gateway: Arc<StdMutex<GatewayConfig>>,
+        spec: ChatSpec,
+        credentials: Arc<CredentialStore>,
+        cron: Arc<CronStore>,
+        checkpoints: Arc<dyn CheckpointStore>,
+        catalog_lock: Arc<Mutex<()>>,
+        session_id: String,
+        origin_label: &str,
+    ) -> Result<Self> {
+        let gateway_config = gateway
+            .lock()
+            .map_err(|_| Error::Config("gateway configuration lock is poisoned".into()))?
+            .clone();
         let running = start_agent(
-            &config,
+            &gateway_config,
+            &spec,
             &store,
             Arc::clone(&credentials),
+            Arc::clone(&cron),
             Arc::clone(&checkpoints),
-            None,
-            "horus-gateway",
+            session_id.clone(),
+            origin_label,
+            false,
         )
         .await?;
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
         let state = HostState {
             store,
-            config,
+            gateway,
+            spec,
             credentials,
             cron,
             checkpoints,
+            catalog_lock,
             running,
             pending_turns: 0,
             approval_active: false,
             restart_after_turn: false,
-            provider_login: None,
             suppress_history_broadcast: false,
             pending_startup: Vec::new(),
             active_cron: None,
@@ -219,15 +744,26 @@ impl HostHandle {
             replay: VecDeque::with_capacity(REPLAY_CAPACITY),
             artifacts: VecDeque::with_capacity(ARTIFACT_CAPACITY),
             commands: receiver,
-            command_sender: commands.downgrade(),
             events: events.clone(),
+            idle_waiters: Vec::new(),
         };
         tokio::spawn(state.run());
-        Ok(Self { commands, events })
+        Ok(Self {
+            inner: Arc::new(HostInner {
+                session_id: session_id.into(),
+                commands,
+                events,
+            }),
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn session_id(&self) -> &str {
+        &self.inner.session_id
     }
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<ServerFrame> {
-        self.events.subscribe()
+        self.inner.events.subscribe()
     }
 
     pub(crate) async fn snapshot(
@@ -240,16 +776,6 @@ impl HostHandle {
             reply,
         })
         .await?;
-        receive(receiver).await
-    }
-
-    pub(crate) async fn open_session(
-        &self,
-        session_id: Option<String>,
-    ) -> std::result::Result<(), Rejection> {
-        let (reply, receiver) = oneshot::channel();
-        self.send(HostCommand::OpenSession { session_id, reply })
-            .await?;
         receive(receiver).await
     }
 
@@ -302,6 +828,16 @@ impl HostHandle {
         receive(receiver).await
     }
 
+    pub(crate) async fn start_cron_setup(
+        &self,
+        task: Option<String>,
+    ) -> std::result::Result<(), Rejection> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(HostCommand::StartCronSetup { task, reply })
+            .await?;
+        receive(receiver).await
+    }
+
     pub(crate) async fn configure(
         &self,
         expected_revision: u64,
@@ -317,9 +853,9 @@ impl HostHandle {
         receive(receiver).await
     }
 
-    pub(crate) async fn set_workspace(&self, path: PathBuf) -> std::result::Result<(), Rejection> {
+    pub(crate) async fn set_model(&self, route: String) -> std::result::Result<(), Rejection> {
         let (reply, receiver) = oneshot::channel();
-        self.send(HostCommand::SetWorkspace { path, reply }).await?;
+        self.send(HostCommand::SetModel { route, reply }).await?;
         receive(receiver).await
     }
 
@@ -329,42 +865,19 @@ impl HostHandle {
         receiver.await.map_err(|_| stopped())?
     }
 
-    pub(crate) async fn set_credential(
+    async fn refresh_provider(
         &self,
         provider: String,
-        api_key: String,
         base_url: Option<String>,
     ) -> std::result::Result<(), Rejection> {
         let (reply, receiver) = oneshot::channel();
-        self.send(HostCommand::SetCredential {
+        self.send(HostCommand::RefreshProvider {
             provider,
-            api_key,
             base_url,
             reply,
         })
         .await?;
         receive(receiver).await
-    }
-
-    pub(crate) async fn start_provider_login(
-        &self,
-        request_id: String,
-        provider: String,
-    ) -> std::result::Result<(), Rejection> {
-        let (reply, receiver) = oneshot::channel();
-        self.send(HostCommand::StartProviderLogin {
-            request_id,
-            provider,
-            reply,
-        })
-        .await?;
-        receive(receiver).await
-    }
-
-    pub(crate) async fn profile(&self) -> std::result::Result<ProfileSnapshot, Rejection> {
-        let (reply, receiver) = oneshot::channel();
-        self.send(HostCommand::Profile { reply }).await?;
-        receiver.await.map_err(|_| stopped())
     }
 
     pub(crate) async fn artifacts(&self) -> std::result::Result<Vec<ArtifactRecord>, Rejection> {
@@ -373,14 +886,58 @@ impl HostHandle {
         receiver.await.map_err(|_| stopped())
     }
 
-    pub(crate) async fn run_cron(&self, id: String) -> std::result::Result<(), Rejection> {
+    pub(crate) async fn run_cron(
+        &self,
+        run: ActiveCronRun,
+        input: String,
+        cron: &CronStore,
+    ) -> std::result::Result<(), Rejection> {
         let (reply, receiver) = oneshot::channel();
-        self.send(HostCommand::RunCron { id, reply }).await?;
+        if let Err(error) = self
+            .inner
+            .commands
+            .send(HostCommand::RunCron { run, input, reply })
+            .await
+        {
+            let HostCommand::RunCron { run, .. } = error.0 else {
+                unreachable!("only a cron command was sent")
+            };
+            cron.finish_run(
+                run,
+                CronRunStatus::Failed,
+                Some("the agent stopped before the scheduled run began".into()),
+            )
+            .map_err(internal)?;
+            return Err(stopped());
+        }
         receive(receiver).await
     }
 
+    async fn wait_idle(&self) {
+        let (reply, receiver) = oneshot::channel();
+        if self.send(HostCommand::WaitIdle { reply }).await.is_ok() {
+            let _ = receiver.await;
+        }
+    }
+
+    fn is_unreferenced(&self) -> bool {
+        Arc::strong_count(&self.inner) == 1
+    }
+
+    async fn stop_if_idle(&self) -> bool {
+        let (reply, receiver) = oneshot::channel();
+        if self.send(HostCommand::StopIfIdle { reply }).await.is_err() {
+            return true;
+        }
+        receiver.await.unwrap_or(true)
+    }
+
     async fn send(&self, command: HostCommand) -> std::result::Result<(), Rejection> {
-        self.commands.send(command).await.map_err(|_| stopped())
+        self.inner
+            .commands
+            .send(command)
+            .await
+            .map_err(|_| stopped())
     }
 }
 
@@ -392,7 +949,11 @@ impl HostState {
                 event = self.running.events.recv() => Next::Event(event),
             };
             match next {
-                Next::Command(Some(command)) => self.handle(command).await,
+                Next::Command(Some(command)) => {
+                    if !self.handle(command).await {
+                        break;
+                    }
+                }
                 Next::Command(None) => break,
                 Next::Event(Some(event)) => {
                     if let Err(error) = self.forward_event(event).await {
@@ -413,20 +974,31 @@ impl HostState {
                 }
             }
         }
+        if let Err(error) = fail_active_cron(
+            &self.cron,
+            &mut self.active_cron,
+            "the agent stopped before the scheduled run completed",
+        ) {
+            self.broadcast(ServerMessage::Error {
+                code: "cron_state_error".into(),
+                message: error.to_string(),
+                fatal: false,
+            });
+        }
+        for waiter in self.idle_waiters.drain(..) {
+            let _ = waiter.send(());
+        }
+        self.cron.cancel_setup(&self.running.session_id);
         shutdown_agent(self.running).await;
     }
 
-    async fn handle(&mut self, command: HostCommand) {
+    async fn handle(&mut self, command: HostCommand) -> bool {
         match command {
             HostCommand::Snapshot {
                 last_sequence,
                 reply,
             } => {
                 let _ = reply.send(self.snapshot_value(last_sequence).await);
-            }
-            HostCommand::OpenSession { session_id, reply } => {
-                let result = self.open_session(session_id).await;
-                let _ = reply.send(result);
             }
             HostCommand::RenameSession {
                 session_id,
@@ -452,6 +1024,10 @@ impl HostState {
                 let result = self.submit(submission, false);
                 let _ = reply.send(result);
             }
+            HostCommand::StartCronSetup { task, reply } => {
+                let result = self.start_cron_setup(task);
+                let _ = reply.send(result);
+            }
             HostCommand::Configure {
                 expected_revision,
                 config,
@@ -460,54 +1036,44 @@ impl HostState {
                 let result = self.configure(expected_revision, config).await;
                 let _ = reply.send(result);
             }
-            HostCommand::SetWorkspace { path, reply } => {
-                let result = self.set_workspace(path).await;
+            HostCommand::SetModel { route, reply } => {
+                let result = self.set_model(&route).await;
                 let _ = reply.send(result);
             }
             HostCommand::GitDiff { reply } => {
                 let _ = reply.send(
-                    workspace_git_diff(&self.running.gateway_sandbox, &self.config.workspace).await,
+                    workspace_git_diff(&self.running.gateway_sandbox, &self.spec.workspace).await,
                 );
             }
-            HostCommand::SetCredential {
+            HostCommand::RefreshProvider {
                 provider,
-                api_key,
                 base_url,
                 reply,
             } => {
-                let result = self
-                    .set_credential(&provider, &api_key, base_url.as_deref())
-                    .await;
+                let result = self.refresh_provider(&provider, base_url.as_deref()).await;
                 let _ = reply.send(result);
-            }
-            HostCommand::StartProviderLogin {
-                request_id,
-                provider,
-                reply,
-            } => {
-                let result = self.start_provider_login(request_id, provider).await;
-                let _ = reply.send(result);
-            }
-            HostCommand::ProviderLoginCompleted {
-                request_id,
-                login_id,
-                provider,
-                result,
-            } => {
-                self.finish_provider_login(request_id, login_id, provider, result)
-                    .await;
-            }
-            HostCommand::Profile { reply } => {
-                let _ = reply.send(self.config.profile());
             }
             HostCommand::Artifacts { reply } => {
                 let _ = reply.send(self.artifacts.iter().cloned().collect());
             }
-            HostCommand::RunCron { id, reply } => {
-                let result = self.run_cron(&id).await;
+            HostCommand::RunCron { run, input, reply } => {
+                let result = self.run_cron(run, input);
                 let _ = reply.send(result);
             }
+            HostCommand::WaitIdle { reply } => {
+                if self.is_idle() {
+                    let _ = reply.send(());
+                } else {
+                    self.idle_waiters.push(reply);
+                }
+            }
+            HostCommand::StopIfIdle { reply } => {
+                let idle = self.is_idle();
+                let _ = reply.send(idle);
+                return !idle;
+            }
         }
+        true
     }
 
     async fn snapshot_value(
@@ -551,34 +1117,6 @@ impl HostState {
             .collect())
     }
 
-    async fn open_session(
-        &mut self,
-        session_id: Option<String>,
-    ) -> std::result::Result<(), Rejection> {
-        self.require_idle()?;
-        if let Some(session_id) = session_id.as_deref() {
-            let checkpoint = self
-                .checkpoints
-                .load(session_id)
-                .await
-                .map_err(internal)?
-                .ok_or_else(|| Rejection {
-                    code: "unknown_session",
-                    message: "the requested session does not exist".into(),
-                    fatal: false,
-                })?;
-            let current_workspace = self.config.workspace_info();
-            if checkpoint.session_context.workspace_id.as_deref()
-                != Some(current_workspace.id.as_str())
-            {
-                return Err(invalid_session_workspace());
-            }
-        }
-        self.restart(session_id, "horus-gateway").await?;
-        self.broadcast_ready().await?;
-        Ok(())
-    }
-
     async fn rename_session(
         &mut self,
         session_id: &str,
@@ -586,6 +1124,7 @@ impl HostState {
     ) -> std::result::Result<(), Rejection> {
         self.require_session(session_id).await?;
         let title = validate_session_title(title)?;
+        let _catalog = self.catalog_lock.lock().await;
         let mut metadata = load_session_metadata(&self.checkpoints)
             .await
             .map_err(internal)?;
@@ -602,6 +1141,7 @@ impl HostState {
         pinned: bool,
     ) -> std::result::Result<(), Rejection> {
         self.require_session(session_id).await?;
+        let _catalog = self.catalog_lock.lock().await;
         let mut metadata = load_session_metadata(&self.checkpoints)
             .await
             .map_err(internal)?;
@@ -614,13 +1154,10 @@ impl HostState {
 
     async fn delete_session(&mut self, session_id: &str) -> std::result::Result<(), Rejection> {
         if session_id == self.running.session_id {
-            return Err(Rejection {
-                code: "active_session",
-                message: "open another chat before deleting this one".into(),
-                fatal: false,
-            });
+            self.require_idle()?;
         }
         self.require_session(session_id).await?;
+        let _catalog = self.catalog_lock.lock().await;
         let mut metadata = load_session_metadata(&self.checkpoints)
             .await
             .map_err(internal)?;
@@ -648,60 +1185,26 @@ impl HostState {
         Ok(())
     }
 
-    async fn run_cron(&mut self, id: &str) -> std::result::Result<(), Rejection> {
-        let task = self.cron.task(id).map_err(invalid_cron)?;
+    fn run_cron(
+        &mut self,
+        run: ActiveCronRun,
+        input: String,
+    ) -> std::result::Result<(), Rejection> {
         if let Err(rejection) = self.require_idle() {
             self.cron
-                .skip_run(
-                    &task.id,
-                    "the agent was busy when this invocation became due",
+                .finish_run(
+                    run,
+                    CronRunStatus::Failed,
+                    Some("the agent was busy when this invocation became due".into()),
                 )
                 .map_err(internal)?;
             return Err(rejection);
-        }
-        let run = match self.cron.begin_run(&task.id).map_err(invalid_cron)? {
-            BeginRun::Started(run) => run,
-            BeginRun::Skipped => {
-                return Err(Rejection {
-                    code: "cron_overlap",
-                    message: format!("cron task {} is already running", task.id),
-                    fatal: false,
-                });
-            }
-        };
-        let (_, input) = match self.cron.task_input(&task.id) {
-            Ok(task) => task,
-            Err(error) => {
-                let message = error.to_string();
-                self.cron
-                    .finish_run(run, CronRunStatus::Failed, Some(message.clone()))
-                    .map_err(internal)?;
-                return Err(invalid_cron(message));
-            }
-        };
-        let return_session_id = self.running.session_id.clone();
-        let label = format!("cron · {}", task.id.get(..8).unwrap_or(&task.id));
-        if let Err(rejection) = self.restart(None, &label).await {
-            self.cron
-                .finish_run(run, CronRunStatus::Failed, Some(rejection.message.clone()))
-                .map_err(internal)?;
-            return Err(rejection);
-        }
-        if let Err(error) = self.cron.attach_session(&run, &self.running.session_id) {
-            let message = error.to_string();
-            self.cron
-                .finish_run(run, CronRunStatus::Failed, Some(message.clone()))
-                .map_err(internal)?;
-            self.restore_after_failed_cron_start(return_session_id)
-                .await;
-            return Err(internal(message));
         }
         let submission_id = Uuid::new_v4().to_string();
         self.active_cron = Some(ActiveCron {
             run,
             submission_id: submission_id.clone(),
             turn_id: None,
-            return_session_id,
             failure: None,
         });
         let submission = Submission {
@@ -717,22 +1220,9 @@ impl HostState {
                     Some(rejection.message.clone()),
                 )
                 .map_err(internal)?;
-            self.restore_after_failed_cron_start(active.return_session_id)
-                .await;
             return Err(rejection);
         }
-        self.broadcast_ready().await?;
         Ok(())
-    }
-
-    async fn restore_after_failed_cron_start(&mut self, session_id: String) {
-        if self
-            .restart(Some(session_id), "horus-gateway")
-            .await
-            .is_ok()
-        {
-            let _ = self.broadcast_ready().await;
-        }
     }
 
     fn submit(
@@ -768,38 +1258,68 @@ impl HostState {
         Ok(())
     }
 
+    fn start_cron_setup(&mut self, task: Option<String>) -> std::result::Result<(), Rejection> {
+        self.require_idle()?;
+        let input = self
+            .cron
+            .begin_setup(&self.running.session_id, task.as_deref())
+            .map_err(invalid_cron)?;
+        let submission = Submission {
+            id: Uuid::new_v4().to_string(),
+            op: Op::UserInput { text: input },
+        };
+        if let Err(rejection) = self.submit(submission, false) {
+            self.cron.cancel_setup(&self.running.session_id);
+            return Err(rejection);
+        }
+        Ok(())
+    }
+
     async fn configure(
         &mut self,
         expected_revision: u64,
         composition: AgentComposition,
     ) -> std::result::Result<(), Rejection> {
         self.require_idle()?;
-        if expected_revision != self.config.agent.revision {
+        if expected_revision != self.spec.agent.revision {
             return Err(Rejection {
                 code: "revision_conflict",
-                message: format!(
-                    "configuration revision is now {}",
-                    self.config.agent.revision
-                ),
+                message: format!("configuration revision is now {}", self.spec.agent.revision),
                 fatal: false,
             });
         }
         let next = self
-            .config
-            .replacing_agent(expected_revision, composition)
+            .spec
+            .replacing_agent(
+                expected_revision,
+                composition,
+                self.store.state_dir(),
+                self.gateway
+                    .lock()
+                    .map_err(|_| internal("gateway configuration lock is poisoned"))?
+                    .tls
+                    .as_ref(),
+            )
             .map_err(invalid_config)?;
         let session_id = self.running.session_id.clone();
+        let gateway = self
+            .gateway
+            .lock()
+            .map_err(|_| internal("gateway configuration lock is poisoned"))?
+            .clone();
         let replacement = start_agent(
+            &gateway,
             &next,
             &self.store,
             Arc::clone(&self.credentials),
+            Arc::clone(&self.cron),
             Arc::clone(&self.checkpoints),
-            Some(session_id),
+            session_id,
             "horus-gateway",
+            true,
         )
         .await
         .map_err(internal)?;
-        self.store.save(&next).map_err(internal)?;
         let suppress_history_broadcast = reset_replay_for_restart(
             &mut self.replay,
             &self.running.session_id,
@@ -807,237 +1327,68 @@ impl HostState {
         );
         let previous = std::mem::replace(&mut self.running, replacement);
         self.suppress_history_broadcast = suppress_history_broadcast;
-        self.config = next;
+        self.spec = next;
         shutdown_agent(previous).await;
         if suppress_history_broadcast {
             self.record_replacement_startup().map_err(internal)?;
         }
-        self.broadcast(ServerMessage::ConfigChanged {
-            snapshot: self.config.agent.clone(),
-        });
-        self.broadcast_ready().await?;
+        self.broadcast_changed().await?;
         Ok(())
     }
 
-    async fn set_workspace(&mut self, path: PathBuf) -> std::result::Result<(), Rejection> {
+    async fn set_model(&mut self, route: &str) -> std::result::Result<(), Rejection> {
         self.require_idle()?;
-        let next = self
-            .store
-            .replacing_workspace(&self.config, &path)
-            .map_err(invalid_workspace)?;
-        if next.workspace == self.config.workspace {
-            self.broadcast_ready().await?;
+        let gateway = self
+            .gateway
+            .lock()
+            .map_err(|_| internal("gateway configuration lock is poisoned"))?
+            .clone();
+        let provider =
+            configured_provider_for_route(&gateway, &self.store, &self.credentials, route)
+                .map_err(invalid_config)?;
+        if self.running.session.model.route == route && self.spec.agent.config.provider == provider
+        {
             return Ok(());
         }
-        self.switch_workspace(next, None).await?;
-        self.broadcast_ready().await?;
-        Ok(())
+        let mut composition = self.spec.agent.config.clone();
+        composition.provider = provider;
+        self.configure(self.spec.agent.revision, composition).await
     }
 
-    async fn switch_workspace(
-        &mut self,
-        next: GatewayConfig,
-        session_id: Option<String>,
-    ) -> std::result::Result<(), Rejection> {
-        if !self.cron.list().map_err(internal)?.is_empty() {
-            return Err(Rejection {
-                code: "workspace_has_cron",
-                message: "delete all cron tasks before changing the workspace".into(),
-                fatal: false,
-            });
-        }
-        let replacement = start_agent(
-            &next,
-            &self.store,
-            Arc::clone(&self.credentials),
-            Arc::clone(&self.checkpoints),
-            session_id,
-            "horus-gateway",
-        )
-        .await
-        .map_err(internal)?;
-        if let Err(error) = self.store.save(&next) {
-            shutdown_agent(replacement).await;
-            return Err(internal(error));
-        }
-        if let Err(error) = self.cron.set_workspace(&next.workspace) {
-            let message = match self.store.save(&self.config) {
-                Ok(()) => error.to_string(),
-                Err(rollback) => format!(
-                    "{error}; restoring the previous gateway configuration failed: {rollback}"
-                ),
-            };
-            shutdown_agent(replacement).await;
-            return Err(invalid_workspace(message));
-        }
-        reset_replay_for_restart(
-            &mut self.replay,
-            &self.running.session_id,
-            &replacement.session_id,
-        );
-        let previous = std::mem::replace(&mut self.running, replacement);
-        self.config = next;
-        self.suppress_history_broadcast = false;
-        self.pending_startup.clear();
-        self.artifacts.clear();
-        shutdown_agent(previous).await;
-        Ok(())
-    }
-
-    async fn set_credential(
+    async fn refresh_provider(
         &mut self,
         provider_id: &str,
-        api_key: &str,
         base_url: Option<&str>,
     ) -> std::result::Result<(), Rejection> {
-        self.require_idle()?;
-        let definition = provider(provider_id).map_err(invalid_config)?;
-        let base_url = base_url.or_else(|| {
-            if !definition.configurable_base_url() {
-                return None;
-            }
-            if self.config.agent.config.provider.provider == provider_id {
-                self.config.agent.config.provider.base_url.as_deref()
-            } else {
-                None
-            }
-            .or_else(|| definition.default_base_url())
-        });
-        definition
-            .validate_base_url(base_url)
-            .map_err(invalid_config)?;
-        let active = &self.config.agent.config.provider;
-        let active_base_url = if definition.configurable_base_url() {
-            active
-                .base_url
-                .as_deref()
-                .or_else(|| definition.default_base_url())
-        } else {
-            None
-        };
-        let restart = active.provider == provider_id && active_base_url == base_url;
-        self.credentials
-            .set(provider_id, api_key, base_url)
-            .map_err(invalid_config)?;
-        if restart {
-            let session_id = Some(self.running.session_id.clone());
-            self.restart(session_id, "horus-gateway").await?;
-        }
-        self.broadcast_ready().await?;
-        Ok(())
-    }
-
-    async fn start_provider_login(
-        &mut self,
-        request_id: String,
-        provider_id: String,
-    ) -> std::result::Result<(), Rejection> {
-        ensure_provider_login_available(self.provider_login.as_deref())?;
-        let definition = provider(&provider_id).map_err(invalid_config)?;
-        let ProviderAuth::Browser(auth) = definition.auth() else {
-            return Err(Rejection {
-                code: "invalid_provider_auth",
-                message: "the selected provider uses an API key".into(),
-                fatal: false,
-            });
-        };
-        if !auth.supports_device_login() {
-            return Err(Rejection {
-                code: "device_login_unavailable",
-                message: "the selected provider does not support device-code login".into(),
-                fatal: false,
-            });
-        }
-        let login = auth.start_device().await.map_err(internal)?;
-        let login_id = Uuid::new_v4().to_string();
-        self.provider_login = Some(login_id.clone());
-        self.broadcast(ServerMessage::ProviderLoginStarted {
-            request_id: request_id.clone(),
-            login_id: login_id.clone(),
-            provider: provider_id.clone(),
-            verification_url: login.verification_url().into(),
-            user_code: login.user_code().into(),
-        });
-        let path = self.store.provider_auth_path();
-        let commands = self.command_sender.clone();
-        tokio::spawn(async move {
-            let result = login
-                .complete(path)
-                .await
-                .map_err(|error| error.to_string());
-            if let Some(commands) = commands.upgrade() {
-                let _ = commands
-                    .send(HostCommand::ProviderLoginCompleted {
-                        request_id,
-                        login_id,
-                        provider: provider_id,
-                        result,
-                    })
-                    .await;
-            }
-        });
-        Ok(())
-    }
-
-    async fn finish_provider_login(
-        &mut self,
-        request_id: String,
-        login_id: String,
-        provider: String,
-        result: std::result::Result<(), String>,
-    ) {
-        if self.provider_login.as_deref() != Some(login_id.as_str()) {
-            return;
-        }
-        self.provider_login = None;
-        if let Err(message) = result {
-            self.broadcast(ServerMessage::Rejected {
-                request_id,
-                code: "provider_login_failed".into(),
-                message,
-                fatal: false,
-            });
-            return;
-        }
-        self.broadcast(ServerMessage::ProviderLoginFinished {
-            request_id,
-            login_id,
-            provider: provider.clone(),
-        });
-        if self.config.agent.config.provider.provider != provider {
-            let _ = self.broadcast_ready().await;
-            return;
+        if !provider_credential_matches(&self.spec.agent.config.provider, provider_id, base_url)
+            .map_err(invalid_config)?
+        {
+            return Ok(());
         }
         if self.pending_turns > 0 || self.approval_active {
             self.restart_after_turn = true;
-            return;
+            return Ok(());
         }
-        if let Err(rejection) = self
-            .restart(Some(self.running.session_id.clone()), "horus-gateway")
-            .await
-        {
-            self.broadcast(ServerMessage::Error {
-                code: rejection.code.into(),
-                message: rejection.message,
-                fatal: rejection.fatal,
-            });
-            return;
-        }
-        let _ = self.broadcast_ready().await;
+        self.restart("horus-gateway").await?;
+        self.broadcast_changed().await
     }
 
-    async fn restart(
-        &mut self,
-        session_id: Option<String>,
-        origin_label: &str,
-    ) -> std::result::Result<(), Rejection> {
+    async fn restart(&mut self, origin_label: &str) -> std::result::Result<(), Rejection> {
+        let gateway = self
+            .gateway
+            .lock()
+            .map_err(|_| internal("gateway configuration lock is poisoned"))?
+            .clone();
         let replacement = start_agent(
-            &self.config,
+            &gateway,
+            &self.spec,
             &self.store,
             Arc::clone(&self.credentials),
+            Arc::clone(&self.cron),
             Arc::clone(&self.checkpoints),
-            session_id,
+            self.running.session_id.clone(),
             origin_label,
+            false,
         )
         .await
         .map_err(internal)?;
@@ -1092,9 +1443,14 @@ impl HostState {
         }
         match &event.msg {
             EventMsg::ExecApprovalRequest(_) => self.approval_active = true,
-            EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) => {
+            EventMsg::TurnComplete(_) => {
                 self.pending_turns = self.pending_turns.saturating_sub(1);
                 self.approval_active = false;
+            }
+            EventMsg::TurnAborted(_) => {
+                self.pending_turns = self.pending_turns.saturating_sub(1);
+                self.approval_active = false;
+                self.cron.cancel_setup(&self.running.session_id);
             }
             _ => {}
         }
@@ -1107,21 +1463,19 @@ impl HostState {
                 .map_err(|rejection| Error::Config(rejection.message))?;
             if let Some((active, status, message)) = cron_completion {
                 self.cron.finish_run(active.run, status, message)?;
-                self.restart_after_turn = false;
-                self.restart(Some(active.return_session_id), "horus-gateway")
-                    .await
-                    .map_err(|rejection| Error::Config(rejection.message))?;
-                self.broadcast_ready()
-                    .await
-                    .map_err(|rejection| Error::Config(rejection.message))?;
             } else if self.restart_after_turn {
                 self.restart_after_turn = false;
-                self.restart(Some(self.running.session_id.clone()), "horus-gateway")
+                self.restart("horus-gateway")
                     .await
                     .map_err(|rejection| Error::Config(rejection.message))?;
-                self.broadcast_ready()
+                self.broadcast_changed()
                     .await
                     .map_err(|rejection| Error::Config(rejection.message))?;
+            }
+            if !self.approval_active && self.active_cron.is_none() {
+                for waiter in self.idle_waiters.drain(..) {
+                    let _ = waiter.send(());
+                }
             }
         }
         Ok(())
@@ -1135,13 +1489,18 @@ impl HostState {
     ) -> Result<ServerFrame> {
         if let EventMsg::TokenCount(count) = &event.msg
             && let Some(info) = &count.info
-            && self.config.observe_usage(
+        {
+            let mut gateway = self
+                .gateway
+                .lock()
+                .map_err(|_| Error::Config("gateway configuration lock is poisoned".into()))?;
+            if gateway.observe_usage(
                 &self.running.session_id,
                 &info.total_token_usage,
                 was_active,
-            )?
-        {
-            self.store.save(&self.config)?;
+            )? {
+                self.store.save(&gateway)?;
+            }
         }
         let blocks = self.running.frontend.render(&event.msg);
         self.record_artifacts(&blocks);
@@ -1157,6 +1516,7 @@ impl HostState {
             .checked_add(1)
             .ok_or_else(|| Error::Config("event sequence overflow".into()))?;
         let frame = ServerFrame::new(ServerMessage::AgentEvent {
+            session_id: self.running.session_id.clone(),
             sequence: self.sequence,
             event,
             blocks,
@@ -1247,36 +1607,31 @@ impl HostState {
         }
     }
 
-    async fn ready(&self) -> Result<ReadyPayload> {
-        let workspace = self.config.workspace_info();
-        let sessions = session_catalog(&self.checkpoints, &workspace.id).await?;
-        Ok(ReadyPayload {
+    async fn ready(&self) -> Result<SessionReadyPayload> {
+        Ok(SessionReadyPayload {
             latest_sequence: self.sequence,
-            workspace,
+            workspace: self.spec.workspace_info(),
             git: git_status(&self.running.gateway_sandbox).await,
             session: self.running.session.clone(),
-            sessions,
-            model_choices: self.running.model_choices.clone(),
             contributions: self.running.frontend.contributions().to_vec(),
-            config: self.config.agent.clone(),
-            providers: provider_statuses(&self.store, &self.credentials)?,
+            config: self.spec.agent.clone(),
         })
     }
 
-    async fn broadcast_ready(&mut self) -> std::result::Result<(), Rejection> {
+    async fn broadcast_changed(&mut self) -> std::result::Result<(), Rejection> {
         let payload = self.ready().await.map_err(internal)?;
-        let ready = ServerFrame::new(ServerMessage::Ready { payload });
+        let ready = ServerFrame::new(ServerMessage::SessionChanged { payload });
         let pending = std::mem::take(&mut self.pending_startup);
         publish_ready_and_pending(&self.events, ready, pending);
         Ok(())
     }
 
     async fn broadcast_sessions(&self) -> std::result::Result<(), Rejection> {
-        let workspace = self.config.workspace_info();
-        let sessions = session_catalog(&self.checkpoints, &workspace.id)
-            .await
-            .map_err(internal)?;
-        self.broadcast(ServerMessage::Sessions { sessions });
+        let sessions = session_catalog(&self.checkpoints).await.map_err(internal)?;
+        self.broadcast(ServerMessage::Sessions {
+            request_id: None,
+            sessions,
+        });
         Ok(())
     }
 
@@ -1295,31 +1650,102 @@ impl HostState {
             Ok(())
         }
     }
+
+    fn is_idle(&self) -> bool {
+        self.pending_turns == 0 && !self.approval_active && self.active_cron.is_none()
+    }
 }
 
+fn provider_credential_matches(
+    selection: &ProviderConfig,
+    provider_id: &str,
+    base_url: Option<&str>,
+) -> Result<bool> {
+    if selection.provider != provider_id {
+        return Ok(false);
+    }
+    let definition = provider(provider_id)?;
+    let selected_base_url = definition
+        .configurable_base_url()
+        .then(|| {
+            selection
+                .base_url
+                .as_deref()
+                .or_else(|| definition.default_base_url())
+        })
+        .flatten();
+    Ok(selected_base_url == base_url)
+}
+
+fn fail_active_cron(
+    cron: &CronStore,
+    active: &mut Option<ActiveCron>,
+    message: &str,
+) -> Result<()> {
+    let Some(active) = active.take() else {
+        return Ok(());
+    };
+    cron.finish_run(active.run, CronRunStatus::Failed, Some(message.to_string()))
+        .map(|_| ())
+}
+
+async fn gateway_ready(state: &GatewayState) -> std::result::Result<ReadyPayload, Rejection> {
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| internal("gateway configuration lock is poisoned"))?
+        .clone();
+    Ok(ReadyPayload {
+        sessions: session_catalog(&state.checkpoints)
+            .await
+            .map_err(internal)?,
+        providers: provider_statuses(&state.store, &state.credentials).map_err(internal)?,
+        models: configured_model_choices(&config, &state.store, &state.credentials)
+            .map_err(internal)?,
+        default_config: config.default_agent,
+        max_active_sessions: MAX_ACTIVE_SESSIONS,
+    })
+}
+
+fn setup_agent_config() -> VersionedAgentConfig {
+    VersionedAgentConfig {
+        revision: 1,
+        config: AgentComposition::default(),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "agent assembly keeps chat and gateway dependencies explicit"
+)]
 async fn start_agent(
-    config: &GatewayConfig,
+    gateway: &GatewayConfig,
+    spec: &ChatSpec,
     store: &ConfigStore,
     credentials: Arc<CredentialStore>,
+    cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
-    session_id: Option<String>,
+    session_id: String,
     origin_label: &str,
+    override_saved_model_route: bool,
 ) -> Result<RunningAgent> {
     let BuiltAgent {
         agent,
         gateway_sandbox,
         subagent_template,
     } = assemble(
-        config,
+        gateway,
+        spec,
         store,
         credentials,
+        cron,
         checkpoints,
-        session_id,
+        Some(session_id),
         origin_label,
+        override_saved_model_route,
     )
     .await?;
     let session = agent.session().clone();
-    let model_choices = agent.model_choices().to_vec();
     let frontend = agent.frontend().clone();
     let session_id = session.session_id.clone();
     let (sender, events) = agent.into_parts();
@@ -1329,7 +1755,6 @@ async fn start_agent(
         events,
         frontend,
         session,
-        model_choices,
         gateway_sandbox,
         subagent_template,
     })
@@ -1347,27 +1772,55 @@ async fn shutdown_agent(agent: RunningAgent) {
     drop(subagent_template);
 }
 
-async fn session_catalog(
-    checkpoints: &Arc<dyn CheckpointStore>,
-    workspace_id: &str,
-) -> Result<Vec<SessionRecord>> {
-    // ponytail: scan one global page; add store-side workspace filtering if foreign sessions
-    // can obscure older sessions from this workspace.
-    let page = checkpoints
-        .list_sessions_page(SessionPageRequest {
-            cursor: None,
-            limit: SESSION_PAGE_SIZE,
-        })
-        .await?;
-    let mut sessions = page
-        .sessions
-        .into_iter()
-        .filter(|session| {
-            session.catalog_visible
-                && (session.sequence > 0 || session.parent_session_id.is_some())
-                && session.session_context.workspace_id.as_deref() == Some(workspace_id)
-        })
-        .collect::<Vec<_>>();
+fn cron_execution_checkpoint(
+    source: &Checkpoint,
+    session_id: &str,
+    origin_label: &str,
+) -> Checkpoint {
+    let mut checkpoint = Checkpoint::empty(session_id);
+    checkpoint
+        .session_context
+        .clone_from(&source.session_context);
+    checkpoint.session_context.origin_label = Some(origin_label.into());
+    checkpoint.metadata.clone_from(&source.metadata);
+    checkpoint.model_route.clone_from(&source.model_route);
+    checkpoint
+}
+
+async fn hide_checkpoint(checkpoints: &Arc<dyn CheckpointStore>, session_id: &str) -> Result<()> {
+    let Some(mut checkpoint) = checkpoints.load(session_id).await? else {
+        return Ok(());
+    };
+    checkpoint.catalog_visible = false;
+    checkpoint.sequence = checkpoint
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| Error::Config("checkpoint sequence overflow".into()))?;
+    checkpoints.save(&checkpoint, &[]).await?;
+    Ok(())
+}
+
+async fn session_catalog(checkpoints: &Arc<dyn CheckpointStore>) -> Result<Vec<SessionRecord>> {
+    let mut cursor = None;
+    let mut sessions = Vec::new();
+    while sessions.len() < SESSION_PAGE_SIZE {
+        let page = checkpoints
+            .list_sessions_page(SessionPageRequest {
+                cursor,
+                limit: SESSION_PAGE_SIZE,
+            })
+            .await?;
+        sessions.extend(
+            page.sessions
+                .into_iter()
+                .filter(|session| session.catalog_visible),
+        );
+        let Some(next) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next);
+    }
+    sessions.truncate(SESSION_PAGE_SIZE);
     for session in &mut sessions {
         if let Some(message) = &mut session.first_user_message
             && message.len() > MAX_SESSION_PREVIEW_BYTES
@@ -1796,6 +2249,32 @@ fn ensure_provider_login_available(
     Ok(())
 }
 
+fn reserve_provider_login(
+    active_login: &StdMutex<Option<String>>,
+    login_id: &str,
+) -> std::result::Result<(), Rejection> {
+    let mut active_login = active_login
+        .lock()
+        .map_err(|_| internal("provider login lock is poisoned"))?;
+    ensure_provider_login_available(active_login.as_deref())?;
+    *active_login = Some(login_id.into());
+    Ok(())
+}
+
+fn release_provider_login(
+    active_login: &StdMutex<Option<String>>,
+    login_id: &str,
+) -> std::result::Result<bool, Rejection> {
+    let mut active_login = active_login
+        .lock()
+        .map_err(|_| internal("provider login lock is poisoned"))?;
+    if active_login.as_deref() != Some(login_id) {
+        return Ok(false);
+    }
+    *active_login = None;
+    Ok(true)
+}
+
 async fn receive<T>(
     receiver: oneshot::Receiver<std::result::Result<T, Rejection>>,
 ) -> std::result::Result<T, Rejection> {
@@ -1838,6 +2317,14 @@ fn invalid_session_workspace() -> Rejection {
     Rejection {
         code: "invalid_session_workspace",
         message: "the requested session belongs to another workspace".into(),
+        fatal: false,
+    }
+}
+
+fn unknown_session() -> Rejection {
+    Rejection {
+        code: "unknown_session",
+        message: "the requested chat does not exist".into(),
         fatal: false,
     }
 }
@@ -1897,8 +2384,6 @@ fn invalid_cron(error: impl std::fmt::Display) -> Rejection {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use horus::backend::checkpoint::Checkpoint;
 
     use super::*;
@@ -1924,31 +2409,97 @@ mod tests {
         (state, sandbox)
     }
 
-    async fn save_chat(
-        checkpoints: &SqliteCheckpoint,
-        session_id: &str,
-        workspace: crate::wire::WorkspaceInfo,
-    ) {
-        let mut checkpoint = Checkpoint::empty(session_id);
-        checkpoint.session_context.workspace_id = Some(workspace.id);
-        checkpoint.session_context.workspace_label = Some(workspace.label);
-        checkpoint.first_user_message = Some(format!("chat {session_id}"));
-        checkpoint.sequence = 1;
-        checkpoints.save(&checkpoint, &[]).await.expect("save chat");
+    #[test]
+    fn cron_execution_inherits_the_chat_recipe_without_transcript_state() {
+        let mut source = Checkpoint::empty("source");
+        source.context.push(serde_json::json!({"role": "user"}));
+        source.first_user_message = Some("source message".into());
+        source.model_route = Some("kimi::kimi-k2.5::high".into());
+        source.metadata.insert(
+            "horus_gateway.chat".into(),
+            serde_json::json!({"version": 1}),
+        );
+        source.session_context.workspace_id = Some("workspace".into());
+
+        let execution = cron_execution_checkpoint(&source, "execution", "cron · task");
+
+        assert_eq!(execution.model_route, source.model_route);
+        assert_eq!(execution.metadata, source.metadata);
+        assert_eq!(
+            execution.session_context,
+            horus::protocol::SessionContext {
+                workspace_id: Some("workspace".into()),
+                origin_label: Some("cron · task".into()),
+                ..horus::protocol::SessionContext::default()
+            }
+        );
+        assert!(execution.context.is_empty());
+        assert!(execution.first_user_message.is_none());
+        assert_eq!(execution.sequence, 0);
     }
 
-    async fn next_sessions(events: &mut broadcast::Receiver<ServerFrame>) -> Vec<SessionRecord> {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let ServerMessage::Sessions { sessions } =
-                    events.recv().await.expect("gateway broadcast").message
-                {
-                    return sessions;
-                }
-            }
-        })
-        .await
-        .expect("sessions timeout")
+    #[test]
+    fn stopped_agent_finishes_its_active_cron_run() {
+        let state = tempfile::tempdir().expect("state");
+        let cron = CronStore::open(state.path()).expect("cron");
+        let task = cron
+            .add_for_test("source", "do work", "17 3 * * *")
+            .expect("task");
+        let run = match cron.begin_run(&task.id).expect("begin run") {
+            BeginRun::Started(run) => run,
+            BeginRun::Skipped => panic!("new task must start"),
+        };
+        let mut active = Some(ActiveCron {
+            run,
+            submission_id: "submission".into(),
+            turn_id: None,
+            failure: None,
+        });
+
+        fail_active_cron(&cron, &mut active, "agent stopped").expect("finish run");
+        let history = cron.history("source", Some(&task.id)).expect("history");
+
+        assert!(active.is_none());
+        assert_eq!(history[0].status, CronRunStatus::Failed);
+        assert_eq!(history[0].message.as_deref(), Some("agent stopped"));
+    }
+
+    #[tokio::test]
+    async fn overlapping_cron_does_not_create_a_visible_execution_chat() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        let state_dir = root.path().join("state");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let (store, config) = ConfigStore::initialize(state_dir, listen, None).expect("config");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway =
+            GatewayHost::start(store, config, credentials, Arc::clone(&cron)).expect("gateway");
+        let source = gateway
+            .create_session(&workspace)
+            .await
+            .expect("source chat");
+        let task = cron
+            .add_for_test(source.session_id(), "do work", "* * * * *")
+            .expect("task");
+        let held = match cron.begin_run(&task.id).expect("claim run") {
+            BeginRun::Started(run) => run,
+            BeginRun::Skipped => panic!("first run must start"),
+        };
+        let before = gateway.sessions().await.expect("sessions before");
+
+        let error = gateway
+            .run_cron(source.session_id().into(), task.id)
+            .await
+            .expect_err("overlap must fail");
+        let after = gateway.sessions().await.expect("sessions after");
+        cron.finish_run(held, CronRunStatus::Succeeded, None)
+            .expect("finish held run");
+
+        assert_eq!(error.code, "cron_overlap");
+        assert_eq!(after, before);
     }
 
     #[tokio::test]
@@ -1958,24 +2509,24 @@ mod tests {
         let state = root.path().join("state");
         std::fs::create_dir(&workspace).expect("workspace");
         let listen = "127.0.0.1:8741".parse().expect("listen address");
-        let (store, config) =
-            ConfigStore::initialize(state, workspace, listen, None).expect("config");
+        let (store, config) = ConfigStore::initialize(state, listen, None).expect("config");
         let credentials =
             Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
-        let cron = Arc::new(CronStore::open(store.state_dir(), &config.workspace).expect("cron"));
-        let host = HostHandle::start(store, config, Arc::clone(&credentials), cron)
-            .await
-            .expect("host");
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway =
+            GatewayHost::start(store, config, Arc::clone(&credentials), cron).expect("gateway");
+        gateway.create_session(&workspace).await.expect("chat");
         let custom_endpoint = "https://example.com/v1";
 
-        host.set_credential(
-            "responses".into(),
-            "custom-secret".into(),
-            Some(custom_endpoint.into()),
-        )
-        .await
-        .expect("store custom credential");
-        let error = host
+        gateway
+            .set_credential(
+                "responses".into(),
+                "custom-secret".into(),
+                Some(custom_endpoint.into()),
+            )
+            .await
+            .expect("store custom credential");
+        let error = gateway
             .set_credential(
                 "kimi".into(),
                 "fixed-secret".into(),
@@ -1999,98 +2550,263 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_change_rebuilds_persists_and_broadcasts_ready() {
+    async fn credential_update_refreshes_every_matching_resident_chat() {
         let root = tempfile::tempdir().expect("root");
         let workspace = root.path().join("workspace");
-        let replacement = root.path().join("replacement");
         let state = root.path().join("state");
         std::fs::create_dir(&workspace).expect("workspace");
-        std::fs::create_dir(&replacement).expect("replacement workspace");
         let listen = "127.0.0.1:8741".parse().expect("listen address");
-        let (store, config) =
-            ConfigStore::initialize(state.clone(), workspace, listen, None).expect("config");
+        let (store, config) = ConfigStore::initialize(state, listen, None).expect("config");
         let credentials =
             Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
-        let cron = Arc::new(CronStore::open(store.state_dir(), &config.workspace).expect("cron"));
-        let host = HostHandle::start(store, config, credentials, cron)
+        credentials
+            .set("kimi", "old-secret", None)
+            .expect("initial Kimi credential");
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+        gateway
+            .register_provider(ProviderConfig {
+                provider: "kimi".into(),
+                model: "kimi-k3".into(),
+                base_url: None,
+                reasoning_effort: Some("max".into()),
+                web_search: horus::backend::model::provider::HostedWebSearch::Off,
+            })
             .await
-            .expect("host");
-        let previous_session = host
-            .snapshot(None)
+            .expect("register Kimi");
+        let first = gateway
+            .create_session(&workspace)
             .await
-            .expect("initial snapshot")
-            .ready
-            .session
-            .session_id;
-        let mut events = host.subscribe();
+            .expect("first chat");
+        let second = gateway
+            .create_session(&workspace)
+            .await
+            .expect("second chat");
+        let mut first_events = first.subscribe();
+        let mut second_events = second.subscribe();
 
-        host.set_workspace(replacement.clone())
+        gateway
+            .set_credential("kimi".into(), "new-secret".into(), None)
             .await
-            .expect("change workspace");
-        let frame = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .expect("replace Kimi credential");
+
+        for events in [&mut first_events, &mut second_events] {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if matches!(
+                        events.recv().await.expect("chat event").message,
+                        ServerMessage::SessionChanged { .. }
+                    ) {
+                        break;
+                    }
+                }
+            })
             .await
-            .expect("ready timeout")
-            .expect("ready broadcast");
-        let ServerMessage::Ready { payload } = frame.message else {
-            panic!("workspace change must broadcast ready");
+            .expect("matching chat refresh");
+        }
+    }
+
+    #[test]
+    fn credential_refresh_matches_only_the_selected_custom_endpoint() {
+        let selection = ProviderConfig {
+            provider: "responses".into(),
+            model: "custom-model".into(),
+            base_url: Some("https://first.example/v1".into()),
+            reasoning_effort: None,
+            web_search: horus::backend::model::provider::HostedWebSearch::Off,
         };
-        let (_, persisted) = ConfigStore::open(state).expect("persisted config");
-        let replacement = std::fs::canonicalize(replacement).expect("canonical replacement");
 
-        assert_eq!(payload.workspace, persisted.workspace_info());
-        assert_eq!(persisted.workspace, replacement);
-        assert_ne!(payload.session.session_id, previous_session);
-        assert_eq!(
-            payload.session.context.workspace_id.as_deref(),
-            Some(payload.workspace.id.as_str())
+        assert!(
+            provider_credential_matches(&selection, "responses", Some("https://first.example/v1"))
+                .expect("matching endpoint")
+                && !provider_credential_matches(
+                    &selection,
+                    "responses",
+                    Some("https://second.example/v1")
+                )
+                .expect("different endpoint")
         );
     }
 
     #[tokio::test]
-    async fn opening_a_foreign_workspace_chat_is_rejected_and_catalog_stays_local() {
+    async fn chats_keep_independent_workspace_and_agent_configuration() {
         let root = tempfile::tempdir().expect("root");
-        let workspace = root.path().join("workspace");
-        let foreign_workspace = root.path().join("foreign");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
         let state = root.path().join("state");
-        std::fs::create_dir(&workspace).expect("workspace");
-        std::fs::create_dir(&foreign_workspace).expect("foreign workspace");
+        std::fs::create_dir(&first).expect("first workspace");
+        std::fs::create_dir(&second).expect("second workspace");
         let listen = "127.0.0.1:8741".parse().expect("listen address");
-        let (store, config) =
-            ConfigStore::initialize(state.clone(), workspace, listen, None).expect("config");
-        let foreign = GatewayConfig::new(
-            listen,
-            std::fs::canonicalize(&foreign_workspace).expect("canonical foreign workspace"),
-            None,
-        )
-        .expect("foreign config")
-        .workspace_info();
-        let checkpoints = SqliteCheckpoint::new(store.checkpoints_path()).expect("checkpoints");
-        save_chat(&checkpoints, "local", config.workspace_info()).await;
-        save_chat(&checkpoints, "foreign", foreign.clone()).await;
+        let (store, config) = ConfigStore::initialize(state, listen, None).expect("config");
         let credentials =
             Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
-        let cron = Arc::new(CronStore::open(store.state_dir(), &config.workspace).expect("cron"));
-        let host = HostHandle::start(store, config, credentials, cron)
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+        let first_host = gateway.create_session(&first).await.expect("first chat");
+        let second_host = gateway.create_session(&second).await.expect("second chat");
+        let first_before = first_host
+            .snapshot(None)
             .await
-            .expect("host");
-
-        let error = host
-            .open_session(Some("foreign".into()))
+            .expect("first snapshot")
+            .ready;
+        let second_before = second_host
+            .snapshot(None)
             .await
-            .expect_err("foreign chat must be rejected");
-        let payload = host.snapshot(None).await.expect("snapshot").ready;
-        let (_, persisted) = ConfigStore::open(state).expect("persisted config");
+            .expect("second snapshot")
+            .ready;
+        let mut composition = first_before.config.config.clone();
+        composition.middleware.tools = false;
 
-        assert_eq!(error.code, "invalid_session_workspace");
-        assert_ne!(payload.workspace, foreign);
-        assert_ne!(payload.session.session_id, "foreign");
-        assert_eq!(payload.sessions.len(), 1);
-        assert_eq!(payload.sessions[0].summary.session_id, "local");
-        assert_eq!(persisted.workspace_info(), payload.workspace);
+        first_host
+            .configure(first_before.config.revision, composition)
+            .await
+            .expect("configure first chat");
+        let first_after = first_host
+            .snapshot(None)
+            .await
+            .expect("first updated")
+            .ready;
+        let second_after = second_host
+            .snapshot(None)
+            .await
+            .expect("second unchanged")
+            .ready;
+
+        assert_ne!(first_after.workspace, second_after.workspace);
+        assert!(!first_after.config.config.middleware.tools);
+        assert!(
+            first_after
+                .contributions
+                .iter()
+                .any(|contribution| contribution.capability == "sessions"),
+            "the /resume picker is gateway-standard, not an optional agent feature"
+        );
+        assert_eq!(second_after.config, second_before.config);
+
+        let first_id = first_host.session_id().to_owned();
+        let second_id = second_host.session_id().to_owned();
+        let (first_renamed, second_renamed) = tokio::join!(
+            first_host.rename_session(first_id.clone(), "first".into()),
+            second_host.rename_session(second_id.clone(), "second".into())
+        );
+        first_renamed.expect("rename first chat");
+        second_renamed.expect("rename second chat");
+        let checkpoints = Arc::clone(&gateway.state.lock().await.checkpoints);
+        let metadata = load_session_metadata(&checkpoints)
+            .await
+            .expect("catalog metadata");
+        assert_eq!(metadata[&first_id].title.as_deref(), Some("first"));
+        assert_eq!(metadata[&second_id].title.as_deref(), Some("second"));
     }
 
     #[tokio::test]
-    async fn session_catalog_includes_fresh_forks_but_not_empty_roots() {
+    async fn model_selection_updates_only_the_chat_and_new_chats_keep_the_gateway_default() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        let state = root.path().join("state");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let (store, config) = ConfigStore::initialize(state, listen, None).expect("config");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
+        credentials
+            .set("kimi", "test-secret", None)
+            .expect("Kimi credential");
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+        let mut gateway_updates = gateway.subscribe();
+        let ready = gateway
+            .register_provider(ProviderConfig {
+                provider: "kimi".into(),
+                model: "kimi-k3".into(),
+                base_url: None,
+                reasoning_effort: Some("max".into()),
+                web_search: horus::backend::model::provider::HostedWebSearch::Off,
+            })
+            .await
+            .expect("register Kimi");
+        let broadcast = gateway_updates
+            .try_recv()
+            .expect("gateway-wide catalog update");
+        assert!(matches!(
+            broadcast.message,
+            ServerMessage::Ready { payload } if payload.models == ready.models
+        ));
+        let alternate = ready
+            .models
+            .iter()
+            .find(|choice| choice.model == "kimi-k2.7-code")
+            .expect("alternate Kimi model")
+            .route
+            .clone();
+        let selected = gateway
+            .create_session(&workspace)
+            .await
+            .expect("selected chat");
+
+        selected
+            .set_model(alternate.clone())
+            .await
+            .expect("select alternate model");
+        let selected_ready = selected
+            .snapshot(None)
+            .await
+            .expect("selected snapshot")
+            .ready;
+        let fresh = gateway
+            .create_session(&workspace)
+            .await
+            .expect("fresh chat");
+        let fresh_ready = fresh.snapshot(None).await.expect("fresh snapshot").ready;
+
+        assert_eq!(selected_ready.session.model.route, alternate);
+        assert_eq!(
+            selected_ready.config.config.provider.model,
+            "kimi-k2.7-code"
+        );
+        assert_eq!(fresh_ready.config.config.provider.model, "kimi-k3");
+        assert_ne!(selected.session_id(), fresh.session_id());
+    }
+
+    #[tokio::test]
+    async fn capacity_reclaims_an_unreferenced_idle_chat() {
+        let root = tempfile::tempdir().expect("root");
+        let state_dir = root.path().join("state");
+        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let (store, config) = ConfigStore::initialize(state_dir, listen, None).expect("config");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+        let mut state = gateway.state.lock().await;
+        for index in 0..MAX_ACTIVE_SESSIONS {
+            let (commands, mut receiver) = mpsc::channel(1);
+            tokio::spawn(async move {
+                if let Some(HostCommand::StopIfIdle { reply }) = receiver.recv().await {
+                    let _ = reply.send(true);
+                }
+            });
+            let (events, _) = broadcast::channel(1);
+            let id = format!("chat-{index}");
+            state.sessions.insert(
+                id.clone(),
+                HostHandle {
+                    inner: Arc::new(HostInner {
+                        session_id: id.into(),
+                        commands,
+                        events,
+                    }),
+                },
+            );
+        }
+
+        state.ensure_capacity().await.expect("reclaim capacity");
+
+        assert_eq!(state.sessions.len(), MAX_ACTIVE_SESSIONS - 1);
+    }
+
+    #[tokio::test]
+    async fn session_catalog_includes_empty_roots_and_fresh_forks() {
         let workspace = tempfile::tempdir().expect("workspace");
         let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
             SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
@@ -2113,7 +2829,7 @@ mod tests {
             .await
             .expect("fork parent");
 
-        let mut sessions = session_catalog(&checkpoints, "workspace")
+        let mut sessions = session_catalog(&checkpoints)
             .await
             .expect("session catalog")
             .into_iter()
@@ -2125,6 +2841,7 @@ mod tests {
             sessions,
             vec![
                 ("child".into(), Some("parent".into())),
+                ("empty-root".into(), None),
                 ("parent".into(), None)
             ]
         );
@@ -2149,7 +2866,7 @@ mod tests {
             checkpoints.save(&checkpoint, &[]).await.expect("save chat");
         }
 
-        let sessions = session_catalog(&checkpoints, "workspace")
+        let sessions = session_catalog(&checkpoints)
             .await
             .expect("session catalog");
         let preview = sessions
@@ -2168,47 +2885,6 @@ mod tests {
             preview,
             "€".repeat(MAX_SESSION_PREVIEW_BYTES / '€'.len_utf8())
         );
-    }
-
-    #[tokio::test]
-    async fn session_actions_persist_metadata_and_broadcast_the_visible_catalog() {
-        let root = tempfile::tempdir().expect("root");
-        let workspace = root.path().join("workspace");
-        let state = root.path().join("state");
-        std::fs::create_dir(&workspace).expect("workspace");
-        let listen = "127.0.0.1:8741".parse().expect("listen address");
-        let (store, config) =
-            ConfigStore::initialize(state, workspace, listen, None).expect("config");
-        let checkpoints = SqliteCheckpoint::new(store.checkpoints_path()).expect("checkpoints");
-        save_chat(&checkpoints, "target", config.workspace_info()).await;
-        let credentials =
-            Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
-        let cron = Arc::new(CronStore::open(store.state_dir(), &config.workspace).expect("cron"));
-        let host = HostHandle::start(store, config, credentials, cron)
-            .await
-            .expect("host");
-        let mut events = host.subscribe();
-
-        host.rename_session("target".into(), "  Renamed  ".into())
-            .await
-            .expect("rename chat");
-        let renamed = next_sessions(&mut events).await;
-        host.set_session_pinned("target".into(), true)
-            .await
-            .expect("pin chat");
-        let pinned = next_sessions(&mut events).await;
-        host.delete_session("target".into())
-            .await
-            .expect("hide chat");
-        let hidden = next_sessions(&mut events).await;
-        let metadata = load_session_metadata(&(Arc::new(checkpoints) as Arc<dyn CheckpointStore>))
-            .await
-            .expect("load metadata");
-
-        assert_eq!(renamed[0].title.as_deref(), Some("Renamed"));
-        assert!(pinned[0].pinned);
-        assert!(hidden.is_empty());
-        assert!(metadata["target"].hidden);
     }
 
     #[tokio::test]
@@ -2360,11 +3036,16 @@ mod tests {
 
     #[test]
     fn active_provider_login_reserves_the_only_polling_slot() {
-        let rejection = ensure_provider_login_available(Some("login-a"))
+        let active = StdMutex::new(None);
+        reserve_provider_login(&active, "login-a").expect("reserve first login");
+        let rejection = reserve_provider_login(&active, "login-b")
             .expect_err("a second provider login must be rejected");
 
         assert_eq!(rejection.code, "provider_login_in_progress");
-        assert!(ensure_provider_login_available(None).is_ok());
+        release_provider_login(&active, "another-login").expect("ignore stale completion");
+        assert!(reserve_provider_login(&active, "login-b").is_err());
+        release_provider_login(&active, "login-a").expect("finish first login");
+        reserve_provider_login(&active, "login-b").expect("reserve next login");
     }
 
     #[test]

@@ -18,9 +18,25 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use crate::{Error, Result};
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 4;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+/// Cancellation-safe reader for length-prefixed gateway frames.
+pub struct FrameReader<R> {
+    reader: R,
+    buffer: Vec<u8>,
+}
+
+impl<R> FrameReader<R> {
+    /// Wraps one transport reader and retains partial frames between reads.
+    pub const fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buffer: Vec::new(),
+        }
+    }
+}
 
 /// One client-to-gateway frame.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -60,15 +76,21 @@ pub enum ClientMessage {
     Pair {
         code: String,
         client_label: String,
-        last_sequence: Option<u64>,
     },
     Authenticate {
         token: String,
-        last_sequence: Option<u64>,
+    },
+    ListSessions {
+        request_id: String,
+    },
+    CreateSession {
+        request_id: String,
+        workspace: PathBuf,
     },
     OpenSession {
         request_id: String,
-        session_id: Option<String>,
+        session_id: String,
+        last_sequence: Option<u64>,
     },
     RenameSession {
         request_id: String,
@@ -85,19 +107,18 @@ pub enum ClientMessage {
         session_id: String,
     },
     Submit {
+        session_id: String,
         submission: Submission,
     },
-    ConfigureAgent {
+    ConfigureSession {
         request_id: String,
+        session_id: String,
         expected_revision: u64,
         config: AgentComposition,
     },
-    SetWorkspace {
-        request_id: String,
-        path: PathBuf,
-    },
     GetGitDiff {
         request_id: String,
+        session_id: String,
     },
     ListDirectories {
         request_id: String,
@@ -115,6 +136,10 @@ pub enum ClientMessage {
         base_url: String,
         api_key: String,
     },
+    RegisterProvider {
+        request_id: String,
+        config: ProviderConfig,
+    },
     CreatePairingCode {
         request_id: String,
     },
@@ -127,30 +152,36 @@ pub enum ClientMessage {
     },
     ListArtifacts {
         request_id: String,
+        session_id: String,
     },
-    AddCron {
+    StartCronSetup {
         request_id: String,
-        task: PathBuf,
-        schedule: String,
+        session_id: String,
+        task: Option<String>,
     },
     ListCron {
         request_id: String,
+        session_id: String,
     },
     RescheduleCron {
         request_id: String,
+        session_id: String,
         id: String,
         schedule: String,
     },
     DeleteCron {
         request_id: String,
+        session_id: String,
         id: String,
     },
     RunCron {
         request_id: String,
+        session_id: String,
         id: String,
     },
     ListCronHistory {
         request_id: String,
+        session_id: String,
         id: Option<String>,
     },
 }
@@ -189,10 +220,6 @@ impl ServerFrame {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "wire variants are serialized directly and boxing would add per-frame allocations"
-)]
 pub enum ServerMessage {
     Paired {
         client_id: String,
@@ -200,6 +227,17 @@ pub enum ServerMessage {
     },
     Authenticated,
     Ready {
+        payload: ReadyPayload,
+    },
+    SessionOpened {
+        request_id: String,
+        payload: SessionReadyPayload,
+    },
+    SessionChanged {
+        payload: SessionReadyPayload,
+    },
+    GatewayConfigured {
+        request_id: String,
         payload: ReadyPayload,
     },
     Accepted {
@@ -212,6 +250,7 @@ pub enum ServerMessage {
         fatal: bool,
     },
     AgentEvent {
+        session_id: String,
         sequence: u64,
         event: Event,
         blocks: Vec<FrontendBlock>,
@@ -220,10 +259,9 @@ pub enum ServerMessage {
         preview: Option<RenderedPreview>,
     },
     Sessions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         sessions: Vec<SessionRecord>,
-    },
-    ConfigChanged {
-        snapshot: VersionedAgentConfig,
     },
     ProviderCredentialStatus {
         request_id: String,
@@ -253,10 +291,12 @@ pub enum ServerMessage {
     },
     Artifacts {
         request_id: String,
+        session_id: String,
         artifacts: Vec<ArtifactRecord>,
     },
     GitDiff {
         request_id: String,
+        session_id: String,
         diff: String,
     },
     Directories {
@@ -265,10 +305,12 @@ pub enum ServerMessage {
     },
     CronTasks {
         request_id: String,
+        session_id: String,
         tasks: Vec<CronTask>,
     },
     CronHistory {
         request_id: String,
+        session_id: String,
         runs: Vec<CronRun>,
     },
     Error {
@@ -285,18 +327,25 @@ pub struct BootstrapPayload {
     pub pairing_code: String,
 }
 
-/// Complete frontend-safe state sent after authentication or agent restart.
+/// Gateway-wide frontend-safe state sent after authentication.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReadyPayload {
+    pub sessions: Vec<SessionRecord>,
+    pub providers: Vec<ProviderStatus>,
+    pub default_config: Option<VersionedAgentConfig>,
+    pub models: Vec<ModelChoice>,
+    pub max_active_sessions: usize,
+}
+
+/// Frontend-safe state for one opened session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionReadyPayload {
     pub latest_sequence: u64,
     pub workspace: WorkspaceInfo,
     pub git: Option<GitStatus>,
     pub session: SessionConfiguredEvent,
-    pub sessions: Vec<SessionRecord>,
-    pub model_choices: Vec<ModelChoice>,
     pub contributions: Vec<FrontendContribution>,
     pub config: VersionedAgentConfig,
-    pub providers: Vec<ProviderStatus>,
 }
 
 /// One visible session with gateway-owned catalog presentation metadata.
@@ -308,11 +357,11 @@ pub struct SessionRecord {
     pub pinned: bool,
 }
 
-/// Opaque workspace identity and display label.
+/// Canonical workspace identity and path for one chat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceInfo {
     pub id: String,
-    pub label: String,
+    pub path: PathBuf,
 }
 
 /// Local branch state for a Git-backed workspace.
@@ -363,8 +412,6 @@ pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key_env: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub web_search: HostedWebSearch,
@@ -401,7 +448,6 @@ pub struct MiddlewareConfig {
     pub subagents: bool,
     pub steering: bool,
     pub compaction: bool,
-    pub sessions: bool,
 }
 
 /// Capability-rendered preview whose inner events remain provider-neutral.
@@ -422,7 +468,6 @@ pub struct RenderedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileSnapshot {
     pub user_name: Option<String>,
-    pub workspace: WorkspaceInfo,
     pub daily_usage: Vec<DailyUsage>,
 }
 
@@ -450,10 +495,11 @@ pub enum ArtifactKind {
     CodeDiff,
 }
 
-/// One persisted scheduled task owned by the gateway workspace.
+/// One persisted scheduled task owned by its source session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronTask {
     pub id: String,
+    pub session_id: String,
     pub task: PathBuf,
     pub schedule: String,
 }
@@ -463,6 +509,7 @@ pub struct CronTask {
 pub struct CronRun {
     pub id: String,
     pub task_id: String,
+    pub source_session_id: String,
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub status: CronRunStatus,
@@ -495,27 +542,39 @@ where
 }
 
 /// Reads one length-prefixed JSON value, returning `None` only for a clean EOF.
-pub async fn read_frame<T>(reader: &mut (impl AsyncRead + Unpin)) -> Result<Option<T>>
+pub async fn read_frame<T>(reader: &mut FrameReader<impl AsyncRead + Unpin>) -> Result<Option<T>>
 where
     T: DeserializeOwned,
 {
-    let mut prefix = [0_u8; 4];
-    match reader.read_exact(&mut prefix[..1]).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error.into()),
+    loop {
+        if reader.buffer.len() >= 4 {
+            let prefix = reader.buffer[..4]
+                .try_into()
+                .map_err(|_| Error::Protocol("frame length is unsupported".into()))?;
+            let length = usize::try_from(u32::from_be_bytes(prefix))
+                .map_err(|_| Error::Protocol("frame length is unsupported".into()))?;
+            if length == 0 || length > MAX_FRAME_BYTES {
+                return Err(Error::Protocol(format!(
+                    "frame length must be 1–{MAX_FRAME_BYTES} bytes"
+                )));
+            }
+            let frame_end = 4 + length;
+            if reader.buffer.len() >= frame_end {
+                let frame = serde_json::from_slice(&reader.buffer[4..frame_end])?;
+                reader.buffer.drain(..frame_end);
+                return Ok(Some(frame));
+            }
+        }
+        let mut chunk = [0_u8; 8 * 1024];
+        let read = reader.reader.read(&mut chunk).await?;
+        if read == 0 {
+            if reader.buffer.is_empty() {
+                return Ok(None);
+            }
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
+        reader.buffer.extend_from_slice(&chunk[..read]);
     }
-    reader.read_exact(&mut prefix[1..]).await?;
-    let length = usize::try_from(u32::from_be_bytes(prefix))
-        .map_err(|_| Error::Protocol("frame length is unsupported".into()))?;
-    if length == 0 || length > MAX_FRAME_BYTES {
-        return Err(Error::Protocol(format!(
-            "frame length must be 1–{MAX_FRAME_BYTES} bytes"
-        )));
-    }
-    let mut payload = vec![0; length];
-    reader.read_exact(&mut payload).await?;
-    Ok(Some(serde_json::from_slice(&payload)?))
 }
 
 /// Writes one bounded length-prefixed JSON value.
@@ -557,9 +616,9 @@ mod tests {
     async fn framed_json_round_trip_preserves_the_versioned_message() {
         let expected = ClientFrame::new(ClientMessage::Authenticate {
             token: "secret".into(),
-            last_sequence: Some(7),
         });
-        let (mut writer, mut reader) = duplex(1024);
+        let (mut writer, reader) = duplex(1024);
+        let mut reader = FrameReader::new(reader);
 
         write_frame(&mut writer, &expected)
             .await
@@ -573,8 +632,79 @@ mod tests {
     }
 
     #[test]
+    fn connection_handshakes_have_no_session_replay_cursor() {
+        let frames = [
+            ClientMessage::Authenticate {
+                token: "secret".into(),
+            },
+            ClientMessage::Pair {
+                code: "pairing-code".into(),
+                client_label: "client".into(),
+            },
+        ];
+
+        let has_cursor = frames
+            .into_iter()
+            .map(ClientFrame::new)
+            .map(|frame| serde_json::to_value(frame).expect("encode handshake"))
+            .any(|value| value.get("last_sequence").is_some());
+
+        assert!(!has_cursor);
+    }
+
+    #[tokio::test]
+    async fn framed_reader_retains_a_partial_prefix_when_cancelled() {
+        let first = ClientFrame::new(ClientMessage::ListCron {
+            request_id: "request-a".into(),
+            session_id: "session-a".into(),
+        });
+        let second = ClientFrame::new(ClientMessage::GetProfile {
+            request_id: "request-b".into(),
+        });
+        let encode = |frame: &ClientFrame| {
+            let payload = serde_json::to_vec(frame).expect("encode frame");
+            let mut encoded = u32::try_from(payload.len())
+                .expect("frame length")
+                .to_be_bytes()
+                .to_vec();
+            encoded.extend_from_slice(&payload);
+            encoded
+        };
+        let mut encoded = encode(&first);
+        encoded.extend_from_slice(&encode(&second));
+        let (mut writer, reader) = duplex(4096);
+        let mut reader = FrameReader::new(reader);
+        writer
+            .write_all(&encoded[..1])
+            .await
+            .expect("write partial prefix");
+
+        {
+            let pending = read_frame::<ClientFrame>(&mut reader);
+            tokio::pin!(pending);
+            tokio::select! {
+                biased;
+                result = &mut pending => panic!("partial frame completed: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        writer.write_all(&encoded[1..]).await.expect("finish frame");
+        let actual_first = read_frame::<ClientFrame>(&mut reader)
+            .await
+            .expect("read resumed frame")
+            .expect("frame");
+        let actual_second = read_frame::<ClientFrame>(&mut reader)
+            .await
+            .expect("read buffered frame")
+            .expect("frame");
+
+        assert_eq!([actual_first, actual_second], [first, second]);
+    }
+
+    #[test]
     fn client_frame_round_trip_handles_a_nested_operation_tag() {
         let expected = ClientFrame::new(ClientMessage::Submit {
+            session_id: "session-a".into(),
             submission: Submission {
                 id: "submission-a".into(),
                 op: horus::protocol::Op::CapabilityCommand {
@@ -593,23 +723,126 @@ mod tests {
     }
 
     #[test]
-    fn workspace_change_uses_a_gateway_host_path() {
-        let frame = ClientFrame::new(ClientMessage::SetWorkspace {
+    fn session_creation_uses_a_gateway_host_workspace() {
+        let frame = ClientFrame::new(ClientMessage::CreateSession {
             request_id: "request-a".into(),
-            path: PathBuf::from("/srv/horus/project"),
+            workspace: PathBuf::from("/srv/horus/project"),
         });
 
-        let encoded = serde_json::to_value(frame).expect("encode workspace change");
+        let encoded = serde_json::to_value(frame).expect("encode session creation");
 
         assert_eq!(
             encoded,
             serde_json::json!({
                 "version": PROTOCOL_VERSION,
-                "type": "set_workspace",
+                "type": "create_session",
                 "request_id": "request-a",
-                "path": "/srv/horus/project"
+                "workspace": "/srv/horus/project"
             })
         );
+    }
+
+    #[test]
+    fn provider_registration_is_gateway_scoped() {
+        let frame = ClientFrame::new(ClientMessage::RegisterProvider {
+            request_id: "request-provider".into(),
+            config: ProviderConfig {
+                provider: "kimi".into(),
+                model: "kimi-k3".into(),
+                base_url: None,
+                reasoning_effort: Some("max".into()),
+                web_search: HostedWebSearch::Off,
+            },
+        });
+
+        let encoded = serde_json::to_value(frame).expect("encode provider registration");
+
+        assert_eq!(encoded["type"], "register_provider");
+        assert_eq!(encoded["config"]["provider"], "kimi");
+        assert!(encoded.get("session_id").is_none());
+    }
+
+    #[test]
+    fn provider_config_rejects_api_key_environment_overrides() {
+        let encoded = serde_json::json!({
+            "provider": "kimi",
+            "model": "kimi-k3",
+            "api_key_env": "CUSTOM_KIMI_API_KEY"
+        });
+
+        let error = serde_json::from_value::<ProviderConfig>(encoded)
+            .expect_err("provider environment overrides must be rejected");
+
+        assert!(error.to_string().contains("unknown field `api_key_env`"));
+    }
+
+    #[test]
+    fn opening_a_session_owns_its_replay_cursor() {
+        let frame = ClientFrame::new(ClientMessage::OpenSession {
+            request_id: "request-open".into(),
+            session_id: "session-a".into(),
+            last_sequence: Some(7),
+        });
+
+        let encoded = serde_json::to_value(frame).expect("encode session open");
+
+        assert_eq!(encoded["last_sequence"], 7);
+    }
+
+    #[test]
+    fn cron_setup_is_an_explicit_correlated_request() {
+        let frame = ClientFrame::new(ClientMessage::StartCronSetup {
+            request_id: "request-cron".into(),
+            session_id: "session-a".into(),
+            task: Some("Review open pull requests".into()),
+        });
+
+        let encoded = serde_json::to_value(frame).expect("encode cron setup");
+
+        assert_eq!(encoded["type"], "start_cron_setup");
+        assert_eq!(encoded["request_id"], "request-cron");
+        assert_eq!(encoded["session_id"], "session-a");
+        assert_eq!(encoded["task"], "Review open pull requests");
+    }
+
+    #[test]
+    fn cron_management_is_session_scoped() {
+        let frames = [
+            ClientMessage::ListCron {
+                request_id: "list".into(),
+                session_id: "session-a".into(),
+            },
+            ClientMessage::RescheduleCron {
+                request_id: "reschedule".into(),
+                session_id: "session-a".into(),
+                id: "cron-a".into(),
+                schedule: "0 9 * * *".into(),
+            },
+            ClientMessage::DeleteCron {
+                request_id: "delete".into(),
+                session_id: "session-a".into(),
+                id: "cron-a".into(),
+            },
+            ClientMessage::RunCron {
+                request_id: "run".into(),
+                session_id: "session-a".into(),
+                id: "cron-a".into(),
+            },
+            ClientMessage::ListCronHistory {
+                request_id: "history".into(),
+                session_id: "session-a".into(),
+                id: None,
+            },
+        ];
+
+        let session_ids = frames
+            .into_iter()
+            .map(ClientFrame::new)
+            .map(|frame| serde_json::to_value(frame).expect("encode cron operation"))
+            .map(|value| value["session_id"].clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(session_ids, vec![Value::String("session-a".into()); 5]);
     }
 
     #[test]
@@ -643,10 +876,12 @@ mod tests {
     fn git_diff_query_has_a_correlated_unified_diff_response() {
         let request = serde_json::to_value(ClientFrame::new(ClientMessage::GetGitDiff {
             request_id: "request-diff".into(),
+            session_id: "session-a".into(),
         }))
         .expect("encode Git diff request");
         let response = serde_json::to_value(ServerFrame::new(ServerMessage::GitDiff {
             request_id: "request-diff".into(),
+            session_id: "session-a".into(),
             diff: "diff --git a/file b/file\n".into(),
         }))
         .expect("encode Git diff response");
@@ -656,7 +891,27 @@ mod tests {
             (Some("get_git_diff"), Some("git_diff"))
         );
         assert_eq!(response["request_id"], "request-diff");
+        assert_eq!(response["session_id"], "session-a");
         assert_eq!(response["diff"], "diff --git a/file b/file\n");
+    }
+
+    #[test]
+    fn agent_events_identify_their_session() {
+        let frame = ServerFrame::new(ServerMessage::AgentEvent {
+            session_id: "session-a".into(),
+            sequence: 1,
+            event: Event {
+                submission_id: None,
+                msg: EventMsg::ContextCompacted,
+            },
+            blocks: Vec::new(),
+            history: None,
+            preview: None,
+        });
+
+        let encoded = serde_json::to_value(frame).expect("encode agent event");
+
+        assert_eq!(encoded["session_id"], "session-a");
     }
 
     #[test]
@@ -708,13 +963,41 @@ mod tests {
     }
 
     #[test]
-    fn server_frame_decodes_ready_with_a_widget_action_tag() {
+    fn gateway_ready_contains_no_selected_session() {
+        let frame = ServerFrame::new(ServerMessage::Ready {
+            payload: ReadyPayload {
+                sessions: Vec::new(),
+                providers: Vec::new(),
+                default_config: Some(VersionedAgentConfig {
+                    revision: 1,
+                    config: AgentComposition::default(),
+                }),
+                models: Vec::new(),
+                max_active_sessions: 32,
+            },
+        });
+
+        let encoded = serde_json::to_value(frame).expect("encode gateway ready");
+
+        assert_eq!(
+            (
+                encoded["payload"]["max_active_sessions"].as_u64(),
+                encoded["payload"].get("session"),
+                encoded["payload"].get("workspace"),
+            ),
+            (Some(32), None, None)
+        );
+    }
+
+    #[test]
+    fn server_frame_decodes_session_opened_with_a_widget_action_tag() {
         let encoded = serde_json::json!({
             "version": PROTOCOL_VERSION,
-            "type": "ready",
+            "type": "session_opened",
+            "request_id": "request-open",
             "payload": {
                 "latest_sequence": 4,
-                "workspace": { "id": "workspace-a", "label": "/workspace" },
+                "workspace": { "id": "workspace-a", "path": "/workspace" },
                 "git": null,
                 "session": {
                     "session_id": "session-a",
@@ -726,8 +1009,6 @@ mod tests {
                         "model_context_window": null
                     }
                 },
-                "sessions": [],
-                "model_choices": [],
                 "contributions": [{
                     "capability": "subagents",
                     "commands": [],
@@ -760,28 +1041,39 @@ mod tests {
                             "skills": true,
                             "subagents": true,
                             "steering": true,
-                            "compaction": true,
-                            "sessions": true
+                            "compaction": true
                         },
                         "approval": "on",
                         "system_prompt": "test"
                     }
-                },
-                "providers": []
+                }
             }
         });
 
-        let frame: ServerFrame = serde_json::from_value(encoded).expect("decode nested ready");
-        let ServerMessage::Ready { payload } = frame.message else {
-            panic!("expected ready frame");
+        let frame: ServerFrame =
+            serde_json::from_value(encoded).expect("decode nested session ready");
+        let ServerMessage::SessionOpened {
+            request_id,
+            payload,
+        } = frame.message
+        else {
+            panic!("expected session-opened frame");
         };
 
-        assert!(payload.contributions[0].widgets[0].action.is_some());
+        assert_eq!(
+            (
+                request_id.as_str(),
+                payload.session.session_id.as_str(),
+                payload.contributions[0].widgets[0].action.is_some(),
+            ),
+            ("request-open", "session-a", true)
+        );
     }
 
     #[tokio::test]
     async fn read_frame_rejects_an_oversized_declared_payload() {
-        let (mut writer, mut reader) = duplex(8);
+        let (mut writer, reader) = duplex(8);
+        let mut reader = FrameReader::new(reader);
         let oversized = u32::try_from(MAX_FRAME_BYTES + 1).expect("frame limit fits u32");
         writer
             .write_all(&oversized.to_be_bytes())

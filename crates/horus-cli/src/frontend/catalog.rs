@@ -54,9 +54,9 @@ struct UiCommand {
 #[derive(Clone)]
 enum CommandHandler {
     Help,
+    GatewaySettings,
     Agent,
     Workspace,
-    Providers,
     Login,
     Pair,
     Profile,
@@ -90,7 +90,11 @@ pub(crate) struct CommandContext<'a> {
 pub(crate) enum CommandAction {
     Submit(Op),
     Gateway(GatewayAction),
-    Setup(SetupMode),
+    GatewaySettings,
+    Setup {
+        mode: SetupMode,
+        provider: Option<String>,
+    },
     Frontend(FrontendEvent),
     ShowMenu,
     Print(String),
@@ -101,25 +105,11 @@ pub(crate) enum CommandAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GatewayAction {
-    Agent(String),
     Workspace(String),
-    Providers,
-    Login(String),
     Pair,
     Profile,
     Artifacts,
-    Cron(CronAction),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CronAction {
-    Slash(String),
-    Add { task: PathBuf, schedule: String },
-    List,
-    Reschedule { id: String, schedule: String },
-    Delete(String),
-    Run(String),
-    History(Option<String>),
+    Cron(String),
 }
 
 impl UiCatalog {
@@ -322,7 +312,10 @@ impl UiCatalog {
                 "unknown command `{COMMAND_PREFIX}{name}`"
             )));
         };
-        if command.requires_idle && context.active_turn.is_some() {
+        let cron_setup_busy = matches!(command.handler, CommandHandler::Cron)
+            && arguments.split_ascii_whitespace().next() == Some("new")
+            && context.active_turn.is_some();
+        if (command.requires_idle && context.active_turn.is_some()) || cron_setup_busy {
             return Some(CommandAction::Print(format!(
                 "`{COMMAND_PREFIX}{}` is available when the agent is idle",
                 command.name
@@ -330,14 +323,25 @@ impl UiCatalog {
         }
         Some(match &command.handler {
             CommandHandler::Help => CommandAction::ShowMenu,
-            CommandHandler::Agent if arguments.is_empty() => CommandAction::Setup(SetupMode::Agent),
-            CommandHandler::Agent => CommandAction::Gateway(GatewayAction::Agent(arguments.into())),
+            CommandHandler::GatewaySettings if arguments.is_empty() => {
+                CommandAction::GatewaySettings
+            }
+            CommandHandler::GatewaySettings => CommandAction::Print("usage: /gateway".into()),
+            CommandHandler::Agent if arguments.is_empty() => CommandAction::Setup {
+                mode: SetupMode::Agent,
+                provider: None,
+            },
+            CommandHandler::Agent => CommandAction::Print("usage: /agent".into()),
             CommandHandler::Workspace => {
                 CommandAction::Gateway(GatewayAction::Workspace(arguments.into()))
             }
-            CommandHandler::Providers => CommandAction::Gateway(GatewayAction::Providers),
-            CommandHandler::Login if arguments.is_empty() => CommandAction::Setup(SetupMode::Login),
-            CommandHandler::Login => CommandAction::Gateway(GatewayAction::Login(arguments.into())),
+            CommandHandler::Login if arguments.split_whitespace().count() <= 1 => {
+                CommandAction::Setup {
+                    mode: SetupMode::Login,
+                    provider: (!arguments.is_empty()).then(|| arguments.into()),
+                }
+            }
+            CommandHandler::Login => CommandAction::Print("usage: /login [provider]".into()),
             CommandHandler::Pair => CommandAction::Gateway(GatewayAction::Pair),
             CommandHandler::Profile => CommandAction::Gateway(GatewayAction::Profile),
             CommandHandler::Artifacts => CommandAction::Gateway(GatewayAction::Artifacts),
@@ -345,9 +349,7 @@ impl UiCatalog {
             CommandHandler::Clear => CommandAction::Clear,
             CommandHandler::Model => model_picker(&self.model_choices),
             CommandHandler::Reasoning => reasoning_picker(context.model_route, &self.model_choices),
-            CommandHandler::Cron => {
-                CommandAction::Gateway(GatewayAction::Cron(CronAction::Slash(arguments.into())))
-            }
+            CommandHandler::Cron => CommandAction::Gateway(GatewayAction::Cron(arguments.into())),
             CommandHandler::Status => CommandAction::Print(context.status.to_string()),
             CommandHandler::Interrupt => context.active_turn.map_or_else(
                 || CommandAction::Print("no active turn to interrupt".into()),
@@ -397,29 +399,39 @@ impl UiReference {
 fn cli_commands() -> Vec<UiCommand> {
     vec![
         command("help", "show commands", false, CommandHandler::Help),
+        command(
+            "gateway",
+            "view, pair, or reconnect gateways",
+            true,
+            CommandHandler::GatewaySettings,
+        ),
         UiCommand {
             name: "agent".into(),
-            arguments: "[<composition-json>]".into(),
-            description: "set up the gateway agent".into(),
+            arguments: String::new(),
+            description: "configure agent features".into(),
             requires_idle: true,
             handler: CommandHandler::Agent,
         },
         UiCommand {
             name: "workspace".into(),
             arguments: "<gateway-path>".into(),
-            description: "change the gateway workspace".into(),
+            description: "start a chat in another workspace".into(),
             requires_idle: true,
             handler: CommandHandler::Workspace,
         },
-        command("providers", "show gateway provider configuration", false, CommandHandler::Providers),
         UiCommand {
             name: "login".into(),
-            arguments: "[<provider> [env:NAME]]".into(),
-            description: "set up provider authentication".into(),
+            arguments: "[provider]".into(),
+            description: "authenticate a provider and configure its agent".into(),
             requires_idle: true,
             handler: CommandHandler::Login,
         },
-        command("profile", "show gateway usage statistics", false, CommandHandler::Profile),
+        command(
+            "profile",
+            "show gateway usage statistics",
+            false,
+            CommandHandler::Profile,
+        ),
         command(
             "pair",
             "create a pairing code for another client",
@@ -432,10 +444,10 @@ fn cli_commands() -> Vec<UiCommand> {
             false,
             CommandHandler::Artifacts,
         ),
-        command("new", "start a new session", true, CommandHandler::New),
+        command("new", "start a new chat", true, CommandHandler::New),
         command(
             "clear",
-            "clear the terminal and start a new session",
+            "clear the terminal and start a new chat",
             true,
             CommandHandler::Clear,
         ),
@@ -453,8 +465,10 @@ fn cli_commands() -> Vec<UiCommand> {
         ),
         UiCommand {
             name: "cron".into(),
-            arguments: "[list|add <task> <schedule>|reschedule <id> <schedule>|delete <id>|run <id>|history [id]]".into(),
-            description: "list or manage scheduled tasks".into(),
+            arguments:
+                "[new [task]|list|reschedule <id> <schedule>|delete <id>|run <id>|history [id]]"
+                    .into(),
+            description: "create or manage scheduled tasks".into(),
             requires_idle: false,
             handler: CommandHandler::Cron,
         },
@@ -739,16 +753,67 @@ mod tests {
 
         assert_eq!(
             catalog.dispatch("/login", context),
-            Some(CommandAction::Setup(SetupMode::Login))
+            Some(CommandAction::Setup {
+                mode: SetupMode::Login,
+                provider: None,
+            })
         );
         assert_eq!(
             catalog.dispatch("/agent", context),
-            Some(CommandAction::Setup(SetupMode::Agent))
+            Some(CommandAction::Setup {
+                mode: SetupMode::Agent,
+                provider: None,
+            })
         );
         assert_eq!(
             catalog.dispatch("/login kimi", context),
-            Some(CommandAction::Gateway(GatewayAction::Login("kimi".into())))
+            Some(CommandAction::Setup {
+                mode: SetupMode::Login,
+                provider: Some("kimi".into()),
+            })
         );
+        assert_eq!(
+            catalog.dispatch("/agent {}", context),
+            Some(CommandAction::Print("usage: /agent".into()))
+        );
+    }
+
+    #[test]
+    fn bare_gateway_command_opens_gateway_settings() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let catalog = UiCatalog::build(&[], &[], workspace.path()).expect("catalog");
+
+        assert_eq!(
+            catalog.dispatch(
+                "/gateway",
+                CommandContext {
+                    active_turn: None,
+                    status: "idle",
+                    model_route: "kimi",
+                },
+            ),
+            Some(CommandAction::GatewaySettings)
+        );
+    }
+
+    #[test]
+    fn cron_setup_waits_for_idle_but_management_does_not() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let catalog = UiCatalog::build(&[], &[], workspace.path()).expect("catalog");
+        let context = CommandContext {
+            active_turn: Some("turn"),
+            status: "working",
+            model_route: "kimi",
+        };
+
+        assert!(matches!(
+            catalog.dispatch("/cron new review pull requests", context),
+            Some(CommandAction::Print(message)) if message.contains("agent is idle")
+        ));
+        assert!(matches!(
+            catalog.dispatch("/cron list", context),
+            Some(CommandAction::Gateway(GatewayAction::Cron(arguments))) if arguments == "list"
+        ));
     }
 
     #[test]

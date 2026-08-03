@@ -83,6 +83,16 @@ impl GatewaySandbox {
             Some(path) => std::fs::canonicalize(path)?,
             None => state_dir.clone(),
         };
+        if root.starts_with(&state_dir) || state_dir.starts_with(&root) {
+            return Err(Error::Config(
+                "gateway state directory and chat workspace must not overlap".into(),
+            ));
+        }
+        if tls_key.starts_with(&root) {
+            return Err(Error::Config(
+                "TLS private key must be stored outside every chat workspace".into(),
+            ));
+        }
         let delegate = LocalSandbox::new(&root)?.command_timeout(timeout)?;
         let temp = tempfile::Builder::new()
             .prefix("horus-gateway-")
@@ -380,6 +390,62 @@ async fn read_output(mut reader: impl AsyncRead + Unpin) -> Result<String> {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn construction_rejects_both_state_workspace_overlap_directions() {
+        let workspace_parent = tempfile::tempdir().expect("workspace parent");
+        let state_inside = workspace_parent.path().join("state");
+        std::fs::create_dir(&state_inside).expect("nested state");
+        let state_parent = tempfile::tempdir().expect("state parent");
+        let workspace_inside = state_parent.path().join("workspace");
+        std::fs::create_dir(&workspace_inside).expect("nested workspace");
+
+        let state_inside_error = match GatewaySandbox::new(
+            workspace_parent.path(),
+            &state_inside,
+            None,
+            Duration::from_secs(5),
+        ) {
+            Ok(_) => panic!("state inside workspace must fail"),
+            Err(error) => error,
+        };
+        let workspace_inside_error = match GatewaySandbox::new(
+            &workspace_inside,
+            state_parent.path(),
+            None,
+            Duration::from_secs(5),
+        ) {
+            Ok(_) => panic!("workspace inside state must fail"),
+            Err(error) => error,
+        };
+
+        assert!(state_inside_error.to_string().contains("must not overlap"));
+        assert!(
+            workspace_inside_error
+                .to_string()
+                .contains("must not overlap")
+        );
+    }
+
+    #[test]
+    fn construction_rejects_a_tls_key_inside_the_chat_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let private_key = workspace.path().join("private-key.pem");
+        std::fs::write(&private_key, "private key").expect("private key");
+
+        let error = match GatewaySandbox::new(
+            workspace.path(),
+            state.path(),
+            Some(&private_key),
+            Duration::from_secs(5),
+        ) {
+            Ok(_) => panic!("workspace TLS key must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("outside every chat workspace"));
+    }
 
     #[tokio::test]
     async fn commands_cannot_read_gateway_state() {

@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use horus::backend::model::provider::{ProviderAuth, provider};
 use horus::protocol::TokenUsage;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::Digest as _;
 
 use crate::wire::{
@@ -22,7 +23,9 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 3;
+const CHAT_SPEC_VERSION: u32 = 1;
+pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
 const CONFIG_FILE: &str = "gateway.json";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 64 * 1024;
@@ -45,17 +48,26 @@ pub struct TlsConfig {
     pub private_key: PathBuf,
 }
 
-/// Durable settings for one gateway process and workspace.
+/// Durable machine-wide settings and defaults for one gateway process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     version: u32,
     pub listen: SocketAddr,
-    pub workspace: PathBuf,
     pub tls: Option<TlsConfig>,
-    pub agent: VersionedAgentConfig,
+    pub default_agent: Option<VersionedAgentConfig>,
+    pub configured_providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     usage: UsageHistory,
+}
+
+/// Durable runtime recipe copied into one chat checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChatSpec {
+    version: u32,
+    pub(crate) workspace: PathBuf,
+    pub(crate) agent: VersionedAgentConfig,
 }
 
 /// File owner for gateway configuration and aggregate usage.
@@ -92,7 +104,6 @@ impl Default for AgentComposition {
                 provider: "openai_codex".into(),
                 model: "gpt-5.6-sol".into(),
                 base_url: None,
-                api_key_env: None,
                 reasoning_effort: Some("medium".into()),
                 web_search: horus::backend::model::provider::HostedWebSearch::Off,
             },
@@ -102,7 +113,6 @@ impl Default for AgentComposition {
                 subagents: true,
                 steering: true,
                 compaction: true,
-                sessions: true,
             },
             approval: horus::backend::sandbox::ApprovalPolicy::On,
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
@@ -111,54 +121,51 @@ impl Default for AgentComposition {
 }
 
 impl GatewayConfig {
-    /// Builds the initial validated settings for one workspace.
-    pub fn new(listen: SocketAddr, workspace: PathBuf, tls: Option<TlsConfig>) -> Result<Self> {
+    /// Builds validated machine-wide settings and new-chat defaults.
+    pub fn new(listen: SocketAddr, tls: Option<TlsConfig>) -> Result<Self> {
         let config = Self {
             version: CONFIG_VERSION,
             listen,
-            workspace,
             tls,
-            agent: VersionedAgentConfig {
-                revision: 1,
-                config: AgentComposition::default(),
-            },
+            default_agent: None,
+            configured_providers: BTreeMap::new(),
             usage: UsageHistory::default(),
         };
         config.validate()?;
         Ok(config)
     }
 
-    /// Returns the workspace's frontend-safe identity.
-    #[must_use]
-    pub fn workspace_info(&self) -> WorkspaceInfo {
-        WorkspaceInfo {
-            id: workspace_id(&self.workspace),
-            label: self.workspace.display().to_string(),
-        }
-    }
-
-    /// Builds a revision-checked replacement without mutating the current value.
-    pub fn replacing_agent(
-        &self,
-        expected_revision: u64,
-        composition: AgentComposition,
-    ) -> Result<Self> {
-        if expected_revision != self.agent.revision {
-            return Err(Error::Config(format!(
-                "configuration revision changed from {expected_revision} to {}",
-                self.agent.revision
-            )));
-        }
-        validate_agent_composition(&composition)?;
+    /// Registers one configured provider and establishes the first as the new-chat default.
+    pub(crate) fn registering_provider(&self, selection: ProviderConfig) -> Result<Self> {
+        validate_provider_config(&selection)?;
         let mut next = self.clone();
-        next.agent = VersionedAgentConfig {
-            revision: self
-                .agent
-                .revision
-                .checked_add(1)
-                .ok_or_else(|| Error::Config("configuration revision overflow".into()))?,
-            config: composition,
-        };
+        next.configured_providers
+            .insert(selection.provider.clone(), selection.clone());
+        match &self.default_agent {
+            None => {
+                let config = AgentComposition {
+                    provider: selection,
+                    ..AgentComposition::default()
+                };
+                next.default_agent = Some(VersionedAgentConfig {
+                    revision: 1,
+                    config,
+                });
+            }
+            Some(default) if default.config.provider.provider == selection.provider => {
+                let mut config = default.config.clone();
+                config.provider = selection;
+                next.default_agent = Some(VersionedAgentConfig {
+                    revision: default
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Config("configuration revision overflow".into()))?,
+                    config,
+                });
+            }
+            Some(_) => {}
+        }
+        next.validate()?;
         Ok(next)
     }
 
@@ -178,7 +185,6 @@ impl GatewayConfig {
     pub fn profile(&self) -> ProfileSnapshot {
         ProfileSnapshot {
             user_name: local_user_name(),
-            workspace: self.workspace_info(),
             daily_usage: self
                 .usage
                 .days
@@ -199,22 +205,9 @@ impl GatewayConfig {
                 self.version
             )));
         }
-        if self.agent.revision == 0 {
-            return Err(Error::Config(
-                "configuration revision must be positive".into(),
-            ));
-        }
         if self.listen.port() == 0 {
             return Err(Error::Config(
                 "gateway listen port must be greater than zero".into(),
-            ));
-        }
-        if !self.workspace.is_absolute()
-            || !self.workspace.is_dir()
-            || self.workspace.parent().is_none()
-        {
-            return Err(Error::Config(
-                "workspace must be an existing absolute non-root directory".into(),
             ));
         }
         match (&self.tls, self.listen.ip().is_loopback()) {
@@ -224,23 +217,136 @@ impl GatewayConfig {
                         .into(),
                 ));
             }
-            (Some(tls), _) => {
-                tls.validate()?;
-                if fs::canonicalize(&tls.private_key)?
-                    .starts_with(fs::canonicalize(&self.workspace)?)
-                {
-                    return Err(Error::Config(
-                        "TLS private key must be stored outside the agent workspace".into(),
-                    ));
-                }
-            }
+            (Some(tls), _) => tls.validate()?,
             (None, true) => {}
         }
-        validate_agent_composition(&self.agent.config)?;
+        if self.configured_providers.is_empty() != self.default_agent.is_none() {
+            return Err(Error::Config(
+                "the gateway default must exist exactly when a provider is configured".into(),
+            ));
+        }
+        for (provider_id, selection) in &self.configured_providers {
+            if provider_id != &selection.provider {
+                return Err(Error::Config(format!(
+                    "configured provider key `{provider_id}` does not match `{}`",
+                    selection.provider
+                )));
+            }
+            validate_provider_config(selection)?;
+        }
+        if let Some(default) = &self.default_agent {
+            if default.revision == 0 {
+                return Err(Error::Config(
+                    "configuration revision must be positive".into(),
+                ));
+            }
+            validate_agent_composition(&default.config)?;
+            if self
+                .configured_providers
+                .get(&default.config.provider.provider)
+                != Some(&default.config.provider)
+            {
+                return Err(Error::Config(
+                    "the gateway default must reference its configured provider entry".into(),
+                ));
+            }
+        }
         for usage in self.usage.days.values().chain(self.usage.sessions.values()) {
             validate_usage(usage)?;
         }
         Ok(())
+    }
+}
+
+impl ChatSpec {
+    pub(crate) fn new(
+        workspace: &Path,
+        agent: VersionedAgentConfig,
+        state_dir: &Path,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Self> {
+        let spec = Self {
+            version: CHAT_SPEC_VERSION,
+            workspace: validate_chat_workspace(workspace, state_dir, tls)?,
+            agent,
+        };
+        spec.validate(state_dir, tls)?;
+        Ok(spec)
+    }
+
+    pub(crate) fn from_metadata(
+        metadata: &BTreeMap<String, Value>,
+        state_dir: &Path,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Self> {
+        let value = metadata.get(CHAT_SPEC_METADATA_KEY).ok_or_else(|| {
+            Error::Config("chat checkpoint has no gateway runtime configuration".into())
+        })?;
+        let spec: Self = serde_json::from_value(value.clone())?;
+        spec.validate(state_dir, tls)?;
+        Ok(spec)
+    }
+
+    pub(crate) fn metadata(&self) -> Result<BTreeMap<String, Value>> {
+        Ok(BTreeMap::from([(
+            CHAT_SPEC_METADATA_KEY.into(),
+            serde_json::to_value(self)?,
+        )]))
+    }
+
+    #[must_use]
+    pub(crate) fn workspace_info(&self) -> WorkspaceInfo {
+        WorkspaceInfo {
+            id: workspace_id(&self.workspace),
+            path: self.workspace.clone(),
+        }
+    }
+
+    pub(crate) fn replacing_agent(
+        &self,
+        expected_revision: u64,
+        composition: AgentComposition,
+        state_dir: &Path,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Self> {
+        if expected_revision != self.agent.revision {
+            return Err(Error::Config(format!(
+                "configuration revision changed from {expected_revision} to {}",
+                self.agent.revision
+            )));
+        }
+        let mut next = self.clone();
+        next.agent = VersionedAgentConfig {
+            revision: self
+                .agent
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| Error::Config("configuration revision overflow".into()))?,
+            config: composition,
+        };
+        next.validate(state_dir, tls)?;
+        Ok(next)
+    }
+
+    fn validate(&self, state_dir: &Path, tls: Option<&TlsConfig>) -> Result<()> {
+        if self.version != CHAT_SPEC_VERSION {
+            return Err(Error::Config(format!(
+                "unsupported chat configuration version {}",
+                self.version
+            )));
+        }
+        if self.agent.revision == 0 {
+            return Err(Error::Config(
+                "chat configuration revision must be positive".into(),
+            ));
+        }
+        let workspace = validate_chat_workspace(&self.workspace, state_dir, tls)?;
+        if workspace != self.workspace {
+            return Err(Error::Config(
+                "chat workspace must use its canonical path".into(),
+            ));
+        }
+        validate_agent_composition(&self.agent.config)
     }
 }
 
@@ -264,13 +370,11 @@ impl ConfigStore {
     /// Initializes an owner-only state directory and new config file.
     pub fn initialize(
         state_dir: PathBuf,
-        workspace: PathBuf,
         listen: SocketAddr,
         tls: Option<TlsConfig>,
     ) -> Result<(Self, GatewayConfig)> {
-        let workspace = canonical_workspace(&workspace)?;
-        let config = GatewayConfig::new(listen, workspace.clone(), tls)?;
-        let state_dir = prepare_state_dir(state_dir, &workspace)?;
+        let config = GatewayConfig::new(listen, tls)?;
+        let state_dir = prepare_state_dir(state_dir)?;
         let store = Self::at(state_dir);
         store.save_with_mode(&config, true)?;
         Ok((store, config))
@@ -288,20 +392,14 @@ impl ConfigStore {
         if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_CONFIG_BYTES {
             return Err(Error::Config("gateway configuration is too large".into()));
         }
-        let config: GatewayConfig = serde_json::from_slice(&contents)?;
+        let config: GatewayConfig = serde_json::from_slice(&contents).map_err(|error| {
+            Error::Config(format!(
+                "gateway state at {} is incompatible with this release; remove that directory and run `horus` again: {error}",
+                store.state_dir.display()
+            ))
+        })?;
         store.validate_config(&config)?;
         Ok((store, config))
-    }
-
-    pub(crate) fn replacing_workspace(
-        &self,
-        current: &GatewayConfig,
-        workspace: &Path,
-    ) -> Result<GatewayConfig> {
-        let mut next = current.clone();
-        next.workspace = canonical_workspace(workspace)?;
-        self.validate_config(&next)?;
-        Ok(next)
     }
 
     /// Atomically replaces validated persistent configuration.
@@ -366,15 +464,7 @@ impl ConfigStore {
     }
 
     fn validate_config(&self, config: &GatewayConfig) -> Result<()> {
-        config.validate()?;
-        if self.state_dir.starts_with(&config.workspace)
-            || config.workspace.starts_with(&self.state_dir)
-        {
-            return Err(Error::Config(
-                "gateway state directory and workspace must not overlap".into(),
-            ));
-        }
-        Ok(())
+        config.validate()
     }
 }
 
@@ -483,52 +573,54 @@ pub fn validate_agent_composition(config: &AgentComposition) -> Result<()> {
             "system prompt must be 1–{MAX_SYSTEM_PROMPT_BYTES} bytes"
         )));
     }
-    if config.provider.provider.trim().is_empty() || config.provider.provider.len() > 256 {
+    validate_provider_config(&config.provider)
+}
+
+fn validate_provider_config(config: &ProviderConfig) -> Result<()> {
+    if config.provider.trim().is_empty() || config.provider.len() > 256 {
         return Err(Error::Config("provider ID must be 1–256 bytes".into()));
     }
-    if config.provider.model.trim().is_empty() || config.provider.model.len() > 1024 {
+    if config.model.trim().is_empty() || config.model.len() > 1024 {
         return Err(Error::Config("model must be 1–1024 bytes".into()));
     }
-    if let Some(name) = config.provider.api_key_env.as_deref()
-        && !valid_env_name(name)
-    {
-        return Err(Error::Config(
-            "API-key environment variable name is invalid".into(),
-        ));
-    }
-    let definition = provider(&config.provider.provider)?;
-    if matches!(definition.auth(), ProviderAuth::Browser(_))
-        && config.provider.api_key_env.is_some()
-    {
-        return Err(Error::Config(
-            "browser-auth providers cannot configure an API-key environment variable".into(),
-        ));
-    }
-    if definition.configurable_base_url() && config.provider.api_key_env.is_some() {
-        return Err(Error::Config(
-            "custom-endpoint credentials must be stored through the gateway".into(),
-        ));
-    }
+    let definition = provider(&config.provider)?;
     definition.build_config_is_valid(
-        &config.provider.model,
-        config.provider.base_url.as_deref(),
-        config.provider.reasoning_effort.as_deref(),
-        config.provider.web_search,
+        &config.model,
+        config.base_url.as_deref(),
+        config.reasoning_effort.as_deref(),
+        config.web_search,
     )?;
     Ok(())
 }
 
-fn canonical_workspace(path: &Path) -> Result<PathBuf> {
+fn validate_chat_workspace(
+    path: &Path,
+    state_dir: &Path,
+    tls: Option<&TlsConfig>,
+) -> Result<PathBuf> {
     let path = fs::canonicalize(path)?;
     if !path.is_dir() || path.parent().is_none() {
         return Err(Error::Config(
             "workspace must be an existing non-root directory".into(),
         ));
     }
+    let state_dir = fs::canonicalize(state_dir)?;
+    if path.starts_with(&state_dir) || state_dir.starts_with(&path) {
+        return Err(Error::Config(
+            "gateway state directory and chat workspace must not overlap".into(),
+        ));
+    }
+    if tls.is_some_and(|tls| {
+        fs::canonicalize(&tls.private_key).is_ok_and(|key| key.starts_with(&path))
+    }) {
+        return Err(Error::Config(
+            "TLS private key must be stored outside every chat workspace".into(),
+        ));
+    }
     Ok(path)
 }
 
-fn prepare_state_dir(path: PathBuf, workspace: &Path) -> Result<PathBuf> {
+fn prepare_state_dir(path: PathBuf) -> Result<PathBuf> {
     let name = path
         .file_name()
         .ok_or_else(|| Error::Config("gateway state directory must have a name".into()))?
@@ -539,11 +631,6 @@ fn prepare_state_dir(path: PathBuf, workspace: &Path) -> Result<PathBuf> {
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
     let path = fs::canonicalize(parent)?.join(name);
-    if path.starts_with(workspace) || workspace.starts_with(&path) {
-        return Err(Error::Config(
-            "gateway state directory and workspace must not overlap".into(),
-        ));
-    }
     match fs::create_dir(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -589,14 +676,6 @@ pub(crate) fn local_user_name() -> Option<String> {
         .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
 }
 
-fn valid_env_name(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    bytes
-        .next()
-        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
-        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
-}
-
 impl UsageHistory {
     fn observe(
         &mut self,
@@ -628,7 +707,6 @@ impl UsageHistory {
     }
 
     fn set_baseline(&mut self, session_id: &str, total: &TokenUsage) {
-        self.sessions.clear();
         self.sessions.insert(session_id.into(), total.clone());
     }
 }
@@ -679,24 +757,110 @@ fn usage_nonnegative(usage: &TokenUsage) -> bool {
 mod tests {
     use super::*;
 
+    fn test_agent() -> VersionedAgentConfig {
+        VersionedAgentConfig {
+            revision: 1,
+            config: AgentComposition::default(),
+        }
+    }
+
+    #[test]
+    fn gateway_config_is_machine_scoped() {
+        let config = GatewayConfig::new(DEFAULT_LISTEN, None).expect("gateway config");
+        let serialized = serde_json::to_value(config).expect("serialize gateway config");
+
+        assert!(serialized.get("workspace").is_none());
+        assert!(serialized["default_agent"].is_null());
+        assert_eq!(serialized["configured_providers"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn first_registered_provider_becomes_and_remains_the_default() {
+        let config = GatewayConfig::new(DEFAULT_LISTEN, None).expect("gateway config");
+        let kimi = ProviderConfig {
+            provider: "kimi".into(),
+            model: "kimi-k3".into(),
+            base_url: None,
+            reasoning_effort: Some("max".into()),
+            web_search: horus::backend::model::provider::HostedWebSearch::Off,
+        };
+        let first = config
+            .registering_provider(kimi.clone())
+            .expect("register Kimi");
+        let openrouter = ProviderConfig {
+            provider: "openrouter".into(),
+            model: "openrouter/pareto-code".into(),
+            base_url: None,
+            reasoning_effort: None,
+            web_search: horus::backend::model::provider::HostedWebSearch::Off,
+        };
+        let second = first
+            .registering_provider(openrouter.clone())
+            .expect("register OpenRouter");
+
+        assert_eq!(second.configured_providers["kimi"], kimi);
+        assert_eq!(second.configured_providers["openrouter"], openrouter);
+        assert_eq!(
+            second
+                .default_agent
+                .as_ref()
+                .expect("gateway default")
+                .config
+                .provider
+                .provider,
+            "kimi"
+        );
+
+        let mut updated = kimi;
+        updated.model = "kimi-k2.7-code".into();
+        updated.reasoning_effort = None;
+        let third = second
+            .registering_provider(updated.clone())
+            .expect("update default provider");
+        let default = third.default_agent.expect("updated default");
+        assert_eq!(default.revision, 2);
+        assert_eq!(default.config.provider, updated);
+    }
+
+    #[test]
+    fn configured_custom_provider_keeps_its_endpoint_and_model() {
+        let selection = ProviderConfig {
+            provider: "responses".into(),
+            model: "vendor/model::opaque".into(),
+            base_url: Some("https://example.com/v1".into()),
+            reasoning_effort: Some("provider-defined".into()),
+            web_search: horus::backend::model::provider::HostedWebSearch::Off,
+        };
+        let config = GatewayConfig::new(DEFAULT_LISTEN, None)
+            .expect("gateway config")
+            .registering_provider(selection.clone())
+            .expect("register custom provider");
+
+        assert_eq!(config.configured_providers["responses"], selection);
+        assert_eq!(
+            config
+                .default_agent
+                .expect("gateway default")
+                .config
+                .provider,
+            selection
+        );
+    }
+
     #[test]
     fn non_loopback_listener_requires_tls() {
-        let workspace = tempfile::tempdir().expect("workspace");
         let listen = "0.0.0.0:8741".parse().expect("listen address");
 
-        let error = GatewayConfig::new(listen, workspace.path().to_path_buf(), None)
-            .expect_err("remote plaintext must fail");
+        let error = GatewayConfig::new(listen, None).expect_err("remote plaintext must fail");
 
         assert!(error.to_string().contains("require a TLS certificate"));
     }
 
     #[test]
     fn listener_rejects_port_zero() {
-        let workspace = tempfile::tempdir().expect("workspace");
         let listen = "127.0.0.1:0".parse().expect("listen address");
 
-        let error = GatewayConfig::new(listen, workspace.path().to_path_buf(), None)
-            .expect_err("port zero must fail");
+        let error = GatewayConfig::new(listen, None).expect_err("port zero must fail");
 
         assert!(error.to_string().contains("greater than zero"));
     }
@@ -704,12 +868,10 @@ mod tests {
     #[test]
     fn invalid_configuration_does_not_create_gateway_state() {
         let root = tempfile::tempdir().expect("temporary directory");
-        let workspace = root.path().join("workspace");
-        fs::create_dir(&workspace).expect("workspace");
         let state = root.path().join("state");
         let listen = "127.0.0.1:0".parse().expect("listen address");
 
-        let error = ConfigStore::initialize(state.clone(), workspace, listen, None)
+        let error = ConfigStore::initialize(state.clone(), listen, None)
             .expect_err("invalid config must fail");
 
         assert!(error.to_string().contains("greater than zero"));
@@ -717,75 +879,168 @@ mod tests {
     }
 
     #[test]
-    fn replacement_workspace_must_be_an_existing_directory() {
+    fn incompatible_state_explains_the_required_reset() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let state = root.path().join("state");
+        let (_, config) =
+            ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize state");
+        let mut legacy = serde_json::to_value(config).expect("serialize config");
+        legacy
+            .as_object_mut()
+            .expect("config object")
+            .insert("workspace".into(), serde_json::json!(root.path()));
+        fs::write(
+            state.join(CONFIG_FILE),
+            serde_json::to_vec(&legacy).expect("encode legacy config"),
+        )
+        .expect("write legacy config");
+
+        let error = ConfigStore::open(state.clone()).expect_err("legacy state must fail");
+
+        assert!(error.to_string().contains("incompatible with this release"));
+        assert!(error.to_string().contains(&state.display().to_string()));
+    }
+
+    #[test]
+    fn chats_keep_canonical_specs_for_different_worktrees() {
+        let root = tempfile::tempdir().expect("root");
+        let state = root.path().join("state");
+        let worktrees = root.path().join("worktrees");
+        let first = worktrees.join("first");
+        let second = worktrees.join("second");
+        fs::create_dir(&state).expect("state");
+        fs::create_dir_all(&first).expect("first worktree");
+        fs::create_dir(&second).expect("second worktree");
+        let agent = test_agent();
+
+        let first_spec =
+            ChatSpec::new(&first.join("..").join("first"), agent.clone(), &state, None)
+                .expect("first chat spec");
+        let second_spec = ChatSpec::new(&second, agent, &state, None).expect("second chat spec");
+
+        assert_eq!(
+            first_spec.workspace,
+            fs::canonicalize(first).expect("first")
+        );
+        assert_eq!(
+            second_spec.workspace,
+            fs::canonicalize(second).expect("second")
+        );
+        assert_ne!(first_spec.workspace_info(), second_spec.workspace_info());
+    }
+
+    #[test]
+    fn chat_specs_reject_both_state_overlap_directions() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace_parent = root.path().join("workspace-parent");
+        let state_inside = workspace_parent.join("state");
+        let state_parent = root.path().join("state-parent");
+        let workspace_inside = state_parent.join("workspace");
+        fs::create_dir_all(&state_inside).expect("nested state");
+        fs::create_dir_all(&workspace_inside).expect("nested workspace");
+        let agent = test_agent();
+
+        let state_inside_error =
+            ChatSpec::new(&workspace_parent, agent.clone(), &state_inside, None)
+                .expect_err("state inside workspace must fail");
+        let workspace_inside_error = ChatSpec::new(&workspace_inside, agent, &state_parent, None)
+            .expect_err("workspace inside state must fail");
+
+        assert!(state_inside_error.to_string().contains("must not overlap"));
+        assert!(
+            workspace_inside_error
+                .to_string()
+                .contains("must not overlap")
+        );
+    }
+
+    #[test]
+    fn chat_spec_rejects_a_tls_private_key_inside_its_workspace() {
         let root = tempfile::tempdir().expect("root");
         let workspace = root.path().join("workspace");
         let state = root.path().join("state");
-        let file = root.path().join("file");
         fs::create_dir(&workspace).expect("workspace");
-        fs::write(&file, "not a directory").expect("file");
-        let listen = "127.0.0.1:8741".parse().expect("listen address");
-        let (store, config) =
-            ConfigStore::initialize(state, workspace, listen, None).expect("initialize config");
-
-        let error = store
-            .replacing_workspace(&config, &file)
-            .expect_err("file workspace must fail");
-
-        assert!(error.to_string().contains("existing non-root directory"));
-    }
-
-    #[test]
-    fn replacement_workspace_cannot_expose_gateway_state() {
-        let root = tempfile::tempdir().expect("root");
-        let workspace = root.path().join("workspace");
-        let state = root.path().join("state");
-        fs::create_dir(&workspace).expect("workspace");
-        let listen = "127.0.0.1:8741".parse().expect("listen address");
-        let (store, config) =
-            ConfigStore::initialize(state, workspace, listen, None).expect("initialize config");
-
-        let error = store
-            .replacing_workspace(&config, root.path())
-            .expect_err("state-containing workspace must fail");
-
-        assert!(error.to_string().contains("must not overlap"));
-    }
-
-    #[test]
-    fn rejected_workspace_overlap_does_not_create_gateway_state() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let state = workspace.path().join(".horus").join("gateway");
-        let listen = "127.0.0.1:8741".parse().expect("listen address");
-
-        let error =
-            ConfigStore::initialize(state.clone(), workspace.path().to_path_buf(), listen, None)
-                .expect_err("overlapping state must fail");
-
-        assert!(error.to_string().contains("must not overlap"));
-        assert!(!state.exists());
-    }
-
-    #[test]
-    fn tls_private_key_cannot_be_exposed_inside_the_agent_workspace() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let certificate = workspace.path().join("certificate.pem");
-        let private_key = workspace.path().join("private-key.pem");
+        fs::create_dir(&state).expect("state");
+        let certificate = root.path().join("certificate.pem");
+        let private_key = workspace.join("private-key.pem");
         fs::write(&certificate, "certificate").expect("certificate");
         fs::write(&private_key, "private key").expect("private key");
-        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let tls = TlsConfig {
+            certificate,
+            private_key,
+        };
+        let agent = test_agent();
 
-        let error = GatewayConfig::new(
-            listen,
-            workspace.path().to_path_buf(),
-            Some(TlsConfig {
-                certificate,
-                private_key,
-            }),
-        )
-        .expect_err("workspace TLS key must fail");
+        let error = ChatSpec::new(&workspace, agent, &state, Some(&tls))
+            .expect_err("workspace TLS key must fail");
 
-        assert!(error.to_string().contains("outside the agent workspace"));
+        assert!(error.to_string().contains("outside every chat workspace"));
+    }
+
+    #[test]
+    fn chat_spec_metadata_round_trips_and_revalidates_tampering() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        let state = root.path().join("state");
+        fs::create_dir(&workspace).expect("workspace");
+        fs::create_dir(&state).expect("state");
+        let agent = test_agent();
+        let spec = ChatSpec::new(&workspace, agent, &state, None).expect("chat spec");
+        let mut metadata = spec.metadata().expect("chat metadata");
+
+        assert_eq!(
+            ChatSpec::from_metadata(&metadata, &state, None).expect("restore chat spec"),
+            spec
+        );
+        metadata
+            .get_mut(CHAT_SPEC_METADATA_KEY)
+            .and_then(Value::as_object_mut)
+            .expect("chat metadata object")
+            .insert(
+                "workspace".into(),
+                serde_json::to_value(fs::canonicalize(&state).expect("canonical state"))
+                    .expect("state path value"),
+            );
+
+        let error = ChatSpec::from_metadata(&metadata, &state, None)
+            .expect_err("tampered workspace must be revalidated");
+
+        assert!(error.to_string().contains("must not overlap"));
+    }
+
+    #[test]
+    fn concurrent_session_usage_keeps_independent_baselines() {
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(2 * SECONDS_PER_DAY);
+        let usage = |tokens| TokenUsage {
+            input_tokens: tokens,
+            total_tokens: tokens,
+            ..TokenUsage::default()
+        };
+        let mut history = UsageHistory::default();
+
+        assert!(
+            !history
+                .observe("session-a", &usage(100), false, now)
+                .expect("baseline a")
+        );
+        assert!(
+            !history
+                .observe("session-b", &usage(200), false, now)
+                .expect("baseline b")
+        );
+        assert!(
+            history
+                .observe("session-a", &usage(130), true, now)
+                .expect("observe a")
+        );
+        assert!(
+            history
+                .observe("session-b", &usage(240), true, now)
+                .expect("observe b")
+        );
+
+        assert_eq!(history.sessions.len(), 2);
+        assert_eq!(history.days.get(&2), Some(&usage(70)));
     }
 
     #[test]
@@ -796,25 +1051,6 @@ mod tests {
         let error = validate_agent_composition(&config).expect_err("empty prompt must fail");
 
         assert!(error.to_string().contains("system prompt"));
-    }
-
-    #[test]
-    fn custom_endpoint_rejects_host_environment_credentials() {
-        let config = AgentComposition {
-            provider: ProviderConfig {
-                provider: "responses".into(),
-                model: "custom-model".into(),
-                base_url: Some("https://example.com/v1".into()),
-                api_key_env: Some("OPENAI_API_KEY".into()),
-                reasoning_effort: None,
-                web_search: horus::backend::model::provider::HostedWebSearch::Off,
-            },
-            ..AgentComposition::default()
-        };
-
-        let error = validate_agent_composition(&config).expect_err("host credential redirect");
-
-        assert!(error.to_string().contains("stored through the gateway"));
     }
 
     #[cfg(unix)]
@@ -841,14 +1077,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn initialized_state_and_config_are_owner_only() {
-        let workspace = tempfile::tempdir().expect("workspace");
         let state_parent = tempfile::tempdir().expect("state parent");
         let state = state_parent.path().join("gateway");
         let listen = "127.0.0.1:8741".parse().expect("listen address");
 
         let (store, _) =
-            ConfigStore::initialize(state.clone(), workspace.path().to_path_buf(), listen, None)
-                .expect("initialize config");
+            ConfigStore::initialize(state.clone(), listen, None).expect("initialize config");
 
         let directory_mode = fs::metadata(store.state_dir())
             .expect("state metadata")
@@ -866,19 +1100,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn initialization_does_not_repermission_an_existing_directory() {
-        let workspace = tempfile::tempdir().expect("workspace");
         let state = tempfile::tempdir().expect("existing state directory");
         fs::set_permissions(state.path(), fs::Permissions::from_mode(0o755))
             .expect("state permissions");
         let listen = "127.0.0.1:8741".parse().expect("listen address");
 
-        let error = ConfigStore::initialize(
-            state.path().to_path_buf(),
-            workspace.path().to_path_buf(),
-            listen,
-            None,
-        )
-        .expect_err("existing state directory must fail");
+        let error = ConfigStore::initialize(state.path().to_path_buf(), listen, None)
+            .expect_err("existing state directory must fail");
         let mode = fs::metadata(state.path())
             .expect("state metadata")
             .permissions()

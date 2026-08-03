@@ -1,5 +1,6 @@
 //! Reusable async client for CLI and native frontends.
 
+use std::collections::VecDeque;
 use std::env;
 use std::fmt;
 use std::net::IpAddr;
@@ -15,12 +16,14 @@ use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
 use crate::wire::{
-    ClientFrame, ClientMessage, ServerFrame, ServerMessage, read_frame, validate_version,
-    write_frame,
+    ClientFrame, ClientMessage, FrameReader, ServerFrame, ServerMessage, read_frame,
+    validate_version, write_frame,
 };
 use crate::{Error, Result};
 
 const DEFAULT_ENDPOINT: &str = "tcp://127.0.0.1:8741";
+/// Maximum number of frames a focused client flow may temporarily defer.
+pub const MAX_PENDING_FRAMES: usize = 1024;
 
 trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> Transport for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -62,7 +65,8 @@ pub struct GatewaySender {
 
 /// Single-owner framed event reader.
 pub struct GatewayEvents {
-    reader: ReadHalf<BoxedTransport>,
+    reader: FrameReader<ReadHalf<BoxedTransport>>,
+    pending: VecDeque<ServerFrame>,
 }
 
 impl Endpoint {
@@ -171,12 +175,8 @@ impl fmt::Display for Endpoint {
 }
 
 impl GatewayClient {
-    /// Authenticates an existing client and leaves Ready/replay frames for `events`.
-    pub async fn connect(
-        endpoint: &Endpoint,
-        token: impl Into<String>,
-        last_sequence: Option<u64>,
-    ) -> Result<Self> {
+    /// Authenticates an existing client and leaves the gateway Ready frame for `events`.
+    pub async fn connect(endpoint: &Endpoint, token: impl Into<String>) -> Result<Self> {
         let transport = endpoint.connect().await?;
         let (reader, writer) = tokio::io::split(transport);
         let client = Self::from_parts(reader, writer);
@@ -184,7 +184,6 @@ impl GatewayClient {
             .sender
             .write(ClientMessage::Authenticate {
                 token: token.into(),
-                last_sequence,
             })
             .await?;
         client.expect_authenticated().await
@@ -195,7 +194,6 @@ impl GatewayClient {
         endpoint: &Endpoint,
         code: impl Into<String>,
         client_label: impl Into<String>,
-        last_sequence: Option<u64>,
     ) -> Result<(Self, PairedClient)> {
         let transport = endpoint.connect().await?;
         let (reader, writer) = tokio::io::split(transport);
@@ -205,7 +203,6 @@ impl GatewayClient {
             .write(ClientMessage::Pair {
                 code: code.into(),
                 client_label: client_label.into(),
-                last_sequence,
             })
             .await?;
         let frame = client
@@ -239,7 +236,10 @@ impl GatewayClient {
             sender: GatewaySender {
                 writer: Arc::new(Mutex::new(writer)),
             },
-            events: GatewayEvents { reader },
+            events: GatewayEvents {
+                reader: FrameReader::new(reader),
+                pending: VecDeque::new(),
+            },
         }
     }
 
@@ -290,11 +290,30 @@ impl GatewaySender {
 impl GatewayEvents {
     /// Receives the next version-checked server frame.
     pub async fn next(&mut self) -> Result<Option<ServerFrame>> {
+        if let Some(frame) = self.pending.pop_front() {
+            return Ok(Some(frame));
+        }
         let Some(frame) = read_frame::<ServerFrame>(&mut self.reader).await? else {
             return Ok(None);
         };
         validate_version(frame.version)?;
         Ok(Some(frame))
+    }
+
+    /// Restores temporarily consumed frames ahead of unread transport data.
+    pub fn prepend(&mut self, frames: Vec<ServerFrame>) -> Result<()> {
+        if self.pending.len() + frames.len() > MAX_PENDING_FRAMES {
+            return Err(Error::Protocol(format!(
+                "gateway event backlog exceeds {MAX_PENDING_FRAMES} frames"
+            )));
+        }
+        for frame in &frames {
+            validate_version(frame.version)?;
+        }
+        for frame in frames.into_iter().rev() {
+            self.pending.push_front(frame);
+        }
+        Ok(())
     }
 }
 
@@ -324,6 +343,41 @@ fn format_address(host: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connect_authenticates_without_a_session_cursor() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway");
+        let endpoint = format!("tcp://{}", listener.local_addr().expect("gateway address"))
+            .parse::<Endpoint>()
+            .expect("gateway endpoint");
+        let gateway = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut reader = FrameReader::new(reader);
+            let frame = read_frame::<ClientFrame>(&mut reader)
+                .await
+                .expect("read authentication")
+                .expect("authentication frame");
+            write_frame(&mut writer, &ServerFrame::new(ServerMessage::Authenticated))
+                .await
+                .expect("acknowledge authentication");
+            frame
+        });
+
+        let _client = GatewayClient::connect(&endpoint, "secret")
+            .await
+            .expect("connect client");
+        let frame = gateway.await.expect("gateway task");
+
+        assert_eq!(
+            frame.message,
+            ClientMessage::Authenticate {
+                token: "secret".into()
+            }
+        );
+    }
 
     #[test]
     fn endpoint_rejects_remote_plaintext() {
@@ -356,5 +410,42 @@ mod tests {
             connection_error("unauthorized", "authentication failed".into()),
             Error::Unauthorized
         ));
+    }
+
+    #[tokio::test]
+    async fn prepended_frames_are_returned_in_order() {
+        let (transport, _peer) = tokio::io::duplex(64);
+        let (reader, _writer) = tokio::io::split(Box::new(transport) as BoxedTransport);
+        let mut events = GatewayEvents {
+            reader: FrameReader::new(reader),
+            pending: VecDeque::new(),
+        };
+        events
+            .prepend(vec![
+                ServerFrame::new(ServerMessage::Accepted {
+                    request_id: "first".into(),
+                }),
+                ServerFrame::new(ServerMessage::Accepted {
+                    request_id: "second".into(),
+                }),
+            ])
+            .expect("defer frames");
+
+        for expected in ["first", "second"] {
+            let frame = events.next().await.expect("next frame").expect("frame");
+            assert!(matches!(
+                frame.message,
+                ServerMessage::Accepted { request_id } if request_id == expected
+            ));
+        }
+        let mut invalid = ServerFrame::new(ServerMessage::Accepted {
+            request_id: "invalid".into(),
+        });
+        invalid.version = 0;
+        assert!(events.prepend(vec![invalid]).is_err());
+        let frame = ServerFrame::new(ServerMessage::Accepted {
+            request_id: "overflow".into(),
+        });
+        assert!(events.prepend(vec![frame; MAX_PENDING_FRAMES + 1]).is_err());
     }
 }

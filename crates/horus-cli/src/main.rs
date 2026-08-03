@@ -1,9 +1,10 @@
 mod frontend;
+mod gateway_accounts;
 
-use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::fs::{File, OpenOptions};
+use std::io::{IsTerminal as _, Read as _};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 #[cfg(unix)]
@@ -12,21 +13,24 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use frontend::{CronAction, FrontendExit, GatewayAction};
-use horus::protocol::{Op, Submission};
+use frontend::FrontendExit;
+use gateway_accounts::{GatewayAccounts, configured_endpoint, configured_token};
 use horus::{Error, Result};
 use horus_gateway::client::{
-    Endpoint, GatewayClient, GatewayEvents, GatewaySender, token_from_env,
+    Endpoint, GatewayClient, GatewayEvents, GatewaySender, MAX_PENDING_FRAMES,
 };
-use horus_gateway::config::state_dir;
-use horus_gateway::wire::{BootstrapPayload, ClientMessage, ReadyPayload, ServerMessage};
+use horus_gateway::config::{ConfigStore, state_dir};
+use horus_gateway::wire::{
+    BootstrapPayload, ClientMessage, ReadyPayload, ServerFrame, ServerMessage, SessionReadyPayload,
+};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 use uuid::Uuid;
 
-const USAGE: &str = "usage: horus [run <task-file> | pair <endpoint> <code> | cron <command>]";
+const USAGE: &str = "usage: horus [run <task-file> | pair <endpoint> <code>]";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_LOCAL_ENDPOINT: &str = "tcp://127.0.0.1:8741";
 const STARTUP_RETRY: Duration = Duration::from_millis(50);
 const MAX_BOOTSTRAP_BYTES: usize = 4096;
 const MAX_STARTUP_ERROR_BYTES: u64 = 8192;
@@ -48,9 +52,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
             pair(text(&endpoint, "endpoint")?, text(&code, "pairing code")?).await?;
         }
-        Some(command) if command == OsStr::new("cron") => {
-            run_cron(args.collect()).await?;
-        }
         Some(command) if command == OsStr::new("--help") || command == OsStr::new("-h") => {
             println!("{USAGE}");
         }
@@ -63,41 +64,83 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_interactive() -> Result<()> {
-    let (mut sender, mut events, mut ready, local_gateway) = connect().await?;
+    let (
+        mut sender,
+        mut events,
+        mut gateway,
+        mut session,
+        mut disposable_session,
+        mut local_gateway,
+        mut endpoint,
+    ) = connect(None).await?;
     loop {
-        let (exit, next_sender, next_events) =
-            frontend::run(sender, events, ready, local_gateway).await?;
+        let (exit, next_sender, next_events) = frontend::run(
+            sender,
+            events,
+            &mut gateway,
+            &mut session,
+            local_gateway,
+            endpoint.to_string(),
+        )
+        .await?;
         sender = next_sender;
         events = next_events;
         match exit {
             FrontendExit::Exit => return Ok(()),
-            FrontendExit::New(model_route) => {
-                ready = open_session(&sender, &mut events, None).await?;
-                submit(&sender, Op::SetModel { route: model_route }).await?;
+            FrontendExit::Discard => {
+                if let Some(session_id) = disposable_session.as_deref() {
+                    discard_session(&sender, &mut events, &mut gateway, session_id).await?;
+                }
+                return Ok(());
+            }
+            FrontendExit::New => {
+                session = create_session(
+                    &sender,
+                    &mut events,
+                    &mut gateway,
+                    session.workspace.path.clone(),
+                )
+                .await?;
+                disposable_session = None;
             }
             FrontendExit::Resume(session_id) => {
-                ready = open_session(&sender, &mut events, Some(session_id)).await?;
+                session = open_session(&sender, &mut events, &mut gateway, session_id).await?;
+                disposable_session = None;
             }
-            FrontendExit::Reload(payload) => ready = *payload,
+            FrontendExit::Reload => {}
+            FrontendExit::Reconnect => {
+                let selected = Some((endpoint.clone(), session.session.session_id.clone()));
+                (
+                    sender,
+                    events,
+                    gateway,
+                    session,
+                    disposable_session,
+                    local_gateway,
+                    endpoint,
+                ) = connect(selected).await?;
+            }
         }
     }
 }
 
 async fn run_task(task_file: &Path) -> Result<()> {
     let task = std::fs::read_to_string(task_file)?;
-    let (sender, mut events, _, _) = connect().await?;
-    let _ready = open_session(&sender, &mut events, None).await?;
-    if let Some(message) = frontend::run_headless(sender, events, task).await? {
+    let (sender, mut events, mut gateway, session, disposable_session, _, _) =
+        connect(None).await?;
+    if gateway.default_config.is_none() || gateway.models.is_empty() {
+        if let Some(session_id) = disposable_session.as_deref() {
+            discard_session(&sender, &mut events, &mut gateway, session_id).await?;
+        }
+        return Err(Error::Config(
+            "run `horus` interactively to configure a provider before using `horus run`".into(),
+        ));
+    }
+    if let Some(message) =
+        frontend::run_headless(sender, events, session.session.session_id, task).await?
+    {
         print_output(&message);
     }
-    Ok(())
-}
-
-async fn run_cron(args: Vec<OsString>) -> Result<()> {
-    let action = cron_action(&args)?;
-    let (sender, mut events, ready, _) = connect().await?;
-    let output = frontend::execute_gateway_action(&sender, &mut events, &ready, action).await?;
-    print_output(&output);
     Ok(())
 }
 
@@ -115,33 +158,85 @@ fn output_text(value: &str, terminal: bool) -> String {
 
 async fn pair(endpoint: &str, code: &str) -> std::result::Result<(), horus_gateway::Error> {
     let endpoint = endpoint.parse::<Endpoint>()?;
-    let (_client, paired) = GatewayClient::pair(&endpoint, code, "horus-cli", None).await?;
-    save_token(&token_path()?, &endpoint.to_string(), &paired.token)?;
+    let mut accounts = GatewayAccounts::load()?;
+    accounts.prepare()?;
+    let (_client, paired) = GatewayClient::pair(&endpoint, code, "horus-cli").await?;
+    accounts.add(&endpoint, paired.token)?;
+    accounts.save()?;
     println!("paired {} · token saved", paired.client_id);
     Ok(())
 }
 
-async fn connect() -> Result<(GatewaySender, GatewayEvents, ReadyPayload, bool)> {
-    let endpoint = Endpoint::from_env().map_err(gateway_error)?;
+async fn connect(
+    selected: Option<(Endpoint, String)>,
+) -> Result<(
+    GatewaySender,
+    GatewayEvents,
+    ReadyPayload,
+    SessionReadyPayload,
+    Option<String>,
+    bool,
+    Endpoint,
+)> {
+    let endpoint = configured_endpoint().map_err(gateway_error)?;
     // ponytail: TLS gateways skip local `@` scanning; use a gateway-backed inventory if needed.
     let local_gateway = endpoint.is_plaintext();
-    let token = load_token(&endpoint).map_err(gateway_error)?;
-    let connected = if automatically_manage_local_gateway() {
+    let token = configured_token(&endpoint).map_err(gateway_error)?;
+    let connected = if automatically_manage_local_gateway(&endpoint) {
         connect_local(&endpoint, token).await
     } else {
         match token {
-            Some(token) => GatewayClient::connect(&endpoint, token, None).await,
+            Some(token) => GatewayClient::connect(&endpoint, token).await,
             None => Err(missing_token(&endpoint)),
         }
     };
     let client = connected.map_err(gateway_error)?;
     let (sender, mut events) = client.into_parts();
-    let ready = wait_ready(&mut events).await?;
-    Ok((sender, events, ready, local_gateway))
+    let mut gateway = wait_gateway_ready(&mut events).await?;
+    let (session, disposable_session) = match selected.filter(|(previous, _)| previous == &endpoint)
+    {
+        Some((_, session_id)) => {
+            let session = open_session(&sender, &mut events, &mut gateway, session_id).await?;
+            (session, None)
+        }
+        None if local_gateway => {
+            let session =
+                create_session(&sender, &mut events, &mut gateway, env::current_dir()?).await?;
+            let disposable_session = (gateway.default_config.is_none()
+                || gateway.models.is_empty())
+            .then(|| session.session.session_id.clone());
+            (session, disposable_session)
+        }
+        None => {
+            let session_id = gateway
+                .sessions
+                .first()
+                .map(|session| session.summary.session_id.clone())
+                .ok_or_else(|| {
+                    Error::Stopped(
+                        "the remote gateway has no chats; create a workspace chat from a local frontend first"
+                            .into(),
+                    )
+                })?;
+            let session = open_session(&sender, &mut events, &mut gateway, session_id).await?;
+            (session, None)
+        }
+    };
+    Ok((
+        sender,
+        events,
+        gateway,
+        session,
+        disposable_session,
+        local_gateway,
+        endpoint,
+    ))
 }
 
-fn automatically_manage_local_gateway() -> bool {
-    env::var_os("HORUS_GATEWAY_ENDPOINT").is_none() && env::var_os("HORUS_GATEWAY_TOKEN").is_none()
+fn automatically_manage_local_gateway(endpoint: &Endpoint) -> bool {
+    endpoint.is_plaintext()
+        && env::var_os("HORUS_GATEWAY_ENDPOINT").is_none()
+        && env::var_os("HORUS_GATEWAY_TOKEN").is_none()
 }
 
 async fn connect_local(
@@ -154,7 +249,7 @@ async fn connect_local(
             Err(horus_gateway::Error::Io(error))
                 if error.kind() == std::io::ErrorKind::ConnectionRefused =>
             {
-                return start_local_gateway(endpoint, Some(token)).await;
+                return start_local_gateway(endpoint).await;
             }
             Err(horus_gateway::Error::Unauthorized) => {
                 return Err(missing_local_token(endpoint));
@@ -162,35 +257,85 @@ async fn connect_local(
             Err(error) => return Err(error),
         }
     }
-    start_local_gateway(endpoint, None).await
+    start_local_gateway(endpoint).await
 }
 
 async fn connect_local_once(
     endpoint: &Endpoint,
     token: &str,
 ) -> horus_gateway::Result<GatewayClient> {
-    tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        GatewayClient::connect(endpoint, token, None),
-    )
-    .await
-    .map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, "gateway connection timed out")
-    })?
+    tokio::time::timeout(CONNECT_TIMEOUT, GatewayClient::connect(endpoint, token))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "gateway connection timed out")
+        })?
 }
 
-async fn start_local_gateway(
-    endpoint: &Endpoint,
-    saved_token: Option<String>,
-) -> horus_gateway::Result<GatewayClient> {
+async fn start_local_gateway(endpoint: &Endpoint) -> horus_gateway::Result<GatewayClient> {
     let configured_state_dir = state_dir()?;
+    let _startup_lock = lock_local_gateway_startup(&configured_state_dir)?;
+    let saved_token = configured_token(endpoint)?;
+    if let Some(token) = saved_token.as_deref() {
+        match connect_local_once(endpoint, token).await {
+            Ok(client) => return Ok(client),
+            Err(horus_gateway::Error::Io(error))
+                if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Err(horus_gateway::Error::Unauthorized) => {
+                return Err(missing_local_token(endpoint));
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let binary = gateway_binary()?;
     if configured_state_dir.try_exists()? {
+        let (_, config) = ConfigStore::open(configured_state_dir.clone())?;
+        let configured_endpoint = format!(
+            "{}://{}",
+            if config.tls.is_some() { "tls" } else { "tcp" },
+            config.listen
+        );
+        if endpoint.to_string() != configured_endpoint {
+            return Err(horus_gateway::Error::Config(format!(
+                "saved endpoint {endpoint} is not the local gateway configured at {configured_endpoint}; start it separately or select the configured endpoint"
+            )));
+        }
         let token = saved_token.ok_or_else(|| missing_local_token(endpoint))?;
-        let (child, log) = spawn_gateway(&binary, &configured_state_dir, None)?;
+        let (child, log) = spawn_gateway(&binary, &configured_state_dir, false)?;
         return connect_started_gateway(endpoint, &token, child, log).await;
     }
+    if endpoint.to_string() != DEFAULT_LOCAL_ENDPOINT {
+        return Err(horus_gateway::Error::Config(format!(
+            "saved local gateway {endpoint} is stopped; start it separately before reconnecting"
+        )));
+    }
     bootstrap_local_gateway(endpoint, &binary, &configured_state_dir).await
+}
+
+fn lock_local_gateway_startup(state_dir: &Path) -> horus_gateway::Result<File> {
+    let mut name = state_dir
+        .file_name()
+        .ok_or_else(|| {
+            horus_gateway::Error::Config("gateway state directory has no file name".into())
+        })?
+        .to_os_string();
+    name.push(".startup.lock");
+    let path = state_dir.with_file_name(name);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.lock()?;
+    Ok(file)
 }
 
 async fn bootstrap_local_gateway(
@@ -198,14 +343,13 @@ async fn bootstrap_local_gateway(
     binary: &Path,
     state_dir: &Path,
 ) -> horus_gateway::Result<GatewayClient> {
-    let token_path = token_path()?;
-    prepare_token_path(&token_path)?;
-    let workspace = env::current_dir()?;
-    let (mut child, log) = spawn_gateway(binary, state_dir, Some(&workspace))?;
+    let mut accounts = GatewayAccounts::load()?;
+    accounts.prepare()?;
+    let (mut child, log) = spawn_gateway(binary, state_dir, true)?;
     let pairing_code = read_bootstrap(&mut child, &log).await?;
     let paired = match tokio::time::timeout(
         STARTUP_TIMEOUT,
-        GatewayClient::pair(endpoint, pairing_code, "horus-cli", None),
+        GatewayClient::pair(endpoint, pairing_code, "horus-cli"),
     )
     .await
     {
@@ -222,24 +366,15 @@ async fn bootstrap_local_gateway(
             return Err(error);
         }
     };
-    if let Err(error) = save_token(&token_path, &endpoint.to_string(), &paired.token) {
+    if let Err(error) = accounts
+        .add(endpoint, paired.token)
+        .and_then(|()| accounts.save())
+    {
         stop_child(&mut child).await;
         return Err(error);
     }
     detach_child(child);
     Ok(client)
-}
-
-fn prepare_token_path(path: &Path) -> horus_gateway::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| horus_gateway::Error::Config("token path has no parent".into()))?;
-    std::fs::create_dir_all(parent)?;
-    let file = tempfile::NamedTempFile::new_in(parent)?;
-    #[cfg(unix)]
-    file.as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
 }
 
 fn gateway_binary() -> horus_gateway::Result<PathBuf> {
@@ -256,7 +391,8 @@ fn gateway_binary_beside(current_executable: &Path) -> horus_gateway::Result<Pat
     let metadata = std::fs::metadata(&candidate).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             horus_gateway::Error::Config(
-                "install horus-gateway beside horus (`cargo install horus-gateway`)".into(),
+                "install horus-cli to provide horus-gateway beside horus (`cargo install --locked horus-cli`)"
+                    .into(),
             )
         } else {
             error.into()
@@ -279,19 +415,15 @@ fn gateway_binary_beside(current_executable: &Path) -> horus_gateway::Result<Pat
 fn spawn_gateway(
     binary: &Path,
     state_dir: &Path,
-    bootstrap_workspace: Option<&Path>,
+    bootstrap: bool,
 ) -> horus_gateway::Result<(Child, tempfile::NamedTempFile)> {
     let log = tempfile::NamedTempFile::new()?;
     #[cfg(unix)]
     log.as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let mut command = Command::new(binary);
-    if let Some(workspace) = bootstrap_workspace {
-        command
-            .arg("bootstrap")
-            .arg("--workspace")
-            .arg(workspace)
-            .stdout(Stdio::piped());
+    if bootstrap {
+        command.arg("bootstrap").stdout(Stdio::piped());
     } else {
         command.arg("serve").stdout(Stdio::null());
     }
@@ -452,31 +584,80 @@ fn missing_local_token(endpoint: &Endpoint) -> horus_gateway::Error {
 async fn open_session(
     sender: &GatewaySender,
     events: &mut GatewayEvents,
-    session_id: Option<String>,
-) -> Result<ReadyPayload> {
+    gateway: &mut ReadyPayload,
+    session_id: String,
+) -> Result<SessionReadyPayload> {
+    let request_id = Uuid::new_v4().to_string();
     sender
         .send(ClientMessage::OpenSession {
-            request_id: Uuid::new_v4().to_string(),
+            request_id: request_id.clone(),
             session_id,
+            last_sequence: None,
         })
         .await
         .map_err(gateway_error)?;
-    wait_ready(events).await
+    wait_session_opened(events, gateway, &request_id).await
 }
 
-async fn submit(sender: &GatewaySender, op: Op) -> Result<()> {
+async fn create_session(
+    sender: &GatewaySender,
+    events: &mut GatewayEvents,
+    gateway: &mut ReadyPayload,
+    workspace: PathBuf,
+) -> Result<SessionReadyPayload> {
+    let request_id = Uuid::new_v4().to_string();
     sender
-        .send(ClientMessage::Submit {
-            submission: Submission {
-                id: Uuid::new_v4().to_string(),
-                op,
-            },
+        .send(ClientMessage::CreateSession {
+            request_id: request_id.clone(),
+            workspace,
         })
         .await
-        .map_err(gateway_error)
+        .map_err(gateway_error)?;
+    wait_session_opened(events, gateway, &request_id).await
 }
 
-async fn wait_ready(events: &mut GatewayEvents) -> Result<ReadyPayload> {
+async fn discard_session(
+    sender: &GatewaySender,
+    events: &mut GatewayEvents,
+    gateway: &mut ReadyPayload,
+    session_id: &str,
+) -> Result<()> {
+    let request_id = Uuid::new_v4().to_string();
+    sender
+        .send(ClientMessage::DeleteSession {
+            request_id: request_id.clone(),
+            session_id: session_id.into(),
+        })
+        .await
+        .map_err(gateway_error)?;
+    let mut deferred = Vec::new();
+    let result = loop {
+        let frame = events.next().await.map_err(gateway_error)?.ok_or_else(|| {
+            Error::Stopped("gateway disconnected before discarding the setup chat".into())
+        })?;
+        match frame.message {
+            ServerMessage::Accepted { request_id: actual } if actual == request_id => break Ok(()),
+            ServerMessage::Ready { payload } => *gateway = payload,
+            ServerMessage::Sessions { sessions, .. } => gateway.sessions = sessions,
+            ServerMessage::Rejected {
+                request_id: actual,
+                message,
+                ..
+            } if actual == request_id => break Err(Error::Stopped(message)),
+            ServerMessage::Error { message, .. } => break Err(Error::Stopped(message)),
+            message if deferred.len() == MAX_PENDING_FRAMES => {
+                break Err(Error::Stopped(format!(
+                    "gateway event backlog exceeds {MAX_PENDING_FRAMES} frames while discarding the setup chat: {message:?}"
+                )));
+            }
+            message => deferred.push(ServerFrame::new(message)),
+        }
+    };
+    events.prepend(deferred).map_err(gateway_error)?;
+    result
+}
+
+async fn wait_gateway_ready(events: &mut GatewayEvents) -> Result<ReadyPayload> {
     loop {
         let frame =
             events.next().await.map_err(gateway_error)?.ok_or_else(|| {
@@ -492,38 +673,40 @@ async fn wait_ready(events: &mut GatewayEvents) -> Result<ReadyPayload> {
     }
 }
 
-fn cron_action(args: &[OsString]) -> Result<GatewayAction> {
-    let action = match args {
-        [command] if command == OsStr::new("list") => CronAction::List,
-        [command, id] if command == OsStr::new("delete") => {
-            CronAction::Delete(text(id, "task ID")?.into())
-        }
-        [command, id] if command == OsStr::new("run") => {
-            CronAction::Run(text(id, "task ID")?.into())
-        }
-        [command] if command == OsStr::new("history") => CronAction::History(None),
-        [command, id] if command == OsStr::new("history") => {
-            CronAction::History(Some(text(id, "task ID")?.into()))
-        }
-        [command, id, flag, schedule]
-            if command == OsStr::new("reschedule") && flag == OsStr::new("--schedule") =>
-        {
-            CronAction::Reschedule {
-                id: text(id, "task ID")?.into(),
-                schedule: text(schedule, "schedule")?.into(),
+async fn wait_session_opened(
+    events: &mut GatewayEvents,
+    gateway: &mut ReadyPayload,
+    request_id: &str,
+) -> Result<SessionReadyPayload> {
+    let mut deferred = Vec::new();
+    let result = loop {
+        let frame =
+            events.next().await.map_err(gateway_error)?.ok_or_else(|| {
+                Error::Stopped("gateway disconnected before opening the chat".into())
+            })?;
+        match frame.message {
+            ServerMessage::SessionOpened {
+                request_id: actual,
+                payload,
+            } if actual == request_id => break Ok(payload),
+            ServerMessage::Ready { payload } => *gateway = payload,
+            ServerMessage::Sessions { sessions, .. } => gateway.sessions = sessions,
+            ServerMessage::Rejected {
+                request_id: actual,
+                message,
+                ..
+            } if actual == request_id => break Err(Error::Stopped(message)),
+            ServerMessage::Error { message, .. } => break Err(Error::Stopped(message)),
+            message if deferred.len() == MAX_PENDING_FRAMES => {
+                break Err(Error::Stopped(format!(
+                    "gateway event backlog exceeds {MAX_PENDING_FRAMES} frames while opening a chat: {message:?}"
+                )));
             }
+            message => deferred.push(ServerFrame::new(message)),
         }
-        [task_flag, task, schedule_flag, schedule]
-            if task_flag == OsStr::new("--task") && schedule_flag == OsStr::new("--schedule") =>
-        {
-            CronAction::Add {
-                task: PathBuf::from(task),
-                schedule: text(schedule, "schedule")?.into(),
-            }
-        }
-        _ => return Err(Error::Config(USAGE.into())),
     };
-    Ok(GatewayAction::Cron(action))
+    events.prepend(deferred).map_err(gateway_error)?;
+    result
 }
 
 fn one_argument(mut args: impl Iterator<Item = OsString>, usage: &str) -> Result<OsString> {
@@ -538,95 +721,8 @@ fn text<'a>(value: &'a OsStr, name: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::Config(format!("{name} is not valid UTF-8")))
 }
 
-fn load_token(endpoint: &Endpoint) -> horus_gateway::Result<Option<String>> {
-    if env::var_os("HORUS_GATEWAY_TOKEN").is_some() {
-        return token_from_env().map(Some);
-    }
-    let path = token_path()?;
-    let metadata = match std::fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.is_file() {
-        return Err(horus_gateway::Error::Config(
-            "gateway token path is not a file".into(),
-        ));
-    }
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(horus_gateway::Error::Config(
-            "gateway token file must be readable only by its owner".into(),
-        ));
-    }
-    let contents = std::fs::read(&path)?;
-    if contents.len() > 64 * 1024 {
-        return Err(horus_gateway::Error::Config(
-            "gateway token file is too large".into(),
-        ));
-    }
-    let tokens: BTreeMap<String, String> = serde_json::from_slice(&contents)?;
-    let Some(token) = tokens.get(&endpoint.to_string()) else {
-        return Ok(None);
-    };
-    let token = token.trim();
-    if token.is_empty() || token.len() > 512 {
-        return Err(horus_gateway::Error::Config(
-            "saved gateway token is invalid".into(),
-        ));
-    }
-    Ok(Some(token.into()))
-}
-
 fn missing_token(endpoint: &Endpoint) -> horus_gateway::Error {
     horus_gateway::Error::Config(format!("pair horus-cli with {endpoint} before connecting"))
-}
-
-fn token_path() -> horus_gateway::Result<PathBuf> {
-    if let Some(path) = std::env::var_os("HORUS_GATEWAY_TOKEN_FILE") {
-        return Ok(path.into());
-    }
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .map(|path| path.join(".horus").join("gateway-tokens.json"))
-        .ok_or_else(|| {
-            horus_gateway::Error::Config(
-                "cannot determine token path; set HORUS_GATEWAY_TOKEN_FILE".into(),
-            )
-        })
-}
-
-fn save_token(path: &Path, endpoint: &str, token: &str) -> horus_gateway::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| horus_gateway::Error::Config("token path has no parent".into()))?;
-    std::fs::create_dir_all(parent)?;
-    let mut tokens: BTreeMap<String, String> = match std::fs::read(path) {
-        Ok(contents) if contents.len() <= 64 * 1024 => serde_json::from_slice(&contents)?,
-        Ok(_) => {
-            return Err(horus_gateway::Error::Config(
-                "gateway token file is too large".into(),
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-        Err(error) => return Err(error.into()),
-    };
-    if !tokens.contains_key(endpoint) && tokens.len() >= 64 {
-        return Err(horus_gateway::Error::Config(
-            "gateway token file has too many endpoints".into(),
-        ));
-    }
-    tokens.insert(endpoint.into(), token.into());
-    let contents = serde_json::to_vec(&tokens)?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    #[cfg(unix)]
-    file.as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(&contents)?;
-    file.as_file().sync_all()?;
-    file.persist(path).map_err(|error| error.error)?;
-    Ok(())
 }
 
 fn gateway_error(error: horus_gateway::Error) -> Error {
@@ -635,42 +731,9 @@ fn gateway_error(error: horus_gateway::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
-
-    #[test]
-    fn cron_cli_maps_every_scheduler_operation_to_gateway_actions() {
-        for args in [
-            vec!["list"],
-            vec!["delete", "abc"],
-            vec!["run", "abc"],
-            vec!["history"],
-            vec!["history", "abc"],
-            vec!["reschedule", "abc", "--schedule", "0 4 * * *"],
-            vec!["--task", "/work/horus/task.md", "--schedule", "0 3 * * *"],
-        ] {
-            let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
-            assert!(cron_action(&args).is_ok());
-        }
-    }
-
-    #[test]
-    fn pairing_tokens_are_scoped_to_their_exact_endpoints() {
-        let directory = tempfile::tempdir().expect("token directory");
-        let path = directory.path().join("tokens.json");
-        save_token(&path, "tcp://127.0.0.1:8741", "local-token").expect("local token");
-        save_token(&path, "tls://gateway.example:443", "remote-token").expect("remote token");
-        let tokens: BTreeMap<String, String> =
-            serde_json::from_slice(&std::fs::read(&path).expect("read tokens"))
-                .expect("parse tokens");
-
-        assert_eq!(
-            tokens,
-            BTreeMap::from([
-                ("tcp://127.0.0.1:8741".into(), "local-token".into()),
-                ("tls://gateway.example:443".into(), "remote-token".into()),
-            ])
-        );
-    }
 
     #[test]
     fn startup_errors_include_bounded_gateway_diagnostics() {
@@ -683,12 +746,55 @@ mod tests {
     }
 
     #[test]
+    fn local_gateway_startup_lock_allows_one_of_three_contenders() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state_dir = directory.path().join("gateway");
+        let lock_path = directory.path().join("gateway.startup.lock");
+        let first = lock_local_gateway_startup(&state_dir).expect("first startup lock");
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("second contender");
+        let third = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("third contender");
+
+        assert!(
+            matches!(second.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+                && matches!(third.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+        );
+
+        drop(first);
+        second.lock().expect("released startup lock");
+        drop(second);
+        drop(third);
+        assert!(lock_path.exists(), "startup lock must remain persistent");
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(lock_path)
+                .expect("startup lock metadata")
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "startup lock must be owner-only"
+        );
+    }
+
+    #[test]
     fn gateway_autostart_ignores_path_and_requires_a_sibling_binary() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let error = gateway_binary_beside(&directory.path().join("horus"))
             .expect_err("missing sibling gateway must fail");
 
-        assert!(error.to_string().contains("cargo install horus-gateway"));
+        assert!(
+            error
+                .to_string()
+                .contains("cargo install --locked horus-cli")
+        );
     }
 
     #[test]

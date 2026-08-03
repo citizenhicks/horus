@@ -5,38 +5,44 @@ composition, providers, sessions, sandboxing, usage, and scheduled work.
 
 ## Install the client
 
-Download matching `horus-cli` and `horus-gateway` archives and checksums from
+Download one `horus-cli` archive and checksum from
 [GitHub Releases](https://github.com/citizenhicks/horus/releases):
 
 - Apple Silicon macOS: `aarch64-apple-darwin`
 - x86_64 Linux: `x86_64-unknown-linux-gnu`
 
-Verify with `shasum -a 256 -c FILE.sha256`, extract both binaries into the same directory,
-and put it on your `PATH`. Rust users and other macOS or Linux architectures can install both
-with Rust 1.89 or newer:
+Verify with `shasum -a 256 -c FILE.sha256`, extract the included `horus` and
+`horus-gateway` binaries into one directory, and put it on your `PATH`. Rust users and other
+macOS or Linux architectures can install both commands with Rust 1.89 or newer:
 
 ```sh
-cargo install horus-gateway horus-cli
+cargo install --locked horus-cli
 ```
 
-## Gateway prerequisite
+If the earlier standalone gateway package is installed, run
+`cargo install --force --locked horus-cli` once to transfer both commands to this package.
 
-`horus-gateway` is the CLI's only extra runtime prerequisite; the core `horus` crate is linked
-into the binaries. Run the CLI from the workspace the local gateway should own:
+## Gateway included
+
+The CLI package installs its gateway beside `horus`; the core `horus` crate is linked into the
+binaries. Run the CLI from the workspace for the chat you want to create:
 
 ```sh
 cd /path/to/repository
 horus
 ```
 
-With no explicit gateway endpoint or token, the first run initializes the default loopback
-gateway for that directory, pairs the CLI, saves its token, and starts `horus-gateway` in the
-background. Subsequent runs reconnect to that gateway or restart it without changing its
-workspace. For a source checkout, build the sibling gateway binary first:
+With no explicit gateway endpoint or token, the first run initializes the machine-wide default
+loopback gateway, pairs the CLI, saves its token, and starts `horus-gateway` in the background.
+If no model provider is configured, the same three-page `/login` flow opens immediately. The
+first configured model becomes the gateway default for new chats.
+Each run creates a chat scoped to the current directory; `/workspace <gateway-path>` creates and
+selects another chat without changing other running chats. For a source checkout, build both
+commands from the CLI package:
 
 ```sh
-cargo build -p horus-gateway
-cargo run -p horus-cli
+cargo build -p horus-cli
+cargo run -p horus-cli --bin horus
 ```
 
 Plaintext is restricted to loopback. A gateway reachable over the network must use TLS; point the
@@ -62,41 +68,30 @@ Run one task file without the TUI:
 ```sh
 horus run path/to/task.md
 # From a source checkout:
-cargo run -p horus-cli -- run path/to/task.md
+cargo run -p horus-cli --bin horus -- run path/to/task.md
 ```
 
-The gateway workspace—not the CLI process—is the command and file boundary. An approval prompt
-aborts a headless run, so scheduled work that edits files or runs commands needs an appropriate
-gateway approval policy.
+The selected chat workspace—not the CLI process—is the command and file boundary. An approval
+prompt aborts a headless run, so scheduled work that edits files or runs commands needs an
+appropriate chat approval policy.
 
-Register that task with the gateway scheduler, for example every day at 03:00:
+Inside the TUI, `/cron new [task]` starts the model-assisted setup. The model asks for missing task
+or frequency details, then an approval-required gateway tool saves and registers the final task.
+Ordinary chat cannot create schedules. `/cron` also exposes list, reschedule, delete, run, and
+history operations for the selected chat; every scheduled execution creates a separate durable
+result chat.
 
-```sh
-horus cron --task /path/to/repository/task.md --schedule "0 3 * * *"
-```
-
-The schedule must be quoted so the shell does not expand `*`:
-
-```sh
-horus cron list
-horus cron reschedule <task-id> --schedule "0 5 * * *"
-horus cron delete <task-id>
-horus cron run <task-id>
-horus cron history [task-id]
-```
-
-Inside the TUI, `/cron` exposes the same add, list, reschedule, delete, run, and history operations.
-Every scheduled execution is a normal durable gateway session.
-
-`/providers` shows frontend-safe provider status. `/login` opens the guided provider login screen,
-where API keys can be pasted into a masked field and device-login providers show their login flow.
-`/agent` opens the same guided flow and adds provider, endpoint, and model selection. Secrets are
-sent directly to the gateway and never returned to the CLI.
-
-For a direct setup, `/login <provider>` reads that provider's standard environment variable or
-starts its device login. `/login <provider> env:NAME` reads an explicitly named variable, and
-`/agent <json>` validates, persists, and restarts an advanced composition while preserving the
-session.
+`/login` is the single provider setup path. It opens the guided provider screen, where API keys
+can be pasted into a masked field, the environment variable declared by the provider manifest is
+used when the field is empty, and device-login providers show their login flow. There is no
+separate environment-name setting. The final page confirms the provider's model and reasoning
+choice. The gateway owns the complete configured-model catalog and
+new-chat default; `/model` only changes the selected chat to one of those available routes.
+`/agent` opens a one-page capability and approval-policy editor without changing the selected
+provider or system prompt. Secrets are sent directly to the gateway and never returned to the CLI.
+`/gateway` lists saved endpoints and opens a second page to pair a new endpoint; reconnect and
+delete act on the selected saved gateway. Explicit endpoint or token environment variables make
+that screen read-only until they are unset.
 
 API-key providers use their standard environment variables:
 
@@ -107,9 +102,9 @@ export OPENROUTER_API_KEY=...
 export ANTHROPIC_API_KEY=...
 ```
 
-The CLI stores only an owner-readable endpoint-to-token map at
-`~/.horus/gateway-tokens.json`. `HORUS_GATEWAY_TOKEN` overrides it explicitly;
-`HORUS_GATEWAY_TOKEN_FILE` changes its path.
+The CLI stores only an owner-readable selected endpoint and endpoint-token map at
+`~/.horus/gateway-tokens.json`. `HORUS_GATEWAY_TOKEN` overrides the saved token explicitly;
+`HORUS_GATEWAY_TOKEN_FILE` changes the account-file path.
 
 ## Terminal contributions
 
@@ -121,13 +116,15 @@ The TUI is a thin subscriber to the framework capability catalog:
 - `@` workspace-file completion is available for a local plaintext gateway; TLS gateways do not
   scan similarly named paths on the client machine.
 
-The CLI owns only shell lifecycle and presentation commands: `/help`, `/agent`, `/providers`,
-`/login`, `/pair`, `/profile`, `/artifacts`, `/new`, `/clear`, `/model`, `/reasoning`, `/cron`,
-`/status`, `/interrupt`, and `/exit`. The menu changes with the installed gateway capabilities.
+The CLI owns only shell lifecycle and presentation commands: `/help`, `/gateway`, `/agent`,
+`/login`, `/pair`, `/profile`, `/artifacts`, `/new`, `/clear`, `/model`,
+`/reasoning`, `/cron`, `/status`, `/interrupt`, and `/exit`. The menu changes with the installed
+gateway capabilities. The gateway always contributes `/resume` as the single saved-chat picker;
+it lists chats across every workspace.
 
 The Sora-themed TUI uses the full terminal. The mouse wheel and Page Up/Page Down scroll the chat;
-Ctrl-T opens its full-screen transcript view. Arrow, page, and wheel input navigate an open preview;
-Up/Down and Ctrl-P/Ctrl-N navigate composer history.
+Ctrl-T opens a full-screen transcript view, releases mouse capture for native drag-to-copy, and
+scrolls with Arrow or Page Up/Page Down. Up/Down and Ctrl-P/Ctrl-N navigate composer history.
 
 Sandboxing runs on the gateway host and fails closed when its platform sandbox is unavailable.
 

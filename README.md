@@ -1,8 +1,8 @@
 # Horus
 
 Horus is a small Rust coding-agent framework with one headless gateway and a
-thin terminal client. The gateway owns the agent, provider credentials,
-sandbox, sessions, artifacts, usage statistics, and scheduled work.
+thin terminal client. One gateway process owns machine credentials, up to 32
+concurrent chat agents, artifacts, usage statistics, and scheduled work.
 
 | Package | Purpose |
 | --- | --- |
@@ -10,15 +10,19 @@ sandbox, sessions, artifacts, usage statistics, and scheduled work.
 | [`horus-gateway`](https://crates.io/crates/horus-gateway) | Headless authenticated agent host |
 | [`horus-cli`](https://crates.io/crates/horus-cli) | Terminal gateway client |
 
-## Run a local gateway
+## Install
 
-Download matching `horus-gateway` and `horus-cli` archives and checksums from
-[GitHub Releases](https://github.com/citizenhicks/horus/releases), placing both
-binaries in the same directory, or install them with Rust 1.89 or newer:
+Download one `horus-cli` archive and checksum from
+[GitHub Releases](https://github.com/citizenhicks/horus/releases). It contains both
+`horus` and `horus-gateway`. Rust users can install both commands with Rust 1.89 or newer:
 
 ```sh
-cargo install horus-gateway horus-cli
+cargo install --locked horus-cli
 ```
+
+Users upgrading from the earlier split packages should run
+`cargo install --force --locked horus-cli` once so Cargo transfers both commands to the CLI
+package.
 
 Then run `horus` from the workspace it should own:
 
@@ -27,11 +31,16 @@ cd /path/to/repository
 horus
 ```
 
-On first use, the CLI initializes the default local gateway for that directory,
-pairs itself, saves its token, and starts the gateway in the background. Later
-runs reconnect to it or restart it without changing its workspace. The core
-`horus` crate is linked into the binaries and is not a separate runtime
-prerequisite.
+On first use, the CLI initializes the machine-wide local gateway, pairs itself,
+saves its token, starts the gateway in the background, and opens `/login` when no
+provider is configured. The first configured model becomes the gateway default
+for new chats. Each CLI invocation
+creates an independent chat for its current directory; other terminal and app
+frontends can connect to the same gateway and open separate or shared chats.
+Workspace, model, reasoning, agent features, approval policy, and prompt are
+chat-scoped. The gateway owns the available-model catalog and new-chat default;
+a chat only selects from that catalog. The core `horus` crate is linked into the
+binaries and is not a separate runtime prerequisite.
 
 Plaintext is limited to loopback. A remote gateway must listen with a TLS
 certificate and clients pair with `tls://host:port`; setting an explicit
@@ -43,8 +52,8 @@ for manual and remote setup.
 To run the Rust binaries from this checkout:
 
 ```sh
-cargo build -p horus-gateway
-cargo run -p horus-cli
+cargo build -p horus-cli
+cargo run -p horus-cli --bin horus
 ```
 
 ## Framework

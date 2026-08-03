@@ -8,39 +8,42 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use horus::protocol::Op;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use crate::auth::{AuthStore, PairingGrant};
 use crate::config::{ConfigStore, CredentialStore, GatewayConfig, TlsConfig};
 use crate::cron::CronStore;
-use crate::host::{HostHandle, Rejection};
+use crate::host::{GatewayHost, HostHandle, Rejection};
 use crate::wire::{
-    ClientFrame, ClientMessage, DirectoryEntry, DirectoryListing, ServerFrame, ServerMessage,
-    read_frame, validate_version, write_frame,
+    ClientFrame, ClientMessage, DirectoryEntry, DirectoryListing, FrameReader, ServerFrame,
+    ServerMessage, read_frame, validate_version, write_frame,
 };
 use crate::{Error, Result};
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONNECTIONS: usize = 32;
+const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(72 * 60 * 60);
 const SCHEDULER_TICK: Duration = Duration::from_secs(15);
 const MAX_DIRECTORY_ENTRIES: usize = 512;
 
-/// Fully assembled gateway listener and its single shared agent host.
+/// Fully assembled machine gateway and its chat registry.
 pub struct GatewayServer {
     config: GatewayConfig,
     listener: TcpListener,
     auth: Arc<AuthStore>,
-    host: HostHandle,
+    host: GatewayHost,
     cron: Arc<CronStore>,
 }
 
 impl GatewayServer {
-    /// Opens protected state and starts the sole agent event owner.
+    /// Opens protected state and the machine-wide chat registry.
     pub async fn open(state_dir: PathBuf) -> Result<Self> {
         let (store, config) = ConfigStore::open(state_dir)?;
         let listener = TcpListener::bind(config.listen).await?;
@@ -50,11 +53,10 @@ impl GatewayServer {
     /// Binds and initializes a fresh local gateway before exposing its one-use pairing grant.
     pub async fn bootstrap(
         state_dir: PathBuf,
-        workspace: PathBuf,
         listen: std::net::SocketAddr,
     ) -> Result<(Self, PairingGrant)> {
         let listener = TcpListener::bind(listen).await?;
-        let (store, config) = ConfigStore::initialize(state_dir, workspace, listen, None)?;
+        let (store, config) = ConfigStore::initialize(state_dir, listen, None)?;
         let initialized_state = store.state_dir().to_path_buf();
         let result = match AuthStore::initialize(store.auth_path()) {
             Ok((_, grant)) => Self::assemble(store, config, listener)
@@ -83,8 +85,8 @@ impl GatewayServer {
     ) -> Result<Self> {
         let auth = Arc::new(AuthStore::open(store.auth_path())?);
         let credentials = Arc::new(CredentialStore::open(store.credentials_path())?);
-        let cron = Arc::new(CronStore::open(store.state_dir(), &config.workspace)?);
-        let host = HostHandle::start(store, config.clone(), credentials, Arc::clone(&cron)).await?;
+        let cron = Arc::new(CronStore::open(store.state_dir())?);
+        let host = GatewayHost::start(store, config.clone(), credentials, Arc::clone(&cron))?;
         Ok(Self {
             config,
             listener,
@@ -94,7 +96,7 @@ impl GatewayServer {
         })
     }
 
-    /// Serves until the process receives Ctrl-C.
+    /// Serves until Ctrl-C or 72 hours pass without a client or registered cron task.
     pub async fn serve(self) -> Result<()> {
         self.serve_until(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -102,8 +104,17 @@ impl GatewayServer {
         .await
     }
 
-    /// Serves until the supplied shutdown signal resolves.
+    /// Serves until shutdown or the same inactivity policy as [`Self::serve`].
     pub async fn serve_until(self, shutdown: impl Future<Output = ()>) -> Result<()> {
+        self.serve_until_inactive(shutdown, INACTIVITY_TIMEOUT)
+            .await
+    }
+
+    async fn serve_until_inactive(
+        self,
+        shutdown: impl Future<Output = ()>,
+        inactivity_timeout: Duration,
+    ) -> Result<()> {
         self.config.validate()?;
         let tls = self.config.tls.as_ref().map(tls_acceptor).transpose()?;
         if tls.is_none() && !self.listener.local_addr()?.ip().is_loopback() {
@@ -111,15 +122,24 @@ impl GatewayServer {
                 "plaintext listeners are restricted to loopback".into(),
             ));
         }
-        let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let mut connections = JoinSet::new();
+        let mut has_scheduled_tasks = self.cron.has_tasks()?;
+        let inactivity = tokio::time::sleep(inactivity_timeout);
+        tokio::pin!(inactivity);
         let mut scheduler = tokio::time::interval(SCHEDULER_TICK);
         scheduler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut scheduled_minute = None;
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
+                biased;
                 () = &mut shutdown => return Ok(()),
                 _ = scheduler.tick() => {
+                    let scheduled = self.cron.has_tasks()?;
+                    if has_scheduled_tasks && !scheduled && connections.is_empty() {
+                        inactivity.as_mut().reset(tokio::time::Instant::now() + inactivity_timeout);
+                    }
+                    has_scheduled_tasks = scheduled;
                     let minute = CronStore::current_unix_minute();
                     if scheduled_minute != Some(minute) {
                         scheduled_minute = Some(minute);
@@ -128,24 +148,27 @@ impl GatewayServer {
                             let host = self.host.clone();
                             tokio::spawn(async move {
                                 for task in due {
-                                    let _ = host.run_cron(task.id).await;
+                                    let _ = host.run_cron(task.session_id, task.id).await;
                                 }
                             });
                         }
                     }
                 }
-                accepted = self.listener.accept() => {
+                Some(_) = connections.join_next(), if !connections.is_empty() => {
+                    if connections.is_empty() {
+                        has_scheduled_tasks = self.cron.has_tasks()?;
+                        if !has_scheduled_tasks {
+                            inactivity.as_mut().reset(tokio::time::Instant::now() + inactivity_timeout);
+                        }
+                    }
+                }
+                accepted = self.listener.accept(), if connections.len() < MAX_CONNECTIONS => {
                     let (stream, _) = accepted?;
-                    let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
-                        drop(stream);
-                        continue;
-                    };
                     let auth = Arc::clone(&self.auth);
                     let host = self.host.clone();
                     let cron = Arc::clone(&self.cron);
                     let tls = tls.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
+                    connections.spawn(async move {
                         if let Some(tls) = tls {
                             if let Ok(Ok(stream)) =
                                 tokio::time::timeout(AUTH_TIMEOUT, tls.accept(stream)).await
@@ -156,6 +179,12 @@ impl GatewayServer {
                             let _ = serve_connection(stream, auth, host, cron).await;
                         }
                     });
+                }
+                () = &mut inactivity, if connections.is_empty() && !has_scheduled_tasks => {
+                    has_scheduled_tasks = self.cron.has_tasks()?;
+                    if !has_scheduled_tasks {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -171,13 +200,14 @@ impl GatewayServer {
 async fn serve_connection<S>(
     stream: S,
     auth: Arc<AuthStore>,
-    host: HostHandle,
+    host: GatewayHost,
     cron: Arc<CronStore>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = FrameReader::new(reader);
     let first = tokio::time::timeout(AUTH_TIMEOUT, read_frame::<ClientFrame>(&mut reader))
         .await
         .map_err(|_| Error::Unauthorized)??
@@ -186,12 +216,8 @@ where
         write_server_error(&mut writer, "protocol_version", error.to_string(), true).await?;
         return Ok(());
     }
-    let last_sequence = match first.message {
-        ClientMessage::Pair {
-            code,
-            client_label,
-            last_sequence,
-        } => match auth.pair(&code, &client_label) {
+    match first.message {
+        ClientMessage::Pair { code, client_label } => match auth.pair(&code, &client_label) {
             Ok(issued) => {
                 write_frame(
                     &mut writer,
@@ -201,18 +227,14 @@ where
                     }),
                 )
                 .await?;
-                last_sequence
             }
             Err(_) => {
                 write_server_error(&mut writer, "unauthorized", "pairing failed", true).await?;
                 return Ok(());
             }
         },
-        ClientMessage::Authenticate {
-            token,
-            last_sequence,
-        } => match auth.authenticate(&token) {
-            Ok(_identity) => last_sequence,
+        ClientMessage::Authenticate { token } => match auth.authenticate(&token) {
+            Ok(_identity) => {}
             Err(_) => {
                 write_server_error(&mut writer, "unauthorized", "authentication failed", true)
                     .await?;
@@ -229,76 +251,115 @@ where
             .await?;
             return Ok(());
         }
-    };
-
-    let mut broadcasts = host.subscribe();
-    write_frame(&mut writer, &ServerFrame::new(ServerMessage::Authenticated)).await?;
-    let snapshot = match host.snapshot(last_sequence).await {
-        Ok(snapshot) => snapshot,
-        Err(rejection) => {
-            write_rejection_as_error(&mut writer, &rejection).await?;
-            host.snapshot(None)
-                .await
-                .map_err(|rejection| Error::Protocol(rejection.message))?
-        }
-    };
-    write_frame(
-        &mut writer,
-        &ServerFrame::new(ServerMessage::Ready {
-            payload: snapshot.ready,
-        }),
-    )
-    .await?;
-    let mut delivered_sequence = 0;
-    for frame in snapshot.replay {
-        if let Some(sequence) = sequence(&frame) {
-            delivered_sequence = delivered_sequence.max(sequence);
-        }
-        write_frame(&mut writer, &frame).await?;
     }
 
+    write_frame(&mut writer, &ServerFrame::new(ServerMessage::Authenticated)).await?;
+    let mut gateway_broadcasts = host.subscribe();
+    let ready = host
+        .ready()
+        .await
+        .map_err(|rejection| Error::Protocol(rejection.message))?;
+    write_frame(
+        &mut writer,
+        &ServerFrame::new(ServerMessage::Ready { payload: ready }),
+    )
+    .await?;
+    let mut selected: Option<SelectedChat> = None;
+
     loop {
-        tokio::select! {
-            incoming = read_frame::<ClientFrame>(&mut reader) => {
-                let Some(frame) = incoming? else {
-                    return Ok(());
-                };
-                if let Err(error) = validate_version(frame.version) {
-                    write_server_error(&mut writer, "protocol_version", error.to_string(), true).await?;
-                    return Ok(());
-                }
-                handle_message(frame.message, &auth, &host, &cron, &mut writer).await?;
-            }
-            outgoing = broadcasts.recv() => match outgoing {
-                Ok(frame) => {
-                    if sequence(&frame).is_some_and(|value| value <= delivered_sequence) {
-                        continue;
+        let incoming = tokio::select! {
+            incoming = read_frame::<ClientFrame>(&mut reader) => Some(incoming),
+            outgoing = gateway_broadcasts.recv() => {
+                match outgoing {
+                    Ok(frame) => write_frame(&mut writer, &frame).await?,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let ready = host
+                            .ready()
+                            .await
+                            .map_err(|rejection| Error::Protocol(rejection.message))?;
+                        write_frame(
+                            &mut writer,
+                            &ServerFrame::new(ServerMessage::Ready { payload: ready }),
+                        )
+                        .await?;
                     }
-                    if let Some(value) = sequence(&frame) {
-                        delivered_sequence = value;
-                    }
-                    write_frame(&mut writer, &frame).await?;
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    write_server_error(
-                        &mut writer,
-                        "client_lagged",
-                        "the client fell behind the event stream; reconnect with the last sequence",
-                        true,
-                    ).await?;
-                    return Ok(());
-                }
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                None
             }
+            outgoing = selected_broadcast(&mut selected) => {
+                match outgoing {
+                    Ok(frame) => {
+                        let active = selected
+                            .as_mut()
+                            .expect("a selected-chat broadcast requires a selected chat");
+                        if !sequence(&frame)
+                            .is_some_and(|value| value <= active.delivered_sequence)
+                        {
+                            if let Some(value) = sequence(&frame) {
+                                active.delivered_sequence = value;
+                            }
+                            write_frame(&mut writer, &frame).await?;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        write_server_error(
+                            &mut writer,
+                            "client_lagged",
+                            "the client fell behind the event stream; reconnect with the last sequence",
+                            true,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+                None
+            }
+        };
+        let Some(incoming) = incoming else {
+            continue;
+        };
+        let Some(frame) = incoming? else {
+            return Ok(());
+        };
+        if let Err(error) = validate_version(frame.version) {
+            write_server_error(&mut writer, "protocol_version", error.to_string(), true).await?;
+            return Ok(());
         }
+        handle_message(
+            frame.message,
+            &auth,
+            &host,
+            &cron,
+            &mut selected,
+            &mut writer,
+        )
+        .await?;
+    }
+}
+
+struct SelectedChat {
+    host: HostHandle,
+    broadcasts: broadcast::Receiver<ServerFrame>,
+    delivered_sequence: u64,
+}
+
+async fn selected_broadcast(
+    selected: &mut Option<SelectedChat>,
+) -> std::result::Result<ServerFrame, broadcast::error::RecvError> {
+    match selected {
+        Some(active) => active.broadcasts.recv().await,
+        None => std::future::pending().await,
     }
 }
 
 async fn handle_message(
     message: ClientMessage,
     auth: &AuthStore,
-    host: &HostHandle,
+    gateway: &GatewayHost,
     cron: &CronStore,
+    selected: &mut Option<SelectedChat>,
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
     match message {
@@ -311,15 +372,43 @@ async fn handle_message(
             )
             .await
         }
+        ClientMessage::ListSessions { request_id } => match gateway.sessions().await {
+            Ok(sessions) => {
+                write_frame(
+                    writer,
+                    &ServerFrame::new(ServerMessage::Sessions {
+                        request_id: Some(request_id),
+                        sessions,
+                    }),
+                )
+                .await
+            }
+            Err(rejection) => write_rejection(writer, request_id, rejection).await,
+        },
+        ClientMessage::CreateSession {
+            request_id,
+            workspace,
+        } => match gateway.create_session(&workspace).await {
+            Ok(host) => open_selected(writer, selected, request_id, host, None).await,
+            Err(rejection) => write_rejection(writer, request_id, rejection).await,
+        },
         ClientMessage::OpenSession {
             request_id,
             session_id,
-        } => write_result(writer, request_id, host.open_session(session_id).await).await,
+            last_sequence,
+        } => match gateway.open_session(&session_id).await {
+            Ok(host) => open_selected(writer, selected, request_id, host, last_sequence).await,
+            Err(rejection) => write_rejection(writer, request_id, rejection).await,
+        },
         ClientMessage::RenameSession {
             request_id,
             session_id,
             title,
         } => {
+            let host = match require_selected(selected, &session_id) {
+                Ok(host) => host,
+                Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+            };
             write_result(
                 writer,
                 request_id,
@@ -332,6 +421,10 @@ async fn handle_message(
             session_id,
             pinned,
         } => {
+            let host = match require_selected(selected, &session_id) {
+                Ok(host) => host,
+                Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+            };
             write_result(
                 writer,
                 request_id,
@@ -342,16 +435,38 @@ async fn handle_message(
         ClientMessage::DeleteSession {
             request_id,
             session_id,
-        } => write_result(writer, request_id, host.delete_session(session_id).await).await,
-        ClientMessage::Submit { submission } => {
-            let request_id = submission.id.clone();
-            write_result(writer, request_id, host.submit(submission).await).await
+        } => {
+            let host = match require_selected(selected, &session_id) {
+                Ok(host) => host,
+                Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+            };
+            write_result(writer, request_id, host.delete_session(session_id).await).await
         }
-        ClientMessage::ConfigureAgent {
+        ClientMessage::Submit {
+            session_id,
+            submission,
+        } => {
+            let request_id = submission.id.clone();
+            let host = match require_selected(selected, &session_id) {
+                Ok(host) => host,
+                Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+            };
+            let result = match &submission.op {
+                Op::SetModel { route } => host.set_model(route.clone()).await,
+                _ => host.submit(submission).await,
+            };
+            write_result(writer, request_id, result).await
+        }
+        ClientMessage::ConfigureSession {
             request_id,
+            session_id,
             expected_revision,
             config,
         } => {
+            let host = match require_selected(selected, &session_id) {
+                Ok(host) => host,
+                Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+            };
             write_result(
                 writer,
                 request_id,
@@ -359,18 +474,25 @@ async fn handle_message(
             )
             .await
         }
-        ClientMessage::SetWorkspace { request_id, path } => {
-            write_result(writer, request_id, host.set_workspace(path).await).await
-        }
-        ClientMessage::GetGitDiff { request_id } => match host.git_diff().await {
-            Ok(diff) => {
-                write_frame(
-                    writer,
-                    &ServerFrame::new(ServerMessage::GitDiff { request_id, diff }),
-                )
-                .await
-            }
+        ClientMessage::GetGitDiff {
+            request_id,
+            session_id,
+        } => match require_selected(selected, &session_id) {
             Err(rejection) => write_rejection(writer, request_id, rejection).await,
+            Ok(host) => match host.git_diff().await {
+                Ok(diff) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::GitDiff {
+                            request_id,
+                            session_id,
+                            diff,
+                        }),
+                    )
+                    .await
+                }
+                Err(rejection) => write_rejection(writer, request_id, rejection).await,
+            },
         },
         ClientMessage::ListDirectories {
             request_id,
@@ -400,42 +522,64 @@ async fn handle_message(
             request_id,
             provider,
             api_key,
-        } => match host.set_credential(provider.clone(), api_key, None).await {
-            Ok(()) => {
-                write_frame(
-                    writer,
-                    &ServerFrame::new(ServerMessage::ProviderCredentialStatus {
-                        request_id,
-                        provider,
-                        configured: true,
-                    }),
-                )
+        } => {
+            match gateway
+                .set_credential(provider.clone(), api_key, None)
                 .await
+            {
+                Ok(()) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::ProviderCredentialStatus {
+                            request_id,
+                            provider,
+                            configured: true,
+                        }),
+                    )
+                    .await
+                }
+                Err(rejection) => write_rejection(writer, request_id, rejection).await,
             }
-            Err(rejection) => write_rejection(writer, request_id, rejection).await,
-        },
+        }
         ClientMessage::SetProviderEndpointCredential {
             request_id,
             provider,
             base_url,
             api_key,
-        } => match host
-            .set_credential(provider.clone(), api_key, Some(base_url))
-            .await
-        {
-            Ok(()) => {
-                write_frame(
-                    writer,
-                    &ServerFrame::new(ServerMessage::ProviderCredentialStatus {
-                        request_id,
-                        provider,
-                        configured: true,
-                    }),
-                )
+        } => {
+            match gateway
+                .set_credential(provider.clone(), api_key, Some(base_url))
                 .await
+            {
+                Ok(()) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::ProviderCredentialStatus {
+                            request_id,
+                            provider,
+                            configured: true,
+                        }),
+                    )
+                    .await
+                }
+                Err(rejection) => write_rejection(writer, request_id, rejection).await,
             }
-            Err(rejection) => write_rejection(writer, request_id, rejection).await,
-        },
+        }
+        ClientMessage::RegisterProvider { request_id, config } => {
+            match gateway.register_provider(config).await {
+                Ok(payload) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::GatewayConfigured {
+                            request_id,
+                            payload,
+                        }),
+                    )
+                    .await
+                }
+                Err(rejection) => write_rejection(writer, request_id, rejection).await,
+            }
+        }
         ClientMessage::CreatePairingCode { request_id } => match auth.create_pairing_code() {
             Ok(grant) => {
                 write_frame(
@@ -459,11 +603,11 @@ async fn handle_message(
             write_result(
                 writer,
                 request_id.clone(),
-                host.start_provider_login(request_id, provider).await,
+                gateway.start_provider_login(request_id, provider).await,
             )
             .await
         }
-        ClientMessage::GetProfile { request_id } => match host.profile().await {
+        ClientMessage::GetProfile { request_id } => match gateway.profile().await {
             Ok(profile) => {
                 write_frame(
                     writer,
@@ -476,35 +620,49 @@ async fn handle_message(
             }
             Err(rejection) => write_rejection(writer, request_id, rejection).await,
         },
-        ClientMessage::ListArtifacts { request_id } => match host.artifacts().await {
-            Ok(artifacts) => {
-                write_frame(
-                    writer,
-                    &ServerFrame::new(ServerMessage::Artifacts {
-                        request_id,
-                        artifacts,
-                    }),
-                )
-                .await
-            }
-            Err(rejection) => write_rejection(writer, request_id, rejection).await,
-        },
-        ClientMessage::AddCron {
+        ClientMessage::ListArtifacts {
             request_id,
+            session_id,
+        } => match require_selected(selected, &session_id) {
+            Err(rejection) => write_rejection(writer, request_id, rejection).await,
+            Ok(host) => match host.artifacts().await {
+                Ok(artifacts) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::Artifacts {
+                            request_id,
+                            session_id,
+                            artifacts,
+                        }),
+                    )
+                    .await
+                }
+                Err(rejection) => write_rejection(writer, request_id, rejection).await,
+            },
+        },
+        ClientMessage::StartCronSetup {
+            request_id,
+            session_id,
             task,
-            schedule,
         } => {
-            let result = cron
-                .add(&task, &schedule)
-                .map(|_| ())
-                .map_err(cron_rejection);
-            write_result(writer, request_id, result).await
+            let host = match require_selected(selected, &session_id) {
+                Ok(host) => host,
+                Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+            };
+            write_result(writer, request_id, host.start_cron_setup(task).await).await
         }
-        ClientMessage::ListCron { request_id } => match cron.list() {
+        ClientMessage::ListCron {
+            request_id,
+            session_id,
+        } => match cron.list(&session_id) {
             Ok(tasks) => {
                 write_frame(
                     writer,
-                    &ServerFrame::new(ServerMessage::CronTasks { request_id, tasks }),
+                    &ServerFrame::new(ServerMessage::CronTasks {
+                        request_id,
+                        session_id,
+                        tasks,
+                    }),
                 )
                 .await
             }
@@ -512,33 +670,111 @@ async fn handle_message(
         },
         ClientMessage::RescheduleCron {
             request_id,
+            session_id,
             id,
             schedule,
         } => {
             let result = cron
-                .reschedule(&id, &schedule)
+                .reschedule(&session_id, &id, &schedule)
                 .map(|_| ())
                 .map_err(cron_rejection);
             write_result(writer, request_id, result).await
         }
-        ClientMessage::DeleteCron { request_id, id } => {
-            let result = cron.delete(&id).map(|_| ()).map_err(cron_rejection);
+        ClientMessage::DeleteCron {
+            request_id,
+            session_id,
+            id,
+        } => {
+            let result = cron
+                .delete(&session_id, &id)
+                .map(|_| ())
+                .map_err(cron_rejection);
             write_result(writer, request_id, result).await
         }
-        ClientMessage::RunCron { request_id, id } => {
-            write_result(writer, request_id, host.run_cron(id).await).await
-        }
-        ClientMessage::ListCronHistory { request_id, id } => match cron.history(id.as_deref()) {
+        ClientMessage::RunCron {
+            request_id,
+            session_id,
+            id,
+        } => write_result(writer, request_id, gateway.run_cron(session_id, id).await).await,
+        ClientMessage::ListCronHistory {
+            request_id,
+            session_id,
+            id,
+        } => match cron.history(&session_id, id.as_deref()) {
             Ok(runs) => {
                 write_frame(
                     writer,
-                    &ServerFrame::new(ServerMessage::CronHistory { request_id, runs }),
+                    &ServerFrame::new(ServerMessage::CronHistory {
+                        request_id,
+                        session_id,
+                        runs,
+                    }),
                 )
                 .await
             }
             Err(error) => write_rejection(writer, request_id, cron_rejection(error)).await,
         },
     }
+}
+
+async fn open_selected(
+    writer: &mut (impl AsyncWrite + Unpin),
+    selected: &mut Option<SelectedChat>,
+    request_id: String,
+    host: HostHandle,
+    last_sequence: Option<u64>,
+) -> Result<()> {
+    let broadcasts = host.subscribe();
+    let snapshot = match host.snapshot(last_sequence).await {
+        Ok(snapshot) => snapshot,
+        Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+    };
+    let delivered_sequence = snapshot.ready.latest_sequence;
+    write_frame(
+        writer,
+        &ServerFrame::new(ServerMessage::SessionOpened {
+            request_id,
+            payload: snapshot.ready,
+        }),
+    )
+    .await?;
+    for frame in snapshot.replay {
+        write_frame(writer, &frame).await?;
+    }
+    *selected = Some(SelectedChat {
+        host,
+        broadcasts,
+        delivered_sequence,
+    });
+    Ok(())
+}
+
+fn require_selected<'a>(
+    selected: &'a Option<SelectedChat>,
+    session_id: &str,
+) -> std::result::Result<&'a HostHandle, Rejection> {
+    let host = require_any_selected(selected)?;
+    if host.session_id() != session_id {
+        return Err(Rejection {
+            code: "session_not_selected",
+            message: "open this chat on the connection before controlling it".into(),
+            fatal: false,
+        });
+    }
+    Ok(host)
+}
+
+fn require_any_selected(
+    selected: &Option<SelectedChat>,
+) -> std::result::Result<&HostHandle, Rejection> {
+    selected
+        .as_ref()
+        .map(|selected| &selected.host)
+        .ok_or_else(|| Rejection {
+            code: "session_required",
+            message: "create or open a chat first".into(),
+            fatal: false,
+        })
 }
 
 async fn write_result(
@@ -571,19 +807,6 @@ async fn write_rejection(
             message: rejection.message,
             fatal: rejection.fatal,
         }),
-    )
-    .await
-}
-
-async fn write_rejection_as_error(
-    writer: &mut (impl AsyncWrite + Unpin),
-    rejection: &Rejection,
-) -> Result<()> {
-    write_server_error(
-        writer,
-        rejection.code,
-        rejection.message.clone(),
-        rejection.fatal,
     )
     .await
 }
@@ -695,23 +918,263 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 
 #[cfg(test)]
 mod tests {
+    use horus::protocol::{Op, Submission};
+    use uuid::Uuid;
+
+    use crate::client::{Endpoint, GatewayClient, GatewayEvents, GatewaySender};
+
     use super::*;
+
+    async fn wait_gateway_ready(events: &mut GatewayEvents) {
+        loop {
+            let frame = events
+                .next()
+                .await
+                .expect("gateway frame")
+                .expect("gateway open");
+            if matches!(frame.message, ServerMessage::Ready { .. }) {
+                return;
+            }
+        }
+    }
+
+    async fn create_chat(
+        sender: &GatewaySender,
+        events: &mut GatewayEvents,
+        workspace: &Path,
+    ) -> String {
+        let request_id = Uuid::new_v4().to_string();
+        sender
+            .send(ClientMessage::CreateSession {
+                request_id: request_id.clone(),
+                workspace: workspace.into(),
+            })
+            .await
+            .expect("create chat");
+        loop {
+            let frame = events
+                .next()
+                .await
+                .expect("chat frame")
+                .expect("gateway open");
+            if let ServerMessage::SessionOpened {
+                request_id: actual,
+                payload,
+            } = frame.message
+                && actual == request_id
+            {
+                return payload.session.session_id;
+            }
+        }
+    }
+
+    async fn open_chat(sender: &GatewaySender, events: &mut GatewayEvents, session_id: &str) {
+        let request_id = Uuid::new_v4().to_string();
+        sender
+            .send(ClientMessage::OpenSession {
+                request_id: request_id.clone(),
+                session_id: session_id.into(),
+                last_sequence: None,
+            })
+            .await
+            .expect("open chat");
+        loop {
+            let frame = events
+                .next()
+                .await
+                .expect("chat frame")
+                .expect("gateway open");
+            if matches!(
+                frame.message,
+                ServerMessage::SessionOpened { request_id: actual, .. } if actual == request_id
+            ) {
+                return;
+            }
+        }
+    }
+
+    async fn wait_submission(events: &mut GatewayEvents, submission_id: &str) {
+        loop {
+            let frame = events
+                .next()
+                .await
+                .expect("agent frame")
+                .expect("gateway open");
+            if matches!(
+                frame.message,
+                ServerMessage::AgentEvent { event, .. }
+                    if event.submission_id.as_deref() == Some(submission_id)
+            ) {
+                return;
+            }
+        }
+    }
+
+    async fn drain_ready_replay(events: &mut GatewayEvents) {
+        while matches!(
+            tokio::time::timeout(Duration::from_millis(10), events.next()).await,
+            Ok(Ok(Some(_)))
+        ) {}
+    }
 
     #[tokio::test]
     async fn bootstrap_owns_the_listener_before_creating_state() {
         let root = tempfile::tempdir().expect("temporary directory");
-        let workspace = root.path().join("workspace");
-        fs::create_dir(&workspace).expect("workspace");
         let occupied = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("occupied listener");
         let listen = occupied.local_addr().expect("listen address");
         let state = root.path().join("state");
 
-        let result = GatewayServer::bootstrap(state.clone(), workspace, listen).await;
+        let result = GatewayServer::bootstrap(state.clone(), listen).await;
 
         assert!(matches!(result, Err(Error::Io(_))));
         assert!(!state.exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connected_client_pauses_and_resets_inactivity_shutdown() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let listen = reservation.local_addr().expect("listen address");
+        drop(reservation);
+        let (server, _) = GatewayServer::bootstrap(root.path().join("state"), listen)
+            .await
+            .expect("bootstrap gateway");
+        let serving = tokio::spawn(
+            server.serve_until_inactive(std::future::pending(), Duration::from_millis(100)),
+        );
+        let connection = tokio::net::TcpStream::connect(listen)
+            .await
+            .expect("connect client");
+
+        tokio::time::advance(Duration::from_millis(150)).await;
+        assert!(!serving.is_finished());
+        drop(connection);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert!(!serving.is_finished());
+        tokio::time::advance(Duration::from_millis(100)).await;
+
+        tokio::time::timeout(Duration::from_secs(1), serving)
+            .await
+            .expect("inactivity shutdown timeout")
+            .expect("gateway task")
+            .expect("gateway shutdown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_task_disables_inactivity_shutdown() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let listen = reservation.local_addr().expect("listen address");
+        drop(reservation);
+        let (server, _) = GatewayServer::bootstrap(root.path().join("state"), listen)
+            .await
+            .expect("bootstrap gateway");
+        let cron = Arc::clone(&server.cron);
+        let (shutdown, signal) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(server.serve_until_inactive(
+            async move {
+                let _ = signal.await;
+            },
+            Duration::from_millis(50),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(25)).await;
+        cron.add_for_test("source-chat", "do work", "0 9 * * *")
+            .expect("schedule task");
+
+        tokio::time::advance(Duration::from_millis(75)).await;
+        assert!(
+            !serving.is_finished(),
+            "scheduled task must keep gateway alive"
+        );
+        shutdown.send(()).expect("send shutdown");
+        serving
+            .await
+            .expect("gateway task")
+            .expect("gateway shutdown");
+    }
+
+    #[tokio::test]
+    async fn frontends_select_independent_chats_and_can_share_one_chat() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let first_workspace = root.path().join("first");
+        let second_workspace = root.path().join("second");
+        fs::create_dir(&first_workspace).expect("first workspace");
+        fs::create_dir(&second_workspace).expect("second workspace");
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let listen = reservation.local_addr().expect("listen address");
+        drop(reservation);
+        let (server, grant) = GatewayServer::bootstrap(root.path().join("state"), listen)
+            .await
+            .expect("bootstrap gateway");
+        let (shutdown, signal) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(server.serve_until(async move {
+            let _ = signal.await;
+        }));
+        let endpoint = format!("tcp://{listen}")
+            .parse::<Endpoint>()
+            .expect("endpoint");
+        let (first, paired) = GatewayClient::pair(&endpoint, grant.code, "first")
+            .await
+            .expect("pair first frontend");
+        let second = GatewayClient::connect(&endpoint, paired.token)
+            .await
+            .expect("connect second frontend");
+        let (first_sender, mut first_events) = first.into_parts();
+        let (second_sender, mut second_events) = second.into_parts();
+        wait_gateway_ready(&mut first_events).await;
+        wait_gateway_ready(&mut second_events).await;
+        let first_session = create_chat(&first_sender, &mut first_events, &first_workspace).await;
+        let second_session =
+            create_chat(&second_sender, &mut second_events, &second_workspace).await;
+        assert_ne!(first_session, second_session);
+        drain_ready_replay(&mut first_events).await;
+        drain_ready_replay(&mut second_events).await;
+
+        let first_submission = Uuid::new_v4().to_string();
+        first_sender
+            .send(ClientMessage::Submit {
+                session_id: first_session.clone(),
+                submission: Submission {
+                    id: first_submission.clone(),
+                    op: Op::UserInput {
+                        text: "hello".into(),
+                    },
+                },
+            })
+            .await
+            .expect("submit first chat");
+        wait_submission(&mut first_events, &first_submission).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second_events.next())
+                .await
+                .is_err(),
+            "the second frontend received another chat's event"
+        );
+
+        open_chat(&second_sender, &mut second_events, &first_session).await;
+        drain_ready_replay(&mut second_events).await;
+        let shared_submission = Uuid::new_v4().to_string();
+        first_sender
+            .send(ClientMessage::Submit {
+                session_id: first_session,
+                submission: Submission {
+                    id: shared_submission.clone(),
+                    op: Op::UserInput {
+                        text: "shared".into(),
+                    },
+                },
+            })
+            .await
+            .expect("submit shared chat");
+        wait_submission(&mut first_events, &shared_submission).await;
+        wait_submission(&mut second_events, &shared_submission).await;
+
+        shutdown.send(()).expect("stop gateway");
+        serving.await.expect("gateway task").expect("gateway stop");
     }
 
     #[test]
@@ -767,7 +1230,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejection_frames_preserve_request_correlation() {
-        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let mut reader = FrameReader::new(reader);
         write_rejection(
             &mut writer,
             "request-7".into(),

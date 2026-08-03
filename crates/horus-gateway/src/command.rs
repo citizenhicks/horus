@@ -1,3 +1,5 @@
+//! Command-line entrypoint shared by the gateway and CLI packages.
+
 use std::ffi::OsString;
 #[cfg(any(unix, test))]
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -11,11 +13,11 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use horus_gateway::auth::AuthStore;
-use horus_gateway::config::{ConfigStore, DEFAULT_LISTEN, TlsConfig, state_dir};
-use horus_gateway::server::GatewayServer;
-use horus_gateway::wire::BootstrapPayload;
-use horus_gateway::{Error, Result};
+use crate::auth::AuthStore;
+use crate::config::{ConfigStore, DEFAULT_LISTEN, TlsConfig, state_dir};
+use crate::server::GatewayServer;
+use crate::wire::BootstrapPayload;
+use crate::{Error, Result};
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
@@ -23,10 +25,9 @@ use nix::unistd::Pid;
 #[cfg(any(unix, test))]
 use serde::{Deserialize, Serialize};
 
-const USAGE: &str = "usage: horus-gateway init [--workspace PATH] [--state-dir PATH] \
-                     [--listen ADDR] [--tls-cert PATH --tls-key PATH]\n       \
-                     horus-gateway bootstrap [--workspace PATH] [--state-dir PATH] \
-                     [--listen ADDR]\n       \
+const USAGE: &str = "usage: horus-gateway init [--state-dir PATH] [--listen ADDR] \
+                     [--tls-cert PATH --tls-key PATH]\n       \
+                     horus-gateway bootstrap [--state-dir PATH] [--listen ADDR]\n       \
                      horus-gateway serve [--state-dir PATH]\n       \
                      horus-gateway pair-code [--state-dir PATH]\n       \
                      horus-gateway status [--state-dir PATH]\n       \
@@ -53,7 +54,6 @@ enum Command {
 
 #[derive(Debug)]
 struct InitOptions {
-    workspace: PathBuf,
     state_dir: PathBuf,
     listen: SocketAddr,
     tls: Option<TlsConfig>,
@@ -73,9 +73,8 @@ struct ProcessRecordGuard {
     file: File,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+/// Runs a gateway command with arguments excluding the executable name.
+pub async fn run(arguments: Vec<OsString>) -> Result<()> {
     if matches!(arguments.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!("{USAGE}");
         return Ok(());
@@ -101,8 +100,7 @@ async fn bootstrap(options: InitOptions) -> Result<()> {
         ));
     }
     let state_dir = options.state_dir.clone();
-    let (server, grant) =
-        GatewayServer::bootstrap(options.state_dir, options.workspace, options.listen).await?;
+    let (server, grant) = GatewayServer::bootstrap(options.state_dir, options.listen).await?;
     let _process_record = ProcessRecordGuard::create(&state_dir)?;
     serde_json::to_writer(
         std::io::stdout().lock(),
@@ -116,18 +114,10 @@ async fn bootstrap(options: InitOptions) -> Result<()> {
 }
 
 fn initialize(options: InitOptions) -> Result<()> {
-    let (store, config) = ConfigStore::initialize(
-        options.state_dir,
-        options.workspace,
-        options.listen,
-        options.tls,
-    )?;
+    let (store, config) = ConfigStore::initialize(options.state_dir, options.listen, options.tls)?;
     let (_, pairing) = AuthStore::initialize(store.auth_path())?;
     let scheme = if config.tls.is_some() { "tls" } else { "tcp" };
-    println!(
-        "initialized Horus gateway for {}",
-        config.workspace.display()
-    );
+    println!("initialized Horus gateway");
     println!("endpoint: {scheme}://{}", config.listen);
     println!("pairing code: {}", pairing.code);
     println!("pairing code expires at Unix time {}", pairing.expires_at);
@@ -162,7 +152,6 @@ fn show_status(state_dir: PathBuf) -> Result<()> {
         None => false,
     };
     let scheme = if config.tls.is_some() { "tls" } else { "tcp" };
-    println!("workspace: {}", config.workspace.display());
     println!("endpoint: {scheme}://{}", config.listen);
     println!("status: {}", if running { "running" } else { "stopped" });
     Ok(())
@@ -333,7 +322,6 @@ fn parse(arguments: Vec<OsString>) -> Result<Command> {
 }
 
 fn parse_init(arguments: Vec<OsString>) -> Result<InitOptions> {
-    let mut workspace = None;
     let mut configured_state_dir = None;
     let mut listen = None;
     let mut certificate = None;
@@ -343,9 +331,7 @@ fn parse_init(arguments: Vec<OsString>) -> Result<InitOptions> {
         let value = arguments
             .next()
             .ok_or_else(|| Error::Config(format!("{} requires a value", flag.to_string_lossy())))?;
-        if flag == "--workspace" {
-            set_once(&mut workspace, PathBuf::from(value), "--workspace")?;
-        } else if flag == "--state-dir" {
+        if flag == "--state-dir" {
             set_once(
                 &mut configured_state_dir,
                 PathBuf::from(value),
@@ -366,10 +352,6 @@ fn parse_init(arguments: Vec<OsString>) -> Result<InitOptions> {
             return Err(Error::Config(USAGE.into()));
         }
     }
-    let workspace = match workspace {
-        Some(workspace) => workspace,
-        None => std::env::current_dir()?,
-    };
     let state_dir = configured_state_dir.map_or_else(state_dir, Ok)?;
     let listen = listen.unwrap_or(DEFAULT_LISTEN);
     let tls = match (certificate, private_key) {
@@ -385,7 +367,6 @@ fn parse_init(arguments: Vec<OsString>) -> Result<InitOptions> {
         }
     };
     Ok(InitOptions {
-        workspace,
         state_dir,
         listen,
         tls,
@@ -428,11 +409,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_bootstrap_uses_explicit_workspace_and_state() {
+    fn parse_bootstrap_uses_machine_state_without_a_workspace() {
         let command = parse(vec![
             "bootstrap".into(),
-            "--workspace".into(),
-            "/tmp/workspace".into(),
             "--state-dir".into(),
             "/tmp/horus".into(),
         ])
@@ -440,10 +419,45 @@ mod tests {
 
         assert!(matches!(
             command,
-            Command::Bootstrap(InitOptions { workspace, state_dir, .. })
-                if workspace == std::path::Path::new("/tmp/workspace")
-                    && state_dir == std::path::Path::new("/tmp/horus")
+            Command::Bootstrap(InitOptions { state_dir, listen, tls })
+                if state_dir == std::path::Path::new("/tmp/horus")
+                    && listen == DEFAULT_LISTEN
+                    && tls.is_none()
         ));
+    }
+
+    #[test]
+    fn parse_init_uses_machine_state_without_a_workspace() {
+        let command = parse(vec![
+            "init".into(),
+            "--state-dir".into(),
+            "/tmp/horus".into(),
+            "--listen".into(),
+            "127.0.0.1:9000".into(),
+        ])
+        .expect("parse init");
+
+        assert!(matches!(
+            command,
+            Command::Init(InitOptions { state_dir, listen, tls })
+                if state_dir == std::path::Path::new("/tmp/horus")
+                    && listen == "127.0.0.1:9000".parse().expect("listen")
+                    && tls.is_none()
+        ));
+    }
+
+    #[test]
+    fn init_and_bootstrap_reject_the_removed_workspace_flag() {
+        for command in ["init", "bootstrap"] {
+            let error = parse(vec![
+                command.into(),
+                "--workspace".into(),
+                "/tmp/workspace".into(),
+            ])
+            .expect_err("workspace flag must be rejected");
+
+            assert!(error.to_string().contains("usage:"));
+        }
     }
 
     #[test]

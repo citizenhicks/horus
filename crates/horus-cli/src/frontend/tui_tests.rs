@@ -5,7 +5,7 @@ use ratatui::crossterm::event::{MouseEvent, MouseEventKind};
 use ratatui::style::Color;
 
 use super::*;
-use crate::frontend::catalog::{GatewayAction, UiCatalog};
+use crate::frontend::catalog::UiCatalog;
 use crate::frontend::theme::{Role, current};
 use horus::backend::model::ModelChoice;
 use horus::middleware::Middleware;
@@ -101,7 +101,7 @@ fn new_and_clear_keep_distinct_terminal_semantics() {
 
     assert_eq!(
         (new.submit_input(&catalog), clear.submit_input(&catalog)),
-        (UiAction::New("kimi".into()), UiAction::Clear("kimi".into()))
+        (UiAction::New, UiAction::Clear)
     );
 }
 
@@ -158,7 +158,7 @@ fn generic_picker_submits_the_selected_operation() {
     let mut state = state();
     state.handle_agent_event(
         EventMsg::Frontend(FrontendEvent::Picker {
-            title: "Resume session".into(),
+            title: "Resume chat".into(),
             options: vec![
                 horus::protocol::FrontendPickerOption {
                     label: "first".into(),
@@ -402,21 +402,6 @@ async fn remote_workspace_inventory_does_not_read_the_client_filesystem() {
         .expect("disabled workspace inventory");
 
     assert!(catalog.reference_suggestions('@', "client").is_empty());
-}
-
-#[test]
-fn pasted_agent_json_remains_a_command() {
-    let catalog = default_catalog();
-    let mut state = state();
-    let config = "{\n  \"provider\": {\"provider\": \"openai\"}\n}";
-    state.input = "/agent ".into();
-    state.cursor = state.input.len();
-    state.insert_paste(config);
-
-    assert_eq!(
-        state.submit_input(&catalog),
-        UiAction::Gateway(GatewayAction::Agent(config.into()))
-    );
 }
 
 #[test]

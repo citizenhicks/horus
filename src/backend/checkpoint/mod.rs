@@ -1,5 +1,7 @@
 //! Durable agent checkpoints.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -14,7 +16,7 @@ use crate::protocol::TokenUsage;
 
 pub mod sqlite;
 
-pub(crate) const CHECKPOINT_VERSION: u32 = 2;
+pub(crate) const CHECKPOINT_VERSION: u32 = 3;
 
 /// A tool batch waiting for a frontend decision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,6 +38,7 @@ pub struct Checkpoint {
     pub version: u32,
     pub session_id: String,
     pub session_context: SessionContext,
+    pub metadata: BTreeMap<String, Value>,
     pub catalog_visible: bool,
     pub first_user_message: Option<String>,
     pub model_route: Option<String>,
@@ -57,6 +60,7 @@ impl Checkpoint {
             version: CHECKPOINT_VERSION,
             session_id: session_id.into(),
             session_context: SessionContext::default(),
+            metadata: BTreeMap::new(),
             catalog_visible: true,
             first_user_message: None,
             model_route: None,

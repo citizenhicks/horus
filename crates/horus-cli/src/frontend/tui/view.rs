@@ -200,7 +200,7 @@ pub(super) fn render_preview(frame: &mut Frame<'_>, state: &mut TuiState) {
         .style(theme.style(Role::Canvas))
         .border_style(theme.style(Role::Info))
         .title(Line::styled(
-            format!(" {title} · ↑↓/wheel scroll · Esc/Ctrl+T close "),
+            format!(" {title} · ↑↓/PgUp/PgDn scroll · drag to copy · Esc/Ctrl+T close "),
             theme.style(Role::Accent).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -508,7 +508,7 @@ pub(super) fn welcome_card(state: &TuiState) -> String {
         format!("model: {model} {reasoning}"),
         format!("directory: {directory}"),
         "type / for commands".into(),
-        String::new(),
+        "ctrl+t transcript / copy".into(),
     ];
     let rows = WELCOME_EYE
         .iter()

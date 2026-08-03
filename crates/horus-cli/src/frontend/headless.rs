@@ -7,11 +7,13 @@ use uuid::Uuid;
 pub(crate) async fn run(
     sender: GatewaySender,
     mut events: GatewayEvents,
+    session_id: String,
     task: String,
 ) -> Result<Option<String>> {
     let submission_id = Uuid::new_v4().to_string();
     sender
         .send(ClientMessage::Submit {
+            session_id: session_id.clone(),
             submission: Submission {
                 id: submission_id.clone(),
                 op: Op::UserInput { text: task },
@@ -29,7 +31,11 @@ pub(crate) async fn run(
                 Error::Stopped("gateway disconnected before turn completion".into())
             })?;
         let event = match frame.message {
-            ServerMessage::AgentEvent { event, .. } => event,
+            ServerMessage::AgentEvent {
+                session_id: actual,
+                event,
+                ..
+            } if actual == session_id => event,
             ServerMessage::Rejected {
                 request_id,
                 message,
@@ -53,6 +59,7 @@ pub(crate) async fn run(
                 ));
                 sender
                     .send(ClientMessage::Submit {
+                        session_id: session_id.clone(),
                         submission: Submission {
                             id: Uuid::new_v4().to_string(),
                             op: Op::ExecApproval {

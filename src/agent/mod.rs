@@ -46,8 +46,6 @@ const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
 const MAX_OPERATION_BYTES: usize = 256;
 const MAX_COMMAND_ARGUMENT_BYTES: usize = 64 * 1024;
 const DEFAULT_INITIAL_REPLAY_BATCHES: usize = 100;
-const PREFERENCE_SCOPE: &str = "agent";
-const MODEL_ROUTE_KEY: &str = "model_route";
 
 /// Dependencies and policy for one agent session.
 #[derive(Clone)]
@@ -63,6 +61,8 @@ pub struct AgentConfig {
     default_context_window: i64,
     session_context: SessionContext,
     metadata: BTreeMap<String, Value>,
+    metadata_configured: bool,
+    model_route_configured: bool,
     initial_replay_batches: usize,
 }
 
@@ -89,6 +89,8 @@ impl AgentConfig {
             default_context_window: 272_000,
             session_context: SessionContext::default(),
             metadata: BTreeMap::new(),
+            metadata_configured: false,
+            model_route_configured: false,
             initial_replay_batches: DEFAULT_INITIAL_REPLAY_BATCHES,
         }
     }
@@ -122,17 +124,29 @@ impl AgentConfig {
         self
     }
 
-    /// Attaches framework-internal metadata used by installed capabilities.
+    /// Sets durable framework-internal metadata used by installed capabilities.
+    ///
+    /// On resume, calling this replaces the saved metadata. Omitting it preserves
+    /// the saved value.
     #[must_use]
     pub fn metadata(mut self, metadata: BTreeMap<String, Value>) -> Self {
         self.metadata = metadata;
+        self.metadata_configured = true;
         self
     }
 
     /// Selects a registered model route and optional reasoning effort.
     pub fn model_route(mut self, route: &str, reasoning_effort: Option<&str>) -> Result<Self> {
         self.select_model_with_reasoning(route, reasoning_effort)?;
+        self.model_route_configured = true;
         Ok(self)
+    }
+
+    /// Makes the configured router default replace a saved route on resume.
+    #[must_use]
+    pub fn override_saved_model_route(mut self) -> Self {
+        self.model_route_configured = true;
+        self
     }
 
     fn select_model(&mut self, route: &str) -> Result<ModelChoice> {
@@ -399,16 +413,6 @@ impl Runner {
         };
         self.state.model_route = Some(choice.route.clone());
         self.save().await?;
-        if self.state.catalog_visible {
-            self.config
-                .checkpoints
-                .save_state(
-                    PREFERENCE_SCOPE,
-                    MODEL_ROUTE_KEY,
-                    &serde_json::Value::String(choice.route.clone()),
-                )
-                .await?;
-        }
         self.emit(
             submission_id,
             EventMsg::ModelChanged(ModelChangedEvent {

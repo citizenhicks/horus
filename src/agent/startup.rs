@@ -8,8 +8,6 @@ use super::AgentConfig;
 use super::AgentSender;
 use super::COMMAND_QUEUE_CAPACITY;
 use super::EVENT_QUEUE_CAPACITY;
-use super::MODEL_ROUTE_KEY;
-use super::PREFERENCE_SCOPE;
 use super::Runner;
 use super::try_send_event;
 use crate::Error;
@@ -54,10 +52,18 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             "checkpoint does not match the requested session".into(),
         ));
     }
+    let mut metadata_changed = false;
     if is_new {
         state.session_context.clone_from(&config.session_context);
+        state.metadata.clone_from(&config.metadata);
     } else {
         config.session_context.clone_from(&state.session_context);
+        if config.metadata_configured {
+            metadata_changed = config.metadata != state.metadata;
+            state.metadata.clone_from(&config.metadata);
+        } else {
+            config.metadata.clone_from(&state.metadata);
+        }
     }
     let mut replay = if is_new {
         Vec::new()
@@ -86,22 +92,15 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         }
     }
     let mut recovery_delta = Vec::new();
-    let preferred_route = if is_new && state.catalog_visible {
-        config
-            .checkpoints
-            .load_state(PREFERENCE_SCOPE, MODEL_ROUTE_KEY)
-            .await?
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .filter(|route| config.model.choices().any(|choice| choice.route == *route))
+    let route = if config.model_route_configured {
+        config.provider.clone()
     } else {
-        None
+        state
+            .model_route
+            .clone()
+            .filter(|route| config.model.choices().any(|choice| choice.route == *route))
+            .unwrap_or_else(|| config.provider.clone())
     };
-    let route = state
-        .model_route
-        .clone()
-        .filter(|route| config.model.choices().any(|choice| choice.route == *route))
-        .or(preferred_route)
-        .unwrap_or_else(|| config.provider.clone());
     let choice = config.select_model(&route)?;
     let model = crate::backend::model::ModelInfo {
         model: choice.model,
@@ -151,7 +150,8 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         .into();
     let catalog = config.middleware.catalog(&runtime)?;
     let frontend = FrontendExtensions::new(Arc::clone(&config.sandbox), config.middleware.clone())?;
-    let mut state_changed = state.model_route.as_deref() != Some(route.as_str());
+    let mut state_changed =
+        metadata_changed || state.model_route.as_deref() != Some(route.as_str());
     state.model_route = Some(route);
     let uncertain_tools = !state.pending_tools.is_empty()
         && state

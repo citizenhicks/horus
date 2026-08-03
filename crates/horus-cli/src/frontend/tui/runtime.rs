@@ -17,14 +17,15 @@ use super::input::UiAction;
 use super::view::render_preview;
 use crate::frontend::FrontendExit;
 use crate::frontend::catalog::UiCatalog;
-use crate::frontend::gateway_actions::{PreparedAction, prepare, render_response};
+use crate::frontend::gateway;
+use crate::frontend::gateway_actions::{prepare, render_response};
 use crate::frontend::setup;
 use crate::frontend::terminal::{INPUT_POLL, MAX_INPUT_BATCH, TerminalGuard, poll_event};
 use horus::backend::model::ModelInfo;
 use horus::protocol::{Op, Submission};
 use horus::{Error, Result};
 use horus_gateway::client::{GatewayEvents, GatewaySender};
-use horus_gateway::wire::{ClientMessage, ReadyPayload, ServerMessage};
+use horus_gateway::wire::{ClientMessage, ReadyPayload, ServerMessage, SessionReadyPayload};
 use uuid::Uuid;
 
 const ELAPSED_INTERVAL: Duration = Duration::from_secs(1);
@@ -33,27 +34,47 @@ const CLEAR_SCREEN_AND_SCROLLBACK: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b
 pub(in crate::frontend) async fn run(
     sender: GatewaySender,
     mut events: GatewayEvents,
-    mut ready: ReadyPayload,
+    gateway: &mut ReadyPayload,
+    session: &mut SessionReadyPayload,
     mut catalog: UiCatalog,
     local_gateway: bool,
+    gateway_endpoint: String,
 ) -> Result<(FrontendExit, GatewaySender, GatewayEvents)> {
+    let mut guard = TerminalGuard::alternate()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    terminal.clear()?;
+    if gateway.default_config.is_none() || gateway.models.is_empty() {
+        setup::run(
+            &mut terminal,
+            setup::SetupMode::Login,
+            None,
+            &sender,
+            &mut events,
+            gateway,
+            session,
+        )
+        .await?;
+        if gateway.default_config.is_none() || gateway.models.is_empty() {
+            drop(terminal);
+            drop(guard);
+            return Ok((FrontendExit::Discard, sender, events));
+        }
+        catalog.replace_model_choices(&gateway.models);
+    }
     let mut workspace_inventory = catalog.start_workspace_inventory(local_gateway);
     let mut workspace_inventory_pending = true;
     let model = ModelInfo {
-        model: ready.session.model.model.clone(),
-        reasoning_effort: ready.session.model.reasoning_effort.clone(),
+        model: session.session.model.model.clone(),
+        reasoning_effort: session.session.model.reasoning_effort.clone(),
     };
-    let model_route = ready.session.model.route.clone();
-    let workspace_id = ready.workspace.id.clone();
+    let model_route = session.session.model.route.clone();
+    let session_id = session.session.session_id.clone();
     let mut state = TuiState::new(
         &catalog,
         catalog.workspace().to_path_buf(),
         model,
         model_route,
     );
-    let guard = TerminalGuard::alternate()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    terminal.clear()?;
     let mut tick = tokio::time::interval(INPUT_POLL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut elapsed = tokio::time::interval(ELAPSED_INTERVAL);
@@ -82,7 +103,14 @@ pub(in crate::frontend) async fn run(
                 match event {
                     Ok(Some(frame)) => {
                         match frame.message {
-                            ServerMessage::AgentEvent { event, blocks, history, preview, .. } => {
+                            ServerMessage::AgentEvent {
+                                session_id: actual,
+                                event,
+                                blocks,
+                                history,
+                                preview,
+                                ..
+                            } if actual == session_id => {
                                 handle_gateway_event(
                                     &mut state,
                                     event.msg,
@@ -91,44 +119,49 @@ pub(in crate::frontend) async fn run(
                                     preview,
                                 );
                             }
+                            ServerMessage::SessionOpened { payload, .. } => {
+                                *session = payload;
+                                exit = FrontendExit::Reload;
+                                break 'ui;
+                            }
                             ServerMessage::Ready { payload } => {
-                                if payload.workspace.id == ready.workspace.id
-                                    && payload.session.session_id == ready.session.session_id
-                                    && payload.config.revision == ready.config.revision
-                                    && payload.contributions == ready.contributions
+                                *gateway = payload;
+                                sync_gateway_models(&mut state, &mut catalog, gateway);
+                            }
+                            ServerMessage::SessionChanged { payload }
+                                if payload.session.session_id == session_id
+                                    && payload.config.revision >= session.config.revision =>
+                            {
+                                if payload.workspace.id == session.workspace.id
+                                    && payload.contributions == session.contributions
                                 {
-                                    refresh_ready(&mut state, &mut catalog, &mut ready, payload);
+                                    refresh_session(&mut state, session, payload);
                                 } else {
-                                    exit = FrontendExit::Reload(Box::new(payload));
+                                    *session = payload;
+                                    exit = FrontendExit::Reload;
                                     break 'ui;
                                 }
                             }
-                            ServerMessage::ConfigChanged { .. } => {}
-                            ServerMessage::Artifacts { artifacts, .. } => {
+                            ServerMessage::Artifacts {
+                                session_id: actual,
+                                artifacts,
+                                ..
+                            } if actual == session_id => {
                                 for artifact in artifacts {
                                     state.push(artifact.title, TranscriptTone::Neutral);
                                     state.apply_block(artifact.block);
                                 }
                             }
                             message => {
-                                if let Some(message) = render_response(&message) {
+                                if let Some(message) = render_response(&message, &session_id) {
                                     state.push(message, TranscriptTone::Neutral);
                                 }
                             }
                         }
                         if let Some(request) = state.requested_resume.take() {
-                            if same_workspace(
-                                Some(&workspace_id),
-                                request.context.workspace_id.as_deref(),
-                            ) {
-                                clear_on_exit = true;
-                                exit = FrontendExit::Resume(request.session_id);
-                                break 'ui;
-                            }
-                            state.push(
-                                "session belongs to another workspace · start Horus there to resume",
-                                TranscriptTone::Warning,
-                            );
+                            clear_on_exit = true;
+                            exit = FrontendExit::Resume(request.session_id);
+                            break 'ui;
                         }
                     }
                     Ok(None) => {
@@ -180,55 +213,68 @@ pub(in crate::frontend) async fn run(
                         UiAction::None => {}
                         UiAction::Exit => {
                             if let Some(turn_id) = state.active_turn.clone() {
-                                let _ = send_op(&sender, Op::Interrupt { turn_id }).await;
+                                let _ = send_op(&sender, &session_id, Op::Interrupt { turn_id }).await;
                             }
                             break 'ui;
                         }
-                        UiAction::New(model_route) => {
-                            exit = FrontendExit::New(model_route);
+                        UiAction::New => {
+                            exit = FrontendExit::New;
                             break 'ui;
                         }
-                        UiAction::Clear(model_route) => {
+                        UiAction::Clear => {
                             clear_on_exit = true;
-                            exit = FrontendExit::New(model_route);
+                            exit = FrontendExit::New;
                             break 'ui;
                         }
                         UiAction::Submit(op) => {
-                            if let Err(error) = send_op(&sender, op).await {
+                            if let Err(error) = send_op(&sender, &session_id, op).await {
                                 state.push(error.to_string(), TranscriptTone::Error);
                             }
                         }
-                        UiAction::Gateway(action) => match prepare(action, &ready) {
-                            Ok(PreparedAction::Print(message)) => {
-                                state.push(message, TranscriptTone::Neutral);
-                            }
-                            Ok(PreparedAction::Send { message, .. }) => {
-                                if let Err(error) = sender.send(message).await {
+                        UiAction::Gateway(action) => match prepare(action, &session_id) {
+                            Ok(message) => {
+                                if let Err(error) = sender.send(*message).await {
                                     state.push(error.to_string(), TranscriptTone::Error);
                                 }
                             }
                             Err(error) => state.push(error.to_string(), TranscriptTone::Error),
                         },
-                        UiAction::Setup(mode) => {
-                            let workspace = ready.workspace.id.clone();
-                            let session = ready.session.session_id.clone();
-                            let contributions = ready.contributions.clone();
+                        UiAction::GatewaySettings => {
+                            match gateway::run(&mut terminal, &gateway_endpoint).await {
+                                Ok(true) => {
+                                    exit = FrontendExit::Reconnect;
+                                    break 'ui;
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    state.push(error.to_string(), TranscriptTone::Error);
+                                }
+                            }
+                            dirty = true;
+                        }
+                        UiAction::Setup { mode, provider } => {
+                            let workspace = session.workspace.id.clone();
+                            let selected = session.session.session_id.clone();
+                            let contributions = session.contributions.clone();
                             let result = setup::run(
                                 &mut terminal,
                                 mode,
+                                provider.as_deref(),
                                 &sender,
                                 &mut events,
-                                &mut ready,
+                                gateway,
+                                session,
                             )
                             .await;
-                            if ready.workspace.id != workspace
-                                || ready.session.session_id != session
-                                || ready.contributions != contributions
+                            if session.workspace.id != workspace
+                                || session.session.session_id != selected
+                                || session.contributions != contributions
                             {
-                                exit = FrontendExit::Reload(Box::new(ready));
+                                exit = FrontendExit::Reload;
                                 break 'ui;
                             }
-                            sync_ready(&mut state, &mut catalog, &ready);
+                            sync_gateway_models(&mut state, &mut catalog, gateway);
+                            sync_session(&mut state, session);
                             if let Err(error) = result {
                                 state.push(error.to_string(), TranscriptTone::Error);
                             }
@@ -247,6 +293,7 @@ pub(in crate::frontend) async fn run(
                 dirty = true;
             }
         }
+        guard.set_mouse_capture(state.preview.is_none())?;
     }
     drop(terminal);
     drop(guard);
@@ -256,32 +303,39 @@ pub(in crate::frontend) async fn run(
     Ok((exit, sender, events))
 }
 
-fn refresh_ready(
+fn refresh_session(
     state: &mut TuiState,
-    catalog: &mut UiCatalog,
-    ready: &mut ReadyPayload,
-    payload: ReadyPayload,
+    session: &mut SessionReadyPayload,
+    payload: SessionReadyPayload,
 ) {
-    sync_ready(state, catalog, &payload);
-    *ready = payload;
+    sync_session(state, &payload);
+    *session = payload;
 }
 
-fn sync_ready(state: &mut TuiState, catalog: &mut UiCatalog, ready: &ReadyPayload) {
-    state.model.model = super::terminal_text(&ready.session.model.model);
-    state.model.reasoning_effort = ready
+fn sync_session(state: &mut TuiState, session: &SessionReadyPayload) {
+    state.model.model = super::terminal_text(&session.session.model.model);
+    state.model.reasoning_effort = session
         .session
         .model
         .reasoning_effort
         .as_deref()
         .map(super::terminal_text);
-    state.model_route.clone_from(&ready.session.model.route);
-    state.model_choices.clone_from(&ready.model_choices);
-    catalog.replace_model_choices(&ready.model_choices);
+    state.model_route.clone_from(&session.session.model.route);
 }
 
-async fn send_op(sender: &horus_gateway::client::GatewaySender, op: Op) -> Result<()> {
+fn sync_gateway_models(state: &mut TuiState, catalog: &mut UiCatalog, gateway: &ReadyPayload) {
+    state.model_choices.clone_from(&gateway.models);
+    catalog.replace_model_choices(&gateway.models);
+}
+
+async fn send_op(
+    sender: &horus_gateway::client::GatewaySender,
+    session_id: &str,
+    op: Op,
+) -> Result<()> {
     sender
         .send(ClientMessage::Submit {
+            session_id: session_id.into(),
             submission: Submission {
                 id: Uuid::new_v4().to_string(),
                 op,
@@ -289,20 +343,4 @@ async fn send_op(sender: &horus_gateway::client::GatewaySender, op: Op) -> Resul
         })
         .await
         .map_err(|error| Error::Stopped(error.to_string()))
-}
-
-fn same_workspace(current: Option<&str>, target: Option<&str>) -> bool {
-    current.is_some() && current == target
-}
-
-#[cfg(test)]
-mod tests {
-    use super::same_workspace;
-
-    #[test]
-    fn resume_requires_matching_known_workspace_ids() {
-        assert!(same_workspace(Some("workspace-a"), Some("workspace-a")));
-        assert!(!same_workspace(Some("workspace-a"), Some("workspace-b")));
-        assert!(!same_workspace(None, None));
-    }
 }

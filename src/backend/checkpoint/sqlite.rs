@@ -30,7 +30,7 @@ use crate::Error;
 use crate::Result;
 use crate::protocol::SessionContext;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SCHEMA: &str = "
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS transcript_delta (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS sessions_recent_idx
     ON sessions(updated_at DESC, latest_sequence DESC, session_id DESC);
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 COMMIT;
 ";
 
@@ -733,6 +733,40 @@ mod tests {
                     .collect::<Vec<_>>(),
             ),
             (context.clone(), context.clone(), vec![&context, &context])
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_round_trips_through_save_and_fork() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+        let mut parent = Checkpoint::empty("parent");
+        parent
+            .metadata
+            .insert("gateway.chat".into(), json!({"workspace": "/srv/project"}));
+        store.save(&parent, &[]).await.expect("save parent");
+        let mut child = Checkpoint::empty("child");
+        child.metadata.clone_from(&parent.metadata);
+
+        store
+            .fork(&parent.session_id, parent.sequence, &child)
+            .await
+            .expect("fork session");
+        let loaded_parent = store
+            .load("parent")
+            .await
+            .expect("load parent")
+            .expect("parent checkpoint");
+        let loaded_child = store
+            .load("child")
+            .await
+            .expect("load child")
+            .expect("child checkpoint");
+
+        assert_eq!(
+            (loaded_parent.metadata, loaded_child.metadata),
+            (parent.metadata, child.metadata)
         );
     }
 

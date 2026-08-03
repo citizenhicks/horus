@@ -164,6 +164,13 @@ impl AgentScope {
         checkpoint.catalog_visible = false;
         checkpoint.context = fork_context(&context, turns);
         checkpoint.session_context = parent.session_context;
+        let metadata = AgentIdentity {
+            root_session_id: self.root_session_id.clone(),
+            agent_path: agent_path.clone(),
+            depth: self.depth + 1,
+        }
+        .metadata(self.metadata.clone());
+        checkpoint.metadata.clone_from(&metadata);
         self.checkpoints
             .fork(&self.session_id, parent_sequence, &checkpoint)
             .await?;
@@ -171,12 +178,7 @@ impl AgentScope {
             session_id,
             model,
             reasoning_effort,
-            metadata: AgentIdentity {
-                root_session_id: self.root_session_id.clone(),
-                agent_path,
-                depth: self.depth + 1,
-            }
-            .metadata(self.metadata.clone()),
+            metadata,
         })
         .await
     }
@@ -931,6 +933,71 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fork_persists_the_metadata_passed_to_the_child() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+            crate::backend::checkpoint::sqlite::SqliteCheckpoint::new(
+                workspace.path().join("checkpoints.sqlite3"),
+            )
+            .expect("checkpoint store"),
+        );
+        let mut parent = Checkpoint::empty("parent");
+        parent.metadata.insert(
+            "gateway.chat".into(),
+            serde_json::json!({"workspace": "/srv/project"}),
+        );
+        checkpoints.save(&parent, &[]).await.expect("save parent");
+        let launched = Arc::new(std::sync::Mutex::new(None));
+        let launcher: SubagentLauncher = Arc::new({
+            let launched = Arc::clone(&launched);
+            move |launch| {
+                *launched.lock().expect("launch metadata lock") = Some(launch.metadata);
+                Box::pin(async { Err(Error::Stopped("test launch stopped".into())) })
+            }
+        });
+        let runtime = RuntimeContext {
+            checkpoints: Arc::clone(&checkpoints),
+            session_id: parent.session_id.clone(),
+            model_route: "test".into(),
+            session_context: parent.session_context.clone(),
+            metadata: parent.metadata.clone(),
+            frontend: Arc::new(|_| {}),
+        };
+        let scope = AgentScope::new(&runtime, launcher).expect("agent scope");
+
+        let result = scope
+            .fork(
+                "child".into(),
+                "/root/child".into(),
+                "test".into(),
+                None,
+                ForkTurns::None,
+            )
+            .await;
+        assert!(matches!(result, Err(Error::Stopped(_))));
+        let child = checkpoints
+            .load("child")
+            .await
+            .expect("load child")
+            .expect("child checkpoint");
+        let launched = launched
+            .lock()
+            .expect("launch metadata lock")
+            .clone()
+            .expect("launched metadata");
+        let identity = AgentIdentity::read("child", &child.metadata).expect("child identity");
+
+        assert_eq!(child.metadata, launched);
+        assert_eq!(
+            child.metadata.get("gateway.chat"),
+            parent.metadata.get("gateway.chat")
+        );
+        assert_eq!(identity.root_session_id, "parent");
+        assert_eq!(identity.agent_path, "/root/child");
+        assert_eq!(identity.depth, 1);
+    }
 
     #[test]
     fn cleanup_failures_preserve_both_errors() {
