@@ -18,6 +18,7 @@ use horus::middleware::sessions::Sessions;
 use horus::middleware::skills::Skills;
 use horus::middleware::steering::Steering;
 use horus::middleware::subagents::{SubagentLaunch, SubagentLauncher, Subagents};
+use horus::middleware::tasks::Tasks;
 use horus::middleware::tools::Tools;
 use horus::middleware::{Middleware, MiddlewareStack};
 use horus::protocol::SessionContext;
@@ -570,6 +571,7 @@ fn build_middleware(
                 workspace.join(".agents/skills"),
                 workspace.join(".codex/skills"),
             ])?),
+            BuiltinMiddleware::Tasks => Arc::new(Tasks),
             BuiltinMiddleware::Subagents => Arc::new(Subagents::new(
                 4,
                 8,

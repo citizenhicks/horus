@@ -11,6 +11,7 @@ pub(crate) enum BuiltinMiddleware {
     Instructions,
     Cron,
     Skills,
+    Tasks,
     Subagents,
     Steering,
     Compaction,
@@ -26,7 +27,7 @@ pub(crate) struct MiddlewareDefinition {
     default_enabled: bool,
 }
 
-pub(crate) const MIDDLEWARE: [MiddlewareDefinition; 8] = [
+pub(crate) const MIDDLEWARE: [MiddlewareDefinition; 9] = [
     MiddlewareDefinition {
         kind: BuiltinMiddleware::Tools,
         id: "tools",
@@ -58,6 +59,14 @@ pub(crate) const MIDDLEWARE: [MiddlewareDefinition; 8] = [
         description: "Discover local SKILL.md capabilities",
         required: false,
         default_enabled: true,
+    },
+    MiddlewareDefinition {
+        kind: BuiltinMiddleware::Tasks,
+        id: "tasks",
+        label: "Tasks",
+        description: "Maintain a durable todo list for multi-step work",
+        required: false,
+        default_enabled: false,
     },
     MiddlewareDefinition {
         kind: BuiltinMiddleware::Subagents,
@@ -139,6 +148,7 @@ mod tests {
         let config = default_config();
         let features = features();
 
+        assert!(!config.enabled("tasks"));
         assert!(
             features
                 .iter()

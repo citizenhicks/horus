@@ -30,6 +30,7 @@ pub mod sessions;
 pub mod skills;
 pub mod steering;
 pub mod subagents;
+pub mod tasks;
 pub mod tools;
 
 use tools::Catalog;
