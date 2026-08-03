@@ -25,11 +25,16 @@ mod process_group;
 pub(crate) const MAX_FILE_BYTES: usize = 1024 * 1024;
 
 pub use approval::ApprovalPolicy;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use process_group::MACOS_COMMAND_WRAPPER;
 #[doc(hidden)]
 pub use process_group::ProcessGroupGuard;
 
 use approval::Approval;
 pub(crate) use background::BackgroundCommandPoll;
+#[cfg(test)]
+pub(crate) use background::BackgroundCommandStatus;
 use background::BackgroundCommands;
 
 /// Deny-by-default macOS Seatbelt prelude shared by first-party sandbox backends.
@@ -61,6 +66,13 @@ pub struct CommandOutput {
 pub enum CommandStream {
     Stdout,
     Stderr,
+}
+
+/// Whether command execution has a foreground deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandMode {
+    Foreground,
+    Background,
 }
 
 /// Optional observer for bounded command output consumers.
@@ -99,6 +111,7 @@ pub trait SandboxBackend: Send + Sync {
         &'a self,
         command: &'a str,
         network_access: NetworkAccess,
+        mode: CommandMode,
         output: CommandOutputSink,
     ) -> BoxFuture<'a, Result<CommandOutput>>;
 }
@@ -162,6 +175,7 @@ impl Sandbox {
         self.backend.execute(
             command,
             permissions.network_access,
+            CommandMode::Foreground,
             CommandOutputSink::default(),
         )
     }

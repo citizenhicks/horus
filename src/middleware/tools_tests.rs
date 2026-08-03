@@ -259,3 +259,19 @@ fn only_starting_a_background_command_requires_approval() {
     assert!(!catalog.requires_approval("poll_command"));
     assert!(!catalog.requires_approval("stop_command"));
 }
+
+#[test]
+fn background_output_remains_valid_json_at_its_limit() {
+    let rendered = background_output(BackgroundCommandPoll {
+        status: crate::backend::sandbox::BackgroundCommandStatus::Running,
+        exit_code: None,
+        stdout: "\0".repeat(6_000),
+        stderr: String::new(),
+        truncated: false,
+        error: Some("\0".repeat(512)),
+    });
+
+    assert!(rendered.len() <= MAX_TOOL_OUTPUT_BYTES);
+    let value: Value = serde_json::from_str(&rendered).expect("valid JSON");
+    assert_eq!(value["status"], "running");
+}

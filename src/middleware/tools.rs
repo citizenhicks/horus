@@ -770,13 +770,27 @@ fn command_id_schema() -> Value {
 }
 
 fn background_output(output: BackgroundCommandPoll) -> String {
-    serde_json::json!({
-        "status": output.status.as_str(),
-        "exit_code": output.exit_code,
+    let status = output.status.as_str();
+    let exit_code = output.exit_code;
+    let rendered = serde_json::json!({
+        "status": status,
+        "exit_code": exit_code,
         "stdout": output.stdout,
         "stderr": output.stderr,
         "truncated": output.truncated,
         "error": output.error
+    })
+    .to_string();
+    if rendered.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return rendered;
+    }
+    serde_json::json!({
+        "status": status,
+        "exit_code": exit_code,
+        "stdout": "",
+        "stderr": "",
+        "truncated": true,
+        "error": "background output exceeded its serialized limit"
     })
     .to_string()
 }

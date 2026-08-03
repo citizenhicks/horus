@@ -2,6 +2,20 @@ use std::process::Stdio;
 
 use crate::{Error, Result};
 
+/// Reaps every process in one Seatbelt instance when the host-owned stdin lease closes.
+#[cfg(target_os = "macos")]
+pub const MACOS_COMMAND_WRAPPER: &str = r#"
+exec 3<&0
+(
+  trap '' HUP INT TERM
+  while IFS= read -r _ <&3; do :; done
+  kill -KILL -- -1 2>/dev/null
+) &
+test -n "$!" || exit 125
+exec 3<&-
+exec "$@" </dev/null
+"#;
+
 /// Kills one command's process group when execution completes or is cancelled.
 ///
 /// The command must be configured with `process_group(0)` before it is spawned.

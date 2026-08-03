@@ -4,11 +4,14 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::{CommandOutput, CommandOutputSink, CommandStream, NetworkAccess, SandboxBackend};
+use super::{
+    CommandMode, CommandOutput, CommandOutputSink, CommandStream, NetworkAccess, SandboxBackend,
+};
 use crate::{Error, Result};
 
 const MAX_BACKGROUND_COMMANDS: usize = 4;
-const MAX_POLL_OUTPUT_BYTES: usize = 40_000;
+const MAX_POLL_OUTPUT_BYTES: usize = 6_000;
+const MAX_ERROR_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackgroundCommandStatus {
@@ -84,8 +87,11 @@ impl BackgroundCommands {
                 output.push(stream, bytes);
             }
         });
-        let task =
-            tokio::spawn(async move { backend.execute(&command, network_access, sink).await });
+        let task = tokio::spawn(async move {
+            backend
+                .execute(&command, network_access, CommandMode::Background, sink)
+                .await
+        });
         entries.insert(
             id.clone(),
             Entry {
@@ -118,16 +124,14 @@ impl BackgroundCommands {
             entries.remove(id).ok_or_else(|| unknown(id))?
         };
         entry.task.abort();
-        let _ = entry.task.await;
-        let output = take_output(&entry.output)?;
-        Ok(BackgroundCommandPoll {
-            status: BackgroundCommandStatus::Stopped,
-            exit_code: None,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            truncated: output.truncated,
-            error: None,
-        })
+        let result = entry.task.await;
+        if result
+            .as_ref()
+            .is_err_and(tokio::task::JoinError::is_cancelled)
+        {
+            return stopped(&entry.output);
+        }
+        finish(&entry.output, result)
     }
 
     pub(super) async fn shutdown(&self, owner: &str) -> Result<()> {
@@ -206,7 +210,26 @@ fn poll_running(output: &Arc<Mutex<BufferedOutput>>) -> Result<BackgroundCommand
 
 async fn completed(entry: Entry) -> Result<BackgroundCommandPoll> {
     let result = entry.task.await;
-    let mut output = take_output(&entry.output)?;
+    finish(&entry.output, result)
+}
+
+fn stopped(output: &Arc<Mutex<BufferedOutput>>) -> Result<BackgroundCommandPoll> {
+    let output = take_output(output)?;
+    Ok(BackgroundCommandPoll {
+        status: BackgroundCommandStatus::Stopped,
+        exit_code: None,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        truncated: output.truncated,
+        error: None,
+    })
+}
+
+fn finish(
+    output: &Arc<Mutex<BufferedOutput>>,
+    result: std::result::Result<Result<CommandOutput>, tokio::task::JoinError>,
+) -> Result<BackgroundCommandPoll> {
+    let mut output = take_output(output)?;
     match result {
         Ok(Ok(command)) => {
             if !output.saw_output {
@@ -222,14 +245,18 @@ async fn completed(entry: Entry) -> Result<BackgroundCommandPoll> {
                 error: None,
             })
         }
-        Ok(Err(error)) => Ok(BackgroundCommandPoll {
-            status: BackgroundCommandStatus::Failed,
-            exit_code: None,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            truncated: output.truncated,
-            error: Some(error.to_string()),
-        }),
+        Ok(Err(error)) => {
+            let error = error.to_string();
+            let truncated = error.len() > MAX_ERROR_BYTES;
+            Ok(BackgroundCommandPoll {
+                status: BackgroundCommandStatus::Failed,
+                exit_code: None,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                truncated: output.truncated || truncated,
+                error: Some(crate::truncate_utf8(&error, MAX_ERROR_BYTES).into()),
+            })
+        }
         Err(error) => Ok(BackgroundCommandPoll {
             status: if error.is_cancelled() {
                 BackgroundCommandStatus::Stopped
@@ -291,9 +318,11 @@ mod tests {
             &'a self,
             _command: &'a str,
             _network_access: NetworkAccess,
+            mode: CommandMode,
             output: CommandOutputSink,
         ) -> BoxFuture<'a, Result<CommandOutput>> {
             Box::pin(async move {
+                assert_eq!(mode, CommandMode::Background);
                 output.write(CommandStream::Stdout, b"first");
                 self.started.notify_one();
                 self.release.notified().await;
@@ -370,6 +399,7 @@ mod tests {
             &'a self,
             _command: &'a str,
             _network_access: NetworkAccess,
+            _mode: CommandMode,
             _output: CommandOutputSink,
         ) -> BoxFuture<'a, Result<CommandOutput>> {
             Box::pin(async move {
@@ -401,6 +431,43 @@ mod tests {
         commands.shutdown("session-a").await.expect("shutdown");
 
         assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn stopping_a_finished_command_preserves_its_result() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let commands = BackgroundCommands::default();
+        let id = commands
+            .start(
+                "session",
+                Arc::new(StreamingBackend {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                }),
+                "command".into(),
+                NetworkAccess::Denied,
+            )
+            .expect("start");
+        started.notified().await;
+        release.notify_one();
+        while !commands
+            .entries
+            .lock()
+            .expect("commands")
+            .get(&id)
+            .expect("entry")
+            .task
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        let output = commands.stop("session", &id).await.expect("stop");
+
+        assert_eq!(output.status, BackgroundCommandStatus::Exited);
+        assert_eq!(output.exit_code, Some(7));
+        assert_eq!(output.stderr, "last");
     }
 
     #[test]

@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-#[cfg(target_os = "macos")]
-use horus::backend::sandbox::MACOS_SEATBELT_BASE_POLICY;
+#[cfg(target_os = "linux")]
+use horus::backend::sandbox::ProcessGroupGuard;
 use horus::backend::sandbox::{
-    CommandOutput, CommandOutputSink, CommandStream, NetworkAccess, ProcessGroupGuard,
-    SandboxBackend, local::LocalSandbox,
+    CommandMode, CommandOutput, CommandOutputSink, CommandStream, NetworkAccess, SandboxBackend,
+    local::LocalSandbox,
 };
+#[cfg(target_os = "macos")]
+use horus::backend::sandbox::{MACOS_COMMAND_WRAPPER, MACOS_SEATBELT_BASE_POLICY};
 use horus::{BoxFuture, Error, Result};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::Command;
@@ -216,7 +218,20 @@ impl GatewaySandbox {
                 .ok_or_else(|| Error::Sandbox("sandbox path is not UTF-8".into()))?;
             command.arg(format!("-D{name}={path}"));
         }
-        command.args(["--", "/bin/bash", "--noprofile", "--norc", "-c", script]);
+        command.args([
+            "--",
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            MACOS_COMMAND_WRAPPER,
+            "horus-command",
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            script,
+        ]);
         Ok(command)
     }
 
@@ -224,26 +239,32 @@ impl GatewaySandbox {
         &self,
         script: &str,
         network_access: NetworkAccess,
+        mode: CommandMode,
         output: CommandOutputSink,
     ) -> Result<CommandOutput> {
         if script.trim().is_empty() {
             return Err(Error::Sandbox("command is empty".into()));
         }
         let command = self.command(script, network_access, true)?;
-        self.run_command(command, output).await
+        self.run_command(command, mode, output).await
     }
 
     pub(crate) async fn execute_git(&self, args: &[&str]) -> Result<CommandOutput> {
         let git = find_executable("git", &self.root, &self.state_dir)?;
         let mut command = self.command(GIT_SCRIPT, NetworkAccess::Denied, false)?;
         command.arg(git).args(args);
-        self.run_command(command, CommandOutputSink::default())
-            .await
+        self.run_command(
+            command,
+            CommandMode::Foreground,
+            CommandOutputSink::default(),
+        )
+        .await
     }
 
     async fn run_command(
         &self,
         mut command: Command,
+        mode: CommandMode,
         output_sink: CommandOutputSink,
     ) -> Result<CommandOutput> {
         let inherited = [
@@ -264,14 +285,25 @@ impl GatewaySandbox {
             .envs(inherited)
             .env("HOME", self.temp.path())
             .env("TMPDIR", self.temp.path())
-            .env("SHELL", "/bin/bash")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
+            .env("SHELL", "/bin/bash");
+        #[cfg(target_os = "macos")]
+        command.stdin(Stdio::piped());
+        #[cfg(not(target_os = "macos"))]
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(target_os = "linux")]
         command.process_group(0);
         let mut child = command.spawn()?;
+        #[cfg(target_os = "macos")]
+        let cleanup_lease = Some(
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| Error::Sandbox("command cleanup lease unavailable".into()))?,
+        );
+        #[cfg(not(target_os = "macos"))]
+        let cleanup_lease = None::<tokio::process::ChildStdin>;
+        #[cfg(target_os = "linux")]
         let mut process_group = ProcessGroupGuard::new(&child)?;
         let stdout = child
             .stdout
@@ -281,31 +313,55 @@ impl GatewaySandbox {
             .stderr
             .take()
             .ok_or_else(|| Error::Sandbox("command stderr unavailable".into()))?;
-        let result = tokio::time::timeout(self.command_timeout, async {
+        let execution = async {
+            let wait = async {
+                let status = child.wait().await;
+                drop(cleanup_lease);
+                status
+            };
             let (stdout, stderr, status) = tokio::join!(
                 read_output(stdout, CommandStream::Stdout, output_sink.clone()),
                 read_output(stderr, CommandStream::Stderr, output_sink),
-                child.wait()
+                wait
             );
             Ok(CommandOutput {
                 exit_code: status?.code().unwrap_or(-1),
                 stdout: stdout?,
                 stderr: stderr?,
             })
-        })
-        .await;
-        process_group.kill();
-        match result {
-            Ok(output) => output,
-            Err(_) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                Err(Error::Sandbox(format!(
-                    "command exceeded {} seconds",
-                    self.command_timeout.as_secs_f64()
-                )))
+        };
+        let result = match mode {
+            CommandMode::Background => execution.await,
+            CommandMode::Foreground => {
+                match tokio::time::timeout(self.command_timeout, execution).await {
+                    Ok(output) => output,
+                    Err(_) => {
+                        #[cfg(target_os = "linux")]
+                        process_group.kill();
+                        #[cfg(target_os = "macos")]
+                        if tokio::time::timeout(Duration::from_secs(1), child.wait())
+                            .await
+                            .is_err()
+                        {
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                        }
+                        return Err(Error::Sandbox(format!(
+                            "command exceeded {} seconds",
+                            self.command_timeout.as_secs_f64()
+                        )));
+                    }
+                }
             }
-        }
+        };
+        #[cfg(target_os = "linux")]
+        process_group.kill();
+        result
     }
 }
 
@@ -322,9 +378,10 @@ impl SandboxBackend for GatewaySandbox {
         &'a self,
         script: &'a str,
         network_access: NetworkAccess,
+        mode: CommandMode,
         output: CommandOutputSink,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
-        Box::pin(self.execute_command(script, network_access, output))
+        Box::pin(self.execute_command(script, network_access, mode, output))
     }
 }
 
@@ -444,7 +501,12 @@ mod tests {
         let script = format!("cat {}/sentinel", state.path().display());
 
         let output = sandbox
-            .execute(&script, NetworkAccess::Denied, CommandOutputSink::default())
+            .execute(
+                &script,
+                NetworkAccess::Denied,
+                CommandMode::Foreground,
+                CommandOutputSink::default(),
+            )
             .await
             .expect("blocked command still returns status");
 

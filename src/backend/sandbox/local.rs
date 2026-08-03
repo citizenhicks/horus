@@ -26,11 +26,13 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-#[cfg(target_os = "macos")]
-use super::MACOS_SEATBELT_BASE_POLICY;
 use super::NetworkAccess;
+#[cfg(target_os = "linux")]
+use super::ProcessGroupGuard;
 use super::SandboxBackend;
-use super::{CommandOutput, CommandOutputSink, CommandStream, MAX_FILE_BYTES, ProcessGroupGuard};
+use super::{CommandMode, CommandOutput, CommandOutputSink, CommandStream, MAX_FILE_BYTES};
+#[cfg(target_os = "macos")]
+use super::{MACOS_COMMAND_WRAPPER, MACOS_SEATBELT_BASE_POLICY};
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
@@ -230,7 +232,18 @@ impl LocalSandbox {
         ] {
             command.arg(format!("-D{name}={}", path.to_string_lossy()));
         }
-        command.args(["--", "/bin/bash", "-lc", script]);
+        command.args([
+            "--",
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            MACOS_COMMAND_WRAPPER,
+            "horus-command",
+            "/bin/bash",
+            "-lc",
+            script,
+        ]);
         Ok(command)
     }
 
@@ -275,6 +288,7 @@ impl SandboxBackend for LocalSandbox {
         &'a self,
         script: &'a str,
         network_access: NetworkAccess,
+        mode: CommandMode,
         output_sink: CommandOutputSink,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
         Box::pin(async move {
@@ -308,15 +322,23 @@ impl SandboxBackend for LocalSandbox {
                     .current_dir(&self.root)
                     .env_clear()
                     .envs(inherited)
-                    .env("TMPDIR", command_temp(self.temp.path()))
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .kill_on_drop(true);
-                #[cfg(unix)]
+                    .env("TMPDIR", command_temp(self.temp.path()));
+                #[cfg(target_os = "macos")]
+                command.stdin(Stdio::piped());
+                #[cfg(not(target_os = "macos"))]
+                command.stdin(Stdio::null());
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                #[cfg(target_os = "linux")]
                 command.process_group(0);
                 let mut child = command.spawn()?;
-                #[cfg(unix)]
+                #[cfg(target_os = "macos")]
+                let cleanup_lease =
+                    Some(child.stdin.take().ok_or_else(|| {
+                        Error::Sandbox("command cleanup lease unavailable".into())
+                    })?);
+                #[cfg(not(target_os = "macos"))]
+                let cleanup_lease = None::<tokio::process::ChildStdin>;
+                #[cfg(target_os = "linux")]
                 let mut process_group = ProcessGroupGuard::new(&child)?;
                 let stdout = child
                     .stdout
@@ -326,35 +348,51 @@ impl SandboxBackend for LocalSandbox {
                     .stderr
                     .take()
                     .ok_or_else(|| Error::Sandbox("command stderr unavailable".into()))?;
-                match tokio::time::timeout(self.command_timeout, async {
+                let execution = async {
+                    let wait = async {
+                        let status = child.wait().await;
+                        drop(cleanup_lease);
+                        status
+                    };
                     let (stdout, stderr, status) = tokio::join!(
                         read_output(stdout, CommandStream::Stdout, output_sink.clone()),
                         read_output(stderr, CommandStream::Stderr, output_sink),
-                        child.wait()
+                        wait
                     );
                     Ok(CommandOutput {
                         exit_code: status?.code().unwrap_or(-1),
                         stdout: stdout?,
                         stderr: stderr?,
                     })
-                })
-                .await
-                {
-                    Ok(output) => {
-                        #[cfg(unix)]
-                        process_group.kill();
-                        output
+                };
+                let output = match mode {
+                    CommandMode::Background => execution.await,
+                    CommandMode::Foreground => {
+                        match tokio::time::timeout(self.command_timeout, execution).await {
+                            Ok(output) => output,
+                            Err(_) => {
+                                #[cfg(target_os = "linux")]
+                                process_group.kill();
+                                #[cfg(target_os = "macos")]
+                                if tokio::time::timeout(Duration::from_secs(1), child.wait())
+                                    .await
+                                    .is_err()
+                                {
+                                    let _ = child.kill().await;
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                let _ = child.kill().await;
+                                return Err(Error::Sandbox(format!(
+                                    "command exceeded {} seconds",
+                                    self.command_timeout.as_secs_f64()
+                                )));
+                            }
+                        }
                     }
-                    Err(_) => {
-                        #[cfg(unix)]
-                        process_group.kill();
-                        let _ = child.kill().await;
-                        Err(Error::Sandbox(format!(
-                            "command exceeded {} seconds",
-                            self.command_timeout.as_secs_f64()
-                        )))
-                    }
-                }
+                };
+                #[cfg(target_os = "linux")]
+                process_group.kill();
+                output
             }
             .await;
             #[cfg(target_os = "linux")]
@@ -1054,6 +1092,74 @@ fn validate_root(_path: &Path, _directory: &Dir) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn background_commands_do_not_use_the_foreground_deadline() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sandbox = LocalSandbox::new(workspace.path())
+            .expect("sandbox")
+            .command_timeout(Duration::from_millis(1))
+            .expect("timeout");
+
+        let output = sandbox
+            .execute(
+                "sleep 0.05",
+                NetworkAccess::Denied,
+                CommandMode::Background,
+                CommandOutputSink::default(),
+            )
+            .await
+            .expect("background command");
+
+        assert_eq!(output.exit_code, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn command_cleanup_reaps_daemonized_descendants() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sandbox = LocalSandbox::new(workspace.path())
+            .expect("sandbox")
+            .command_timeout(Duration::from_millis(100))
+            .expect("timeout");
+        let script = r#"/usr/bin/perl -MPOSIX=setsid -e '
+exit if fork; setsid(); exit if fork;
+open my $file, ">", "daemon.pid" or die; print $file "$$\n"; close $file;
+sleep 30;
+' &
+for _ in {1..100}; do test -s daemon.pid && break; sleep 0.01; done
+test -s daemon.pid || exit 1
+sleep 30"#;
+
+        let error = sandbox
+            .execute(
+                script,
+                NetworkAccess::Denied,
+                CommandMode::Foreground,
+                CommandOutputSink::default(),
+            )
+            .await
+            .expect_err("foreground deadline");
+        assert!(error.to_string().contains("exceeded"));
+        let pid = std::fs::read_to_string(workspace.path().join("daemon.pid"))
+            .expect("daemon pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric pid");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if alive {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        assert!(!alive, "daemonized child {pid} survived command cleanup");
+    }
+
     fn local_sandbox(workspace: &Path) -> LocalSandbox {
         LocalSandbox::new(workspace).expect("sandbox")
     }
@@ -1225,6 +1331,7 @@ mod tests {
             .execute(
                 "mkdir .git .agents .codex",
                 NetworkAccess::Denied,
+                CommandMode::Foreground,
                 CommandOutputSink::default(),
             )
             .await
