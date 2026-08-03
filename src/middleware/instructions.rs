@@ -5,6 +5,8 @@ use std::path::Path;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
+#[cfg(unix)]
+use cap_std::fs::MetadataExt as _;
 
 use super::Middleware;
 use crate::{Error, Result};
@@ -61,9 +63,15 @@ fn read_optional(directory: &Dir, name: &str) -> Result<Option<String>> {
         )));
     }
     let file = directory.open(name)?;
-    if !file.metadata()?.is_file() {
+    let opened = file.metadata()?;
+    let current = directory.symlink_metadata(name)?;
+    if !opened.is_file()
+        || current.is_symlink()
+        || !same_file(&metadata, &opened)
+        || !same_file(&opened, &current)
+    {
         return Err(Error::Config(format!(
-            "workspace instruction `{name}` must be a regular file"
+            "workspace instruction `{name}` changed while opening"
         )));
     }
     let mut bytes = Vec::new();
@@ -77,6 +85,16 @@ fn read_optional(directory: &Dir, name: &str) -> Result<Option<String>> {
     String::from_utf8(bytes)
         .map(Some)
         .map_err(|_| Error::Config(format!("workspace instruction `{name}` is not valid UTF-8")))
+}
+
+#[cfg(unix)]
+fn same_file(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_left: &cap_std::fs::Metadata, _right: &cap_std::fs::Metadata) -> bool {
+    true
 }
 
 #[cfg(test)]
