@@ -1114,7 +1114,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn command_cleanup_reaps_daemonized_descendants() {
         let workspace = tempfile::tempdir().expect("workspace");
         let sandbox = LocalSandbox::new(workspace.path())
@@ -1126,32 +1126,60 @@ exit if fork; setsid(); exit if fork;
 open my $file, ">", "daemon.pid" or die; print $file "$$\n"; close $file;
 sleep 30;
 ' &
-for _ in {1..100}; do test -s daemon.pid && break; sleep 0.01; done
-test -s daemon.pid || exit 1
 sleep 30"#;
 
-        let error = sandbox
-            .execute(
-                script,
-                NetworkAccess::Denied,
-                CommandMode::Foreground,
-                CommandOutputSink::default(),
-            )
+        let execution = tokio::spawn(async move {
+            sandbox
+                .execute(
+                    script,
+                    NetworkAccess::Denied,
+                    CommandMode::Foreground,
+                    CommandOutputSink::default(),
+                )
+                .await
+        });
+        let pid_path = workspace.path().join("daemon.pid");
+        let pid = tokio::task::spawn_blocking(move || {
+            for _ in 0..500 {
+                if let Ok(pid) = std::fs::read_to_string(&pid_path)
+                    .and_then(|pid| pid.trim().parse::<u32>().map_err(std::io::Error::other))
+                {
+                    return Some(pid);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None
+        })
+        .await
+        .expect("daemon readiness task");
+        let Some(pid) = pid else {
+            execution.abort();
+            panic!("daemon pid was not written");
+        };
+
+        tokio::time::advance(Duration::from_millis(101)).await;
+        let error = execution
             .await
+            .expect("command task")
             .expect_err("foreground deadline");
         assert!(error.to_string().contains("exceeded"));
-        let pid = std::fs::read_to_string(workspace.path().join("daemon.pid"))
-            .expect("daemon pid")
-            .trim()
-            .parse::<u32>()
-            .expect("numeric pid");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let alive = std::process::Command::new("/bin/kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+        let alive = tokio::task::spawn_blocking(move || {
+            for _ in 0..100 {
+                let alive = std::process::Command::new("/bin/kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if !alive {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            true
+        })
+        .await
+        .expect("daemon cleanup task");
         if alive {
             let _ = std::process::Command::new("/bin/kill")
                 .args(["-KILL", &pid.to_string()])
