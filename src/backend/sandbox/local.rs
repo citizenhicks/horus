@@ -37,8 +37,11 @@ use crate::Error;
 use crate::Result;
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 40_000;
+/// Read-only inspection feeds a UI rather than a model context, so it keeps a larger budget.
+const MAX_READ_ONLY_OUTPUT_BYTES: usize = 400_000;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const PROTECTED_METADATA: [&str; 3] = [".git", ".agents", ".codex"];
+const GIT_METADATA: &str = ".git";
 #[cfg(target_os = "linux")]
 const ISOLATED_HOME: &str = "/tmp/horus-home";
 #[cfg(target_os = "linux")]
@@ -56,6 +59,18 @@ const SEATBELT_POLICY_SUFFIX: &str = r#"
     (subpath (param "WRITABLE_ROOT"))
     (require-not (literal (param "GIT_PATH")))
     (require-not (subpath (param "GIT_PATH")))
+    (require-not (literal (param "AGENTS_PATH")))
+    (require-not (subpath (param "AGENTS_PATH")))
+    (require-not (literal (param "CODEX_PATH")))
+    (require-not (subpath (param "CODEX_PATH")))))
+"#;
+#[cfg(target_os = "macos")]
+const SEATBELT_GIT_POLICY_SUFFIX: &str = r#"
+(allow file-read*)
+(allow file-write*
+  (subpath (param "TEMP_ROOT"))
+  (require-all
+    (subpath (param "WRITABLE_ROOT"))
     (require-not (literal (param "AGENTS_PATH")))
     (require-not (subpath (param "AGENTS_PATH")))
     (require-not (literal (param "CODEX_PATH")))
@@ -85,6 +100,13 @@ enum Invocation<'a> {
         executable: &'a Path,
         arguments: &'a [&'a str],
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkspaceAccess {
+    ReadOnly,
+    Writable,
+    GitWritable,
 }
 
 #[cfg(target_os = "linux")]
@@ -235,7 +257,28 @@ impl LocalSandbox {
             CommandMode::Foreground,
             CommandOutputSink::default(),
             environment,
-            false,
+            WorkspaceAccess::ReadOnly,
+        )
+        .await
+    }
+
+    /// Runs Git argv with a writable workspace and Git metadata but no network access.
+    pub async fn execute_git_mutation(
+        &self,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Result<CommandOutput> {
+        let executable = self.find_executable("git")?;
+        self.execute_invocation(
+            Invocation::Argv {
+                executable: &executable,
+                arguments,
+            },
+            NetworkAccess::Denied,
+            CommandMode::Foreground,
+            CommandOutputSink::default(),
+            environment,
+            WorkspaceAccess::GitWritable,
         )
         .await
     }
@@ -267,7 +310,7 @@ impl LocalSandbox {
         &self,
         invocation: &Invocation<'_>,
         network_access: NetworkAccess,
-        workspace_writable: bool,
+        workspace_access: WorkspaceAccess,
     ) -> Result<Command> {
         let bwrap = self
             .find_executable("bwrap")
@@ -290,15 +333,18 @@ impl LocalSandbox {
             command.args(["--tmpfs", "/run"]);
         }
         command
-            .arg(if workspace_writable {
-                "--bind"
-            } else {
+            .arg(if workspace_access == WorkspaceAccess::ReadOnly {
                 "--ro-bind"
+            } else {
+                "--bind"
             })
             .arg(&self.root)
             .arg(&self.root);
-        if workspace_writable {
+        if workspace_access != WorkspaceAccess::ReadOnly {
             for name in PROTECTED_METADATA {
+                if workspace_access == WorkspaceAccess::GitWritable && name == GIT_METADATA {
+                    continue;
+                }
                 let path = self.root.join(name);
                 let metadata = std::fs::symlink_metadata(&path)
                     .map_err(|_| Error::Sandbox(format!("{name} protection is unavailable")))?;
@@ -349,7 +395,7 @@ impl LocalSandbox {
         &self,
         invocation: &Invocation<'_>,
         network_access: NetworkAccess,
-        workspace_writable: bool,
+        workspace_access: WorkspaceAccess,
     ) -> Result<Command> {
         let executable = Path::new("/usr/bin/sandbox-exec");
         if !executable.is_file() {
@@ -359,7 +405,12 @@ impl LocalSandbox {
         }
         let temp = std::fs::canonicalize(self.temp.path())?;
         let mut command = Command::new(executable);
-        let mut policy = format!("{MACOS_SEATBELT_BASE_POLICY}{SEATBELT_POLICY_SUFFIX}");
+        let suffix = if workspace_access == WorkspaceAccess::GitWritable {
+            SEATBELT_GIT_POLICY_SUFFIX
+        } else {
+            SEATBELT_POLICY_SUFFIX
+        };
+        let mut policy = format!("{MACOS_SEATBELT_BASE_POLICY}{suffix}");
         for (index, denied) in self.denied_reads.iter().enumerate() {
             let parameter = format!("DENIED_READ_{index}");
             policy.push_str(&format!(
@@ -374,7 +425,7 @@ impl LocalSandbox {
         if network_access == NetworkAccess::Allowed {
             policy.push_str("\n(allow network*)");
         }
-        if !workspace_writable {
+        if workspace_access == WorkspaceAccess::ReadOnly {
             policy.push_str(
                 r#"
 (deny file-write*
@@ -435,7 +486,7 @@ impl LocalSandbox {
         &self,
         _invocation: &Invocation<'_>,
         _network_access: NetworkAccess,
-        _workspace_writable: bool,
+        _workspace_access: WorkspaceAccess,
     ) -> Result<Command> {
         Err(Error::Sandbox(
             "local code execution requires Linux or macOS".into(),
@@ -449,23 +500,31 @@ impl LocalSandbox {
         mode: CommandMode,
         output_sink: CommandOutputSink,
         environment: &[(&str, &str)],
-        workspace_writable: bool,
+        workspace_access: WorkspaceAccess,
     ) -> Result<CommandOutput> {
         if matches!(&invocation, Invocation::Shell(script) if script.trim().is_empty()) {
             return Err(Error::Sandbox("command is empty".into()));
         }
         validate_root(&self.root, &self.root_dir)?;
-        #[cfg(target_os = "linux")]
-        let protected = if workspace_writable {
-            Some(self.protect_command_metadata().await?)
+        if workspace_access == WorkspaceAccess::GitWritable {
+            validate_git_metadata(&self.root)?;
+        }
+        let output_limit = if workspace_access == WorkspaceAccess::ReadOnly {
+            MAX_READ_ONLY_OUTPUT_BYTES
         } else {
+            MAX_COMMAND_OUTPUT_BYTES
+        };
+        #[cfg(target_os = "linux")]
+        let protected = if workspace_access == WorkspaceAccess::ReadOnly {
             None
+        } else {
+            Some(self.protect_command_metadata().await?)
         };
         let output =
             async {
                 validate_root(&self.root, &self.root_dir)?;
                 let mut command =
-                    self.sandboxed_command(&invocation, network_access, workspace_writable)?;
+                    self.sandboxed_command(&invocation, network_access, workspace_access)?;
                 let mut inherited = [
                     "PATH",
                     "USER",
@@ -529,8 +588,13 @@ impl LocalSandbox {
                         status
                     };
                     let (stdout, stderr, status) = tokio::join!(
-                        read_output(stdout, CommandStream::Stdout, output_sink.clone()),
-                        read_output(stderr, CommandStream::Stderr, output_sink),
+                        read_output(
+                            stdout,
+                            CommandStream::Stdout,
+                            output_sink.clone(),
+                            output_limit
+                        ),
+                        read_output(stderr, CommandStream::Stderr, output_sink, output_limit),
                         wait
                     );
                     Ok(CommandOutput {
@@ -629,9 +693,22 @@ impl SandboxBackend for LocalSandbox {
             mode,
             output_sink,
             &[],
-            true,
+            WorkspaceAccess::Writable,
         ))
     }
+}
+
+fn validate_git_metadata(root: &Path) -> Result<()> {
+    let path = root.join(GIT_METADATA);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|_| Error::Sandbox("Git metadata is unavailable".into()))?;
+    if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
+        return Err(Error::Sandbox(format!(
+            "Git metadata has an invalid type: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn read_file(root: Dir, relative: &Path, requested: &str) -> Result<String> {
@@ -1283,6 +1360,7 @@ async fn read_output(
     mut reader: impl AsyncRead + Unpin,
     stream: CommandStream,
     sink: CommandOutputSink,
+    limit: usize,
 ) -> Result<String> {
     let mut output = Vec::new();
     let mut buffer = [0; 8192];
@@ -1293,7 +1371,7 @@ async fn read_output(
             break;
         }
         sink.write(stream, &buffer[..read]);
-        let remaining = MAX_COMMAND_OUTPUT_BYTES.saturating_sub(output.len());
+        let remaining = limit.saturating_sub(output.len());
         output.extend_from_slice(&buffer[..read.min(remaining)]);
         truncated |= read > remaining;
     }
@@ -1490,10 +1568,18 @@ sleep 30"#;
             .await
             .expect("protect command metadata");
         let denied = sandbox
-            .sandboxed_command(&Invocation::Shell("true"), NetworkAccess::Denied, true)
+            .sandboxed_command(
+                &Invocation::Shell("true"),
+                NetworkAccess::Denied,
+                WorkspaceAccess::Writable,
+            )
             .expect("network-disabled command");
         let allowed = sandbox
-            .sandboxed_command(&Invocation::Shell("true"), NetworkAccess::Allowed, true)
+            .sandboxed_command(
+                &Invocation::Shell("true"),
+                NetworkAccess::Allowed,
+                WorkspaceAccess::Writable,
+            )
             .expect("network-enabled command");
         #[cfg(target_os = "linux")]
         _protected

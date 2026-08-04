@@ -10,7 +10,7 @@ use super::input::ActiveRoute;
 use super::input::ActiveTurnRouter;
 use super::input::Wait;
 use super::input::interruptible;
-use super::try_send_stream_event;
+use super::try_send_event;
 use crate::Error;
 use crate::Result;
 use crate::backend::model::ModelEventSink;
@@ -218,7 +218,7 @@ impl Runner {
             let thread_id = self.state.session_id.clone();
             let stream: ModelEventSink = Arc::new(move |event| {
                 let msg = event.into_event(&thread_id, &event_turn_id, &item_id);
-                try_send_stream_event(
+                try_send_event(
                     &events,
                     Event {
                         submission_id: Some(event_submission_id.clone()),
@@ -425,7 +425,7 @@ impl Runner {
         let Some(last) = self.state.last_usage.clone() else {
             return Ok(());
         };
-        try_send_stream_event(
+        try_send_event(
             &self.events,
             Event {
                 submission_id: Some(submission_id.to_string()),

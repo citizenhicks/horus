@@ -259,6 +259,7 @@ pub struct Agent {
     session: SessionConfiguredEvent,
     model: ModelInfo,
     model_choices: Vec<ModelChoice>,
+    tool_count: usize,
 }
 
 impl Agent {
@@ -304,6 +305,12 @@ impl Agent {
     #[must_use]
     pub fn model_choices(&self) -> &[ModelChoice] {
         &self.model_choices
+    }
+
+    /// Returns the number of tools registered for this agent.
+    #[must_use]
+    pub const fn tool_count(&self) -> usize {
+        self.tool_count
     }
 
     /// Separates command and event halves for a frontend event loop.
@@ -557,15 +564,6 @@ fn try_send_event(events: &mpsc::Sender<Event>, event: Event) -> Result<()> {
             Error::Stopped("frontend event channel closed".into())
         }
     })
-}
-
-fn try_send_stream_event(events: &mpsc::Sender<Event>, event: Event) -> Result<()> {
-    match events.try_send(event) {
-        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            Err(Error::Stopped("frontend event channel closed".into()))
-        }
-    }
 }
 
 #[cfg(test)]

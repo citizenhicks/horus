@@ -217,9 +217,10 @@ pub struct FrontendCommand {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrontendContribution {
     pub capability: String,
+    /// Optional capability-owned item count for generic summaries.
+    pub count: Option<usize>,
     pub commands: Vec<FrontendCommand>,
     pub widgets: Vec<FrontendWidget>,
-    #[serde(default)]
     pub references: Vec<FrontendReference>,
     pub active_input: Option<FrontendActiveInput>,
 }
@@ -245,9 +246,33 @@ pub struct FrontendWidget {
     pub slot: FrontendSlot,
     pub text: String,
     pub tone: FrontendTone,
+    pub symbol: Option<String>,
+    pub icon_only: bool,
+    pub progress: Option<FrontendProgress>,
+    pub content: Option<FrontendWidgetContent>,
     /// Optional operation invoked when a frontend activates this widget.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Op>,
+}
+
+/// Determinate progress rendered by a frontend widget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendProgress {
+    pub completed: usize,
+    pub total: usize,
+}
+
+/// Capability-owned content shown when a frontend widget is opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FrontendWidgetContent {
+    Blocks {
+        title: String,
+        blocks: Vec<FrontendBlock>,
+    },
+    Picker {
+        title: String,
+        options: Vec<FrontendPickerOption>,
+    },
 }
 
 /// Stable locations a thin frontend shell makes available to capabilities.
@@ -299,6 +324,7 @@ pub enum FrontendBlockFormat {
 pub struct FrontendPickerOption {
     pub label: String,
     pub description: String,
+    pub detail: String,
     pub op: Op,
 }
 
@@ -476,7 +502,6 @@ pub enum ReviewDecision {
 pub struct TokenUsage {
     pub input_tokens: i64,
     pub cached_input_tokens: i64,
-    #[serde(default)]
     pub cache_write_input_tokens: i64,
     pub output_tokens: i64,
     pub reasoning_output_tokens: i64,
@@ -617,6 +642,10 @@ mod tests {
                 slot: FrontendSlot::ComposerHeader,
                 text: "2 agents".into(),
                 tone: FrontendTone::Neutral,
+                symbol: Some("robot".into()),
+                icon_only: true,
+                progress: None,
+                content: None,
                 action: None,
             },
         });

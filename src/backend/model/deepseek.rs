@@ -47,6 +47,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "deepseek",
         "DeepSeek",
+        "magnifying-glass",
         "DeepSeek Responses API",
         ProviderAuth::ApiKey("DEEPSEEK_API_KEY"),
         MODELS,

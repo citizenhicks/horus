@@ -21,6 +21,7 @@ use crate::protocol::FrontendPickerOption;
 use crate::protocol::FrontendSlot;
 use crate::protocol::FrontendTone;
 use crate::protocol::FrontendWidget;
+use crate::protocol::FrontendWidgetContent;
 use crate::protocol::Op;
 use crate::protocol::replay_events;
 
@@ -128,7 +129,7 @@ impl Shared {
                 let mut root = root.state.lock().await;
                 root.frontend = context.frontend;
                 if !root.tree.agents.is_empty() {
-                    emit_status(&root);
+                    emit_status(&root)?;
                 }
             }
             return Ok(());
@@ -157,8 +158,9 @@ impl Shared {
         };
         if changed {
             persist(&root_id, &root).await?;
-        } else if !root.tree.agents.is_empty() {
-            emit_status(&root);
+        }
+        if !root.tree.agents.is_empty() {
+            emit_status(&root)?;
         }
         self.roots.lock().await.entry(root_id).or_insert_with(|| {
             Arc::new(RootSlot {
@@ -322,20 +324,7 @@ impl Shared {
     pub(super) async fn resume_options(&self, root_id: &str) -> Result<Vec<FrontendPickerOption>> {
         let root = self.root(root_id).await?;
         let root = root.state.lock().await;
-        Ok(root
-            .tree
-            .agents
-            .iter()
-            .map(|(path, entry)| FrontendPickerOption {
-                label: path.clone(),
-                description: format!("{} · {}", entry.status.label(), entry.model),
-                op: Op::CapabilityCommand {
-                    capability: "subagents".into(),
-                    command: "subagents".into(),
-                    arguments: path.clone(),
-                },
-            })
-            .collect())
+        Ok(picker_options(&root.tree))
     }
 
     pub(super) async fn preview(&self, root_id: &str, path: &str) -> Result<Vec<EventMsg>> {
@@ -421,7 +410,10 @@ impl Shared {
         };
         let error = match persist(root_id, &candidate).await {
             Ok(()) => {
+                let frontend = Arc::clone(&candidate.frontend);
+                let status = status_event(&candidate.tree);
                 *root.state.lock().await = candidate;
+                frontend(status)?;
                 return Ok(Stage::Changed(output));
             }
             Err(error) => error,
@@ -429,14 +421,26 @@ impl Shared {
         match on_failure {
             OnPersistFailure::Abort => Err(error),
             OnPersistFailure::CommitWithStatus => {
-                emit_status(&candidate);
+                let frontend = Arc::clone(&candidate.frontend);
+                let status = status_event(&candidate.tree);
                 *root.state.lock().await = candidate;
+                if let Err(delivery) = frontend(status) {
+                    return Err(Error::Stopped(format!(
+                        "{error}; frontend status delivery failed: {delivery}"
+                    )));
+                }
                 Err(error)
             }
             OnPersistFailure::RepairRetry(repair) => {
-                let retry_message = repair(&mut candidate, &error);
-                if let Err(retry_error) = persist(root_id, &candidate).await {
-                    (candidate.frontend)(FrontendEvent::Render {
+                let (retry_message, failure_event) = repair(&mut candidate, &error);
+                let retry = persist(root_id, &candidate).await;
+                let frontend = Arc::clone(&candidate.frontend);
+                let status = status_event(&candidate.tree);
+                *root.state.lock().await = candidate;
+                frontend(status)?;
+                frontend(failure_event)?;
+                if let Err(retry_error) = retry {
+                    frontend(FrontendEvent::Render {
                         capability: "subagents".into(),
                         block: FrontendBlock {
                             id: None,
@@ -447,9 +451,8 @@ impl Shared {
                             format: crate::protocol::FrontendBlockFormat::PlainText,
                             tone: FrontendTone::Error,
                         },
-                    });
+                    })?;
                 }
-                *root.state.lock().await = candidate;
                 Ok(Stage::Changed(output))
             }
         }
@@ -474,7 +477,7 @@ impl<T> Stage<T> {
 
 /// Repairs runtime state after a failed durable write; returns the message
 /// surfaced when the retry also fails.
-type PersistRepair = Box<dyn FnOnce(&mut Root, &Error) -> String + Send>;
+type PersistRepair = Box<dyn FnOnce(&mut Root, &Error) -> (String, FrontendEvent) + Send>;
 
 /// How `Shared::commit_root` reacts when the durable write fails.
 enum OnPersistFailure {
@@ -520,7 +523,7 @@ fn status_widget(tree: &Tree) -> FrontendWidget {
     FrontendWidget {
         id: "status".into(),
         slot: FrontendSlot::ComposerFooter,
-        text: format!("subagents {} ({active})", tree.agents.len()),
+        text: tree.agents.len().to_string(),
         tone: if failed {
             FrontendTone::Error
         } else if active > 0 {
@@ -528,16 +531,35 @@ fn status_widget(tree: &Tree) -> FrontendWidget {
         } else {
             FrontendTone::Neutral
         },
-        action: Some(Op::CapabilityCommand {
-            capability: "subagents".into(),
-            command: "subagents".into(),
-            arguments: String::new(),
+        symbol: Some("robot".into()),
+        icon_only: false,
+        progress: None,
+        content: Some(FrontendWidgetContent::Picker {
+            title: "Subagents".into(),
+            options: picker_options(tree),
         }),
+        action: None,
     }
 }
 
-fn emit_status(root: &Root) {
-    (root.frontend)(if root.tree.agents.is_empty() {
+fn picker_options(tree: &Tree) -> Vec<FrontendPickerOption> {
+    tree.agents
+        .iter()
+        .map(|(path, entry)| FrontendPickerOption {
+            label: path.clone(),
+            description: entry.status.label().into(),
+            detail: entry.model.clone(),
+            op: Op::CapabilityCommand {
+                capability: "subagents".into(),
+                command: "subagents".into(),
+                arguments: path.clone(),
+            },
+        })
+        .collect()
+}
+
+fn status_event(tree: &Tree) -> FrontendEvent {
+    if tree.agents.is_empty() {
         FrontendEvent::RemoveWidget {
             capability: "subagents".into(),
             id: "status".into(),
@@ -545,17 +567,19 @@ fn emit_status(root: &Root) {
     } else {
         FrontendEvent::Widget {
             capability: "subagents".into(),
-            item: status_widget(&root.tree),
+            item: status_widget(tree),
         }
-    });
+    }
+}
+
+fn emit_status(root: &Root) -> Result<()> {
+    (root.frontend)(status_event(&root.tree))
 }
 
 async fn persist(root_id: &str, root: &Root) -> Result<()> {
     root.checkpoints
         .save_state(root_id, STATE_KEY, &serde_json::to_value(&root.tree)?)
-        .await?;
-    emit_status(root);
-    Ok(())
+        .await
 }
 
 #[cfg(test)]
@@ -583,14 +607,33 @@ mod tests {
     }
 
     #[test]
-    fn status_widget_owns_its_frontend_action() {
+    fn status_widget_owns_its_picker() {
+        let mut tree = Tree::default();
+        tree.agents.insert(
+            "reviewer".into(),
+            AgentRecord {
+                parent: String::new(),
+                session_id: "child-1".into(),
+                depth: 1,
+                model: "openai::gpt-5::high".into(),
+                active_turn_id: None,
+                status: AgentStatus::Running,
+                last_message: None,
+            },
+        );
+
+        let widget = status_widget(&tree);
+        assert_eq!(widget.symbol.as_deref(), Some("robot"));
+        assert_eq!(widget.text, "1");
+        assert!(!widget.icon_only);
         assert!(matches!(
-            status_widget(&Tree::default()).action,
-            Some(Op::CapabilityCommand {
-                capability,
-                command,
-                arguments,
-            }) if capability == "subagents" && command == "subagents" && arguments.is_empty()
+            widget.content,
+            Some(FrontendWidgetContent::Picker { title, options })
+                if title == "Subagents"
+                    && options.len() == 1
+                    && options[0].label == "reviewer"
+                    && options[0].description == "running"
+                    && options[0].detail == "openai::gpt-5::high"
         ));
     }
 
@@ -685,7 +728,7 @@ mod tests {
             saved_state: StdMutex::new(None),
         });
         shared
-            .initialize(test_context(checkpoints, Arc::new(|_| {})))
+            .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
             .await
             .expect("initialize runtime");
 
@@ -732,7 +775,10 @@ mod tests {
         shared
             .initialize(test_context(
                 checkpoints,
-                Arc::new(move |event| events.lock().expect("frontend events").push(event)),
+                Arc::new(move |event| {
+                    events.lock().expect("frontend events").push(event);
+                    Ok(())
+                }),
             ))
             .await
             .expect("initialize runtime");
@@ -777,7 +823,7 @@ mod tests {
             saved_state: StdMutex::new(None),
         });
         shared
-            .initialize(test_context(checkpoints, Arc::new(|_| {})))
+            .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
             .await
             .expect("initialize runtime");
         shared
@@ -815,7 +861,7 @@ mod tests {
             saved_state: StdMutex::new(None),
         });
         shared
-            .initialize(test_context(checkpoints, Arc::new(|_| {})))
+            .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
             .await
             .expect("initialize runtime");
         for index in 0..2 {
@@ -858,7 +904,7 @@ mod tests {
             saved_state: StdMutex::new(None),
         });
         shared
-            .initialize(test_context(checkpoints, Arc::new(|_| {})))
+            .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
             .await
             .expect("initialize runtime");
         for index in 0..2 {
@@ -907,7 +953,7 @@ mod tests {
         });
         let checkpoints: Arc<dyn CheckpointStore> = store.clone();
         shared
-            .initialize(test_context(checkpoints, Arc::new(|_| {})))
+            .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
             .await
             .expect("initialize runtime");
         shared
@@ -952,7 +998,7 @@ mod tests {
             saved_state: StdMutex::new(None),
         });
         shared
-            .initialize(test_context(checkpoints, Arc::new(|_| {})))
+            .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
             .await
             .expect("initialize runtime");
 
@@ -974,7 +1020,10 @@ mod tests {
         shared
             .initialize(test_context(
                 checkpoints,
-                Arc::new(move |event| events.lock().expect("frontend events").push(event)),
+                Arc::new(move |event| {
+                    events.lock().expect("frontend events").push(event);
+                    Ok(())
+                }),
             ))
             .await
             .expect("initialize runtime");
@@ -998,7 +1047,8 @@ mod tests {
                 AgentStatus::Completed,
                 Some("done".into()),
             )
-            .await;
+            .await
+            .expect("finish child");
 
         let agents = shared.list("root", None).await.expect("list agents");
         let updates = shared
@@ -1047,7 +1097,7 @@ mod tests {
         });
         let checkpoints: Arc<dyn CheckpointStore> = store.clone();
         shared
-            .initialize(test_context(checkpoints, Arc::new(|_| {})))
+            .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
             .await
             .expect("initialize runtime");
         shared
@@ -1074,7 +1124,7 @@ mod tests {
                         AgentStatus::Completed,
                         Some("done".into()),
                     )
-                    .await;
+                    .await
             })
         };
         store.retry_started.notified().await;
@@ -1084,7 +1134,7 @@ mod tests {
         assert!(premature.is_err() && agents[0]["status"] == "pending_init");
 
         store.release_retry.notify_one();
-        finishing.await.expect("finish task");
+        finishing.await.expect("finish task").expect("finish child");
 
         tokio::time::timeout(Duration::from_millis(100), before_commit)
             .await

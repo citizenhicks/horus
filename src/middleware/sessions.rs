@@ -55,6 +55,7 @@ impl Middleware for Sessions {
     fn frontend(&self) -> FrontendContribution {
         FrontendContribution {
             capability: self.name().into(),
+            count: None,
             commands: vec![
                 FrontendCommand {
                     name: "resume".into(),
@@ -122,6 +123,7 @@ async fn fork(context: MiddlewareCommandContext<'_>) -> Result<MiddlewareCommand
             options: vec![FrontendPickerOption {
                 label: "Open fork".into(),
                 description: "Continue in the new chat".into(),
+                detail: String::new(),
                 op: Op::ResumeSession {
                     session_id: checkpoint.session_id,
                 },
@@ -212,6 +214,7 @@ fn resume_page_options(
         options.push(FrontendPickerOption {
             label: "More chats…".into(),
             description: String::new(),
+            detail: String::new(),
             op: Op::CapabilityCommand {
                 capability: "sessions".into(),
                 command: "resume".into(),
@@ -257,6 +260,7 @@ fn resume_option(
     Some(FrontendPickerOption {
         label,
         description,
+        detail: String::new(),
         op: Op::ResumeSession {
             session_id: session.session_id,
         },

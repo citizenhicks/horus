@@ -57,6 +57,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "openrouter",
         "OpenRouter",
+        "path",
         "Responses API across multiple model vendors",
         ProviderAuth::ApiKey("OPENROUTER_API_KEY"),
         MODELS,

@@ -136,15 +136,13 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         session_context: config.session_context.clone(),
         metadata: config.metadata.clone(),
         frontend: Arc::new(move |update| {
-            // Middleware UI updates are advisory and intentionally lossy.
-            match middleware_events.try_send(Event {
-                submission_id: None,
-                msg: EventMsg::Frontend(update),
-            }) {
-                Ok(())
-                | Err(mpsc::error::TrySendError::Full(_))
-                | Err(mpsc::error::TrySendError::Closed(_)) => {}
-            }
+            try_send_event(
+                &middleware_events,
+                Event {
+                    submission_id: None,
+                    msg: EventMsg::Frontend(update),
+                },
+            )
         }),
     };
     let system_prompt: Arc<str> = config
@@ -152,6 +150,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         .system_prompt(&config.system_prompt, &runtime)?
         .into();
     let catalog = config.middleware.catalog(&runtime)?;
+    let tool_count = catalog.definitions().len();
     let frontend = FrontendExtensions::new(config.middleware.clone())?;
     let mut state_changed =
         metadata_changed || state.model_route.as_deref() != Some(route.as_str());
@@ -264,5 +263,6 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         session,
         model,
         model_choices,
+        tool_count,
     })
 }

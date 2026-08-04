@@ -330,6 +330,7 @@ impl Middleware for Subagents {
     fn frontend(&self) -> FrontendContribution {
         FrontendContribution {
             capability: self.name().into(),
+            count: None,
             commands: vec![FrontendCommand {
                 name: "subagents".into(),
                 arguments: String::new(),
@@ -1037,7 +1038,7 @@ mod tests {
             model_route: "test".into(),
             session_context: parent.session_context.clone(),
             metadata: parent.metadata.clone(),
-            frontend: Arc::new(|_| {}),
+            frontend: Arc::new(|_| Ok(())),
         };
         let scope = AgentScope::new(&runtime, launcher).expect("agent scope");
 

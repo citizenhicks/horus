@@ -81,6 +81,18 @@ impl SqliteCheckpoint {
         let connection = Connection::open(&path)?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version == 0
+            && connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_schema LIMIT 1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Err(Error::Checkpoint(format!(
+                "unversioned SQLite database is not empty; expected schema version \
+                 {SCHEMA_VERSION} (start with a fresh database)"
+            )));
+        }
         if version != 0 && version != SCHEMA_VERSION {
             return Err(Error::Checkpoint(format!(
                 "unsupported SQLite schema version {version}; expected {SCHEMA_VERSION} \
@@ -625,6 +637,27 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+
+    #[test]
+    fn open_rejects_a_nonempty_unversioned_database() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let path = workspace.path().join("checkpoints.sqlite3");
+        let connection = Connection::open(&path).expect("create unversioned database");
+        connection
+            .execute("CREATE TABLE legacy_state (value TEXT)", [])
+            .expect("create legacy schema");
+        drop(connection);
+
+        let error = SqliteCheckpoint::new(path)
+            .err()
+            .expect("nonempty unversioned database must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "checkpoint error: unversioned SQLite database is not empty; expected schema version \
+             3 (start with a fresh database)"
+        );
+    }
 
     #[tokio::test]
     async fn load_completes_while_another_connection_holds_a_write_transaction() {

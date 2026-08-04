@@ -83,6 +83,7 @@ impl Approval {
     pub(super) fn frontend(&self) -> FrontendContribution {
         FrontendContribution {
             capability: CAPABILITY.into(),
+            count: None,
             commands: vec![FrontendCommand {
                 name: "permissions".into(),
                 arguments: "<on|allow|network>".into(),
@@ -307,6 +308,10 @@ fn widget(policy: ApprovalPolicy) -> FrontendWidget {
         } else {
             FrontendTone::Warning
         },
+        symbol: None,
+        icon_only: false,
+        progress: None,
+        content: None,
         action: None,
     }
 }

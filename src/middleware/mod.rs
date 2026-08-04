@@ -41,7 +41,7 @@ use tools::Catalog;
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 
 /// Sends middleware-owned UI updates without depending on a concrete frontend.
-pub type FrontendEventSink = Arc<dyn Fn(FrontendEvent) + Send + Sync>;
+pub type FrontendEventSink = Arc<dyn Fn(FrontendEvent) -> Result<()> + Send + Sync>;
 
 /// Durable runtime identity exposed while middleware is initialized.
 #[derive(Clone)]
@@ -369,7 +369,7 @@ impl Middleware for Sandbox {
             for event in
                 Sandbox::initialize(self, &context.session_id, &context.checkpoints).await?
             {
-                (context.frontend)(event);
+                (context.frontend)(event)?;
             }
             Ok(())
         })
@@ -771,7 +771,7 @@ mod tests {
             model_route: "model".into(),
             session_context: SessionContext::default(),
             metadata: BTreeMap::new(),
-            frontend: Arc::new(|_| {}),
+            frontend: Arc::new(|_| Ok(())),
         };
         let stack = MiddlewareStack::new(vec![Arc::new(CatchAllRenderer), Arc::new(ToolOwner)])
             .expect("middleware stack");
@@ -796,6 +796,7 @@ mod tests {
         fn frontend(&self) -> FrontendContribution {
             FrontendContribution {
                 capability: self.name().into(),
+                count: None,
                 commands: Vec::new(),
                 widgets: Vec::new(),
                 references: vec![FrontendReference {

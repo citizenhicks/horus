@@ -371,6 +371,7 @@ pub(super) const fn generic_provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "responses",
         "Local and Other",
+        "hard-drives",
         "Any local or remote OpenAI-compatible Responses endpoint",
         ProviderAuth::ApiKey("OPENAI_API_KEY"),
         MODELS,

@@ -206,12 +206,17 @@ impl Middleware for Skills {
     fn frontend(&self) -> FrontendContribution {
         FrontendContribution {
             capability: self.name().into(),
+            count: Some(self.skills.len()),
             commands: Vec::new(),
             widgets: vec![FrontendWidget {
                 id: "count".into(),
                 slot: FrontendSlot::Header,
                 text: format!("skills {}", self.skills.len()),
                 tone: FrontendTone::Neutral,
+                symbol: None,
+                icon_only: false,
+                progress: None,
+                content: None,
                 action: None,
             }],
             references: self

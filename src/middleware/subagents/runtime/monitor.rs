@@ -71,7 +71,7 @@ impl Shared {
         path: &str,
         status: AgentStatus,
         message: Option<String>,
-    ) {
+    ) -> Result<()> {
         let message = message.map(bounded);
         let repair_path = path.to_string();
         let stage = self
@@ -110,36 +110,43 @@ impl Shared {
                             message: Some(failure.clone()),
                         };
                     }
-                    super::emit_status(candidate);
-                    (candidate.frontend)(FrontendEvent::Render {
-                        capability: "subagents".into(),
-                        block: FrontendBlock {
-                            id: None,
-                            group: None,
-                            append: false,
-                            pending: false,
-                            text: failure,
-                            format: crate::protocol::FrontendBlockFormat::PlainText,
-                            tone: FrontendTone::Error,
+                    (
+                        format!("{repair_path} state persistence retry failed"),
+                        FrontendEvent::Render {
+                            capability: "subagents".into(),
+                            block: FrontendBlock {
+                                id: None,
+                                group: None,
+                                append: false,
+                                pending: false,
+                                text: failure,
+                                format: crate::protocol::FrontendBlockFormat::PlainText,
+                                tone: FrontendTone::Error,
+                            },
                         },
-                    });
-                    format!("{repair_path} state persistence retry failed")
+                    )
                 })),
             )
-            .await;
-        if matches!(stage, Ok(Stage::Changed(()))) {
+            .await?;
+        if matches!(stage, Stage::Changed(())) {
             self.changed.notify_waiters();
         }
+        Ok(())
     }
 
-    async fn fail_monitor(&self, root_id: &str, path: &str, error: impl std::fmt::Display) {
+    async fn fail_monitor(
+        &self,
+        root_id: &str,
+        path: &str,
+        error: impl std::fmt::Display,
+    ) -> Result<()> {
         self.finished(
             root_id,
             path,
             AgentStatus::Errored,
             Some(format!("subagent monitor failed: {error}")),
         )
-        .await;
+        .await
     }
 
     async fn active(&self, root_id: &str, path: &str) -> bool {
@@ -182,7 +189,7 @@ pub(in crate::middleware::subagents) async fn monitor_agent(
     root_id: String,
     path: String,
     mut events: mpsc::Receiver<Event>,
-) {
+) -> Result<()> {
     let mut last_message = None;
     while let Some(event) = events.recv().await {
         let update = match event.msg {
@@ -213,28 +220,24 @@ pub(in crate::middleware::subagents) async fn monitor_agent(
             }
             EventMsg::TurnComplete(turn) => {
                 let message = turn.last_agent_message.or_else(|| last_message.clone());
-                shared
+                return shared
                     .finished(&root_id, &path, AgentStatus::Completed, message)
                     .await;
-                return;
             }
             EventMsg::TurnAborted(turn) => {
-                shared
+                return shared
                     .finished(&root_id, &path, AgentStatus::Interrupted, Some(turn.reason))
                     .await;
-                return;
             }
             EventMsg::Error(error) => {
-                shared
+                return shared
                     .finished(&root_id, &path, AgentStatus::Errored, Some(error.message))
                     .await;
-                return;
             }
             _ => Ok(()),
         };
         if let Err(error) = update {
-            shared.fail_monitor(&root_id, &path, error).await;
-            return;
+            return shared.fail_monitor(&root_id, &path, error).await;
         }
     }
     if shared.active(&root_id, &path).await {
@@ -245,8 +248,9 @@ pub(in crate::middleware::subagents) async fn monitor_agent(
                 AgentStatus::Errored,
                 Some("agent disconnected".into()),
             )
-            .await;
+            .await?;
     }
+    Ok(())
 }
 
 fn bounded(mut value: String) -> String {

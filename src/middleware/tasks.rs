@@ -10,8 +10,8 @@ use super::{Middleware, MiddlewareCommandContext, MiddlewareCommandOutput, Runti
 use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::model::ToolDefinition;
 use crate::protocol::{
-    EventMsg, FrontendBlock, FrontendCommand, FrontendContribution, FrontendEvent, FrontendSlot,
-    FrontendTone, FrontendWidget, Op,
+    EventMsg, FrontendBlock, FrontendCommand, FrontendContribution, FrontendEvent,
+    FrontendProgress, FrontendSlot, FrontendTone, FrontendWidget, FrontendWidgetContent,
 };
 use crate::{BoxFuture, Error, Result};
 
@@ -91,8 +91,7 @@ impl Middleware for Tasks {
     fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let todos = load_todos(&context.checkpoints, &context.session_id).await?;
-            (context.frontend)(widget_event(&todos));
-            Ok(())
+            (context.frontend)(widget_event(&todos))
         })
     }
 
@@ -169,7 +168,7 @@ impl Tool for WriteTodos {
                     &serde_json::to_value(&arguments.todos)?,
                 )
                 .await?;
-            (self.frontend)(widget_event(&arguments.todos));
+            (self.frontend)(widget_event(&arguments.todos))?;
             Ok(format!("updated {} todos", arguments.todos.len()))
         })
     }
@@ -212,26 +211,36 @@ fn widget_event(todos: &[Todo]) -> FrontendEvent {
         .iter()
         .filter(|todo| todo.status == TodoStatus::Completed)
         .count();
-    let active = todos
-        .iter()
-        .filter(|todo| todo.status == TodoStatus::InProgress)
-        .count();
     FrontendEvent::Widget {
         capability: "tasks".into(),
         item: FrontendWidget {
             id: "status".into(),
             slot: FrontendSlot::ComposerFooter,
-            text: format!("tasks {completed}/{} · {active} active", todos.len()),
+            text: "tasks".into(),
             tone: if completed == todos.len() {
                 FrontendTone::Success
             } else {
                 FrontendTone::Neutral
             },
-            action: Some(Op::CapabilityCommand {
-                capability: "tasks".into(),
-                command: "tasks".into(),
-                arguments: String::new(),
+            symbol: None,
+            icon_only: false,
+            progress: Some(FrontendProgress {
+                completed,
+                total: todos.len(),
             }),
+            content: Some(FrontendWidgetContent::Blocks {
+                title: "Tasks".into(),
+                blocks: vec![FrontendBlock {
+                    id: None,
+                    group: None,
+                    append: false,
+                    pending: false,
+                    text: format_todos(todos),
+                    format: crate::protocol::FrontendBlockFormat::PlainText,
+                    tone: FrontendTone::Neutral,
+                }],
+            }),
+            action: None,
         },
     }
 }
@@ -283,7 +292,10 @@ mod tests {
             model_route: "default".into(),
             session_context: SessionContext::default(),
             metadata: BTreeMap::new(),
-            frontend: Arc::new(move |event| events.lock().expect("frontend events").push(event)),
+            frontend: Arc::new(move |event| {
+                events.lock().expect("frontend events").push(event);
+                Ok(())
+            }),
         };
         let tasks = Tasks;
         let mut catalog = Catalog::default();
@@ -329,7 +341,18 @@ mod tests {
         );
         assert!(matches!(
             frontend_events.lock().expect("frontend events").last(),
-            Some(FrontendEvent::Widget { item, .. }) if item.text == "tasks 1/2 · 1 active"
+            Some(FrontendEvent::Widget { item, .. })
+                if item.text == "tasks"
+                    && item.progress == Some(FrontendProgress { completed: 1, total: 2 })
+                    && item.action.is_none()
+                    && matches!(
+                        &item.content,
+                        Some(FrontendWidgetContent::Blocks { title, blocks })
+                            if title == "Tasks"
+                                && blocks.len() == 1
+                                && blocks[0].text
+                                    == "[x] inspect seams\n[~] Implement tasks"
+                    )
         ));
     }
 }

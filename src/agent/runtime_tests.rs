@@ -4,7 +4,9 @@ use std::sync::Mutex;
 
 use super::AgentConfig;
 use super::AgentSender;
+use super::EVENT_QUEUE_CAPACITY;
 use super::create_agent;
+use super::try_send_event;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
@@ -25,13 +27,36 @@ use crate::middleware::Middleware;
 use crate::middleware::MiddlewareStack;
 use crate::middleware::RuntimeContext;
 use crate::middleware::tools::Catalog;
+use crate::protocol::Event;
 use crate::protocol::EventMsg;
+use crate::protocol::FrontendEvent;
 use crate::protocol::MAX_USER_INPUT_BYTES;
 use crate::protocol::Op;
 use crate::protocol::SessionContext;
 use crate::protocol::ToolCallEndEvent;
+use crate::protocol::WarningEvent;
 
 struct TestModel;
+
+struct SaturatingMiddleware;
+
+impl Middleware for SaturatingMiddleware {
+    fn name(&self) -> &'static str {
+        "saturating"
+    }
+
+    fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            for index in 0..=EVENT_QUEUE_CAPACITY {
+                (context.frontend)(FrontendEvent::RemoveWidget {
+                    capability: "saturating".into(),
+                    id: index.to_string(),
+                })?;
+            }
+            Ok(())
+        })
+    }
+}
 
 struct MetadataProbe {
     observed: Arc<Mutex<Option<std::collections::BTreeMap<String, serde_json::Value>>>>,
@@ -79,6 +104,43 @@ fn sender_reports_a_full_live_queue_as_busy() {
         .expect_err("queue should be full");
 
     assert!(matches!(error, Error::Busy(_)));
+}
+
+#[test]
+fn event_queue_saturation_returns_an_error_without_reordering_queued_events() {
+    let (events, mut receiver) = tokio::sync::mpsc::channel(1);
+    try_send_event(
+        &events,
+        Event {
+            submission_id: None,
+            msg: EventMsg::Warning(WarningEvent {
+                message: "first".into(),
+            }),
+        },
+    )
+    .expect("queue first event");
+
+    let error = try_send_event(
+        &events,
+        Event {
+            submission_id: None,
+            msg: EventMsg::Warning(WarningEvent {
+                message: "second".into(),
+            }),
+        },
+    )
+    .expect_err("full queue must fail");
+    let EventMsg::Warning(queued) = receiver.try_recv().expect("first queued event").msg else {
+        panic!("expected queued warning");
+    };
+
+    assert_eq!(
+        (error.to_string(), queued.message.as_str()),
+        (
+            "agent stopped: frontend event queue is full".to_string(),
+            "first"
+        )
+    );
 }
 
 impl Model for TestModel {
@@ -164,6 +226,27 @@ fn config_with_metadata_probe(
         Some(metadata) => config.metadata(metadata),
         None => config,
     }
+}
+
+#[tokio::test]
+async fn middleware_event_saturation_fails_agent_creation_instead_of_dropping_updates() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let mut agent_config = config(workspace.path(), checkpoints, "saturating-events");
+    agent_config.middleware =
+        MiddlewareStack::new(vec![Arc::new(SaturatingMiddleware)]).expect("middleware");
+
+    let Err(error) = create_agent(agent_config).await else {
+        panic!("agent creation should report the full event queue");
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "agent stopped: frontend event queue is full"
+    );
 }
 
 #[tokio::test]

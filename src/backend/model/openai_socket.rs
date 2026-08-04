@@ -552,6 +552,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "openai_socket",
         "OpenAI (API key)",
+        "sparkle",
         "Persistent Responses WebSocket with native compaction",
         ProviderAuth::ApiKey("OPENAI_API_KEY"),
         MODELS,

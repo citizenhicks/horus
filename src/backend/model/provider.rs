@@ -205,6 +205,7 @@ type ProviderBuilder = fn(ProviderBuildConfig) -> Result<Arc<dyn Model>>;
 pub struct ProviderDefinition {
     id: &'static str,
     label: &'static str,
+    symbol: &'static str,
     description: &'static str,
     auth: ProviderAuth,
     models: &'static [ModelPreset],
@@ -214,9 +215,14 @@ pub struct ProviderDefinition {
 }
 
 impl ProviderDefinition {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a provider manifest keeps its required fields explicit at the registry entry"
+    )]
     pub(crate) const fn new(
         id: &'static str,
         label: &'static str,
+        symbol: &'static str,
         description: &'static str,
         auth: ProviderAuth,
         models: &'static [ModelPreset],
@@ -226,6 +232,7 @@ impl ProviderDefinition {
         Self {
             id,
             label,
+            symbol,
             description,
             auth,
             models,
@@ -248,6 +255,11 @@ impl ProviderDefinition {
     #[must_use]
     pub const fn label(&self) -> &'static str {
         self.label
+    }
+
+    #[must_use]
+    pub const fn symbol(&self) -> &'static str {
+        self.symbol
     }
 
     #[must_use]
@@ -317,6 +329,13 @@ impl ProviderDefinition {
                 self.id
             )));
         }
+        let preset = self.model(model);
+        if !self.models.is_empty() && preset.is_none() {
+            return Err(Error::Config(format!(
+                "provider `{}` does not advertise model `{model}`",
+                self.id
+            )));
+        }
         if !self.web_search.contains(&web_search) {
             return Err(Error::Config(format!(
                 "provider `{}` does not support web search mode `{}`",
@@ -326,7 +345,7 @@ impl ProviderDefinition {
         }
         self.validate_base_url(base_url)?;
         if let Some(effort) = reasoning_effort
-            && let Some(preset) = self.model(model)
+            && let Some(preset) = preset
             && !preset.reasoning.iter().any(|preset| preset.id == effort)
         {
             return Err(Error::Config(format!(
@@ -394,6 +413,12 @@ pub fn providers() -> &'static [ProviderDefinition] {
     PROVIDERS
 }
 
+/// Returns the provider used by an unconfigured composition.
+#[must_use]
+pub fn default_provider() -> &'static ProviderDefinition {
+    &PROVIDERS[0]
+}
+
 /// Resolves a built-in provider by its stable manifest ID.
 pub fn provider(id: &str) -> Result<&'static ProviderDefinition> {
     PROVIDERS
@@ -416,5 +441,36 @@ mod tests {
             providers().iter().all(|provider| ids.insert(provider.id())),
             "provider manifest contains duplicate IDs"
         );
+    }
+
+    #[test]
+    fn provider_manifests_are_complete_and_internally_consistent() {
+        for provider in providers() {
+            assert!(!provider.id().trim().is_empty());
+            assert!(!provider.label().trim().is_empty());
+            assert!(!provider.symbol().trim().is_empty());
+            assert!(!provider.description().trim().is_empty());
+            assert_eq!(provider.web_search().first(), Some(&HostedWebSearch::Off));
+
+            let mut model_ids = BTreeSet::new();
+            for model in provider.models() {
+                assert!(model_ids.insert(model.id), "duplicate model `{}`", model.id);
+                assert!(!model.label.trim().is_empty());
+                assert!(!model.description.trim().is_empty());
+                assert!(model.context_window > 0);
+
+                let mut reasoning_ids = BTreeSet::new();
+                for reasoning in model.reasoning {
+                    assert!(reasoning_ids.insert(reasoning.id));
+                    assert!(!reasoning.label.trim().is_empty());
+                    assert!(!reasoning.description.trim().is_empty());
+                }
+                assert!(
+                    model
+                        .default_reasoning
+                        .is_none_or(|default| reasoning_ids.contains(default))
+                );
+            }
+        }
     }
 }
