@@ -87,7 +87,7 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(20))
 
         XCTAssertEqual(model.pendingApproval, approval)
-        XCTAssertNotNil(model.errorMessage)
+        XCTAssertEqual(model.toast?.tone, .error)
     }
 
     func testFrontendRenderIsNamespacedAndReplayedFromHistory() throws {
@@ -252,5 +252,114 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.lastUsage.cachedInputTokens, 20)
         XCTAssertEqual(model.contextTokens, 99)
         XCTAssertEqual(model.modelContextWindow, 200)
+    }
+
+    func testSessionActivityShowsOnlyUnseenCompletion() throws {
+        let model = try model()
+        model.selectedSessionID = "chat-1"
+        model.destination = .agent
+        model.setChatVisible(false)
+
+        model.updateSessionActivity(
+            sessionID: "chat-1",
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("task_started"),
+                "turnId": .string("turn-1")
+            ]))
+        )
+        XCTAssertTrue(model.runningSessionIDs.contains("chat-1"))
+
+        model.updateSessionActivity(
+            sessionID: "chat-1",
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("exec_approval_request"),
+                "id": .string("approval-1")
+            ]))
+        )
+        XCTAssertEqual(model.toast?.tone, .warning)
+
+        model.updateSessionActivity(
+            sessionID: "chat-1",
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("task_complete"),
+                "turnId": .string("turn-1")
+            ]))
+        )
+        XCTAssertFalse(model.runningSessionIDs.contains("chat-1"))
+        XCTAssertTrue(model.unreadSessionIDs.contains("chat-1"))
+        XCTAssertEqual(model.toast?.tone, .success)
+
+        model.destination = .chat
+        model.setChatVisible(true)
+        XCTAssertFalse(model.unreadSessionIDs.contains("chat-1"))
+        model.dismissToast()
+        model.updateSessionActivity(
+            sessionID: "chat-1",
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("task_complete"),
+                "turnId": .string("turn-2")
+            ]))
+        )
+        XCTAssertNil(model.toast)
+    }
+
+    func testAgentErrorOutranksAbortWithoutDroppingLaterFeedback() throws {
+        let model = try model()
+        model.selectedSessionID = "chat-1"
+        model.setChatVisible(false)
+
+        model.updateSessionActivity(
+            sessionID: "chat-1",
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("error"),
+                "message": .string("Provider failed")
+            ]))
+        )
+        model.updateSessionActivity(
+            sessionID: "chat-1",
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("turn_aborted"),
+                "turnId": .string("turn-1")
+            ]))
+        )
+
+        XCTAssertEqual(model.toast?.message, "Provider failed")
+        XCTAssertEqual(model.toast?.tone, .error)
+        XCTAssertTrue(model.unreadSessionIDs.contains("chat-1"))
+
+        model.showToast("Credential saved.", tone: .success)
+        XCTAssertEqual(model.toast?.message, "Credential saved.")
+        XCTAssertEqual(model.toast?.tone, .success)
+    }
+
+    func testSetupValidationUsesGlobalToast() throws {
+        let model = try model()
+        model.pairingEndpoint = "tcp://localhost:9191"
+
+        model.pair()
+
+        XCTAssertEqual(model.toast?.message, "Enter the one-time code shown by the gateway.")
+        XCTAssertEqual(model.toast?.tone, .error)
+
+        model.dismissToast()
+        model.saveProviderCredential(provider: "openai")
+
+        XCTAssertEqual(model.toast?.message, "Enter an API key. It will be sent once and never read back.")
+        XCTAssertEqual(model.toast?.tone, .error)
+    }
+
+    func testTranscriptReplayDoesNotShowStaleErrorToast() throws {
+        let model = try model()
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("error"),
+                "message": .string("Old error")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+
+        XCTAssertNil(model.toast)
+        XCTAssertEqual(model.transcript.last?.text, "Old error")
     }
 }

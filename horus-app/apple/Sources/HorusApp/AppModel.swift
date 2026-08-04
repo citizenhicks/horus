@@ -64,6 +64,19 @@ enum ProviderActionState: Equatable {
     case failed(String)
 }
 
+enum ToastTone: Equatable {
+    case info
+    case success
+    case warning
+    case error
+}
+
+struct AppToast: Identifiable {
+    let id = UUID()
+    let message: String
+    let tone: ToastTone
+}
+
 enum ThemePreference: String, CaseIterable, Identifiable {
     case system
     case dark
@@ -188,9 +201,11 @@ final class AppModel {
     var gitDiff = ""
     var sessions: [SessionRecord] = []
     var selectedSessionID: String?
+    private(set) var runningSessionIDs: Set<String> = []
+    private(set) var unreadSessionIDs: Set<String> = []
     var transcript: [TranscriptEntry] = []
     var composer = ""
-    var errorMessage: String?
+    var toast: AppToast?
     var activeTurnID: String?
     var activeOperation: String?
     var turnStartedAt: Date?
@@ -258,7 +273,10 @@ final class AppModel {
     @ObservationIgnored private var providerLoginRequestID: String?
     @ObservationIgnored private var providerRegistrationRequestID: String?
     @ObservationIgnored private var cronRequestIDs: Set<String> = []
+    @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
+    @ObservationIgnored private var isChatVisible = false
     @ObservationIgnored private var latestSequence: UInt64?
+    @ObservationIgnored private var notificationReplayCeiling: UInt64?
     @ObservationIgnored private var inspectorPickerSubmissionID: String?
     @ObservationIgnored private var steeringSubmissionID: String?
 
@@ -277,6 +295,7 @@ final class AppModel {
     deinit {
         eventTask?.cancel()
         pairingCodeExpiryTask?.cancel()
+        toastDismissTask?.cancel()
     }
 
     var selectedAccount: GatewayAccount? {
@@ -309,6 +328,32 @@ final class AppModel {
         completedGenerationTime + (turnStartedAt.map { max(0, date.timeIntervalSince($0)) } ?? 0)
     }
 
+    func showToast(_ message: String, tone: ToastTone = .info) {
+        let toast = AppToast(message: message, tone: tone)
+        toastDismissTask?.cancel()
+        self.toast = toast
+        let duration: Duration = tone == .error || tone == .warning ? .seconds(7) : .seconds(4)
+        toastDismissTask = Task { [weak self] in
+            try? await Task.sleep(for: duration)
+            guard !Task.isCancelled, self?.toast?.id == toast.id else { return }
+            self?.toast = nil
+            self?.toastDismissTask = nil
+        }
+    }
+
+    func dismissToast() {
+        toastDismissTask?.cancel()
+        toastDismissTask = nil
+        toast = nil
+    }
+
+    func setChatVisible(_ visible: Bool) {
+        isChatVisible = visible
+        if visible, let selectedSessionID {
+            unreadSessionIDs.remove(selectedSessionID)
+        }
+    }
+
     var capabilityCommands: [MountedCommand] {
         contributions.flatMap { contribution in
             contribution.commands.map {
@@ -326,12 +371,55 @@ final class AppModel {
     }
 
     var currentSessionTitle: String {
-        let session = sessions.first(where: { $0.sessionId == selectedSessionID })
+        selectedSessionID.map(sessionTitle) ?? "New conversation"
+    }
+
+    private func sessionTitle(_ sessionID: String) -> String {
+        let session = sessions.first(where: { $0.sessionId == sessionID })
         guard let message = (session?.title ?? session?.firstUserMessage)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
             !message.isEmpty
         else { return "New conversation" }
         return String(message.prefix(72))
+    }
+
+    func updateSessionActivity(sessionID: String, event: AgentEventRecord) {
+        switch event.msg["type"]?.stringValue {
+        case "task_started":
+            runningSessionIDs.insert(sessionID)
+            unreadSessionIDs.remove(sessionID)
+        case "exec_approval_request":
+            runningSessionIDs.insert(sessionID)
+            showToast(
+                "\(sessionTitle(sessionID)) needs approval.",
+                tone: .warning
+            )
+        case "task_complete":
+            runningSessionIDs.remove(sessionID)
+            notifyCompletion(of: sessionID, tone: .success)
+        case "turn_aborted":
+            runningSessionIDs.remove(sessionID)
+            notifyCompletion(of: sessionID, tone: .warning)
+        case "error":
+            showToast(event.msg["message"]?.stringValue ?? "Agent error", tone: .error)
+        default:
+            break
+        }
+    }
+
+    private func notifyCompletion(of sessionID: String, tone: ToastTone) {
+        guard selectedSessionID != sessionID || !isChatVisible else {
+            unreadSessionIDs.remove(sessionID)
+            return
+        }
+        unreadSessionIDs.insert(sessionID)
+        if tone == .warning, toast?.tone == .error { return }
+        showToast(
+            tone == .success
+                ? "\(sessionTitle(sessionID)) is ready."
+                : "\(sessionTitle(sessionID)) stopped.",
+            tone: tone
+        )
     }
 
     var headerWidgets: [MountedWidget] { widgets(in: "header") }
@@ -369,7 +457,9 @@ final class AppModel {
             let endpoint = try GatewayEndpoint(pairingEndpoint)
             let code = pairingCode.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !code.isEmpty else {
-                pairingError = "Enter the one-time code shown by the gateway."
+                let message = "Enter the one-time code shown by the gateway."
+                pairingError = message
+                showToast(message, tone: .error)
                 return
             }
             let account = accounts.first(where: { $0.endpoint == endpoint })
@@ -384,6 +474,7 @@ final class AppModel {
             }
         } catch {
             pairingError = error.localizedDescription
+            showToast(error.localizedDescription, tone: .error)
         }
     }
 
@@ -464,8 +555,9 @@ final class AppModel {
                 }
                 showsPairing = true
             }
+            showToast("Gateway removed.", tone: .info)
         } catch {
-            errorMessage = error.localizedDescription
+            showToast(error.localizedDescription, tone: .error)
         }
     }
 
@@ -483,11 +575,10 @@ final class AppModel {
             requestID: id,
             sessionID: sessionID,
             lastSequence: nil
-        )) { [weak self] message in
+        )) { [weak self] _ in
             guard self?.sessionRequestID == id else { return }
             self?.sessionRequestID = nil
             self?.connectionState = .ready
-            self?.errorMessage = message
         }
     }
 
@@ -501,9 +592,8 @@ final class AppModel {
             requestID: id,
             sessionID: session.sessionId,
             title: title
-        )) { [weak self] message in
+        )) { [weak self] _ in
             if self?.sessionMutationRequestID == id { self?.sessionMutationRequestID = nil }
-            self?.errorMessage = message
         }
     }
 
@@ -515,9 +605,8 @@ final class AppModel {
             requestID: id,
             sessionID: session.sessionId,
             pinned: pinned
-        )) { [weak self] message in
+        )) { [weak self] _ in
             if self?.sessionMutationRequestID == id { self?.sessionMutationRequestID = nil }
-            self?.errorMessage = message
         }
     }
 
@@ -528,9 +617,8 @@ final class AppModel {
         transmit(.deleteSession(
             requestID: id,
             sessionID: session.sessionId
-        )) { [weak self] message in
+        )) { [weak self] _ in
             if self?.sessionMutationRequestID == id { self?.sessionMutationRequestID = nil }
-            self?.errorMessage = message
         }
     }
 
@@ -546,7 +634,7 @@ final class AppModel {
         let text = composer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         guard text.utf8.count <= maximumComposerBytes else {
-            errorMessage = "Messages are limited to 1 MiB."
+            showToast("Messages are limited to 1 MiB.", tone: .error)
             return
         }
         let id = requestID("input")
@@ -560,13 +648,12 @@ final class AppModel {
         }
         pendingDrafts[id] = text
         composer = ""
-        transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: op))) { [weak self] message in
+        transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: op))) { [weak self] _ in
             self?.restoreDraft(id: id)
             if self?.steeringSubmissionID == id {
                 self?.steeringSubmissionID = nil
                 self?.steeringQueued = false
             }
-            self?.errorMessage = message
         }
     }
 
@@ -578,9 +665,8 @@ final class AppModel {
             inspectorPickerSubmissionID = id
             inspectorSection = .subagents
         }
-        transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: action))) { [weak self] message in
+        transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: action))) { [weak self] _ in
             if self?.inspectorPickerSubmissionID == id { self?.inspectorPickerSubmissionID = nil }
-            self?.errorMessage = message
         }
     }
 
@@ -625,10 +711,9 @@ final class AppModel {
                 id: id,
                 op: .execApproval(id: approval.id, decision: decision)
             )
-        )) { [weak self] message in
+        )) { [weak self] _ in
             guard self?.approvalRequestID == id else { return }
             self?.approvalRequestID = nil
-            self?.errorMessage = message
         }
     }
 
@@ -698,7 +783,10 @@ final class AppModel {
     func setApprovalPolicy(_ policy: ApprovalPolicy) {
         guard let snapshot = agentSnapshot, let draft = agentDraft else { return }
         guard draft == snapshot.config else {
-            errorMessage = "Apply or reload pending agent/provider edits before changing approval."
+            showToast(
+                "Apply or reload pending agent/provider edits before changing approval.",
+                tone: .warning
+            )
             return
         }
         guard draft.approval != policy else { return }
@@ -709,6 +797,7 @@ final class AppModel {
     func reloadAgentDraft() {
         agentDraft = agentSnapshot?.config
         applyState = .idle
+        showToast("Agent draft reloaded.", tone: .info)
     }
 
     func selectProvider(_ provider: String) {
@@ -727,7 +816,9 @@ final class AppModel {
     func saveProviderCredential(provider: String) {
         let key = providerAPIKey
         guard !key.isEmpty else {
-            providerActionState = .failed("Enter an API key. It will be sent once and never read back.")
+            let message = "Enter an API key. It will be sent once and never read back."
+            providerActionState = .failed(message)
+            showToast(message, tone: .error)
             return
         }
         let id = requestID("credential")
@@ -775,8 +866,8 @@ final class AppModel {
         pairingCodeExpiryTask?.cancel()
         pairingCodeExpiryTask = nil
         pairingCodeInfo = nil
-        transmit(.createPairingCode(requestID: id)) { [weak self] message in
-            self?.errorMessage = message
+        transmit(.createPairingCode(requestID: id)) { [weak self] _ in
+            self?.pairingCodeRequestID = nil
         }
     }
 
@@ -868,7 +959,7 @@ final class AppModel {
                 }
             } catch {
                 self.connectionState = .failed(error.localizedDescription)
-                self.errorMessage = error.localizedDescription
+                self.showToast(error.localizedDescription, tone: .error)
                 if let storeError = error as? GatewayStore.StoreError,
                    case .missingToken = storeError {
                     self.repairSelectedGateway()
@@ -883,7 +974,6 @@ final class AppModel {
         authenticate: @escaping @MainActor @Sendable () async throws -> Void
     ) {
         connectionState = .connecting
-        errorMessage = nil
 
         Task { [weak self] in
             guard let self else { return }
@@ -921,8 +1011,8 @@ final class AppModel {
             } catch {
                 guard generation == self.connectionGeneration else { return }
                 let message = error.localizedDescription
-                if let onFailure { onFailure(message) }
-                else { self.errorMessage = message }
+                self.showToast(message, tone: .error)
+                onFailure?(message)
             }
         }
     }
@@ -938,8 +1028,10 @@ final class AppModel {
                 pendingPairingAccount = nil
                 pairingCode = ""
                 showsPairing = false
+                showToast("Gateway paired.", tone: .success)
             } catch {
                 pairingError = error.localizedDescription
+                showToast(error.localizedDescription, tone: .error)
             }
         case .authenticated:
             connectionState = .loading
@@ -964,10 +1056,24 @@ final class AppModel {
         case .rejected(let rejection):
             handleRejected(rejection)
         case .agentEvent(let sessionID, let sequence, let event, let blocks, let history, let preview):
-            guard sessionID == selectedSessionID else { break }
+            guard sessionID == selectedSessionID else {
+                updateSessionActivity(sessionID: sessionID, event: event)
+                break
+            }
             guard latestSequence.map({ sequence > $0 }) ?? true else { return }
             latestSequence = sequence
+            let isLive = notificationReplayCeiling.map { sequence > $0 } ?? true
             reduce(event: event, blocks: blocks, history: history, preview: preview)
+            if isLive {
+                updateSessionActivity(sessionID: sessionID, event: event)
+            } else if activeTurnID == nil {
+                runningSessionIDs.remove(sessionID)
+            } else {
+                runningSessionIDs.insert(sessionID)
+            }
+            if let ceiling = notificationReplayCeiling, sequence >= ceiling {
+                notificationReplayCeiling = nil
+            }
         case .sessions(let requestID, let sessions):
             if requestID == sessionMutationRequestID { sessionMutationRequestID = nil }
             applySessions(sessions)
@@ -980,9 +1086,12 @@ final class AppModel {
                 if configured {
                     providerAPIKey = ""
                     providerActionState = .credentialSaved(provider)
+                    showToast("\(provider) credential saved.", tone: .success)
                     registerAuthenticatedProvider(provider)
                 } else {
-                    providerActionState = .failed("The gateway did not store the provider credential.")
+                    let message = "The gateway did not store the provider credential."
+                    providerActionState = .failed(message)
+                    showToast(message, tone: .error)
                 }
             }
         case .pairingCode(let requestID, let code, let expiresAt):
@@ -1003,6 +1112,7 @@ final class AppModel {
             if requestID == providerLoginRequestID {
                 providerLoginRequestID = nil
                 providerActionState = .loginFinished(provider)
+                showToast("Signed in to \(provider).", tone: .success)
                 registerAuthenticatedProvider(provider)
             }
             if let index = providerStatuses.firstIndex(where: { $0.provider == provider }) {
@@ -1039,7 +1149,7 @@ final class AppModel {
             if failure.code == "unauthorized", pendingPairingAccount == nil {
                 repairSelectedGateway()
             }
-            errorMessage = failure.message
+            showToast(failure.message, tone: .error)
             if failure.fatal {
                 restorePendingDrafts()
                 connectionState = .failed(failure.message)
@@ -1052,7 +1162,6 @@ final class AppModel {
         modelChoices = payload.models
         middlewareFeatures = payload.middlewareFeatures
         if sessionRequestID == nil { connectionState = .ready }
-        errorMessage = nil
         applySessions(payload.sessions)
         transmit(.getProfile(requestID: requestID("profile")))
         if selectedSessionID == nil, sessionRequestID == nil {
@@ -1060,7 +1169,7 @@ final class AppModel {
                 if let session = sessions.first(where: { $0.sessionId == sessionToRestoreID }) {
                     openSession(session.sessionId)
                 } else {
-                    errorMessage = "The previously selected chat is no longer available."
+                    showToast("The previously selected chat is no longer available.", tone: .error)
                 }
             } else if let session = sessions.first {
                 openSession(session.sessionId)
@@ -1070,7 +1179,9 @@ final class AppModel {
 
     private func registerAuthenticatedProvider(_ provider: String) {
         guard agentDraft?.provider.provider == provider else {
-            providerActionState = .failed("The selected provider changed during authentication.")
+            let message = "The selected provider changed during authentication."
+            providerActionState = .failed(message)
+            showToast(message, tone: .error)
             return
         }
         applyProviderConfiguration()
@@ -1084,7 +1195,10 @@ final class AppModel {
             restorePendingDrafts()
             resetSessionState()
         }
-        if opened { latestSequence = nil }
+        if opened {
+            latestSequence = nil
+            notificationReplayCeiling = payload.latestSequence
+        }
         sessionRequestID = nil
         workspace = payload.workspace
         gitStatus = payload.git
@@ -1092,6 +1206,7 @@ final class AppModel {
         isChangingWorkspace = false
         showsWorkspaceBrowser = false
         selectedSessionID = payload.session.sessionId
+        if isChatVisible { unreadSessionIDs.remove(payload.session.sessionId) }
         selectedModelRoute = payload.session.model.route
         modelContextWindow = payload.session.model.modelContextWindow
         contributions = payload.contributions
@@ -1106,13 +1221,18 @@ final class AppModel {
         )
         agentSnapshot = payload.config
         connectionState = .ready
-        errorMessage = nil
-        if applyState == .restarting { applyState = .applied }
+        if applyState == .restarting {
+            applyState = .applied
+            showToast("Agent configuration applied.", tone: .success)
+        }
         if opened { requestSessionData() }
     }
 
     private func applySessions(_ records: [SessionRecord]) {
         sessions = records.filter(\.catalogVisible)
+        let visible = Set(sessions.map(\.sessionId))
+        runningSessionIDs.formIntersection(visible)
+        unreadSessionIDs.formIntersection(visible)
         guard let selectedSessionID,
               !sessions.contains(where: { $0.sessionId == selectedSessionID }),
               sessionRequestID == nil
@@ -1148,11 +1268,10 @@ final class AppModel {
             configRequestID = nil
         }
         if requestID == sessionMutationRequestID {
-            transmit(.listSessions(requestID: requestID)) { [weak self] message in
+            transmit(.listSessions(requestID: requestID)) { [weak self] _ in
                 if self?.sessionMutationRequestID == requestID {
                     self?.sessionMutationRequestID = nil
                 }
-                self?.errorMessage = message
             }
         }
         if cronRequestIDs.remove(requestID) != nil {
@@ -1182,7 +1301,6 @@ final class AppModel {
             connectionState = .ready
             if isChangingWorkspace { workspaceError = rejection.message }
             isChangingWorkspace = false
-            errorMessage = rejection.message
         }
         if rejection.requestId == sessionMutationRequestID {
             sessionMutationRequestID = nil
@@ -1211,13 +1329,17 @@ final class AppModel {
             providerRegistrationRequestID = nil
         }
         if rejection.requestId == pairingCodeRequestID {
-            errorMessage = rejection.message
             pairingCodeRequestID = nil
         }
         if cronRequestIDs.remove(rejection.requestId) != nil {
             cronError = rejection.message
         }
-        errorMessage = rejection.message
+        showToast(
+            rejection.message,
+            tone: rejection.code == "revision_conflict" || rejection.code == "agent_busy"
+                ? .warning
+                : .error
+        )
         if rejection.fatal {
             restorePendingDrafts()
             connectionState = .failed(rejection.message)
@@ -1325,7 +1447,6 @@ final class AppModel {
         case "error":
             let message = event.msg["message"]?.stringValue ?? "Agent error"
             appendText(message, kind: .error, tone: "error")
-            errorMessage = message
         case "model_changed":
             selectedModelRoute = event.msg["route"]?.stringValue ?? selectedModelRoute
             if let window = event.msg["modelContextWindow"]?.intValue {
@@ -1661,7 +1782,8 @@ final class AppModel {
         restorePendingDrafts()
         connectionState = .failed(message)
         if pendingPairingAccount != nil { pairingError = message }
-        errorMessage = message
+        showToast(message, tone: .error)
+        runningSessionIDs.removeAll()
         activeTurnID = nil
         finishGeneration()
         steeringQueued = false
@@ -1676,6 +1798,7 @@ final class AppModel {
         eventTask?.cancel()
         eventTask = nil
         latestSequence = nil
+        notificationReplayCeiling = nil
         if preservingDrafts {
             restorePendingDrafts()
         } else {
@@ -1684,7 +1807,7 @@ final class AppModel {
         }
         pendingPairingAccount = nil
         connectionState = .disconnected
-        errorMessage = nil
+        dismissToast()
         sessionRequestID = nil
         sessionMutationRequestID = nil
         sessionToRestoreID = nil
@@ -1697,6 +1820,8 @@ final class AppModel {
         isLoadingDirectories = false
         sessions = []
         selectedSessionID = nil
+        runningSessionIDs.removeAll()
+        unreadSessionIDs.removeAll()
         profile = nil
         modelChoices = []
         middlewareFeatures = []

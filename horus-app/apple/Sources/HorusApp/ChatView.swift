@@ -466,23 +466,11 @@ private struct HorusMarkdownFonts: MarkdownFontGroup {
 
 struct ComposerView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.horusPalette) private var palette
 
     var body: some View {
         VStack(spacing: 8) {
             ForEach(model.composerHeaderWidgets) { widget in
                 FrontendWidgetView(widget: widget)
-            }
-            if let error = model.errorMessage {
-                HStack(spacing: 8) {
-                    HorusIcon(name: "triangle-alert", foreground: palette.danger)
-                    Text(error).frame(maxWidth: .infinity, alignment: .leading)
-                    Button("Dismiss") { model.errorMessage = nil }.buttonStyle(.borderless)
-                }
-                .font(HorusStyle.bodyFont)
-                .foregroundStyle(palette.danger)
-                .padding(8)
-                .background(palette.danger.opacity(0.10), in: RoundedRectangle(cornerRadius: HorusStyle.controlRadius))
             }
             if let approval = model.pendingApproval {
                 ApprovalView(approval: approval)

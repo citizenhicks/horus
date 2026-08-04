@@ -1,13 +1,17 @@
 import SwiftUI
+import Accessibility
 
 struct AppShell: View {
     @Environment(AppModel.self) private var model
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
     @State private var columnVisibility = NavigationSplitViewVisibility.all
     @State private var compactColumn = NavigationSplitViewColumn.sidebar
 
     var body: some View {
         @Bindable var model = model
-        ZStack {
+        ZStack(alignment: .top) {
             HorusBackdrop()
             if model.accounts.isEmpty {
                 PairingView(canCancel: false)
@@ -26,21 +30,38 @@ struct AppShell: View {
                 .navigationSplitViewStyle(.balanced)
                 .inspector(isPresented: $model.showsInspector) {
                     ArtifactInspector()
+                        .overlay(alignment: .top) {
+                            #if os(iOS)
+                            if horizontalSizeClass == .compact { AppToastOverlay() }
+                            #endif
+                        }
                 }
                 .sheet(isPresented: $model.showsPairing) {
                     PairingView(canCancel: true)
                         .frame(maxWidth: 560)
                         .padding(24)
+                        .overlay(alignment: .top) { AppToastOverlay() }
                         .presentationDetents([.medium, .large])
                 }
                 .sheet(isPresented: $model.showsWorkspaceBrowser) {
                     WorkspaceBrowserView()
                         .frame(idealWidth: 520, idealHeight: 620)
+                        .overlay(alignment: .top) { AppToastOverlay() }
                         .presentationDetents([.medium, .large])
                 }
             }
+            AppToastOverlay().zIndex(10)
         }
         .preferredColorScheme(preferredColorScheme)
+        .onChange(of: chatIsVisible, initial: true) { _, visible in
+            model.setChatVisible(visible)
+        }
+        .onChange(of: model.toast?.id) { _, _ in
+            guard let toast = model.toast else { return }
+            AccessibilityNotification.Announcement(
+                "\(toast.tone.title): \(toast.message)"
+            ).post()
+        }
         .task { model.start() }
     }
 
@@ -64,6 +85,119 @@ struct AppShell: View {
         }
     }
 
+    private var chatIsVisible: Bool {
+        guard !model.accounts.isEmpty,
+              model.destination == .chat,
+              !model.showsPairing,
+              !model.showsWorkspaceBrowser
+        else { return false }
+        #if os(iOS)
+        return horizontalSizeClass != .compact
+            || compactColumn == .detail && !model.showsInspector
+        #else
+        return true
+        #endif
+    }
+}
+
+private struct AppToastOverlay: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Group {
+            if let toast = model.toast {
+                AppToastView(toast: toast, dismiss: model.dismissToast)
+                    .transition(
+                        reduceMotion
+                            ? .opacity
+                            : .move(edge: .top).combined(with: .opacity)
+                    )
+            }
+        }
+        .frame(maxWidth: 520)
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .allowsHitTesting(model.toast != nil)
+        .animation(
+            reduceMotion ? .easeOut(duration: 0.12) : .smooth(duration: 0.28),
+            value: model.toast?.id
+        )
+    }
+}
+
+private struct AppToastView: View {
+    @Environment(\.horusPalette) private var palette
+    let toast: AppToast
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                HorusIcon(
+                    name: toast.tone.icon,
+                    size: 18,
+                    foreground: toast.tone.color(in: palette)
+                )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(toast.tone.title)
+                        .font(HorusStyle.controlFont.weight(.semibold))
+                        .foregroundStyle(toast.tone.color(in: palette))
+                    Text(toast.message)
+                        .font(HorusStyle.bodyFont)
+                        .foregroundStyle(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(toast.tone.title): \(toast.message)")
+
+            Button(action: dismiss) {
+                HorusIcon(name: "x", size: 14, foreground: palette.muted)
+                    .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss notification")
+        }
+        .padding(.leading, 16)
+        .padding(.trailing, 6)
+        .padding(.vertical, 10)
+        .horusGlass(
+            in: RoundedRectangle(cornerRadius: HorusStyle.cardRadius, style: .continuous)
+        )
+        .shadow(color: .black.opacity(0.20), radius: 18, y: 8)
+    }
+}
+
+private extension ToastTone {
+    var title: String {
+        switch self {
+        case .info: "Notice"
+        case .success: "Done"
+        case .warning: "Attention"
+        case .error: "Error"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .info: "info"
+        case .success: "circle-check"
+        case .warning: "triangle-alert"
+        case .error: "circle-x"
+        }
+    }
+
+    func color(in palette: HorusPalette) -> Color {
+        switch self {
+        case .info: palette.accent
+        case .success: palette.signal
+        case .warning: palette.warning
+        case .error: palette.danger
+        }
+    }
 }
 
 private struct WorkspaceBrowserView: View {
@@ -405,20 +539,38 @@ struct SidebarView: View {
 
     private func sessionRow(_ session: SessionRecord) -> some View {
         let isSelected = session.sessionId == model.selectedSessionID
+        let isRunning = model.runningSessionIDs.contains(session.sessionId)
+        let isUnread = model.unreadSessionIDs.contains(session.sessionId)
+        let activityValue: String
+        if isRunning {
+            activityValue = "In progress"
+        } else if isUnread {
+            activityValue = "Completed, unread"
+        } else {
+            activityValue = ""
+        }
         return HStack(spacing: 4) {
             Button {
                 model.openSession(session.sessionId)
                 model.destination = .chat
                 showDetail()
             } label: {
-                Text(session.displayTitle)
-                    .lineLimit(1)
-                    .foregroundStyle(.primary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
+                HStack(spacing: 8) {
+                    Text(session.displayTitle)
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    SessionActivityIndicator(
+                        isRunning: isRunning,
+                        isUnread: isUnread
+                    )
+                }
+                .frame(minHeight: HorusStyle.iconButtonSize)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(!model.canOpenSession && session.sessionId != model.selectedSessionID)
+            .accessibilityValue(activityValue)
 
             if session.pinned {
                 HorusIcon(name: "pin", size: 12, foreground: palette.accent)
@@ -464,6 +616,40 @@ struct SidebarView: View {
             get: { sessionToDelete != nil },
             set: { if !$0 { sessionToDelete = nil } }
         )
+    }
+}
+
+private struct SessionActivityIndicator: View {
+    @Environment(\.horusPalette) private var palette
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let isRunning: Bool
+    let isUnread: Bool
+
+    var body: some View {
+        Group {
+            if isRunning {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { context in
+                    let progress = context.date.timeIntervalSinceReferenceDate
+                        .truncatingRemainder(dividingBy: 0.9) / 0.9
+                    Circle()
+                        .trim(from: 0.08, to: 0.76)
+                        .stroke(
+                            palette.accent,
+                            style: StrokeStyle(lineWidth: 1.7, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(reduceMotion ? -90 : progress * 360 - 90))
+                }
+                .frame(width: 11, height: 11)
+            } else if isUnread {
+                Circle()
+                    .fill(palette.accent)
+                    .frame(width: 7, height: 7)
+                    .frame(width: 11, height: 11)
+            } else {
+                Color.clear.frame(width: 11, height: 11)
+            }
+        }
+        .accessibilityHidden(true)
     }
 }
 
