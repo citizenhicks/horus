@@ -109,10 +109,7 @@ impl Approval {
             group: None,
             append: false,
             pending: false,
-            text: format!(
-                "approve? [y] once · [a] session · [N] deny · [q] abort\n{}\n  {tools}",
-                request.reason
-            ),
+            text: format!("approval required\n{}\n  {tools}", request.reason),
             format: crate::protocol::FrontendBlockFormat::PlainText,
             tone: FrontendTone::Warning,
         })
@@ -371,6 +368,31 @@ mod tests {
             ApprovalPolicy::AllowNetwork.network_access(),
             NetworkAccess::Allowed
         );
+    }
+
+    #[test]
+    fn approval_rendering_is_frontend_neutral() {
+        let block = Approval::new(ApprovalPolicy::On)
+            .render(&EventMsg::ExecApprovalRequest(
+                crate::protocol::ExecApprovalRequestEvent {
+                    id: "approval".into(),
+                    turn_id: "turn".into(),
+                    calls: vec![crate::protocol::ApprovalCall {
+                        call_id: "call".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "true"}),
+                    }],
+                    reason: "command execution".into(),
+                },
+            ))
+            .expect("approval block");
+
+        assert!(
+            block
+                .text
+                .starts_with("approval required\ncommand execution\n")
+        );
+        assert!(!block.text.contains('[') && !block.text.contains(']'));
     }
 
     #[test]

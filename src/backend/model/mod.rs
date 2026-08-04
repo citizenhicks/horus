@@ -25,9 +25,8 @@ pub mod openrouter;
 pub mod provider;
 mod transport;
 
-pub(crate) const TOOL_ERROR_FIELD: &str = "_horus_is_error";
-pub(crate) const REPLAY_REASONING_FIELD: &str = "_horus_reasoning";
-const INTERNAL_MESSAGE_FIELD: &str = "_horus_internal";
+use crate::protocol::INTERNAL_MESSAGE_FIELD;
+pub(crate) use crate::protocol::{REPLAY_REASONING_FIELD, TOOL_ERROR_FIELD};
 const MAX_MODEL_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 128;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
@@ -507,14 +506,6 @@ pub(crate) fn internal_user_message(kind: &str, text: &str) -> Value {
     let mut message = user_message(text);
     message[INTERNAL_MESSAGE_FIELD] = Value::String(kind.into());
     message
-}
-
-pub(crate) fn internal_message_kind(message: &Value) -> Option<&str> {
-    message.get(INTERNAL_MESSAGE_FIELD)?.as_str()
-}
-
-pub(crate) fn is_internal_message(message: &Value) -> bool {
-    internal_message_kind(message).is_some()
 }
 
 /// Creates a Responses API function-call-output item.

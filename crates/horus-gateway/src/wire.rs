@@ -508,7 +508,7 @@ pub struct DailyUsage {
     pub usage: TokenUsage,
 }
 
-/// A reusable code-diff or subagent artifact emitted by a capability.
+/// A reusable artifact emitted for one session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRecord {
     pub id: String,

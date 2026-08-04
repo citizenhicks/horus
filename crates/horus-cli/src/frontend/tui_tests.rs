@@ -8,15 +8,20 @@ use super::*;
 use crate::frontend::catalog::UiCatalog;
 use crate::frontend::theme::{Role, current};
 use horus::backend::model::ModelChoice;
-use horus::middleware::Middleware;
-use horus::middleware::steering::Steering;
 use horus::protocol::{
-    FrontendBlockFormat, FrontendSlot, FrontendTone, FrontendWidget, ReviewDecision,
+    FrontendActiveInput, FrontendBlockFormat, FrontendContribution, FrontendSlot, FrontendTone,
+    FrontendWidget, ReviewDecision,
 };
-use horus_gateway::wire::RenderedEvent;
+use horus_gateway::wire::{RenderedEvent, RenderedPreview};
 
 fn catalog(workspace: &std::path::Path) -> UiCatalog {
-    let steering = Steering::default().frontend();
+    let steering = FrontendContribution {
+        capability: "steering".into(),
+        active_input: Some(FrontendActiveInput {
+            operation: "steer".into(),
+        }),
+        ..FrontendContribution::default()
+    };
     UiCatalog::build(
         &[steering],
         &[ModelChoice {
@@ -45,11 +50,6 @@ fn state() -> TuiState {
         },
         "kimi".into(),
     )
-}
-
-fn frontend() -> impl Fn(&EventMsg) -> Vec<FrontendBlock> {
-    let tools = horus::middleware::tools::Tools::coding();
-    move |event| tools.render(event).into_iter().collect()
 }
 
 fn rendered_text(lines: &[ratatui::text::Line<'_>]) -> String {
@@ -191,76 +191,18 @@ fn generic_picker_submits_the_selected_operation() {
 }
 
 #[test]
-fn session_history_uses_normal_reasoning_and_tool_rendering() {
-    let frontend = frontend();
+fn completed_diff_replaces_the_pending_block_with_a_styled_diff() {
     let mut state = state();
     state.transcript.clear();
-
-    handle_event(
-        &mut state,
-        &frontend,
-        EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent {
-            events: vec![
-                EventMsg::UserMessage(horus::protocol::UserMessageEvent {
-                    message: "inspect the file".into(),
-                }),
-                EventMsg::AgentReasoningContentDelta(
-                    horus::protocol::AgentReasoningContentDeltaEvent {
-                        thread_id: "saved".into(),
-                        turn_id: "history-1".into(),
-                        item_id: "reasoning".into(),
-                        delta: "I should read it.".into(),
-                    },
-                ),
-                EventMsg::ToolCallBegin(horus::protocol::ToolCallBeginEvent {
-                    turn_id: "history-1".into(),
-                    call_id: "call-1".into(),
-                    name: "read_file".into(),
-                    arguments: serde_json::json!({"path": "note.txt"}),
-                }),
-                EventMsg::ToolCallEnd(horus::protocol::ToolCallEndEvent {
-                    turn_id: "history-1".into(),
-                    call_id: "call-1".into(),
-                    name: "read_file".into(),
-                    output: "hello".into(),
-                    is_error: false,
-                }),
-            ],
-        }),
-    );
-
-    assert_eq!(
-        state
-            .transcript
-            .iter()
-            .map(|entry| entry.text.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "› inspect the file",
-            "I should read it.",
-            "◉ Read note.txt\n  hello"
-        ]
-    );
-}
-
-#[test]
-fn completed_patch_replaces_the_tool_log_with_a_styled_diff() {
-    let frontend = frontend();
-    let mut state = state();
-    state.transcript.clear();
-    handle_event(
-        &mut state,
-        &frontend,
-        EventMsg::ToolCallBegin(horus::protocol::ToolCallBeginEvent {
-            turn_id: "turn".into(),
-            call_id: "patch".into(),
-            name: "apply_patch".into(),
-            arguments: serde_json::json!({
-                "path": "note.txt",
-                "patch": "--- note.txt\n+++ note.txt\n@@ -1 +1 @@\n-old\n+new\n"
-            }),
-        }),
-    );
+    state.apply_block(FrontendBlock {
+        id: Some("turn/patch".into()),
+        group: None,
+        append: false,
+        pending: true,
+        text: "◉ Edit note.rs".into(),
+        format: FrontendBlockFormat::PlainText,
+        tone: FrontendTone::Neutral,
+    });
     view::live_transcript_lines(&mut state, 0, 80);
     assert_eq!(
         state
@@ -270,17 +212,15 @@ fn completed_patch_replaces_the_tool_log_with_a_styled_diff() {
             .map(|(width, _)| *width),
         Some(80)
     );
-    handle_event(
-        &mut state,
-        &frontend,
-        EventMsg::ToolCallEnd(horus::protocol::ToolCallEndEvent {
-            turn_id: "turn".into(),
-            call_id: "patch".into(),
-            name: "apply_patch".into(),
-            output: "--- note.rs\n+++ note.rs\n@@ -1,5 +1,5 @@\n-fn old_name() {}\n+fn new_name() {}\n keep_one();\n-let removed = false;\n keep_two();\n+let added = true;\n keep_three();\n".into(),
-            is_error: false,
-        }),
-    );
+    state.apply_block(FrontendBlock {
+        id: Some("turn/patch".into()),
+        group: None,
+        append: false,
+        pending: false,
+        text: "--- note.rs\n+++ note.rs\n@@ -1,5 +1,5 @@\n-fn old_name() {}\n+fn new_name() {}\n keep_one();\n-let removed = false;\n keep_two();\n+let added = true;\n keep_three();\n".into(),
+        format: FrontendBlockFormat::UnifiedDiff,
+        tone: FrontendTone::Success,
+    });
     assert!(
         state
             .transcript
@@ -581,18 +521,20 @@ fn live_transcript_preview_uses_the_full_frame_and_new_entries() {
 
 #[test]
 fn snapshot_preview_scrolls_with_the_mouse_wheel() {
-    let frontend = frontend();
     let mut state = state();
-    handle_event(
+    events::handle_gateway_event(
         &mut state,
-        &frontend,
-        EventMsg::Frontend(FrontendEvent::Preview {
+        EventMsg::ContextCompacted,
+        Vec::new(),
+        None,
+        Some(RenderedPreview {
             title: "subagent".into(),
             events: (0..30)
-                .map(|index| {
-                    EventMsg::UserMessage(horus::protocol::UserMessageEvent {
+                .map(|index| RenderedEvent {
+                    event: EventMsg::UserMessage(horus::protocol::UserMessageEvent {
                         message: format!("subagent row {index}"),
-                    })
+                    }),
+                    blocks: Vec::new(),
                 })
                 .collect(),
         }),

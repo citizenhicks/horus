@@ -13,6 +13,7 @@ use horus::backend::model::{
 };
 use horus::backend::sandbox::{Sandbox, SandboxBackend};
 use horus::middleware::compaction::Compaction;
+use horus::middleware::cron::Cron;
 use horus::middleware::instructions::Instructions;
 use horus::middleware::sessions::Sessions;
 use horus::middleware::skills::Skills;
@@ -24,7 +25,7 @@ use horus::middleware::{Middleware, MiddlewareStack};
 use horus::protocol::SessionContext;
 
 use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig, local_user_name};
-use crate::cron::{ConversationalCron, CronStore};
+use crate::cron::CronStore;
 use crate::middleware_manifest::{BuiltinMiddleware, MIDDLEWARE};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{MiddlewareConfig, ProviderAuthKind, ProviderConfig, ProviderStatus};
@@ -566,7 +567,14 @@ fn build_middleware(
         let middleware: Arc<dyn Middleware> = match feature.kind {
             BuiltinMiddleware::Tools => Arc::new(Tools::coding()),
             BuiltinMiddleware::Instructions => Arc::new(Instructions::discover(workspace)?),
-            BuiltinMiddleware::Cron => Arc::new(ConversationalCron::new(Arc::clone(&cron))),
+            BuiltinMiddleware::Cron => {
+                let cron = Arc::clone(&cron);
+                Arc::new(Cron::new(move |session_id, task, schedule| {
+                    cron.add_managed(session_id, task, schedule)
+                        .map(|task| task.id)
+                        .map_err(|error| HorusError::Tool(error.to_string()))
+                }))
+            }
             BuiltinMiddleware::Skills => Arc::new(Skills::discover_installed([
                 workspace.join(".agents/skills"),
                 workspace.join(".codex/skills"),

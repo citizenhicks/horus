@@ -214,10 +214,6 @@ impl Sandbox {
         self.background.stop(&permissions.session_id, id).await
     }
 
-    pub(crate) fn name(&self) -> &'static str {
-        "sandbox"
-    }
-
     pub(crate) fn frontend(&self) -> FrontendContribution {
         self.approval.frontend()
     }

@@ -440,7 +440,7 @@ fn cli_commands() -> Vec<UiCommand> {
         ),
         command(
             "artifacts",
-            "show code diff and subagent artifacts",
+            "show session artifacts",
             false,
             CommandHandler::Artifacts,
         ),

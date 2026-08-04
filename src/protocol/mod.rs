@@ -3,7 +3,10 @@
 use serde::Deserialize;
 use serde::Serialize;
 
-pub(crate) use self::replay::events as replay_events;
+pub(crate) use self::replay::{
+    INTERNAL_MESSAGE_FIELD, REPLAY_REASONING_FIELD, TOOL_ERROR_FIELD, events as replay_events,
+    internal_message_kind, is_internal_message,
+};
 
 mod replay;
 
@@ -419,7 +422,7 @@ pub struct SessionResumeRequestedEvent {
     pub context: SessionContext,
 }
 
-/// Responses API message phases understood by frontends.
+/// Assistant message phases understood by frontends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentMessagePhase {

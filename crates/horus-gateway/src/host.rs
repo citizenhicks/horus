@@ -1,60 +1,48 @@
 //! Per-chat agent ownership, event sequencing, replay, and authenticated operations.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::{Component, Path};
+mod catalog;
+mod git;
+mod providers;
+
+use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::Duration;
 
 use horus::agent::{AgentConfig, AgentSender};
-use horus::backend::checkpoint::{
-    Checkpoint, CheckpointStore, SessionPageRequest, sqlite::SqliteCheckpoint,
-};
-use horus::backend::model::provider::{ProviderAuth, provider};
-use horus::backend::sandbox::CommandOutput;
+use horus::backend::checkpoint::{Checkpoint, CheckpointStore, sqlite::SqliteCheckpoint};
+use horus::backend::model::provider::provider;
 use horus::middleware::FrontendExtensions;
 use horus::protocol::{
     Event, EventMsg, FrontendBlock, FrontendBlockFormat, FrontendEvent, Op, ReviewDecision,
-    Submission,
+    Submission, TokenUsage,
 };
-use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::assembly::{
     BuiltAgent, assemble, configured_model_choices, configured_provider_for_route,
-    credential_is_configured, provider_statuses,
+    provider_statuses,
 };
-use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig};
+use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig, usage_delta};
 use crate::cron::{ActiveCronRun, BeginRun, CronStore};
-use crate::sandbox::{GatewaySandbox, MAX_COMMAND_OUTPUT_BYTES};
+use crate::sandbox::GatewaySandbox;
 use crate::wire::{
-    AgentComposition, ArtifactKind, ArtifactRecord, CronRunStatus, GitStatus, ProfileSnapshot,
-    ProviderConfig, ReadyPayload, RenderedEvent, RenderedPreview, ServerFrame, ServerMessage,
-    SessionReadyPayload, SessionRecord, VersionedAgentConfig,
+    AgentComposition, ArtifactKind, ArtifactRecord, CronRunStatus, ProfileSnapshot, ProviderConfig,
+    ReadyPayload, RenderedEvent, RenderedPreview, ServerFrame, ServerMessage, SessionReadyPayload,
+    SessionRecord, VersionedAgentConfig,
 };
 use crate::{Error, Result};
+
+use self::catalog::{
+    load_session_metadata, save_session_metadata, session_catalog, validate_session_title,
+};
+use self::git::{diff as workspace_git_diff, status as git_status};
 
 const COMMAND_CAPACITY: usize = 128;
 const BROADCAST_CAPACITY: usize = 512;
 const REPLAY_CAPACITY: usize = 1024;
 const ARTIFACT_CAPACITY: usize = 256;
-const SESSION_PAGE_SIZE: usize = 100;
-const SESSION_CATALOG_SCOPE: &str = "gateway";
-const SESSION_CATALOG_KEY: &str = "session_catalog";
-const MAX_SESSION_TITLE_BYTES: usize = 256;
-const MAX_SESSION_PREVIEW_BYTES: usize = 512;
-const MAX_GIT_DIFF_BYTES: usize = MAX_COMMAND_OUTPUT_BYTES;
-const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const MAX_ACTIVE_SESSIONS: usize = 32;
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct SessionMetadata {
-    title: Option<String>,
-    pinned: bool,
-    hidden: bool,
-}
-
-type SessionCatalogMetadata = BTreeMap<String, SessionMetadata>;
 
 #[derive(Clone)]
 pub(crate) struct HostHandle {
@@ -107,6 +95,7 @@ struct HostState {
     checkpoints: Arc<dyn CheckpointStore>,
     catalog_lock: Arc<Mutex<()>>,
     running: RunningAgent,
+    usage_baseline: TokenUsage,
     pending_turns: usize,
     approval_active: bool,
     restart_after_turn: bool,
@@ -170,10 +159,6 @@ enum HostCommand {
         config: AgentComposition,
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
-    SetModel {
-        route: String,
-        reply: oneshot::Sender<std::result::Result<(), Rejection>>,
-    },
     GitDiff {
         reply: oneshot::Sender<std::result::Result<String, Rejection>>,
     },
@@ -235,194 +220,6 @@ impl GatewayHost {
     pub(crate) async fn ready(&self) -> std::result::Result<ReadyPayload, Rejection> {
         let state = self.state.lock().await;
         gateway_ready(&state).await
-    }
-
-    pub(crate) async fn set_credential(
-        &self,
-        provider_id: String,
-        api_key: String,
-        base_url: Option<String>,
-    ) -> std::result::Result<(), Rejection> {
-        let base_url = {
-            let state = self.state.lock().await;
-            let definition = provider(&provider_id).map_err(invalid_config)?;
-            let base_url = if definition.configurable_base_url() {
-                base_url.or_else(|| definition.default_base_url().map(str::to_owned))
-            } else {
-                base_url
-            };
-            definition
-                .validate_base_url(base_url.as_deref())
-                .map_err(invalid_config)?;
-            state
-                .credentials
-                .set(&provider_id, &api_key, base_url.as_deref())
-                .map_err(invalid_config)?;
-            base_url
-        };
-        self.refresh_provider_sessions(&provider_id, base_url.as_deref())
-            .await
-    }
-
-    pub(crate) async fn start_provider_login(
-        &self,
-        request_id: String,
-        provider_id: String,
-    ) -> std::result::Result<(), Rejection> {
-        let definition = provider(&provider_id).map_err(invalid_config)?;
-        let ProviderAuth::Browser(auth) = definition.auth() else {
-            return Err(Rejection {
-                code: "invalid_provider_auth",
-                message: "the selected provider uses an API key".into(),
-                fatal: false,
-            });
-        };
-        if !auth.supports_device_login() {
-            return Err(Rejection {
-                code: "device_login_unavailable",
-                message: "the selected provider does not support device-code login".into(),
-                fatal: false,
-            });
-        }
-        let (login_guard, path) = {
-            let state = self.state.lock().await;
-            (
-                Arc::clone(&state.provider_login),
-                state.store.provider_auth_path(),
-            )
-        };
-        let login_id = Uuid::new_v4().to_string();
-        reserve_provider_login(&login_guard, &login_id)?;
-        let login = match auth.start_device().await {
-            Ok(login) => login,
-            Err(error) => {
-                release_provider_login(&login_guard, &login_id)?;
-                return Err(internal(error));
-            }
-        };
-        self.broadcast(ServerMessage::ProviderLoginStarted {
-            request_id: request_id.clone(),
-            login_id: login_id.clone(),
-            provider: provider_id.clone(),
-            verification_url: login.verification_url().into(),
-            user_code: login.user_code().into(),
-        });
-        let gateway = self.clone();
-        tokio::spawn(async move {
-            let result = login
-                .complete(path)
-                .await
-                .map_err(|error| error.to_string());
-            gateway
-                .finish_provider_login(request_id, login_id, provider_id, result)
-                .await;
-        });
-        Ok(())
-    }
-
-    async fn finish_provider_login(
-        &self,
-        request_id: String,
-        login_id: String,
-        provider: String,
-        result: std::result::Result<(), String>,
-    ) {
-        let login_guard = Arc::clone(&self.state.lock().await.provider_login);
-        match release_provider_login(&login_guard, &login_id) {
-            Ok(true) => {}
-            Ok(false) => return,
-            Err(rejection) => {
-                self.broadcast(ServerMessage::Error {
-                    code: rejection.code.into(),
-                    message: rejection.message,
-                    fatal: rejection.fatal,
-                });
-                return;
-            }
-        }
-        if let Err(message) = result {
-            self.broadcast(ServerMessage::Rejected {
-                request_id,
-                code: "provider_login_failed".into(),
-                message,
-                fatal: false,
-            });
-            return;
-        }
-        let refresh = self.refresh_provider_sessions(&provider, None).await;
-        self.broadcast(ServerMessage::ProviderLoginFinished {
-            request_id,
-            login_id,
-            provider,
-        });
-        if let Err(rejection) = refresh {
-            self.broadcast(ServerMessage::Error {
-                code: rejection.code.into(),
-                message: rejection.message,
-                fatal: rejection.fatal,
-            });
-        }
-    }
-
-    async fn refresh_provider_sessions(
-        &self,
-        provider: &str,
-        base_url: Option<&str>,
-    ) -> std::result::Result<(), Rejection> {
-        let sessions = self
-            .state
-            .lock()
-            .await
-            .sessions
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut failure = None;
-        for host in sessions {
-            if let Err(rejection) = host
-                .refresh_provider(provider.into(), base_url.map(str::to_owned))
-                .await
-            {
-                failure.get_or_insert(rejection);
-            }
-        }
-        failure.map_or(Ok(()), Err)
-    }
-
-    fn broadcast(&self, message: ServerMessage) {
-        let _ = self.events.send(ServerFrame::new(message));
-    }
-
-    pub(crate) async fn register_provider(
-        &self,
-        selection: ProviderConfig,
-    ) -> std::result::Result<ReadyPayload, Rejection> {
-        let state = self.state.lock().await;
-        if !credential_is_configured(&selection, &state.store, &state.credentials)
-            .map_err(invalid_config)?
-        {
-            return Err(invalid_config(Error::Config(format!(
-                "provider `{}` is not configured on this gateway",
-                selection.provider
-            ))));
-        }
-        {
-            let mut current = state
-                .config
-                .lock()
-                .map_err(|_| internal("gateway configuration lock is poisoned"))?;
-            let next = current
-                .registering_provider(selection)
-                .map_err(invalid_config)?;
-            state.store.save(&next).map_err(internal)?;
-            *current = next;
-        }
-        let payload = gateway_ready(&state).await?;
-        let frame = ServerFrame::new(ServerMessage::Ready {
-            payload: payload.clone(),
-        });
-        let _ = self.events.send(frame);
-        Ok(payload)
     }
 
     pub(crate) async fn sessions(&self) -> std::result::Result<Vec<SessionRecord>, Rejection> {
@@ -734,6 +531,7 @@ impl HostHandle {
             checkpoints,
             catalog_lock,
             running,
+            usage_baseline: TokenUsage::default(),
             pending_turns: 0,
             approval_active: false,
             restart_after_turn: false,
@@ -850,12 +648,6 @@ impl HostHandle {
             reply,
         })
         .await?;
-        receive(receiver).await
-    }
-
-    pub(crate) async fn set_model(&self, route: String) -> std::result::Result<(), Rejection> {
-        let (reply, receiver) = oneshot::channel();
-        self.send(HostCommand::SetModel { route, reply }).await?;
         receive(receiver).await
     }
 
@@ -1021,7 +813,10 @@ impl HostState {
                 let _ = reply.send(result);
             }
             HostCommand::Submit { submission, reply } => {
-                let result = self.submit(submission, false);
+                let result = match &submission.op {
+                    Op::SetModel { route } => self.set_model(route).await,
+                    _ => self.submit(submission, false),
+                };
                 let _ = reply.send(result);
             }
             HostCommand::StartCronSetup { task, reply } => {
@@ -1034,10 +829,6 @@ impl HostState {
                 reply,
             } => {
                 let result = self.configure(expected_revision, config).await;
-                let _ = reply.send(result);
-            }
-            HostCommand::SetModel { route, reply } => {
-                let result = self.set_model(&route).await;
                 let _ = reply.send(result);
             }
             HostCommand::GitDiff { reply } => {
@@ -1417,7 +1208,7 @@ impl HostState {
                     if is_history {
                         self.suppress_history_broadcast = false;
                     }
-                    let frame = self.record_event(event, false, true)?;
+                    let frame = self.record_event(event, true)?;
                     if !is_history {
                         self.pending_startup.push(frame);
                     }
@@ -1455,7 +1246,7 @@ impl HostState {
             _ => {}
         }
         let cron_completion = self.observe_cron_event(&event)?;
-        self.record_event(event, was_active, suppress_broadcast)?;
+        self.record_event(event, suppress_broadcast)?;
 
         if self.pending_turns == 0 && was_active {
             self.broadcast_sessions()
@@ -1481,24 +1272,13 @@ impl HostState {
         Ok(())
     }
 
-    fn record_event(
-        &mut self,
-        event: Event,
-        was_active: bool,
-        suppress_broadcast: bool,
-    ) -> Result<ServerFrame> {
-        if let EventMsg::TokenCount(count) = &event.msg
-            && let Some(info) = &count.info
-        {
+    fn record_event(&mut self, event: Event, suppress_broadcast: bool) -> Result<ServerFrame> {
+        if let Some(delta) = live_usage_delta(&mut self.usage_baseline, &event)? {
             let mut gateway = self
                 .gateway
                 .lock()
                 .map_err(|_| Error::Config("gateway configuration lock is poisoned".into()))?;
-            if gateway.observe_usage(
-                &self.running.session_id,
-                &info.total_token_usage,
-                was_active,
-            )? {
+            if gateway.observe_usage(&delta)? {
                 self.store.save(&gateway)?;
             }
         }
@@ -1656,6 +1436,21 @@ impl HostState {
     }
 }
 
+fn live_usage_delta(baseline: &mut TokenUsage, event: &Event) -> Result<Option<TokenUsage>> {
+    let EventMsg::TokenCount(count) = &event.msg else {
+        return Ok(None);
+    };
+    let Some(info) = &count.info else {
+        return Ok(None);
+    };
+    let delta = usage_delta(&info.total_token_usage, baseline)?;
+    baseline.clone_from(&info.total_token_usage);
+    if event.submission_id.is_none() {
+        return Ok(None);
+    }
+    Ok(delta)
+}
+
 fn provider_credential_matches(
     selection: &ProviderConfig,
     provider_id: &str,
@@ -1801,311 +1596,6 @@ async fn hide_checkpoint(checkpoints: &Arc<dyn CheckpointStore>, session_id: &st
     Ok(())
 }
 
-async fn session_catalog(checkpoints: &Arc<dyn CheckpointStore>) -> Result<Vec<SessionRecord>> {
-    let mut cursor = None;
-    let mut sessions = Vec::new();
-    while sessions.len() < SESSION_PAGE_SIZE {
-        let page = checkpoints
-            .list_sessions_page(SessionPageRequest {
-                cursor,
-                limit: SESSION_PAGE_SIZE,
-            })
-            .await?;
-        sessions.extend(
-            page.sessions
-                .into_iter()
-                .filter(|session| session.catalog_visible),
-        );
-        let Some(next) = page.next_cursor else {
-            break;
-        };
-        cursor = Some(next);
-    }
-    sessions.truncate(SESSION_PAGE_SIZE);
-    for session in &mut sessions {
-        if let Some(message) = &mut session.first_user_message
-            && message.len() > MAX_SESSION_PREVIEW_BYTES
-        {
-            let mut end = MAX_SESSION_PREVIEW_BYTES;
-            while !message.is_char_boundary(end) {
-                end -= 1;
-            }
-            message.truncate(end);
-        }
-    }
-    let metadata = load_session_metadata(checkpoints).await?;
-    let mut sessions = sessions
-        .into_iter()
-        .filter_map(|summary| {
-            let metadata = metadata.get(&summary.session_id);
-            (!metadata.is_some_and(|metadata| metadata.hidden)).then(|| SessionRecord {
-                title: metadata.and_then(|metadata| metadata.title.clone()),
-                pinned: metadata.is_some_and(|metadata| metadata.pinned),
-                summary,
-            })
-        })
-        .collect::<Vec<_>>();
-    sessions.sort_by(|left, right| {
-        right
-            .pinned
-            .cmp(&left.pinned)
-            .then_with(|| right.summary.updated_at.cmp(&left.summary.updated_at))
-            .then_with(|| right.summary.sequence.cmp(&left.summary.sequence))
-            .then_with(|| left.summary.session_id.cmp(&right.summary.session_id))
-    });
-    Ok(sessions)
-}
-
-async fn load_session_metadata(
-    checkpoints: &Arc<dyn CheckpointStore>,
-) -> Result<SessionCatalogMetadata> {
-    let Some(value) = checkpoints
-        .load_state(SESSION_CATALOG_SCOPE, SESSION_CATALOG_KEY)
-        .await?
-    else {
-        return Ok(SessionCatalogMetadata::default());
-    };
-    Ok(serde_json::from_value(value)?)
-}
-
-async fn save_session_metadata(
-    checkpoints: &Arc<dyn CheckpointStore>,
-    metadata: &SessionCatalogMetadata,
-) -> Result<()> {
-    checkpoints
-        .save_state(
-            SESSION_CATALOG_SCOPE,
-            SESSION_CATALOG_KEY,
-            &serde_json::to_value(metadata)?,
-        )
-        .await?;
-    Ok(())
-}
-
-fn validate_session_title(title: &str) -> std::result::Result<&str, Rejection> {
-    let title = title.trim();
-    if title.is_empty() || title.len() > MAX_SESSION_TITLE_BYTES {
-        return Err(Rejection {
-            code: "invalid_session_title",
-            message: format!("chat title must be 1–{MAX_SESSION_TITLE_BYTES} UTF-8 bytes"),
-            fatal: false,
-        });
-    }
-    Ok(title)
-}
-
-async fn git_status(sandbox: &GatewaySandbox) -> Option<GitStatus> {
-    let current = tokio::time::timeout(
-        GIT_TIMEOUT,
-        sandbox.execute_git(&["branch", "--show-current"]),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if current.exit_code != 0
-        || current.stdout.len() > MAX_GIT_DIFF_BYTES
-        || current.stderr.len() > MAX_GIT_DIFF_BYTES
-    {
-        return None;
-    }
-    Some(GitStatus {
-        current_branch: current.stdout.trim().into(),
-    })
-}
-
-async fn workspace_git_diff(
-    sandbox: &GatewaySandbox,
-    workspace: &Path,
-) -> std::result::Result<String, Rejection> {
-    tokio::time::timeout(GIT_TIMEOUT, workspace_git_diff_inner(sandbox, workspace))
-        .await
-        .map_err(|_| git_timeout())?
-}
-
-async fn workspace_git_diff_inner(
-    sandbox: &GatewaySandbox,
-    workspace: &Path,
-) -> std::result::Result<String, Rejection> {
-    let repository = git_output(sandbox, &["rev-parse", "--is-inside-work-tree"]).await?;
-    if repository.exit_code != 0 {
-        if repository.stderr.contains("not a git repository") {
-            return Ok(String::new());
-        }
-        return Err(git_failure(
-            "checking the Git workspace failed",
-            &repository.stderr,
-        ));
-    }
-    if repository.stdout != "true\n" {
-        return Ok(String::new());
-    }
-
-    let head = git_output(sandbox, &["rev-parse", "--verify", "--quiet", "HEAD"]).await?;
-    let mut diff = if head.exit_code == 0 {
-        successful_git_output(
-            git_output(
-                sandbox,
-                &[
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-color",
-                    "--no-textconv",
-                    "HEAD",
-                    "--",
-                ],
-            )
-            .await?,
-            "git diff failed",
-        )?
-    } else {
-        let staged = successful_git_output(
-            git_output(
-                sandbox,
-                &[
-                    "diff",
-                    "--cached",
-                    "--no-ext-diff",
-                    "--no-color",
-                    "--no-textconv",
-                    "--",
-                ],
-            )
-            .await?,
-            "staged git diff failed",
-        )?;
-        let unstaged = successful_git_output(
-            git_output(
-                sandbox,
-                &["diff", "--no-ext-diff", "--no-color", "--no-textconv", "--"],
-            )
-            .await?,
-            "unstaged git diff failed",
-        )?;
-        let mut diff = Vec::new();
-        append_diff(&mut diff, &staged)?;
-        append_diff(&mut diff, &unstaged)?;
-        diff
-    };
-    if diff.len() > MAX_GIT_DIFF_BYTES {
-        return Err(git_diff_too_large());
-    }
-
-    let untracked = successful_git_output(
-        git_output(
-            sandbox,
-            &["ls-files", "--others", "--exclude-standard", "-z", "--"],
-        )
-        .await?,
-        "listing untracked files failed",
-    )?;
-    if untracked.len() > MAX_GIT_DIFF_BYTES {
-        return Err(git_diff_too_large());
-    }
-    for path in untracked
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-    {
-        let path = std::str::from_utf8(path).map_err(|_| git_invalid_path())?;
-        let relative = Path::new(path);
-        if !safe_git_path(relative) {
-            return Err(git_invalid_path());
-        }
-        let metadata = match tokio::fs::symlink_metadata(workspace.join(relative)).await {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(git_error(error)),
-        };
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        let patch = untracked_git_diff(sandbox, path).await?;
-        if !is_binary_diff(&patch) {
-            append_diff(&mut diff, &patch)?;
-        }
-    }
-
-    Ok(String::from_utf8_lossy(&diff).into_owned())
-}
-
-async fn git_output(
-    sandbox: &GatewaySandbox,
-    args: &[&str],
-) -> std::result::Result<CommandOutput, Rejection> {
-    let output = sandbox.execute_git(args).await.map_err(git_error)?;
-    if output.stdout.len() > MAX_GIT_DIFF_BYTES || output.stderr.len() > MAX_GIT_DIFF_BYTES {
-        return Err(git_diff_too_large());
-    }
-    Ok(output)
-}
-
-async fn untracked_git_diff(
-    sandbox: &GatewaySandbox,
-    path: &str,
-) -> std::result::Result<Vec<u8>, Rejection> {
-    let output = git_output(
-        sandbox,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-color",
-            "--no-textconv",
-            "--no-index",
-            "--",
-            "/dev/null",
-            path,
-        ],
-    )
-    .await?;
-    if matches!(output.exit_code, 0 | 1) {
-        Ok(output.stdout.into_bytes())
-    } else {
-        Err(git_failure("untracked git diff failed", &output.stderr))
-    }
-}
-
-fn successful_git_output(
-    output: CommandOutput,
-    failure: &str,
-) -> std::result::Result<Vec<u8>, Rejection> {
-    if output.exit_code == 0 {
-        Ok(output.stdout.into_bytes())
-    } else {
-        Err(git_failure(failure, &output.stderr))
-    }
-}
-
-fn append_diff(target: &mut Vec<u8>, patch: &[u8]) -> std::result::Result<(), Rejection> {
-    if patch.is_empty() {
-        return Ok(());
-    }
-    let separator = usize::from(!target.is_empty() && !target.ends_with(b"\n"));
-    if target
-        .len()
-        .saturating_add(separator)
-        .saturating_add(patch.len())
-        > MAX_GIT_DIFF_BYTES
-    {
-        return Err(git_diff_too_large());
-    }
-    if separator == 1 {
-        target.push(b'\n');
-    }
-    target.extend_from_slice(patch);
-    Ok(())
-}
-
-fn safe_git_path(path: &Path) -> bool {
-    !path.as_os_str().is_empty()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-}
-
-fn is_binary_diff(diff: &[u8]) -> bool {
-    diff.split(|byte| *byte == b'\n')
-        .any(|line| line.starts_with(b"Binary files "))
-}
-
 fn render_preview(frontend: &FrontendExtensions, event: &EventMsg) -> Option<RenderedPreview> {
     let EventMsg::Frontend(FrontendEvent::Preview { title, events }) = event else {
         return None;
@@ -2217,10 +1707,21 @@ fn record_and_publish(
     frame: ServerFrame,
     suppress_broadcast: bool,
 ) {
-    if replay.len() == REPLAY_CAPACITY {
-        replay.pop_front();
+    if !matches!(
+        &frame.message,
+        ServerMessage::AgentEvent {
+            event: Event {
+                msg: EventMsg::SessionResumeRequested(_),
+                ..
+            },
+            ..
+        }
+    ) {
+        if replay.len() == REPLAY_CAPACITY {
+            replay.pop_front();
+        }
+        replay.push_back(frame.clone());
     }
-    replay.push_back(frame.clone());
     if !suppress_broadcast {
         let _ = events.send(frame);
     }
@@ -2235,45 +1736,6 @@ fn publish_ready_and_pending(
     for frame in pending {
         let _ = events.send(frame);
     }
-}
-
-fn ensure_provider_login_available(
-    active_login: Option<&str>,
-) -> std::result::Result<(), Rejection> {
-    if active_login.is_some() {
-        return Err(Rejection {
-            code: "provider_login_in_progress",
-            message: "finish the active provider login before starting another".into(),
-            fatal: false,
-        });
-    }
-    Ok(())
-}
-
-fn reserve_provider_login(
-    active_login: &StdMutex<Option<String>>,
-    login_id: &str,
-) -> std::result::Result<(), Rejection> {
-    let mut active_login = active_login
-        .lock()
-        .map_err(|_| internal("provider login lock is poisoned"))?;
-    ensure_provider_login_available(active_login.as_deref())?;
-    *active_login = Some(login_id.into());
-    Ok(())
-}
-
-fn release_provider_login(
-    active_login: &StdMutex<Option<String>>,
-    login_id: &str,
-) -> std::result::Result<bool, Rejection> {
-    let mut active_login = active_login
-        .lock()
-        .map_err(|_| internal("provider login lock is poisoned"))?;
-    if active_login.as_deref() != Some(login_id) {
-        return Ok(false);
-    }
-    *active_login = None;
-    Ok(true)
 }
 
 async fn receive<T>(
@@ -2330,51 +1792,6 @@ fn unknown_session() -> Rejection {
     }
 }
 
-fn git_error(error: impl std::fmt::Display) -> Rejection {
-    Rejection {
-        code: "git_error",
-        message: error.to_string(),
-        fatal: false,
-    }
-}
-
-fn git_failure(prefix: &str, stderr: &str) -> Rejection {
-    let detail = stderr.trim();
-    Rejection {
-        code: "git_error",
-        message: if detail.is_empty() {
-            prefix.into()
-        } else {
-            format!("{prefix}: {detail}")
-        },
-        fatal: false,
-    }
-}
-
-fn git_timeout() -> Rejection {
-    Rejection {
-        code: "git_timeout",
-        message: "Git inspection exceeded 5 seconds".into(),
-        fatal: false,
-    }
-}
-
-fn git_diff_too_large() -> Rejection {
-    Rejection {
-        code: "git_diff_too_large",
-        message: format!("workspace Git diff exceeds {MAX_GIT_DIFF_BYTES} bytes"),
-        fatal: false,
-    }
-}
-
-fn git_invalid_path() -> Rejection {
-    Rejection {
-        code: "git_error",
-        message: "Git returned an invalid untracked path".into(),
-        fatal: false,
-    }
-}
-
 fn invalid_cron(error: impl std::fmt::Display) -> Rejection {
     Rejection {
         code: "invalid_cron",
@@ -2386,28 +1803,38 @@ fn invalid_cron(error: impl std::fmt::Display) -> Rejection {
 #[cfg(test)]
 mod tests {
     use horus::backend::checkpoint::Checkpoint;
+    use horus::protocol::{TokenCountEvent, TokenUsageInfo};
 
     use super::*;
 
-    fn run_git(workspace: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .env("LC_ALL", "C")
-            .current_dir(workspace)
-            .output()
-            .expect("run Git");
-        assert!(
-            output.status.success(),
-            "Git failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    #[test]
+    fn startup_usage_seeds_the_live_delta_without_being_counted() {
+        let usage = |tokens| TokenUsage {
+            input_tokens: tokens,
+            total_tokens: tokens,
+            ..TokenUsage::default()
+        };
+        let event = |submission_id: Option<&str>, tokens| Event {
+            submission_id: submission_id.map(str::to_owned),
+            msg: EventMsg::TokenCount(TokenCountEvent {
+                info: Some(TokenUsageInfo {
+                    total_token_usage: usage(tokens),
+                    last_token_usage: usage(tokens),
+                    model_context_window: None,
+                }),
+                rate_limits: None,
+            }),
+        };
+        let mut baseline = TokenUsage::default();
 
-    fn test_git_sandbox(workspace: &Path) -> (tempfile::TempDir, GatewaySandbox) {
-        let state = tempfile::tempdir().expect("state");
-        let sandbox =
-            GatewaySandbox::new(workspace, state.path(), None, GIT_TIMEOUT).expect("Git sandbox");
-        (state, sandbox)
+        let startup = live_usage_delta(&mut baseline, &event(None, 100)).expect("startup usage");
+        let live =
+            live_usage_delta(&mut baseline, &event(Some("submission"), 130)).expect("live usage");
+
+        assert_eq!(
+            (startup, live, baseline),
+            (None, Some(usage(30)), usage(130))
+        );
     }
 
     #[test]
@@ -2501,132 +1928,6 @@ mod tests {
 
         assert_eq!(error.code, "cron_overlap");
         assert_eq!(after, before);
-    }
-
-    #[tokio::test]
-    async fn credential_endpoints_are_validated_and_persisted() {
-        let root = tempfile::tempdir().expect("root");
-        let workspace = root.path().join("workspace");
-        let state = root.path().join("state");
-        std::fs::create_dir(&workspace).expect("workspace");
-        let listen = "127.0.0.1:8741".parse().expect("listen address");
-        let (store, config) = ConfigStore::initialize(state, listen, None).expect("config");
-        let credentials =
-            Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
-        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
-        let gateway =
-            GatewayHost::start(store, config, Arc::clone(&credentials), cron).expect("gateway");
-        gateway.create_session(&workspace).await.expect("chat");
-        let custom_endpoint = "https://example.com/v1";
-
-        gateway
-            .set_credential(
-                "responses".into(),
-                "custom-secret".into(),
-                Some(custom_endpoint.into()),
-            )
-            .await
-            .expect("store custom credential");
-        let error = gateway
-            .set_credential(
-                "kimi".into(),
-                "fixed-secret".into(),
-                Some(custom_endpoint.into()),
-            )
-            .await
-            .expect_err("fixed provider endpoint must be rejected");
-
-        assert_eq!(
-            credentials
-                .get("responses", Some(custom_endpoint))
-                .expect("custom credential"),
-            Some("custom-secret".into())
-        );
-        assert_eq!(error.code, "invalid_config");
-        assert!(error.message.contains("fixed API endpoint"));
-        assert_eq!(
-            credentials.get("kimi", None).expect("fixed credential"),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn credential_update_refreshes_every_matching_resident_chat() {
-        let root = tempfile::tempdir().expect("root");
-        let workspace = root.path().join("workspace");
-        let state = root.path().join("state");
-        std::fs::create_dir(&workspace).expect("workspace");
-        let listen = "127.0.0.1:8741".parse().expect("listen address");
-        let (store, config) = ConfigStore::initialize(state, listen, None).expect("config");
-        let credentials =
-            Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
-        credentials
-            .set("kimi", "old-secret", None)
-            .expect("initial Kimi credential");
-        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
-        let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
-        gateway
-            .register_provider(ProviderConfig {
-                provider: "kimi".into(),
-                model: "kimi-k3".into(),
-                base_url: None,
-                reasoning_effort: Some("max".into()),
-                web_search: horus::backend::model::provider::HostedWebSearch::Off,
-            })
-            .await
-            .expect("register Kimi");
-        let first = gateway
-            .create_session(&workspace)
-            .await
-            .expect("first chat");
-        let second = gateway
-            .create_session(&workspace)
-            .await
-            .expect("second chat");
-        let mut first_events = first.subscribe();
-        let mut second_events = second.subscribe();
-
-        gateway
-            .set_credential("kimi".into(), "new-secret".into(), None)
-            .await
-            .expect("replace Kimi credential");
-
-        for events in [&mut first_events, &mut second_events] {
-            tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    if matches!(
-                        events.recv().await.expect("chat event").message,
-                        ServerMessage::SessionChanged { .. }
-                    ) {
-                        break;
-                    }
-                }
-            })
-            .await
-            .expect("matching chat refresh");
-        }
-    }
-
-    #[test]
-    fn credential_refresh_matches_only_the_selected_custom_endpoint() {
-        let selection = ProviderConfig {
-            provider: "responses".into(),
-            model: "custom-model".into(),
-            base_url: Some("https://first.example/v1".into()),
-            reasoning_effort: None,
-            web_search: horus::backend::model::provider::HostedWebSearch::Off,
-        };
-
-        assert!(
-            provider_credential_matches(&selection, "responses", Some("https://first.example/v1"))
-                .expect("matching endpoint")
-                && !provider_credential_matches(
-                    &selection,
-                    "responses",
-                    Some("https://second.example/v1")
-                )
-                .expect("different endpoint")
-        );
     }
 
     #[tokio::test]
@@ -2746,7 +2047,12 @@ mod tests {
             .expect("selected chat");
 
         selected
-            .set_model(alternate.clone())
+            .submit(Submission {
+                id: "set-model".into(),
+                op: Op::SetModel {
+                    route: alternate.clone(),
+                },
+            })
             .await
             .expect("select alternate model");
         let selected_ready = selected
@@ -2806,176 +2112,6 @@ mod tests {
         assert_eq!(state.sessions.len(), MAX_ACTIVE_SESSIONS - 1);
     }
 
-    #[tokio::test]
-    async fn session_catalog_includes_empty_roots_and_fresh_forks() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
-            SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
-                .expect("checkpoints"),
-        );
-        let mut parent = Checkpoint::empty("parent");
-        parent.session_context.workspace_id = Some("workspace".into());
-        parent.sequence = 1;
-        checkpoints.save(&parent, &[]).await.expect("save parent");
-        let mut empty_root = Checkpoint::empty("empty-root");
-        empty_root.session_context.workspace_id = Some("workspace".into());
-        checkpoints
-            .save(&empty_root, &[])
-            .await
-            .expect("save empty root");
-        let mut child = Checkpoint::empty("child");
-        child.session_context.workspace_id = Some("workspace".into());
-        checkpoints
-            .fork("parent", parent.sequence, &child)
-            .await
-            .expect("fork parent");
-
-        let mut sessions = session_catalog(&checkpoints)
-            .await
-            .expect("session catalog")
-            .into_iter()
-            .map(|record| (record.summary.session_id, record.summary.parent_session_id))
-            .collect::<Vec<_>>();
-        sessions.sort();
-
-        assert_eq!(
-            sessions,
-            vec![
-                ("child".into(), Some("parent".into())),
-                ("empty-root".into(), None),
-                ("parent".into(), None)
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn session_catalog_is_bounded_and_truncates_utf8_previews() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
-            SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
-                .expect("checkpoints"),
-        );
-        for index in 0..=SESSION_PAGE_SIZE {
-            let mut checkpoint = Checkpoint::empty(format!("{index:03}"));
-            checkpoint.session_context.workspace_id = Some("workspace".into());
-            checkpoint.sequence = 1;
-            checkpoint.first_user_message = Some(if index == SESSION_PAGE_SIZE {
-                "€".repeat(MAX_SESSION_PREVIEW_BYTES / '€'.len_utf8() + 1)
-            } else {
-                format!("chat {index}")
-            });
-            checkpoints.save(&checkpoint, &[]).await.expect("save chat");
-        }
-
-        let sessions = session_catalog(&checkpoints)
-            .await
-            .expect("session catalog");
-        let preview = sessions
-            .iter()
-            .find(|session| session.summary.session_id == "100")
-            .and_then(|session| session.summary.first_user_message.as_deref())
-            .expect("UTF-8 preview");
-
-        assert_eq!(sessions.len(), SESSION_PAGE_SIZE);
-        assert!(
-            sessions
-                .iter()
-                .all(|session| session.summary.session_id != "000")
-        );
-        assert_eq!(
-            preview,
-            "€".repeat(MAX_SESSION_PREVIEW_BYTES / '€'.len_utf8())
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_diff_includes_staged_unstaged_and_untracked_text() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let (_state, sandbox) = test_git_sandbox(workspace.path());
-        run_git(workspace.path(), &["init", "--quiet"]);
-        run_git(
-            workspace.path(),
-            &["config", "user.email", "horus@example.invalid"],
-        );
-        run_git(workspace.path(), &["config", "user.name", "Horus Test"]);
-        run_git(workspace.path(), &["config", "commit.gpgsign", "false"]);
-        std::fs::write(workspace.path().join("staged.txt"), "before\n").expect("staged file");
-        std::fs::write(workspace.path().join("unstaged.txt"), "before\n").expect("unstaged file");
-        std::fs::write(workspace.path().join(".gitignore"), "ignored.txt\n").expect("ignore file");
-        run_git(workspace.path(), &["add", "--", "."]);
-        run_git(workspace.path(), &["commit", "--quiet", "-m", "initial"]);
-
-        std::fs::write(workspace.path().join("staged.txt"), "staged change\n")
-            .expect("change staged file");
-        run_git(workspace.path(), &["add", "--", "staged.txt"]);
-        std::fs::write(workspace.path().join("unstaged.txt"), "unstaged change\n")
-            .expect("change unstaged file");
-        std::fs::write(workspace.path().join("new.txt"), "untracked content\n")
-            .expect("untracked file");
-        std::fs::write(workspace.path().join("ignored.txt"), "ignored\n").expect("ignored file");
-        std::fs::write(workspace.path().join("binary.bin"), [0, 1, 2]).expect("binary file");
-
-        let diff = workspace_git_diff(&sandbox, workspace.path())
-            .await
-            .expect("workspace diff");
-
-        assert!(
-            diff.contains("diff --git a/staged.txt b/staged.txt")
-                && diff.contains("+staged change")
-                && diff.contains("diff --git a/unstaged.txt b/unstaged.txt")
-                && diff.contains("+unstaged change")
-                && diff.contains("diff --git a/new.txt b/new.txt")
-                && diff.contains("--- /dev/null")
-                && diff.contains("+untracked content")
-                && !diff.contains("ignored.txt")
-                && !diff.contains("binary.bin"),
-            "unexpected diff:\n{diff}"
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_diff_is_empty_outside_a_git_repository() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let (_state, sandbox) = test_git_sandbox(workspace.path());
-
-        let diff = workspace_git_diff(&sandbox, workspace.path())
-            .await
-            .expect("non-Git workspace");
-
-        assert!(diff.is_empty());
-    }
-
-    #[tokio::test]
-    async fn workspace_diff_rejects_oversized_output() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let (_state, sandbox) = test_git_sandbox(workspace.path());
-        run_git(workspace.path(), &["init", "--quiet"]);
-        std::fs::write(
-            workspace.path().join("large.txt"),
-            "x".repeat(MAX_GIT_DIFF_BYTES),
-        )
-        .expect("large untracked file");
-
-        let error = workspace_git_diff(&sandbox, workspace.path())
-            .await
-            .expect_err("oversized diff");
-
-        assert_eq!(error.code, "git_diff_too_large");
-    }
-
-    #[test]
-    fn session_titles_are_trimmed_and_bounded() {
-        assert_eq!(
-            validate_session_title("  hello  ").expect("valid title"),
-            "hello"
-        );
-        assert_eq!(
-            validate_session_title(" ").expect_err("blank title").code,
-            "invalid_session_title"
-        );
-        assert!(validate_session_title(&"x".repeat(MAX_SESSION_TITLE_BYTES + 1)).is_err());
-    }
-
     #[test]
     fn every_restart_resets_replay_and_only_same_session_history_is_suppressed_live() {
         let mut replay = VecDeque::from([ServerFrame::new(ServerMessage::Error {
@@ -3010,6 +2146,33 @@ mod tests {
     }
 
     #[test]
+    fn resume_requests_are_broadcast_without_entering_replay() {
+        let (events, mut receiver) = broadcast::channel(1);
+        let mut replay = VecDeque::new();
+        let frame = ServerFrame::new(ServerMessage::AgentEvent {
+            session_id: "source".into(),
+            sequence: 1,
+            event: Event {
+                submission_id: Some("resume".into()),
+                msg: EventMsg::SessionResumeRequested(
+                    horus::protocol::SessionResumeRequestedEvent {
+                        session_id: "target".into(),
+                        context: Default::default(),
+                    },
+                ),
+            },
+            blocks: Vec::new(),
+            history: None,
+            preview: None,
+        });
+
+        record_and_publish(&mut replay, &events, frame.clone(), false);
+
+        assert!(replay.is_empty());
+        assert_eq!(receiver.try_recv().expect("live resume request"), frame);
+    }
+
+    #[test]
     fn replacement_startup_is_published_only_after_ready() {
         let (events, mut receiver) = broadcast::channel(4);
         let ready = ServerFrame::new(ServerMessage::Error {
@@ -3033,20 +2196,6 @@ mod tests {
             receiver.try_recv().expect("startup frame").message,
             ServerMessage::Error { code, .. } if code == "startup"
         ));
-    }
-
-    #[test]
-    fn active_provider_login_reserves_the_only_polling_slot() {
-        let active = StdMutex::new(None);
-        reserve_provider_login(&active, "login-a").expect("reserve first login");
-        let rejection = reserve_provider_login(&active, "login-b")
-            .expect_err("a second provider login must be rejected");
-
-        assert_eq!(rejection.code, "provider_login_in_progress");
-        release_provider_login(&active, "another-login").expect("ignore stale completion");
-        assert!(reserve_provider_login(&active, "login-b").is_err());
-        release_provider_login(&active, "login-a").expect("finish first login");
-        reserve_provider_login(&active, "login-b").expect("reserve next login");
     }
 
     #[test]

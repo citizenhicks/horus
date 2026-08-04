@@ -43,6 +43,9 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             "initial replay batch limit must be positive".into(),
         ));
     }
+    config.middleware = config
+        .middleware
+        .with_sandbox(Arc::clone(&config.sandbox))?;
     let (mut state, is_new) = match config.checkpoints.load(&config.session_id).await? {
         Some(state) => (state, false),
         None => (Checkpoint::empty(&config.session_id), true),
@@ -149,7 +152,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         .system_prompt(&config.system_prompt, &runtime)?
         .into();
     let catalog = config.middleware.catalog(&runtime)?;
-    let frontend = FrontendExtensions::new(Arc::clone(&config.sandbox), config.middleware.clone())?;
+    let frontend = FrontendExtensions::new(config.middleware.clone())?;
     let mut state_changed =
         metadata_changed || state.model_route.as_deref() != Some(route.as_str());
     state.model_route = Some(route);
@@ -224,32 +227,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         )?;
     }
     let model_choices = config.model.choices().cloned().collect();
-    let sandbox_events = config
-        .sandbox
-        .initialize(&config.session_id, &config.checkpoints)
-        .await?;
-    let initialized = async {
-        for update in sandbox_events {
-            try_send_event(
-                &event_tx,
-                Event {
-                    submission_id: None,
-                    msg: EventMsg::Frontend(update),
-                },
-            )?;
-        }
-        config.middleware.initialize(runtime).await
-    }
-    .await;
-    if let Err(error) = initialized {
-        if let Err(rollback) = config.sandbox.shutdown(&config.session_id).await {
-            return Err(Error::Rollback {
-                primary: Box::new(error),
-                rollback: Box::new(rollback),
-            });
-        }
-        return Err(error);
-    }
+    config.middleware.initialize(runtime).await?;
     let mut runner = Runner {
         config,
         system_prompt,
@@ -266,16 +244,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
     tokio::spawn(async move {
         let run = runner.run(command_rx).await;
         let shutdown = runner.config.middleware.shutdown(end_context).await;
-        let sandbox_shutdown = runner
-            .config
-            .sandbox
-            .shutdown(&runner.config.session_id)
-            .await;
-        if let Some(error) = run
-            .err()
-            .or_else(|| shutdown.err())
-            .or_else(|| sandbox_shutdown.err())
-        {
+        if let Some(error) = run.err().or_else(|| shutdown.err()) {
             let _ = event_tx
                 .send(Event {
                     submission_id: None,

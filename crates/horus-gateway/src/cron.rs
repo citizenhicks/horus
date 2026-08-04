@@ -7,16 +7,12 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use chrono::{Local, TimeZone as _, Utc};
 use croner::Cron;
-use horus::backend::model::ToolDefinition;
-use horus::middleware::tools::{ApprovalRequirement, Catalog, Tool, ToolContext};
-use horus::middleware::{Middleware, RuntimeContext};
 use horus::protocol::MAX_USER_INPUT_BYTES;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use uuid::Uuid;
 
 use crate::wire::{CronRun, CronRunStatus, CronTask};
@@ -36,111 +32,6 @@ pub(crate) struct CronStore {
     setup_sessions: Mutex<BTreeSet<String>>,
     path: PathBuf,
     state: Mutex<CronState>,
-}
-
-/// Lets the model turn a confirmed conversation into a durable scheduled task.
-pub(crate) struct ConversationalCron {
-    store: Arc<CronStore>,
-}
-
-impl ConversationalCron {
-    pub(crate) fn new(store: Arc<CronStore>) -> Self {
-        Self { store }
-    }
-}
-
-impl Middleware for ConversationalCron {
-    fn name(&self) -> &'static str {
-        "cron"
-    }
-
-    fn register(&self, catalog: &mut Catalog, runtime: &RuntimeContext) -> horus::Result<()> {
-        if is_cron_execution(runtime.session_context.origin_label.as_deref()) {
-            return Ok(());
-        }
-        catalog.register(Arc::new(ScheduleTask {
-            store: Arc::clone(&self.store),
-            source_session_id: runtime.session_id.clone(),
-        }))
-    }
-
-    fn prompt_fragment(&self, runtime: &RuntimeContext) -> horus::Result<Option<String>> {
-        if is_cron_execution(runtime.session_context.origin_label.as_deref()) {
-            return Ok(None);
-        }
-        Ok(Some(
-            "Use `schedule_task` only during setup started by `/cron new`. During that setup, ask only for missing task or timing details, then call it once with standalone task instructions and a five-field cron expression in the gateway's local time. Outside explicit cron setup, never call it."
-                .into(),
-        ))
-    }
-}
-
-fn is_cron_execution(origin_label: Option<&str>) -> bool {
-    origin_label.is_some_and(|label| label.starts_with("cron · "))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ScheduleTaskArgs {
-    task: String,
-    schedule: String,
-}
-
-struct ScheduleTask {
-    store: Arc<CronStore>,
-    source_session_id: String,
-}
-
-impl Tool for ScheduleTask {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "schedule_task".into(),
-            description: "Save the recurring task being configured through `/cron new`.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "task": {
-                        "type": "string",
-                        "description": "Complete standalone task instructions in Markdown."
-                    },
-                    "schedule": {
-                        "type": "string",
-                        "description": "Five-field cron expression evaluated in the gateway's local time."
-                    }
-                },
-                "required": ["task", "schedule"],
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    fn approval(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Always
-    }
-
-    fn call<'a>(
-        &'a self,
-        _context: ToolContext,
-        arguments: Value,
-    ) -> horus::BoxFuture<'a, horus::Result<String>> {
-        Box::pin(async move {
-            let arguments: ScheduleTaskArgs = serde_json::from_value(arguments)?;
-            let task = self
-                .store
-                .add_managed(
-                    &self.source_session_id,
-                    &arguments.task,
-                    &arguments.schedule,
-                )
-                .map_err(|error| horus::Error::Tool(error.to_string()))?;
-            Ok(format!(
-                "scheduled `{}` as task {} and saved {}",
-                task.schedule,
-                task.id,
-                task.task.display()
-            ))
-        })
-    }
 }
 
 /// Result of reserving one task invocation.
@@ -239,12 +130,12 @@ impl CronStore {
         let task = task.map(str::trim).filter(|task| !task.is_empty());
         let input = task.map_or_else(
             || {
-                "Set up a recurring gateway task. Ask me for the task and timing details, then use `schedule_task`."
+                "Set up a recurring task. Ask me for the task and timing details, then use `schedule_task`."
                     .into()
             },
             |task| {
                 format!(
-                    "Set up this recurring gateway task:\n\n{task}\n\nAsk only for missing timing details, then use `schedule_task`."
+                    "Set up this recurring task:\n\n{task}\n\nAsk only for missing timing details, then use `schedule_task`."
                 )
             },
         );
@@ -265,12 +156,17 @@ impl CronStore {
     }
 
     /// Writes and registers one model-confirmed task in the private gateway task directory.
-    fn add_managed(&self, source_session_id: &str, task: &str, schedule: &str) -> Result<CronTask> {
+    pub(crate) fn add_managed(
+        &self,
+        source_session_id: &str,
+        task: &str,
+        schedule: &str,
+    ) -> Result<CronTask> {
         validate_session_id(source_session_id)?;
         let mut active = self.lock_setups()?;
         if !active.contains(source_session_id) {
             return Err(Error::Config(
-                "scheduled tasks can only be created through `/cron new`".into(),
+                "scheduled tasks require an active scheduling setup".into(),
             ));
         }
         let task = task.trim();
@@ -846,12 +742,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn cron_execution_cannot_schedule_another_task() {
-        assert!(is_cron_execution(Some("cron · task")));
-        assert!(!is_cron_execution(Some("horus-gateway")));
-    }
-
     fn store() -> (tempfile::TempDir, CronStore) {
         let root = tempfile::tempdir().expect("temp dir");
         let state = root.path().join("state");
@@ -1079,19 +969,8 @@ mod tests {
             .add_managed("ordinary-chat", "Review open pull requests", "0 9 * * 1")
             .expect_err("setup authority is required");
 
-        assert!(error.to_string().contains("/cron new"));
+        assert!(error.to_string().contains("active scheduling setup"));
         assert!(store.list("ordinary-chat").expect("list").is_empty());
-    }
-
-    #[test]
-    fn conversational_scheduling_requires_approval() {
-        let (_root, store) = store();
-        let tool = ScheduleTask {
-            store: Arc::new(store),
-            source_session_id: "session-a".into(),
-        };
-
-        assert_eq!(tool.approval(), ApprovalRequirement::Always);
     }
 
     #[test]

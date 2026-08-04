@@ -4,9 +4,6 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::backend::model::REPLAY_REASONING_FIELD;
-use crate::backend::model::TOOL_ERROR_FIELD;
-use crate::backend::model::is_internal_message;
 use crate::protocol::AgentMessageEvent;
 use crate::protocol::AgentMessagePhase;
 use crate::protocol::AgentReasoningContentDeltaEvent;
@@ -14,6 +11,18 @@ use crate::protocol::EventMsg;
 use crate::protocol::ToolCallBeginEvent;
 use crate::protocol::ToolCallEndEvent;
 use crate::protocol::UserMessageEvent;
+
+pub(crate) const INTERNAL_MESSAGE_FIELD: &str = "_horus_internal";
+pub(crate) const REPLAY_REASONING_FIELD: &str = "_horus_reasoning";
+pub(crate) const TOOL_ERROR_FIELD: &str = "_horus_is_error";
+
+pub(crate) fn internal_message_kind(message: &Value) -> Option<&str> {
+    message.get(INTERNAL_MESSAGE_FIELD)?.as_str()
+}
+
+pub(crate) fn is_internal_message(message: &Value) -> bool {
+    internal_message_kind(message).is_some()
+}
 
 pub(crate) fn events(context: &[Value], session_id: &str) -> Vec<EventMsg> {
     let mut events = Vec::new();
