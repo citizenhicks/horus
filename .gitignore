@@ -1,3 +1,5 @@
 /target
 /.horus
 .env
+xcuserdata/
+*.profraw

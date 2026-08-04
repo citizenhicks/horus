@@ -27,54 +27,58 @@ struct AgentSettingsView: View {
                 }
                 .toggleStyle(.switch)
 
-                Section("Execution approval") {
-                    LabeledContent {
-                        Picker("Approval policy", selection: approvalPolicy) {
-                            Text("Ask").tag(ApprovalPolicy.on)
-                            Text("Allow · no network").tag(ApprovalPolicy.allow)
-                            Text("Allow · network").tag(ApprovalPolicy.allowNetwork)
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Approval policy").font(HorusStyle.controlFont)
-                            if let approvalDescription {
-                                Text(approvalDescription)
-                                    .font(HorusStyle.bodyFont)
-                                    .foregroundStyle(palette.muted)
+                if model.isSubagentsEnabledInDraft {
+                    Section("Subagents") {
+                        Picker("Default model", selection: subagentModel) {
+                            Text("Inherit parent").tag(String?.none)
+                            ForEach(model.subagentModelOptions) { option in
+                                Text(option.group).tag(Optional(option.id))
                             }
                         }
+                        .settingsPickerStyle()
+                        SettingsCaption("Used when a subagent does not choose a model.")
+
+                        if !model.subagentReasoningChoices.isEmpty {
+                            Picker("Reasoning", selection: subagentReasoning) {
+                                ForEach(model.subagentReasoningChoices) { choice in
+                                    Text(choice.reasoningEffort?.capitalized ?? "Provider default")
+                                        .tag(choice.route)
+                                }
+                            }
+                            .settingsPickerStyle()
+                            SettingsCaption("Attached to the default subagent model route.")
+                        }
                     }
-                    .frame(maxWidth: .infinity)
+                }
+
+                Section("Execution approval") {
+                    Picker("Approval policy", selection: approvalPolicy) {
+                        Text("Ask").tag(ApprovalPolicy.on)
+                        Text("Allow · no network").tag(ApprovalPolicy.allow)
+                        Text("Allow · network").tag(ApprovalPolicy.allowNetwork)
+                    }
+                    .settingsPickerStyle()
+                    if let approvalDescription {
+                        SettingsCaption(approvalDescription)
+                    }
                     if model.agentDraft?.approval == .allowNetwork {
                         HorusLabel(
                             title: "This permits unprompted network-capable tools. Only use it with a gateway and workspace you trust.",
-                            icon: "globe-lock",
+                            systemImage: "globe",
                             iconColor: palette.danger
                         )
-                        .font(HorusStyle.controlFont)
                         .foregroundStyle(palette.danger)
                     }
                 }
 
-                Button(action: model.applyAgentConfiguration) {
-                    Text("Apply and restart agent")
-                        .frame(maxWidth: settingsActionMaxWidth)
-                }
-                .settingsPrimaryAction()
-                .disabled(!hasChanges || model.applyState == .applying || model.applyState == .restarting)
-                .settingsStandaloneRow()
+                HorusActionRow { agentConfigurationActions }
+                    .settingsStandaloneRow()
             } else {
-                ContentUnavailableView {
-                    Label {
-                        Text("Agent unavailable")
-                    } icon: {
-                        HorusIcon(name: "toggle-left", size: 32)
-                    }
-                } description: {
-                    Text("Connect to a gateway first.")
-                }
+                HorusUnavailable(
+                    title: "Agent unavailable",
+                    systemImage: "switch.2",
+                    detail: "Connect to a gateway first."
+                )
             }
         }
     }
@@ -83,7 +87,7 @@ struct AgentSettingsView: View {
     private var applyStatus: some View {
         switch model.applyState {
         case .idle, .applied:
-            if !hasChanges {
+            if !hasActiveChanges && !hasDefaultChanges {
                 HStack(spacing: 7) {
                     Circle()
                         .fill(palette.signal)
@@ -96,7 +100,7 @@ struct AgentSettingsView: View {
                 .padding(.horizontal, 12)
                 .frame(height: 32)
                 .horusGlass(in: Capsule())
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
                 .listRowInsets(EdgeInsets())
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
@@ -119,17 +123,15 @@ struct AgentSettingsView: View {
     }
 
     private func capabilityToggle(_ feature: MiddlewareFeature) -> some View {
-        LabeledContent {
-            Toggle(feature.label, isOn: middleware(feature))
-                .labelsHidden()
-                .disabled(feature.required)
-        } label: {
+        Toggle(isOn: middleware(feature)) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(feature.label).font(HorusStyle.controlFont)
-                Text(feature.description).font(HorusStyle.bodyFont).foregroundStyle(palette.muted)
+                Text(feature.label)
+                Text(feature.description)
+                    .font(HorusStyle.bodyFont)
+                    .foregroundStyle(palette.muted)
             }
         }
-        .frame(maxWidth: .infinity)
+        .disabled(feature.required)
     }
 
     private var systemPrompt: Binding<String> {
@@ -160,6 +162,20 @@ struct AgentSettingsView: View {
         )
     }
 
+    private var subagentModel: Binding<String?> {
+        Binding(
+            get: { model.selectedSubagentModelOptionID },
+            set: { model.selectSubagentModelOption($0) }
+        )
+    }
+
+    private var subagentReasoning: Binding<String> {
+        Binding(
+            get: { model.agentDraft?.middleware.subagents.modelRoute ?? "" },
+            set: { model.selectSubagentReasoningRoute($0) }
+        )
+    }
+
     private var approvalDescription: String? {
         switch model.agentDraft?.approval ?? .on {
         case .on: "Workspace mutations pause in chat for an explicit decision."
@@ -168,8 +184,33 @@ struct AgentSettingsView: View {
         }
     }
 
-    private var hasChanges: Bool {
+    @ViewBuilder
+    private var agentConfigurationActions: some View {
+        Button(
+            "Change for this chat only",
+            systemImage: "ellipsis.message",
+            action: model.changeAgentForCurrentChat
+        )
+            .horusProminentButton()
+            .disabled(!hasActiveChanges || model.isApplyingConfiguration)
+
+        Button(
+            "Save as default",
+            systemImage: "square.and.arrow.down",
+            action: model.saveAgentAsDefault
+        )
+            .disabled(!hasDefaultChanges || model.isApplyingConfiguration)
+    }
+
+    private var hasActiveChanges: Bool {
         guard let snapshot = model.agentSnapshot, let draft = model.agentDraft else { return false }
+        return snapshot.config != draft
+    }
+
+    private var hasDefaultChanges: Bool {
+        guard let snapshot = model.defaultAgentSnapshot, let draft = model.agentDraft else {
+            return false
+        }
         return snapshot.config != draft
     }
 }
@@ -198,38 +239,47 @@ struct ProvidersView: View {
                     }
                 }
 
-                Section("New configuration") {
-                    LabeledContent("Provider") {
-                        Picker("Provider", selection: providerID) {
-                            ForEach(model.providerStatuses) { status in
-                                Text(status.label).tag(status.provider)
+                // Model and reasoning are picked per chat in the composer; this page only
+                // manages what the gateway itself has configured.
+                Section("Provider") {
+                    Picker("Provider", selection: providerID) {
+                        ForEach(model.providerStatuses) { status in
+                            Text(status.label).tag(status.provider)
+                        }
+                    }
+                    .settingsPickerStyle()
+
+                    if let status = selectedStatus {
+                        SettingsCaption(status.description)
+
+                        if status.models.isEmpty {
+                            LabeledContent("Model ID") {
+                                TextField("Exact model ID", text: providerModelID)
+                                    .settingsField()
                             }
                         }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                    }
-                    .frame(maxWidth: .infinity)
 
-                    #if os(iOS)
-                    VStack(alignment: .leading, spacing: 7) {
-                        Text("Base URL override")
-                            .font(HorusStyle.controlFont)
-                        TextField("Use provider default", text: providerBaseURL)
-                            .textFieldStyle(.roundedBorder)
-                            .textContentType(.URL)
+                        if status.defaultBaseUrl != nil {
+                            LabeledContent("Base URL") {
+                                TextField("Provider endpoint", text: providerBaseURL)
+                                    .textContentType(.URL)
+                                    .settingsField()
+                            }
+                        }
+
+                        Picker("Hosted web search", selection: providerWebSearch) {
+                            ForEach(status.webSearch) { search in
+                                Text(search.label).tag(search)
+                            }
+                        }
+                        .settingsPickerStyle()
+                        .disabled(status.webSearch.count == 1)
+                        .accessibilityHint(
+                            status.webSearch.count == 1
+                                ? "This provider does not offer another web search mode."
+                                : "Selects the provider-hosted web search mode."
+                        )
                     }
-                    #else
-                    LabeledContent("Base URL override") {
-                        TextField("Use provider default", text: providerBaseURL)
-                            .textFieldStyle(.roundedBorder)
-                            .textContentType(.URL)
-                            .frame(maxWidth: 300)
-                    }
-                    #endif
-                    LabeledContent("Hosted web search") {
-                        Text((model.agentDraft?.provider.webSearch ?? "off").capitalized)
-                    }
-                    .frame(maxWidth: .infinity)
                 }
 
                 if selectedStatus != nil {
@@ -240,28 +290,26 @@ struct ProvidersView: View {
 
                 providerActionStatus
 
-                Button(action: model.applyProviderConfiguration) {
-                    Text("Apply provider and restart")
-                        .frame(maxWidth: settingsActionMaxWidth)
+                HorusActionRow {
+                    Button(
+                        "Save to gateway",
+                        systemImage: "square.and.arrow.down",
+                        action: model.saveProviderAsDefault
+                    )
+                        .horusProminentButton()
+                        .disabled(
+                            !hasDefaultChanges
+                                || !providerConfigurationValid
+                                || model.isApplyingConfiguration
+                        )
                 }
-                .settingsPrimaryAction()
-                .disabled(
-                    model.agentDraft == model.agentSnapshot?.config
-                        || !providerConfigurationValid
-                        || model.applyState == .applying
-                        || model.applyState == .restarting
-                )
                 .settingsStandaloneRow()
             } else {
-                ContentUnavailableView {
-                    Label {
-                        Text("Providers unavailable")
-                    } icon: {
-                        HorusIcon(name: "cpu", size: 32)
-                    }
-                } description: {
-                    Text("Connect to a gateway first.")
-                }
+                HorusUnavailable(
+                    title: "Providers unavailable",
+                    systemImage: "cpu",
+                    detail: "Connect to a gateway first."
+                )
             }
         }
     }
@@ -275,33 +323,27 @@ struct ProvidersView: View {
                     .foregroundStyle(status.configured ? palette.signal : palette.warning)
             }
 
-            if status.auth == "api_key" {
-                HStack {
-                    SecureField("New API key · write only", text: Binding(
-                        get: { model.providerAPIKey },
-                        set: { model.providerAPIKey = $0 }
-                    ))
-                    .textFieldStyle(.roundedBorder)
+            if status.auth == .apiKey {
+                @Bindable var model = model
+                SecureField("New API key · write only", text: $model.providerAPIKey)
                     .textContentType(.password)
-                    Button(
-                        "Send key to gateway",
-                        lucideIcon: "key-round",
-                        action: { model.saveProviderCredential(provider: status.provider) }
-                    )
-                    .labelStyle(.iconOnly)
-                    .buttonStyle(HorusIconButtonStyle(prominent: true))
-                    .help("Send key to gateway")
+                HorusActionRow {
+                    Button("Send key to gateway", systemImage: "key") {
+                        model.saveProviderCredential(provider: status.provider)
+                    }
+                    .horusProminentButton()
                     .disabled(model.providerAPIKey.isEmpty)
                 }
-            } else if status.auth == "device_code" {
-                Button(action: { model.startProviderLogin(provider: status.provider) }) {
-                    Text("Start device sign-in")
-                        .frame(maxWidth: settingsActionMaxWidth)
+            } else if status.auth == .deviceCode {
+                HorusActionRow {
+                    Button(
+                        "Start device sign-in",
+                        systemImage: "rectangle.portrait.and.arrow.forward"
+                    ) {
+                        model.startProviderLogin(provider: status.provider)
+                    }
+                    .horusProminentButton()
                 }
-                .buttonStyle(.glassProminent)
-                .buttonBorderShape(.capsule)
-                .controlSize(.large)
-                .frame(maxWidth: .infinity)
             }
         }
     }
@@ -329,38 +371,23 @@ struct ProvidersView: View {
                     .tracking(3)
                     .textSelection(.enabled)
                     .padding(12)
-                    .background(palette.raised, in: RoundedRectangle(cornerRadius: HorusStyle.controlRadius))
-                ViewThatFits(in: .horizontal) {
-                    HStack {
-                        if let destination = URL(string: url) {
-                            Link("Open verification page", destination: destination)
-                                .buttonStyle(.glass)
-                                .buttonBorderShape(.capsule)
-                                .controlSize(.large)
-                        }
-                        ShareLink("Copy or share code", item: code)
-                            .buttonStyle(.glass)
-                            .buttonBorderShape(.capsule)
-                            .controlSize(.large)
-                    }
-                    VStack(alignment: .leading) {
-                        if let destination = URL(string: url) {
-                            Link("Open verification page", destination: destination)
-                                .buttonStyle(.glass)
-                                .buttonBorderShape(.capsule)
-                                .controlSize(.large)
-                        }
-                        ShareLink("Copy or share code", item: code)
-                            .buttonStyle(.glass)
-                            .buttonBorderShape(.capsule)
-                            .controlSize(.large)
-                    }
-                }
+                    .background(palette.raised, in: HorusStyle.controlShape)
+                deviceCodeActions(url: url, code: code)
             }
         case .loginFinished(let provider):
             StatusBanner(tone: .success, title: "Sign-in complete", detail: "\(provider) is ready on the gateway.")
         case .failed(let message):
             StatusBanner(tone: .error, title: "Provider action failed", detail: message)
+        }
+    }
+
+    @ViewBuilder
+    private func deviceCodeActions(url: String, code: String) -> some View {
+        HorusActionRow {
+            if let destination = URL(string: url) {
+                Link("Open verification page", destination: destination)
+            }
+            ShareLink("Copy or share code", item: code)
         }
     }
 
@@ -387,10 +414,45 @@ struct ProvidersView: View {
         )
     }
 
+    private var providerModelID: Binding<String> {
+        Binding(
+            get: { model.agentDraft?.provider.model ?? "" },
+            set: { model.selectProviderModel($0) }
+        )
+    }
+
+    private var providerWebSearch: Binding<HostedWebSearch> {
+        Binding(
+            get: { model.agentDraft?.provider.webSearch ?? .off },
+            set: { model.agentDraft?.provider.webSearch = $0 }
+        )
+    }
+
+    private var selectedProviderModel: ProviderModel? {
+        guard let status = selectedStatus,
+              let modelID = model.agentDraft?.provider.model
+        else { return nil }
+        return status.models.first { $0.id == modelID }
+    }
+
+    private var hasDefaultChanges: Bool {
+        guard let snapshot = model.defaultAgentSnapshot, let draft = model.agentDraft else {
+            return false
+        }
+        return snapshot.config != draft
+    }
+
     private var providerConfigurationValid: Bool {
-        guard let provider = model.agentDraft?.provider else { return false }
-        return !provider.provider.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !provider.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard let provider = model.agentDraft?.provider,
+              let status = selectedStatus,
+              status.configured,
+              status.webSearch.contains(provider.webSearch),
+              !provider.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return false }
+        guard !status.models.isEmpty else { return true }
+        guard let providerModel = selectedProviderModel else { return false }
+        return provider.reasoningEffort == nil
+            || providerModel.reasoning.contains { $0.id == provider.reasoningEffort }
     }
 }
 
@@ -399,28 +461,11 @@ struct CronView: View {
     @Environment(\.horusPalette) private var palette
 
     var body: some View {
+        // Creating a schedule needs a live chat, so that action lives in the chat menu.
         PageScaffold(
             title: "Schedules",
             detail: "Run durable Horus tasks on the gateway workspace, even when this app is closed."
         ) {
-            Section("New schedule") {
-                TextField("Optional task instructions", text: Binding(
-                    get: { model.cronTaskDraft }, set: { model.cronTaskDraft = $0 }
-                ), axis: .vertical)
-                .lineLimit(2...5)
-                Text("Continue in chat to describe the schedule and confirm the task.")
-                    .font(HorusStyle.bodyFont)
-                    .foregroundStyle(palette.muted)
-            }
-
-            Button(action: model.startCronSetup) {
-                HorusLabel(title: "Start setup", icon: "plus")
-                    .frame(maxWidth: settingsActionMaxWidth)
-            }
-            .settingsPrimaryAction()
-            .disabled(!model.connectionState.isReady || model.selectedSessionID == nil)
-            .settingsStandaloneRow()
-
             if let error = model.cronError {
                 StatusBanner(tone: .error, title: "Schedule rejected", detail: error)
             }
@@ -436,7 +481,7 @@ struct CronView: View {
                 HStack {
                     Text("Tasks")
                     Spacer()
-                    Button("Refresh", lucideIcon: "refresh-cw") { model.refreshCron() }
+                    Button("Refresh", systemImage: "arrow.clockwise") { model.refreshCron() }
                         .labelStyle(.iconOnly)
                         .buttonStyle(HorusIconButtonStyle())
                         .help("Refresh schedules")
@@ -469,36 +514,29 @@ private struct CronTaskRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(task.task)
-                        .font(HorusStyle.metadataFont.weight(.semibold))
-                        .textSelection(.enabled)
-                    Text("ID \(task.id)")
-                        .font(HorusStyle.metadataFont)
-                        .foregroundStyle(palette.muted)
-                }
-                Spacer()
-                Button("Run now", lucideIcon: "play") { model.runCron(task) }
-                    .buttonStyle(.glassProminent)
-                    .buttonBorderShape(.capsule)
-                    .controlSize(.large)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(task.task)
+                    .font(HorusStyle.bodyFont.weight(.semibold))
+                    .textSelection(.enabled)
+                Text("ID \(task.id)")
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(palette.muted)
             }
-            HStack {
-                TextField("Schedule", text: $schedule)
-                    .textFieldStyle(.roundedBorder)
+            LabeledContent("Schedule") {
+                TextField("* * * * *", text: $schedule)
                     .font(HorusStyle.bodyFont.monospaced())
-                Button("Reschedule") { model.rescheduleCron(task, schedule: schedule) }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.capsule)
-                    .controlSize(.large)
+                    .settingsField()
+            }
+            HorusActionRow(collapsesToIcons: true) {
+                Button("Run now", systemImage: "play.fill") { model.runCron(task) }
+                    .horusProminentButton()
+                Button("Reschedule", systemImage: "clock") {
+                    model.rescheduleCron(task, schedule: schedule)
+                }
                     .disabled(schedule == task.schedule)
-                Button("Delete schedule", lucideIcon: "trash-2", role: .destructive) {
+                Button("Delete", systemImage: "trash", role: .destructive) {
                     model.deleteCron(task)
                 }
-                .labelStyle(.iconOnly)
-                .buttonStyle(HorusIconButtonStyle())
-                .accessibilityLabel("Delete schedule")
             }
         }
         .onChange(of: task.schedule) { schedule = task.schedule }
@@ -515,7 +553,8 @@ private struct CronRunRow: View {
             Circle().fill(statusColor).frame(width: 9, height: 9).padding(.top, 5)
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
-                    Text(run.status.uppercased()).font(HorusStyle.metadataFont.weight(.bold))
+                    Text(run.status.rawValue.uppercased())
+                        .font(HorusStyle.metadataFont.weight(.bold))
                     Text(Date(timeIntervalSince1970: TimeInterval(run.startedAt)), style: .relative)
                         .font(HorusStyle.bodyFont)
                         .foregroundStyle(palette.muted)
@@ -524,28 +563,28 @@ private struct CronRunRow: View {
                 if let message = run.message {
                     Text(message).font(HorusStyle.bodyFont).foregroundStyle(palette.muted)
                 }
-            }
-            Spacer()
-            if let sessionID = run.sessionId {
-                Button("Open session") {
-                    model.openSession(sessionID)
-                    model.destination = .chat
+                if let sessionID = run.sessionId {
+                    Button("Open session") {
+                        model.openSession(sessionID)
+                        model.destination = .chat
+                    }
+                    .buttonStyle(.glass)
+                    .buttonBorderShape(.capsule)
+                    .padding(.top, 2)
                 }
-                .buttonStyle(.glass)
-                .buttonBorderShape(.capsule)
-                .controlSize(.large)
             }
+            Spacer(minLength: 0)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(run.status) run for task \(run.taskId)")
+        .accessibilityLabel("\(run.status.rawValue) run for task \(run.taskId)")
     }
 
     private var statusColor: Color {
         switch run.status {
-        case "succeeded": palette.signal
-        case "failed": palette.danger
-        case "running": palette.accent
-        default: palette.muted
+        case .succeeded: palette.signal
+        case .failed: palette.danger
+        case .running: palette.accent
+        case .skipped: palette.muted
         }
     }
 }
@@ -581,11 +620,12 @@ private struct ProfileUsageSection: View {
             result.totalTokens += day.usage.totalTokens
         }
         VStack(alignment: .leading, spacing: 16) {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 100), spacing: 16)], spacing: 16) {
+            // Four fixed columns: an adaptive grid drops to three and orphans the last metric.
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 16) {
                 UsageMetric(label: "TOKENS", value: compact(total.totalTokens))
                 UsageMetric(label: "INPUT", value: compact(total.inputTokens))
                 UsageMetric(label: "OUTPUT", value: compact(total.outputTokens))
-                UsageMetric(label: "CACHE HIT", value: cacheHit(total))
+                UsageMetric(label: "CACHE", value: cacheHit(total))
             }
             Text("52-week activity")
                 .font(HorusStyle.controlFont)
@@ -608,7 +648,7 @@ private struct UsageMetric: View {
                 .tracking(1)
                 .foregroundStyle(palette.muted)
             Text(value)
-                .font(.headline.weight(.semibold))
+                .font(.headline)
                 .monospacedDigit()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -715,17 +755,15 @@ struct GatewayView: View {
             detail: "Manage the selected gateway and pair another device."
         ) {
             Section("Connection") {
-                LabeledContent("Gateway") {
-                    Picker("Gateway", selection: Binding(
-                        get: { model.selectedAccountID },
-                        set: { model.selectAccount($0) }
-                    )) {
-                        ForEach(model.accounts) { account in
-                            Text(account.displayName).tag(Optional(account.id))
-                        }
+                Picker("Gateway", selection: Binding(
+                    get: { model.selectedAccountID },
+                    set: { model.selectAccount($0) }
+                )) {
+                    ForEach(model.accounts) { account in
+                        Text(account.displayName).tag(Optional(account.id))
                     }
-                    .labelsHidden()
                 }
+                .settingsPickerStyle()
                 LabeledContent("Status") {
                     HStack(spacing: 7) {
                         Circle()
@@ -740,59 +778,43 @@ struct GatewayView: View {
                 LabeledContent("Protocol", value: "Horus gateway v\(gatewayProtocolVersion)")
             }
 
-            GlassEffectContainer(spacing: 8) {
-                HStack(spacing: 8) {
-                    Button("Reconnect", lucideIcon: "refresh-cw", action: model.reconnect)
-                        .help("Reconnect")
-                    Button("Add gateway", lucideIcon: "plus") { model.showsPairing = true }
-                        .help("Add gateway")
-                    Button("Forget gateway", lucideIcon: "trash-2", role: .destructive) {
-                        confirmsForget = true
-                    }
-                    .help("Forget gateway")
+            HorusActionRow(collapsesToIcons: true) {
+                Button("Reconnect", systemImage: "arrow.clockwise", action: model.reconnect)
+                Button("Add gateway", systemImage: "plus") { model.showsPairing = true }
+                Button("Forget", systemImage: "trash", role: .destructive) {
+                    confirmsForget = true
                 }
-                .labelStyle(.iconOnly)
-                .buttonStyle(HorusIconButtonStyle())
             }
             .settingsStandaloneRow()
 
             Section("Pair another device") {
-                Text("Ask this gateway for a short-lived code, then enter it with the same gateway address on the other device.")
-                    .font(HorusStyle.bodyFont)
-                    .foregroundStyle(palette.muted)
+                SettingsCaption("Ask this gateway for a short-lived code, then enter it with the same gateway address on the other device.")
                 if let pairing = model.pairingCodeInfo {
                     Text(pairing.code)
-                        .font(.system(.title, design: .monospaced, weight: .bold))
+                        .font(.system(.title2, design: .monospaced, weight: .bold))
                         .tracking(3)
                         .textSelection(.enabled)
-                    HStack {
-                        HStack(spacing: 3) {
-                            Text("Expires")
-                            Text(pairing.expiresAt, style: .relative)
-                        }
-                        .font(HorusStyle.bodyFont)
-                        .foregroundStyle(palette.muted)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                    LabeledContent("Expires") {
+                        Text(pairing.expiresAt, style: .relative)
                     }
+                    .foregroundStyle(palette.muted)
                 }
             }
 
-            if let pairing = model.pairingCodeInfo {
-                ShareLink(item: pairing.code) {
-                    HorusLabel(title: "Copy or share", icon: "share")
-                        .frame(maxWidth: settingsActionMaxWidth)
+            HorusActionRow {
+                if let pairing = model.pairingCodeInfo {
+                    ShareLink("Copy or share", item: pairing.code)
+                } else {
+                    Button(
+                        "Create one-time code",
+                        systemImage: "key",
+                        action: model.createPairingCode
+                    )
+                        .horusProminentButton()
                 }
-                .buttonStyle(.glass)
-                .buttonBorderShape(.capsule)
-                .controlSize(.large)
-                .settingsStandaloneRow()
-            } else {
-                Button(action: model.createPairingCode) {
-                    Text("Create one-time code")
-                        .frame(maxWidth: settingsActionMaxWidth)
-                }
-                .settingsPrimaryAction()
-                .settingsStandaloneRow()
             }
+            .settingsStandaloneRow()
         }
         .confirmationDialog(
             "Forget this gateway?",
@@ -843,6 +865,7 @@ struct PageScaffold<Content: View>: View {
                     .font(HorusStyle.bodyFont)
                     .foregroundStyle(palette.muted)
                     .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
                 #endif
 
                 content
@@ -861,25 +884,43 @@ struct PageScaffold<Content: View>: View {
     }
 }
 
-#if os(iOS)
-private let settingsActionMaxWidth: CGFloat? = .infinity
-#else
-private let settingsActionMaxWidth: CGFloat? = nil
-#endif
+/// Secondary explanation under a form control.
+private struct SettingsCaption: View {
+    @Environment(\.horusPalette) private var palette
+    let text: String
+
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(HorusStyle.bodyFont)
+            .foregroundStyle(palette.muted)
+            .listRowSeparator(.hidden)
+    }
+}
 
 private extension View {
-    func settingsPrimaryAction() -> some View {
-        buttonStyle(.glassProminent)
-            .buttonBorderShape(.capsule)
-            .controlSize(.large)
+    /// A menu keeps the value on its own row without pushing a destination: the
+    /// navigation-link style pushes a blank page from a split view's detail column.
+    func settingsPickerStyle() -> some View {
+        pickerStyle(.menu)
+    }
+
+    /// Trailing-aligned entry like Settings.app on iOS, fixed width on macOS.
+    func settingsField() -> some View {
+        #if os(iOS)
+        multilineTextAlignment(.trailing)
+        #else
+        frame(maxWidth: 300)
+        #endif
     }
 
     func settingsStandaloneRow() -> some View {
         Section {
-        } header: {
-            self
-                .frame(maxWidth: .infinity, alignment: .center)
-                .textCase(nil)
+            frame(maxWidth: .infinity)
+                .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
         }
     }
 }
@@ -896,7 +937,7 @@ private struct StatusBanner: View {
     var body: some View {
         HStack(spacing: 12) {
             if progress { ProgressView().controlSize(.small) }
-            else { HorusIcon(name: symbol, foreground: color) }
+            else { HorusIcon(systemName: systemImage, foreground: color) }
             VStack(alignment: .leading, spacing: 3) {
                 Text(title).font(HorusStyle.controlFont)
                 Text(detail).font(HorusStyle.bodyFont).foregroundStyle(palette.muted)
@@ -909,9 +950,9 @@ private struct StatusBanner: View {
             }
         }
         .padding(13)
-        .background(color.opacity(0.09), in: RoundedRectangle(cornerRadius: HorusStyle.cardRadius))
+        .background(color.opacity(0.09), in: HorusStyle.cardShape)
         .overlay {
-            RoundedRectangle(cornerRadius: HorusStyle.cardRadius)
+            HorusStyle.cardShape
                 .stroke(color.opacity(0.45), lineWidth: HorusStyle.borderWidth)
         }
     }
@@ -925,12 +966,12 @@ private struct StatusBanner: View {
         }
     }
 
-    private var symbol: String {
+    private var systemImage: String {
         switch tone {
-        case .neutral: "info"
-        case .success: "badge-check"
-        case .warning: "triangle-alert"
-        case .error: "octagon-x"
+        case .neutral: "info.circle"
+        case .success: "checkmark.seal"
+        case .warning: "exclamationmark.triangle"
+        case .error: "exclamationmark.octagon"
         }
     }
 }
@@ -943,11 +984,4 @@ func cacheHit(_ usage: TokenUsage) -> String {
     guard usage.inputTokens > 0 else { return "—" }
     return (Double(usage.cachedInputTokens) / Double(usage.inputTokens))
         .formatted(.percent.precision(.fractionLength(1)))
-}
-
-private extension String {
-    var nonEmpty: String? {
-        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
 }

@@ -1,39 +1,16 @@
 import SwiftUI
 
 struct ArtifactView: View {
-    @Environment(AppModel.self) private var model
-
     var body: some View {
         VStack(spacing: 0) {
-            header
+            Text("Diff")
+                .font(HorusStyle.controlFont)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .center)
+                .accessibilityAddTraits(.isHeader)
             ArtifactContent()
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-    }
-
-    private var header: some View {
-        Menu {
-            ForEach(InspectorSection.allCases) { section in
-                Button(section.rawValue) { model.showInspector(section) }
-            }
-        } label: {
-            HorusMenuLabel(text: model.inspectorSection.rawValue)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Inspector view, \(model.inspectorSection.rawValue)")
-        .help("Switch between Diff and Subagents")
-        .frame(maxWidth: .infinity, alignment: headerAlignment)
-        .padding(.horizontal, 16)
-        .frame(minHeight: 44)
-    }
-
-    private var headerAlignment: Alignment {
-#if os(iOS)
-        .center
-#else
-        .leading
-#endif
     }
 }
 
@@ -41,25 +18,13 @@ private struct ArtifactContent: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        switch model.inspectorSection {
-        case .diff:
-            if model.gitDiff.isEmpty {
-                unavailable("No code changes", symbol: "diff")
-            } else {
-                UnifiedDiffView(document: UnifiedDiffDocument(model.gitDiff))
-            }
-        case .subagents:
-            SubagentCardsView()
-        }
-    }
-
-    private func unavailable(_ title: String, symbol: String) -> some View {
-        ContentUnavailableView {
-            Label {
-                Text(title)
-            } icon: {
-                HorusIcon(name: symbol, size: 32)
-            }
+        if model.gitDiff.isEmpty {
+            HorusUnavailable(
+                title: "No code changes",
+                systemImage: "doc.text.magnifyingglass"
+            )
+        } else {
+            UnifiedDiffView(document: UnifiedDiffDocument(model.gitDiff))
         }
     }
 }
@@ -216,17 +181,15 @@ private struct DiffFileView: View {
 
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
-            ScrollView(.horizontal) {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(file.hunks) { hunk in
-                        DiffHunkView(hunk: hunk)
-                    }
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(file.hunks) { hunk in
+                    DiffHunkView(hunk: hunk)
                 }
-                .fixedSize(horizontal: true, vertical: false)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         } label: {
             HStack(spacing: 8) {
-                HorusIcon(name: "file-text", foreground: palette.accent)
+                HorusIcon(systemName: "doc.text", foreground: palette.accent)
                 Text(file.path)
                     .font(HorusStyle.metadataFont.weight(.semibold))
                     .lineLimit(1)
@@ -240,7 +203,7 @@ private struct DiffFileView: View {
             .frame(minHeight: HorusStyle.iconButtonSize)
         }
         .padding(.horizontal, 12)
-        .horusGlass(in: RoundedRectangle(cornerRadius: HorusStyle.controlRadius, style: .continuous), interactive: true)
+        .horusGlass(in: HorusStyle.controlShape, interactive: true)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("File \(file.path), \(file.added) additions, \(file.removed) removals")
     }
@@ -283,9 +246,9 @@ private struct DiffLineView: View {
                 .font(HorusStyle.metadataFont)
                 .textSelection(.enabled)
                 .padding(.trailing, 12)
-                .fixedSize(horizontal: true, vertical: false)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .frame(minHeight: 23)
+        .frame(maxWidth: .infinity, minHeight: 23, alignment: .leading)
         .background(background)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
@@ -347,107 +310,59 @@ private struct DiffLineView: View {
     }
 }
 
-private struct SubagentCardsView: View {
-    @Environment(AppModel.self) private var model
+struct PreviewTranscriptSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let preview: TranscriptPreview
 
     var body: some View {
-        if model.inspectorPickerOptions.isEmpty && previews.isEmpty {
-            ContentUnavailableView {
-                Label {
-                    Text("No subagents")
-                } icon: {
-                    HorusIcon(name: "user-round-x", size: 32)
-                }
-            }
-        } else {
-            ScrollView {
-                LazyVStack(spacing: 12) {
-                    if model.inspectorPickerOptions.isEmpty {
-                        ForEach(previews) { artifact in
-                            PreviewCard(artifact: artifact)
+        NavigationStack {
+            VStack(spacing: 0) {
+                VStack(spacing: 8) {
+                    Text(preview.title)
+                        .font(.title2)
+                        .bold()
+                    HStack(spacing: 8) {
+                        if let status = preview.status {
+                            HorusBadge(text: status, tone: status == "errored" ? "error" : "neutral")
                         }
-                    } else {
-                        ForEach(model.inspectorPickerOptions) { option in
-                            SubagentCard(option: option)
+                        if let model = preview.model {
+                            Text(model)
+                                .font(HorusStyle.metadataFont)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
-                .padding(14)
-            }
-            .scrollIndicators(.hidden)
-        }
-    }
+                .frame(maxWidth: .infinity)
+                .padding()
 
-    private var previews: [TranscriptPreview] { model.previews }
-}
+                Divider()
 
-private struct SubagentCard: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.horusPalette) private var palette
-    @State private var isExpanded = false
-    let option: FrontendPickerOption
-
-    var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
-            if let preview {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(preview.blocks) { block in
-                        PreviewBlockView(block: block.block)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(preview.blocks) { block in
+                            PreviewBlockView(block: block.block)
+                        }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
                 }
-                .padding(.bottom, 12)
-            } else {
-                ProgressView().frame(maxWidth: .infinity).padding(.bottom, 12)
+                .scrollIndicators(.hidden)
             }
-        } label: {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(option.label).font(HorusStyle.controlFont)
-                if !option.description.isEmpty {
-                    Text(option.description)
-                        .font(HorusStyle.metadataFont)
-                        .foregroundStyle(palette.muted)
-                        .lineLimit(1)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Close", systemImage: "xmark", action: dismiss.callAsFunction)
+                        .labelStyle(.iconOnly)
                 }
             }
-            .padding(.vertical, 10)
-            .frame(minHeight: HorusStyle.iconButtonSize, alignment: .leading)
         }
-        .padding(.horizontal, 12)
-        .horusGlass(in: RoundedRectangle(cornerRadius: HorusStyle.controlRadius, style: .continuous), interactive: true)
-        .onChange(of: isExpanded) {
-            if isExpanded && preview == nil { model.openInspectorPickerOption(option) }
-        }
-    }
-
-    private var preview: TranscriptPreview? {
-        model.previews.first { $0.title == option.label }
+        #if os(macOS)
+        .frame(minWidth: 560, minHeight: 520)
+        #endif
+        .presentationDetents([.medium, .large])
     }
 }
 
-private struct PreviewCard: View {
-    @State private var isExpanded = false
-    let artifact: TranscriptPreview
-
-    var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
-            VStack(alignment: .leading, spacing: 8) {
-                ForEach(artifact.blocks) { block in
-                    PreviewBlockView(block: block.block)
-                }
-            }
-            .padding(.bottom, 12)
-        } label: {
-            Text(artifact.title)
-                .font(HorusStyle.controlFont)
-                .padding(.vertical, 10)
-                .frame(minHeight: HorusStyle.iconButtonSize, alignment: .leading)
-        }
-        .padding(.horizontal, 12)
-        .horusGlass(in: RoundedRectangle(cornerRadius: HorusStyle.controlRadius, style: .continuous), interactive: true)
-    }
-}
-
-private struct PreviewBlockView: View {
+struct PreviewBlockView: View {
     @Environment(\.horusPalette) private var palette
     let block: FrontendBlock
 
@@ -455,19 +370,10 @@ private struct PreviewBlockView: View {
         HStack(alignment: .top, spacing: 8) {
             if block.pending { ProgressView().controlSize(.mini) }
             Text(block.text)
-                .font(block.format == "unified_diff" ? .caption.monospaced() : HorusStyle.bodyFont)
-                .foregroundStyle(foreground)
+                .font(block.format == "unified_diff" ? HorusStyle.metadataFont : HorusStyle.bodyFont)
+                .foregroundStyle(palette.tone(block.tone))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    private var foreground: Color {
-        switch block.tone {
-        case "success": palette.signal
-        case "warning": palette.warning
-        case "error": palette.danger
-        default: palette.muted
         }
     }
 }

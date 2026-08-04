@@ -1,13 +1,21 @@
 import SwiftUI
 import Accessibility
 
+private let debugStartsOnDetail: Bool = {
+    #if DEBUG
+    return ProcessInfo.processInfo.environment["HORUS_PAGE"] != nil
+    #else
+    return false
+    #endif
+}()
+
 struct AppShell: View {
     @Environment(AppModel.self) private var model
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     #endif
     @State private var columnVisibility = NavigationSplitViewVisibility.all
-    @State private var compactColumn = NavigationSplitViewColumn.sidebar
+    @State private var compactColumn = debugStartsOnDetail ? NavigationSplitViewColumn.detail : .sidebar
 
     var body: some View {
         @Bindable var model = model
@@ -135,7 +143,7 @@ private struct AppToastView: View {
         HStack(spacing: 12) {
             HStack(alignment: .top, spacing: 10) {
                 HorusIcon(
-                    name: toast.tone.icon,
+                    systemName: toast.tone.systemImage,
                     size: 18,
                     foreground: toast.tone.color(in: palette)
                 )
@@ -154,7 +162,7 @@ private struct AppToastView: View {
             .accessibilityLabel("\(toast.tone.title): \(toast.message)")
 
             Button(action: dismiss) {
-                HorusIcon(name: "x", size: 14, foreground: palette.muted)
+                HorusIcon(systemName: "xmark", size: 14, foreground: palette.muted)
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                     .contentShape(Rectangle())
             }
@@ -164,9 +172,7 @@ private struct AppToastView: View {
         .padding(.leading, 16)
         .padding(.trailing, 6)
         .padding(.vertical, 10)
-        .horusGlass(
-            in: RoundedRectangle(cornerRadius: HorusStyle.cardRadius, style: .continuous)
-        )
+        .horusGlass(in: HorusStyle.cardShape)
         .shadow(color: .black.opacity(0.20), radius: 18, y: 8)
     }
 }
@@ -181,12 +187,12 @@ private extension ToastTone {
         }
     }
 
-    var icon: String {
+    var systemImage: String {
         switch self {
-        case .info: "info"
-        case .success: "circle-check"
-        case .warning: "triangle-alert"
-        case .error: "circle-x"
+        case .info: "info.circle"
+        case .success: "checkmark.circle"
+        case .warning: "exclamationmark.triangle"
+        case .error: "xmark.circle"
         }
     }
 
@@ -218,7 +224,7 @@ private struct WorkspaceBrowserView: View {
                     List {
                         ForEach(listing.entries) { entry in
                             Button { model.loadDirectory(entry.path) } label: {
-                                HorusLabel(title: entry.name, icon: "folder")
+                                HorusLabel(title: entry.name, systemImage: "folder")
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .contentShape(Rectangle())
                             }
@@ -231,7 +237,11 @@ private struct WorkspaceBrowserView: View {
                                 .listRowSeparator(.hidden)
                         }
                         if let error = model.directoryError ?? model.workspaceError {
-                            HorusLabel(title: error, icon: "triangle-alert", iconColor: palette.danger)
+                            HorusLabel(
+                                title: error,
+                                systemImage: "exclamationmark.triangle",
+                                iconColor: palette.danger
+                            )
                                 .foregroundStyle(palette.danger)
                                 .listRowSeparator(.hidden)
                         }
@@ -284,7 +294,7 @@ private struct DirectoryBrowserHeader: View {
                     .font(HorusStyle.controlFont)
                 Spacer()
                 if let parent {
-                    Button("Parent folder", lucideIcon: "folder-up") { onParent(parent) }
+                    Button("Parent folder", systemImage: "arrow.up") { onParent(parent) }
                         .labelStyle(.iconOnly)
                         .buttonStyle(HorusIconButtonStyle())
                         .help("Parent folder")
@@ -306,82 +316,66 @@ private struct ArtifactInspector: View {
 
 struct SidebarView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.horusPalette) private var palette
     let showDetail: () -> Void
     @State private var collapsedWorkspaces: Set<String> = []
     @State private var sessionToRename: SessionRecord?
     @State private var renameDraft = ""
     @State private var sessionToDelete: SessionRecord?
+    @State private var showsConnectionDetails = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Text("𓂀")
-                    .font(.system(size: 27, weight: .regular, design: .serif))
-                    .foregroundStyle(palette.accent)
-                    .accessibilityHidden(true)
-                Text("HORUS")
-                    .font(.system(.subheadline, design: .serif, weight: .bold))
-                    .tracking(1.4)
-                Spacer()
-                Menu {
-                    Text(model.connectionState.label)
-                    if let account = model.selectedAccount {
-                        Text(account.displayName)
-                        Text(account.endpoint.rawValue)
-                    } else {
-                        Text("No gateway selected")
+        ScrollView {
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Text("𓂀")
+                        .font(.system(size: 27, weight: .regular, design: .serif))
+                        .foregroundStyle(palette.accent)
+                        .accessibilityHidden(true)
+                    Text("HORUS")
+                        .font(.system(.subheadline, design: .serif, weight: .bold))
+                        .tracking(1.4)
+                    Spacer()
+                    Button {
+                        showsConnectionDetails = true
+                    } label: {
+                        Image(systemName: "circle.fill")
+                            .font(.system(size: 8))
+                            .foregroundStyle(
+                                model.connectionState.isReady ? palette.signal : palette.danger
+                            )
+                            .symbolEffect(
+                                .pulse.byLayer,
+                                options: .repeat(.continuous),
+                                isActive: !reduceMotion
+                            )
+                            .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                            .contentShape(Rectangle())
                     }
-                    if !model.connectionState.isReady {
-                        Divider()
-                        if case .failed(let message) = model.connectionState {
-                            Text(message)
-                        }
-                        Button("Retry connection", lucideIcon: "refresh-cw", action: model.reconnect)
-                            .disabled(model.selectedAccount == nil)
-                        Button("Repair pairing", lucideIcon: "link") {
-                            model.repairSelectedGateway()
-                        }
-                        .disabled(model.selectedAccount == nil)
-                    }
-                } label: {
-                    Circle()
-                        .fill(model.connectionState.isReady ? palette.signal : palette.danger)
-                        .frame(width: 8, height: 8)
-                        .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
-                        .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Gateway connection")
+                    .accessibilityValue(model.connectionState.label)
+                    .help("Gateway: \(model.connectionState.label)")
+                    .popover(isPresented: $showsConnectionDetails) { connectionDetails }
                 }
-                .buttonStyle(.plain)
-                .menuIndicator(.hidden)
-                .accessibilityLabel("Gateway connection")
-                .accessibilityValue(model.connectionState.label)
-                .help("Gateway: \(model.connectionState.label)")
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
 
-            VStack(alignment: .leading, spacing: 2) {
-                navigationButton("Gateway", destination: .gateway)
-                navigationButton("Providers", destination: .providers)
-                navigationButton("Agent settings", destination: .agent)
-                navigationButton("Cron", destination: .cron)
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 10)
+                VStack(alignment: .leading, spacing: 2) {
+                    navigationButton("Gateway", destination: .gateway)
+                    navigationButton("Providers", destination: .providers)
+                    navigationButton("Agent settings", destination: .agent)
+                    navigationButton("Cron", destination: .cron)
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
 
-            VStack(alignment: .leading, spacing: 0) {
-                HorusLabel(
-                    title: "Chats",
-                    icon: "messages-square",
-                    iconColor: model.destination == .chat ? palette.accent : Color.primary
-                )
-                    .font(HorusStyle.controlFont)
-                    .foregroundStyle(model.destination == .chat ? palette.accent : Color.primary)
-                    .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
-                    .padding(.horizontal, 16)
+                VStack(alignment: .leading, spacing: 0) {
+                    navigationButton("Chats", destination: .chat)
+                        .padding(.horizontal, 12)
 
-                ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
                         if model.sessions.isEmpty {
                             Text(model.connectionState.isReady ? "No chats yet" : model.connectionState.label)
@@ -394,8 +388,11 @@ struct SidebarView: View {
                     .padding(.horizontal, 16)
                 }
             }
+            .frame(maxWidth: .infinity)
         }
         .font(HorusStyle.bodyFont)
+        // The split view paints its own system background over the app backdrop.
+        .background { HorusBackdrop() }
         .safeAreaInset(edge: .bottom) {
             HStack {
                 Button {
@@ -403,10 +400,10 @@ struct SidebarView: View {
                     model.destination = .chat
                     showDetail()
                 } label: {
-                    HorusLabel(title: "New chat", icon: "square-pen")
+                    HorusLabel(title: "New chat", systemImage: "square.and.pencil")
                         .font(HorusStyle.controlFont)
                 }
-                .buttonStyle(.glassProminent)
+                .horusProminentButton()
                 .buttonBorderShape(.capsule)
                 .controlSize(.large)
                 .disabled(!model.canCreateSession)
@@ -416,7 +413,7 @@ struct SidebarView: View {
                     model.destination = .profile
                     showDetail()
                 } label: {
-                    HorusIcon(name: "settings")
+                    HorusIcon(systemName: "gearshape")
                 }
                 .buttonStyle(HorusIconButtonStyle())
                 .accessibilityLabel("Settings")
@@ -451,6 +448,54 @@ struct SidebarView: View {
         }
     }
 
+    private var connectionDetails: some View {
+        VStack(spacing: 10) {
+            Text(model.connectionState.label)
+                .font(HorusStyle.controlFont.weight(.semibold))
+                .foregroundStyle(model.connectionState.isReady ? palette.signal : palette.danger)
+
+            if let account = model.selectedAccount {
+                Text(account.displayName)
+                Text(account.endpoint.rawValue)
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(palette.muted)
+            } else {
+                Text("No gateway selected")
+                    .foregroundStyle(palette.muted)
+            }
+
+            if case .failed(let message) = model.connectionState {
+                Text(message)
+                    .font(HorusStyle.bodyFont)
+                    .foregroundStyle(palette.danger)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
+
+            if !model.connectionState.isReady {
+                Divider()
+                Button {
+                    showsConnectionDetails = false
+                    model.reconnect()
+                } label: {
+                    Label("Retry connection", systemImage: "arrow.clockwise")
+                }
+                .disabled(model.selectedAccount == nil)
+                Button {
+                    showsConnectionDetails = false
+                    model.repairSelectedGateway()
+                } label: {
+                    Label("Repair pairing", systemImage: "link")
+                }
+                .disabled(model.selectedAccount == nil)
+            }
+        }
+        .multilineTextAlignment(.center)
+        .padding(16)
+        .frame(width: 280)
+        .presentationCompactAdaptation(.popover)
+    }
+
     private func navigationButton(_ title: String, destination: AppDestination) -> some View {
         Button {
             model.destination = destination
@@ -458,7 +503,7 @@ struct SidebarView: View {
         } label: {
             HorusLabel(
                 title: title,
-                icon: destination.symbol,
+                systemImage: destination.systemImage,
                 iconColor: model.destination == destination ? palette.accent : Color.primary
             )
                 .font(HorusStyle.controlFont)
@@ -511,14 +556,16 @@ struct SidebarView: View {
                 expansionBinding(for: group.id).wrappedValue.toggle()
             } label: {
                 HStack(spacing: 6) {
-                    HorusIcon(name: "folder", foreground: palette.muted)
+                    HorusIcon(systemName: "folder", foreground: palette.muted)
                     Text(group.name)
                         .font(HorusStyle.controlFont)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer()
                     HorusIcon(
-                        name: collapsedWorkspaces.contains(group.id) ? "chevron-right" : "chevron-down",
+                        systemName: collapsedWorkspaces.contains(group.id)
+                            ? "chevron.right"
+                            : "chevron.down",
                         size: 12,
                         foreground: palette.muted
                     )
@@ -539,15 +586,15 @@ struct SidebarView: View {
 
     private func sessionRow(_ session: SessionRecord) -> some View {
         let isSelected = session.sessionId == model.selectedSessionID
-        let isRunning = model.runningSessionIDs.contains(session.sessionId)
         let isUnread = model.unreadSessionIDs.contains(session.sessionId)
         let activityValue: String
-        if isRunning {
+        switch session.activity.state {
+        case .running:
             activityValue = "In progress"
-        } else if isUnread {
-            activityValue = "Completed, unread"
-        } else {
-            activityValue = ""
+        case .awaitingApproval:
+            activityValue = "Awaiting approval"
+        case .idle:
+            activityValue = isUnread ? "Finished, unread" : ""
         }
         return HStack(spacing: 4) {
             Button {
@@ -557,11 +604,12 @@ struct SidebarView: View {
             } label: {
                 HStack(spacing: 8) {
                     Text(session.displayTitle)
+                        .fontWeight(isSelected ? .semibold : nil)
                         .lineLimit(1)
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(isSelected ? palette.accent : .primary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     SessionActivityIndicator(
-                        isRunning: isRunning,
+                        state: session.activity.state,
                         isUnread: isUnread
                     )
                 }
@@ -571,37 +619,57 @@ struct SidebarView: View {
             .buttonStyle(.plain)
             .disabled(!model.canOpenSession && session.sessionId != model.selectedSessionID)
             .accessibilityValue(activityValue)
+            .accessibilityAddTraits(isSelected ? .isSelected : [])
 
             if session.pinned {
-                HorusIcon(name: "pin", size: 12, foreground: palette.accent)
+                HorusIcon(systemName: "pin", size: 12, foreground: palette.accent)
             }
 
             Menu {
-                Button(session.pinned ? "Unpin" : "Pin", lucideIcon: session.pinned ? "pin-off" : "pin") {
+                Button {
                     model.setSessionPinned(session, pinned: !session.pinned)
+                } label: {
+                    Label(
+                        session.pinned ? "Unpin" : "Pin",
+                        systemImage: session.pinned ? "pin.slash" : "pin"
+                    )
                 }
-                .disabled(!isSelected)
-                Button("Rename", lucideIcon: "pencil") {
+                Button {
                     renameDraft = session.displayTitle
                     sessionToRename = session
+                } label: {
+                    Label("Rename", systemImage: "pencil")
                 }
-                .disabled(!isSelected)
                 Divider()
-                Button("Delete", lucideIcon: "trash-2", role: .destructive) {
+                Button(role: .destructive) {
                     sessionToDelete = session
+                } label: {
+                    Label("Delete", systemImage: "trash")
                 }
-                .disabled(!isSelected)
             } label: {
-                HorusIcon(name: "ellipsis", size: 14)
+                Image(systemName: "ellipsis")
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                     .contentShape(Rectangle())
             }
+            .labelStyle(.titleAndIcon)
             .buttonStyle(.plain)
             .menuIndicator(.hidden)
             .accessibilityLabel("Chat actions")
             .help("Chat actions")
         }
+        .padding(.horizontal, 8)
         .frame(minHeight: HorusStyle.iconButtonSize)
+        .background(
+            isSelected ? palette.accentSoft.opacity(0.55) : .clear,
+            in: HorusStyle.controlShape
+        )
+        .overlay {
+            HorusStyle.controlShape.stroke(
+                isSelected ? palette.accent.opacity(0.5) : .clear,
+                lineWidth: HorusStyle.borderWidth
+            )
+            .allowsHitTesting(false)
+        }
     }
 
     private var renamePresented: Binding<Bool> {
@@ -622,12 +690,13 @@ struct SidebarView: View {
 private struct SessionActivityIndicator: View {
     @Environment(\.horusPalette) private var palette
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    let isRunning: Bool
+    let state: SessionActivityState
     let isUnread: Bool
 
     var body: some View {
         Group {
-            if isRunning {
+            switch state {
+            case .running:
                 TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { context in
                     let progress = context.date.timeIntervalSinceReferenceDate
                         .truncatingRemainder(dividingBy: 0.9) / 0.9
@@ -640,13 +709,24 @@ private struct SessionActivityIndicator: View {
                         .rotationEffect(.degrees(reduceMotion ? -90 : progress * 360 - 90))
                 }
                 .frame(width: 11, height: 11)
-            } else if isUnread {
+            case .awaitingApproval:
                 Circle()
-                    .fill(palette.accent)
-                    .frame(width: 7, height: 7)
+                    .trim(from: 0.08, to: 0.76)
+                    .stroke(
+                        palette.warning,
+                        style: StrokeStyle(lineWidth: 1.7, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(-90))
                     .frame(width: 11, height: 11)
-            } else {
-                Color.clear.frame(width: 11, height: 11)
+            case .idle:
+                if isUnread {
+                    Circle()
+                        .fill(palette.accent)
+                        .frame(width: 7, height: 7)
+                        .frame(width: 11, height: 11)
+                } else {
+                    Color.clear.frame(width: 11, height: 11)
+                }
             }
         }
         .accessibilityHidden(true)
@@ -677,7 +757,7 @@ struct PairingView: View {
                     )
                     Spacer()
                     if canCancel {
-                        Button("Close", lucideIcon: "x") {
+                        Button("Close", systemImage: "xmark") {
                             model.showsPairing = false
                             dismiss()
                         }
@@ -687,67 +767,80 @@ struct PairingView: View {
                     }
                 }
 
-                HorusCard {
-                    VStack(alignment: .leading, spacing: 18) {
-                        VStack(alignment: .leading, spacing: 7) {
-                            Text("Gateway address")
-                                .font(HorusStyle.controlFont)
-                            TextField("tls://gateway.example:7443", text: $model.pairingEndpoint)
-                                .textFieldStyle(.roundedBorder)
-                                .textContentType(.URL)
-                                .autocorrectionDisabled()
-                                .controlSize(.large)
+                VStack(spacing: 12) {
+                    HorusCard {
+                        VStack(alignment: .leading, spacing: 18) {
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text("Gateway address")
+                                    .font(HorusStyle.controlFont)
+                                TextField("tls://gateway.example:7443", text: $model.pairingEndpoint)
+                                    .textFieldStyle(.roundedBorder)
+                                    .textContentType(.URL)
+                                    .autocorrectionDisabled()
+                                    .controlSize(.large)
+                            }
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text("One-time code")
+                                    .font(HorusStyle.controlFont)
+                                SecureField("One-time code", text: $model.pairingCode)
+                                    .textFieldStyle(.roundedBorder)
+                                    .controlSize(.large)
+                            }
                         }
-                        VStack(alignment: .leading, spacing: 7) {
-                            Text("One-time code")
-                                .font(HorusStyle.controlFont)
-                            SecureField("Pairing code", text: $model.pairingCode)
-                                .textFieldStyle(.roundedBorder)
-                                .controlSize(.large)
-                        }
-                        Text("Remote gateways require tls://. tcp:// is accepted only for localhost or a loopback address.")
-                            .font(HorusStyle.bodyFont)
-                            .foregroundStyle(palette.muted)
-                            .fixedSize(horizontal: false, vertical: true)
                     }
-                }
 
-                if let error = model.pairingError {
-                    HorusLabel(title: error, icon: "triangle-alert", iconColor: palette.danger)
+                    Text("Remote gateways require tls://. tcp:// is accepted only for localhost or a loopback address.")
                         .font(HorusStyle.bodyFont)
-                        .foregroundStyle(palette.danger)
-                }
-
-                VStack(spacing: 14) {
-                    HorusLabel(
-                        title: "4-byte framed JSON · protocol v\(gatewayProtocolVersion)",
-                        icon: "shield-check",
-                        iconColor: palette.muted
-                    )
-                        .font(HorusStyle.metadataFont)
                         .foregroundStyle(palette.muted)
-                    if model.connectionState == .connecting || model.connectionState == .authenticating {
-                        ProgressView().controlSize(.small)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 8)
+
+                    if let error = model.pairingError {
+                        HorusLabel(
+                            title: error,
+                            systemImage: "exclamationmark.triangle",
+                            iconColor: palette.danger
+                        )
+                            .foregroundStyle(palette.danger)
+                            .multilineTextAlignment(.center)
                     }
-                    Button(action: model.pair) {
-                        Text("Pair gateway")
-                            #if os(iOS)
-                            .frame(maxWidth: .infinity)
-                            #endif
-                    }
-                    .buttonStyle(.glassProminent)
-                    .buttonBorderShape(.capsule)
-                    .controlSize(.large)
                 }
                 .frame(maxWidth: .infinity)
             }
         }
         .scrollIndicators(.hidden)
+        .scrollBounceBehavior(.basedOnSize)
+        .safeAreaInset(edge: .bottom) { pairAction }
         .onSubmit { model.pair() }
+    }
+
+    private var pairAction: some View {
+        VStack(spacing: 14) {
+            HorusLabel(
+                title: "4-byte framed JSON · protocol v\(gatewayProtocolVersion)",
+                systemImage: "checkmark.shield",
+                iconColor: palette.muted
+            )
+                .font(HorusStyle.metadataFont)
+                .foregroundStyle(palette.muted)
+            if model.connectionState == .connecting || model.connectionState == .authenticating {
+                ProgressView().controlSize(.small)
+            }
+            Button("Pair gateway", action: model.pair)
+                .horusProminentButton()
+                .buttonBorderShape(.capsule)
+                .controlSize(.large)
+                #if os(iOS)
+                .buttonSizing(.flexible)
+                #endif
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 16)
     }
 }
 
-private extension String {
+extension String {
     var nonEmpty: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed

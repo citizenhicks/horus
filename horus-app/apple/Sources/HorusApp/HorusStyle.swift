@@ -1,15 +1,9 @@
 import SwiftUI
-import LucideIcons
-#if os(iOS)
-import UIKit
-#else
-import AppKit
-#endif
 
 enum HorusStyle {
     #if os(iOS)
-    static let bodyFont: Font = .footnote
-    static let controlFont: Font = .footnote.weight(.medium)
+    static let bodyFont: Font = .subheadline
+    static let controlFont: Font = .subheadline.weight(.medium)
     #else
     static let bodyFont: Font = .system(size: 14)
     static let controlFont: Font = .system(size: 14, weight: .medium)
@@ -18,6 +12,8 @@ enum HorusStyle {
     static let badgeFont: Font = .caption.weight(.medium)
     static let cardRadius: CGFloat = 22
     static let controlRadius: CGFloat = 9
+    static let cardShape = RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
+    static let controlShape = RoundedRectangle(cornerRadius: controlRadius, style: .continuous)
     static let cardPadding: CGFloat = 14
     static let controlHeight: CGFloat = 30
     static let badgeHeight: CGFloat = 26
@@ -31,68 +27,123 @@ enum HorusStyle {
 }
 
 struct HorusIcon: View {
-    let name: String
+    let systemName: String
     var size = HorusStyle.iconSize
     var foreground: Color? = nil
 
     @ViewBuilder
     var body: some View {
+        let icon = Image(systemName: systemName)
+            .symbolRenderingMode(.monochrome)
+            .font(.system(size: size, weight: .regular))
+            .frame(width: size, height: size)
+            .accessibilityHidden(true)
         if let foreground {
             icon.foregroundStyle(foreground)
         } else {
             icon
         }
     }
-
-    private var icon: some View {
-        image
-            .renderingMode(.template)
-            .resizable()
-            .scaledToFit()
-            .frame(width: size, height: size)
-            .accessibilityHidden(true)
-    }
-
-    private var image: Image {
-        #if os(iOS)
-        let image = UIImage(lucideId: name) ?? UIImage(lucideId: "circle-question-mark")!
-        return Image(uiImage: image.withRenderingMode(.alwaysTemplate))
-        #else
-        let source = NSImage.image(lucideId: name) ?? NSImage.image(lucideId: "circle-question-mark")!
-        let image = source.copy() as! NSImage
-        image.isTemplate = true
-        return Image(nsImage: image)
-        #endif
-    }
 }
 
 struct HorusLabel: View {
     let title: String
-    let icon: String
+    let systemImage: String
     var iconColor: Color? = nil
+    var iconSize = HorusStyle.iconSize
 
     var body: some View {
         Label {
             Text(title)
         } icon: {
-            HorusIcon(name: icon, foreground: iconColor)
+            HorusIcon(systemName: systemImage, size: iconSize, foreground: iconColor)
         }
+    }
+}
+
+/// Row of capsule actions. Rows of several actions drop their labels on a narrow
+/// screen; a single action keeps its label and goes full width instead.
+struct HorusActionRow<Content: View>: View {
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
+    var collapsesToIcons = false
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        Group {
+            if iconsOnly {
+                HStack(spacing: 8) { content }
+                    .labelStyle(.iconOnly)
+                    .buttonBorderShape(.circle)
+            } else {
+                #if os(iOS)
+                // Full width keeps the label: measuring for a horizontal fit either
+                // hyphenates or truncates it away.
+                VStack(spacing: 8) { content }.buttonSizing(.flexible)
+                #else
+                HStack(spacing: 8) { content }
+                #endif
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .lineLimit(1)
+        .buttonStyle(.glass)
+        .buttonBorderShape(iconsOnly ? .circle : .capsule)
+        .controlSize(.large)
+    }
+
+    private var iconsOnly: Bool {
+        #if os(iOS)
+        collapsesToIcons && horizontalSizeClass == .compact
+        #else
+        false
+        #endif
+    }
+}
+
+struct HorusUnavailable: View {
+    let title: String
+    let systemImage: String
+    var detail: String?
+
+    var body: some View {
+        ContentUnavailableView {
+            HorusLabel(title: title, systemImage: systemImage, iconSize: 32)
+        } description: {
+            if let detail { Text(detail) }
+        }
+        // Reads as a page, not as a list row, when it stands in for a form's content.
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
     }
 }
 
 extension Button where Label == HorusLabel {
     init(
         _ title: String,
-        lucideIcon: String,
+        systemImage: String,
         role: ButtonRole? = nil,
         action: @escaping () -> Void
     ) {
         self.init(role: role, action: action) {
-            HorusLabel(
-                title: title,
-                icon: lucideIcon,
-                iconColor: role == .destructive ? .red : nil
-            )
+            HorusLabel(title: title, systemImage: systemImage)
+        }
+    }
+}
+
+enum HorusSymbol {
+    static func systemName(for semanticName: String) -> String {
+        switch semanticName {
+        case "brain": "brain.head.profile"
+        case "chat-circle": "text.bubble"
+        case "hard-drives": "externaldrive.connected.to.line.below"
+        case "magnifying-glass": "magnifyingglass"
+        case "moon": "moon"
+        case "path": "point.3.connected.trianglepath.dotted"
+        case "robot": "person.3.fill"
+        case "sparkle": "sparkles"
+        default: "questionmark.square.dashed"
         }
     }
 }
@@ -108,32 +159,61 @@ struct HorusPalette: Sendable {
     let warning: Color
     let danger: Color
     let muted: Color
+    /// Label colour for anything filled with `accent`.
+    let onAccent: Color
 
+    // Nord (nordtheme.com): the canvas sits below Polar Night so nord0–nord3 read as
+    // raised surfaces, with the darker Frost blue as the accent.
     init(_ scheme: ColorScheme) {
+        onAccent = .nord6
         if scheme == .dark {
-            canvas = .black
-            panel = Color(red: 0.090, green: 0.085, blue: 0.074)
-            raised = Color(red: 0.130, green: 0.120, blue: 0.098)
-            line = Color(red: 0.250, green: 0.235, blue: 0.190)
-            accent = Color(red: 0.925, green: 0.660, blue: 0.270)
-            accentSoft = Color(red: 0.250, green: 0.190, blue: 0.085)
-            signal = Color(red: 0.425, green: 0.775, blue: 0.620)
-            warning = Color(red: 0.930, green: 0.690, blue: 0.335)
-            danger = Color(red: 0.900, green: 0.420, blue: 0.390)
-            muted = Color(red: 0.600, green: 0.635, blue: 0.565)
+            canvas = Color(red: 0.141, green: 0.161, blue: 0.200)
+            panel = .nord0
+            raised = .nord1
+            line = .nord3
+            accent = .nord10
+            accentSoft = Color(red: 0.227, green: 0.278, blue: 0.349)
+            signal = .nord14
+            warning = .nord13
+            danger = .nord11
+            muted = Color(red: 0.541, green: 0.588, blue: 0.671)
         } else {
-            canvas = Color(red: 0.985, green: 0.982, blue: 0.970)
-            panel = Color(red: 0.945, green: 0.936, blue: 0.910)
-            raised = Color(red: 0.975, green: 0.968, blue: 0.948)
-            line = Color(red: 0.790, green: 0.750, blue: 0.660)
-            accent = Color(red: 0.610, green: 0.335, blue: 0.055)
-            accentSoft = Color(red: 0.925, green: 0.820, blue: 0.600)
-            signal = Color(red: 0.100, green: 0.440, blue: 0.325)
-            warning = Color(red: 0.650, green: 0.390, blue: 0.030)
-            danger = Color(red: 0.650, green: 0.180, blue: 0.160)
-            muted = Color(red: 0.390, green: 0.380, blue: 0.330)
+            canvas = .nord6
+            panel = .nord5
+            raised = Color(red: 0.965, green: 0.973, blue: 0.984)
+            line = .nord4
+            accent = .nord10
+            accentSoft = Color(red: 0.831, green: 0.871, blue: 0.918)
+            signal = Color(red: 0.353, green: 0.482, blue: 0.243)
+            warning = Color(red: 0.565, green: 0.435, blue: 0.153)
+            danger = Color(red: 0.639, green: 0.263, blue: 0.310)
+            muted = .nord3
         }
     }
+
+    func tone(_ tone: String) -> Color {
+        switch tone {
+        case "success": signal
+        case "warning": warning
+        case "error": danger
+        default: muted
+        }
+    }
+}
+
+private extension Color {
+    static let nord0 = Color(red: 0.180, green: 0.204, blue: 0.251)
+    static let nord1 = Color(red: 0.231, green: 0.259, blue: 0.322)
+    static let nord2 = Color(red: 0.263, green: 0.298, blue: 0.369)
+    static let nord3 = Color(red: 0.298, green: 0.337, blue: 0.416)
+    static let nord4 = Color(red: 0.847, green: 0.871, blue: 0.914)
+    static let nord5 = Color(red: 0.898, green: 0.914, blue: 0.941)
+    static let nord6 = Color(red: 0.925, green: 0.937, blue: 0.957)
+    static let nord8 = Color(red: 0.533, green: 0.753, blue: 0.816)
+    static let nord10 = Color(red: 0.369, green: 0.506, blue: 0.675)
+    static let nord11 = Color(red: 0.749, green: 0.380, blue: 0.416)
+    static let nord13 = Color(red: 0.922, green: 0.796, blue: 0.545)
+    static let nord14 = Color(red: 0.639, green: 0.745, blue: 0.549)
 }
 
 extension EnvironmentValues {
@@ -174,11 +254,7 @@ struct HorusCard<Content: View>: View {
         content
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(HorusStyle.cardPadding)
-            .glassEffect(.regular, in: cardShape)
-    }
-
-    private var cardShape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: HorusStyle.cardRadius, style: .continuous)
+            .glassEffect(.regular, in: HorusStyle.cardShape)
     }
 }
 
@@ -186,7 +262,7 @@ struct HorusBadge: View {
     @Environment(\.horusPalette) private var palette
     let text: String
     var tone = "neutral"
-    var symbol: String?
+    var systemImage: String?
     var progress: Double?
     var interactive = false
 
@@ -203,8 +279,10 @@ struct HorusBadge: View {
                 .frame(width: 12, height: 12)
                 .accessibilityHidden(true)
             }
-            if let symbol { HorusIcon(name: symbol, size: 13, foreground: foreground) }
-            Text(text).lineLimit(1)
+            if let systemImage {
+                HorusIcon(systemName: systemImage, size: 13, foreground: foreground)
+            }
+            if !text.isEmpty { Text(text).lineLimit(1) }
         }
         .font(HorusStyle.badgeFont)
         .foregroundStyle(foreground)
@@ -213,25 +291,18 @@ struct HorusBadge: View {
         .horusGlass(in: Capsule(), interactive: interactive)
     }
 
-    private var foreground: Color {
-        switch tone {
-        case "success": palette.signal
-        case "warning": palette.warning
-        case "error": palette.danger
-        default: palette.muted
-        }
-    }
+    private var foreground: Color { palette.tone(tone) }
 }
 
 struct HorusMenuLabel: View {
     let text: String
-    var symbol: String?
+    var systemImage: String?
 
     var body: some View {
         HStack(spacing: 6) {
-            if let symbol { HorusIcon(name: symbol) }
+            if let systemImage { HorusIcon(systemName: systemImage) }
             Text(text).lineLimit(1)
-            HorusIcon(name: "chevrons-up-down", size: 13)
+            HorusIcon(systemName: "chevron.up.chevron.down", size: 13)
         }
         .font(HorusStyle.controlFont)
         .frame(height: HorusStyle.controlHeight)
@@ -243,20 +314,53 @@ struct HorusIconButtonStyle: ButtonStyle {
     var prominent = false
 
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(HorusStyle.controlFont)
-            .foregroundStyle(prominent ? Color.white : .primary)
-            .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
-            .horusGlass(
-                in: Circle(),
-                interactive: true,
-                prominent: prominent
-            )
-            .opacity(configuration.isPressed ? 0.72 : 1)
+        IconButton(label: configuration.label, isPressed: configuration.isPressed, prominent: prominent)
+    }
+
+    private struct IconButton: View {
+        @Environment(\.horusPalette) private var palette
+        let label: ButtonStyleConfiguration.Label
+        let isPressed: Bool
+        let prominent: Bool
+
+        var body: some View {
+            label
+                .font(HorusStyle.controlFont)
+                .foregroundStyle(prominent ? palette.onAccent : .primary)
+                .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                .horusGlass(in: Circle(), interactive: true, prominent: prominent)
+                .opacity(isPressed ? 0.72 : 1)
+        }
+    }
+}
+
+/// `.glassProminent` with a label that stays legible on the amber accent in both schemes.
+private struct HorusProminentButton: ViewModifier {
+    @Environment(\.horusPalette) private var palette
+
+    func body(content: Content) -> some View {
+        content
+            .buttonStyle(.glassProminent)
+            .foregroundStyle(palette.onAccent)
     }
 }
 
 extension View {
+    func horusProminentButton() -> some View { modifier(HorusProminentButton()) }
+
+    /// Lets a row of badges scroll instead of squeezing when it outgrows the width.
+    func scrollableRow() -> some View {
+        ViewThatFits(in: .horizontal) {
+            fixedSize(horizontal: true, vertical: false)
+                .frame(maxWidth: .infinity, alignment: .center)
+            ScrollView(.horizontal) {
+                fixedSize(horizontal: true, vertical: false)
+            }
+            .scrollIndicators(.hidden)
+            .scrollBounceBehavior(.basedOnSize)
+        }
+    }
+
     func horusGlass<S: Shape>(
         in shape: S,
         interactive: Bool = false,
@@ -265,9 +369,6 @@ extension View {
         modifier(HorusGlassModifier(shape: shape, interactive: interactive, prominent: prominent))
     }
 
-    func horusPopoverCard() -> some View {
-        modifier(HorusPopoverCardModifier())
-    }
 }
 
 private struct HorusGlassModifier<S: Shape>: ViewModifier {
@@ -286,19 +387,6 @@ private struct HorusGlassModifier<S: Shape>: ViewModifier {
     }
 }
 
-private struct HorusPopoverCardModifier: ViewModifier {
-    func body(content: Content) -> some View {
-        content
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(HorusStyle.cardPadding)
-            .glassEffect(.regular, in: cardShape)
-    }
-
-    private var cardShape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: HorusStyle.cardRadius, style: .continuous)
-    }
-}
-
 struct SectionHeading: View {
     @Environment(\.horusPalette) private var palette
     let title: String
@@ -307,7 +395,7 @@ struct SectionHeading: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             Text(title)
-                .font(.headline.weight(.semibold))
+                .font(.headline)
             Text(detail)
                 .font(HorusStyle.bodyFont)
                 .foregroundStyle(palette.muted)

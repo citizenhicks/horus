@@ -1,6 +1,6 @@
 import Foundation
 
-let gatewayProtocolVersion = 5
+let gatewayProtocolVersion = 6
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 
@@ -259,7 +259,13 @@ enum GatewayRequest: Encodable, Sendable {
         expectedRevision: UInt64,
         config: AgentComposition
     )
+    case configureDefaultAgent(
+        requestID: String,
+        expectedRevision: UInt64,
+        config: AgentComposition
+    )
     case getGitDiff(requestID: String, sessionID: String)
+    case switchGitBranch(requestID: String, sessionID: String, branch: String)
     case listDirectories(requestID: String, path: String, includeFiles: Bool)
     case setProviderCredential(requestID: String, provider: String, apiKey: String)
     case setProviderEndpointCredential(
@@ -327,10 +333,20 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(sessionID, forKey: "sessionId")
             try container.encode(expectedRevision, forKey: "expectedRevision")
             try container.encode(config, forKey: "config")
+        case .configureDefaultAgent(let requestID, let expectedRevision, let config):
+            try container.encode("configure_default_agent", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(expectedRevision, forKey: "expectedRevision")
+            try container.encode(config, forKey: "config")
         case .getGitDiff(let requestID, let sessionID):
             try container.encode("get_git_diff", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
+        case .switchGitBranch(let requestID, let sessionID, let branch):
+            try container.encode("switch_git_branch", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
+            try container.encode(branch, forKey: "branch")
         case .listDirectories(let requestID, let path, let includeFiles):
             try container.encode("list_directories", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -580,6 +596,7 @@ struct SessionReadyPayload: Decodable, Sendable {
     let git: GitStatus?
     let session: SessionConfigured
     let contributions: [FrontendContribution]
+    let toolCount: Int
     let config: VersionedAgentConfig
 }
 
@@ -590,6 +607,7 @@ struct WorkspaceInfo: Identifiable, Codable, Hashable, Sendable {
 
 struct GitStatus: Codable, Equatable, Sendable {
     let currentBranch: String
+    let branches: [String]
 }
 
 struct DirectoryListing: Codable, Equatable, Sendable {
@@ -640,8 +658,29 @@ struct SessionRecord: Identifiable, Codable, Hashable, Sendable {
     let firstUserMessage: String?
     let title: String?
     let pinned: Bool
+    let activity: SessionActivity
     let createdAt: Int64
     let updatedAt: Int64
+}
+
+struct SessionActivity: Codable, Hashable, Sendable {
+    let state: SessionActivityState
+    let turnId: String?
+    let startedAt: Int64?
+    let lastOutcome: SessionOutcome?
+    let message: String?
+}
+
+enum SessionActivityState: String, Codable, Hashable, Sendable {
+    case idle
+    case running
+    case awaitingApproval = "awaiting_approval"
+}
+
+enum SessionOutcome: String, Codable, Hashable, Sendable {
+    case completed
+    case aborted
+    case failed
 }
 
 struct ModelChoice: Identifiable, Codable, Hashable, Sendable {
@@ -654,12 +693,43 @@ struct ModelChoice: Identifiable, Codable, Hashable, Sendable {
     let contextWindow: Int64?
 }
 
-struct FrontendContribution: Codable, Sendable {
+struct FrontendContribution: Decodable, Sendable {
     let capability: String
+    let count: Int?
     let commands: [FrontendCommand]
     let widgets: [FrontendWidget]
     let references: [FrontendReference]
     let activeInput: FrontendActiveInput?
+}
+
+extension FrontendContribution {
+    private enum CodingKeys: String, CodingKey {
+        case capability
+        case count
+        case commands
+        case widgets
+        case references
+        case activeInput
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        guard container.contains(.count) else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.count,
+                .init(
+                    codingPath: container.codingPath,
+                    debugDescription: "Frontend contribution requires count."
+                )
+            )
+        }
+        capability = try container.decode(String.self, forKey: .capability)
+        count = try container.decodeIfPresent(Int.self, forKey: .count)
+        commands = try container.decode([FrontendCommand].self, forKey: .commands)
+        widgets = try container.decode([FrontendWidget].self, forKey: .widgets)
+        references = try container.decode([FrontendReference].self, forKey: .references)
+        activeInput = try container.decodeIfPresent(FrontendActiveInput.self, forKey: .activeInput)
+    }
 }
 
 struct FrontendCommand: Codable, Hashable, Sendable {
@@ -668,11 +738,27 @@ struct FrontendCommand: Codable, Hashable, Sendable {
     let description: String
 }
 
-struct FrontendWidget: Identifiable, Codable, Sendable {
+struct FrontendProgress: Decodable, Sendable {
+    let completed: Int
+    let total: Int
+
+    var fraction: Double { Double(completed) / Double(total) }
+}
+
+enum FrontendWidgetContent: Sendable {
+    case blocks(title: String, blocks: [FrontendBlock])
+    case picker(title: String, options: [FrontendPickerOption])
+}
+
+struct FrontendWidget: Identifiable, Decodable, Sendable {
     let id: String
     let slot: String
     let text: String
     let tone: String
+    let symbol: String?
+    let iconOnly: Bool
+    let progress: FrontendProgress?
+    let content: FrontendWidgetContent?
     let action: AgentOperation?
 }
 
@@ -685,7 +771,12 @@ extension FrontendWidget {
         guard let id = json["id"]?.stringValue,
               let slot = json["slot"]?.stringValue,
               let text = json["text"]?.stringValue,
-              let tone = json["tone"]?.stringValue
+              let tone = json["tone"]?.stringValue,
+              let iconOnly = json["iconOnly"]?.boolValue,
+              json["symbol"] != nil,
+              json["progress"] != nil,
+              json["content"] != nil,
+              json["action"] != nil
         else {
             throw GatewayWireError.invalidFrame("frontend widget is missing a required field")
         }
@@ -698,6 +789,50 @@ extension FrontendWidget {
         self.slot = slot
         self.text = text
         self.tone = tone
+        self.iconOnly = iconOnly
+        switch json["symbol"] {
+        case .some(.string(let symbol)): self.symbol = symbol
+        case .some(.null): self.symbol = nil
+        default: throw GatewayWireError.invalidFrame("frontend widget has an invalid symbol")
+        }
+        switch json["progress"] {
+        case .some(.object(let value)):
+            guard let completed = value["completed"]?.intValue,
+                  let total = value["total"]?.intValue,
+                  total > 0,
+                  completed >= 0,
+                  completed <= total
+            else {
+                throw GatewayWireError.invalidFrame("frontend widget has invalid progress")
+            }
+            progress = FrontendProgress(completed: completed, total: total)
+        case .some(.null): progress = nil
+        default: throw GatewayWireError.invalidFrame("frontend widget has invalid progress")
+        }
+        switch json["content"] {
+        case .some(.object(let value)):
+            guard let type = value["type"]?.stringValue,
+                  let title = value["title"]?.stringValue
+            else {
+                throw GatewayWireError.invalidFrame("frontend widget content is missing a required field")
+            }
+            switch type {
+            case "blocks":
+                guard let values = value["blocks"]?.arrayValue else {
+                    throw GatewayWireError.invalidFrame("frontend widget blocks are missing")
+                }
+                content = .blocks(title: title, blocks: try values.map(FrontendBlock.init(json:)))
+            case "picker":
+                guard let values = value["options"]?.arrayValue else {
+                    throw GatewayWireError.invalidFrame("frontend widget options are missing")
+                }
+                content = .picker(title: title, options: try values.map(FrontendPickerOption.init(json:)))
+            default:
+                throw GatewayWireError.invalidFrame("frontend widget has unknown content")
+            }
+        case .some(.null): content = nil
+        default: throw GatewayWireError.invalidFrame("frontend widget has invalid content")
+        }
         if let action = json["action"], action != .null {
             self.action = try AgentOperation(json: action)
         } else {
@@ -843,17 +978,20 @@ struct FrontendPickerOption: Identifiable, Sendable {
     let id = UUID()
     let label: String
     let description: String
+    let detail: String
     let op: AgentOperation
 
     init(json: JSONValue) throws {
         guard let label = json["label"]?.stringValue,
               let description = json["description"]?.stringValue,
+              let detail = json["detail"]?.stringValue,
               let op = json["op"]
         else {
             throw GatewayWireError.invalidFrame("frontend picker option is missing a required field")
         }
         self.label = label
         self.description = description
+        self.detail = detail
         self.op = try AgentOperation(json: op)
     }
 }
@@ -943,12 +1081,9 @@ extension AgentEventRecord {
             }
             for key in [
                 "inputTokens", "cachedInputTokens", "outputTokens",
-                "reasoningOutputTokens", "totalTokens"
+                "cacheWriteInputTokens", "reasoningOutputTokens", "totalTokens"
             ] {
                 try requireInteger(key, in: value)
-            }
-            if value["cacheWriteInputTokens"] != nil {
-                try requireInteger("cacheWriteInputTokens", in: value)
             }
         }
 
@@ -1106,11 +1241,61 @@ struct ProviderConfig: Codable, Equatable, Sendable {
     var model: String
     var baseUrl: String?
     var reasoningEffort: String?
-    var webSearch: String
+    var webSearch: HostedWebSearch
+}
+
+enum HostedWebSearch: String, Codable, CaseIterable, Identifiable, Sendable {
+    case off
+    case cached
+    case live
+
+    var id: Self { self }
+
+    var label: String {
+        switch self {
+        case .off: "Off"
+        case .cached: "Cached"
+        case .live: "Live"
+        }
+    }
 }
 
 struct MiddlewareConfig: Codable, Equatable, Sendable {
     var enabled: Set<String>
+    var subagents: SubagentConfig
+}
+
+struct SubagentConfig: Codable, Equatable, Sendable {
+    var modelRoute: String?
+}
+
+extension SubagentConfig {
+    private enum CodingKeys: String, CodingKey {
+        case modelRoute
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        guard container.contains(.modelRoute) else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.modelRoute,
+                .init(
+                    codingPath: container.codingPath,
+                    debugDescription: "Subagent configuration requires model_route."
+                )
+            )
+        }
+        modelRoute = try container.decodeIfPresent(String.self, forKey: .modelRoute)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if let modelRoute {
+            try container.encode(modelRoute, forKey: .modelRoute)
+        } else {
+            try container.encodeNil(forKey: .modelRoute)
+        }
+    }
 }
 
 struct MiddlewareFeature: Identifiable, Codable, Equatable, Sendable {
@@ -1125,13 +1310,34 @@ struct ProviderStatus: Identifiable, Codable, Equatable, Sendable {
 
     let provider: String
     let label: String
+    let symbol: String
+    let description: String
     var configured: Bool
-    let auth: String
-    let defaultModel: String?
+    let auth: ProviderAuthKind
     let defaultBaseUrl: String?
     let defaultApiKeyEnv: String?
-    let defaultReasoningEffort: String?
-    let defaultWebSearch: String
+    let models: [ProviderModel]
+    let webSearch: [HostedWebSearch]
+}
+
+enum ProviderAuthKind: String, Codable, Sendable {
+    case apiKey = "api_key"
+    case deviceCode = "device_code"
+}
+
+struct ProviderModel: Identifiable, Codable, Equatable, Sendable {
+    let id: String
+    let label: String
+    let description: String
+    let contextWindow: Int64
+    let reasoning: [ReasoningChoice]
+    let defaultReasoning: String?
+}
+
+struct ReasoningChoice: Identifiable, Codable, Equatable, Sendable {
+    let id: String
+    let label: String
+    let description: String
 }
 
 struct TokenUsage: Codable, Equatable, Sendable {
@@ -1156,9 +1362,13 @@ struct DailyUsage: Codable, Equatable, Sendable {
 struct ArtifactRecord: Identifiable, Codable, Equatable, Sendable {
     let id: String
     let sessionId: String
-    let kind: String
+    let kind: ArtifactKind
     let title: String
     let block: FrontendBlock
+}
+
+enum ArtifactKind: String, Codable, Equatable, Sendable {
+    case codeDiff = "code_diff"
 }
 
 struct CronTask: Identifiable, Codable, Equatable, Sendable {
@@ -1174,9 +1384,16 @@ struct CronRun: Identifiable, Codable, Equatable, Sendable {
     let sourceSessionId: String
     let startedAt: Int64
     let finishedAt: Int64?
-    let status: String
+    let status: CronRunStatus
     let sessionId: String?
     let message: String?
+}
+
+enum CronRunStatus: String, Codable, Equatable, Sendable {
+    case running
+    case succeeded
+    case failed
+    case skipped
 }
 
 indirect enum JSONValue: Codable, Equatable, Sendable {

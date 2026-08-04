@@ -9,44 +9,51 @@ import UIKit
 struct ChatView: View {
     @Environment(AppModel.self) private var model
     @State private var composerHeight: CGFloat = 0
+    @State private var isAtBottom = true
+    @State private var scrollToBottomRequest = 0
 
     var body: some View {
+        @Bindable var model = model
         ZStack(alignment: .bottom) {
-            TranscriptView(bottomInset: composerHeight)
+            TranscriptView(
+                bottomInset: composerHeight,
+                isAtBottom: $isAtBottom,
+                scrollToBottomRequest: scrollToBottomRequest
+            )
             ComposerView()
                 .onGeometryChange(for: CGFloat.self) { geometry in
                     geometry.size.height
                 } action: { height in
                     composerHeight = height
                 }
+                .zIndex(1)
+            if !isAtBottom {
+                Button("Scroll to latest", systemImage: "arrow.down") {
+                    scrollToBottomRequest += 1
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(HorusIconButtonStyle())
+                .padding(.bottom, composerHeight + 12)
+                .help("Scroll to latest")
+                .zIndex(2)
             }
+        }
         .navigationTitle(model.transcript.isEmpty ? "Hello" : model.currentSessionTitle)
         #if os(iOS)
         .toolbarTitleDisplayMode(.inline)
         #endif
         .toolbar {
-            #if os(macOS)
-            ToolbarItem(placement: .primaryAction) {
-                ControlGroup {
-                    inspectorButton
-                    ChatOptionsMenu()
-                }
-                .controlGroupStyle(.navigation)
-                .controlSize(.large)
-                .tint(.primary)
-            }
-            #else
             ToolbarItemGroup(placement: .primaryAction) {
                 inspectorButton
                 ChatOptionsMenu()
             }
-            #endif
         }
+        .sheet(item: $model.presentedPreview, content: PreviewTranscriptSheet.init)
     }
 
     private var inspectorButton: some View {
         Button(action: model.toggleInspector) {
-            HorusIcon(name: "panel-right", foreground: .primary)
+            HorusIcon(systemName: "sidebar.right", foreground: .primary)
         }
         .accessibilityLabel("Toggle artifact inspector")
         .tint(.primary)
@@ -59,51 +66,56 @@ private struct ChatOptionsMenu: View {
     @State private var pendingCommand: MountedCommand?
 
     var body: some View {
-        let totals = diffTotals(model.gitDiff)
         Menu {
-            Section("Workspace") {
-                Text(model.workspace?.path ?? "No chat selected")
+            Section(model.workspace?.path ?? "No chat selected") {
                 if let git = model.gitStatus, !git.currentBranch.isEmpty {
-                    Text("Branch · \(git.currentBranch)")
-                }
-            }
-            Section("Session") {
-                Text(currentModelLabel)
-                Text("\(model.contextTokens.formatted()) · \(model.contextFillPercent)%")
-                ForEach(model.composerFooterWidgets) { widget in
-                    if widget.widget.action != nil {
-                        Button(compactWidgetValue(widget.widget.text)) {
-                            model.submitWidget(widget, presentsPickerInInspector: true)
-                        }
-                    } else {
-                        Text(compactWidgetValue(widget.widget.text))
-                    }
-                }
-                Text("+\(totals.added) −\(totals.removed)")
-                TimelineView(.periodic(from: .now, by: 1)) { timeline in
-                    Text(formatDuration(model.generationElapsed(at: timeline.date)))
-                }
-                if model.lastUsage.inputTokens > 0 {
-                    Text(cacheHit(model.lastUsage))
-                }
-            }
-            if !model.capabilityCommands.isEmpty {
-                Section("Capabilities") {
-                    ForEach(model.capabilityCommands) { mounted in
-                        Button(commandLabel(mounted.command)) {
-                            if mounted.command.arguments.isEmpty {
-                                model.submitCommand(mounted, arguments: "")
-                            } else {
-                                pendingCommand = mounted
+                    Menu {
+                        ForEach(git.branches, id: \.self) { branch in
+                            Button {
+                                model.switchGitBranch(to: branch)
+                            } label: {
+                                Label(
+                                    branch,
+                                    systemImage: branch == git.currentBranch
+                                        ? "checkmark"
+                                        : "arrow.trianglehead.branch"
+                                )
                             }
+                            .disabled(branch == git.currentBranch)
                         }
-                        .disabled(!model.canOpenSession)
+                    } label: {
+                        Label(git.currentBranch, systemImage: "arrow.trianglehead.branch")
+                    }
+                    .disabled(model.isSwitchingGitBranch || !model.canOpenSession)
+                }
+                Button(action: model.showInspector) {
+                    Label("Open code diff", systemImage: "doc.text.magnifyingglass")
+                }
+                .disabled(model.gitDiff.isEmpty)
+                if let path = model.workspace?.path {
+                    Button { copyToPasteboard(path) } label: {
+                        Label("Copy workspace path", systemImage: "doc.on.doc")
                     }
                 }
+            }
+            Section {
+                Button {
+                    model.startCronSetup()
+                } label: {
+                    Label("Schedule as a task…", systemImage: "calendar.badge.clock")
+                }
+                .disabled(!model.canOpenSession || model.selectedSessionID == nil)
+                Button {
+                    model.openWorkspaceBrowser()
+                } label: {
+                    Label("New chat in another folder…", systemImage: "folder.badge.plus")
+                }
+                .disabled(!model.canCreateSession)
             }
         } label: {
-            HorusIcon(name: "ellipsis", foreground: .primary)
+            Image(systemName: "ellipsis")
         }
+        .labelStyle(.titleAndIcon)
         .menuIndicator(.hidden)
         .accessibilityLabel("Chat options")
         .tint(.primary)
@@ -112,20 +124,6 @@ private struct ChatOptionsMenu: View {
             CapabilityCommandSheet(mounted: mounted)
         }
     }
-
-    private var currentModelLabel: String {
-        guard let choice = model.modelChoices.first(where: { $0.route == model.selectedModelRoute }) else {
-            return "Model"
-        }
-        return "\(choice.model) · \(choice.reasoningEffort?.capitalized ?? "Default")"
-    }
-
-    private func commandLabel(_ command: FrontendCommand) -> String {
-        command.arguments.isEmpty
-            ? "/\(command.name)"
-            : "/\(command.name) \(command.arguments)"
-    }
-
 }
 
 private struct CapabilityCommandSheet: View {
@@ -168,12 +166,20 @@ private struct CapabilityCommandSheet: View {
     }
 }
 
+private struct TranscriptRowLayout {
+    let entry: TranscriptEntry
+    let topSpacing: CGFloat
+}
+
 private struct TranscriptView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
-    @State private var isAtBottom = true
     let bottomInset: CGFloat
-    private let bottomID = "transcript-bottom"
+    @Binding var isAtBottom: Bool
+    let scrollToBottomRequest: Int
+    // A restored transcript lands after the scroll view exists, so an initial-offset anchor
+    // resolves against empty content. A bottom-edge scroll position survives the late fill.
+    @State private var position = ScrollPosition(edge: .bottom)
     #if os(iOS)
     private let rowSpacing: CGFloat = 12
     private let contentPadding: CGFloat = 16
@@ -183,68 +189,218 @@ private struct TranscriptView: View {
     #endif
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(model.transcript.enumerated(), id: \.element.id) { index, entry in
-                        TranscriptRow(entry: entry)
-                            .id(entry.id)
-                            .padding(.top, rowSpacing(before: index, entry: entry))
-                    }
-                    Color.clear
-                        .frame(height: max(1, bottomInset))
-                        .id(bottomID)
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(rows, id: \.entry.id) { row in
+                    TranscriptRow(entry: row.entry)
+                        .id(row.entry.id)
+                        .padding(.top, row.topSpacing)
                 }
-                .frame(maxWidth: 880)
-                .frame(maxWidth: .infinity)
-                .padding(contentPadding)
+                Color.clear.frame(height: max(1, bottomInset))
             }
-            .background(palette.canvas)
-            .id(model.selectedSessionID)
-            .defaultScrollAnchor(.bottom, for: .initialOffset)
-            .defaultScrollAnchor(.bottom, for: .sizeChanges)
-            .scrollIndicators(.hidden)
-            .overlay {
-                if model.transcript.isEmpty { emptyState }
-            }
-            .onScrollGeometryChange(for: Bool.self) { geometry in
-                geometry.visibleRect.maxY >= geometry.contentSize.height - 8
-            } action: { _, atBottom in
-                isAtBottom = atBottom
-            }
-            .overlay(alignment: .bottom) {
-                if !isAtBottom {
-                    Button("Scroll to latest", lucideIcon: "arrow-down") {
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            proxy.scrollTo(bottomID, anchor: .bottom)
-                        }
-                    }
-                    .labelStyle(.iconOnly)
-                    .buttonStyle(HorusIconButtonStyle())
-                    .padding(.bottom, bottomInset + 12)
-                    .help("Scroll to latest")
-                }
-            }
-            .onChange(of: model.transcript.last?.text) {
-                guard isAtBottom || model.activeTurnID != nil else { return }
-                proxy.scrollTo(bottomID, anchor: .bottom)
-            }
+            .frame(maxWidth: 880)
+            .frame(maxWidth: .infinity)
+            .padding(contentPadding)
+        }
+        .background(palette.canvas)
+        .id(model.selectedSessionID)
+        .scrollPosition($position)
+        .defaultScrollAnchor(.bottom, for: .sizeChanges)
+        .scrollIndicators(.hidden)
+        .overlay {
+            if model.transcript.isEmpty { emptyState }
+        }
+        // Measured against the furthest reachable offset, including the bottom inset:
+        // comparing the visible rect to the content height never reads as "at bottom".
+        .onScrollGeometryChange(for: Bool.self) { geometry in
+            // The visible rect covers the toolbar inset that `containerSize` leaves out, so it is
+            // the only measure that reaches the content height at rest.
+            return geometry.visibleRect.maxY >= geometry.contentSize.height - 24
+        } action: { _, atBottom in
+            isAtBottom = atBottom
+        }
+        .onChange(of: scrollToBottomRequest) {
+            withAnimation(.easeOut(duration: 0.2)) { position.scrollTo(edge: .bottom) }
+        }
+        .onChange(of: model.transcript.count) { followTranscript() }
+        .onChange(of: model.transcript.last?.text) { followTranscript() }
+        .task(id: model.selectedSessionID) { await openAtLatest() }
+    }
+
+    /// A lazy stack only estimates the height of rows it has not built, so a single bottom scroll
+    /// lands short on a long transcript. Re-assert until the content settles, or the reader scrolls.
+    private func openAtLatest() async {
+        isAtBottom = true
+        for _ in 0..<20 {
+            position.scrollTo(edge: .bottom)
+            try? await Task.sleep(for: .milliseconds(100))
+            if isAtBottom || position.isPositionedByUser { return }
         }
     }
 
-    private func rowSpacing(before index: Int, entry: TranscriptEntry) -> CGFloat {
-        guard index > 0 else { return 0 }
-        let previous = model.transcript[index - 1]
-        return entry.group != nil && entry.group == previous.group ? 0 : rowSpacing
+    private func followTranscript() {
+        guard isAtBottom || model.activeTurnID != nil else { return }
+        position.scrollTo(edge: .bottom)
+    }
+
+    // Spacing is resolved up front: a row body must never index back into the live
+    // transcript, which can shrink between layout passes.
+    private var rows: [TranscriptRowLayout] {
+        var previousGroup: String?
+        return model.transcript.enumerated().map { index, entry in
+            let joinsPrevious = index > 0 && entry.group != nil && entry.group == previousGroup
+            previousGroup = entry.group
+            return TranscriptRowLayout(
+                entry: entry,
+                topSpacing: joinsPrevious ? 0 : (index == 0 ? 0 : rowSpacing)
+            )
+        }
     }
 
     private var emptyState: some View {
-        Text("𓂀")
-            .font(.system(size: 58, weight: .regular, design: .serif))
-            .foregroundStyle(palette.accent.opacity(0.5))
+        AgentCard()
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.horizontal, 24)
             .padding(.bottom, bottomInset)
-            .accessibilityHidden(true)
+    }
+}
+
+private struct AgentCard: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+
+    var body: some View {
+        if let config = model.agentSnapshot?.config {
+            HorusCard {
+                VStack(spacing: 16) {
+                    VStack(spacing: 10) {
+                        if let provider = selectedProvider(config) {
+                            HorusIcon(
+                                systemName: HorusSymbol.systemName(for: provider.symbol),
+                                size: 20,
+                                foreground: palette.accent
+                            )
+                                .frame(width: 40, height: 40)
+                                .background(palette.accentSoft.opacity(0.65), in: Circle())
+                        }
+                        VStack(spacing: 3) {
+                            Text(selectedModelLabel(config))
+                                .font(.headline)
+                            Text(modelDetail(config))
+                                .font(HorusStyle.bodyFont)
+                                .foregroundStyle(palette.muted)
+                        }
+                        .multilineTextAlignment(.center)
+                    }
+
+                    // ponytail: a plain row, not a grid. An adaptive grid pins its columns to the
+                    // card's full width, which reads as left-aligned for two or three metrics.
+                    HStack(alignment: .top, spacing: 20) {
+                        AgentCardMetric(label: "Tools", value: model.toolCount)
+                        ForEach(model.middlewareContributionCounts) { contribution in
+                            AgentCardMetric(label: contribution.label, value: contribution.value)
+                        }
+                    }
+                    .scrollableRow()
+
+                    VStack(spacing: 10) {
+                        AgentCardDetail(label: "Providers", value: configuredProviders)
+                        AgentCardDetail(label: "Capabilities", value: activeMiddleware(config))
+                        AgentCardDetail(label: "Approval", value: approvalLabel(config.approval))
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .frame(maxWidth: 580)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Current agent configuration")
+        }
+    }
+
+    private var configuredProviders: String {
+        let labels = model.providerStatuses.filter(\.configured).map(\.label)
+        return labels.isEmpty ? "None configured" : labels.joined(separator: ", ")
+    }
+
+    private func selectedProvider(_ config: AgentComposition) -> ProviderStatus? {
+        model.providerStatuses.first { $0.provider == config.provider.provider }
+    }
+
+    private func selectedModelLabel(_ config: AgentComposition) -> String {
+        let provider = model.providerStatuses.first { $0.provider == config.provider.provider }
+        return provider?.models.first { $0.id == config.provider.model }?.label
+            ?? config.provider.model
+    }
+
+    private func modelDetail(_ config: AgentComposition) -> String {
+        let provider = model.providerStatuses.first { $0.provider == config.provider.provider }
+        let providerLabel = provider?.label ?? config.provider.provider
+        guard let reasoning = config.provider.reasoningEffort else {
+            return "\(providerLabel) · Provider-default reasoning"
+        }
+        let reasoningLabel = provider?.models
+            .first { $0.id == config.provider.model }?
+            .reasoning.first { $0.id == reasoning }?
+            .label ?? reasoning.capitalized
+        return "\(providerLabel) · \(reasoningLabel) reasoning"
+    }
+
+    private func activeMiddleware(_ config: AgentComposition) -> String {
+        let labels = model.middlewareFeatures.compactMap { feature in
+            (feature.required || config.middleware.enabled.contains(feature.id))
+                ? feature.label
+                : nil
+        }
+        return labels.isEmpty ? "Core only" : labels.joined(separator: ", ")
+    }
+
+    private func approvalLabel(_ approval: ApprovalPolicy) -> String {
+        switch approval {
+        case .on: "Ask before workspace changes"
+        case .allow: "Allow changes · no network"
+        case .allowNetwork: "Allow changes · network"
+        }
+    }
+}
+
+private struct AgentCardMetric: View {
+    @Environment(\.horusPalette) private var palette
+    let label: String
+    let value: Int
+
+    var body: some View {
+        VStack(spacing: 2) {
+            Text(value.formatted())
+                .font(.title3.weight(.semibold).monospacedDigit())
+            Text(label)
+                .font(HorusStyle.metadataFont)
+                .foregroundStyle(palette.muted)
+                .lineLimit(1)
+        }
+        .frame(minWidth: 88)
+        .padding(10)
+        .background(palette.raised.opacity(0.55), in: HorusStyle.controlShape)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(label): \(value)")
+    }
+}
+
+private struct AgentCardDetail: View {
+    @Environment(\.horusPalette) private var palette
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(spacing: 2) {
+            Text(label)
+                .font(HorusStyle.metadataFont)
+                .foregroundStyle(palette.muted)
+            Text(value)
+                .font(HorusStyle.bodyFont)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -287,7 +443,7 @@ private struct TranscriptRow: View {
                     .textSelection(.enabled)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
-                    .background(palette.accentSoft, in: RoundedRectangle(cornerRadius: HorusStyle.cardRadius, style: .continuous))
+                    .background(palette.accentSoft, in: HorusStyle.cardShape)
             }
         case .assistant:
             MarkdownText(entry.text, parsesMarkdown: !entry.pending)
@@ -312,16 +468,32 @@ private struct TranscriptRow: View {
         }
     }
 
+    @ViewBuilder
     private var controls: some View {
-        MessageActionButton(title: "Copy", symbol: "copy") {
-            copyToPasteboard(entry.text)
+        HStack(spacing: 0) {
+            MessageActionButton(title: "Copy", systemImage: "doc.on.doc") {
+                copyToPasteboard(entry.text)
+            }
+            if let fork = model.forkCommand {
+                MessageActionButton(
+                    title: "Fork chat",
+                    systemImage: "arrow.trianglehead.branch"
+                ) {
+                    model.submitCommand(fork, arguments: "")
+                }
+            }
         }
     }
 
     @ViewBuilder
     private var transcriptActions: some View {
         if hasMessageActions {
-            Button("Copy", lucideIcon: "copy") { copyToPasteboard(entry.text) }
+            Button("Copy", systemImage: "doc.on.doc") { copyToPasteboard(entry.text) }
+            if let fork = model.forkCommand {
+                Button("Fork chat", systemImage: "arrow.trianglehead.branch") {
+                    model.submitCommand(fork, arguments: "")
+                }
+            }
         }
     }
 
@@ -354,11 +526,11 @@ private struct MessageActionButton: View {
     @Environment(\.horusPalette) private var palette
     @State private var isHovered = false
     let title: String
-    let symbol: String
+    let systemImage: String
     let action: () -> Void
 
     var body: some View {
-        Button(title, lucideIcon: symbol, action: action)
+        Button(title, systemImage: systemImage, action: action)
         .labelStyle(.iconOnly)
         .buttonStyle(.borderless)
         .font(HorusStyle.badgeFont)
@@ -373,50 +545,86 @@ private struct MessageActionButton: View {
 
 private struct EventCard: View {
     @Environment(\.horusPalette) private var palette
+    @State private var isExpanded = false
     let entry: TranscriptEntry
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(title)
-                    .font(HorusStyle.metadataFont.weight(.bold))
-                Spacer()
-                if entry.pending { ProgressView().controlSize(.mini) }
-                if entry.format == "unified_diff" { Text("Open").font(HorusStyle.controlFont) }
+        HStack(alignment: .top, spacing: 10) {
+            if entry.pending {
+                ProgressView().controlSize(.mini).frame(width: 14, height: 14)
+            } else {
+                HorusIcon(systemName: systemImage, size: 14, foreground: foreground)
+                    .padding(.top, 1)
             }
-            Text(entry.format == "unified_diff" ? diffSummary(entry.text) : entry.text)
-                .font(entry.format == "unified_diff" ? HorusStyle.metadataFont : HorusStyle.bodyFont)
-                .multilineTextAlignment(.leading)
-                .lineLimit(entry.format == "unified_diff" ? 4 : nil)
-                .textSelection(.enabled)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(label)
+                        .font(HorusStyle.metadataFont.weight(.semibold))
+                        .foregroundStyle(foreground)
+                    if entry.format == "unified_diff" {
+                        Text(diffSummary(entry.text))
+                            .font(HorusStyle.metadataFont)
+                            .foregroundStyle(palette.muted)
+                            .lineLimit(1)
+                    }
+                }
+                if entry.format != "unified_diff" {
+                    Text(detail)
+                        .font(HorusStyle.metadataFont)
+                        .foregroundStyle(entry.tone == "neutral" ? palette.muted : foreground)
+                        .lineLimit(isExpanded ? nil : 2)
+                        .textSelection(.enabled)
+                }
+            }
+            Spacer(minLength: 0)
+            if isTruncatable {
+                HorusIcon(
+                    systemName: isExpanded ? "chevron.up" : "chevron.down",
+                    size: 12,
+                    foreground: palette.muted
+                )
+            }
         }
-        .foregroundStyle(foreground)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(HorusStyle.cardPadding)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
         .background(
-            entry.tone == "neutral" ? palette.raised : foreground.opacity(0.09),
-            in: RoundedRectangle(cornerRadius: HorusStyle.cardRadius, style: .continuous)
+            entry.tone == "neutral" ? palette.panel : foreground.opacity(0.10),
+            in: HorusStyle.controlShape
         )
+        .contentShape(Rectangle())
+        .onTapGesture { if isTruncatable { isExpanded.toggle() } }
     }
 
-    private var title: String {
-        if entry.format == "unified_diff" { return "CODE CHANGE" }
+    private var detail: String {
+        entry.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var isTruncatable: Bool {
+        entry.format != "unified_diff" && detail.contains("\n")
+    }
+
+    /// Event ids arrive namespaced as "capability/block", which is the best label available.
+    private var label: String {
+        if entry.format == "unified_diff" { return "Code change" }
+        let capability = entry.id.split(separator: "/").first.map(String.init) ?? ""
+        guard !capability.isEmpty, capability.count < 24, !capability.contains("-") else {
+            return entry.tone == "error" ? "Error" : "Event"
+        }
+        return capability.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    private var systemImage: String {
+        if entry.format == "unified_diff" { return "doc.text.magnifyingglass" }
         switch entry.tone {
-        case "success": return "SUCCESS"
-        case "warning": return "WARNING"
-        case "error": return "ERROR"
-        default: return "EVENT"
+        case "success": return "checkmark.circle"
+        case "warning": return "exclamationmark.triangle"
+        case "error": return "xmark.circle"
+        default: return "terminal"
         }
     }
 
-    private var foreground: Color {
-        switch entry.tone {
-        case "success": palette.signal
-        case "warning": palette.warning
-        case "error": palette.danger
-        default: palette.muted
-        }
-    }
+    private var foreground: Color { palette.tone(entry.tone) }
 }
 
 private struct MarkdownText: View {
@@ -550,9 +758,7 @@ private struct ComposerSurface: View {
                 .padding(.horizontal, 16)
                 .padding(.bottom, 12)
         }
-        .horusGlass(
-            in: RoundedRectangle(cornerRadius: HorusStyle.cardRadius, style: .continuous)
-        )
+        .horusGlass(in: HorusStyle.cardShape)
         .shadow(color: .black.opacity(0.18), radius: 12, y: 6)
     }
 
@@ -602,6 +808,8 @@ private struct ComposerSurface: View {
 private struct ComposerActivityView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
+    @State private var showsWorkspace = false
+    @State private var showsBranch = false
 
     var body: some View {
         let totals = diffTotals(model.gitDiff)
@@ -609,33 +817,52 @@ private struct ComposerActivityView: View {
             HStack(spacing: 8) {
                 #if os(macOS)
                 if let workspace = model.workspace {
-                    HorusIcon(name: "folder", foreground: palette.muted)
-                        .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                    Button { showsWorkspace = true } label: {
+                        HorusBadge(text: "", systemImage: "folder", interactive: true)
+                    }
+                        .buttonStyle(.plain)
                         .help(workspace.path)
                         .accessibilityLabel("Workspace")
                         .accessibilityValue(workspace.path)
+                        .popover(isPresented: $showsWorkspace) {
+                            BadgePopover(title: "Folder") {
+                                Text(workspace.path)
+                                    .font(HorusStyle.bodyFont.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                        }
                 }
 
                 if let git = model.gitStatus, !git.currentBranch.isEmpty {
-                    HorusIcon(name: "git-branch", foreground: palette.muted)
-                        .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                    Button { showsBranch = true } label: {
+                        HorusBadge(
+                            text: "",
+                            systemImage: "arrow.trianglehead.branch",
+                            interactive: true
+                        )
+                    }
+                        .buttonStyle(.plain)
                         .help(git.currentBranch)
                         .accessibilityLabel("Git branch")
                         .accessibilityValue(git.currentBranch)
+                        .popover(isPresented: $showsBranch) {
+                            BadgePopover(title: "Git branch") {
+                                Text(git.currentBranch)
+                                    .font(HorusStyle.bodyFont.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                        }
                 }
                 #endif
 
-                ForEach(model.headerWidgets) { widget in
-                    FrontendWidgetView(widget: widget)
-                }
                 ForEach(model.composerFooterWidgets) { widget in
-                    FrontendWidgetView(widget: widget, presentsPickerInInspector: true)
+                    FrontendWidgetView(widget: widget)
                 }
                 if model.steeringQueued {
                     HorusBadge(text: "Steering queued", tone: "warning")
                 }
                 if totals.added > 0 || totals.removed > 0 {
-                    Button { model.showInspector(.diff) } label: {
+                    Button(action: model.showInspector) {
                         HStack(spacing: 6) {
                             Text("+\(totals.added)").foregroundStyle(palette.signal)
                             Text("−\(totals.removed)").foregroundStyle(palette.danger)
@@ -651,38 +878,80 @@ private struct ComposerActivityView: View {
                     .accessibilityHint("Opens the latest code diff")
                 }
 
-                if model.turnStartedAt != nil || model.completedGenerationTime >= 1 {
-                    TimelineView(.periodic(from: .now, by: 1)) { timeline in
-                        let elapsed = model.generationElapsed(at: timeline.date)
-                        if elapsed >= 1 {
-                            HorusBadge(text: formatDuration(elapsed))
-                                .accessibilityLabel("Total generation time")
-                                .accessibilityValue(formatDuration(elapsed))
-                        }
-                    }
-                }
-
-                if model.contextFillPercent > 0 {
-                    ZStack {
-                        Circle().stroke(palette.line.opacity(0.55), lineWidth: 2)
-                        Circle()
-                            .trim(from: 0, to: model.contextFillFraction)
-                            .stroke(palette.accent, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                            .rotationEffect(.degrees(-90))
-                    }
-                    .frame(width: 12, height: 12)
-                    .frame(width: HorusStyle.badgeHeight, height: HorusStyle.badgeHeight)
-                    .horusGlass(in: Circle())
-                    .accessibilityLabel("Context used")
-                    .accessibilityValue("\(model.contextFillPercent) percent")
-                }
+                SessionStatsBadge()
             }
             .frame(minHeight: HorusStyle.iconButtonSize)
+            .scrollableRow()
         }
         .frame(maxWidth: .infinity)
         .accessibilityElement(children: .contain)
     }
 
+}
+
+/// Context fill and turn duration in one bubble; cache hit joins them in the popover.
+private struct SessionStatsBadge: View {
+    @Environment(AppModel.self) private var model
+    @State private var showsDetail = false
+
+    var body: some View {
+        if model.selectedSessionID != nil {
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                let elapsed = model.sessionElapsed(at: timeline.date)
+                Button { showsDetail = true } label: {
+                    HorusBadge(
+                        text: elapsed >= 1 ? formatDuration(elapsed) : "\(model.contextFillPercent)%",
+                        progress: model.contextFillFraction,
+                        interactive: true
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Context and timing")
+                .accessibilityValue("\(model.contextFillPercent) percent context, \(formatDuration(elapsed))")
+                .popover(isPresented: $showsDetail) {
+                    BadgePopover(title: "Session") {
+                        BadgeStat(label: "Context", value: "\(model.contextTokens.formatted()) · \(model.contextFillPercent)%")
+                        BadgeStat(label: "Cache hit", value: cacheHit(model.lastUsage))
+                        BadgeStat(label: "Elapsed", value: formatDuration(elapsed))
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct BadgePopover<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(HorusStyle.controlFont.weight(.semibold))
+            content
+        }
+        .padding(16)
+        .frame(minWidth: 220, alignment: .leading)
+        .presentationCompactAdaptation(.popover)
+    }
+}
+
+private struct BadgeStat: View {
+    @Environment(\.horusPalette) private var palette
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(label)
+                .font(HorusStyle.metadataFont)
+                .foregroundStyle(palette.muted)
+            Spacer(minLength: 8)
+            Text(value)
+                .font(HorusStyle.bodyFont.monospacedDigit())
+        }
+        .accessibilityElement(children: .combine)
+    }
 }
 
 private struct ComposerOptionsView: View {
@@ -713,7 +982,11 @@ private struct ComposerOptionsView: View {
 
     private var approvalMenu: some View {
         Menu { approvalMenuContent } label: {
-            HorusLabel(title: approvalLabel, icon: approvalSymbol, iconColor: approvalForeground)
+            HorusLabel(
+                title: approvalLabel,
+                systemImage: approvalSystemImage,
+                iconColor: approvalForeground
+            )
                 .labelStyle(.iconOnly)
                 .foregroundStyle(approvalForeground)
         }
@@ -757,12 +1030,12 @@ private struct ComposerOptionsView: View {
     @ViewBuilder
     private var actionButtons: some View {
         if model.activeTurnID != nil && !hasComposerText {
-            Button("Stop", lucideIcon: "square") { model.interrupt() }
+            Button("Stop", systemImage: "stop.fill") { model.interrupt() }
                 .labelStyle(.iconOnly)
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
                 .help("Stop")
         } else {
-            Button("Send", lucideIcon: "arrow-up") { model.sendMessage() }
+            Button("Send", systemImage: "arrow.up") { model.sendMessage() }
                 .labelStyle(.iconOnly)
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
                 .disabled(!model.connectionState.isReady || !hasComposerText)
@@ -790,8 +1063,8 @@ private struct ComposerOptionsView: View {
         approvalPolicyLabel(model.agentDraft?.approval ?? .on)
     }
 
-    private var approvalSymbol: String {
-        approvalPolicySymbol(model.agentDraft?.approval ?? .on)
+    private var approvalSystemImage: String {
+        approvalPolicySystemImage(model.agentDraft?.approval ?? .on)
     }
 
     private var approvalForeground: Color {
@@ -819,7 +1092,11 @@ private struct ApprovalView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HorusLabel(title: "Approval required", icon: "hand", iconColor: palette.warning)
+            HorusLabel(
+                title: "Approval required",
+                systemImage: "hand.raised",
+                iconColor: palette.warning
+            )
                 .font(.headline)
                 .foregroundStyle(palette.warning)
             Text(approval.reason).font(HorusStyle.bodyFont)
@@ -831,68 +1108,127 @@ private struct ApprovalView: View {
                             Text(call.arguments).font(HorusStyle.metadataFont).textSelection(.enabled)
                         }
                         .padding(10)
-                        .background(palette.raised, in: RoundedRectangle(cornerRadius: HorusStyle.controlRadius))
+                        .background(palette.raised, in: HorusStyle.controlShape)
                         .accessibilityElement(children: .combine)
                         .accessibilityLabel("\(call.name), arguments \(call.arguments)")
                     }
                 }
             }
             .frame(maxHeight: 180)
-            HStack {
-                Button("Abort") { model.resolveApproval(.abort) }.buttonStyle(.borderless)
-                Spacer()
-                Button("Deny") { model.resolveApproval(.denied(rejection: "Denied in Horus App")) }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.capsule)
-                Button("Approve for session") { model.resolveApproval(.approvedForSession) }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.capsule)
-                Button("Approve once") { model.resolveApproval(.approved) }
-                    .buttonStyle(.glassProminent)
-                    .buttonBorderShape(.capsule)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) { actions }
+                VStack(spacing: 8) { actions }.buttonSizing(.flexible)
             }
+            .buttonStyle(.glass)
+            .buttonBorderShape(.capsule)
+            .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .padding(HorusStyle.cardPadding)
-        .background(palette.warning.opacity(0.09), in: RoundedRectangle(cornerRadius: HorusStyle.cardRadius))
+        .background(palette.warning.opacity(0.09), in: HorusStyle.cardShape)
         .overlay {
-            RoundedRectangle(cornerRadius: HorusStyle.cardRadius)
+            HorusStyle.cardShape
                 .stroke(palette.warning.opacity(0.55), lineWidth: HorusStyle.borderWidth)
         }
+    }
+
+    @ViewBuilder
+    private var actions: some View {
+        Button("Abort", role: .destructive) { model.resolveApproval(.abort) }
+        Button("Deny") { model.resolveApproval(.denied(rejection: "Denied in Horus App")) }
+        Button("Approve for session") { model.resolveApproval(.approvedForSession) }
+        Button("Approve once") { model.resolveApproval(.approved) }
+            .horusProminentButton()
     }
 }
 
 struct FrontendWidgetView: View {
     @Environment(AppModel.self) private var model
+    @State private var showsDetail = false
     let widget: MountedWidget
-    var presentsPickerInInspector = false
 
     var body: some View {
-        if widget.widget.action != nil {
-            Button { model.submitWidget(widget, presentsPickerInInspector: presentsPickerInInspector) } label: {
-                HorusBadge(
-                    text: widgetText,
-                    tone: widget.widget.tone,
-                    symbol: presentsPickerInInspector ? "bot" : nil,
-                    interactive: true
-                )
+        if let content = widget.widget.content {
+            Button(action: openDetail) {
+                badge
             }
             .buttonStyle(.plain)
             .frame(minHeight: HorusStyle.iconButtonSize)
-            .accessibilityLabel(widget.widget.text)
-        } else {
-            HorusBadge(
-                text: widgetText,
-                tone: widget.widget.tone,
-                symbol: presentsPickerInInspector ? "bot" : nil
-            )
+            .accessibilityLabel(accessibilityTitle)
+            .popover(isPresented: $showsDetail) {
+                WidgetContentPopover(content: content, isPresented: $showsDetail)
+            }
+        } else if widget.widget.action != nil {
+            Button(action: submit) { badge }
+                .buttonStyle(.plain)
                 .frame(minHeight: HorusStyle.iconButtonSize)
-                .accessibilityLabel(widget.widget.text)
+                .accessibilityLabel(accessibilityTitle)
+        } else {
+            badge
+                .frame(minHeight: HorusStyle.iconButtonSize)
+                .accessibilityLabel(accessibilityTitle)
         }
     }
 
-    private var widgetText: String {
-        guard presentsPickerInInspector else { return widget.widget.text }
-        return widget.widget.text.split(separator: " ", maxSplits: 1).last.map(String.init) ?? widget.widget.text
+    /// Widget text can be as terse as a bare count, so the detail title carries the meaning.
+    private var accessibilityTitle: String {
+        switch widget.widget.content {
+        case .blocks(let title, _), .picker(let title, _): "\(title) \(widget.widget.text)"
+        case nil: widget.widget.text
+        }
+    }
+
+    private var badge: HorusBadge {
+        HorusBadge(
+            text: widget.widget.iconOnly ? "" : widget.widget.text,
+            tone: widget.widget.tone,
+            systemImage: widget.widget.symbol.map { HorusSymbol.systemName(for: $0) },
+            progress: widget.widget.progress?.fraction,
+            interactive: widget.widget.content != nil || widget.widget.action != nil
+        )
+    }
+
+    private func openDetail() { showsDetail = true }
+    private func submit() { model.submitWidget(widget) }
+}
+
+private struct WidgetContentPopover: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+    let content: FrontendWidgetContent
+    @Binding var isPresented: Bool
+
+    var body: some View {
+        switch content {
+        case .blocks(let title, let blocks):
+            BadgePopover(title: title) {
+                ForEach(blocks.enumerated(), id: \.offset) { _, block in
+                    PreviewBlockView(block: block)
+                }
+            }
+        case .picker(let title, let options):
+            BadgePopover(title: title) {
+                ForEach(options) { option in
+                    Button { select(option) } label: {
+                        HStack(spacing: 12) {
+                            Text(option.label)
+                                .font(HorusStyle.controlFont)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Text(option.description)
+                                .font(HorusStyle.metadataFont)
+                                .foregroundStyle(palette.muted)
+                        }
+                        .frame(minHeight: HorusStyle.iconButtonSize)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private func select(_ option: FrontendPickerOption) {
+        isPresented = false
+        model.submitPickerOption(option)
     }
 }
 
@@ -902,24 +1238,25 @@ private struct FrontendPickerView: View {
     let picker: FrontendPickerPrompt
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            Text(picker.title)
-                .font(.headline)
-            ForEach(picker.options) { option in
-                Button { model.submitPickerOption(option) } label: {
-                    HStack(alignment: .firstTextBaseline, spacing: 12) {
-                        Text(option.label).fontWeight(.semibold)
-                        Text(option.description)
-                            .font(HorusStyle.bodyFont)
-                            .foregroundStyle(palette.muted)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+        HorusCard {
+            VStack(alignment: .leading, spacing: 11) {
+                Text(picker.title)
+                    .font(.headline)
+                ForEach(picker.options) { option in
+                    Button { model.submitPickerOption(option) } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: 12) {
+                            Text(option.label).fontWeight(.semibold)
+                            Text(option.description)
+                                .font(HorusStyle.bodyFont)
+                                .foregroundStyle(palette.muted)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .contentShape(Rectangle())
                     }
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
             }
         }
-        .horusPopoverCard()
     }
 }
 
@@ -944,10 +1281,6 @@ private func formatDuration(_ interval: TimeInterval) -> String {
     return Duration.seconds(seconds).formatted(.time(pattern: .minuteSecond(padMinuteToLength: 1)))
 }
 
-private func compactWidgetValue(_ text: String) -> String {
-    text.split(separator: " ", maxSplits: 2).dropFirst().first.map(String.init) ?? text
-}
-
 private func approvalPolicyLabel(_ policy: ApprovalPolicy) -> String {
     switch policy {
     case .on: "Ask"
@@ -956,12 +1289,20 @@ private func approvalPolicyLabel(_ policy: ApprovalPolicy) -> String {
     }
 }
 
-private func approvalPolicySymbol(_ policy: ApprovalPolicy) -> String {
+private func approvalPolicySystemImage(_ policy: ApprovalPolicy) -> String {
     switch policy {
-    case .on: "shield-question-mark"
-    case .allow: "shield-check"
-    case .allowNetwork: "globe-lock"
+    case .on: "hand.raised"
+    case .allow: "checkmark.shield"
+    case .allowNetwork: "globe"
     }
+}
+
+private func diffTitle(_ diff: String) -> String {
+    for line in diff.split(separator: "\n", omittingEmptySubsequences: false) {
+        if line.hasPrefix("+++ b/") { return String(line.dropFirst(6)) }
+        if line.hasPrefix("+++ ") { return String(line.dropFirst(4)) }
+    }
+    return "Code changes"
 }
 
 private func diffSummary(_ text: String) -> String {

@@ -9,14 +9,14 @@ enum AppDestination: Equatable {
     case cron
     case profile
 
-    var symbol: String {
+    var systemImage: String {
         switch self {
-        case .chat: "messages-square"
-        case .gateway: "server"
-        case .agent: "sliders-horizontal"
+        case .chat: "bubble.left.and.bubble.right"
+        case .gateway: "server.rack"
+        case .agent: "slider.horizontal.3"
         case .providers: "network"
-        case .cron: "calendar-clock"
-        case .profile: "settings"
+        case .cron: "calendar.badge.clock"
+        case .profile: "gearshape"
         }
     }
 }
@@ -81,13 +81,6 @@ enum ThemePreference: String, CaseIterable, Identifiable {
     case system
     case dark
     case light
-
-    var id: Self { self }
-}
-
-enum InspectorSection: String, CaseIterable, Identifiable {
-    case diff = "Diff"
-    case subagents = "Subagents"
 
     var id: Self { self }
 }
@@ -168,6 +161,24 @@ struct MountedReference: Identifiable, Sendable {
     var replacement: String { "\(reference.trigger)\(reference.value)" }
 }
 
+struct MiddlewareContributionCount: Identifiable, Equatable, Sendable {
+    let id: String
+    let label: String
+    let value: Int
+}
+
+struct SubagentModelOption: Identifiable, Equatable, Sendable {
+    let group: String
+    let model: String
+
+    var id: String { "\(group)\u{0}\(model)" }
+}
+
+private enum ConfigurationTarget {
+    case session
+    case defaultAgent
+}
+
 struct ReferenceSuggestions {
     let range: Range<String.Index>
     let matches: [MountedReference]
@@ -181,6 +192,8 @@ struct PreviewBlock: Identifiable, Sendable {
 struct TranscriptPreview: Identifiable, Sendable {
     let id: String
     let title: String
+    let status: String?
+    let model: String?
     let blocks: [PreviewBlock]
 }
 
@@ -201,15 +214,12 @@ final class AppModel {
     var gitDiff = ""
     var sessions: [SessionRecord] = []
     var selectedSessionID: String?
-    private(set) var runningSessionIDs: Set<String> = []
     private(set) var unreadSessionIDs: Set<String> = []
     var transcript: [TranscriptEntry] = []
     var composer = ""
     var toast: AppToast?
     var activeTurnID: String?
     var activeOperation: String?
-    var turnStartedAt: Date?
-    var completedGenerationTime: TimeInterval = 0
     var steeringQueued = false
     var contextTokens = 0
     var modelContextWindow: Int64?
@@ -218,14 +228,14 @@ final class AppModel {
     var middlewareFeatures: [MiddlewareFeature] = []
     var selectedModelRoute = ""
     var contributions: [FrontendContribution] = []
+    var toolCount = 0
     var mountedWidgets: [MountedWidget] = []
     var pendingPicker: FrontendPickerPrompt?
     var artifacts: [ArtifactRecord] = []
     var previews: [TranscriptPreview] = []
+    var presentedPreview: TranscriptPreview?
     var selectedArtifactID: String?
     var showsInspector = false
-    var inspectorSection = InspectorSection.diff
-    var inspectorPickerOptions: [FrontendPickerOption] = []
     var profile: ProfileSnapshot?
     var currentUsage = TokenUsage()
     var lastUsage = TokenUsage()
@@ -241,6 +251,7 @@ final class AppModel {
     var isLoadingDirectories = false
 
     var agentSnapshot: VersionedAgentConfig?
+    var defaultAgentSnapshot: VersionedAgentConfig?
     var agentDraft: AgentComposition?
     var applyState: ApplyState = .idle
     var providerStatuses: [ProviderStatus] = []
@@ -256,6 +267,8 @@ final class AppModel {
 
     @ObservationIgnored private let client: GatewayClient
     @ObservationIgnored private let store: GatewayStore
+    @ObservationIgnored private let requestSender:
+        @MainActor @Sendable (GatewayRequest) async throws -> Void
     @ObservationIgnored private var eventTask: Task<Void, Never>?
     @ObservationIgnored private var connectionGeneration = UUID()
     @ObservationIgnored private var pendingPairingAccount: GatewayAccount?
@@ -264,32 +277,59 @@ final class AppModel {
     private var sessionMutationRequestID: String?
     @ObservationIgnored private var sessionToRestoreID: String?
     @ObservationIgnored private var configRequestID: String?
+    @ObservationIgnored private var defaultConfigRequestID: String?
     @ObservationIgnored private var approvalRequestID: String?
     @ObservationIgnored private var directoryRequestID: String?
     @ObservationIgnored private var gitDiffRequestID: String?
+    private var gitBranchRequestID: String?
     @ObservationIgnored private var credentialRequestID: String?
     @ObservationIgnored private var pairingCodeRequestID: String?
     @ObservationIgnored private var pairingCodeExpiryTask: Task<Void, Never>?
     @ObservationIgnored private var providerLoginRequestID: String?
     @ObservationIgnored private var providerRegistrationRequestID: String?
+    @ObservationIgnored private var providerRegistrationTarget: ConfigurationTarget?
     @ObservationIgnored private var cronRequestIDs: Set<String> = []
     @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
     @ObservationIgnored private var isChatVisible = false
     @ObservationIgnored private var latestSequence: UInt64?
-    @ObservationIgnored private var notificationReplayCeiling: UInt64?
-    @ObservationIgnored private var inspectorPickerSubmissionID: String?
+    @ObservationIgnored private var sessionOpenCursor: UInt64?
     @ObservationIgnored private var steeringSubmissionID: String?
+    @ObservationIgnored private var previewSelections: [String: FrontendPickerOption] = [:]
 
-    init(client: GatewayClient? = nil, store: GatewayStore? = nil) {
+    init(
+        client: GatewayClient? = nil,
+        store: GatewayStore? = nil,
+        requestSender: (@MainActor @Sendable (GatewayRequest) async throws -> Void)? = nil
+    ) {
         let client = client ?? GatewayClient()
         let store = store ?? GatewayStore()
         self.client = client
         self.store = store
+        self.requestSender = requestSender ?? { request in
+            try await client.send(request)
+        }
         self.accounts = store.loadAccounts()
         self.selectedAccountID = store.selectedAccountID()
         self.theme = ThemePreference(rawValue: UserDefaults.standard.string(forKey: "theme") ?? "") ?? .system
         if selectedAccountID == nil { selectedAccountID = accounts.first?.id }
         showsPairing = accounts.isEmpty
+        #if DEBUG
+        let environment = ProcessInfo.processInfo.environment
+        if accounts.isEmpty,
+           let endpoint = environment["HORUS_PAIR_ENDPOINT"],
+           let code = environment["HORUS_PAIR_CODE"] {
+            pairingEndpoint = endpoint
+            pairingCode = code
+        }
+        switch ProcessInfo.processInfo.environment["HORUS_PAGE"] {
+        case "gateway": destination = .gateway
+        case "providers": destination = .providers
+        case "agent": destination = .agent
+        case "cron": destination = .cron
+        case "profile": destination = .profile
+        default: break
+        }
+        #endif
     }
 
     deinit {
@@ -309,11 +349,76 @@ final class AppModel {
             && pendingDrafts.isEmpty
             && sessionRequestID == nil
             && sessionMutationRequestID == nil
+            && gitBranchRequestID == nil
             && applyState != .applying
             && applyState != .restarting
     }
 
     var canCreateSession: Bool { canOpenSession }
+
+    var isSwitchingGitBranch: Bool { gitBranchRequestID != nil }
+
+    var runningSessionIDs: Set<String> {
+        Set(sessions.lazy.filter { $0.activity.state != .idle }.map(\.sessionId))
+    }
+
+    var isApplyingConfiguration: Bool {
+        configRequestID != nil
+            || defaultConfigRequestID != nil
+            || providerRegistrationRequestID != nil
+            || applyState == .applying
+            || applyState == .restarting
+    }
+
+    var isSubagentsEnabledInDraft: Bool {
+        guard let feature = middlewareFeatures.first(where: { $0.id == "subagents" }) else {
+            return false
+        }
+        return feature.required
+            || (agentDraft?.middleware.enabled.contains(feature.id) ?? false)
+    }
+
+    var subagentModelOptions: [SubagentModelOption] {
+        var seen: Set<String> = []
+        return modelChoices.compactMap { choice in
+            let option = SubagentModelOption(group: choice.group, model: choice.model)
+            return seen.insert(option.id).inserted ? option : nil
+        }
+    }
+
+    var selectedSubagentModelOptionID: String? {
+        guard let route = agentDraft?.middleware.subagents.modelRoute,
+              let choice = modelChoices.first(where: { $0.route == route })
+        else { return nil }
+        return SubagentModelOption(group: choice.group, model: choice.model).id
+    }
+
+    var subagentReasoningChoices: [ModelChoice] {
+        guard let route = agentDraft?.middleware.subagents.modelRoute,
+              let selected = modelChoices.first(where: { $0.route == route })
+        else { return [] }
+        return modelChoices.filter {
+            $0.group == selected.group && $0.model == selected.model
+        }
+    }
+
+    func selectSubagentModelOption(_ optionID: String?) {
+        guard let optionID else {
+            agentDraft?.middleware.subagents.modelRoute = nil
+            return
+        }
+        guard let option = subagentModelOptions.first(where: { $0.id == optionID }),
+              let choice = modelChoices.first(where: {
+                  $0.group == option.group && $0.model == option.model
+              })
+        else { return }
+        agentDraft?.middleware.subagents.modelRoute = choice.route
+    }
+
+    func selectSubagentReasoningRoute(_ route: String) {
+        guard subagentReasoningChoices.contains(where: { $0.route == route }) else { return }
+        agentDraft?.middleware.subagents.modelRoute = route
+    }
 
     var contextFillFraction: Double {
         guard let modelContextWindow, modelContextWindow > 0 else { return 0 }
@@ -324,8 +429,14 @@ final class AppModel {
         Int((contextFillFraction * 100).rounded())
     }
 
-    func generationElapsed(at date: Date) -> TimeInterval {
-        completedGenerationTime + (turnStartedAt.map { max(0, date.timeIntervalSince($0)) } ?? 0)
+    /// How long the current turn has been running. Zero once the turn ends: the gateway only
+    /// advertises `startedAt` while a turn is in flight.
+    func sessionElapsed(at date: Date) -> TimeInterval {
+        guard let session = sessions.first(where: { $0.sessionId == selectedSessionID }),
+              session.activity.state != .idle,
+              let startedAt = session.activity.startedAt
+        else { return 0 }
+        return max(0, date.timeIntervalSince1970 - TimeInterval(startedAt))
     }
 
     func showToast(_ message: String, tone: ToastTone = .info) {
@@ -362,11 +473,34 @@ final class AppModel {
         }
     }
 
+    /// Backs the fork action under a message, when the gateway mounts the sessions capability.
+    var forkCommand: MountedCommand? {
+        guard canOpenSession else { return nil }
+        return capabilityCommands.first {
+            $0.command.name == "fork" && $0.command.arguments.isEmpty
+        }
+    }
+
     var capabilityReferences: [MountedReference] {
         contributions.flatMap { contribution in
             contribution.references.map {
                 MountedReference(capability: contribution.capability, reference: $0)
             }
+        }
+    }
+
+    var middlewareContributionCounts: [MiddlewareContributionCount] {
+        contributions.compactMap { contribution in
+            guard let value = contribution.count,
+                  let feature = middlewareFeatures.first(where: {
+                      $0.id == contribution.capability
+                  })
+            else { return nil }
+            return MiddlewareContributionCount(
+                id: contribution.capability,
+                label: feature.label,
+                value: value
+            )
         }
     }
 
@@ -381,45 +515,6 @@ final class AppModel {
             !message.isEmpty
         else { return "New conversation" }
         return String(message.prefix(72))
-    }
-
-    func updateSessionActivity(sessionID: String, event: AgentEventRecord) {
-        switch event.msg["type"]?.stringValue {
-        case "task_started":
-            runningSessionIDs.insert(sessionID)
-            unreadSessionIDs.remove(sessionID)
-        case "exec_approval_request":
-            runningSessionIDs.insert(sessionID)
-            showToast(
-                "\(sessionTitle(sessionID)) needs approval.",
-                tone: .warning
-            )
-        case "task_complete":
-            runningSessionIDs.remove(sessionID)
-            notifyCompletion(of: sessionID, tone: .success)
-        case "turn_aborted":
-            runningSessionIDs.remove(sessionID)
-            notifyCompletion(of: sessionID, tone: .warning)
-        case "error":
-            showToast(event.msg["message"]?.stringValue ?? "Agent error", tone: .error)
-        default:
-            break
-        }
-    }
-
-    private func notifyCompletion(of sessionID: String, tone: ToastTone) {
-        guard selectedSessionID != sessionID || !isChatVisible else {
-            unreadSessionIDs.remove(sessionID)
-            return
-        }
-        unreadSessionIDs.insert(sessionID)
-        if tone == .warning, toast?.tone == .error { return }
-        showToast(
-            tone == .success
-                ? "\(sessionTitle(sessionID)) is ready."
-                : "\(sessionTitle(sessionID)) stopped.",
-            tone: tone
-        )
     }
 
     var headerWidgets: [MountedWidget] { widgets(in: "header") }
@@ -445,6 +540,9 @@ final class AppModel {
 
     func start() {
         guard let account = selectedAccount else {
+            #if DEBUG
+            if !pairingCode.isEmpty, !pairingEndpoint.isEmpty { pair(); return }
+            #endif
             showsPairing = true
             return
         }
@@ -464,8 +562,12 @@ final class AppModel {
             }
             let account = accounts.first(where: { $0.endpoint == endpoint })
                 ?? GatewayAccount(endpoint: endpoint)
-            let sessionID = account.id == selectedAccountID ? selectedSessionID : nil
-            let generation = resetGatewayState(preservingDrafts: account.id == selectedAccountID)
+            let sameGateway = account.id == selectedAccountID
+            let sessionID = sameGateway ? selectedSessionID : nil
+            let generation = resetGatewayState(
+                preservingDrafts: sameGateway,
+                preservingSession: sessionID != nil
+            )
             sessionToRestoreID = sessionID
             pendingPairingAccount = account
             beginConnection(to: endpoint, generation: generation) { [weak self] in
@@ -507,6 +609,7 @@ final class AppModel {
         }
         guard canCreateSession else { return }
         sessionToRestoreID = nil
+        sessionOpenCursor = nil
         let id = requestID("create")
         sessionRequestID = id
         workspaceError = nil
@@ -567,23 +670,36 @@ final class AppModel {
 
     func openSession(_ sessionID: String) {
         guard canOpenSession, sessionID != selectedSessionID else { return }
+        requestSessionOpen(sessionID, lastSequence: nil)
+    }
+
+    private func restoreSession(_ sessionID: String) {
+        let cursor = sessionID == selectedSessionID ? latestSequence : nil
+        requestSessionOpen(sessionID, lastSequence: cursor)
+    }
+
+    private func requestSessionOpen(_ sessionID: String, lastSequence: UInt64?) {
         sessionToRestoreID = nil
+        sessionOpenCursor = lastSequence
         let id = requestID("open")
         sessionRequestID = id
         connectionState = .loading
         transmit(.openSession(
             requestID: id,
             sessionID: sessionID,
-            lastSequence: nil
+            lastSequence: lastSequence
         )) { [weak self] _ in
             guard self?.sessionRequestID == id else { return }
             self?.sessionRequestID = nil
+            self?.sessionOpenCursor = nil
             self?.connectionState = .ready
         }
     }
 
+    // Renaming, pinning and deleting address a session by id, so they work on any chat in the
+    // catalogue rather than only the open one.
     func renameSession(_ session: SessionRecord, title: String) {
-        guard session.sessionId == selectedSessionID, sessionMutationRequestID == nil else { return }
+        guard sessionMutationRequestID == nil else { return }
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else { return }
         let id = requestID("session-rename")
@@ -598,7 +714,7 @@ final class AppModel {
     }
 
     func setSessionPinned(_ session: SessionRecord, pinned: Bool) {
-        guard session.sessionId == selectedSessionID, sessionMutationRequestID == nil else { return }
+        guard sessionMutationRequestID == nil else { return }
         let id = requestID("session-pin")
         sessionMutationRequestID = id
         transmit(.setSessionPinned(
@@ -611,7 +727,7 @@ final class AppModel {
     }
 
     func deleteSession(_ session: SessionRecord) {
-        guard session.sessionId == selectedSessionID, sessionMutationRequestID == nil else { return }
+        guard sessionMutationRequestID == nil else { return }
         let id = requestID("session-delete")
         sessionMutationRequestID = id
         transmit(.deleteSession(
@@ -627,6 +743,20 @@ final class AppModel {
         let id = requestID("git-diff")
         gitDiffRequestID = id
         transmit(.getGitDiff(requestID: id, sessionID: sessionID))
+    }
+
+    func switchGitBranch(to branch: String) {
+        guard canOpenSession,
+              let sessionID = selectedSessionID,
+              let gitStatus,
+              branch != gitStatus.currentBranch,
+              gitStatus.branches.contains(branch)
+        else { return }
+        let id = requestID("git-branch")
+        gitBranchRequestID = id
+        transmit(.switchGitBranch(requestID: id, sessionID: sessionID, branch: branch)) { [weak self] _ in
+            if self?.gitBranchRequestID == id { self?.gitBranchRequestID = nil }
+        }
     }
 
     func sendMessage() {
@@ -657,26 +787,23 @@ final class AppModel {
         }
     }
 
-    func submitWidget(_ mounted: MountedWidget, presentsPickerInInspector: Bool = false) {
+    func submitWidget(_ mounted: MountedWidget) {
         guard let sessionID = selectedSessionID, let action = mounted.widget.action else { return }
         let id = requestID("widget")
-        if presentsPickerInInspector {
-            pendingPicker = nil
-            inspectorPickerSubmissionID = id
-            inspectorSection = .subagents
-        }
-        transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: action))) { [weak self] _ in
-            if self?.inspectorPickerSubmissionID == id { self?.inspectorPickerSubmissionID = nil }
-        }
+        transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: action)))
     }
 
     func submitPickerOption(_ option: FrontendPickerOption) {
         guard let sessionID = selectedSessionID else { return }
+        let id = requestID("picker")
         pendingPicker = nil
+        if case .capabilityCommand = option.op { previewSelections[id] = option }
         transmit(.submit(
             sessionID: sessionID,
-            submission: Submission(id: requestID("picker"), op: option.op)
-        ))
+            submission: Submission(id: id, op: option.op)
+        )) { [weak self] _ in
+            self?.previewSelections.removeValue(forKey: id)
+        }
     }
 
     func selectModel(_ route: String) {
@@ -719,31 +846,21 @@ final class AppModel {
 
     func selectArtifact(_ id: String) {
         selectedArtifactID = id
-        inspectorSection = artifacts.first(where: { $0.id == id })?.kind == "code_diff" ? .diff : .subagents
         showsInspector = true
-        if inspectorSection == .diff { refreshGitDiff() }
+        refreshGitDiff()
     }
 
-    func showInspector(_ section: InspectorSection) {
-        inspectorSection = section
+    func showInspector() {
         showsInspector = true
-        if section == .diff { refreshGitDiff() }
+        refreshGitDiff()
     }
 
     func toggleInspector() {
         if showsInspector {
             showsInspector = false
         } else {
-            showInspector(inspectorSection)
+            showInspector()
         }
-    }
-
-    func openInspectorPickerOption(_ option: FrontendPickerOption) {
-        guard let sessionID = selectedSessionID else { return }
-        transmit(.submit(
-            sessionID: sessionID,
-            submission: Submission(id: requestID("picker"), op: option.op)
-        ))
     }
 
     func submitCommand(_ mounted: MountedCommand, arguments: String) {
@@ -761,22 +878,50 @@ final class AppModel {
         ))
     }
 
-    func applyAgentConfiguration() {
-        guard let sessionID = selectedSessionID,
-              let snapshot = agentSnapshot,
-              let draft = agentDraft
-        else { return }
+    func changeAgentForCurrentChat() {
+        applyAgentConfiguration(to: .session)
+    }
+
+    func saveAgentAsDefault() {
+        applyAgentConfiguration(to: .defaultAgent)
+    }
+
+    private func applyAgentConfiguration(to target: ConfigurationTarget) {
+        guard !isApplyingConfiguration, let draft = agentDraft else { return }
         let id = requestID("configure")
-        configRequestID = id
         applyState = .applying
-        transmit(.configureSession(
-            requestID: id,
-            sessionID: sessionID,
-            expectedRevision: snapshot.revision,
-            config: draft
-        )) { [weak self] message in
-            self?.configRequestID = nil
-            self?.applyState = .failed(message)
+        switch target {
+        case .session:
+            guard let sessionID = selectedSessionID, let snapshot = agentSnapshot else {
+                applyState = .idle
+                return
+            }
+            configRequestID = id
+            transmit(.configureSession(
+                requestID: id,
+                sessionID: sessionID,
+                expectedRevision: snapshot.revision,
+                config: draft
+            )) { [weak self] message in
+                guard self?.configRequestID == id else { return }
+                self?.configRequestID = nil
+                self?.applyState = .failed(message)
+            }
+        case .defaultAgent:
+            guard let snapshot = defaultAgentSnapshot else {
+                applyState = .failed("The gateway has no default agent configuration.")
+                return
+            }
+            defaultConfigRequestID = id
+            transmit(.configureDefaultAgent(
+                requestID: id,
+                expectedRevision: snapshot.revision,
+                config: draft
+            )) { [weak self] message in
+                guard self?.defaultConfigRequestID == id else { return }
+                self?.defaultConfigRequestID = nil
+                self?.applyState = .failed(message)
+            }
         }
     }
 
@@ -791,7 +936,7 @@ final class AppModel {
         }
         guard draft.approval != policy else { return }
         agentDraft?.approval = policy
-        applyAgentConfiguration()
+        changeAgentForCurrentChat()
     }
 
     func reloadAgentDraft() {
@@ -801,16 +946,29 @@ final class AppModel {
     }
 
     func selectProvider(_ provider: String) {
-        guard let status = providerStatuses.first(where: { $0.provider == provider }) else { return }
+        guard let status = providerStatuses.first(where: { $0.provider == provider }),
+              let webSearch = status.webSearch.first
+        else { return }
+        let selectedModel = status.models.first
         agentDraft?.provider = ProviderConfig(
             provider: status.provider,
-            model: status.defaultModel ?? "",
+            model: selectedModel?.id ?? "",
             baseUrl: status.defaultBaseUrl,
-            reasoningEffort: status.defaultReasoningEffort,
-            webSearch: status.defaultWebSearch
+            reasoningEffort: selectedModel?.defaultReasoning,
+            webSearch: webSearch
         )
         providerAPIKey = ""
         providerActionState = .idle
+    }
+
+    func selectProviderModel(_ modelID: String) {
+        guard let status = providerStatuses.first(where: {
+            $0.provider == agentDraft?.provider.provider
+        }) else { return }
+        agentDraft?.provider.model = modelID
+        agentDraft?.provider.reasoningEffort = status.models
+            .first(where: { $0.id == modelID })?
+            .defaultReasoning
     }
 
     func saveProviderCredential(provider: String) {
@@ -840,13 +998,24 @@ final class AppModel {
         }
     }
 
-    func applyProviderConfiguration() {
+    func changeProviderForCurrentChat() {
+        registerProvider(for: .session)
+    }
+
+    func saveProviderAsDefault() {
+        registerProvider(for: .defaultAgent)
+    }
+
+    private func registerProvider(for target: ConfigurationTarget) {
         guard selectedSessionID != nil, let config = agentDraft?.provider else { return }
         let id = requestID("provider")
         providerRegistrationRequestID = id
+        providerRegistrationTarget = target
         applyState = .applying
         transmit(.registerProvider(requestID: id, config: config)) { [weak self] message in
+            guard self?.providerRegistrationRequestID == id else { return }
             self?.providerRegistrationRequestID = nil
+            self?.providerRegistrationTarget = nil
             self?.applyState = .failed(message)
         }
     }
@@ -941,8 +1110,12 @@ final class AppModel {
     }
 
     private func connect(to account: GatewayAccount) {
-        let sessionID = account.id == selectedAccountID ? selectedSessionID : nil
-        let generation = resetGatewayState(preservingDrafts: account.id == selectedAccountID)
+        let sameGateway = account.id == selectedAccountID
+        let sessionID = sameGateway ? selectedSessionID : nil
+        let generation = resetGatewayState(
+            preservingDrafts: sameGateway,
+            preservingSession: sessionID != nil
+        )
         sessionToRestoreID = sessionID
         selectedAccountID = account.id
         store.select(account)
@@ -1007,7 +1180,7 @@ final class AppModel {
         Task { [weak self] in
             guard let self, generation == self.connectionGeneration else { return }
             do {
-                try await self.client.send(request)
+                try await self.requestSender(request)
             } catch {
                 guard generation == self.connectionGeneration else { return }
                 let message = error.localizedDescription
@@ -1046,34 +1219,16 @@ final class AppModel {
             else { break }
             applySessionReady(payload, opened: false)
         case .gatewayConfigured(let requestID, let payload):
-            applyGatewayReady(payload)
-            if requestID == providerRegistrationRequestID {
-                providerRegistrationRequestID = nil
-                applyAgentConfiguration()
-            }
+            applyGatewayConfigurationResponse(requestID: requestID, payload: payload)
         case .accepted(let requestID):
             handleAccepted(requestID)
         case .rejected(let rejection):
             handleRejected(rejection)
         case .agentEvent(let sessionID, let sequence, let event, let blocks, let history, let preview):
-            guard sessionID == selectedSessionID else {
-                updateSessionActivity(sessionID: sessionID, event: event)
-                break
-            }
+            guard sessionID == selectedSessionID else { break }
             guard latestSequence.map({ sequence > $0 }) ?? true else { return }
             latestSequence = sequence
-            let isLive = notificationReplayCeiling.map { sequence > $0 } ?? true
             reduce(event: event, blocks: blocks, history: history, preview: preview)
-            if isLive {
-                updateSessionActivity(sessionID: sessionID, event: event)
-            } else if activeTurnID == nil {
-                runningSessionIDs.remove(sessionID)
-            } else {
-                runningSessionIDs.insert(sessionID)
-            }
-            if let ceiling = notificationReplayCeiling, sequence >= ceiling {
-                notificationReplayCeiling = nil
-            }
         case .sessions(let requestID, let sessions):
             if requestID == sessionMutationRequestID { sessionMutationRequestID = nil }
             applySessions(sessions)
@@ -1087,7 +1242,6 @@ final class AppModel {
                     providerAPIKey = ""
                     providerActionState = .credentialSaved(provider)
                     showToast("\(provider) credential saved.", tone: .success)
-                    registerAuthenticatedProvider(provider)
                 } else {
                     let message = "The gateway did not store the provider credential."
                     providerActionState = .failed(message)
@@ -1113,7 +1267,6 @@ final class AppModel {
                 providerLoginRequestID = nil
                 providerActionState = .loginFinished(provider)
                 showToast("Signed in to \(provider).", tone: .success)
-                registerAuthenticatedProvider(provider)
             }
             if let index = providerStatuses.firstIndex(where: { $0.provider == provider }) {
                 providerStatuses[index].configured = true
@@ -1158,33 +1311,46 @@ final class AppModel {
     }
 
     private func applyGatewayReady(_ payload: ReadyPayload) {
-        providerStatuses = payload.providers
-        modelChoices = payload.models
-        middlewareFeatures = payload.middlewareFeatures
+        applyGatewayCatalog(payload)
         if sessionRequestID == nil { connectionState = .ready }
         applySessions(payload.sessions)
         transmit(.getProfile(requestID: requestID("profile")))
-        if selectedSessionID == nil, sessionRequestID == nil {
-            if let sessionToRestoreID {
-                if let session = sessions.first(where: { $0.sessionId == sessionToRestoreID }) {
-                    openSession(session.sessionId)
-                } else {
-                    showToast("The previously selected chat is no longer available.", tone: .error)
-                }
-            } else if let session = sessions.first {
-                openSession(session.sessionId)
+        guard sessionRequestID == nil else { return }
+        if let sessionToRestoreID {
+            if let session = sessions.first(where: { $0.sessionId == sessionToRestoreID }) {
+                restoreSession(session.sessionId)
+            } else {
+                showToast("The previously selected chat is no longer available.", tone: .error)
+                clearSelectedSession()
             }
+        } else if selectedSessionID == nil, let session = sessions.first {
+            openSession(session.sessionId)
         }
     }
 
-    private func registerAuthenticatedProvider(_ provider: String) {
-        guard agentDraft?.provider.provider == provider else {
-            let message = "The selected provider changed during authentication."
-            providerActionState = .failed(message)
-            showToast(message, tone: .error)
-            return
+    func applyGatewayConfigurationResponse(
+        requestID: String,
+        payload: ReadyPayload
+    ) {
+        applyGatewayReady(payload)
+        if requestID == providerRegistrationRequestID {
+            let target = providerRegistrationTarget
+            providerRegistrationRequestID = nil
+            providerRegistrationTarget = nil
+            applyState = .idle
+            if let target { applyAgentConfiguration(to: target) }
+        } else if requestID == defaultConfigRequestID {
+            defaultConfigRequestID = nil
+            applyState = .applied
+            showToast("Default agent saved for new chats.", tone: .success)
         }
-        applyProviderConfiguration()
+    }
+
+    func applyGatewayCatalog(_ payload: ReadyPayload) {
+        providerStatuses = payload.providers
+        modelChoices = payload.models
+        middlewareFeatures = payload.middlewareFeatures
+        defaultAgentSnapshot = payload.defaultConfig
     }
 
     private func applySessionReady(
@@ -1196,8 +1362,8 @@ final class AppModel {
             resetSessionState()
         }
         if opened {
-            latestSequence = nil
-            notificationReplayCeiling = payload.latestSequence
+            latestSequence = sessionOpenCursor
+            sessionOpenCursor = nil
         }
         sessionRequestID = nil
         workspace = payload.workspace
@@ -1210,6 +1376,7 @@ final class AppModel {
         selectedModelRoute = payload.session.model.route
         modelContextWindow = payload.session.model.modelContextWindow
         contributions = payload.contributions
+        toolCount = payload.toolCount
         mountedWidgets = payload.contributions.flatMap { contribution in
             contribution.widgets.map { MountedWidget(capability: contribution.capability, widget: $0) }
         }
@@ -1228,10 +1395,17 @@ final class AppModel {
         if opened { requestSessionData() }
     }
 
-    private func applySessions(_ records: [SessionRecord]) {
+    func applySessions(_ records: [SessionRecord]) {
+        let previous = Dictionary(uniqueKeysWithValues: sessions.map { ($0.sessionId, $0.activity) })
         sessions = records.filter(\.catalogVisible)
+        for session in sessions {
+            applyActivityTransition(
+                from: previous[session.sessionId],
+                to: session.activity,
+                sessionID: session.sessionId
+            )
+        }
         let visible = Set(sessions.map(\.sessionId))
-        runningSessionIDs.formIntersection(visible)
         unreadSessionIDs.formIntersection(visible)
         guard let selectedSessionID,
               !sessions.contains(where: { $0.sessionId == selectedSessionID }),
@@ -1244,15 +1418,59 @@ final class AppModel {
         }
     }
 
+    private func applyActivityTransition(
+        from previous: SessionActivity?,
+        to activity: SessionActivity,
+        sessionID: String
+    ) {
+        guard let previous, previous != activity else { return }
+        if activity.state == .awaitingApproval,
+           previous.state != .awaitingApproval {
+            showToast("\(sessionTitle(sessionID)) needs approval.", tone: .warning)
+        }
+        guard activity.state == .idle,
+              let outcome = activity.lastOutcome,
+              previous.state != .idle
+                || previous.lastOutcome != outcome
+                || previous.message != activity.message
+        else { return }
+
+        let isActiveChat = selectedSessionID == sessionID && isChatVisible
+        if isActiveChat {
+            unreadSessionIDs.remove(sessionID)
+        } else {
+            unreadSessionIDs.insert(sessionID)
+        }
+
+        switch outcome {
+        case .completed:
+            guard !isActiveChat else { return }
+            showToast("\(sessionTitle(sessionID)) is ready.", tone: .success)
+        case .aborted:
+            guard !isActiveChat else { return }
+            let detail = activity.message.map { ": \($0)" } ?? ""
+            showToast("\(sessionTitle(sessionID)) stopped\(detail).", tone: .warning)
+        case .failed:
+            let detail = activity.message.map { ": \($0)" } ?? ""
+            showToast("\(sessionTitle(sessionID)) failed\(detail).", tone: .error)
+        }
+    }
+
     private func requestSessionData() {
-        guard let sessionID = selectedSessionID else { return }
-        transmit(.listArtifacts(requestID: requestID("artifacts"), sessionID: sessionID))
+        guard selectedSessionID != nil else { return }
+        refreshArtifacts()
         refreshGitDiff()
         refreshCron()
     }
 
+    private func refreshArtifacts() {
+        guard let sessionID = selectedSessionID else { return }
+        transmit(.listArtifacts(requestID: requestID("artifacts"), sessionID: sessionID))
+    }
+
     private func clearSelectedSession() {
         latestSequence = nil
+        sessionOpenCursor = nil
         selectedSessionID = nil
         resetSessionState()
         connectionState = .ready
@@ -1274,6 +1492,11 @@ final class AppModel {
                 }
             }
         }
+        if requestID == gitBranchRequestID {
+            gitBranchRequestID = nil
+            showToast("Git branch changed.", tone: .success)
+            refreshGitDiff()
+        }
         if cronRequestIDs.remove(requestID) != nil {
             cronTaskDraft = ""
             refreshCron()
@@ -1284,20 +1507,23 @@ final class AppModel {
         if pendingDrafts[rejection.requestId] != nil {
             restoreDraft(id: rejection.requestId)
         }
-        if rejection.requestId == configRequestID {
+        if rejection.requestId == configRequestID
+            || rejection.requestId == defaultConfigRequestID {
             switch rejection.code {
             case "revision_conflict": applyState = .conflict(rejection.message)
             case "agent_busy": applyState = .busy(rejection.message)
             case "invalid_config": applyState = .invalid(rejection.message)
             default: applyState = .failed(rejection.message)
             }
-            configRequestID = nil
+            if rejection.requestId == configRequestID { configRequestID = nil }
+            if rejection.requestId == defaultConfigRequestID { defaultConfigRequestID = nil }
         }
         if rejection.requestId == approvalRequestID {
             approvalRequestID = nil
         }
         if rejection.requestId == sessionRequestID {
             sessionRequestID = nil
+            sessionOpenCursor = nil
             connectionState = .ready
             if isChangingWorkspace { workspaceError = rejection.message }
             isChangingWorkspace = false
@@ -1313,8 +1539,8 @@ final class AppModel {
         if rejection.requestId == gitDiffRequestID {
             gitDiffRequestID = nil
         }
-        if rejection.requestId == inspectorPickerSubmissionID {
-            inspectorPickerSubmissionID = nil
+        if rejection.requestId == gitBranchRequestID {
+            gitBranchRequestID = nil
         }
         if rejection.requestId == credentialRequestID {
             providerActionState = .failed(rejection.message)
@@ -1327,6 +1553,7 @@ final class AppModel {
         if rejection.requestId == providerRegistrationRequestID {
             applyState = .failed(rejection.message)
             providerRegistrationRequestID = nil
+            providerRegistrationTarget = nil
         }
         if rejection.requestId == pairingCodeRequestID {
             pairingCodeRequestID = nil
@@ -1357,6 +1584,7 @@ final class AppModel {
         if let submissionID = event.submissionId {
             if type == "warning" || type == "error" {
                 if let draft = pendingDrafts.removeValue(forKey: submissionID) { restoreDraft(draft) }
+                previewSelections.removeValue(forKey: submissionID)
             } else if type == "user_message" {
                 pendingDrafts.removeValue(forKey: submissionID)
                 if submissionID == steeringSubmissionID {
@@ -1369,7 +1597,12 @@ final class AppModel {
         if !blocks.isEmpty {
             for block in blocks { apply(block) }
         }
-        if let preview { apply(preview) }
+        if let preview {
+            apply(
+                preview,
+                selection: event.submissionId.flatMap { previewSelections.removeValue(forKey: $0) }
+            )
+        }
 
         switch type {
         case "session_history":
@@ -1408,14 +1641,12 @@ final class AppModel {
             }
         case "task_started":
             activeTurnID = event.msg["turnId"]?.stringValue
-            turnStartedAt = .now
             if let window = event.msg["modelContextWindow"]?.intValue {
                 modelContextWindow = Int64(window)
             }
         case "task_complete":
             finishPendingTranscriptEntries()
             activeTurnID = nil
-            finishGeneration()
             refreshGitDiff()
             steeringQueued = false
             steeringSubmissionID = nil
@@ -1431,7 +1662,6 @@ final class AppModel {
         case "turn_aborted":
             finishPendingTranscriptEntries()
             activeTurnID = nil
-            finishGeneration()
             refreshGitDiff()
             steeringQueued = false
             steeringSubmissionID = nil
@@ -1458,11 +1688,12 @@ final class AppModel {
             approvalRequestID = nil
             pendingApproval = decodeApproval(event.msg)
         case "token_count":
-            if let usage = event.msg["info"]?["totalTokenUsage"] {
-                currentUsage = TokenUsage(json: usage)
+            if let usage = event.msg["info"]?["totalTokenUsage"],
+               let decoded = TokenUsage(json: usage) {
+                currentUsage = decoded
             }
-            if let usage = event.msg["info"]?["lastTokenUsage"] {
-                let latest = TokenUsage(json: usage)
+            if let usage = event.msg["info"]?["lastTokenUsage"],
+               let latest = TokenUsage(json: usage) {
                 lastUsage = latest
                 contextTokens = max(
                     0,
@@ -1473,13 +1704,13 @@ final class AppModel {
                 modelContextWindow = Int64(window)
             }
         case "frontend":
-            applyFrontendEvent(event.msg, submissionID: event.submissionId, wasRendered: wasRendered)
+            applyFrontendEvent(event.msg)
         default:
             break
         }
     }
 
-    private func applyFrontendEvent(_ event: JSONValue, submissionID: String?, wasRendered: Bool) {
+    private func applyFrontendEvent(_ event: JSONValue) {
         switch event["frontendType"]?.stringValue {
         case "render":
             guard let block = renderedBlock(from: event) else { return }
@@ -1506,18 +1737,8 @@ final class AppModel {
                 try? FrontendPickerOption(json: $0)
             } ?? []
             guard !options.isEmpty else { return }
-            if submissionID == inspectorPickerSubmissionID {
-                inspectorPickerSubmissionID = nil
-                inspectorPickerOptions = options
-                inspectorSection = .subagents
-                showsInspector = true
-            } else {
-                pendingPicker = FrontendPickerPrompt(title: title, options: options)
-            }
+            pendingPicker = FrontendPickerPrompt(title: title, options: options)
         default:
-            if wasRendered, submissionID == inspectorPickerSubmissionID {
-                inspectorPickerSubmissionID = nil
-            }
             break
         }
     }
@@ -1553,19 +1774,13 @@ final class AppModel {
                 pending: block.pending
             ))
         }
-        if block.format == "unified_diff" {
-            upsertArtifact(ArtifactRecord(
-                id: id,
-                sessionId: selectedSessionID ?? "",
-                kind: "code_diff",
-                title: diffTitle(block.text),
-                block: block
-            ))
-            if !block.pending { refreshGitDiff() }
+        if block.format == "unified_diff", !block.pending {
+            refreshArtifacts()
+            refreshGitDiff()
         }
     }
 
-    private func apply(_ preview: RenderedPreview) {
+    private func apply(_ preview: RenderedPreview, selection: FrontendPickerOption?) {
         var blocks: [FrontendBlock] = []
         for rendered in preview.events {
             blocks.append(contentsOf: rendered.blocks)
@@ -1578,9 +1793,12 @@ final class AppModel {
         blocks = reducePreviewBlocks(blocks)
         guard !blocks.isEmpty else { return }
         let id = "preview-\(preview.title)"
+        let existing = previews.first { $0.id == id }
         let record = TranscriptPreview(
             id: id,
             title: preview.title,
+            status: selection?.description ?? existing?.status,
+            model: selection?.detail ?? existing?.model,
             blocks: blocks.enumerated().map { index, block in
                 PreviewBlock(id: block.id ?? "\(id)-\(index)", block: block)
             }
@@ -1590,8 +1808,7 @@ final class AppModel {
         } else {
             previews.append(record)
         }
-        inspectorSection = .subagents
-        showsInspector = true
+        if selection != nil { presentedPreview = record }
     }
 
     private func reducePreviewBlocks(_ blocks: [FrontendBlock]) -> [FrontendBlock] {
@@ -1738,15 +1955,6 @@ final class AppModel {
         )
     }
 
-    private func upsertArtifact(_ artifact: ArtifactRecord) {
-        if let index = artifacts.firstIndex(where: { $0.id == artifact.id }) {
-            artifacts[index] = artifact
-        } else {
-            artifacts.append(artifact)
-        }
-        selectedArtifactID = artifact.id
-    }
-
     private func widgets(in slot: String) -> [MountedWidget] {
         mountedWidgets.filter { $0.widget.slot == slot }
     }
@@ -1771,34 +1979,24 @@ final class AppModel {
         restoreDraft(drafts.joined(separator: "\n\n"))
     }
 
-    private func finishGeneration() {
-        guard let turnStartedAt else { return }
-        completedGenerationTime += max(0, Date.now.timeIntervalSince(turnStartedAt))
-        self.turnStartedAt = nil
-    }
-
     private func connectionEnded(generation: UUID, message: String) {
         guard connectionGeneration == generation else { return }
         restorePendingDrafts()
         connectionState = .failed(message)
         if pendingPairingAccount != nil { pairingError = message }
         showToast(message, tone: .error)
-        runningSessionIDs.removeAll()
-        activeTurnID = nil
-        finishGeneration()
-        steeringQueued = false
-        steeringSubmissionID = nil
-        pendingApproval = nil
-        approvalRequestID = nil
     }
 
     @discardableResult
-    private func resetGatewayState(preservingDrafts: Bool) -> UUID {
+    private func resetGatewayState(
+        preservingDrafts: Bool,
+        preservingSession: Bool = false
+    ) -> UUID {
         connectionGeneration = UUID()
         eventTask?.cancel()
         eventTask = nil
-        latestSequence = nil
-        notificationReplayCeiling = nil
+        if !preservingSession { latestSequence = nil }
+        sessionOpenCursor = nil
         if preservingDrafts {
             restorePendingDrafts()
         } else {
@@ -1811,6 +2009,9 @@ final class AppModel {
         sessionRequestID = nil
         sessionMutationRequestID = nil
         sessionToRestoreID = nil
+        configRequestID = nil
+        defaultConfigRequestID = nil
+        applyState = .idle
         workspaceError = nil
         isChangingWorkspace = false
         showsWorkspaceBrowser = false
@@ -1818,26 +2019,29 @@ final class AppModel {
         directoryError = nil
         directoryRequestID = nil
         isLoadingDirectories = false
-        sessions = []
-        selectedSessionID = nil
-        runningSessionIDs.removeAll()
-        unreadSessionIDs.removeAll()
-        profile = nil
-        modelChoices = []
-        middlewareFeatures = []
-        providerStatuses = []
+        if !preservingSession {
+            sessions = []
+            selectedSessionID = nil
+            unreadSessionIDs.removeAll()
+            profile = nil
+            modelChoices = []
+            middlewareFeatures = []
+            providerStatuses = []
+            defaultAgentSnapshot = nil
+        }
         providerAPIKey = ""
         providerActionState = .idle
         credentialRequestID = nil
         providerLoginRequestID = nil
         providerRegistrationRequestID = nil
+        providerRegistrationTarget = nil
         pairingCodeRequestID = nil
         pairingCodeExpiryTask?.cancel()
         pairingCodeExpiryTask = nil
         pairingCodeInfo = nil
         pairingCode = ""
         pairingError = nil
-        resetSessionState()
+        if !preservingSession { resetSessionState() }
         return connectionGeneration
     }
 
@@ -1846,8 +2050,10 @@ final class AppModel {
         gitStatus = nil
         gitDiff = ""
         gitDiffRequestID = nil
+        gitBranchRequestID = nil
         selectedModelRoute = ""
         contributions = []
+        toolCount = 0
         agentSnapshot = nil
         agentDraft = nil
         applyState = .idle
@@ -1860,8 +2066,6 @@ final class AppModel {
         transcript = []
         activeTurnID = nil
         activeOperation = nil
-        turnStartedAt = nil
-        completedGenerationTime = 0
         steeringQueued = false
         steeringSubmissionID = nil
         contextTokens = 0
@@ -1872,24 +2076,30 @@ final class AppModel {
         mountedWidgets = []
         artifacts = []
         previews = []
+        presentedPreview = nil
+        previewSelections.removeAll()
         selectedArtifactID = nil
         showsInspector = false
-        inspectorSection = .diff
-        inspectorPickerOptions = []
-        inspectorPickerSubmissionID = nil
         currentUsage = TokenUsage()
         lastUsage = TokenUsage()
     }
 }
 
 private extension TokenUsage {
-    init(json: JSONValue) {
-        inputTokens = json["inputTokens"]?.intValue ?? 0
-        cachedInputTokens = json["cachedInputTokens"]?.intValue ?? 0
-        cacheWriteInputTokens = json["cacheWriteInputTokens"]?.intValue ?? 0
-        outputTokens = json["outputTokens"]?.intValue ?? 0
-        reasoningOutputTokens = json["reasoningOutputTokens"]?.intValue ?? 0
-        totalTokens = json["totalTokens"]?.intValue ?? 0
+    init?(json: JSONValue) {
+        guard let inputTokens = json["inputTokens"]?.intValue,
+              let cachedInputTokens = json["cachedInputTokens"]?.intValue,
+              let cacheWriteInputTokens = json["cacheWriteInputTokens"]?.intValue,
+              let outputTokens = json["outputTokens"]?.intValue,
+              let reasoningOutputTokens = json["reasoningOutputTokens"]?.intValue,
+              let totalTokens = json["totalTokens"]?.intValue
+        else { return nil }
+        self.inputTokens = inputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.cacheWriteInputTokens = cacheWriteInputTokens
+        self.outputTokens = outputTokens
+        self.reasoningOutputTokens = reasoningOutputTokens
+        self.totalTokens = totalTokens
     }
 }
 
@@ -1902,12 +2112,4 @@ private extension JSONValue {
         else { return "{}" }
         return text
     }
-}
-
-func diffTitle(_ diff: String) -> String {
-    for line in diff.split(separator: "\n", omittingEmptySubsequences: false) {
-        if line.hasPrefix("+++ b/") { return String(line.dropFirst(6)) }
-        if line.hasPrefix("+++ ") { return String(line.dropFirst(4)) }
-    }
-    return "Code changes"
 }

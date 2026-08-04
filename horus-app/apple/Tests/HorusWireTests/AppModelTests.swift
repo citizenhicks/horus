@@ -1,13 +1,57 @@
 import Foundation
 import XCTest
 
+private actor GatewayRequestRecorder {
+    private var recorded: [GatewayRequest] = []
+
+    func record(_ request: GatewayRequest) {
+        recorded.append(request)
+    }
+
+    func requests() -> [GatewayRequest] {
+        recorded
+    }
+}
+
 @MainActor
 final class AppModelTests: XCTestCase {
-    private func model() throws -> AppModel {
+    private func model(
+        requestSender: (@MainActor @Sendable (GatewayRequest) async throws -> Void)? = nil
+    ) throws -> AppModel {
         let suiteName = UUID().uuidString
         return AppModel(
             client: GatewayClient(),
-            store: GatewayStore(defaults: try XCTUnwrap(UserDefaults(suiteName: suiteName)))
+            store: GatewayStore(defaults: try XCTUnwrap(UserDefaults(suiteName: suiteName))),
+            requestSender: requestSender
+        )
+    }
+
+    private func composition(systemPrompt: String = "Test") -> AgentComposition {
+        AgentComposition(
+            provider: ProviderConfig(
+                provider: "openai_socket",
+                model: "gpt-5.6-sol",
+                baseUrl: nil,
+                reasoningEffort: "high",
+                webSearch: .cached
+            ),
+            middleware: MiddlewareConfig(
+                enabled: ["skills", "subagents"],
+                subagents: SubagentConfig(modelRoute: "openai_socket::gpt-5.6-sol::high")
+            ),
+            approval: .on,
+            systemPrompt: systemPrompt
+        )
+    }
+
+    private func ready(defaultConfig: VersionedAgentConfig) -> ReadyPayload {
+        ReadyPayload(
+            sessions: [session(state: .idle)],
+            providers: [],
+            defaultConfig: defaultConfig,
+            models: [],
+            middlewareFeatures: [],
+            maxActiveSessions: 4
         )
     }
 
@@ -37,6 +81,77 @@ final class AppModelTests: XCTestCase {
         ]))
     }
 
+    private func session(
+        state: SessionActivityState,
+        outcome: SessionOutcome? = nil,
+        message: String? = nil,
+        turnID: String? = nil,
+        createdAt: Int64 = 100,
+        updatedAt: Int64 = 100
+    ) -> SessionRecord {
+        SessionRecord(
+            sessionId: "chat-1",
+            sessionContext: SessionContext(
+                tenantId: nil,
+                userId: nil,
+                userName: nil,
+                workspaceId: "workspace-1",
+                workspaceLabel: "/srv/horus",
+                originLabel: nil
+            ),
+            parentSessionId: nil,
+            parentSequence: nil,
+            sequence: 1,
+            catalogVisible: true,
+            firstUserMessage: "Review",
+            title: nil,
+            pinned: false,
+            activity: SessionActivity(
+                state: state,
+                turnId: turnID,
+                startedAt: state == .idle ? nil : 100,
+                lastOutcome: outcome,
+                message: message
+            ),
+            createdAt: createdAt,
+            updatedAt: updatedAt
+        )
+    }
+
+    func testSessionElapsedTimesTheRunningTurn() throws {
+        let model = try model()
+        model.selectedSessionID = "chat-1"
+        model.sessions = [session(state: .idle, createdAt: 100, updatedAt: 160)]
+
+        XCTAssertEqual(model.sessionElapsed(at: Date(timeIntervalSince1970: 200)), 0)
+
+        // `session(state:)` starts a running turn at 100, not at the chat's creation time.
+        model.sessions = [session(state: .running, createdAt: 20, updatedAt: 160)]
+        XCTAssertEqual(model.sessionElapsed(at: Date(timeIntervalSince1970: 200)), 100)
+    }
+
+    func testGitBranchSwitchUsesAnAdvertisedBranch() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.gitStatus = GitStatus(currentBranch: "main", branches: ["feature", "main"])
+
+        model.switchGitBranch(to: "unknown")
+        model.switchGitBranch(to: "feature")
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        XCTAssertEqual(requests.count, 1)
+        guard case .switchGitBranch(_, let sessionID, let branch) = requests[0] else {
+            return XCTFail("Expected a branch switch request")
+        }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(branch, "feature")
+    }
+
     func testSwitchingGatewaysClearsGatewayScopedStateBeforeTokenLookup() throws {
         let suiteName = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -45,11 +160,10 @@ final class AppModelTests: XCTestCase {
         let store = GatewayStore(defaults: defaults)
         let first = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
         let second = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9192"))
-        try store.save(first, token: "first-token")
-        defer { try? store.remove(first) }
+        store.select(first)
 
         let model = AppModel(client: GatewayClient(), store: store)
-        model.accounts.append(second)
+        model.accounts = [first, second]
         model.connectionState = .ready
         model.composer = "Gateway A draft"
         model.providerAPIKey = "gateway-a-secret"
@@ -137,7 +251,7 @@ final class AppModelTests: XCTestCase {
             tone: "neutral"
         )
         let rendered = renderEvent(
-            capability: "subagents",
+            capability: "reviewer",
             id: "change",
             group: "work",
             text: "@@ -1 +1 @@",
@@ -163,16 +277,127 @@ final class AppModelTests: XCTestCase {
         let snapshot = try XCTUnwrap(model.previews.first)
         XCTAssertEqual(snapshot.title, "worker")
         XCTAssertEqual(snapshot.blocks.map(\.block.text), ["Read file", "@@ -1 +1 @@"])
-        XCTAssertEqual(snapshot.blocks.last?.block.id, "subagents/change")
-        XCTAssertEqual(snapshot.blocks.last?.block.group, "subagents/work")
+        XCTAssertEqual(snapshot.blocks.last?.block.id, "reviewer/change")
+        XCTAssertEqual(snapshot.blocks.last?.block.group, "reviewer/work")
         XCTAssertEqual(snapshot.blocks.last?.block.format, "unified_diff")
         XCTAssertEqual(snapshot.blocks.last?.block.tone, "success")
+        XCTAssertNil(model.presentedPreview)
+        XCTAssertFalse(model.showsInspector)
+    }
+
+    func testSelectedPickerPreviewPresentsOneTranscriptWithAgentMetadata() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.selectedSessionID = "chat-1"
+        model.submitPickerOption(try FrontendPickerOption(json: .object([
+            "label": .string("reviewer"),
+            "description": .string("running"),
+            "detail": .string("gpt-5.6-sol"),
+            "op": .object([
+                "type": .string("capability_command"),
+                "capability": .string("subagents"),
+                "command": .string("subagents"),
+                "arguments": .string("reviewer")
+            ])
+        ])))
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        let submission = try XCTUnwrap(requests.lazy.compactMap { request -> Submission? in
+            guard case .submit(_, let submission) = request else { return nil }
+            return submission
+        }.first)
+        let block = FrontendBlock(
+            id: "worker/message",
+            group: nil,
+            append: false,
+            pending: false,
+            text: "Done",
+            format: "plain_text",
+            tone: "success"
+        )
+        model.reduce(
+            event: AgentEventRecord(submissionId: submission.id, msg: .object([
+                "type": .string("frontend"),
+                "frontendType": .string("preview"),
+                "title": .string("reviewer"),
+                "events": .array([])
+            ])),
+            blocks: [],
+            preview: RenderedPreview(title: "reviewer", events: [
+                RenderedEventRecord(event: .object(["type": .string("agent_message")]), blocks: [block])
+            ])
+        )
+
+        XCTAssertEqual(model.presentedPreview?.title, "reviewer")
+        XCTAssertEqual(model.presentedPreview?.status, "running")
+        XCTAssertEqual(model.presentedPreview?.model, "gpt-5.6-sol")
+        XCTAssertEqual(model.presentedPreview?.blocks.map(\.block.text), ["Done"])
+        XCTAssertFalse(model.showsInspector)
+    }
+
+    func testFrontendPickerUsesGenericPromptForAnyCapability() throws {
+        let model = try model()
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("frontend"),
+                "frontendType": .string("picker"),
+                "title": .string("Choose a review action"),
+                "options": .array([.object([
+                    "label": .string("Accept"),
+                    "description": .string("Accept the review result."),
+                    "detail": .string("reviewer-v1"),
+                    "op": .object([
+                        "type": .string("capability_command"),
+                        "capability": .string("reviewer"),
+                        "command": .string("accept"),
+                        "arguments": .string("")
+                    ])
+                ])])
+            ])),
+            blocks: [],
+            preview: nil
+        )
+
+        XCTAssertEqual(model.pendingPicker?.title, "Choose a review action")
+        XCTAssertEqual(model.pendingPicker?.options.first?.label, "Accept")
+        XCTAssertFalse(model.showsInspector)
+    }
+
+    func testUnifiedDiffRefreshesGatewayArtifactsWithoutLocalDerivation() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.selectedSessionID = "chat-1"
+
+        model.reduce(
+            event: renderEvent(
+                capability: "reviewer",
+                text: "@@ -1 +1 @@",
+                format: "unified_diff"
+            ),
+            blocks: [],
+            preview: nil
+        )
+        try await Task.sleep(for: .milliseconds(20))
+
+        XCTAssertTrue(model.artifacts.isEmpty)
+        let requests = await recorder.requests()
+        XCTAssertTrue(requests.contains {
+            guard case .listArtifacts(_, let sessionID) = $0 else { return false }
+            return sessionID == "chat-1"
+        })
     }
 
     func testContributionCatalogReferencesAndHeaderWidgetsAreGeneric() throws {
         let model = try model()
         model.contributions = [FrontendContribution(
             capability: "tasks",
+            count: 3,
             commands: [FrontendCommand(
                 name: "tasks",
                 arguments: "[filter]",
@@ -183,10 +408,20 @@ final class AppModelTests: XCTestCase {
                 slot: "header",
                 text: "3 tasks",
                 tone: "success",
+                symbol: nil,
+                iconOnly: false,
+                progress: nil,
+                content: nil,
                 action: nil
             )],
             references: [FrontendReference(trigger: "$", value: "planning", description: "Planning skill")],
             activeInput: nil
+        )]
+        model.middlewareFeatures = [MiddlewareFeature(
+            id: "tasks",
+            label: "Work items",
+            description: "Tracks work items.",
+            required: false
         )]
         model.mountedWidgets = model.contributions.flatMap { contribution in
             contribution.widgets.map {
@@ -196,6 +431,11 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.capabilityCommands.first?.command.name, "tasks")
         XCTAssertEqual(model.headerWidgets.first?.widget.text, "3 tasks")
+        XCTAssertEqual(model.middlewareContributionCounts, [MiddlewareContributionCount(
+            id: "tasks",
+            label: "Work items",
+            value: 3
+        )])
         let text = "Use $plan"
         let suggestions = try XCTUnwrap(model.referenceSuggestions(in: text, cursor: text.endIndex))
         XCTAssertEqual(String(text[suggestions.range]), "$plan")
@@ -223,12 +463,17 @@ final class AppModelTests: XCTestCase {
                     "totalTokenUsage": .object([
                         "inputTokens": .number(1_000),
                         "cachedInputTokens": .number(100),
+                        "cacheWriteInputTokens": .number(25),
+                        "outputTokens": .number(100),
+                        "reasoningOutputTokens": .number(50),
                         "totalTokens": .number(1_100)
                     ]),
                     "lastTokenUsage": .object([
                         "inputTokens": .number(40),
                         "cachedInputTokens": .number(20),
+                        "cacheWriteInputTokens": .number(5),
                         "outputTokens": .number(10),
+                        "reasoningOutputTokens": .number(3),
                         "totalTokens": .number(99)
                     ]),
                     "modelContextWindow": .number(200)
@@ -250,41 +495,25 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.transcript.map(\.tone), ["warning", "success", "warning"])
         XCTAssertEqual(model.currentUsage.inputTokens, 1_000)
         XCTAssertEqual(model.lastUsage.cachedInputTokens, 20)
+        XCTAssertEqual(model.lastUsage.cacheWriteInputTokens, 5)
         XCTAssertEqual(model.contextTokens, 99)
         XCTAssertEqual(model.modelContextWindow, 200)
     }
 
-    func testSessionActivityShowsOnlyUnseenCompletion() throws {
+    func testSessionSnapshotsDriveActivityAndOnlyUnseenCompletion() throws {
         let model = try model()
+        model.applySessions([session(state: .idle)])
         model.selectedSessionID = "chat-1"
         model.destination = .agent
         model.setChatVisible(false)
 
-        model.updateSessionActivity(
-            sessionID: "chat-1",
-            event: AgentEventRecord(submissionId: nil, msg: .object([
-                "type": .string("task_started"),
-                "turnId": .string("turn-1")
-            ]))
-        )
+        model.applySessions([session(state: .running, turnID: "turn-1")])
         XCTAssertTrue(model.runningSessionIDs.contains("chat-1"))
 
-        model.updateSessionActivity(
-            sessionID: "chat-1",
-            event: AgentEventRecord(submissionId: nil, msg: .object([
-                "type": .string("exec_approval_request"),
-                "id": .string("approval-1")
-            ]))
-        )
+        model.applySessions([session(state: .awaitingApproval, turnID: "turn-1")])
         XCTAssertEqual(model.toast?.tone, .warning)
 
-        model.updateSessionActivity(
-            sessionID: "chat-1",
-            event: AgentEventRecord(submissionId: nil, msg: .object([
-                "type": .string("task_complete"),
-                "turnId": .string("turn-1")
-            ]))
-        )
+        model.applySessions([session(state: .idle, outcome: .completed)])
         XCTAssertFalse(model.runningSessionIDs.contains("chat-1"))
         XCTAssertTrue(model.unreadSessionIDs.contains("chat-1"))
         XCTAssertEqual(model.toast?.tone, .success)
@@ -293,43 +522,59 @@ final class AppModelTests: XCTestCase {
         model.setChatVisible(true)
         XCTAssertFalse(model.unreadSessionIDs.contains("chat-1"))
         model.dismissToast()
-        model.updateSessionActivity(
-            sessionID: "chat-1",
-            event: AgentEventRecord(submissionId: nil, msg: .object([
-                "type": .string("task_complete"),
-                "turnId": .string("turn-2")
-            ]))
-        )
+        model.applySessions([session(state: .running, turnID: "turn-2")])
+        model.applySessions([session(state: .idle, outcome: .completed)])
         XCTAssertNil(model.toast)
     }
 
-    func testAgentErrorOutranksAbortWithoutDroppingLaterFeedback() throws {
+    func testFailedSessionSnapshotUsesGatewayMessage() throws {
         let model = try model()
+        model.applySessions([session(state: .idle)])
         model.selectedSessionID = "chat-1"
         model.setChatVisible(false)
 
-        model.updateSessionActivity(
-            sessionID: "chat-1",
-            event: AgentEventRecord(submissionId: nil, msg: .object([
-                "type": .string("error"),
-                "message": .string("Provider failed")
-            ]))
-        )
-        model.updateSessionActivity(
-            sessionID: "chat-1",
-            event: AgentEventRecord(submissionId: nil, msg: .object([
-                "type": .string("turn_aborted"),
-                "turnId": .string("turn-1")
-            ]))
-        )
+        model.applySessions([session(state: .running, turnID: "turn-1")])
+        model.applySessions([session(
+            state: .idle,
+            outcome: .failed,
+            message: "Provider failed"
+        )])
 
-        XCTAssertEqual(model.toast?.message, "Provider failed")
+        XCTAssertEqual(model.toast?.message, "Review failed: Provider failed.")
         XCTAssertEqual(model.toast?.tone, .error)
         XCTAssertTrue(model.unreadSessionIDs.contains("chat-1"))
 
         model.showToast("Credential saved.", tone: .success)
         XCTAssertEqual(model.toast?.message, "Credential saved.")
         XCTAssertEqual(model.toast?.tone, .success)
+    }
+
+    func testAgentEventsDoNotDriveCatalogActivityOrToasts() throws {
+        let model = try model()
+        model.applySessions([session(state: .idle)])
+        model.selectedSessionID = "chat-1"
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("task_started"),
+                "turnId": .string("turn-1")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("error"),
+                "message": .string("Provider failed")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+
+        XCTAssertFalse(model.runningSessionIDs.contains("chat-1"))
+        XCTAssertTrue(model.unreadSessionIDs.isEmpty)
+        XCTAssertNil(model.toast)
+        XCTAssertEqual(model.transcript.last?.text, "Provider failed")
     }
 
     func testSetupValidationUsesGlobalToast() throws {
@@ -346,6 +591,271 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.toast?.message, "Enter an API key. It will be sent once and never read back.")
         XCTAssertEqual(model.toast?.tone, .error)
+    }
+
+    func testProviderSelectionUsesGatewayManifestDefaults() throws {
+        let model = try model()
+        model.agentDraft = AgentComposition(
+            provider: ProviderConfig(
+                provider: "old",
+                model: "old-model",
+                baseUrl: nil,
+                reasoningEffort: nil,
+                webSearch: .live
+            ),
+            middleware: MiddlewareConfig(
+                enabled: [],
+                subagents: SubagentConfig(modelRoute: nil)
+            ),
+            approval: .on,
+            systemPrompt: "Test"
+        )
+        model.providerStatuses = [ProviderStatus(
+            provider: "kimi",
+            label: "Kimi",
+            symbol: "moon",
+            description: "Kimi Chat Completions API",
+            configured: true,
+            auth: .apiKey,
+            defaultBaseUrl: nil,
+            defaultApiKeyEnv: "MOONSHOT_API_KEY",
+            models: [
+                ProviderModel(
+                    id: "kimi-k3",
+                    label: "Kimi K3",
+                    description: "Agentic coding model",
+                    contextWindow: 1_048_576,
+                    reasoning: [ReasoningChoice(
+                        id: "max",
+                        label: "Maximum",
+                        description: "Maximum reasoning"
+                    )],
+                    defaultReasoning: "max"
+                ),
+                ProviderModel(
+                    id: "kimi-k2.7-code",
+                    label: "Kimi K2.7 Code",
+                    description: "Coding model",
+                    contextWindow: 262_144,
+                    reasoning: [],
+                    defaultReasoning: nil
+                )
+            ],
+            webSearch: [.off]
+        )]
+
+        model.selectProvider("kimi")
+
+        XCTAssertEqual(model.agentDraft?.provider.model, "kimi-k3")
+        XCTAssertEqual(model.agentDraft?.provider.reasoningEffort, "max")
+        XCTAssertEqual(model.agentDraft?.provider.webSearch, .off)
+
+        model.selectProviderModel("kimi-k2.7-code")
+
+        XCTAssertEqual(model.agentDraft?.provider.model, "kimi-k2.7-code")
+        XCTAssertNil(model.agentDraft?.provider.reasoningEffort)
+    }
+
+    func testSubagentDefaultsUseExactGatewayModelRoutes() throws {
+        let model = try model()
+        model.agentDraft = AgentComposition(
+            provider: ProviderConfig(
+                provider: "openai_socket",
+                model: "gpt-5.6-sol",
+                baseUrl: nil,
+                reasoningEffort: "medium",
+                webSearch: .off
+            ),
+            middleware: MiddlewareConfig(
+                enabled: ["subagents"],
+                subagents: SubagentConfig(modelRoute: nil)
+            ),
+            approval: .on,
+            systemPrompt: "Test"
+        )
+        model.middlewareFeatures = [MiddlewareFeature(
+            id: "subagents",
+            label: "Subagents",
+            description: "Delegate focused work.",
+            required: false
+        )]
+        model.modelChoices = [
+            ModelChoice(
+                route: "openai_socket::gpt-5.6-sol::medium",
+                group: "OpenAI · GPT-5.6 Sol",
+                model: "gpt-5.6-sol",
+                reasoningEffort: "medium",
+                contextWindow: 1_050_000
+            ),
+            ModelChoice(
+                route: "openai_socket::gpt-5.6-sol::high",
+                group: "OpenAI · GPT-5.6 Sol",
+                model: "gpt-5.6-sol",
+                reasoningEffort: "high",
+                contextWindow: 1_050_000
+            ),
+            ModelChoice(
+                route: "kimi::kimi-k3",
+                group: "Kimi · K3",
+                model: "kimi-k3",
+                reasoningEffort: nil,
+                contextWindow: 1_048_576
+            )
+        ]
+
+        XCTAssertTrue(model.isSubagentsEnabledInDraft)
+        XCTAssertEqual(model.subagentModelOptions.map(\.group), [
+            "OpenAI · GPT-5.6 Sol",
+            "Kimi · K3"
+        ])
+
+        let openAI = try XCTUnwrap(model.subagentModelOptions.first)
+        model.selectSubagentModelOption(openAI.id)
+        XCTAssertEqual(
+            model.agentDraft?.middleware.subagents.modelRoute,
+            "openai_socket::gpt-5.6-sol::medium"
+        )
+        XCTAssertEqual(model.subagentReasoningChoices.map(\.reasoningEffort), ["medium", "high"])
+
+        model.selectSubagentReasoningRoute("openai_socket::gpt-5.6-sol::high")
+        XCTAssertEqual(
+            model.agentDraft?.middleware.subagents.modelRoute,
+            "openai_socket::gpt-5.6-sol::high"
+        )
+
+        model.selectSubagentModelOption(nil)
+        XCTAssertNil(model.agentDraft?.middleware.subagents.modelRoute)
+    }
+
+    func testGatewayDefaultRefreshDoesNotOverwriteActiveAgentDraft() throws {
+        let model = try model()
+        let active = AgentComposition(
+            provider: ProviderConfig(
+                provider: "openai_socket",
+                model: "gpt-5.6-sol",
+                baseUrl: nil,
+                reasoningEffort: "medium",
+                webSearch: .cached
+            ),
+            middleware: MiddlewareConfig(
+                enabled: ["skills"],
+                subagents: SubagentConfig(modelRoute: nil)
+            ),
+            approval: .on,
+            systemPrompt: "Active"
+        )
+        var edited = active
+        edited.systemPrompt = "Unsaved active edit"
+        var gatewayDefault = active
+        gatewayDefault.systemPrompt = "New chat default"
+        model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
+        model.agentDraft = edited
+
+        model.applyGatewayCatalog(ReadyPayload(
+            sessions: [],
+            providers: [],
+            defaultConfig: VersionedAgentConfig(revision: 8, config: gatewayDefault),
+            models: [],
+            middlewareFeatures: [],
+            maxActiveSessions: 4
+        ))
+
+        XCTAssertEqual(model.agentSnapshot, VersionedAgentConfig(revision: 3, config: active))
+        XCTAssertEqual(model.agentDraft, edited)
+        XCTAssertEqual(
+            model.defaultAgentSnapshot,
+            VersionedAgentConfig(revision: 8, config: gatewayDefault)
+        )
+    }
+
+    func testProviderRegistrationChainsIntoActiveChatConfiguration() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        let draft = composition(systemPrompt: "Active draft")
+        model.selectedSessionID = "chat-1"
+        model.agentSnapshot = VersionedAgentConfig(revision: 3, config: composition())
+        model.agentDraft = draft
+
+        model.changeProviderForCurrentChat()
+        try await Task.sleep(for: .milliseconds(20))
+
+        let registrationRequests = await recorder.requests()
+        let registration = try XCTUnwrap(
+            registrationRequests.lazy.compactMap { request -> String? in
+                guard case .registerProvider(let requestID, _) = request else { return nil }
+                return requestID
+            }.first
+        )
+        model.applyGatewayConfigurationResponse(
+            requestID: registration,
+            payload: ready(defaultConfig: VersionedAgentConfig(
+                revision: 8,
+                config: composition(systemPrompt: "Gateway default")
+            ))
+        )
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        guard let configured = requests.first(where: {
+            if case .configureSession = $0 { return true }
+            return false
+        }), case .configureSession(
+            _,
+            let sessionID,
+            let expectedRevision,
+            let config
+        ) = configured else {
+            return XCTFail("Expected provider registration to configure the active chat")
+        }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(expectedRevision, 3)
+        XCTAssertEqual(config, draft)
+    }
+
+    func testProviderRegistrationChainsIntoDefaultConfiguration() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        let draft = composition(systemPrompt: "New default")
+        model.selectedSessionID = "chat-1"
+        model.agentSnapshot = VersionedAgentConfig(revision: 3, config: composition())
+        model.agentDraft = draft
+
+        model.saveProviderAsDefault()
+        try await Task.sleep(for: .milliseconds(20))
+
+        let registrationRequests = await recorder.requests()
+        let registration = try XCTUnwrap(
+            registrationRequests.lazy.compactMap { request -> String? in
+                guard case .registerProvider(let requestID, _) = request else { return nil }
+                return requestID
+            }.first
+        )
+        model.applyGatewayConfigurationResponse(
+            requestID: registration,
+            payload: ready(defaultConfig: VersionedAgentConfig(
+                revision: 8,
+                config: composition(systemPrompt: "Previous default")
+            ))
+        )
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        guard let configured = requests.first(where: {
+            if case .configureDefaultAgent = $0 { return true }
+            return false
+        }), case .configureDefaultAgent(
+            _,
+            let expectedRevision,
+            let config
+        ) = configured else {
+            return XCTFail("Expected provider registration to configure the gateway default")
+        }
+        XCTAssertEqual(expectedRevision, 8)
+        XCTAssertEqual(config, draft)
     }
 
     func testTranscriptReplayDoesNotShowStaleErrorToast() throws {

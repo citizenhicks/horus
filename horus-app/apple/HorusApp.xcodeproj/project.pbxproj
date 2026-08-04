@@ -22,7 +22,6 @@
 		20000000000000000000000D /* GatewayWireTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000000C /* GatewayWireTests.swift */; };
 		20000000000000000000000E /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 10000000000000000000000F /* XCTest.framework */; };
 		200000000000000000000011 /* MarkdownView in Frameworks */ = {isa = PBXBuildFile; productRef = 800000000000000000000001 /* MarkdownView */; };
-		200000000000000000000012 /* LucideIcons in Frameworks */ = {isa = PBXBuildFile; productRef = 800000000000000000000002 /* LucideIcons */; };
 		200000000000000000000013 /* GatewayStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000006 /* GatewayStore.swift */; };
 		200000000000000000000014 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000010 /* PrivacyInfo.xcprivacy */; };
 		200000000000000000000015 /* AppModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000011 /* AppModelTests.swift */; };
@@ -66,7 +65,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				200000000000000000000011 /* MarkdownView in Frameworks */,
-				200000000000000000000012 /* LucideIcons in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -170,7 +168,6 @@
 			name = HorusApp;
 			packageProductDependencies = (
 				800000000000000000000001 /* MarkdownView */,
-				800000000000000000000002 /* LucideIcons */,
 			);
 			productName = Horus;
 			productReference = 10000000000000000000000D /* Horus.app */;
@@ -223,7 +220,6 @@
 			mainGroup = 000000000000000000000002;
 			packageReferences = (
 				700000000000000000000001 /* XCRemoteSwiftPackageReference "MarkdownView" */,
-				700000000000000000000002 /* XCRemoteSwiftPackageReference "lucide-icons-swift" */,
 			);
 			productRefGroup = 000000000000000000000003 /* Products */;
 			projectDirPath = "";
@@ -472,11 +468,12 @@
 				BUNDLE_LOADER = "";
 				"BUNDLE_LOADER[sdk=iphonesimulator*]" = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 3T68GZFAR6;
 				GENERATE_INFOPLIST_FILE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				PRODUCT_BUNDLE_IDENTIFIER = app.horus.client.wire-tests;
-				PRODUCT_NAME = "$(TARGET_NAME)";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "app.horus.client.wire-tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				SWIFT_STRICT_CONCURRENCY = complete;
 				SWIFT_VERSION = 5.0;
@@ -491,11 +488,12 @@
 				BUNDLE_LOADER = "";
 				"BUNDLE_LOADER[sdk=iphonesimulator*]" = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 3T68GZFAR6;
 				GENERATE_INFOPLIST_FILE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				PRODUCT_BUNDLE_IDENTIFIER = app.horus.client.wire-tests;
-				PRODUCT_NAME = "$(TARGET_NAME)";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "app.horus.client.wire-tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				SWIFT_STRICT_CONCURRENCY = complete;
 				SWIFT_VERSION = 5.0;
@@ -545,14 +543,6 @@
 				minimumVersion = 3.0.0;
 			};
 		};
-		700000000000000000000002 /* XCRemoteSwiftPackageReference "lucide-icons-swift" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/JakubMazur/lucide-icons-swift.git";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 1.28.0;
-			};
-		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -560,11 +550,6 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 700000000000000000000001 /* XCRemoteSwiftPackageReference "MarkdownView" */;
 			productName = MarkdownView;
-		};
-		800000000000000000000002 /* LucideIcons */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 700000000000000000000002 /* XCRemoteSwiftPackageReference "lucide-icons-swift" */;
-			productName = LucideIcons;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
