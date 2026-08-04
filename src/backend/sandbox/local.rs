@@ -567,13 +567,13 @@ impl LocalSandbox {
             let Some(protected) = protected else {
                 return output;
             };
-            return match (output, protected.finish().await) {
+            match (output, protected.finish().await) {
                 (output, Ok(())) => output,
                 (Ok(_), Err(cleanup)) => Err(cleanup),
                 (Err(error), Err(cleanup)) => Err(Error::Sandbox(format!(
                     "{error}; protected metadata cleanup failed: {cleanup}"
                 ))),
-            };
+            }
         }
         #[cfg(not(target_os = "linux"))]
         output
