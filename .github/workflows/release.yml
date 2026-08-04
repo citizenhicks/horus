@@ -15,8 +15,14 @@ env:
 
 jobs:
   verify:
-    name: Verify release
-    runs-on: ubuntu-22.04
+    name: Verify release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify release notes
@@ -37,6 +43,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --locked --no-deps
       - name: Install Bubblewrap
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
