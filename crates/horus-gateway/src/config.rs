@@ -23,10 +23,11 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 4;
+const CONFIG_VERSION: u32 = 5;
 const CHAT_SPEC_VERSION: u32 = 2;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
-const CONFIG_FILE: &str = "gateway.json";
+const CONFIG_FILE: &str = "gateway.toml";
+const CONFIG_HEADER: &str = "# approval options: \"on\" (prompt), \"allow\" (no prompt, no network),\n# \"allow_network\" (no prompt, network allowed).\n\n";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_API_KEY_BYTES: usize = 16 * 1024;
@@ -94,18 +95,19 @@ struct StoredCredential {
 #[serde(deny_unknown_fields)]
 struct UsageHistory {
     days: BTreeMap<u64, TokenUsage>,
-    sessions: BTreeMap<String, TokenUsage>,
 }
 
 impl Default for AgentComposition {
     fn default() -> Self {
+        let provider = provider("openai_codex").expect("default provider manifest");
+        let model = provider.models().first().expect("default model manifest");
         Self {
             provider: ProviderConfig {
-                provider: "openai_codex".into(),
-                model: "gpt-5.6-sol".into(),
-                base_url: None,
-                reasoning_effort: Some("medium".into()),
-                web_search: horus::backend::model::provider::HostedWebSearch::Off,
+                provider: provider.id().into(),
+                model: model.id.into(),
+                base_url: provider.default_base_url().map(str::to_string),
+                reasoning_effort: model.default_reasoning.map(str::to_string),
+                web_search: provider.web_search().first().copied().unwrap_or_default(),
             },
             middleware: crate::middleware_manifest::default_config(),
             approval: horus::backend::sandbox::ApprovalPolicy::On,
@@ -163,15 +165,9 @@ impl GatewayConfig {
         Ok(next)
     }
 
-    /// Records a cumulative token counter and reports whether daily usage changed.
-    pub fn observe_usage(
-        &mut self,
-        session_id: &str,
-        total: &TokenUsage,
-        live: bool,
-    ) -> Result<bool> {
-        self.usage
-            .observe(session_id, total, live, SystemTime::now())
+    /// Records one live token-usage increment and reports whether daily usage changed.
+    pub fn observe_usage(&mut self, usage: &TokenUsage) -> Result<bool> {
+        self.usage.observe(usage, SystemTime::now())
     }
 
     /// Returns frontend-safe local identity and daily aggregate usage.
@@ -245,7 +241,7 @@ impl GatewayConfig {
                 ));
             }
         }
-        for usage in self.usage.days.values().chain(self.usage.sessions.values()) {
+        for usage in self.usage.days.values() {
             validate_usage(usage)?;
         }
         Ok(())
@@ -386,7 +382,7 @@ impl ConfigStore {
         if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_CONFIG_BYTES {
             return Err(Error::Config("gateway configuration is too large".into()));
         }
-        let config: GatewayConfig = serde_json::from_slice(&contents).map_err(|error| {
+        let config: GatewayConfig = toml::from_slice(&contents).map_err(|error| {
             Error::Config(format!(
                 "gateway state at {} is incompatible with this release; remove that directory and run `horus` again: {error}",
                 store.state_dir.display()
@@ -438,7 +434,10 @@ impl ConfigStore {
 
     fn save_with_mode(&self, config: &GatewayConfig, create_new: bool) -> Result<()> {
         self.validate_config(config)?;
-        let contents = serde_json::to_vec_pretty(config)?;
+        let config = toml::to_string_pretty(config).map_err(|error| {
+            Error::Config(format!("cannot encode gateway configuration: {error}"))
+        })?;
+        let contents = format!("{CONFIG_HEADER}{config}");
         if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_CONFIG_BYTES {
             return Err(Error::Config("gateway configuration is too large".into()));
         }
@@ -446,7 +445,7 @@ impl ConfigStore {
         #[cfg(unix)]
         file.as_file()
             .set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.write_all(&contents)?;
+        file.write_all(contents.as_bytes())?;
         file.as_file().sync_all()?;
         if create_new {
             file.persist_noclobber(&self.path)
@@ -672,37 +671,20 @@ pub(crate) fn local_user_name() -> Option<String> {
 }
 
 impl UsageHistory {
-    fn observe(
-        &mut self,
-        session_id: &str,
-        total: &TokenUsage,
-        live: bool,
-        now: SystemTime,
-    ) -> Result<bool> {
-        validate_usage(total)?;
-        let previous = self.sessions.get(session_id).cloned().unwrap_or_default();
-        let Some(delta) = usage_delta(total, &previous) else {
-            self.set_baseline(session_id, total);
-            return Ok(false);
-        };
-        if !live || delta == TokenUsage::default() {
-            self.set_baseline(session_id, total);
+    fn observe(&mut self, usage: &TokenUsage, now: SystemTime) -> Result<bool> {
+        validate_usage(usage)?;
+        if usage == &TokenUsage::default() {
             return Ok(false);
         }
         let day = unix_day(now)?;
         let mut bucket = self.days.get(&day).cloned().unwrap_or_default();
         bucket
-            .checked_add(&delta)
+            .checked_add(usage)
             .ok_or_else(|| Error::Config("daily token usage overflow".into()))?;
         self.days.insert(day, bucket);
         let first_day = day.saturating_sub(USAGE_HISTORY_DAYS - 1);
         self.days.retain(|stored, _| *stored >= first_day);
-        self.set_baseline(session_id, total);
         Ok(true)
-    }
-
-    fn set_baseline(&mut self, session_id: &str, total: &TokenUsage) {
-        self.sessions.insert(session_id.into(), total.clone());
     }
 }
 
@@ -714,7 +696,15 @@ fn unix_day(now: SystemTime) -> Result<u64> {
         / SECONDS_PER_DAY)
 }
 
-fn usage_delta(current: &TokenUsage, previous: &TokenUsage) -> Option<TokenUsage> {
+pub(crate) fn usage_delta(
+    current: &TokenUsage,
+    previous: &TokenUsage,
+) -> Result<Option<TokenUsage>> {
+    validate_usage(current)?;
+    Ok(checked_usage_delta(current, previous).filter(usage_nonnegative))
+}
+
+fn checked_usage_delta(current: &TokenUsage, previous: &TokenUsage) -> Option<TokenUsage> {
     Some(TokenUsage {
         input_tokens: current.input_tokens.checked_sub(previous.input_tokens)?,
         cached_input_tokens: current
@@ -729,7 +719,6 @@ fn usage_delta(current: &TokenUsage, previous: &TokenUsage) -> Option<TokenUsage
             .checked_sub(previous.reasoning_output_tokens)?,
         total_tokens: current.total_tokens.checked_sub(previous.total_tokens)?,
     })
-    .filter(usage_nonnegative)
 }
 
 fn validate_usage(usage: &TokenUsage) -> Result<()> {
@@ -767,6 +756,39 @@ mod tests {
         assert!(serialized.get("workspace").is_none());
         assert!(serialized["default_agent"].is_null());
         assert_eq!(serialized["configured_providers"], serde_json::json!({}));
+        assert!(serialized["usage"].get("sessions").is_none());
+    }
+
+    #[test]
+    fn generated_toml_documents_approval_and_round_trips() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let state = root.path().join("state");
+        let (store, config) =
+            ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize state");
+        let mut config = config
+            .registering_provider(AgentComposition::default().provider)
+            .expect("register provider");
+        let usage = TokenUsage {
+            input_tokens: 7,
+            total_tokens: 7,
+            ..TokenUsage::default()
+        };
+        config
+            .usage
+            .observe(
+                &usage,
+                UNIX_EPOCH + std::time::Duration::from_secs(2 * SECONDS_PER_DAY),
+            )
+            .expect("record usage");
+        store.save(&config).expect("save config");
+
+        let contents = fs::read_to_string(state.join(CONFIG_FILE)).expect("read config");
+        let (_, restored) = ConfigStore::open(state).expect("open config");
+
+        assert!(contents.starts_with(CONFIG_HEADER));
+        assert!(contents.contains("approval = \"on\""));
+        assert!(!contents.contains("sessions"));
+        assert_eq!(restored, config);
     }
 
     #[test]
@@ -1004,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_session_usage_keeps_independent_baselines() {
+    fn usage_history_aggregates_live_increments() {
         let now = UNIX_EPOCH + std::time::Duration::from_secs(2 * SECONDS_PER_DAY);
         let usage = |tokens| TokenUsage {
             input_tokens: tokens,
@@ -1013,28 +1035,9 @@ mod tests {
         };
         let mut history = UsageHistory::default();
 
-        assert!(
-            !history
-                .observe("session-a", &usage(100), false, now)
-                .expect("baseline a")
-        );
-        assert!(
-            !history
-                .observe("session-b", &usage(200), false, now)
-                .expect("baseline b")
-        );
-        assert!(
-            history
-                .observe("session-a", &usage(130), true, now)
-                .expect("observe a")
-        );
-        assert!(
-            history
-                .observe("session-b", &usage(240), true, now)
-                .expect("observe b")
-        );
+        assert!(history.observe(&usage(30), now).expect("observe first"));
+        assert!(history.observe(&usage(40), now).expect("observe second"));
 
-        assert_eq!(history.sessions.len(), 2);
         assert_eq!(history.days.get(&2), Some(&usage(70)));
     }
 

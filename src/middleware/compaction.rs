@@ -15,12 +15,12 @@ use crate::Result;
 use crate::backend::model::CompactOutput;
 use crate::backend::model::CompactRequest;
 use crate::backend::model::ModelRequest;
-use crate::backend::model::internal_message_kind;
 use crate::backend::model::internal_user_message;
 use crate::backend::model::user_message;
 use crate::protocol::EventMsg;
 use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendTone;
+use crate::protocol::internal_message_kind;
 
 const KEEP_RECENT_TOKENS: usize = 20_000;
 const MAX_SUMMARY_TOOL_RESULT_CHARS: usize = 2_000;

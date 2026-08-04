@@ -23,8 +23,11 @@ use crate::protocol::FrontendEvent;
 use crate::protocol::FrontendTone;
 use crate::protocol::SessionContext;
 use crate::protocol::TokenUsage;
+use crate::protocol::ToolCallBeginEvent;
+use crate::protocol::ToolCallEndEvent;
 
 pub mod compaction;
+pub mod cron;
 pub mod instructions;
 pub mod sessions;
 pub mod skills;
@@ -181,28 +184,14 @@ pub struct MiddlewareCommandOutput {
 /// Read-only middleware UI surface consumed by a frontend shell.
 #[derive(Clone)]
 pub struct FrontendExtensions {
-    sandbox: Arc<Sandbox>,
     stack: MiddlewareStack,
     contributions: Arc<[FrontendContribution]>,
 }
 
 impl FrontendExtensions {
-    pub(crate) fn new(sandbox: Arc<Sandbox>, stack: MiddlewareStack) -> Result<Self> {
-        let sandbox_contribution = sandbox.frontend();
-        if sandbox_contribution.capability != sandbox.name() {
-            return Err(Error::Config(format!(
-                "sandbox exported frontend metadata for `{}`",
-                sandbox_contribution.capability
-            )));
-        }
-        if sandbox_contribution.active_input.is_some() {
-            return Err(Error::Config("sandbox cannot own active-turn input".into()));
-        }
-        let mut contributions = vec![sandbox_contribution];
-        contributions.extend(stack.declared_frontend()?);
-        validate_frontend(&contributions)?;
+    pub(crate) fn new(stack: MiddlewareStack) -> Result<Self> {
+        let contributions = stack.frontend()?;
         Ok(Self {
-            sandbox,
             stack,
             contributions: contributions.into(),
         })
@@ -217,15 +206,14 @@ impl FrontendExtensions {
     /// Lets installed middleware render capability-specific events.
     #[must_use]
     pub fn render(&self, event: &EventMsg) -> Vec<FrontendBlock> {
-        self.sandbox
-            .render(event)
-            .map(|block| block.namespaced(self.sandbox.name()))
-            .into_iter()
-            .chain(self.stack.entries.iter().filter_map(|entry| {
+        self.stack
+            .entries
+            .iter()
+            .filter_map(|entry| {
                 entry
                     .render(event)
                     .map(|block| block.namespaced(entry.name()))
-            }))
+            })
             .collect()
     }
 }
@@ -346,6 +334,52 @@ pub trait Middleware: Send + Sync {
     }
 }
 
+impl Middleware for Sandbox {
+    fn name(&self) -> &'static str {
+        "sandbox"
+    }
+
+    fn frontend(&self) -> FrontendContribution {
+        Sandbox::frontend(self)
+    }
+
+    fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
+        Sandbox::render(self, event)
+    }
+
+    fn command<'a>(
+        &'a self,
+        context: MiddlewareCommandContext<'a>,
+    ) -> BoxFuture<'a, Result<MiddlewareCommandOutput>> {
+        Box::pin(async move {
+            Sandbox::command(
+                self,
+                context.session_id,
+                &context.checkpoints,
+                context.command,
+                context.arguments,
+            )
+            .await
+            .map(MiddlewareCommandOutput::events)
+        })
+    }
+
+    fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            for event in
+                Sandbox::initialize(self, &context.session_id, &context.checkpoints).await?
+            {
+                (context.frontend)(event);
+            }
+            Ok(())
+        })
+    }
+
+    fn shutdown<'a>(&'a self, context: SessionEndContext) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { Sandbox::shutdown(self, &context.session_id).await })
+    }
+}
+
 /// A validated, declaration-ordered middleware pipeline.
 #[derive(Clone)]
 pub struct MiddlewareStack {
@@ -379,11 +413,25 @@ impl MiddlewareStack {
         Ok(Self { entries })
     }
 
+    pub(crate) fn with_sandbox(&self, sandbox: Arc<Sandbox>) -> Result<Self> {
+        let mut entries: Vec<Arc<dyn Middleware>> = vec![sandbox];
+        entries.extend(self.entries.iter().cloned());
+        Self::new(entries)
+    }
+
     /// Builds the immutable tool catalog once.
     pub fn catalog(&self, runtime: &RuntimeContext) -> Result<Catalog> {
         let mut catalog = Catalog::default();
         for entry in &self.entries {
+            let registered = catalog.definitions();
             entry.register(&mut catalog, runtime)?;
+            for definition in catalog.definitions().iter().filter(|definition| {
+                !registered
+                    .iter()
+                    .any(|registered| registered.name == definition.name)
+            }) {
+                validate_tool_rendering(entry.as_ref(), &definition.name)?;
+            }
         }
         Ok(catalog)
     }
@@ -545,6 +593,49 @@ impl MiddlewareStack {
     }
 }
 
+fn validate_tool_rendering(middleware: &dyn Middleware, tool_name: &str) -> Result<()> {
+    let events = [
+        (
+            "ToolCallBegin",
+            EventMsg::ToolCallBegin(ToolCallBeginEvent {
+                turn_id: "validation".into(),
+                call_id: "validation".into(),
+                name: tool_name.into(),
+                arguments: serde_json::json!({}),
+            }),
+        ),
+        (
+            "successful ToolCallEnd",
+            EventMsg::ToolCallEnd(ToolCallEndEvent {
+                turn_id: "validation".into(),
+                call_id: "validation".into(),
+                name: tool_name.into(),
+                output: String::new(),
+                is_error: false,
+            }),
+        ),
+        (
+            "error ToolCallEnd",
+            EventMsg::ToolCallEnd(ToolCallEndEvent {
+                turn_id: "validation".into(),
+                call_id: "validation".into(),
+                name: tool_name.into(),
+                output: "validation error".into(),
+                is_error: true,
+            }),
+        ),
+    ];
+    for (event_name, event) in events {
+        if middleware.render(&event).is_none() {
+            return Err(Error::Config(format!(
+                "middleware `{}` registered tool `{tool_name}` but does not render `{event_name}`",
+                middleware.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_frontend(contributions: &[FrontendContribution]) -> Result<()> {
     let mut commands = BTreeSet::new();
     let mut widgets = BTreeSet::new();
@@ -609,8 +700,91 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::backend::checkpoint::sqlite::SqliteCheckpoint;
     use crate::backend::model::ModelOutput;
+    use crate::backend::model::ToolDefinition;
+    use crate::middleware::tools::Tool;
+    use crate::middleware::tools::ToolContext;
     use crate::protocol::FrontendReference;
+
+    struct UnrenderedTool;
+
+    impl Tool for UnrenderedTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "unrendered".into(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn call<'a>(
+            &'a self,
+            _context: ToolContext,
+            _arguments: Value,
+        ) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    struct ToolOwner;
+
+    impl Middleware for ToolOwner {
+        fn name(&self) -> &'static str {
+            "tool_owner"
+        }
+
+        fn register(&self, catalog: &mut Catalog, _runtime: &RuntimeContext) -> Result<()> {
+            catalog.register(Arc::new(UnrenderedTool))
+        }
+    }
+
+    struct CatchAllRenderer;
+
+    impl Middleware for CatchAllRenderer {
+        fn name(&self) -> &'static str {
+            "catch_all"
+        }
+
+        fn render(&self, _event: &EventMsg) -> Option<FrontendBlock> {
+            Some(FrontendBlock {
+                id: None,
+                group: None,
+                append: false,
+                pending: false,
+                text: String::new(),
+                format: crate::protocol::FrontendBlockFormat::PlainText,
+                tone: FrontendTone::Neutral,
+            })
+        }
+    }
+
+    #[test]
+    fn catalog_requires_the_registering_middleware_to_render_its_tools() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let runtime = RuntimeContext {
+            checkpoints: Arc::new(
+                SqliteCheckpoint::new(temporary.path().join("checkpoints.sqlite3"))
+                    .expect("checkpoint store"),
+            ),
+            session_id: "session".into(),
+            model_route: "model".into(),
+            session_context: SessionContext::default(),
+            metadata: BTreeMap::new(),
+            frontend: Arc::new(|_| {}),
+        };
+        let stack = MiddlewareStack::new(vec![Arc::new(CatchAllRenderer), Arc::new(ToolOwner)])
+            .expect("middleware stack");
+
+        assert_eq!(
+            stack
+                .catalog(&runtime)
+                .err()
+                .expect("unrendered tool should be rejected")
+                .to_string(),
+            "configuration error: middleware `tool_owner` registered tool `unrendered` but does not render `ToolCallBegin`"
+        );
+    }
 
     struct Extension;
 

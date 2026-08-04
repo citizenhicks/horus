@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use horus::backend::model::provider::{ProviderAuth, ProviderDefinition, provider};
 use horus::{Error, Result};
 use horus_gateway::wire::{
-    ArtifactRecord, ClientMessage, CronRun, CronTask, ProfileSnapshot, ProviderAuthKind,
-    ProviderStatus, ServerMessage,
+    ClientMessage, CronRun, CronTask, ProfileSnapshot, ProviderAuthKind, ProviderStatus,
+    ServerMessage,
 };
 use uuid::Uuid;
 
@@ -92,11 +92,6 @@ pub(super) fn render_response(
             Some(format!("{provider} login complete"))
         }
         ServerMessage::Profile { profile, .. } => Some(render_profile(profile)),
-        ServerMessage::Artifacts {
-            session_id,
-            artifacts,
-            ..
-        } if session_id == selected_session_id => Some(render_artifacts(artifacts)),
         ServerMessage::CronTasks {
             session_id, tasks, ..
         } if session_id == selected_session_id => Some(render_cron_tasks(tasks)),
@@ -219,22 +214,6 @@ fn render_profile(profile: &ProfileSnapshot) -> String {
         )
     }));
     lines.join("\n")
-}
-
-fn render_artifacts(artifacts: &[ArtifactRecord]) -> String {
-    if artifacts.is_empty() {
-        return "no artifacts".into();
-    }
-    artifacts
-        .iter()
-        .map(|artifact| {
-            format!(
-                "{} · {:?} · {}\n{}",
-                artifact.id, artifact.kind, artifact.title, artifact.block.text
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
 }
 
 fn render_cron_tasks(tasks: &[CronTask]) -> String {

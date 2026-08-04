@@ -2,7 +2,6 @@
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
 use std::ffi::OsStr;
 #[cfg(target_os = "linux")]
 use std::fs::File;
@@ -41,6 +40,8 @@ const MAX_COMMAND_OUTPUT_BYTES: usize = 40_000;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const PROTECTED_METADATA: [&str; 3] = [".git", ".agents", ".codex"];
 #[cfg(target_os = "linux")]
+const ISOLATED_HOME: &str = "/tmp/horus-home";
+#[cfg(target_os = "linux")]
 const PROTECTED_MARKER: &[u8] = b"horus sandbox protected metadata placeholder v1\n";
 #[cfg(target_os = "linux")]
 const MAX_JOURNAL_BYTES: u64 = 512;
@@ -69,6 +70,21 @@ pub struct LocalSandbox {
     protection_dir: Dir,
     temp: tempfile::TempDir,
     command_timeout: Duration,
+    denied_reads: Vec<DeniedRead>,
+    isolated_home: bool,
+}
+
+struct DeniedRead {
+    path: PathBuf,
+    directory: bool,
+}
+
+enum Invocation<'a> {
+    Shell(&'a str),
+    Argv {
+        executable: &'a Path,
+        arguments: &'a [&'a str],
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -140,6 +156,8 @@ impl LocalSandbox {
                 protection_dir,
                 temp,
                 command_timeout: DEFAULT_COMMAND_TIMEOUT,
+                denied_reads: Vec::new(),
+                isolated_home: false,
             })
         }
     }
@@ -151,6 +169,68 @@ impl LocalSandbox {
         }
         self.command_timeout = timeout;
         Ok(self)
+    }
+
+    /// Hides one canonical file or directory from sandboxed commands.
+    pub fn deny_read(mut self, path: impl AsRef<Path>) -> Result<Self> {
+        let path = std::fs::canonicalize(path)?;
+        if paths_overlap(&self.root, &path) {
+            return Err(Error::Config(
+                "sandbox root and denied read path must not overlap".into(),
+            ));
+        }
+        let metadata = std::fs::metadata(&path)?;
+        if !metadata.is_dir() && !metadata.is_file() {
+            return Err(Error::Config(format!(
+                "denied read path is not a file or directory: {}",
+                path.display()
+            )));
+        }
+        if self
+            .denied_reads
+            .iter()
+            .any(|denied| path == denied.path || path.starts_with(&denied.path))
+        {
+            return Ok(self);
+        }
+        if metadata.is_dir() {
+            self.denied_reads
+                .retain(|denied| !denied.path.starts_with(&path));
+        }
+        self.denied_reads.push(DeniedRead {
+            path,
+            directory: metadata.is_dir(),
+        });
+        Ok(self)
+    }
+
+    /// Uses a private writable home and excludes host user configuration variables.
+    #[must_use]
+    pub fn isolated_home(mut self) -> Self {
+        self.isolated_home = true;
+        self
+    }
+
+    /// Runs one argv command with a read-only workspace and no network access.
+    pub async fn execute_read_only(
+        &self,
+        executable: &str,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Result<CommandOutput> {
+        let executable = self.find_executable(executable)?;
+        self.execute_invocation(
+            Invocation::Argv {
+                executable: &executable,
+                arguments,
+            },
+            NetworkAccess::Denied,
+            CommandMode::Foreground,
+            CommandOutputSink::default(),
+            environment,
+            false,
+        )
+        .await
     }
 
     fn relative(&self, path: &str) -> Result<PathBuf> {
@@ -165,12 +245,26 @@ impl LocalSandbox {
         Ok(path.to_path_buf())
     }
 
-    #[cfg(target_os = "linux")]
-    fn sandboxed_command(&self, script: &str, network_access: NetworkAccess) -> Result<Command> {
+    fn find_executable(&self, name: &str) -> Result<PathBuf> {
+        if name.is_empty() || Path::new(name).file_name() != Some(OsStr::new(name)) {
+            return Err(Error::Sandbox(format!("invalid executable name: {name}")));
+        }
         let path =
             std::env::var_os("PATH").ok_or_else(|| Error::Sandbox("PATH is unavailable".into()))?;
-        let bwrap = find_bwrap(&self.root, &path)
-            .ok_or_else(|| Error::Sandbox("bubblewrap (`bwrap`) is required on Linux".into()))?;
+        find_executable_in(name, &self.root, &self.denied_reads, &path)
+            .ok_or_else(|| Error::Sandbox(format!("{name} is unavailable outside protected paths")))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sandboxed_command(
+        &self,
+        invocation: &Invocation<'_>,
+        network_access: NetworkAccess,
+        workspace_writable: bool,
+    ) -> Result<Command> {
+        let bwrap = self
+            .find_executable("bwrap")
+            .map_err(|_| Error::Sandbox("bubblewrap (`bwrap`) is required on Linux".into()))?;
         let mut command = Command::new(bwrap);
         command.args([
             "--new-session",
@@ -182,21 +276,40 @@ impl LocalSandbox {
             "/dev",
         ]);
         command.args(["--tmpfs", "/tmp"]);
+        if self.isolated_home {
+            command.args(["--dir", ISOLATED_HOME]);
+        }
         if Path::new("/run").is_dir() {
             command.args(["--tmpfs", "/run"]);
         }
-        command.arg("--bind").arg(&self.root).arg(&self.root);
-        for name in PROTECTED_METADATA {
-            let path = self.root.join(name);
-            let metadata = std::fs::symlink_metadata(&path)
-                .map_err(|_| Error::Sandbox(format!("{name} protection is unavailable")))?;
-            if metadata.file_type().is_symlink() {
-                return Err(Error::Sandbox(format!(
-                    "protected metadata path is a symlink: {}",
-                    path.display()
-                )));
+        command
+            .arg(if workspace_writable {
+                "--bind"
+            } else {
+                "--ro-bind"
+            })
+            .arg(&self.root)
+            .arg(&self.root);
+        if workspace_writable {
+            for name in PROTECTED_METADATA {
+                let path = self.root.join(name);
+                let metadata = std::fs::symlink_metadata(&path)
+                    .map_err(|_| Error::Sandbox(format!("{name} protection is unavailable")))?;
+                if metadata.file_type().is_symlink() {
+                    return Err(Error::Sandbox(format!(
+                        "protected metadata path is a symlink: {}",
+                        path.display()
+                    )));
+                }
+                command.arg("--ro-bind").arg(&path).arg(&path);
             }
-            command.arg("--ro-bind").arg(&path).arg(&path);
+        }
+        for denied in &self.denied_reads {
+            if denied.directory {
+                command.arg("--tmpfs").arg(&denied.path);
+            } else {
+                command.arg("--ro-bind").arg("/dev/null").arg(&denied.path);
+            }
         }
         command.args(["--unshare-user", "--unshare-pid"]);
         if network_access == NetworkAccess::Denied {
@@ -204,12 +317,33 @@ impl LocalSandbox {
         }
         command.args(["--proc", "/proc", "--chdir"]);
         command.arg(&self.root);
-        command.args(["--", "/bin/bash", "-lc", script]);
+        command.arg("--");
+        match invocation {
+            Invocation::Shell(script) => {
+                command.arg("/bin/bash");
+                if self.isolated_home {
+                    command.args(["--noprofile", "--norc", "-c", script]);
+                } else {
+                    command.args(["-lc", script]);
+                }
+            }
+            Invocation::Argv {
+                executable,
+                arguments,
+            } => {
+                command.arg(executable).args(arguments.iter().copied());
+            }
+        }
         Ok(command)
     }
 
     #[cfg(target_os = "macos")]
-    fn sandboxed_command(&self, script: &str, network_access: NetworkAccess) -> Result<Command> {
+    fn sandboxed_command(
+        &self,
+        invocation: &Invocation<'_>,
+        network_access: NetworkAccess,
+        workspace_writable: bool,
+    ) -> Result<Command> {
         let executable = Path::new("/usr/bin/sandbox-exec");
         if !executable.is_file() {
             return Err(Error::Sandbox(
@@ -219,8 +353,27 @@ impl LocalSandbox {
         let temp = std::fs::canonicalize(self.temp.path())?;
         let mut command = Command::new(executable);
         let mut policy = format!("{MACOS_SEATBELT_BASE_POLICY}{SEATBELT_POLICY_SUFFIX}");
+        for (index, denied) in self.denied_reads.iter().enumerate() {
+            let parameter = format!("DENIED_READ_{index}");
+            policy.push_str(&format!(
+                "\n(deny file-read*\n  (literal (param \"{parameter}\")){}\n)",
+                if denied.directory {
+                    format!("\n  (subpath (param \"{parameter}\"))")
+                } else {
+                    String::new()
+                }
+            ));
+        }
         if network_access == NetworkAccess::Allowed {
             policy.push_str("\n(allow network*)");
+        }
+        if !workspace_writable {
+            policy.push_str(
+                r#"
+(deny file-write*
+  (literal (param "WRITABLE_ROOT"))
+  (subpath (param "WRITABLE_ROOT")))"#,
+            );
         }
         command.arg("-p").arg(policy);
         for (name, path) in [
@@ -230,7 +383,17 @@ impl LocalSandbox {
             ("AGENTS_PATH", self.root.join(".agents")),
             ("CODEX_PATH", self.root.join(".codex")),
         ] {
-            command.arg(format!("-D{name}={}", path.to_string_lossy()));
+            let path = path
+                .to_str()
+                .ok_or_else(|| Error::Sandbox("sandbox path is not UTF-8".into()))?;
+            command.arg(format!("-D{name}={path}"));
+        }
+        for (index, denied) in self.denied_reads.iter().enumerate() {
+            let path = denied
+                .path
+                .to_str()
+                .ok_or_else(|| Error::Sandbox("sandbox path is not UTF-8".into()))?;
+            command.arg(format!("-DDENIED_READ_{index}={path}"));
         }
         command.args([
             "--",
@@ -240,89 +403,93 @@ impl LocalSandbox {
             "-c",
             MACOS_COMMAND_WRAPPER,
             "horus-command",
-            "/bin/bash",
-            "-lc",
-            script,
         ]);
+        match invocation {
+            Invocation::Shell(script) => {
+                command.arg("/bin/bash");
+                if self.isolated_home {
+                    command.args(["--noprofile", "--norc", "-c", script]);
+                } else {
+                    command.args(["-lc", script]);
+                }
+            }
+            Invocation::Argv {
+                executable,
+                arguments,
+            } => {
+                command.arg(executable).args(arguments.iter().copied());
+            }
+        }
         Ok(command)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn sandboxed_command(&self, _script: &str, _network_access: NetworkAccess) -> Result<Command> {
+    fn sandboxed_command(
+        &self,
+        _invocation: &Invocation<'_>,
+        _network_access: NetworkAccess,
+        _workspace_writable: bool,
+    ) -> Result<Command> {
         Err(Error::Sandbox(
             "local code execution requires Linux or macOS".into(),
         ))
     }
-}
 
-impl SandboxBackend for LocalSandbox {
-    fn read<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<String>> {
-        Box::pin(async move {
-            validate_root(&self.root, &self.root_dir)?;
-            let root = self.root_dir.try_clone()?;
-            let relative = self.relative(path)?;
-            let requested = path.to_string();
-            tokio::task::spawn_blocking(move || read_file(root, &relative, &requested))
-                .await
-                .map_err(|error| Error::Sandbox(format!("file reader failed: {error}")))?
-        })
-    }
-
-    fn write<'a>(&'a self, path: &'a str, content: &'a str) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            if content.len() > MAX_FILE_BYTES {
-                return Err(Error::Sandbox("file exceeds write limit".into()));
-            }
-            validate_root(&self.root, &self.root_dir)?;
-            let relative = self.relative(path)?;
-            let root = self.root_dir.try_clone()?;
-            let requested = path.to_string();
-            let content = content.as_bytes().to_vec();
-            tokio::task::spawn_blocking(move || atomic_write(root, &relative, &content, &requested))
-                .await
-                .map_err(|error| Error::Sandbox(format!("file writer failed: {error}")))?
-        })
-    }
-
-    fn execute<'a>(
-        &'a self,
-        script: &'a str,
+    async fn execute_invocation(
+        &self,
+        invocation: Invocation<'_>,
         network_access: NetworkAccess,
         mode: CommandMode,
         output_sink: CommandOutputSink,
-    ) -> BoxFuture<'a, Result<CommandOutput>> {
-        Box::pin(async move {
-            if script.trim().is_empty() {
-                return Err(Error::Sandbox("command is empty".into()));
-            }
-            validate_root(&self.root, &self.root_dir)?;
-            #[cfg(target_os = "linux")]
-            let protected = self.protect_command_metadata().await?;
-            let output = async {
+        environment: &[(&str, &str)],
+        workspace_writable: bool,
+    ) -> Result<CommandOutput> {
+        if matches!(&invocation, Invocation::Shell(script) if script.trim().is_empty()) {
+            return Err(Error::Sandbox("command is empty".into()));
+        }
+        validate_root(&self.root, &self.root_dir)?;
+        #[cfg(target_os = "linux")]
+        let protected = if workspace_writable {
+            Some(self.protect_command_metadata().await?)
+        } else {
+            None
+        };
+        let output =
+            async {
                 validate_root(&self.root, &self.root_dir)?;
-                let mut command = self.sandboxed_command(script, network_access)?;
-                let inherited = [
+                let mut command =
+                    self.sandboxed_command(&invocation, network_access, workspace_writable)?;
+                let mut inherited = [
                     "PATH",
-                    "HOME",
                     "USER",
                     "LOGNAME",
-                    "SHELL",
                     "LANG",
                     "LC_ALL",
                     "TERM",
-                    "CARGO_HOME",
-                    "RUSTUP_HOME",
                     "DEVELOPER_DIR",
                     "SDKROOT",
                 ]
                 .into_iter()
                 .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
                 .collect::<Vec<_>>();
+                if !self.isolated_home {
+                    inherited.extend(
+                        ["HOME", "SHELL", "CARGO_HOME", "RUSTUP_HOME"]
+                            .into_iter()
+                            .filter_map(|name| std::env::var_os(name).map(|value| (name, value))),
+                    );
+                }
                 command
                     .current_dir(&self.root)
                     .env_clear()
                     .envs(inherited)
+                    .envs(environment.iter().copied())
                     .env("TMPDIR", command_temp(self.temp.path()));
+                if self.isolated_home {
+                    command
+                        .env("HOME", command_home(self.temp.path()))
+                        .env("SHELL", "/bin/bash");
+                }
                 #[cfg(target_os = "macos")]
                 command.stdin(Stdio::piped());
                 #[cfg(not(target_os = "macos"))]
@@ -395,7 +562,11 @@ impl SandboxBackend for LocalSandbox {
                 output
             }
             .await;
-            #[cfg(target_os = "linux")]
+        #[cfg(target_os = "linux")]
+        {
+            let Some(protected) = protected else {
+                return output;
+            };
             return match (output, protected.finish().await) {
                 (output, Ok(())) => output,
                 (Ok(_), Err(cleanup)) => Err(cleanup),
@@ -403,9 +574,56 @@ impl SandboxBackend for LocalSandbox {
                     "{error}; protected metadata cleanup failed: {cleanup}"
                 ))),
             };
-            #[cfg(not(target_os = "linux"))]
-            output
+        }
+        #[cfg(not(target_os = "linux"))]
+        output
+    }
+}
+
+impl SandboxBackend for LocalSandbox {
+    fn read<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            validate_root(&self.root, &self.root_dir)?;
+            let root = self.root_dir.try_clone()?;
+            let relative = self.relative(path)?;
+            let requested = path.to_string();
+            tokio::task::spawn_blocking(move || read_file(root, &relative, &requested))
+                .await
+                .map_err(|error| Error::Sandbox(format!("file reader failed: {error}")))?
         })
+    }
+
+    fn write<'a>(&'a self, path: &'a str, content: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if content.len() > MAX_FILE_BYTES {
+                return Err(Error::Sandbox("file exceeds write limit".into()));
+            }
+            validate_root(&self.root, &self.root_dir)?;
+            let relative = self.relative(path)?;
+            let root = self.root_dir.try_clone()?;
+            let requested = path.to_string();
+            let content = content.as_bytes().to_vec();
+            tokio::task::spawn_blocking(move || atomic_write(root, &relative, &content, &requested))
+                .await
+                .map_err(|error| Error::Sandbox(format!("file writer failed: {error}")))?
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        script: &'a str,
+        network_access: NetworkAccess,
+        mode: CommandMode,
+        output_sink: CommandOutputSink,
+    ) -> BoxFuture<'a, Result<CommandOutput>> {
+        Box::pin(self.execute_invocation(
+            Invocation::Shell(script),
+            network_access,
+            mode,
+            output_sink,
+            &[],
+            true,
+        ))
     }
 }
 
@@ -694,12 +912,22 @@ fn open_private_lock(directory: &Dir, name: &str) -> Result<File> {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn find_bwrap(root: &Path, path: &OsStr) -> Option<PathBuf> {
+fn find_executable_in(
+    name: &str,
+    root: &Path,
+    denied_reads: &[DeniedRead],
+    path: &OsStr,
+) -> Option<PathBuf> {
     std::env::split_paths(path)
         .filter(|directory| directory.is_absolute())
-        .filter_map(|directory| std::fs::canonicalize(directory.join("bwrap")).ok())
-        .find(|candidate| candidate.is_file() && !candidate.starts_with(root))
+        .filter_map(|directory| std::fs::canonicalize(directory.join(name)).ok())
+        .find(|candidate| {
+            candidate.is_file()
+                && !candidate.starts_with(root)
+                && denied_reads
+                    .iter()
+                    .all(|denied| !candidate.starts_with(&denied.path))
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -1020,6 +1248,10 @@ fn same_cap_file(_left: &cap_std::fs::Metadata, _right: &cap_std::fs::Metadata) 
     false
 }
 
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
 #[cfg(target_os = "linux")]
 fn command_temp(_private_temp: &Path) -> &Path {
     Path::new("/tmp")
@@ -1027,6 +1259,16 @@ fn command_temp(_private_temp: &Path) -> &Path {
 
 #[cfg(not(target_os = "linux"))]
 fn command_temp(private_temp: &Path) -> &Path {
+    private_temp
+}
+
+#[cfg(target_os = "linux")]
+fn command_home(_private_temp: &Path) -> &Path {
+    Path::new(ISOLATED_HOME)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn command_home(private_temp: &Path) -> &Path {
     private_temp
 }
 
@@ -1194,6 +1436,44 @@ sleep 30"#;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
+    async fn isolated_home_is_private_and_writable() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sandbox = local_sandbox(workspace.path()).isolated_home();
+        let expected = command_home(sandbox.temp.path())
+            .to_string_lossy()
+            .into_owned();
+
+        let output = sandbox
+            .execute(
+                r#"test -d "$HOME" && test -w "$HOME" && printf '%s' "$HOME""#,
+                NetworkAccess::Denied,
+                CommandMode::Foreground,
+                CommandOutputSink::default(),
+            )
+            .await
+            .expect("isolated home command");
+
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert_eq!(output.stdout, expected);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn read_only_argv_cannot_modify_the_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sandbox = local_sandbox(workspace.path());
+
+        let output = sandbox
+            .execute_read_only("touch", &["blocked"], &[])
+            .await
+            .expect("read-only command");
+
+        assert_ne!(output.exit_code, 0);
+        assert!(!workspace.path().join("blocked").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
     async fn network_policy_changes_command_isolation() {
         let workspace = tempfile::tempdir().expect("workspace");
         let sandbox = local_sandbox(workspace.path());
@@ -1203,10 +1483,10 @@ sleep 30"#;
             .await
             .expect("protect command metadata");
         let denied = sandbox
-            .sandboxed_command("true", NetworkAccess::Denied)
+            .sandboxed_command(&Invocation::Shell("true"), NetworkAccess::Denied, true)
             .expect("network-disabled command");
         let allowed = sandbox
-            .sandboxed_command("true", NetworkAccess::Allowed)
+            .sandboxed_command(&Invocation::Shell("true"), NetworkAccess::Allowed, true)
             .expect("network-enabled command");
         #[cfg(target_os = "linux")]
         _protected
@@ -1520,6 +1800,6 @@ sleep 30"#;
         std::fs::write(binaries.join("bwrap"), "").expect("create bwrap");
         symlink(&binaries, &alias).expect("create path alias");
 
-        assert!(find_bwrap(&workspace, alias.as_os_str()).is_none());
+        assert!(find_executable_in("bwrap", &workspace, &[], alias.as_os_str()).is_none());
     }
 }

@@ -1,0 +1,222 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use horus::backend::checkpoint::{CheckpointStore, SessionPageRequest};
+use serde::{Deserialize, Serialize};
+
+use crate::Result;
+use crate::wire::SessionRecord;
+
+use super::Rejection;
+
+const SESSION_PAGE_SIZE: usize = 100;
+const SESSION_CATALOG_SCOPE: &str = "gateway";
+const SESSION_CATALOG_KEY: &str = "session_catalog";
+const MAX_SESSION_TITLE_BYTES: usize = 256;
+const MAX_SESSION_PREVIEW_BYTES: usize = 512;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(super) struct SessionMetadata {
+    pub(super) title: Option<String>,
+    pub(super) pinned: bool,
+    pub(super) hidden: bool,
+}
+
+pub(super) type SessionCatalogMetadata = BTreeMap<String, SessionMetadata>;
+
+pub(super) async fn session_catalog(
+    checkpoints: &Arc<dyn CheckpointStore>,
+) -> Result<Vec<SessionRecord>> {
+    let mut cursor = None;
+    let mut sessions = Vec::new();
+    while sessions.len() < SESSION_PAGE_SIZE {
+        let page = checkpoints
+            .list_sessions_page(SessionPageRequest {
+                cursor,
+                limit: SESSION_PAGE_SIZE,
+            })
+            .await?;
+        sessions.extend(
+            page.sessions
+                .into_iter()
+                .filter(|session| session.catalog_visible),
+        );
+        let Some(next) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next);
+    }
+    sessions.truncate(SESSION_PAGE_SIZE);
+    for session in &mut sessions {
+        if let Some(message) = &mut session.first_user_message
+            && message.len() > MAX_SESSION_PREVIEW_BYTES
+        {
+            let mut end = MAX_SESSION_PREVIEW_BYTES;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+        }
+    }
+    let metadata = load_session_metadata(checkpoints).await?;
+    let mut sessions = sessions
+        .into_iter()
+        .filter_map(|summary| {
+            let metadata = metadata.get(&summary.session_id);
+            (!metadata.is_some_and(|metadata| metadata.hidden)).then(|| SessionRecord {
+                title: metadata.and_then(|metadata| metadata.title.clone()),
+                pinned: metadata.is_some_and(|metadata| metadata.pinned),
+                summary,
+            })
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        right
+            .pinned
+            .cmp(&left.pinned)
+            .then_with(|| right.summary.updated_at.cmp(&left.summary.updated_at))
+            .then_with(|| right.summary.sequence.cmp(&left.summary.sequence))
+            .then_with(|| left.summary.session_id.cmp(&right.summary.session_id))
+    });
+    Ok(sessions)
+}
+
+pub(super) async fn load_session_metadata(
+    checkpoints: &Arc<dyn CheckpointStore>,
+) -> Result<SessionCatalogMetadata> {
+    let Some(value) = checkpoints
+        .load_state(SESSION_CATALOG_SCOPE, SESSION_CATALOG_KEY)
+        .await?
+    else {
+        return Ok(SessionCatalogMetadata::default());
+    };
+    Ok(serde_json::from_value(value)?)
+}
+
+pub(super) async fn save_session_metadata(
+    checkpoints: &Arc<dyn CheckpointStore>,
+    metadata: &SessionCatalogMetadata,
+) -> Result<()> {
+    checkpoints
+        .save_state(
+            SESSION_CATALOG_SCOPE,
+            SESSION_CATALOG_KEY,
+            &serde_json::to_value(metadata)?,
+        )
+        .await?;
+    Ok(())
+}
+
+pub(super) fn validate_session_title(title: &str) -> std::result::Result<&str, Rejection> {
+    let title = title.trim();
+    if title.is_empty() || title.len() > MAX_SESSION_TITLE_BYTES {
+        return Err(Rejection {
+            code: "invalid_session_title",
+            message: format!("chat title must be 1–{MAX_SESSION_TITLE_BYTES} UTF-8 bytes"),
+            fatal: false,
+        });
+    }
+    Ok(title)
+}
+
+#[cfg(test)]
+mod tests {
+    use horus::backend::checkpoint::{Checkpoint, sqlite::SqliteCheckpoint};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn session_catalog_includes_empty_roots_and_fresh_forks() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+            SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+                .expect("checkpoints"),
+        );
+        let mut parent = Checkpoint::empty("parent");
+        parent.session_context.workspace_id = Some("workspace".into());
+        parent.sequence = 1;
+        checkpoints.save(&parent, &[]).await.expect("save parent");
+        let mut empty_root = Checkpoint::empty("empty-root");
+        empty_root.session_context.workspace_id = Some("workspace".into());
+        checkpoints
+            .save(&empty_root, &[])
+            .await
+            .expect("save empty root");
+        let mut child = Checkpoint::empty("child");
+        child.session_context.workspace_id = Some("workspace".into());
+        checkpoints
+            .fork("parent", parent.sequence, &child)
+            .await
+            .expect("fork parent");
+
+        let mut sessions = session_catalog(&checkpoints)
+            .await
+            .expect("session catalog")
+            .into_iter()
+            .map(|record| (record.summary.session_id, record.summary.parent_session_id))
+            .collect::<Vec<_>>();
+        sessions.sort();
+
+        assert_eq!(
+            sessions,
+            vec![
+                ("child".into(), Some("parent".into())),
+                ("empty-root".into(), None),
+                ("parent".into(), None)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_catalog_is_bounded_and_truncates_utf8_previews() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+            SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+                .expect("checkpoints"),
+        );
+        for index in 0..=SESSION_PAGE_SIZE {
+            let mut checkpoint = Checkpoint::empty(format!("{index:03}"));
+            checkpoint.session_context.workspace_id = Some("workspace".into());
+            checkpoint.sequence = 1;
+            checkpoint.first_user_message = Some(if index == SESSION_PAGE_SIZE {
+                "€".repeat(MAX_SESSION_PREVIEW_BYTES / '€'.len_utf8() + 1)
+            } else {
+                format!("chat {index}")
+            });
+            checkpoints.save(&checkpoint, &[]).await.expect("save chat");
+        }
+
+        let sessions = session_catalog(&checkpoints)
+            .await
+            .expect("session catalog");
+        let preview = sessions
+            .iter()
+            .find(|session| session.summary.session_id == "100")
+            .and_then(|session| session.summary.first_user_message.as_deref())
+            .expect("UTF-8 preview");
+
+        assert_eq!(sessions.len(), SESSION_PAGE_SIZE);
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.summary.session_id != "000")
+        );
+        assert_eq!(
+            preview,
+            "€".repeat(MAX_SESSION_PREVIEW_BYTES / '€'.len_utf8())
+        );
+    }
+
+    #[test]
+    fn session_titles_are_trimmed_and_bounded() {
+        assert_eq!(
+            validate_session_title("  hello  ").expect("valid title"),
+            "hello"
+        );
+        assert_eq!(
+            validate_session_title(" ").expect_err("blank title").code,
+            "invalid_session_title"
+        );
+        assert!(validate_session_title(&"x".repeat(MAX_SESSION_TITLE_BYTES + 1)).is_err());
+    }
+}

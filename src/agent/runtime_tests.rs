@@ -167,6 +167,44 @@ fn config_with_metadata_probe(
 }
 
 #[tokio::test]
+async fn sandbox_commands_use_capability_dispatch() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let mut agent = create_agent(config(workspace.path(), checkpoints, "sandbox-command"))
+        .await
+        .expect("create agent");
+    assert!(matches!(
+        agent.next_event().await.expect("configured event").msg,
+        EventMsg::SessionConfigured(_)
+    ));
+    assert!(matches!(
+        agent.next_event().await.expect("sandbox widget").msg,
+        EventMsg::Frontend(crate::protocol::FrontendEvent::Widget { capability, .. })
+            if capability == "sandbox"
+    ));
+
+    let submission_id = agent
+        .sender()
+        .submit(Op::CapabilityCommand {
+            capability: "sandbox".into(),
+            command: "permissions".into(),
+            arguments: String::new(),
+        })
+        .expect("submit sandbox command");
+    let event = agent.next_event().await.expect("sandbox command result");
+
+    assert_eq!(event.submission_id.as_deref(), Some(submission_id.as_str()));
+    assert!(matches!(
+        event.msg,
+        EventMsg::Frontend(crate::protocol::FrontendEvent::Render { capability, block })
+            if capability == "sandbox" && block.text == "approval ON"
+    ));
+}
+
+#[tokio::test]
 async fn restart_falls_back_when_the_saved_model_route_was_removed() {
     let workspace = tempfile::tempdir().expect("workspace");
     let checkpoints = Arc::new(

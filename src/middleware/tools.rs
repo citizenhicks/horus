@@ -350,7 +350,26 @@ impl Middleware for Tools {
     }
 
     fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
-        render_tool_event(event, |name| self.names.contains(name), tool_heading)
+        let mut block = render_tool_event(event, |name| self.names.contains(name), tool_heading)?;
+        match event {
+            EventMsg::ToolCallBegin(call) if call.name == "read_file" => {
+                block.group = Some(format!("read:{}", call.turn_id));
+            }
+            EventMsg::ToolCallEnd(result) if result.name == "read_file" => {
+                block.group = Some(format!("read:{}", result.turn_id));
+            }
+            EventMsg::ToolCallEnd(result)
+                if !result.is_error
+                    && result.name == "apply_patch"
+                    && Patch::from_str(&result.output).is_ok() =>
+            {
+                block.append = false;
+                block.text = result.output.clone();
+                block.format = FrontendBlockFormat::UnifiedDiff;
+            }
+            _ => {}
+        }
+        Some(block)
     }
 }
 
@@ -362,7 +381,7 @@ pub(crate) fn render_tool_event(
     match event {
         EventMsg::ToolCallBegin(call) if owns(&call.name) => Some(FrontendBlock {
             id: Some(format!("{}/{}", call.turn_id, call.call_id)),
-            group: tool_group(&call.name, &call.turn_id),
+            group: None,
             append: false,
             pending: true,
             text: heading(&call.name, &call.arguments),
@@ -370,24 +389,10 @@ pub(crate) fn render_tool_event(
             tone: FrontendTone::Neutral,
         }),
         EventMsg::ToolCallEnd(result) if owns(&result.name) => {
-            let is_patch_diff = !result.is_error
-                && result.name == "apply_patch"
-                && diffy::Patch::from_str(&result.output).is_ok();
-            if is_patch_diff {
-                return Some(FrontendBlock {
-                    id: Some(format!("{}/{}", result.turn_id, result.call_id)),
-                    group: tool_group(&result.name, &result.turn_id),
-                    append: false,
-                    pending: false,
-                    text: result.output.clone(),
-                    format: FrontendBlockFormat::UnifiedDiff,
-                    tone: FrontendTone::Success,
-                });
-            }
             let output = compact_output(&result.output);
             Some(FrontendBlock {
                 id: Some(format!("{}/{}", result.turn_id, result.call_id)),
-                group: tool_group(&result.name, &result.turn_id),
+                group: None,
                 append: true,
                 pending: false,
                 text: if output.is_empty() {
@@ -405,10 +410,6 @@ pub(crate) fn render_tool_event(
         }
         _ => None,
     }
-}
-
-fn tool_group(name: &str, turn_id: &str) -> Option<String> {
-    (name == "read_file").then(|| format!("read:{turn_id}"))
 }
 
 fn tool_heading(name: &str, arguments: &Value) -> String {

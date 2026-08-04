@@ -19,6 +19,8 @@ use super::SessionEndContext;
 use super::tools::Catalog;
 use super::tools::Tool;
 use super::tools::ToolContext;
+use super::tools::labeled_tool_heading;
+use super::tools::render_tool_event;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
@@ -26,14 +28,15 @@ use crate::agent::Agent;
 use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::model::ToolDefinition;
-use crate::backend::model::internal_message_kind;
 use crate::backend::model::internal_user_message;
-use crate::backend::model::is_internal_message;
+use crate::protocol::EventMsg;
+use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendCommand;
 use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendEvent;
 use crate::protocol::FrontendTone;
 use crate::protocol::Op;
+use crate::protocol::{internal_message_kind, is_internal_message};
 
 use self::runtime::Followup;
 use self::runtime::MAX_MESSAGE_BYTES;
@@ -336,6 +339,32 @@ impl Middleware for Subagents {
             references: Vec::new(),
             active_input: None,
         }
+    }
+
+    fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
+        render_tool_event(
+            event,
+            |name| {
+                matches!(
+                    name,
+                    "spawn_agent"
+                        | "send_message"
+                        | "followup_task"
+                        | "list_agents"
+                        | "interrupt_agent"
+                        | "wait_agent"
+                )
+            },
+            |name, arguments| match name {
+                "spawn_agent" => labeled_tool_heading("Agent", "task_name", arguments),
+                "send_message" => labeled_tool_heading("Message", "target", arguments),
+                "followup_task" => labeled_tool_heading("Follow up", "target", arguments),
+                "list_agents" => labeled_tool_heading("Agents", "path_prefix", arguments),
+                "interrupt_agent" => labeled_tool_heading("Interrupt", "target", arguments),
+                "wait_agent" => labeled_tool_heading("Wait", "timeout_ms", arguments),
+                _ => format!("◉ {name}"),
+            },
+        )
     }
 
     fn command<'a>(
@@ -933,6 +962,51 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{ToolCallBeginEvent, ToolCallEndEvent};
+
+    #[test]
+    fn renders_every_subagent_tool_call() {
+        let middleware = Subagents::new(
+            1,
+            2,
+            2,
+            Arc::new(|_| Box::pin(async { Err(Error::Stopped("unused".into())) })),
+        )
+        .expect("subagents middleware");
+
+        for name in [
+            "spawn_agent",
+            "send_message",
+            "followup_task",
+            "list_agents",
+            "interrupt_agent",
+            "wait_agent",
+        ] {
+            assert!(
+                middleware
+                    .render(&EventMsg::ToolCallBegin(ToolCallBeginEvent {
+                        turn_id: "turn".into(),
+                        call_id: "call".into(),
+                        name: name.into(),
+                        arguments: serde_json::json!({}),
+                    }))
+                    .is_some(),
+                "missing begin renderer for {name}"
+            );
+            assert!(
+                middleware
+                    .render(&EventMsg::ToolCallEnd(ToolCallEndEvent {
+                        turn_id: "turn".into(),
+                        call_id: "call".into(),
+                        name: name.into(),
+                        output: String::new(),
+                        is_error: false,
+                    }))
+                    .is_some(),
+                "missing end renderer for {name}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn fork_persists_the_metadata_passed_to_the_child() {

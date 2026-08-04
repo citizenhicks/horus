@@ -470,33 +470,22 @@ impl Runner {
         command: String,
         arguments: String,
     ) -> Result<()> {
-        let output = if capability == self.config.sandbox.name() {
-            self.config
-                .sandbox
-                .command(
-                    &self.config.session_id,
-                    &self.config.checkpoints,
-                    &command,
-                    &arguments,
-                )
-                .await
-        } else {
-            self.config
-                .middleware
-                .command(
-                    &capability,
-                    MiddlewareCommandContext {
-                        command: &command,
-                        arguments: &arguments,
-                        session_id: &self.config.session_id,
-                        session_context: &self.config.session_context,
-                        checkpoint: &self.state,
-                        checkpoints: Arc::clone(&self.config.checkpoints),
-                    },
-                )
-                .await
-                .map(|output| output.events)
-        };
+        let output = self
+            .config
+            .middleware
+            .command(
+                &capability,
+                MiddlewareCommandContext {
+                    command: &command,
+                    arguments: &arguments,
+                    session_id: &self.config.session_id,
+                    session_context: &self.config.session_context,
+                    checkpoint: &self.state,
+                    checkpoints: Arc::clone(&self.config.checkpoints),
+                },
+            )
+            .await
+            .map(|output| output.events);
         match output {
             Ok(events) => {
                 for event in events {

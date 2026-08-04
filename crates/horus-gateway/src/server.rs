@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use horus::protocol::Op;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -451,11 +450,7 @@ async fn handle_message(
                 Ok(host) => host,
                 Err(rejection) => return write_rejection(writer, request_id, rejection).await,
             };
-            let result = match &submission.op {
-                Op::SetModel { route } => host.set_model(route.clone()).await,
-                _ => host.submit(submission).await,
-            };
-            write_result(writer, request_id, result).await
+            write_result(writer, request_id, host.submit(submission).await).await
         }
         ClientMessage::ConfigureSession {
             request_id,

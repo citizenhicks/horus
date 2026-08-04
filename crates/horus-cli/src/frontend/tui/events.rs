@@ -152,28 +152,12 @@ impl TuiState {
                         selected,
                     });
                 }
-                // Preview events are replayed with middleware renderers at the
-                // frontend boundary. Nested previews are control events, not
-                // transcript content.
+                // Preview transcripts arrive as gateway-rendered records.
+                // Nested previews are control events, not transcript content.
                 FrontendEvent::Preview { .. } => {}
             },
             _ => {}
         }
-    }
-
-    #[cfg(test)]
-    fn open_preview<R>(&mut self, title: String, events: Vec<EventMsg>, render: &R)
-    where
-        R: Fn(&EventMsg) -> Vec<FrontendBlock>,
-    {
-        let mut replay = Self::default();
-        replay_preview_events(&mut replay, render, events);
-        replay.commit_reasoning();
-        replay.commit_stream();
-        self.preview = Some(PreviewState::new(
-            title,
-            PreviewContent::Snapshot(replay.transcript),
-        ));
     }
 }
 
@@ -199,32 +183,6 @@ impl UsageStatus {
             self.cache_hit
                 .map_or_else(|| "—".into(), |value| format!("{value:.1}%"))
         )
-    }
-}
-
-#[cfg(test)]
-pub(super) fn handle_event<R>(state: &mut TuiState, render: &R, event: EventMsg)
-where
-    R: Fn(&EventMsg) -> Vec<FrontendBlock>,
-{
-    match event {
-        EventMsg::Frontend(FrontendEvent::Preview { title, events }) => {
-            state.open_preview(title, events, render);
-        }
-        EventMsg::SessionHistory(history) => {
-            for event in history.events {
-                if let EventMsg::UserMessage(message) = &event {
-                    state.remember_composer_input(message.message.clone());
-                }
-                handle_event(state, render, event);
-            }
-            state.commit_reasoning();
-            state.commit_stream();
-        }
-        event => {
-            let blocks = render(&event);
-            state.handle_agent_event(event, blocks);
-        }
     }
 }
 
@@ -271,30 +229,6 @@ fn replay_gateway_event(state: &mut TuiState, event: EventMsg, blocks: Vec<Front
         }
         EventMsg::Frontend(FrontendEvent::Preview { .. }) => {}
         event => state.handle_agent_event(event, blocks),
-    }
-}
-
-#[cfg(test)]
-fn replay_preview_events<R>(state: &mut TuiState, render: &R, events: Vec<EventMsg>)
-where
-    R: Fn(&EventMsg) -> Vec<FrontendBlock>,
-{
-    for event in events {
-        match event {
-            EventMsg::SessionHistory(history) => {
-                replay_preview_events(state, render, history.events);
-            }
-            EventMsg::Frontend(
-                FrontendEvent::Widget { .. }
-                | FrontendEvent::RemoveWidget { .. }
-                | FrontendEvent::Picker { .. }
-                | FrontendEvent::Preview { .. },
-            ) => {}
-            event => {
-                let blocks = render(&event);
-                state.handle_agent_event(event, blocks);
-            }
-        }
     }
 }
 

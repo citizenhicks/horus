@@ -16,8 +16,6 @@ use ratatui::text::Line;
 
 use self::events::UsageStatus;
 #[cfg(test)]
-use self::events::handle_event;
-#[cfg(test)]
 use self::input::UiAction;
 use self::view::bounded_terminal_text;
 use self::view::initial_widgets;

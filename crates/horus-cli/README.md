@@ -84,8 +84,9 @@ result chat.
 `/login` is the single provider setup path. It opens the guided provider screen, where API keys
 can be pasted into a masked field, the environment variable declared by the provider manifest is
 used when the field is empty, and device-login providers show their login flow. There is no
-separate environment-name setting. The final page confirms the provider's model and reasoning
-choice. The gateway owns the complete configured-model catalog and
+separate environment-name setting. Setup covers the built-in manifests compiled into both the
+gateway and CLI; injected `ModelRouter` entries are library-only. The final page confirms the
+provider's model and reasoning choice. The gateway owns the complete configured-model catalog and
 new-chat default; `/model` only changes the selected chat to one of those available routes.
 `/agent` opens a one-page capability and approval-policy editor without changing the selected
 provider or system prompt. Required gateway capabilities remain visible but cannot be deselected.
