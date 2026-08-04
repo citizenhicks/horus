@@ -677,6 +677,10 @@ struct FrontendWidget: Identifiable, Codable, Sendable {
 }
 
 extension FrontendWidget {
+    init(from decoder: Decoder) throws {
+        try self.init(json: JSONValue(from: decoder))
+    }
+
     init(json: JSONValue) throws {
         guard let id = json["id"]?.stringValue,
               let slot = json["slot"]?.stringValue,
@@ -685,11 +689,20 @@ extension FrontendWidget {
         else {
             throw GatewayWireError.invalidFrame("frontend widget is missing a required field")
         }
+        guard ["header", "composer_header", "composer_footer"].contains(slot),
+              ["neutral", "success", "warning", "error"].contains(tone)
+        else {
+            throw GatewayWireError.invalidFrame("frontend widget has an unknown slot or tone")
+        }
         self.id = id
         self.slot = slot
         self.text = text
         self.tone = tone
-        self.action = try json["action"].map(AgentOperation.init(json:))
+        if let action = json["action"], action != .null {
+            self.action = try AgentOperation(json: action)
+        } else {
+            self.action = nil
+        }
     }
 }
 
@@ -697,6 +710,12 @@ struct FrontendReference: Codable, Hashable, Sendable {
     let trigger: Character
     let value: String
     let description: String
+
+    init(trigger: Character, value: String, description: String) {
+        self.trigger = trigger
+        self.value = value
+        self.description = description
+    }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -737,6 +756,52 @@ struct FrontendBlock: Codable, Hashable, Sendable {
     let tone: String
 }
 
+extension FrontendBlock {
+    init(from decoder: Decoder) throws {
+        try self.init(json: JSONValue(from: decoder))
+    }
+
+    init(json: JSONValue) throws {
+        func optionalString(_ key: String) throws -> String? {
+            switch json[key] {
+            case nil, .some(.null): return nil
+            case .some(.string(let value)): return value
+            default: throw GatewayWireError.invalidFrame("frontend block has invalid \(key)")
+            }
+        }
+
+        guard let append = json["append"]?.boolValue,
+              let pending = json["pending"]?.boolValue,
+              let text = json["text"]?.stringValue,
+              let format = json["format"]?.stringValue,
+              ["plain_text", "unified_diff"].contains(format),
+              let tone = json["tone"]?.stringValue,
+              ["neutral", "success", "warning", "error"].contains(tone)
+        else {
+            throw GatewayWireError.invalidFrame("frontend block is missing a required field")
+        }
+        id = try optionalString("id")
+        group = try optionalString("group")
+        self.append = append
+        self.pending = pending
+        self.text = text
+        self.format = format
+        self.tone = tone
+    }
+
+    func namespaced(to capability: String) -> Self {
+        Self(
+            id: id.map { "\(capability)/\($0)" },
+            group: group.map { "\(capability)/\($0)" },
+            append: append,
+            pending: pending,
+            text: text,
+            format: format,
+            tone: tone
+        )
+    }
+}
+
 struct RenderedPreview: Decodable, Sendable {
     let title: String
     let events: [RenderedEventRecord]
@@ -764,6 +829,16 @@ struct RenderedEventRecord: Decodable, Sendable {
     }
 }
 
+extension RenderedEventRecord {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: DynamicCodingKey.self)
+        let event = try container.decode(JSONValue.self, forKey: "event")
+        try AgentEventRecord.validate(event)
+        self.event = event
+        blocks = try container.decode([FrontendBlock].self, forKey: "blocks")
+    }
+}
+
 struct FrontendPickerOption: Identifiable, Sendable {
     let id = UUID()
     let label: String
@@ -786,6 +861,213 @@ struct FrontendPickerOption: Identifiable, Sendable {
 struct AgentEventRecord: Decodable, Sendable {
     let submissionId: String?
     let msg: JSONValue
+}
+
+extension AgentEventRecord {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: DynamicCodingKey.self)
+        let msg = try container.decode(JSONValue.self, forKey: "msg")
+        try Self.validate(msg)
+        submissionId = try container.decodeIfPresent(String.self, forKey: "submissionId")
+        self.msg = msg
+    }
+
+    fileprivate static func validate(_ msg: JSONValue) throws {
+        guard let type = msg["type"]?.stringValue else {
+            throw GatewayWireError.invalidFrame("agent event has no type")
+        }
+
+        func requireString(_ key: String, in value: JSONValue = msg) throws {
+            guard value[key]?.stringValue != nil else {
+                throw GatewayWireError.invalidFrame("\(type) has invalid \(key)")
+            }
+        }
+
+        func requireBool(_ key: String, in value: JSONValue = msg) throws {
+            guard value[key]?.boolValue != nil else {
+                throw GatewayWireError.invalidFrame("\(type) has invalid \(key)")
+            }
+        }
+
+        func requireInteger(_ key: String, in value: JSONValue = msg) throws {
+            guard value[key]?.intValue != nil else {
+                throw GatewayWireError.invalidFrame("\(type) has invalid \(key)")
+            }
+        }
+
+        func optionalString(_ key: String, in value: JSONValue = msg) throws {
+            guard let field = value[key], field != .null else { return }
+            guard field.stringValue != nil else {
+                throw GatewayWireError.invalidFrame("\(type) has invalid \(key)")
+            }
+        }
+
+        func optionalInteger(_ key: String, in value: JSONValue = msg) throws {
+            guard let field = value[key], field != .null else { return }
+            guard field.intValue != nil else {
+                throw GatewayWireError.invalidFrame("\(type) has invalid \(key)")
+            }
+        }
+
+        func validateContext(_ value: JSONValue) throws {
+            guard value.objectValue != nil else {
+                throw GatewayWireError.invalidFrame("\(type) has invalid context")
+            }
+            for key in ["tenantId", "userId", "userName", "workspaceId", "workspaceLabel", "originLabel"] {
+                try optionalString(key, in: value)
+            }
+        }
+
+        func validateModel(_ value: JSONValue) throws {
+            guard value.objectValue != nil else {
+                throw GatewayWireError.invalidFrame("\(type) has invalid model")
+            }
+            try requireString("route", in: value)
+            try requireString("model", in: value)
+            try optionalString("reasoningEffort", in: value)
+            try optionalInteger("modelContextWindow", in: value)
+        }
+
+        func validatePhase() throws {
+            guard let phase = msg["phase"], phase != .null else { return }
+            guard let value = phase.stringValue,
+                  ["commentary", "final_answer"].contains(value)
+            else {
+                throw GatewayWireError.invalidFrame("\(type) has invalid phase")
+            }
+        }
+
+        func validateUsage(_ value: JSONValue) throws {
+            guard value.objectValue != nil else {
+                throw GatewayWireError.invalidFrame("\(type) has invalid token usage")
+            }
+            for key in [
+                "inputTokens", "cachedInputTokens", "outputTokens",
+                "reasoningOutputTokens", "totalTokens"
+            ] {
+                try requireInteger(key, in: value)
+            }
+            if value["cacheWriteInputTokens"] != nil {
+                try requireInteger("cacheWriteInputTokens", in: value)
+            }
+        }
+
+        switch type {
+        case "error", "warning", "user_message":
+            try requireString("message")
+        case "session_configured":
+            try requireString("sessionId")
+            guard let context = msg["context"], let model = msg["model"] else {
+                throw GatewayWireError.invalidFrame("session_configured is missing context or model")
+            }
+            try validateContext(context)
+            try validateModel(model)
+        case "task_started":
+            try requireString("turnId")
+            try optionalInteger("modelContextWindow")
+        case "task_complete":
+            try requireString("turnId")
+            try optionalString("lastAgentMessage")
+        case "turn_aborted":
+            try requireString("turnId")
+            try requireString("reason")
+        case "agent_message":
+            try requireString("message")
+            try validatePhase()
+        case "agent_message_content_delta":
+            for key in ["threadId", "turnId", "itemId", "delta"] { try requireString(key) }
+            try validatePhase()
+        case "agent_reasoning_content_delta":
+            for key in ["threadId", "turnId", "itemId", "delta"] { try requireString(key) }
+        case "session_history":
+            guard let events = msg["events"]?.arrayValue else {
+                throw GatewayWireError.invalidFrame("session history is missing events")
+            }
+            try events.forEach(validate)
+        case "model_changed":
+            try validateModel(msg)
+        case "session_resume_requested":
+            try requireString("sessionId")
+            guard let context = msg["context"] else {
+                throw GatewayWireError.invalidFrame("session_resume_requested has invalid context")
+            }
+            try validateContext(context)
+        case "tool_call_begin":
+            for key in ["turnId", "callId", "name"] { try requireString(key) }
+            guard msg["arguments"] != nil else {
+                throw GatewayWireError.invalidFrame("tool_call_begin has invalid arguments")
+            }
+        case "tool_call_end":
+            for key in ["turnId", "callId", "name", "output"] { try requireString(key) }
+            try requireBool("isError")
+        case "exec_approval_request":
+            for key in ["id", "turnId", "reason"] { try requireString(key) }
+            guard let calls = msg["calls"]?.arrayValue else {
+                throw GatewayWireError.invalidFrame("exec_approval_request has invalid calls")
+            }
+            for call in calls {
+                try requireString("callId", in: call)
+                try requireString("name", in: call)
+                guard call["arguments"] != nil else {
+                    throw GatewayWireError.invalidFrame("exec_approval_request has invalid arguments")
+                }
+            }
+        case "token_count":
+            if let info = msg["info"], info != .null {
+                guard info.objectValue != nil,
+                      let total = info["totalTokenUsage"],
+                      let last = info["lastTokenUsage"]
+                else {
+                    throw GatewayWireError.invalidFrame("token_count has invalid info")
+                }
+                try validateUsage(total)
+                try validateUsage(last)
+                try optionalInteger("modelContextWindow", in: info)
+            }
+        case "context_compacted":
+            break
+        case "web_search_begin":
+            try requireString("callId")
+        case "web_search_end":
+            try requireString("callId")
+            try optionalString("query")
+            try requireString("action")
+        case "frontend":
+            guard let frontendType = msg["frontendType"]?.stringValue else {
+                throw GatewayWireError.invalidFrame("frontend event has no frontend_type")
+            }
+            switch frontendType {
+            case "render":
+                guard msg["capability"]?.stringValue != nil, let block = msg["block"] else {
+                    throw GatewayWireError.invalidFrame("frontend render is missing a required field")
+                }
+                _ = try FrontendBlock(json: block)
+            case "widget":
+                guard msg["capability"]?.stringValue != nil, let item = msg["item"] else {
+                    throw GatewayWireError.invalidFrame("frontend widget is missing a required field")
+                }
+                _ = try FrontendWidget(json: item)
+            case "remove_widget":
+                guard msg["capability"]?.stringValue != nil, msg["id"]?.stringValue != nil else {
+                    throw GatewayWireError.invalidFrame("frontend remove_widget is missing a required field")
+                }
+            case "picker":
+                guard msg["title"]?.stringValue != nil, let options = msg["options"]?.arrayValue else {
+                    throw GatewayWireError.invalidFrame("frontend picker is missing a required field")
+                }
+                try options.forEach { _ = try FrontendPickerOption(json: $0) }
+            case "preview":
+                guard msg["title"]?.stringValue != nil, let events = msg["events"]?.arrayValue else {
+                    throw GatewayWireError.invalidFrame("frontend preview is missing a required field")
+                }
+                try events.forEach(validate)
+            default:
+                throw GatewayWireError.invalidFrame("unknown frontend event \(frontendType)")
+            }
+        default:
+            throw GatewayWireError.invalidFrame("unknown agent event \(type)")
+        }
+    }
 }
 
 struct VersionedAgentConfig: Codable, Equatable, Sendable {

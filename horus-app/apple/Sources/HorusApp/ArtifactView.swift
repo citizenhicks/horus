@@ -378,9 +378,7 @@ private struct SubagentCardsView: View {
         }
     }
 
-    private var previews: [ArtifactRecord] {
-        model.artifacts.filter { $0.kind != "code_diff" }
-    }
+    private var previews: [TranscriptPreview] { model.previews }
 }
 
 private struct SubagentCard: View {
@@ -392,11 +390,12 @@ private struct SubagentCard: View {
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
             if let preview {
-                Text(preview.block.text)
-                    .foregroundStyle(palette.muted)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.bottom, 12)
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(preview.blocks) { block in
+                        PreviewBlockView(block: block.block)
+                    }
+                }
+                .padding(.bottom, 12)
             } else {
                 ProgressView().frame(maxWidth: .infinity).padding(.bottom, 12)
             }
@@ -420,23 +419,23 @@ private struct SubagentCard: View {
         }
     }
 
-    private var preview: ArtifactRecord? {
-        model.artifacts.first { $0.kind != "code_diff" && $0.title == option.label }
+    private var preview: TranscriptPreview? {
+        model.previews.first { $0.title == option.label }
     }
 }
 
 private struct PreviewCard: View {
-    @Environment(\.horusPalette) private var palette
     @State private var isExpanded = false
-    let artifact: ArtifactRecord
+    let artifact: TranscriptPreview
 
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
-            Text(artifact.block.text)
-                .foregroundStyle(palette.muted)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.bottom, 12)
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(artifact.blocks) { block in
+                    PreviewBlockView(block: block.block)
+                }
+            }
+            .padding(.bottom, 12)
         } label: {
             Text(artifact.title)
                 .font(HorusStyle.controlFont)
@@ -445,5 +444,30 @@ private struct PreviewCard: View {
         }
         .padding(.horizontal, 12)
         .horusGlass(in: RoundedRectangle(cornerRadius: HorusStyle.controlRadius, style: .continuous), interactive: true)
+    }
+}
+
+private struct PreviewBlockView: View {
+    @Environment(\.horusPalette) private var palette
+    let block: FrontendBlock
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            if block.pending { ProgressView().controlSize(.mini) }
+            Text(block.text)
+                .font(block.format == "unified_diff" ? .caption.monospaced() : HorusStyle.bodyFont)
+                .foregroundStyle(foreground)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var foreground: Color {
+        switch block.tone {
+        case "success": palette.signal
+        case "warning": palette.warning
+        case "error": palette.danger
+        default: palette.muted
+        }
     }
 }

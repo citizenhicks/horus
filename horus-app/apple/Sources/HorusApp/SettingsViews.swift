@@ -227,13 +227,7 @@ struct ProvidersView: View {
                     }
                     #endif
                     LabeledContent("Hosted web search") {
-                        Picker("Hosted web search", selection: providerWebSearch) {
-                            Text("Off").tag("off")
-                            Text("Cached").tag("cached")
-                            Text("Live").tag("live")
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
+                        Text((model.agentDraft?.provider.webSearch ?? "off").capitalized)
                     }
                     .frame(maxWidth: .infinity)
                 }
@@ -383,13 +377,6 @@ struct ProvidersView: View {
         Binding(
             get: { model.agentDraft?.provider.provider ?? "" },
             set: { model.selectProvider($0) }
-        )
-    }
-
-    private var providerWebSearch: Binding<String> {
-        Binding(
-            get: { model.agentDraft?.provider.webSearch ?? "off" },
-            set: { model.agentDraft?.provider.webSearch = $0 }
         )
     }
 

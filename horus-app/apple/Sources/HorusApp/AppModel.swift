@@ -92,14 +92,26 @@ final class TranscriptEntry: Identifiable {
     let id: String
     var text: String
     var kind: Kind
+    var group: String?
     var format: String
+    var tone: String
     var pending: Bool
 
-    init(id: String, text: String, kind: Kind, format: String, pending: Bool) {
+    init(
+        id: String,
+        text: String,
+        kind: Kind,
+        group: String? = nil,
+        format: String,
+        tone: String = "neutral",
+        pending: Bool
+    ) {
         self.id = id
         self.text = text
         self.kind = kind
+        self.group = group
         self.format = format
+        self.tone = tone
         self.pending = pending
     }
 }
@@ -126,6 +138,37 @@ struct MountedWidget: Identifiable, Sendable {
     let widget: FrontendWidget
 
     var id: String { "\(capability)\u{0}\(widget.id)" }
+}
+
+struct MountedCommand: Identifiable, Sendable {
+    let capability: String
+    let command: FrontendCommand
+
+    var id: String { "\(capability)\u{0}\(command.name)" }
+}
+
+struct MountedReference: Identifiable, Sendable {
+    let capability: String
+    let reference: FrontendReference
+
+    var id: String { "\(capability)\u{0}\(reference.trigger)\u{0}\(reference.value)" }
+    var replacement: String { "\(reference.trigger)\(reference.value)" }
+}
+
+struct ReferenceSuggestions {
+    let range: Range<String.Index>
+    let matches: [MountedReference]
+}
+
+struct PreviewBlock: Identifiable, Sendable {
+    let id: String
+    let block: FrontendBlock
+}
+
+struct TranscriptPreview: Identifiable, Sendable {
+    let id: String
+    let title: String
+    let blocks: [PreviewBlock]
 }
 
 struct FrontendPickerPrompt: Sendable {
@@ -163,12 +206,14 @@ final class AppModel {
     var mountedWidgets: [MountedWidget] = []
     var pendingPicker: FrontendPickerPrompt?
     var artifacts: [ArtifactRecord] = []
+    var previews: [TranscriptPreview] = []
     var selectedArtifactID: String?
     var showsInspector = false
     var inspectorSection = InspectorSection.diff
     var inspectorPickerOptions: [FrontendPickerOption] = []
     var profile: ProfileSnapshot?
     var currentUsage = TokenUsage()
+    var lastUsage = TokenUsage()
     var cronTasks: [CronTask] = []
     var cronRuns: [CronRun] = []
     var cronTaskDraft = ""
@@ -264,9 +309,19 @@ final class AppModel {
         completedGenerationTime + (turnStartedAt.map { max(0, date.timeIntervalSince($0)) } ?? 0)
     }
 
-    var canForkSession: Bool {
-        canOpenSession && contributions.contains { contribution in
-            contribution.commands.contains { $0.name == "fork" }
+    var capabilityCommands: [MountedCommand] {
+        contributions.flatMap { contribution in
+            contribution.commands.map {
+                MountedCommand(capability: contribution.capability, command: $0)
+            }
+        }
+    }
+
+    var capabilityReferences: [MountedReference] {
+        contributions.flatMap { contribution in
+            contribution.references.map {
+                MountedReference(capability: contribution.capability, reference: $0)
+            }
         }
     }
 
@@ -279,8 +334,26 @@ final class AppModel {
         return String(message.prefix(72))
     }
 
+    var headerWidgets: [MountedWidget] { widgets(in: "header") }
     var composerHeaderWidgets: [MountedWidget] { widgets(in: "composer_header") }
     var composerFooterWidgets: [MountedWidget] { widgets(in: "composer_footer") }
+
+    func referenceSuggestions(in text: String, cursor: String.Index) -> ReferenceSuggestions? {
+        guard text.indices.contains(cursor) || cursor == text.endIndex else { return nil }
+        let start = text[..<cursor].lastIndex(where: { $0.isWhitespace })
+            .map { text.index(after: $0) } ?? text.startIndex
+        guard start < cursor, let trigger = text[start..<cursor].first else { return nil }
+        let queryStart = text.index(after: start)
+        let query = text[queryStart..<cursor]
+        let matches = capabilityReferences
+            .filter {
+                $0.reference.trigger == trigger
+                    && (query.isEmpty || $0.reference.value.localizedCaseInsensitiveContains(query))
+            }
+            .prefix(8)
+        guard !matches.isEmpty else { return nil }
+        return ReferenceSuggestions(range: start..<cursor, matches: Array(matches))
+    }
 
     func start() {
         guard let account = selectedAccount else {
@@ -588,20 +661,16 @@ final class AppModel {
         ))
     }
 
-    func forkSession() {
-        guard canOpenSession, let sessionID = selectedSessionID,
-              let contribution = contributions.first(where: { contribution in
-                  contribution.commands.contains { $0.name == "fork" }
-              })
-        else { return }
+    func submitCommand(_ mounted: MountedCommand, arguments: String) {
+        guard canOpenSession, let sessionID = selectedSessionID else { return }
         transmit(.submit(
             sessionID: sessionID,
             submission: Submission(
-                id: requestID("fork"),
+                id: requestID("command"),
                 op: .capabilityCommand(
-                    capability: contribution.capability,
-                    command: "fork",
-                    arguments: ""
+                    capability: mounted.capability,
+                    command: mounted.command.name,
+                    arguments: arguments
                 )
             )
         ))
@@ -880,7 +949,9 @@ final class AppModel {
             guard requestID == sessionRequestID else { break }
             applySessionReady(payload, opened: true)
         case .sessionChanged(let payload):
-            guard payload.session.sessionId == selectedSessionID else { break }
+            guard payload.session.sessionId == selectedSessionID,
+                  payload.config.revision >= (agentSnapshot?.revision ?? 0)
+            else { break }
             applySessionReady(payload, opened: false)
         case .gatewayConfigured(let requestID, let payload):
             applyGatewayReady(payload)
@@ -909,6 +980,7 @@ final class AppModel {
                 if configured {
                     providerAPIKey = ""
                     providerActionState = .credentialSaved(provider)
+                    registerAuthenticatedProvider(provider)
                 } else {
                     providerActionState = .failed("The gateway did not store the provider credential.")
                 }
@@ -931,6 +1003,7 @@ final class AppModel {
             if requestID == providerLoginRequestID {
                 providerLoginRequestID = nil
                 providerActionState = .loginFinished(provider)
+                registerAuthenticatedProvider(provider)
             }
             if let index = providerStatuses.firstIndex(where: { $0.provider == provider }) {
                 providerStatuses[index].configured = true
@@ -939,9 +1012,7 @@ final class AppModel {
             self.profile = profile
         case .artifacts(_, let sessionID, let artifacts):
             guard sessionID == selectedSessionID else { break }
-            let remoteIDs = Set(artifacts.map(\.id))
-            let previews = self.artifacts.filter { $0.kind == "preview" && !remoteIDs.contains($0.id) }
-            self.artifacts = artifacts + previews
+            self.artifacts = artifacts
             if selectedArtifactID == nil || !self.artifacts.contains(where: { $0.id == selectedArtifactID }) {
                 selectedArtifactID = self.artifacts.first?.id
             }
@@ -995,6 +1066,14 @@ final class AppModel {
                 openSession(session.sessionId)
             }
         }
+    }
+
+    private func registerAuthenticatedProvider(_ provider: String) {
+        guard agentDraft?.provider.provider == provider else {
+            providerActionState = .failed("The selected provider changed during authentication.")
+            return
+        }
+        applyProviderConfiguration()
     }
 
     private func applySessionReady(
@@ -1145,7 +1224,7 @@ final class AppModel {
         }
     }
 
-    private func reduce(
+    func reduce(
         event: AgentEventRecord,
         blocks: [FrontendBlock],
         history: [RenderedEventRecord]? = nil,
@@ -1168,29 +1247,7 @@ final class AppModel {
         if !blocks.isEmpty {
             for block in blocks { apply(block) }
         }
-        if let preview {
-            let text = preview.events
-                .flatMap(\.previewText)
-                .joined(separator: "\n\n")
-            if !text.isEmpty {
-                upsertArtifact(ArtifactRecord(
-                    id: "preview-\(preview.title)",
-                    sessionId: selectedSessionID ?? "",
-                    kind: "preview",
-                    title: preview.title,
-                    block: FrontendBlock(
-                        id: nil,
-                        group: nil,
-                        append: false,
-                        pending: false,
-                        text: text,
-                        format: "plain_text",
-                        tone: "neutral"
-                    )
-                ))
-                showsInspector = true
-            }
-        }
+        if let preview { apply(preview) }
 
         switch type {
         case "session_history":
@@ -1242,6 +1299,13 @@ final class AppModel {
             steeringSubmissionID = nil
             pendingApproval = nil
             approvalRequestID = nil
+        case "web_search_begin":
+            appendText("Searching the web", kind: .event, tone: "warning")
+        case "web_search_end":
+            let query = event.msg["query"]?.stringValue
+                ?? event.msg["action"]?.stringValue
+                ?? "Web search complete"
+            appendText("Searched: \(query)", kind: .event, tone: "success")
         case "turn_aborted":
             finishPendingTranscriptEntries()
             activeTurnID = nil
@@ -1251,11 +1315,16 @@ final class AppModel {
             steeringSubmissionID = nil
             pendingApproval = nil
             approvalRequestID = nil
+            appendText(
+                "Turn aborted: \(event.msg["reason"]?.stringValue ?? "Unknown reason")",
+                kind: .event,
+                tone: "warning"
+            )
         case "warning":
-            appendText(event.msg["message"]?.stringValue, kind: .event)
+            appendText(event.msg["message"]?.stringValue, kind: .event, tone: "warning")
         case "error":
             let message = event.msg["message"]?.stringValue ?? "Agent error"
-            appendText(message, kind: .error)
+            appendText(message, kind: .error, tone: "error")
             errorMessage = message
         case "model_changed":
             selectedModelRoute = event.msg["route"]?.stringValue ?? selectedModelRoute
@@ -1273,7 +1342,11 @@ final class AppModel {
             }
             if let usage = event.msg["info"]?["lastTokenUsage"] {
                 let latest = TokenUsage(json: usage)
-                contextTokens = max(0, latest.inputTokens + latest.outputTokens)
+                lastUsage = latest
+                contextTokens = max(
+                    0,
+                    max(latest.totalTokens, latest.inputTokens + latest.outputTokens)
+                )
             }
             if let window = event.msg["info"]?["modelContextWindow"]?.intValue {
                 modelContextWindow = Int64(window)
@@ -1287,6 +1360,9 @@ final class AppModel {
 
     private func applyFrontendEvent(_ event: JSONValue, submissionID: String?, wasRendered: Bool) {
         switch event["frontendType"]?.stringValue {
+        case "render":
+            guard let block = renderedBlock(from: event) else { return }
+            apply(block)
         case "widget":
             guard let capability = event["capability"]?.stringValue,
                   let item = event["item"],
@@ -1325,19 +1401,34 @@ final class AppModel {
         }
     }
 
+    private func renderedBlock(from event: JSONValue) -> FrontendBlock? {
+        guard event["type"]?.stringValue == "frontend",
+              event["frontendType"]?.stringValue == "render",
+              let capability = event["capability"]?.stringValue,
+              let value = event["block"],
+              let block = try? FrontendBlock(json: value)
+        else { return nil }
+        return block.namespaced(to: capability)
+    }
+
     private func apply(_ block: FrontendBlock) {
         let id = block.id ?? UUID().uuidString
         let kind: TranscriptEntry.Kind = block.tone == "error" ? .error : .event
         if let index = transcript.firstIndex(where: { $0.id == id }) {
             transcript[index].text = block.append ? transcript[index].text + block.text : block.text
+            transcript[index].kind = kind
+            if block.group != nil { transcript[index].group = block.group }
             transcript[index].pending = block.pending
             transcript[index].format = block.format
+            transcript[index].tone = block.tone
         } else {
             transcript.append(TranscriptEntry(
                 id: id,
-                text: block.text,
+                text: block.append ? String(block.text.drop(while: { $0 == "\n" })) : block.text,
                 kind: kind,
+                group: block.group,
                 format: block.format,
+                tone: block.tone,
                 pending: block.pending
             ))
         }
@@ -1353,13 +1444,106 @@ final class AppModel {
         }
     }
 
-    private func appendText(_ text: String?, kind: TranscriptEntry.Kind) {
+    private func apply(_ preview: RenderedPreview) {
+        var blocks: [FrontendBlock] = []
+        for rendered in preview.events {
+            blocks.append(contentsOf: rendered.blocks)
+            if let block = renderedBlock(from: rendered.event) {
+                blocks.append(block)
+            } else if rendered.blocks.isEmpty {
+                blocks.append(contentsOf: previewBlocks(for: rendered))
+            }
+        }
+        blocks = reducePreviewBlocks(blocks)
+        guard !blocks.isEmpty else { return }
+        let id = "preview-\(preview.title)"
+        let record = TranscriptPreview(
+            id: id,
+            title: preview.title,
+            blocks: blocks.enumerated().map { index, block in
+                PreviewBlock(id: block.id ?? "\(id)-\(index)", block: block)
+            }
+        )
+        if let index = previews.firstIndex(where: { $0.id == id }) {
+            previews[index] = record
+        } else {
+            previews.append(record)
+        }
+        inspectorSection = .subagents
+        showsInspector = true
+    }
+
+    private func reducePreviewBlocks(_ blocks: [FrontendBlock]) -> [FrontendBlock] {
+        var result: [FrontendBlock] = []
+        for block in blocks {
+            guard let id = block.id,
+                  let index = result.lastIndex(where: { $0.id == id })
+            else {
+                result.append(block)
+                continue
+            }
+            let current = result[index]
+            result[index] = FrontendBlock(
+                id: id,
+                group: block.group ?? current.group,
+                append: false,
+                pending: block.pending,
+                text: block.append ? current.text + block.text : block.text,
+                format: block.format,
+                tone: block.tone
+            )
+        }
+        return result
+    }
+
+    private func previewBlocks(for rendered: RenderedEventRecord) -> [FrontendBlock] {
+        let type = rendered.event["type"]?.stringValue
+        let tone: String
+        let text: String?
+        switch type {
+        case "web_search_begin":
+            tone = "warning"
+            text = "Searching the web"
+        case "web_search_end":
+            tone = "success"
+            text = "Searched: \(rendered.event["query"]?.stringValue ?? rendered.event["action"]?.stringValue ?? "complete")"
+        case "turn_aborted":
+            tone = "warning"
+            text = "Turn aborted: \(rendered.event["reason"]?.stringValue ?? "Unknown reason")"
+        case "warning":
+            tone = "warning"
+            text = rendered.event["message"]?.stringValue
+        case "error":
+            tone = "error"
+            text = rendered.event["message"]?.stringValue
+        default:
+            tone = "neutral"
+            text = rendered.previewText.first
+        }
+        guard let text, !text.isEmpty else { return [] }
+        return [FrontendBlock(
+            id: nil,
+            group: nil,
+            append: false,
+            pending: false,
+            text: text,
+            format: "plain_text",
+            tone: tone
+        )]
+    }
+
+    private func appendText(
+        _ text: String?,
+        kind: TranscriptEntry.Kind,
+        tone: String = "neutral"
+    ) {
         guard let text, !text.isEmpty else { return }
         transcript.append(TranscriptEntry(
             id: UUID().uuidString,
             text: text,
             kind: kind,
             format: "plain_text",
+            tone: tone,
             pending: false
         ))
     }
@@ -1374,6 +1558,7 @@ final class AppModel {
                 text: delta,
                 kind: kind,
                 format: "plain_text",
+                tone: "neutral",
                 pending: true
             ))
         }
@@ -1561,12 +1746,14 @@ final class AppModel {
         pendingPicker = nil
         mountedWidgets = []
         artifacts = []
+        previews = []
         selectedArtifactID = nil
         showsInspector = false
         inspectorSection = .diff
         inspectorPickerOptions = []
         inspectorPickerSubmissionID = nil
         currentUsage = TokenUsage()
+        lastUsage = TokenUsage()
     }
 }
 

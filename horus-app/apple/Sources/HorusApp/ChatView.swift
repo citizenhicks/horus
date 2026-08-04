@@ -56,6 +56,7 @@ struct ChatView: View {
 
 private struct ChatOptionsMenu: View {
     @Environment(AppModel.self) private var model
+    @State private var pendingCommand: MountedCommand?
 
     var body: some View {
         let totals = diffTotals(model.gitDiff)
@@ -82,8 +83,22 @@ private struct ChatOptionsMenu: View {
                 TimelineView(.periodic(from: .now, by: 1)) { timeline in
                     Text(formatDuration(model.generationElapsed(at: timeline.date)))
                 }
-                if model.currentUsage.inputTokens > 0 {
-                    Text(cacheHit(model.currentUsage))
+                if model.lastUsage.inputTokens > 0 {
+                    Text(cacheHit(model.lastUsage))
+                }
+            }
+            if !model.capabilityCommands.isEmpty {
+                Section("Capabilities") {
+                    ForEach(model.capabilityCommands) { mounted in
+                        Button(commandLabel(mounted.command)) {
+                            if mounted.command.arguments.isEmpty {
+                                model.submitCommand(mounted, arguments: "")
+                            } else {
+                                pendingCommand = mounted
+                            }
+                        }
+                        .disabled(!model.canOpenSession)
+                    }
                 }
             }
         } label: {
@@ -93,6 +108,9 @@ private struct ChatOptionsMenu: View {
         .accessibilityLabel("Chat options")
         .tint(.primary)
         .help("Chat options")
+        .sheet(item: $pendingCommand) { mounted in
+            CapabilityCommandSheet(mounted: mounted)
+        }
     }
 
     private var currentModelLabel: String {
@@ -102,6 +120,52 @@ private struct ChatOptionsMenu: View {
         return "\(choice.model) · \(choice.reasoningEffort?.capitalized ?? "Default")"
     }
 
+    private func commandLabel(_ command: FrontendCommand) -> String {
+        command.arguments.isEmpty
+            ? "/\(command.name)"
+            : "/\(command.name) \(command.arguments)"
+    }
+
+}
+
+private struct CapabilityCommandSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var arguments = ""
+    let mounted: MountedCommand
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if !mounted.command.description.isEmpty {
+                    Text(mounted.command.description)
+                }
+                TextField(mounted.command.arguments, text: $arguments, axis: .vertical)
+                    .lineLimit(1 ... 6)
+                    .accessibilityLabel("Command arguments")
+            }
+            .navigationTitle("/\(mounted.command.name)")
+            #if os(iOS)
+            .toolbarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Run") {
+                        model.submitCommand(
+                            mounted,
+                            arguments: arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+                        )
+                        dismiss()
+                    }
+                    .disabled(!model.canOpenSession)
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
 }
 
 private struct TranscriptView: View {
@@ -121,10 +185,11 @@ private struct TranscriptView: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: rowSpacing) {
-                    ForEach(model.transcript) { entry in
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(model.transcript.enumerated(), id: \.element.id) { index, entry in
                         TranscriptRow(entry: entry)
                             .id(entry.id)
+                            .padding(.top, rowSpacing(before: index, entry: entry))
                     }
                     Color.clear
                         .frame(height: max(1, bottomInset))
@@ -165,6 +230,12 @@ private struct TranscriptView: View {
                 proxy.scrollTo(bottomID, anchor: .bottom)
             }
         }
+    }
+
+    private func rowSpacing(before index: Int, entry: TranscriptEntry) -> CGFloat {
+        guard index > 0 else { return 0 }
+        let previous = model.transcript[index - 1]
+        return entry.group != nil && entry.group == previous.group ? 0 : rowSpacing
     }
 
     private var emptyState: some View {
@@ -242,14 +313,8 @@ private struct TranscriptRow: View {
     }
 
     private var controls: some View {
-        HStack(spacing: 0) {
-            MessageActionButton(title: "Copy", symbol: "copy") {
-                copyToPasteboard(entry.text)
-            }
-            MessageActionButton(title: "Fork current chat", symbol: "git-fork") {
-                model.forkSession()
-            }
-            .disabled(!model.canForkSession)
+        MessageActionButton(title: "Copy", symbol: "copy") {
+            copyToPasteboard(entry.text)
         }
     }
 
@@ -257,8 +322,6 @@ private struct TranscriptRow: View {
     private var transcriptActions: some View {
         if hasMessageActions {
             Button("Copy", lucideIcon: "copy") { copyToPasteboard(entry.text) }
-            Button("Fork current chat", lucideIcon: "git-fork") { model.forkSession() }
-                .disabled(!model.canForkSession)
         }
     }
 
@@ -315,7 +378,7 @@ private struct EventCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(entry.format == "unified_diff" ? "CODE CHANGE" : entry.kind == .error ? "ERROR" : "EVENT")
+                Text(title)
                     .font(HorusStyle.metadataFont.weight(.bold))
                 Spacer()
                 if entry.pending { ProgressView().controlSize(.mini) }
@@ -327,13 +390,32 @@ private struct EventCard: View {
                 .lineLimit(entry.format == "unified_diff" ? 4 : nil)
                 .textSelection(.enabled)
         }
-        .foregroundStyle(entry.kind == .error ? palette.danger : palette.muted)
+        .foregroundStyle(foreground)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(HorusStyle.cardPadding)
         .background(
-            entry.kind == .error ? palette.danger.opacity(0.09) : palette.raised,
+            entry.tone == "neutral" ? palette.raised : foreground.opacity(0.09),
             in: RoundedRectangle(cornerRadius: HorusStyle.cardRadius, style: .continuous)
         )
+    }
+
+    private var title: String {
+        if entry.format == "unified_diff" { return "CODE CHANGE" }
+        switch entry.tone {
+        case "success": return "SUCCESS"
+        case "warning": return "WARNING"
+        case "error": return "ERROR"
+        default: return "EVENT"
+        }
+    }
+
+    private var foreground: Color {
+        switch entry.tone {
+        case "success": palette.signal
+        case "warning": palette.warning
+        case "error": palette.danger
+        default: palette.muted
+        }
     }
 }
 
@@ -433,6 +515,28 @@ private struct ComposerSurface: View {
     var body: some View {
         @Bindable var model = model
         VStack(spacing: 0) {
+            if let suggestions = referenceSuggestions {
+                ScrollView(.horizontal) {
+                    HStack(spacing: 6) {
+                        ForEach(suggestions.matches) { mounted in
+                            Button { complete(mounted, suggestions: suggestions) } label: {
+                                HorusBadge(
+                                    text: mounted.replacement,
+                                    tone: "neutral",
+                                    interactive: true
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .help(mounted.reference.description)
+                            .accessibilityLabel(mounted.replacement)
+                            .accessibilityHint(mounted.reference.description)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
+                }
+                .scrollIndicators(.hidden)
+            }
             TextField(
                 "Ask Horus to inspect, explain, or change something…",
                 text: $model.composer,
@@ -467,6 +571,27 @@ private struct ComposerSurface: View {
     private func submit() {
         selection = nil
         model.sendMessage()
+    }
+
+    private var referenceSuggestions: ReferenceSuggestions? {
+        let cursor: String.Index
+        if let selection, case .selection(let range) = selection.indices, range.isEmpty {
+            cursor = range.lowerBound
+        } else {
+            cursor = model.composer.endIndex
+        }
+        return model.referenceSuggestions(in: model.composer, cursor: cursor)
+    }
+
+    private func complete(_ mounted: MountedReference, suggestions: ReferenceSuggestions) {
+        var text = model.composer
+        let offset = text.distance(from: text.startIndex, to: suggestions.range.lowerBound)
+        text.replaceSubrange(suggestions.range, with: mounted.replacement)
+        model.composer = text
+        selection = TextSelection(insertionPoint: text.index(
+            text.startIndex,
+            offsetBy: offset + mounted.replacement.count
+        ))
     }
 
     private func insertLineBreak() {
@@ -512,6 +637,9 @@ private struct ComposerActivityView: View {
                 }
                 #endif
 
+                ForEach(model.headerWidgets) { widget in
+                    FrontendWidgetView(widget: widget)
+                }
                 ForEach(model.composerFooterWidgets) { widget in
                     FrontendWidgetView(widget: widget, presentsPickerInInspector: true)
                 }

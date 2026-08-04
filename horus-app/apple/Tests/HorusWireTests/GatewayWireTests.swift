@@ -259,6 +259,93 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertNil(preview)
     }
 
+    func testUnknownAgentEventIsRejected() {
+        let fixture = #"{"version":5,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"future_event"}},"blocks":[]}"#
+        XCTAssertThrowsError(try decodeEnvelope(fixture)) { error in
+            XCTAssertEqual(
+                error as? GatewayWireError,
+                .invalidFrame("unknown agent event future_event")
+            )
+        }
+    }
+
+    func testInvalidFrontendEventSubtypeIsRejected() {
+        let fixtures = [
+            (#"{"version":5,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"frontend"}},"blocks":[]}"#, "frontend event has no frontend_type"),
+            (#"{"version":5,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"frontend","frontend_type":"future_frontend"}},"blocks":[]}"#, "unknown frontend event future_frontend")
+        ]
+
+        for (fixture, message) in fixtures {
+            XCTAssertThrowsError(try decodeEnvelope(fixture)) { error in
+                XCTAssertEqual(error as? GatewayWireError, .invalidFrame(message))
+            }
+        }
+    }
+
+    func testMalformedFrontendEventPayloadIsRejected() {
+        let fixtures = [
+            (#"{"version":5,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"frontend","frontend_type":"render","capability":"tools"}},"blocks":[]}"#, "frontend render is missing a required field"),
+            (#"{"version":5,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"frontend","frontend_type":"picker","title":"Choose","options":[{"label":"One","description":"First"}]}},"blocks":[]}"#, "frontend picker option is missing a required field")
+        ]
+
+        for (fixture, message) in fixtures {
+            XCTAssertThrowsError(try decodeEnvelope(fixture)) { error in
+                XCTAssertEqual(error as? GatewayWireError, .invalidFrame(message))
+            }
+        }
+    }
+
+    func testUnknownRenderedPresentationValuesAreRejected() {
+        let outerBlock = #"{"version":5,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"task_complete","turn_id":"turn-1","last_agent_message":null}},"blocks":[{"id":null,"group":null,"append":false,"pending":false,"text":"Done","format":"future_format","tone":"neutral"}]}"#
+        XCTAssertThrowsError(try decodeEnvelope(outerBlock))
+
+        let invalidWidgetPayload = sessionReadyPayloadJSON.replacingOccurrences(
+            of: #""slot":"header""#,
+            with: #""slot":"future_slot""#
+        )
+        XCTAssertThrowsError(try decodeEnvelope(
+            #"{"version":5,"type":"session_opened","request_id":"open-1","payload":\#(invalidWidgetPayload)}"#
+        ))
+    }
+
+    func testMalformedKnownAgentEventIsRejected() {
+        let fixtures = [
+            #"{"version":5,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"turn_aborted","turn_id":"turn-1"}},"blocks":[]}"#,
+            #"{"version":5,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"agent_message","message":"Working","phase":"future_phase"}},"blocks":[]}"#
+        ]
+
+        for fixture in fixtures {
+            XCTAssertThrowsError(try decodeEnvelope(fixture))
+        }
+    }
+
+    func testUnknownAuxiliaryRenderedEventsAreRejected() {
+        let fixtures = [
+            #"{"version":5,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"session_history","events":[]}},"blocks":[],"history":[{"event":{"type":"future_event"},"blocks":[]}]}"#,
+            #"{"version":5,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"frontend","frontend_type":"preview","title":"Worker","events":[]}},"blocks":[],"preview":{"title":"Worker","events":[{"event":{"type":"future_event"},"blocks":[]}]}}"#
+        ]
+
+        for fixture in fixtures {
+            XCTAssertThrowsError(try decodeEnvelope(fixture)) { error in
+                XCTAssertEqual(
+                    error as? GatewayWireError,
+                    .invalidFrame("unknown agent event future_event")
+                )
+            }
+        }
+    }
+
+    func testFrontendRenderAgentEventIsAccepted() throws {
+        let fixture = #"{"version":5,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"submission_id":"input-1","msg":{"type":"frontend","frontend_type":"render","capability":"tools","block":{"id":null,"group":null,"append":false,"pending":false,"text":"Done","format":"plain_text","tone":"neutral"}}},"blocks":[{"id":null,"group":null,"append":false,"pending":false,"text":"Done","format":"plain_text","tone":"neutral"}]}"#
+        let envelope = try decodeEnvelope(fixture)
+
+        guard case .agentEvent(_, _, let event, let blocks, _, _) = envelope else {
+            return XCTFail("Expected agent event envelope")
+        }
+        XCTAssertEqual(event.msg["frontendType"]?.stringValue, "render")
+        XCTAssertEqual(blocks.first?.text, "Done")
+    }
+
     func testSessionsResponseAllowsOmittedRequestID() throws {
         let envelope = try decodeEnvelope(
             #"{"version":5,"type":"sessions","sessions":[\#(sessionRecordJSON)]}"#

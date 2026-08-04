@@ -3,6 +3,40 @@ import XCTest
 
 @MainActor
 final class AppModelTests: XCTestCase {
+    private func model() throws -> AppModel {
+        let suiteName = UUID().uuidString
+        return AppModel(
+            client: GatewayClient(),
+            store: GatewayStore(defaults: try XCTUnwrap(UserDefaults(suiteName: suiteName)))
+        )
+    }
+
+    private func renderEvent(
+        capability: String = "tools",
+        id: String = "result",
+        group: String? = "turn",
+        append: Bool = false,
+        pending: Bool = false,
+        text: String,
+        format: String = "plain_text",
+        tone: String = "neutral"
+    ) -> AgentEventRecord {
+        AgentEventRecord(submissionId: nil, msg: .object([
+            "type": .string("frontend"),
+            "frontendType": .string("render"),
+            "capability": .string(capability),
+            "block": .object([
+                "id": .string(id),
+                "group": group.map(JSONValue.string) ?? .null,
+                "append": .bool(append),
+                "pending": .bool(pending),
+                "text": .string(text),
+                "format": .string(format),
+                "tone": .string(tone)
+            ])
+        ]))
+    }
+
     func testSwitchingGatewaysClearsGatewayScopedStateBeforeTokenLookup() throws {
         let suiteName = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -54,5 +88,169 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.pendingApproval, approval)
         XCTAssertNotNil(model.errorMessage)
+    }
+
+    func testFrontendRenderIsNamespacedAndReplayedFromHistory() throws {
+        let app = try model()
+        let first = renderEvent(
+            pending: true,
+            text: "Started",
+            tone: "warning"
+        )
+        app.reduce(event: first, blocks: [], preview: nil)
+        app.reduce(
+            event: renderEvent(group: nil, append: true, text: " and finished", tone: "success"),
+            blocks: [],
+            preview: nil
+        )
+
+        let entry = try XCTUnwrap(app.transcript.first)
+        XCTAssertEqual(entry.id, "tools/result")
+        XCTAssertEqual(entry.group, "tools/turn")
+        XCTAssertEqual(entry.text, "Started and finished")
+        XCTAssertEqual(entry.tone, "success")
+        XCTAssertFalse(entry.pending)
+
+        let replay = try model()
+        replay.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("session_history"),
+                "events": .array([])
+            ])),
+            blocks: [],
+            history: [RenderedEventRecord(event: first.msg, blocks: [])],
+            preview: nil
+        )
+        XCTAssertEqual(replay.transcript.first?.id, "tools/result")
+        XCTAssertEqual(replay.transcript.first?.tone, "warning")
+    }
+
+    func testPreviewPreservesRenderedBlocksAndCapabilityRender() throws {
+        let model = try model()
+        let outer = FrontendBlock(
+            id: "tools/call",
+            group: "tools/turn",
+            append: false,
+            pending: false,
+            text: "Read file",
+            format: "plain_text",
+            tone: "neutral"
+        )
+        let rendered = renderEvent(
+            capability: "subagents",
+            id: "change",
+            group: "work",
+            text: "@@ -1 +1 @@",
+            format: "unified_diff",
+            tone: "success"
+        )
+        let preview = RenderedPreview(title: "worker", events: [
+            RenderedEventRecord(event: .object(["type": .string("tool_call_end")]), blocks: [outer]),
+            RenderedEventRecord(event: rendered.msg, blocks: [])
+        ])
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("frontend"),
+                "frontendType": .string("preview"),
+                "title": .string("worker"),
+                "events": .array([])
+            ])),
+            blocks: [],
+            preview: preview
+        )
+
+        let snapshot = try XCTUnwrap(model.previews.first)
+        XCTAssertEqual(snapshot.title, "worker")
+        XCTAssertEqual(snapshot.blocks.map(\.block.text), ["Read file", "@@ -1 +1 @@"])
+        XCTAssertEqual(snapshot.blocks.last?.block.id, "subagents/change")
+        XCTAssertEqual(snapshot.blocks.last?.block.group, "subagents/work")
+        XCTAssertEqual(snapshot.blocks.last?.block.format, "unified_diff")
+        XCTAssertEqual(snapshot.blocks.last?.block.tone, "success")
+    }
+
+    func testContributionCatalogReferencesAndHeaderWidgetsAreGeneric() throws {
+        let model = try model()
+        model.contributions = [FrontendContribution(
+            capability: "tasks",
+            commands: [FrontendCommand(
+                name: "tasks",
+                arguments: "[filter]",
+                description: "List tasks"
+            )],
+            widgets: [FrontendWidget(
+                id: "count",
+                slot: "header",
+                text: "3 tasks",
+                tone: "success",
+                action: nil
+            )],
+            references: [FrontendReference(trigger: "$", value: "planning", description: "Planning skill")],
+            activeInput: nil
+        )]
+        model.mountedWidgets = model.contributions.flatMap { contribution in
+            contribution.widgets.map {
+                MountedWidget(capability: contribution.capability, widget: $0)
+            }
+        }
+
+        XCTAssertEqual(model.capabilityCommands.first?.command.name, "tasks")
+        XCTAssertEqual(model.headerWidgets.first?.widget.text, "3 tasks")
+        let text = "Use $plan"
+        let suggestions = try XCTUnwrap(model.referenceSuggestions(in: text, cursor: text.endIndex))
+        XCTAssertEqual(String(text[suggestions.range]), "$plan")
+        XCTAssertEqual(suggestions.matches.first?.replacement, "$planning")
+    }
+
+    func testWebSearchAbortAndLiveUsageMatchCLI() throws {
+        let model = try model()
+        for msg: JSONValue in [
+            .object(["type": .string("web_search_begin"), "callId": .string("search-1")]),
+            .object([
+                "type": .string("web_search_end"),
+                "callId": .string("search-1"),
+                "query": .string("Horus"),
+                "action": .string("search")
+            ]),
+            .object([
+                "type": .string("turn_aborted"),
+                "turnId": .string("turn-1"),
+                "reason": .string("Stopped")
+            ]),
+            .object([
+                "type": .string("token_count"),
+                "info": .object([
+                    "totalTokenUsage": .object([
+                        "inputTokens": .number(1_000),
+                        "cachedInputTokens": .number(100),
+                        "totalTokens": .number(1_100)
+                    ]),
+                    "lastTokenUsage": .object([
+                        "inputTokens": .number(40),
+                        "cachedInputTokens": .number(20),
+                        "outputTokens": .number(10),
+                        "totalTokens": .number(99)
+                    ]),
+                    "modelContextWindow": .number(200)
+                ])
+            ])
+        ] {
+            model.reduce(
+                event: AgentEventRecord(submissionId: nil, msg: msg),
+                blocks: [],
+                preview: nil
+            )
+        }
+
+        XCTAssertEqual(model.transcript.map(\.text), [
+            "Searching the web",
+            "Searched: Horus",
+            "Turn aborted: Stopped"
+        ])
+        XCTAssertEqual(model.transcript.map(\.tone), ["warning", "success", "warning"])
+        XCTAssertEqual(model.currentUsage.inputTokens, 1_000)
+        XCTAssertEqual(model.lastUsage.cachedInputTokens, 20)
+        XCTAssertEqual(model.contextTokens, 99)
+        XCTAssertEqual(model.modelContextWindow, 200)
     }
 }
