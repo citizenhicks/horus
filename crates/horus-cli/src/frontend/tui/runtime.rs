@@ -138,7 +138,7 @@ pub(in crate::frontend) async fn run(
                                     refresh_session(&mut state, session, payload);
                                 } else {
                                     *session = payload;
-                                    exit = FrontendExit::Reload;
+                                    exit = FrontendExit::Resume(session_id.clone());
                                     break 'ui;
                                 }
                             }
@@ -270,7 +270,9 @@ pub(in crate::frontend) async fn run(
                                 || session.session.session_id != selected
                                 || session.contributions != contributions
                             {
-                                exit = FrontendExit::Reload;
+                                exit = FrontendExit::Resume(
+                                    session.session.session_id.clone(),
+                                );
                                 break 'ui;
                             }
                             sync_gateway_models(&mut state, &mut catalog, gateway);
