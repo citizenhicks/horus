@@ -1027,31 +1027,32 @@ mod tests {
         assert!(!state.exists());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn connected_client_pauses_and_resets_inactivity_shutdown() {
         let root = tempfile::tempdir().expect("temporary directory");
         let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
         let listen = reservation.local_addr().expect("listen address");
         drop(reservation);
-        let (server, _) = GatewayServer::bootstrap(root.path().join("state"), listen)
+        let (server, grant) = GatewayServer::bootstrap(root.path().join("state"), listen)
             .await
             .expect("bootstrap gateway");
         let serving = tokio::spawn(
-            server.serve_until_inactive(std::future::pending(), Duration::from_millis(100)),
+            server.serve_until_inactive(std::future::pending(), Duration::from_millis(200)),
         );
-        let connection = tokio::net::TcpStream::connect(listen)
+        let endpoint = format!("tcp://{listen}")
+            .parse::<Endpoint>()
+            .expect("endpoint");
+        let (connection, _) = GatewayClient::pair(&endpoint, grant.code, "inactivity test")
             .await
             .expect("connect client");
 
-        tokio::time::advance(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!serving.is_finished());
         drop(connection);
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(75)).await;
         assert!(!serving.is_finished());
-        tokio::time::advance(Duration::from_millis(100)).await;
 
-        tokio::time::timeout(Duration::from_secs(1), serving)
+        tokio::time::timeout(Duration::from_secs(2), serving)
             .await
             .expect("inactivity shutdown timeout")
             .expect("gateway task")
