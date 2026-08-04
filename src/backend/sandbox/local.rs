@@ -125,6 +125,13 @@ struct ProtectionJournal {
     name: String,
 }
 
+#[cfg(target_os = "linux")]
+impl Drop for ProtectionJournal {
+    fn drop(&mut self) {
+        let _ = self._lock.unlock();
+    }
+}
+
 impl LocalSandbox {
     /// Creates a local sandbox rooted at an existing directory.
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
