@@ -8,6 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
+use chrono::Utc;
 use horus::agent::{AgentConfig, AgentSender};
 use horus::backend::checkpoint::{Checkpoint, CheckpointStore, sqlite::SqliteCheckpoint};
 use horus::backend::model::provider::provider;
@@ -28,21 +29,25 @@ use crate::cron::{ActiveCronRun, BeginRun, CronStore};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{
     AgentComposition, ArtifactKind, ArtifactRecord, CronRunStatus, ProfileSnapshot, ProviderConfig,
-    ReadyPayload, RenderedEvent, RenderedPreview, ServerFrame, ServerMessage, SessionReadyPayload,
-    SessionRecord, VersionedAgentConfig,
+    ReadyPayload, RenderedEvent, RenderedPreview, ServerFrame, ServerMessage, SessionActivity,
+    SessionActivityState, SessionOutcome, SessionReadyPayload, SessionRecord, VersionedAgentConfig,
 };
 use crate::{Error, Result};
 
 use self::catalog::{
     load_session_metadata, save_session_metadata, session_catalog, validate_session_title,
 };
-use self::git::{diff as workspace_git_diff, status as git_status};
+use self::git::{
+    diff as workspace_git_diff, status as git_status, switch_branch as switch_workspace_branch,
+};
 
 const COMMAND_CAPACITY: usize = 128;
 const BROADCAST_CAPACITY: usize = 512;
 const REPLAY_CAPACITY: usize = 1024;
 const ARTIFACT_CAPACITY: usize = 256;
 pub(crate) const MAX_ACTIVE_SESSIONS: usize = 32;
+
+type SessionActivities = Arc<StdMutex<HashMap<String, SessionActivity>>>;
 
 #[derive(Clone)]
 pub(crate) struct HostHandle {
@@ -70,6 +75,7 @@ struct GatewayState {
     checkpoints: Arc<dyn CheckpointStore>,
     // ponytail: one lock is enough for at most 32 tiny catalog writes.
     catalog_lock: Arc<Mutex<()>>,
+    activities: SessionActivities,
     provider_login: Arc<StdMutex<Option<String>>>,
     sessions: HashMap<String, HostHandle>,
 }
@@ -94,10 +100,12 @@ struct HostState {
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     catalog_lock: Arc<Mutex<()>>,
+    activities: SessionActivities,
     running: RunningAgent,
     usage_baseline: TokenUsage,
     pending_turns: usize,
     approval_active: bool,
+    turn_error: Option<String>,
     restart_after_turn: bool,
     suppress_history_broadcast: bool,
     pending_startup: Vec<ServerFrame>,
@@ -107,6 +115,7 @@ struct HostState {
     artifacts: VecDeque<ArtifactRecord>,
     commands: mpsc::Receiver<HostCommand>,
     events: broadcast::Sender<ServerFrame>,
+    gateway_events: broadcast::Sender<ServerFrame>,
     idle_waiters: Vec<oneshot::Sender<()>>,
 }
 
@@ -118,6 +127,7 @@ struct RunningAgent {
     session: horus::protocol::SessionConfiguredEvent,
     gateway_sandbox: Arc<GatewaySandbox>,
     subagent_template: Option<Arc<OnceLock<AgentConfig>>>,
+    tool_count: usize,
 }
 
 struct ActiveCron {
@@ -161,6 +171,10 @@ enum HostCommand {
     },
     GitDiff {
         reply: oneshot::Sender<std::result::Result<String, Rejection>>,
+    },
+    SwitchGitBranch {
+        branch: String,
+        reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
     RefreshProvider {
         provider: String,
@@ -206,6 +220,7 @@ impl GatewayHost {
                 cron,
                 checkpoints,
                 catalog_lock: Arc::new(Mutex::new(())),
+                activities: Arc::new(StdMutex::new(HashMap::new())),
                 provider_login: Arc::new(StdMutex::new(None)),
                 sessions: HashMap::new(),
             })),
@@ -224,7 +239,9 @@ impl GatewayHost {
 
     pub(crate) async fn sessions(&self) -> std::result::Result<Vec<SessionRecord>, Rejection> {
         let state = self.state.lock().await;
-        session_catalog(&state.checkpoints).await.map_err(internal)
+        session_catalog(&state.checkpoints, &state.activities)
+            .await
+            .map_err(internal)
     }
 
     pub(crate) async fn create_session(
@@ -262,12 +279,16 @@ impl GatewayHost {
             Arc::clone(&state.cron),
             Arc::clone(&state.checkpoints),
             Arc::clone(&state.catalog_lock),
+            Arc::clone(&state.activities),
+            self.events.clone(),
             session_id.clone(),
             "horus-gateway",
         )
         .await
         .map_err(internal)?;
         state.sessions.insert(session_id, host.clone());
+        drop(state);
+        self.broadcast_sessions().await?;
         Ok(host)
     }
 
@@ -311,6 +332,8 @@ impl GatewayHost {
             Arc::clone(&state.cron),
             Arc::clone(&state.checkpoints),
             Arc::clone(&state.catalog_lock),
+            Arc::clone(&state.activities),
+            self.events.clone(),
             session_id.into(),
             "horus-gateway",
         )
@@ -406,6 +429,8 @@ impl GatewayHost {
             Arc::clone(&state.cron),
             Arc::clone(&state.checkpoints),
             Arc::clone(&state.catalog_lock),
+            Arc::clone(&state.activities),
+            self.events.clone(),
             session_id.clone(),
             &label,
         )
@@ -457,6 +482,19 @@ impl GatewayHost {
             .profile();
         Ok(profile)
     }
+
+    async fn broadcast_sessions(&self) -> std::result::Result<(), Rejection> {
+        let state = self.state.lock().await;
+        let sessions = session_catalog(&state.checkpoints, &state.activities)
+            .await
+            .map_err(internal)?;
+        drop(state);
+        let _ = self.events.send(ServerFrame::new(ServerMessage::Sessions {
+            request_id: None,
+            sessions,
+        }));
+        Ok(())
+    }
 }
 
 impl GatewayState {
@@ -501,6 +539,8 @@ impl HostHandle {
         cron: Arc<CronStore>,
         checkpoints: Arc<dyn CheckpointStore>,
         catalog_lock: Arc<Mutex<()>>,
+        activities: SessionActivities,
+        gateway_events: broadcast::Sender<ServerFrame>,
         session_id: String,
         origin_label: &str,
     ) -> Result<Self> {
@@ -522,6 +562,11 @@ impl HostHandle {
         .await?;
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
+        activities
+            .lock()
+            .map_err(|_| Error::Config("session activity lock is poisoned".into()))?
+            .entry(session_id.clone())
+            .or_default();
         let state = HostState {
             store,
             gateway,
@@ -530,10 +575,12 @@ impl HostHandle {
             cron,
             checkpoints,
             catalog_lock,
+            activities,
             running,
             usage_baseline: TokenUsage::default(),
             pending_turns: 0,
             approval_active: false,
+            turn_error: None,
             restart_after_turn: false,
             suppress_history_broadcast: false,
             pending_startup: Vec::new(),
@@ -543,6 +590,7 @@ impl HostHandle {
             artifacts: VecDeque::with_capacity(ARTIFACT_CAPACITY),
             commands: receiver,
             events: events.clone(),
+            gateway_events,
             idle_waiters: Vec::new(),
         };
         tokio::spawn(state.run());
@@ -657,6 +705,16 @@ impl HostHandle {
         receiver.await.map_err(|_| stopped())?
     }
 
+    pub(crate) async fn switch_git_branch(
+        &self,
+        branch: String,
+    ) -> std::result::Result<(), Rejection> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(HostCommand::SwitchGitBranch { branch, reply })
+            .await?;
+        receive(receiver).await
+    }
+
     async fn refresh_provider(
         &self,
         provider: String,
@@ -762,6 +820,13 @@ impl HostState {
                         message: "the agent stopped".into(),
                         fatal: true,
                     });
+                    if let Err(error) = self.fail_activity("the agent stopped").await {
+                        self.broadcast(ServerMessage::Error {
+                            code: "session_activity".into(),
+                            message: error.to_string(),
+                            fatal: false,
+                        });
+                    }
                     break;
                 }
             }
@@ -813,10 +878,29 @@ impl HostState {
                 let _ = reply.send(result);
             }
             HostCommand::Submit { submission, reply } => {
+                let resumes_approval = matches!(
+                    &submission.op,
+                    Op::ExecApproval {
+                        decision: ReviewDecision::Approved
+                            | ReviewDecision::ApprovedForSession
+                            | ReviewDecision::Denied { .. },
+                        ..
+                    }
+                );
                 let result = match &submission.op {
                     Op::SetModel { route } => self.set_model(route).await,
                     _ => self.submit(submission, false),
                 };
+                if result.is_ok()
+                    && resumes_approval
+                    && let Err(error) = self.resume_activity().await
+                {
+                    self.broadcast(ServerMessage::Error {
+                        code: "session_activity".into(),
+                        message: error.to_string(),
+                        fatal: false,
+                    });
+                }
                 let _ = reply.send(result);
             }
             HostCommand::StartCronSetup { task, reply } => {
@@ -835,6 +919,10 @@ impl HostState {
                 let _ = reply.send(
                     workspace_git_diff(&self.running.gateway_sandbox, &self.spec.workspace).await,
                 );
+            }
+            HostCommand::SwitchGitBranch { branch, reply } => {
+                let result = self.switch_git_branch(&branch).await;
+                let _ = reply.send(result);
             }
             HostCommand::RefreshProvider {
                 provider,
@@ -1134,9 +1222,13 @@ impl HostState {
             .lock()
             .map_err(|_| internal("gateway configuration lock is poisoned"))?
             .clone();
-        let provider =
+        let mut provider =
             configured_provider_for_route(&gateway, &self.store, &self.credentials, route)
                 .map_err(invalid_config)?;
+        if provider.provider == self.spec.agent.config.provider.provider {
+            provider.base_url = self.spec.agent.config.provider.base_url.clone();
+            provider.web_search = self.spec.agent.config.provider.web_search;
+        }
         if self.running.session.model.route == route && self.spec.agent.config.provider == provider
         {
             return Ok(());
@@ -1196,6 +1288,7 @@ impl HostState {
         }
         self.pending_turns = 0;
         self.approval_active = false;
+        self.turn_error = None;
         Ok(())
     }
 
@@ -1227,6 +1320,7 @@ impl HostState {
 
     async fn forward_event(&mut self, event: Event) -> Result<()> {
         let was_active = self.pending_turns > 0;
+        let next_activity = self.activity_for_event(&event.msg)?;
         let suppress_broadcast =
             self.suppress_history_broadcast && matches!(&event.msg, EventMsg::SessionHistory(_));
         if suppress_broadcast {
@@ -1247,11 +1341,14 @@ impl HostState {
         }
         let cron_completion = self.observe_cron_event(&event)?;
         self.record_event(event, suppress_broadcast)?;
-
-        if self.pending_turns == 0 && was_active {
+        if let Some(activity) = next_activity {
+            self.set_activity(activity)?;
             self.broadcast_sessions()
                 .await
                 .map_err(|rejection| Error::Config(rejection.message))?;
+        }
+
+        if self.pending_turns == 0 && was_active {
             if let Some((active, status, message)) = cron_completion {
                 self.cron.finish_run(active.run, status, message)?;
             } else if self.restart_after_turn {
@@ -1394,8 +1491,15 @@ impl HostState {
             git: git_status(&self.running.gateway_sandbox).await,
             session: self.running.session.clone(),
             contributions: self.running.frontend.contributions().to_vec(),
+            tool_count: self.running.tool_count,
             config: self.spec.agent.clone(),
         })
+    }
+
+    async fn switch_git_branch(&mut self, branch: &str) -> std::result::Result<(), Rejection> {
+        self.require_idle()?;
+        switch_workspace_branch(&self.running.gateway_sandbox, branch).await?;
+        self.broadcast_changed().await
     }
 
     async fn broadcast_changed(&mut self) -> std::result::Result<(), Rejection> {
@@ -1407,11 +1511,123 @@ impl HostState {
     }
 
     async fn broadcast_sessions(&self) -> std::result::Result<(), Rejection> {
-        let sessions = session_catalog(&self.checkpoints).await.map_err(internal)?;
-        self.broadcast(ServerMessage::Sessions {
-            request_id: None,
-            sessions,
-        });
+        let sessions = session_catalog(&self.checkpoints, &self.activities)
+            .await
+            .map_err(internal)?;
+        let _ = self
+            .gateway_events
+            .send(ServerFrame::new(ServerMessage::Sessions {
+                request_id: None,
+                sessions,
+            }));
+        Ok(())
+    }
+
+    fn activity_for_event(&mut self, event: &EventMsg) -> Result<Option<SessionActivity>> {
+        let current = self.activity()?;
+        let next = match event {
+            EventMsg::TurnStarted(turn) => {
+                self.turn_error = None;
+                Some(SessionActivity {
+                    state: SessionActivityState::Running,
+                    turn_id: Some(turn.turn_id.clone()),
+                    started_at: Some(Utc::now().timestamp()),
+                    ..SessionActivity::default()
+                })
+            }
+            EventMsg::ExecApprovalRequest(request) => Some(SessionActivity {
+                state: SessionActivityState::AwaitingApproval,
+                turn_id: Some(request.turn_id.clone()),
+                started_at: current.started_at.or_else(|| Some(Utc::now().timestamp())),
+                ..SessionActivity::default()
+            }),
+            EventMsg::Error(error) if current.state == SessionActivityState::Idle => {
+                self.turn_error = None;
+                Some(SessionActivity {
+                    last_outcome: Some(SessionOutcome::Failed),
+                    message: Some(error.message.clone()),
+                    ..SessionActivity::default()
+                })
+            }
+            EventMsg::Error(error) => {
+                self.turn_error = Some(error.message.clone());
+                None
+            }
+            EventMsg::TurnComplete(_) => {
+                let message = self.turn_error.take();
+                Some(SessionActivity {
+                    last_outcome: Some(if message.is_some() {
+                        SessionOutcome::Failed
+                    } else {
+                        SessionOutcome::Completed
+                    }),
+                    message,
+                    ..SessionActivity::default()
+                })
+            }
+            EventMsg::TurnAborted(turn) => {
+                let error = self.turn_error.take();
+                Some(SessionActivity {
+                    last_outcome: Some(if error.is_some() {
+                        SessionOutcome::Failed
+                    } else {
+                        SessionOutcome::Aborted
+                    }),
+                    message: Some(error.unwrap_or_else(|| turn.reason.clone())),
+                    ..SessionActivity::default()
+                })
+            }
+            _ => None,
+        };
+        Ok(next)
+    }
+
+    async fn resume_activity(&self) -> Result<()> {
+        let current = self.activity()?;
+        if current.state != SessionActivityState::AwaitingApproval {
+            return Ok(());
+        }
+        self.set_activity(SessionActivity {
+            state: SessionActivityState::Running,
+            turn_id: current.turn_id,
+            started_at: current.started_at,
+            ..SessionActivity::default()
+        })?;
+        self.broadcast_sessions()
+            .await
+            .map_err(|rejection| Error::Config(rejection.message))
+    }
+
+    async fn fail_activity(&self, message: &str) -> Result<()> {
+        if self.activity()?.state == SessionActivityState::Idle {
+            return Ok(());
+        }
+        self.set_activity(SessionActivity {
+            last_outcome: Some(SessionOutcome::Failed),
+            message: Some(message.into()),
+            ..SessionActivity::default()
+        })?;
+        self.broadcast_sessions()
+            .await
+            .map_err(|rejection| Error::Config(rejection.message))
+    }
+
+    fn activity(&self) -> Result<SessionActivity> {
+        let activities = self
+            .activities
+            .lock()
+            .map_err(|_| Error::Config("session activity lock is poisoned".into()))?;
+        Ok(activities
+            .get(&self.running.session_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn set_activity(&self, activity: SessionActivity) -> Result<()> {
+        self.activities
+            .lock()
+            .map_err(|_| Error::Config("session activity lock is poisoned".into()))?
+            .insert(self.running.session_id.clone(), activity);
         Ok(())
     }
 
@@ -1420,7 +1636,7 @@ impl HostState {
     }
 
     fn require_idle(&self) -> std::result::Result<(), Rejection> {
-        if self.pending_turns > 0 || self.approval_active {
+        if !self.is_idle() {
             Err(Rejection {
                 code: "agent_busy",
                 message: "finish or interrupt the active turn before changing gateway state".into(),
@@ -1491,7 +1707,7 @@ async fn gateway_ready(state: &GatewayState) -> std::result::Result<ReadyPayload
         .map_err(|_| internal("gateway configuration lock is poisoned"))?
         .clone();
     Ok(ReadyPayload {
-        sessions: session_catalog(&state.checkpoints)
+        sessions: session_catalog(&state.checkpoints, &state.activities)
             .await
             .map_err(internal)?,
         providers: provider_statuses(&state.store, &state.credentials).map_err(internal)?,
@@ -1543,6 +1759,7 @@ async fn start_agent(
     .await?;
     let session = agent.session().clone();
     let frontend = agent.frontend().clone();
+    let tool_count = agent.tool_count();
     let session_id = session.session_id.clone();
     let (sender, events) = agent.into_parts();
     Ok(RunningAgent {
@@ -1553,6 +1770,7 @@ async fn start_agent(
         session,
         gateway_sandbox,
         subagent_template,
+        tool_count,
     })
 }
 
@@ -2012,21 +2230,21 @@ mod tests {
         let credentials =
             Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
         credentials
-            .set("kimi", "test-secret", None)
-            .expect("Kimi credential");
+            .set("openai_socket", "test-secret", None)
+            .expect("OpenAI credential");
         let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
         let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
         let mut gateway_updates = gateway.subscribe();
         let ready = gateway
             .register_provider(ProviderConfig {
-                provider: "kimi".into(),
-                model: "kimi-k3".into(),
+                provider: "openai_socket".into(),
+                model: "gpt-5.6-sol".into(),
                 base_url: None,
-                reasoning_effort: Some("max".into()),
+                reasoning_effort: Some("medium".into()),
                 web_search: horus::backend::model::provider::HostedWebSearch::Off,
             })
             .await
-            .expect("register Kimi");
+            .expect("register OpenAI");
         let broadcast = gateway_updates
             .try_recv()
             .expect("gateway-wide catalog update");
@@ -2037,14 +2255,30 @@ mod tests {
         let alternate = ready
             .models
             .iter()
-            .find(|choice| choice.model == "kimi-k2.7-code")
-            .expect("alternate Kimi model")
+            .find(|choice| {
+                choice.model == "gpt-5.6-terra"
+                    && choice.reasoning_effort.as_deref() == Some("high")
+            })
+            .expect("alternate OpenAI model")
             .route
             .clone();
         let selected = gateway
             .create_session(&workspace)
             .await
             .expect("selected chat");
+        let mut selected_config = selected
+            .snapshot(None)
+            .await
+            .expect("selected snapshot")
+            .ready
+            .config
+            .config;
+        selected_config.provider.web_search =
+            horus::backend::model::provider::HostedWebSearch::Live;
+        selected
+            .configure(1, selected_config)
+            .await
+            .expect("configure selected chat search");
 
         selected
             .submit(Submission {
@@ -2067,11 +2301,16 @@ mod tests {
         let fresh_ready = fresh.snapshot(None).await.expect("fresh snapshot").ready;
 
         assert_eq!(selected_ready.session.model.route, alternate);
+        assert_eq!(selected_ready.config.config.provider.model, "gpt-5.6-terra");
         assert_eq!(
-            selected_ready.config.config.provider.model,
-            "kimi-k2.7-code"
+            selected_ready.config.config.provider.web_search,
+            horus::backend::model::provider::HostedWebSearch::Live
         );
-        assert_eq!(fresh_ready.config.config.provider.model, "kimi-k3");
+        assert_eq!(fresh_ready.config.config.provider.model, "gpt-5.6-sol");
+        assert_eq!(
+            fresh_ready.config.config.provider.web_search,
+            horus::backend::model::provider::HostedWebSearch::Off
+        );
         assert_ne!(selected.session_id(), fresh.session_id());
     }
 
@@ -2218,6 +2457,10 @@ mod tests {
                             slot: horus::protocol::FrontendSlot::Header,
                             text: "subagents".into(),
                             tone: horus::protocol::FrontendTone::Neutral,
+                            symbol: Some("robot".into()),
+                            icon_only: true,
+                            progress: None,
+                            content: None,
                             action: Some(action.clone()),
                         },
                     })],

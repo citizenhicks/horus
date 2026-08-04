@@ -19,6 +19,7 @@ const MAX_CREDENTIAL_BYTES: usize = 512;
 const MAX_CLIENT_LABEL_BYTES: usize = 128;
 const MAX_CLIENTS: usize = 32;
 const PAIRING_LIFETIME_SECONDS: i64 = 10 * 60;
+const REVOKED_PAIRING_EXPIRY: i64 = 0;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,6 +63,14 @@ pub struct IssuedToken {
 pub struct PairingGrant {
     pub code: String,
     pub expires_at: i64,
+}
+
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairingStatus {
+    Pending,
+    Consumed,
+    Replaced,
 }
 
 /// File-backed authentication state shared by all accepted connections.
@@ -132,7 +141,7 @@ impl AuthStore {
         }
 
         let token = random_secret(2);
-        let client_id = Uuid::new_v4().to_string();
+        let client_id = pairing_client_id(code);
         let mut next = state.clone();
         next.pending_pairing = None;
         next.clients.push(ClientToken {
@@ -148,8 +157,11 @@ impl AuthStore {
 
     /// Replaces any unused pairing code without invalidating paired clients.
     pub fn create_pairing_code(&self) -> Result<PairingGrant> {
-        let grant = new_pairing_grant()?;
         let mut state = self.lock_state()?;
+        if state.clients.len() == MAX_CLIENTS {
+            return Err(Error::Config("paired client limit reached".into()));
+        }
+        let grant = new_pairing_grant()?;
         let mut next = state.clone();
         next.pending_pairing = Some(PendingPairing {
             digest: digest(&grant.code),
@@ -179,6 +191,41 @@ impl AuthStore {
         matched.ok_or(Error::Unauthorized)
     }
 
+    #[cfg(any(unix, test))]
+    pub(crate) fn pairing_status(&self, code: &str) -> Result<PairingStatus> {
+        let state = self.lock_state()?;
+        if state
+            .clients
+            .iter()
+            .any(|client| client.id == pairing_client_id(code))
+        {
+            return Ok(PairingStatus::Consumed);
+        }
+        Ok(match &state.pending_pairing {
+            Some(pending) if credential_matches(code, &pending.digest) => PairingStatus::Pending,
+            _ => PairingStatus::Replaced,
+        })
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn revoke_pairing_code(&self, code: &str) -> Result<()> {
+        let mut state = self.lock_state()?;
+        let Some(pending) = &state.pending_pairing else {
+            return Ok(());
+        };
+        if !credential_matches(code, &pending.digest) {
+            return Ok(());
+        }
+        let mut next = state.clone();
+        next.pending_pairing = Some(PendingPairing {
+            digest: digest(&random_secret(1)),
+            expires_at: REVOKED_PAIRING_EXPIRY,
+        });
+        save_private_json(&self.path, &next, false)?;
+        *state = next;
+        Ok(())
+    }
+
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, AuthState>> {
         self.state
             .lock()
@@ -204,6 +251,12 @@ fn credential_matches(candidate: &str, expected: &[u8; 32]) -> bool {
 
 fn digest(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
+}
+
+fn pairing_client_id(code: &str) -> String {
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest(code)[..16]);
+    Uuid::from_bytes(bytes).to_string()
 }
 
 fn new_pairing_grant() -> Result<PairingGrant> {
@@ -282,6 +335,72 @@ mod tests {
 
         assert!(matches!(error, Error::Unauthorized));
         assert!(auth.pair(&replacement.code, "current").is_ok());
+        assert_eq!(
+            auth.pairing_status(&bootstrap.code)
+                .expect("replaced status"),
+            PairingStatus::Replaced
+        );
+    }
+
+    #[test]
+    fn pairing_status_tracks_a_durable_client_issuance() {
+        let directory = tempfile::tempdir().expect("state directory");
+        let path = directory.path().join("auth.json");
+        let (auth, grant) = AuthStore::initialize(&path).expect("initialize auth");
+        let pending = auth.pairing_status(&grant.code).expect("pending status");
+        auth.pair(&grant.code, "iPhone").expect("pair iPhone");
+        let reopened = AuthStore::open(path).expect("reopen auth");
+        let replacement = reopened.create_pairing_code().expect("replacement code");
+        let consumed = reopened
+            .pairing_status(&grant.code)
+            .expect("consumed status");
+
+        assert_eq!(
+            (pending, consumed),
+            (PairingStatus::Pending, PairingStatus::Consumed)
+        );
+        assert_eq!(
+            reopened
+                .pairing_status(&replacement.code)
+                .expect("replacement status"),
+            PairingStatus::Pending
+        );
+    }
+
+    #[test]
+    fn revoking_a_pairing_code_does_not_revoke_its_replacement() {
+        let directory = tempfile::tempdir().expect("state directory");
+        let path = directory.path().join("auth.json");
+        let (auth, revoked) = AuthStore::initialize(path).expect("initialize auth");
+
+        auth.revoke_pairing_code(&revoked.code)
+            .expect("revoke code");
+        assert!(auth.pair(&revoked.code, "stale").is_err());
+
+        let replacement = auth.create_pairing_code().expect("replacement code");
+        auth.revoke_pairing_code(&revoked.code)
+            .expect("revoke old code");
+        assert!(auth.pair(&replacement.code, "current").is_ok());
+    }
+
+    #[test]
+    fn pairing_code_is_not_created_at_the_client_limit() {
+        let directory = tempfile::tempdir().expect("state directory");
+        let path = directory.path().join("auth.json");
+        let (auth, mut grant) = AuthStore::initialize(path).expect("initialize auth");
+        for index in 0..MAX_CLIENTS {
+            auth.pair(&grant.code, &format!("client {index}"))
+                .expect("pair client");
+            if index + 1 < MAX_CLIENTS {
+                grant = auth.create_pairing_code().expect("next code");
+            }
+        }
+
+        let error = auth
+            .create_pairing_code()
+            .expect_err("client limit must reject a code");
+
+        assert!(error.to_string().contains("client limit"));
     }
 
     #[cfg(unix)]

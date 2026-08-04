@@ -16,22 +16,39 @@ cargo install --locked horus-cli
 
 The separately versioned `horus-gateway` crate is the runtime library used by those binaries.
 
-Initialize and serve a local gateway:
+Initialize and pair a local gateway:
 
 ```sh
 horus-gateway init
-horus-gateway serve
+horus-gateway connect
 ```
 
-Initialization prints a ten-minute, one-use pairing code. Plaintext listeners
-and clients are restricted to loopback. A remote macOS or Linux host requires
-TLS:
+`connect` starts the gateway, prints its client endpoint and a ten-minute,
+one-use code, then waits. Enter both values in a client. Once a client pairs,
+the command returns and the gateway keeps running in the background.
+
+Plaintext listeners and clients are restricted to loopback. An iPhone, iPad,
+or another machine therefore needs a routable TLS endpoint with a
+publicly trusted certificate whose hostname matches that endpoint:
 
 ```sh
 horus-gateway init --listen 0.0.0.0:8741 \
   --tls-cert /absolute/path/fullchain.pem \
   --tls-key /absolute/path/private-key.pem
+horus-gateway connect --endpoint tls://gateway.example:8741
 ```
+
+On iPhone, iPad, or Mac, choose **Add gateway** and enter the displayed
+**Gateway address** and **One-time code**. On another terminal client, run the
+displayed `horus pair` command. Pairing consumes the code and returns a unique
+bearer token; Apple clients keep it in Keychain and `horus` keeps it in its
+owner-only gateway account file. Later connections use that token, not the
+one-time code.
+
+To add another device while the gateway is already running, an authenticated
+Apple client can open **Gateway → Pair another device → Create one-time code**;
+an authenticated terminal client can run `/pair`. `horus-gateway connect` is
+the host-side recovery flow for a stopped gateway.
 
 By default, owner-only state is stored under `~/.horus/gateway`. Set
 `HORUS_GATEWAY_STATE_DIR` or pass `--state-dir` to use another location.
@@ -50,22 +67,20 @@ horus-gateway status
 horus-gateway exit
 ```
 
-Status prints the configured endpoint together with `running` or `stopped`.
+Status prints the configured listener together with `running` or `stopped`.
 Exit verifies the gateway's locked process record before sending
 SIGINT and waits up to five seconds for shutdown.
+`serve --background` starts a detached process on macOS or Linux and returns
+only after that process owns the gateway process record. Foreground `serve`
+continues to run until interrupted. Use `serve --background` for ordinary
+restarts after at least one client is paired.
 
-Pair the terminal client with the printed code:
-
-```sh
-horus pair tcp://127.0.0.1:8741 <pairing-code>
-```
-
-If every client token is lost, stop the gateway and issue another one-use code;
-existing paired clients remain valid:
+If every client token is lost, stop the gateway and run the supervised pairing
+flow again; existing paired clients remain valid:
 
 ```sh
-horus-gateway pair-code
-horus-gateway serve
+horus-gateway exit
+horus-gateway connect # add --endpoint tls://HOST:PORT for TLS
 ```
 
 The internal scheduler accepts standard five-field cron expressions. Scheduled

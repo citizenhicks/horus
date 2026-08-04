@@ -4,10 +4,10 @@ use std::sync::Arc;
 use horus::backend::checkpoint::{CheckpointStore, SessionPageRequest};
 use serde::{Deserialize, Serialize};
 
-use crate::Result;
 use crate::wire::SessionRecord;
+use crate::{Error, Result};
 
-use super::Rejection;
+use super::{Rejection, SessionActivities};
 
 const SESSION_PAGE_SIZE: usize = 100;
 const SESSION_CATALOG_SCOPE: &str = "gateway";
@@ -26,6 +26,7 @@ pub(super) type SessionCatalogMetadata = BTreeMap<String, SessionMetadata>;
 
 pub(super) async fn session_catalog(
     checkpoints: &Arc<dyn CheckpointStore>,
+    activities: &SessionActivities,
 ) -> Result<Vec<SessionRecord>> {
     let mut cursor = None;
     let mut sessions = Vec::new();
@@ -59,6 +60,9 @@ pub(super) async fn session_catalog(
         }
     }
     let metadata = load_session_metadata(checkpoints).await?;
+    let activities = activities
+        .lock()
+        .map_err(|_| Error::Config("session activity lock is poisoned".into()))?;
     let mut sessions = sessions
         .into_iter()
         .filter_map(|summary| {
@@ -66,6 +70,10 @@ pub(super) async fn session_catalog(
             (!metadata.is_some_and(|metadata| metadata.hidden)).then(|| SessionRecord {
                 title: metadata.and_then(|metadata| metadata.title.clone()),
                 pinned: metadata.is_some_and(|metadata| metadata.pinned),
+                activity: activities
+                    .get(&summary.session_id)
+                    .cloned()
+                    .unwrap_or_default(),
                 summary,
             })
         })
@@ -123,7 +131,13 @@ pub(super) fn validate_session_title(title: &str) -> std::result::Result<&str, R
 mod tests {
     use horus::backend::checkpoint::{Checkpoint, sqlite::SqliteCheckpoint};
 
+    use crate::wire::{SessionActivity, SessionActivityState};
+
     use super::*;
+
+    fn activities() -> SessionActivities {
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
 
     #[tokio::test]
     async fn session_catalog_includes_empty_roots_and_fresh_forks() {
@@ -149,7 +163,7 @@ mod tests {
             .await
             .expect("fork parent");
 
-        let mut sessions = session_catalog(&checkpoints)
+        let mut sessions = session_catalog(&checkpoints, &activities())
             .await
             .expect("session catalog")
             .into_iter()
@@ -186,7 +200,7 @@ mod tests {
             checkpoints.save(&checkpoint, &[]).await.expect("save chat");
         }
 
-        let sessions = session_catalog(&checkpoints)
+        let sessions = session_catalog(&checkpoints, &activities())
             .await
             .expect("session catalog");
         let preview = sessions
@@ -205,6 +219,36 @@ mod tests {
             preview,
             "€".repeat(MAX_SESSION_PREVIEW_BYTES / '€'.len_utf8())
         );
+    }
+
+    #[tokio::test]
+    async fn session_catalog_attaches_gateway_activity() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+            SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+                .expect("checkpoints"),
+        );
+        checkpoints
+            .save(&Checkpoint::empty("active"), &[])
+            .await
+            .expect("save session");
+        let activities = activities();
+        activities.lock().expect("activities").insert(
+            "active".into(),
+            SessionActivity {
+                state: SessionActivityState::Running,
+                turn_id: Some("turn-a".into()),
+                started_at: Some(1),
+                last_outcome: None,
+                message: None,
+            },
+        );
+
+        let sessions = session_catalog(&checkpoints, &activities)
+            .await
+            .expect("session catalog");
+
+        assert_eq!(sessions[0].activity.state, SessionActivityState::Running);
     }
 
     #[test]

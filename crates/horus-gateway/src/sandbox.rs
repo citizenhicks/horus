@@ -9,12 +9,20 @@ use horus::backend::sandbox::{
 };
 use horus::{BoxFuture, Error, Result};
 
-const GIT_ENVIRONMENT: [(&str, &str); 5] = [
+const GIT_ENVIRONMENT: [(&str, &str); 6] = [
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_NO_LAZY_FETCH", "1"),
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GIT_OPTIONAL_LOCKS", "0"),
+    ("LC_ALL", "C"),
+];
+const GIT_ARGUMENTS: [&str; 5] = [
+    "--no-pager",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
 ];
 
 /// Workspace backend that denies gateway state even to sandboxed shell commands.
@@ -63,16 +71,24 @@ impl GatewaySandbox {
     }
 
     pub(crate) async fn execute_git(&self, args: &[&str]) -> Result<CommandOutput> {
-        let mut arguments = vec![
-            "--no-pager",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-        ];
+        let mut arguments = GIT_ARGUMENTS.to_vec();
         arguments.extend_from_slice(args);
         self.delegate
             .execute_read_only("git", &arguments, &GIT_ENVIRONMENT)
+            .await
+    }
+
+    pub(crate) async fn switch_git_branch(&self, branch: &str) -> Result<CommandOutput> {
+        let mut arguments = GIT_ARGUMENTS.to_vec();
+        arguments.extend_from_slice(&[
+            "switch",
+            "--no-guess",
+            "--no-recurse-submodules",
+            "--",
+            branch,
+        ]);
+        self.delegate
+            .execute_git_mutation(&arguments, &GIT_ENVIRONMENT)
             .await
     }
 }

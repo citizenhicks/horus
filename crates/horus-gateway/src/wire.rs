@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use crate::{Error, Result};
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
@@ -117,9 +117,19 @@ pub enum ClientMessage {
         expected_revision: u64,
         config: AgentComposition,
     },
+    ConfigureDefaultAgent {
+        request_id: String,
+        expected_revision: u64,
+        config: AgentComposition,
+    },
     GetGitDiff {
         request_id: String,
         session_id: String,
+    },
+    SwitchGitBranch {
+        request_id: String,
+        session_id: String,
+        branch: String,
     },
     ListDirectories {
         request_id: String,
@@ -347,6 +357,7 @@ pub struct SessionReadyPayload {
     pub git: Option<GitStatus>,
     pub session: SessionConfiguredEvent,
     pub contributions: Vec<FrontendContribution>,
+    pub tool_count: usize,
     pub config: VersionedAgentConfig,
 }
 
@@ -357,6 +368,48 @@ pub struct SessionRecord {
     pub summary: SessionSummary,
     pub title: Option<String>,
     pub pinned: bool,
+    pub activity: SessionActivity,
+}
+
+/// Gateway-observed lifecycle state for one session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionActivity {
+    pub state: SessionActivityState,
+    pub turn_id: Option<String>,
+    pub started_at: Option<i64>,
+    pub last_outcome: Option<SessionOutcome>,
+    pub message: Option<String>,
+}
+
+impl Default for SessionActivity {
+    fn default() -> Self {
+        Self {
+            state: SessionActivityState::Idle,
+            turn_id: None,
+            started_at: None,
+            last_outcome: None,
+            message: None,
+        }
+    }
+}
+
+/// Current work state advertised in the session catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActivityState {
+    Idle,
+    Running,
+    AwaitingApproval,
+}
+
+/// Most recent terminal outcome advertised in the session catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOutcome {
+    Completed,
+    Aborted,
+    Failed,
 }
 
 /// Canonical workspace identity and path for one chat.
@@ -370,6 +423,7 @@ pub struct WorkspaceInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitStatus {
     pub current_branch: String,
+    pub branches: Vec<String>,
 }
 
 /// One bounded folder listing from the gateway host.
@@ -415,7 +469,6 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
-    #[serde(default)]
     pub web_search: HostedWebSearch,
 }
 
@@ -424,13 +477,45 @@ pub struct ProviderConfig {
 pub struct ProviderStatus {
     pub provider: String,
     pub label: String,
+    pub symbol: String,
+    pub description: String,
     pub configured: bool,
     pub auth: ProviderAuthKind,
-    pub default_model: Option<String>,
     pub default_base_url: Option<String>,
     pub default_api_key_env: Option<String>,
-    pub default_reasoning_effort: Option<String>,
-    pub default_web_search: HostedWebSearch,
+    pub models: Vec<ProviderModel>,
+    pub web_search: Vec<HostedWebSearch>,
+}
+
+impl ProviderStatus {
+    #[must_use]
+    pub fn configurable_base_url(&self) -> bool {
+        self.default_base_url.is_some()
+    }
+
+    #[must_use]
+    pub fn default_model(&self) -> Option<&ProviderModel> {
+        self.models.first()
+    }
+}
+
+/// One model advertised by a provider manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderModel {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub context_window: i64,
+    pub reasoning: Vec<ReasoningChoice>,
+    pub default_reasoning: Option<String>,
+}
+
+/// One reasoning effort advertised for a provider model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningChoice {
+    pub id: String,
+    pub label: String,
+    pub description: String,
 }
 
 /// Frontend-safe provider authentication mechanism.
@@ -446,6 +531,14 @@ pub enum ProviderAuthKind {
 #[serde(deny_unknown_fields)]
 pub struct MiddlewareConfig {
     pub(crate) enabled: BTreeSet<String>,
+    pub subagents: SubagentConfig,
+}
+
+/// Default model route used when the subagent tool does not choose one explicitly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentConfig {
+    pub model_route: Option<String>,
 }
 
 impl MiddlewareConfig {
@@ -926,6 +1019,27 @@ mod tests {
     }
 
     #[test]
+    fn git_branch_switch_is_an_explicit_session_request() {
+        let request = serde_json::to_value(ClientFrame::new(ClientMessage::SwitchGitBranch {
+            request_id: "request-branch".into(),
+            session_id: "session-a".into(),
+            branch: "feature/ui".into(),
+        }))
+        .expect("encode Git branch switch");
+
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "type": "switch_git_branch",
+                "request_id": "request-branch",
+                "session_id": "session-a",
+                "branch": "feature/ui"
+            })
+        );
+    }
+
+    #[test]
     fn agent_events_identify_their_session() {
         let frame = ServerFrame::new(ServerMessage::AgentEvent {
             session_id: "session-a".into(),
@@ -960,6 +1074,13 @@ mod tests {
             },
             title: Some("Greeting".into()),
             pinned: true,
+            activity: SessionActivity {
+                state: SessionActivityState::Running,
+                turn_id: Some("turn-a".into()),
+                started_at: Some(2),
+                last_outcome: None,
+                message: None,
+            },
         };
 
         let encoded = serde_json::to_value(record).expect("encode session record");
@@ -967,7 +1088,28 @@ mod tests {
         assert_eq!(encoded["session_id"], "session-a");
         assert_eq!(encoded["title"], "Greeting");
         assert_eq!(encoded["pinned"], true);
+        assert_eq!(encoded["activity"]["state"], "running");
+        assert_eq!(encoded["activity"]["turn_id"], "turn-a");
         assert!(encoded.get("summary").is_none());
+    }
+
+    #[test]
+    fn session_record_requires_activity() {
+        let encoded = serde_json::json!({
+            "session_id": "session-a",
+            "session_context": {},
+            "parent_session_id": null,
+            "parent_sequence": null,
+            "sequence": 3,
+            "catalog_visible": true,
+            "first_user_message": null,
+            "created_at": 1,
+            "updated_at": 2,
+            "title": null,
+            "pinned": false
+        });
+
+        assert!(serde_json::from_value::<SessionRecord>(encoded).is_err());
     }
 
     #[test]
@@ -1048,6 +1190,10 @@ mod tests {
                         "slot": "header",
                         "text": "subagents",
                         "tone": "neutral",
+                        "symbol": null,
+                        "icon_only": false,
+                        "progress": null,
+                        "content": null,
                         "action": {
                             "type": "capability_command",
                             "capability": "subagents",
@@ -1058,6 +1204,7 @@ mod tests {
                     "references": [],
                     "active_input": null
                 }],
+                "tool_count": 3,
                 "config": {
                     "revision": 1,
                     "config": {
@@ -1067,9 +1214,12 @@ mod tests {
                             "reasoning_effort": null,
                             "web_search": "off"
                         },
-                        "middleware": {"enabled": [
-                            "compaction", "skills", "steering", "subagents", "tools"
-                        ]},
+                        "middleware": {
+                            "enabled": [
+                                "compaction", "skills", "steering", "subagents", "tools"
+                            ],
+                            "subagents": {"model_route": null}
+                        },
                         "approval": "on",
                         "system_prompt": "test"
                     }

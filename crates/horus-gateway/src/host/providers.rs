@@ -5,11 +5,35 @@ use uuid::Uuid;
 
 use crate::Error;
 use crate::assembly::credential_is_configured;
-use crate::wire::{ProviderConfig, ReadyPayload, ServerFrame, ServerMessage};
+use crate::wire::{AgentComposition, ProviderConfig, ReadyPayload, ServerFrame, ServerMessage};
 
 use super::{GatewayHost, Rejection, gateway_ready, internal, invalid_config};
 
 impl GatewayHost {
+    pub(crate) async fn configure_default_agent(
+        &self,
+        expected_revision: u64,
+        config: AgentComposition,
+    ) -> std::result::Result<ReadyPayload, Rejection> {
+        let state = self.state.lock().await;
+        {
+            let mut current = state
+                .config
+                .lock()
+                .map_err(|_| internal("gateway configuration lock is poisoned"))?;
+            let next = current
+                .replacing_default_agent(expected_revision, config)
+                .map_err(invalid_config)?;
+            state.store.save(&next).map_err(internal)?;
+            *current = next;
+        }
+        let payload = gateway_ready(&state).await?;
+        let _ = self.events.send(ServerFrame::new(ServerMessage::Ready {
+            payload: payload.clone(),
+        }));
+        Ok(payload)
+    }
+
     pub(crate) async fn set_credential(
         &self,
         provider_id: String,

@@ -55,6 +55,7 @@ impl GatewayServer {
         listen: std::net::SocketAddr,
     ) -> Result<(Self, PairingGrant)> {
         let listener = TcpListener::bind(listen).await?;
+        let listen = listener.local_addr()?;
         let (store, config) = ConfigStore::initialize(state_dir, listen, None)?;
         let initialized_state = store.state_dir().to_path_buf();
         let result = match AuthStore::initialize(store.auth_path()) {
@@ -95,8 +96,23 @@ impl GatewayServer {
         })
     }
 
-    /// Serves until Ctrl-C or 72 hours pass without a client or registered cron task.
+    /// Serves until a process shutdown signal or 72 hours of inactivity.
     pub async fn serve(self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+
+            let mut interrupts = signal(SignalKind::interrupt())?;
+            let mut terminations = signal(SignalKind::terminate())?;
+            self.serve_until(async move {
+                tokio::select! {
+                    _ = interrupts.recv() => {}
+                    _ = terminations.recv() => {}
+                }
+            })
+            .await
+        }
+        #[cfg(not(unix))]
         self.serve_until(async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -469,6 +485,26 @@ async fn handle_message(
             )
             .await
         }
+        ClientMessage::ConfigureDefaultAgent {
+            request_id,
+            expected_revision,
+            config,
+        } => match gateway
+            .configure_default_agent(expected_revision, config)
+            .await
+        {
+            Ok(payload) => {
+                write_frame(
+                    writer,
+                    &ServerFrame::new(ServerMessage::GatewayConfigured {
+                        request_id,
+                        payload,
+                    }),
+                )
+                .await
+            }
+            Err(rejection) => write_rejection(writer, request_id, rejection).await,
+        },
         ClientMessage::GetGitDiff {
             request_id,
             session_id,
@@ -489,6 +525,17 @@ async fn handle_message(
                 Err(rejection) => write_rejection(writer, request_id, rejection).await,
             },
         },
+        ClientMessage::SwitchGitBranch {
+            request_id,
+            session_id,
+            branch,
+        } => {
+            let host = match require_selected(selected, &session_id) {
+                Ok(host) => host,
+                Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+            };
+            write_result(writer, request_id, host.switch_git_branch(branch).await).await
+        }
         ClientMessage::ListDirectories {
             request_id,
             path,
@@ -917,6 +964,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::client::{Endpoint, GatewayClient, GatewayEvents, GatewaySender};
+    use crate::wire::{SessionActivity, SessionActivityState};
 
     use super::*;
 
@@ -1005,11 +1053,57 @@ mod tests {
         }
     }
 
+    async fn wait_session_activity(
+        events: &mut GatewayEvents,
+        session_id: &str,
+        state: SessionActivityState,
+    ) -> SessionActivity {
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), events.next())
+                .await
+                .expect("session activity timeout")
+                .expect("gateway frame")
+                .expect("gateway open");
+            match frame.message {
+                ServerMessage::AgentEvent {
+                    session_id: actual, ..
+                } if actual == session_id => {
+                    panic!("a nonselected chat event crossed the gateway-wide stream")
+                }
+                ServerMessage::Sessions { sessions, .. } => {
+                    if let Some(activity) = sessions
+                        .into_iter()
+                        .find(|session| session.summary.session_id == session_id)
+                        .map(|session| session.activity)
+                        .filter(|activity| activity.state == state)
+                    {
+                        return activity;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     async fn drain_ready_replay(events: &mut GatewayEvents) {
         while matches!(
             tokio::time::timeout(Duration::from_millis(10), events.next()).await,
             Ok(Ok(Some(_)))
         ) {}
+    }
+
+    fn run_git(workspace: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .env("LC_ALL", "C")
+            .current_dir(workspace)
+            .output()
+            .expect("run Git");
+        assert!(
+            output.status.success(),
+            "Git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[tokio::test]
@@ -1030,12 +1124,13 @@ mod tests {
     #[tokio::test]
     async fn connected_client_pauses_and_resets_inactivity_shutdown() {
         let root = tempfile::tempdir().expect("temporary directory");
-        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
-        let listen = reservation.local_addr().expect("listen address");
-        drop(reservation);
-        let (server, grant) = GatewayServer::bootstrap(root.path().join("state"), listen)
-            .await
-            .expect("bootstrap gateway");
+        let (server, grant) = GatewayServer::bootstrap(
+            root.path().join("state"),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .expect("bootstrap gateway");
+        let listen = server.config.listen;
         let serving = tokio::spawn(
             server.serve_until_inactive(std::future::pending(), Duration::from_millis(200)),
         );
@@ -1062,12 +1157,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn scheduled_task_disables_inactivity_shutdown() {
         let root = tempfile::tempdir().expect("temporary directory");
-        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
-        let listen = reservation.local_addr().expect("listen address");
-        drop(reservation);
-        let (server, _) = GatewayServer::bootstrap(root.path().join("state"), listen)
-            .await
-            .expect("bootstrap gateway");
+        let (server, _) = GatewayServer::bootstrap(
+            root.path().join("state"),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .expect("bootstrap gateway");
         let cron = Arc::clone(&server.cron);
         let (shutdown, signal) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(server.serve_until_inactive(
@@ -1100,12 +1195,13 @@ mod tests {
         let second_workspace = root.path().join("second");
         fs::create_dir(&first_workspace).expect("first workspace");
         fs::create_dir(&second_workspace).expect("second workspace");
-        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
-        let listen = reservation.local_addr().expect("listen address");
-        drop(reservation);
-        let (server, grant) = GatewayServer::bootstrap(root.path().join("state"), listen)
-            .await
-            .expect("bootstrap gateway");
+        let (server, grant) = GatewayServer::bootstrap(
+            root.path().join("state"),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .expect("bootstrap gateway");
+        let listen = server.config.listen;
         let (shutdown, signal) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(server.serve_until(async move {
             let _ = signal.await;
@@ -1144,12 +1240,20 @@ mod tests {
             .await
             .expect("submit first chat");
         wait_submission(&mut first_events, &first_submission).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), second_events.next())
-                .await
-                .is_err(),
-            "the second frontend received another chat's event"
-        );
+        let running = wait_session_activity(
+            &mut second_events,
+            &first_session,
+            SessionActivityState::Running,
+        )
+        .await;
+        let finished = wait_session_activity(
+            &mut second_events,
+            &first_session,
+            SessionActivityState::Idle,
+        )
+        .await;
+        assert!(running.turn_id.is_some());
+        assert!(finished.last_outcome.is_some());
 
         open_chat(&second_sender, &mut second_events, &first_session).await;
         drain_ready_replay(&mut second_events).await;
@@ -1168,6 +1272,78 @@ mod tests {
             .expect("submit shared chat");
         wait_submission(&mut first_events, &shared_submission).await;
         wait_submission(&mut second_events, &shared_submission).await;
+
+        shutdown.send(()).expect("stop gateway");
+        serving.await.expect("gateway task").expect("gateway stop");
+    }
+
+    #[tokio::test]
+    async fn branch_switch_is_acknowledged_and_broadcasts_fresh_status() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        run_git(&workspace, &["init", "--quiet", "--initial-branch", "main"]);
+        run_git(
+            &workspace,
+            &["config", "user.email", "horus@example.invalid"],
+        );
+        run_git(&workspace, &["config", "user.name", "Horus Test"]);
+        fs::write(workspace.join("tracked.txt"), b"main").expect("tracked file");
+        run_git(&workspace, &["add", "--", "tracked.txt"]);
+        run_git(&workspace, &["commit", "--quiet", "-m", "initial"]);
+        run_git(&workspace, &["branch", "feature"]);
+        let (server, grant) = GatewayServer::bootstrap(
+            root.path().join("state"),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .expect("bootstrap gateway");
+        let listen = server.config.listen;
+        let (shutdown, signal) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(server.serve_until(async move {
+            let _ = signal.await;
+        }));
+        let endpoint = format!("tcp://{listen}")
+            .parse::<Endpoint>()
+            .expect("endpoint");
+        let (connection, _) = GatewayClient::pair(&endpoint, grant.code, "branch test")
+            .await
+            .expect("pair frontend");
+        let (sender, mut events) = connection.into_parts();
+        wait_gateway_ready(&mut events).await;
+        let session_id = create_chat(&sender, &mut events, &workspace).await;
+        drain_ready_replay(&mut events).await;
+        let request_id = Uuid::new_v4().to_string();
+
+        sender
+            .send(ClientMessage::SwitchGitBranch {
+                request_id: request_id.clone(),
+                session_id,
+                branch: "feature".into(),
+            })
+            .await
+            .expect("switch branch");
+        let mut accepted = false;
+        let mut changed = false;
+        while !accepted || !changed {
+            let frame = tokio::time::timeout(Duration::from_secs(5), events.next())
+                .await
+                .expect("branch response timeout")
+                .expect("gateway frame")
+                .expect("gateway open");
+            match frame.message {
+                ServerMessage::Accepted { request_id: actual } if actual == request_id => {
+                    accepted = true;
+                }
+                ServerMessage::SessionChanged { payload } => {
+                    changed = payload.git.is_some_and(|git| {
+                        git.current_branch == "feature"
+                            && git.branches == ["feature".to_string(), "main".to_string()]
+                    });
+                }
+                _ => {}
+            }
+        }
 
         shutdown.send(()).expect("stop gateway");
         serving.await.expect("gateway task").expect("gateway stop");

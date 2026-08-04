@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -5,8 +6,8 @@ use horus::Error as HorusError;
 use horus::agent::{Agent, AgentConfig, create_agent};
 use horus::backend::checkpoint::CheckpointStore;
 use horus::backend::model::provider::{
-    HostedWebSearch, HttpClient, ProviderAuth, ProviderBuildConfig, ProviderCredential,
-    ProviderDefinition, provider, providers, streaming_client,
+    HttpClient, ProviderAuth, ProviderBuildConfig, ProviderCredential, ProviderDefinition,
+    provider, providers, streaming_client,
 };
 use horus::backend::model::{
     Model, ModelChoice, ModelEventSink, ModelInfo, ModelOutput, ModelRequest, ModelRouter,
@@ -28,7 +29,10 @@ use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig, local
 use crate::cron::CronStore;
 use crate::middleware_manifest::{BuiltinMiddleware, MIDDLEWARE};
 use crate::sandbox::GatewaySandbox;
-use crate::wire::{MiddlewareConfig, ProviderAuthKind, ProviderConfig, ProviderStatus};
+use crate::wire::{
+    MiddlewareConfig, ProviderAuthKind, ProviderConfig, ProviderModel, ProviderStatus,
+    ReasoningChoice,
+};
 use crate::{Error, Result};
 
 const DEFAULT_CONTEXT_WINDOW: i64 = 272_000;
@@ -58,7 +62,7 @@ pub(crate) async fn assemble(
 ) -> Result<BuiltAgent> {
     let (models, context_window) =
         if credential_is_configured(&chat.agent.config.provider, store, &credentials)? {
-            build_models(&chat.agent.config.provider, store, &credentials)?
+            build_models(gateway, &chat.agent.config.provider, store, &credentials)?
         } else {
             unavailable_models(&chat.agent.config.provider)?
         };
@@ -70,19 +74,18 @@ pub(crate) async fn assemble(
     )?);
     let backend: Arc<dyn SandboxBackend> = gateway_sandbox.clone();
     let sandbox = Arc::new(Sandbox::new(backend, chat.agent.config.approval));
-    let template = chat
+    if let Some(route) = chat
         .agent
         .config
         .middleware
-        .enabled("subagents")
-        .then(|| Arc::new(OnceLock::<AgentConfig>::new()));
-    let launcher = template.as_ref().map(subagent_launcher);
-    let middleware = build_middleware(
-        &chat.agent.config.middleware,
-        &chat.workspace,
-        launcher,
-        cron,
-    )?;
+        .subagents
+        .model_route
+        .as_deref()
+    {
+        models.resolve_choice(route, None)?;
+    }
+    let (middleware, template) =
+        build_middleware(&chat.agent.config.middleware, &chat.workspace, cron)?;
     let mut metadata = match session_id.as_deref() {
         Some(session_id) => checkpoints
             .load(session_id)
@@ -180,6 +183,19 @@ pub(crate) fn configured_provider_for_route(
         .ok_or_else(|| Error::Config("model route is not in the configured gateway catalog".into()))
 }
 
+pub(crate) fn configured_route_exists(gateway: &GatewayConfig, route: &str) -> Result<bool> {
+    for selection in gateway.configured_providers.values() {
+        let definition = provider(&selection.provider)?;
+        if catalog_routes(definition, selection)
+            .iter()
+            .any(|candidate| candidate.choice.route == route)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn configured_model_routes(
     gateway: &GatewayConfig,
     store: &ConfigStore,
@@ -274,19 +290,36 @@ fn provider_status(definition: &ProviderDefinition, configured: bool) -> Provide
         ),
         ProviderAuth::Browser(_) => (ProviderAuthKind::DeviceCode, None),
     };
-    let default_model = definition.models().first();
     ProviderStatus {
         provider: definition.id().into(),
         label: definition.label().into(),
+        symbol: definition.symbol().into(),
+        description: definition.description().into(),
         configured,
         auth,
-        default_model: default_model.map(|model| model.id.into()),
         default_base_url: definition.default_base_url().map(str::to_string),
         default_api_key_env,
-        default_reasoning_effort: default_model
-            .and_then(|model| model.default_reasoning)
-            .map(str::to_string),
-        default_web_search: definition.web_search().first().copied().unwrap_or_default(),
+        models: definition
+            .models()
+            .iter()
+            .map(|model| ProviderModel {
+                id: model.id.into(),
+                label: model.label.into(),
+                description: model.description.into(),
+                context_window: model.context_window,
+                reasoning: model
+                    .reasoning
+                    .iter()
+                    .map(|reasoning| ReasoningChoice {
+                        id: reasoning.id.into(),
+                        label: reasoning.label.into(),
+                        description: reasoning.description.into(),
+                    })
+                    .collect(),
+                default_reasoning: model.default_reasoning.map(str::to_string),
+            })
+            .collect(),
+        web_search: definition.web_search().to_vec(),
     }
 }
 
@@ -310,71 +343,55 @@ fn subagent_launcher(template: &Arc<OnceLock<AgentConfig>>) -> SubagentLauncher 
 }
 
 fn build_models(
+    gateway: &GatewayConfig,
     selection: &ProviderConfig,
     store: &ConfigStore,
     credentials: &CredentialStore,
 ) -> Result<(Arc<ModelRouter>, i64)> {
     let definition = provider(&selection.provider)?;
-    let base_url = if definition.configurable_base_url() {
-        selection
-            .base_url
-            .clone()
-            .or_else(|| definition.default_base_url().map(str::to_string))
-    } else {
-        None
-    };
-    let credential = resolve_credential(definition, base_url.as_deref(), store, credentials)?;
+    let effort = selection.reasoning_effort.as_deref().or_else(|| {
+        definition
+            .model(&selection.model)
+            .and_then(|model| model.default_reasoning)
+    });
+    let selected_route = route_id(&selection.provider, &selection.model, effort);
+    let mut catalog = catalog_routes(definition, selection);
+    catalog.extend(
+        configured_model_routes(gateway, store, credentials)?
+            .into_iter()
+            .filter(|route| route.provider.provider != selection.provider),
+    );
+    catalog.sort_by_key(|route| route.choice.route != selected_route);
+    if catalog.first().map(|route| route.choice.route.as_str()) != Some(selected_route.as_str()) {
+        return Err(Error::Config(
+            "active model route is not in the configured gateway catalog".into(),
+        ));
+    }
     let http = streaming_client()?;
-    let mut models = definition.models().iter().collect::<Vec<_>>();
-    models.sort_by_key(|model| model.id != selection.model);
-    let custom_model = models
-        .iter()
-        .all(|preset| preset.id != selection.model)
-        .then_some(selection.model.as_str());
-    if models.is_empty() && custom_model.is_none() {
-        return Err(Error::Config(format!(
-            "provider `{}` has no model routes",
-            definition.id()
-        )));
-    }
-
-    let mut routes = Vec::new();
-    if let Some(model) = custom_model {
-        routes.push(build_route(RouteSpec {
-            definition,
-            credential: credential.clone(),
-            http: &http,
-            model,
-            effort: selection.reasoning_effort.as_deref(),
-            context_window: Some(DEFAULT_CONTEXT_WINDOW),
-            base_url: base_url.clone(),
-            web_search: selection.web_search,
-        })?);
-    }
-    for preset in models {
-        let preferred = (preset.id == selection.model)
-            .then_some(selection.reasoning_effort.as_deref())
-            .flatten()
-            .or(preset.default_reasoning);
-        let mut efforts = vec![preferred];
-        for reasoning in preset.reasoning {
-            let effort = Some(reasoning.id);
-            if !efforts.contains(&effort) {
-                efforts.push(effort);
+    let mut provider_credentials = BTreeMap::<String, ProviderCredential>::new();
+    let mut routes = Vec::with_capacity(catalog.len());
+    for route in catalog {
+        let definition = provider(&route.provider.provider)?;
+        let base_url = definition
+            .configurable_base_url()
+            .then(|| {
+                route
+                    .provider
+                    .base_url
+                    .clone()
+                    .or_else(|| definition.default_base_url().map(str::to_string))
+            })
+            .flatten();
+        let credential = match provider_credentials.get(definition.id()) {
+            Some(credential) => credential.clone(),
+            None => {
+                let credential =
+                    resolve_credential(definition, base_url.as_deref(), store, credentials)?;
+                provider_credentials.insert(definition.id().into(), credential.clone());
+                credential
             }
-        }
-        for effort in efforts {
-            routes.push(build_route(RouteSpec {
-                definition,
-                credential: credential.clone(),
-                http: &http,
-                model: preset.id,
-                effort,
-                context_window: Some(preset.context_window),
-                base_url: base_url.clone(),
-                web_search: selection.web_search,
-            })?);
-        }
+        };
+        routes.push(build_route(route, definition, credential, base_url, &http)?);
     }
     let first = routes
         .first()
@@ -454,35 +471,24 @@ pub(crate) fn credential_is_configured(
     }
 }
 
-struct RouteSpec<'a> {
+fn build_route(
+    route: CatalogRoute,
     definition: &'static ProviderDefinition,
     credential: ProviderCredential,
-    http: &'a HttpClient,
-    model: &'a str,
-    effort: Option<&'a str>,
-    context_window: Option<i64>,
     base_url: Option<String>,
-    web_search: HostedWebSearch,
-}
-
-fn build_route(spec: RouteSpec<'_>) -> Result<RouteValue> {
-    let id = route_id(spec.definition.id(), spec.model, spec.effort);
-    let model = spec.definition.build(ProviderBuildConfig {
-        credential: spec.credential,
-        model: spec.model.into(),
-        base_url: spec.base_url,
-        reasoning_effort: spec.effort.map(str::to_string),
-        web_search: spec.web_search,
-        http: spec.http.clone(),
+    http: &HttpClient,
+) -> Result<RouteValue> {
+    let model = definition.build(ProviderBuildConfig {
+        credential,
+        model: route.provider.model,
+        base_url,
+        reasoning_effort: route.provider.reasoning_effort,
+        web_search: route.provider.web_search,
+        http: http.clone(),
     })?;
+    let id = route.choice.route.clone();
     Ok(RouteValue {
-        choice: ModelChoice {
-            route: id.clone(),
-            group: spec.model.into(),
-            model: spec.model.into(),
-            reasoning_effort: spec.effort.map(str::to_string),
-            context_window: spec.context_window,
-        },
+        choice: route.choice,
         id,
         model,
     })
@@ -530,12 +536,7 @@ fn unavailable_models(selection: &ProviderConfig) -> Result<(Arc<ModelRouter>, i
             .model(&selection.model)
             .and_then(|preset| preset.default_reasoning.map(str::to_string))
     });
-    let route = format!(
-        "{}::{}::{}",
-        selection.provider,
-        selection.model,
-        effort.as_deref().unwrap_or("default")
-    );
+    let route = route_id(&selection.provider, &selection.model, effort.as_deref());
     let model: Arc<dyn Model> = Arc::new(UnavailableModel {
         info: ModelInfo {
             model: selection.model.clone(),
@@ -556,10 +557,10 @@ fn unavailable_models(selection: &ProviderConfig) -> Result<(Arc<ModelRouter>, i
 fn build_middleware(
     settings: &MiddlewareConfig,
     workspace: &std::path::Path,
-    launcher: Option<SubagentLauncher>,
     cron: Arc<CronStore>,
-) -> Result<MiddlewareStack> {
+) -> Result<(MiddlewareStack, Option<Arc<OnceLock<AgentConfig>>>)> {
     let mut entries: Vec<Arc<dyn Middleware>> = Vec::new();
+    let mut subagent_template = None;
     for feature in MIDDLEWARE
         .iter()
         .filter(|feature| feature.required || settings.enabled(feature.id))
@@ -580,26 +581,29 @@ fn build_middleware(
                 workspace.join(".codex/skills"),
             ])?),
             BuiltinMiddleware::Tasks => Arc::new(Tasks),
-            BuiltinMiddleware::Subagents => Arc::new(Subagents::new(
-                4,
-                8,
-                32,
-                launcher
-                    .clone()
-                    .ok_or_else(|| Error::Config("subagent launcher is missing".into()))?,
-            )?),
+            BuiltinMiddleware::Subagents => {
+                let template = Arc::new(OnceLock::<AgentConfig>::new());
+                let middleware = Subagents::new(4, 8, 32, subagent_launcher(&template))?;
+                let middleware = match settings.subagents.model_route.as_deref() {
+                    Some(route) => middleware.default_model(route),
+                    None => middleware,
+                };
+                subagent_template = Some(template);
+                Arc::new(middleware)
+            }
             BuiltinMiddleware::Steering => Arc::new(Steering::default()),
             BuiltinMiddleware::Compaction => Arc::new(Compaction::default()),
             BuiltinMiddleware::Sessions => Arc::new(Sessions::default()),
         };
         entries.push(middleware);
     }
-    Ok(MiddlewareStack::new(entries)?)
+    Ok((MiddlewareStack::new(entries)?, subagent_template))
 }
 
 #[cfg(test)]
 mod tests {
     use horus::backend::checkpoint::{Checkpoint, sqlite::SqliteCheckpoint};
+    use horus::backend::model::provider::HostedWebSearch;
 
     use super::*;
 
@@ -609,16 +613,20 @@ mod tests {
 
         assert_eq!(status.provider, "openai_socket");
         assert_eq!(status.label, "OpenAI (API key)");
-        assert_eq!(status.default_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(status.symbol, "sparkle");
+        assert_eq!(status.models[0].id, "gpt-5.6-sol");
         assert_eq!(
             status.default_api_key_env.as_deref(),
             Some("OPENAI_API_KEY")
         );
-        assert_eq!(status.default_reasoning_effort.as_deref(), Some("medium"));
-        assert_eq!(status.default_web_search, HostedWebSearch::Off);
+        assert_eq!(
+            status.models[0].default_reasoning.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(status.web_search[0], HostedWebSearch::Off);
 
         let custom = provider_status(provider("responses").expect("provider"), false);
-        assert_eq!(custom.default_model, None);
+        assert!(custom.models.is_empty());
         assert_eq!(
             custom.default_base_url.as_deref(),
             Some("https://api.openai.com/v1")

@@ -8,26 +8,70 @@ use crate::wire::GitStatus;
 
 use super::Rejection;
 
-const MAX_GIT_DIFF_BYTES: usize = 40_000;
+const MAX_GIT_DIFF_BYTES: usize = 400_000;
+const TRUNCATION_NOTE: &[u8] = b"[diff truncated]\n";
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) async fn status(sandbox: &GatewaySandbox) -> Option<GitStatus> {
-    let current = tokio::time::timeout(
-        GIT_TIMEOUT,
-        sandbox.execute_git(&["branch", "--show-current"]),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if current.exit_code != 0
-        || current.stdout.len() > MAX_GIT_DIFF_BYTES
-        || current.stderr.len() > MAX_GIT_DIFF_BYTES
-    {
-        return None;
-    }
-    Some(GitStatus {
-        current_branch: current.stdout.trim().into(),
+    tokio::time::timeout(GIT_TIMEOUT, status_inner(sandbox))
+        .await
+        .ok()?
+        .ok()
+}
+
+pub(super) async fn switch_branch(
+    sandbox: &GatewaySandbox,
+    branch: &str,
+) -> std::result::Result<(), Rejection> {
+    tokio::time::timeout(GIT_TIMEOUT, switch_branch_inner(sandbox, branch))
+        .await
+        .map_err(|_| timeout())?
+}
+
+async fn status_inner(sandbox: &GatewaySandbox) -> std::result::Result<GitStatus, Rejection> {
+    let (current, branches) = tokio::join!(
+        output(sandbox, &["branch", "--show-current"]),
+        output(
+            sandbox,
+            &["for-each-ref", "--format=%(refname)", "refs/heads/"]
+        )
+    );
+    let current = successful_output(current?, "reading the current Git branch failed")?;
+    let branches = successful_output(branches?, "listing local Git branches failed")?;
+    let mut branches = String::from_utf8_lossy(&branches)
+        .lines()
+        .map(|branch| branch.strip_prefix("refs/heads/").map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(invalid_branch_output)?;
+    branches.sort_unstable();
+    branches.dedup();
+    Ok(GitStatus {
+        current_branch: String::from_utf8_lossy(&current).trim().into(),
+        branches,
     })
+}
+
+async fn switch_branch_inner(
+    sandbox: &GatewaySandbox,
+    branch: &str,
+) -> std::result::Result<(), Rejection> {
+    if !status_inner(sandbox)
+        .await?
+        .branches
+        .iter()
+        .any(|candidate| candidate == branch)
+    {
+        return Err(unknown_branch());
+    }
+    let output = sandbox
+        .switch_git_branch(branch)
+        .await
+        .map_err(error_rejection)?;
+    if output.exit_code == 0 {
+        Ok(())
+    } else {
+        Err(failure("switching Git branches failed", &output.stderr))
+    }
 }
 
 pub(super) async fn diff(
@@ -99,13 +143,10 @@ async fn diff_inner(
             "unstaged git diff failed",
         )?;
         let mut diff = Vec::new();
-        append_diff(&mut diff, &staged)?;
-        append_diff(&mut diff, &unstaged)?;
+        append_diff(&mut diff, &staged);
+        append_diff(&mut diff, &unstaged);
         diff
     };
-    if diff.len() > MAX_GIT_DIFF_BYTES {
-        return Err(too_large());
-    }
 
     let untracked = successful_output(
         output(
@@ -115,13 +156,13 @@ async fn diff_inner(
         .await?,
         "listing untracked files failed",
     )?;
-    if untracked.len() > MAX_GIT_DIFF_BYTES {
-        return Err(too_large());
-    }
     for path in untracked
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
     {
+        if diff.len() >= MAX_GIT_DIFF_BYTES {
+            break;
+        }
         let path = std::str::from_utf8(path).map_err(|_| invalid_path())?;
         let relative = Path::new(path);
         if !safe_path(relative) {
@@ -137,10 +178,11 @@ async fn diff_inner(
         }
         let patch = untracked_diff(sandbox, path).await?;
         if !is_binary_diff(&patch) {
-            append_diff(&mut diff, &patch)?;
+            append_diff(&mut diff, &patch);
         }
     }
 
+    truncate_diff(&mut diff);
     Ok(String::from_utf8_lossy(&diff).into_owned())
 }
 
@@ -148,11 +190,7 @@ async fn output(
     sandbox: &GatewaySandbox,
     args: &[&str],
 ) -> std::result::Result<CommandOutput, Rejection> {
-    let output = sandbox.execute_git(args).await.map_err(error_rejection)?;
-    if output.stdout.len() > MAX_GIT_DIFF_BYTES || output.stderr.len() > MAX_GIT_DIFF_BYTES {
-        return Err(too_large());
-    }
-    Ok(output)
+    sandbox.execute_git(args).await.map_err(error_rejection)
 }
 
 async fn untracked_diff(
@@ -191,24 +229,28 @@ fn successful_output(
     }
 }
 
-fn append_diff(target: &mut Vec<u8>, patch: &[u8]) -> std::result::Result<(), Rejection> {
+fn append_diff(target: &mut Vec<u8>, patch: &[u8]) {
     if patch.is_empty() {
-        return Ok(());
+        return;
     }
-    let separator = usize::from(!target.is_empty() && !target.ends_with(b"\n"));
-    if target
-        .len()
-        .saturating_add(separator)
-        .saturating_add(patch.len())
-        > MAX_GIT_DIFF_BYTES
-    {
-        return Err(too_large());
-    }
-    if separator == 1 {
+    if !target.is_empty() && !target.ends_with(b"\n") {
         target.push(b'\n');
     }
     target.extend_from_slice(patch);
-    Ok(())
+}
+
+/// A diff too large to send is still worth reading, so it is cut at the last whole line rather
+/// than rejected. The sandbox already truncates each Git invocation at the same budget.
+fn truncate_diff(diff: &mut Vec<u8>) {
+    if diff.len() <= MAX_GIT_DIFF_BYTES {
+        return;
+    }
+    let cut = diff[..MAX_GIT_DIFF_BYTES]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    diff.truncate(cut);
+    diff.extend_from_slice(TRUNCATION_NOTE);
 }
 
 fn safe_path(path: &Path) -> bool {
@@ -247,15 +289,23 @@ fn failure(prefix: &str, stderr: &str) -> Rejection {
 fn timeout() -> Rejection {
     Rejection {
         code: "git_timeout",
-        message: "Git inspection exceeded 5 seconds".into(),
+        message: "Git operation exceeded 5 seconds".into(),
         fatal: false,
     }
 }
 
-fn too_large() -> Rejection {
+fn unknown_branch() -> Rejection {
     Rejection {
-        code: "git_diff_too_large",
-        message: format!("workspace Git diff exceeds {MAX_GIT_DIFF_BYTES} bytes"),
+        code: "unknown_git_branch",
+        message: "the requested Git branch is not a local branch".into(),
+        fatal: false,
+    }
+}
+
+fn invalid_branch_output() -> Rejection {
+    Rejection {
+        code: "git_error",
+        message: "Git returned an invalid local branch".into(),
         fatal: false,
     }
 }
@@ -291,6 +341,103 @@ mod tests {
         let sandbox =
             GatewaySandbox::new(workspace, state.path(), None, GIT_TIMEOUT).expect("Git sandbox");
         (state, sandbox)
+    }
+
+    fn initialize_repository(workspace: &Path, branch: &str) {
+        run_git(workspace, &["init", "--quiet", "--initial-branch", branch]);
+        run_git(
+            workspace,
+            &["config", "user.email", "horus@example.invalid"],
+        );
+        run_git(workspace, &["config", "user.name", "Horus Test"]);
+        run_git(workspace, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(workspace.join("tracked.txt"), branch).expect("tracked file");
+        run_git(workspace, &["add", "--", "tracked.txt"]);
+        run_git(workspace, &["commit", "--quiet", "-m", "initial"]);
+    }
+
+    #[tokio::test]
+    async fn git_status_lists_sorted_local_branches() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        initialize_repository(workspace.path(), "middle");
+        run_git(workspace.path(), &["branch", "zeta"]);
+        run_git(workspace.path(), &["branch", "Alpha"]);
+        let (_state, sandbox) = test_sandbox(workspace.path());
+
+        let status = status(&sandbox).await.expect("Git status");
+
+        assert_eq!(status.branches, ["Alpha", "middle", "zeta"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn branch_switch_uses_the_protected_git_sandbox() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        initialize_repository(workspace.path(), "main");
+        run_git(workspace.path(), &["switch", "--quiet", "-c", "feature"]);
+        run_git(
+            workspace.path(),
+            &[
+                "config",
+                "filter.horus.smudge",
+                "sh -c 'touch .agents/filter-ran .codex/filter-ran 2>/dev/null; cat'",
+            ],
+        );
+        std::fs::write(
+            workspace.path().join(".gitattributes"),
+            "filtered.txt filter=horus\n",
+        )
+        .expect("attributes");
+        std::fs::write(workspace.path().join("filtered.txt"), "feature\n").expect("filtered file");
+        run_git(workspace.path(), &["add", "--", "."]);
+        run_git(workspace.path(), &["commit", "--quiet", "-m", "feature"]);
+        run_git(workspace.path(), &["switch", "--quiet", "main"]);
+        for directory in [".agents", ".codex"] {
+            std::fs::create_dir(workspace.path().join(directory)).expect("protected directory");
+            std::fs::write(
+                workspace.path().join(directory).join("sentinel"),
+                "protected",
+            )
+            .expect("protected sentinel");
+        }
+        let hook = workspace.path().join(".git/hooks/post-checkout");
+        std::fs::write(&hook, "#!/bin/sh\ntouch hook-ran\n").expect("checkout hook");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+            .expect("hook permissions");
+        let (_state, sandbox) = test_sandbox(workspace.path());
+
+        switch_branch(&sandbox, "feature")
+            .await
+            .expect("switch branch");
+        let status = status(&sandbox).await.expect("Git status");
+
+        assert_eq!(
+            (
+                status.current_branch.as_str(),
+                std::fs::read_to_string(workspace.path().join("filtered.txt"))
+                    .expect("filtered file"),
+                workspace.path().join("hook-ran").exists(),
+                workspace.path().join(".agents/filter-ran").exists(),
+                workspace.path().join(".codex/filter-ran").exists(),
+            ),
+            ("feature", "feature\n".into(), false, false, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_switch_rejects_names_outside_advertised_local_heads() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        initialize_repository(workspace.path(), "main");
+        run_git(workspace.path(), &["branch", "feature"]);
+        let (_state, sandbox) = test_sandbox(workspace.path());
+
+        let error = switch_branch(&sandbox, "feature ")
+            .await
+            .expect_err("unadvertised branch");
+
+        assert_eq!(error.code, "unknown_git_branch");
     }
 
     #[tokio::test]
@@ -351,7 +498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_diff_rejects_oversized_output() {
+    async fn workspace_diff_truncates_oversized_output_at_a_line_boundary() {
         let workspace = tempfile::tempdir().expect("workspace");
         let (_state, sandbox) = test_sandbox(workspace.path());
         run_git(workspace.path(), &["init", "--quiet"]);
@@ -361,10 +508,18 @@ mod tests {
         )
         .expect("large untracked file");
 
-        let error = diff(&sandbox, workspace.path())
+        let diff = diff(&sandbox, workspace.path())
             .await
-            .expect_err("oversized diff");
+            .expect("oversized diff");
 
-        assert_eq!(error.code, "git_diff_too_large");
+        let note = String::from_utf8_lossy(TRUNCATION_NOTE);
+        assert!(
+            diff.len() <= MAX_GIT_DIFF_BYTES + note.len()
+                && diff.ends_with(note.as_ref())
+                && diff.contains("diff --git a/large.txt b/large.txt"),
+            "unexpected truncation: {} bytes, tail {:?}",
+            diff.len(),
+            &diff[diff.len().saturating_sub(40)..]
+        );
     }
 }

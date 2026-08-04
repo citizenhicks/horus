@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use horus::backend::model::provider::{ProviderAuth, provider};
+use horus::backend::model::provider::{ProviderAuth, default_provider, provider};
 use horus::protocol::TokenUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,8 +23,8 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 5;
-const CHAT_SPEC_VERSION: u32 = 2;
+const CONFIG_VERSION: u32 = 6;
+const CHAT_SPEC_VERSION: u32 = 3;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
 const CONFIG_HEADER: &str = "# approval options: \"on\" (prompt), \"allow\" (no prompt, no network),\n# \"allow_network\" (no prompt, network allowed).\n\n";
@@ -58,7 +58,6 @@ pub struct GatewayConfig {
     pub tls: Option<TlsConfig>,
     pub default_agent: Option<VersionedAgentConfig>,
     pub configured_providers: BTreeMap<String, ProviderConfig>,
-    #[serde(default)]
     usage: UsageHistory,
 }
 
@@ -99,7 +98,7 @@ struct UsageHistory {
 
 impl Default for AgentComposition {
     fn default() -> Self {
-        let provider = provider("openai_codex").expect("default provider manifest");
+        let provider = default_provider();
         let model = provider.models().first().expect("default model manifest");
         Self {
             provider: ProviderConfig {
@@ -107,10 +106,13 @@ impl Default for AgentComposition {
                 model: model.id.into(),
                 base_url: provider.default_base_url().map(str::to_string),
                 reasoning_effort: model.default_reasoning.map(str::to_string),
-                web_search: provider.web_search().first().copied().unwrap_or_default(),
+                web_search: *provider
+                    .web_search()
+                    .first()
+                    .expect("default provider web-search manifest"),
             },
             middleware: crate::middleware_manifest::default_config(),
-            approval: horus::backend::sandbox::ApprovalPolicy::On,
+            approval: horus::backend::sandbox::ApprovalPolicy::default(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
         }
     }
@@ -137,30 +139,53 @@ impl GatewayConfig {
         let mut next = self.clone();
         next.configured_providers
             .insert(selection.provider.clone(), selection.clone());
-        match &self.default_agent {
-            None => {
-                let config = AgentComposition {
-                    provider: selection,
-                    ..AgentComposition::default()
-                };
-                next.default_agent = Some(VersionedAgentConfig {
-                    revision: 1,
-                    config,
-                });
-            }
-            Some(default) if default.config.provider.provider == selection.provider => {
-                let mut config = default.config.clone();
-                config.provider = selection;
-                next.default_agent = Some(VersionedAgentConfig {
-                    revision: default
-                        .revision
-                        .checked_add(1)
-                        .ok_or_else(|| Error::Config("configuration revision overflow".into()))?,
-                    config,
-                });
-            }
-            Some(_) => {}
+        if self.default_agent.is_none() {
+            let config = AgentComposition {
+                provider: selection,
+                ..AgentComposition::default()
+            };
+            next.default_agent = Some(VersionedAgentConfig {
+                revision: 1,
+                config,
+            });
         }
+        next.validate()?;
+        Ok(next)
+    }
+
+    /// Replaces only the defaults copied into future chats.
+    pub(crate) fn replacing_default_agent(
+        &self,
+        expected_revision: u64,
+        composition: AgentComposition,
+    ) -> Result<Self> {
+        let current = self
+            .default_agent
+            .as_ref()
+            .ok_or_else(|| Error::Config("configure a provider before saving defaults".into()))?;
+        if current.revision != expected_revision {
+            return Err(Error::Config(format!(
+                "configuration revision changed from {expected_revision} to {}",
+                current.revision
+            )));
+        }
+        validate_agent_composition(&composition)?;
+        if !self
+            .configured_providers
+            .contains_key(&composition.provider.provider)
+        {
+            return Err(Error::Config(
+                "the gateway default must use a configured provider entry".into(),
+            ));
+        }
+        let mut next = self.clone();
+        next.default_agent = Some(VersionedAgentConfig {
+            revision: current
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| Error::Config("configuration revision overflow".into()))?,
+            config: composition,
+        });
         next.validate()?;
         Ok(next)
     }
@@ -231,13 +256,19 @@ impl GatewayConfig {
                 ));
             }
             validate_agent_composition(&default.config)?;
-            if self
+            if !self
                 .configured_providers
-                .get(&default.config.provider.provider)
-                != Some(&default.config.provider)
+                .contains_key(&default.config.provider.provider)
             {
                 return Err(Error::Config(
-                    "the gateway default must reference its configured provider entry".into(),
+                    "the gateway default must reference a configured provider".into(),
+                ));
+            }
+            if let Some(route) = default.config.middleware.subagents.model_route.as_deref()
+                && !crate::assembly::configured_route_exists(self, route)?
+            {
+                return Err(Error::Config(
+                    "the gateway default subagent route is not configured".into(),
                 ));
             }
         }
@@ -787,12 +818,13 @@ mod tests {
 
         assert!(contents.starts_with(CONFIG_HEADER));
         assert!(contents.contains("approval = \"on\""));
+        assert!(contents.contains("[default_agent.config.middleware.subagents]"));
         assert!(!contents.contains("sessions"));
         assert_eq!(restored, config);
     }
 
     #[test]
-    fn first_registered_provider_becomes_and_remains_the_default() {
+    fn provider_registration_never_silently_changes_existing_defaults() {
         let config = GatewayConfig::new(DEFAULT_LISTEN, None).expect("gateway config");
         let kimi = ProviderConfig {
             provider: "kimi".into(),
@@ -828,15 +860,16 @@ mod tests {
             "kimi"
         );
 
-        let mut updated = kimi;
+        let mut updated = kimi.clone();
         updated.model = "kimi-k2.7-code".into();
         updated.reasoning_effort = None;
         let third = second
             .registering_provider(updated.clone())
-            .expect("update default provider");
-        let default = third.default_agent.expect("updated default");
-        assert_eq!(default.revision, 2);
-        assert_eq!(default.config.provider, updated);
+            .expect("update registered provider");
+        assert_eq!(third.configured_providers["kimi"], updated);
+        let default = third.default_agent.expect("preserved default");
+        assert_eq!(default.revision, 1);
+        assert_eq!(default.config.provider, kimi);
     }
 
     #[test]
@@ -861,6 +894,48 @@ mod tests {
                 .config
                 .provider,
             selection
+        );
+    }
+
+    #[test]
+    fn saving_defaults_is_revisioned_and_does_not_change_existing_chat_specs() {
+        let registered = GatewayConfig::new(DEFAULT_LISTEN, None)
+            .expect("gateway config")
+            .registering_provider(AgentComposition::default().provider)
+            .expect("register provider");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let chat = ChatSpec::new(
+            workspace.path(),
+            registered.default_agent.clone().expect("default"),
+            state.path(),
+            None,
+        )
+        .expect("chat spec");
+        let mut replacement = registered
+            .default_agent
+            .as_ref()
+            .expect("default")
+            .config
+            .clone();
+        replacement.approval = horus::backend::sandbox::ApprovalPolicy::Allow;
+
+        let updated = registered
+            .replacing_default_agent(1, replacement.clone())
+            .expect("replace defaults");
+
+        assert_eq!(updated.default_agent.as_ref().expect("default").revision, 2);
+        assert_eq!(
+            updated.default_agent.as_ref().expect("default").config,
+            replacement
+        );
+        assert_eq!(chat.agent.revision, 1);
+        assert!(
+            registered
+                .replacing_default_agent(2, AgentComposition::default())
+                .expect_err("stale revision")
+                .to_string()
+                .contains("revision changed")
         );
     }
 

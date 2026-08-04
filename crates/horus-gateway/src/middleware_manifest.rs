@@ -2,8 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::wire::{MiddlewareConfig, MiddlewareFeature};
+use crate::wire::{MiddlewareConfig, MiddlewareFeature, SubagentConfig};
 use crate::{Error, Result};
+
+const MAX_MODEL_ROUTE_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) enum BuiltinMiddleware {
@@ -117,6 +119,7 @@ pub(crate) fn features() -> Vec<MiddlewareFeature> {
 pub(crate) fn default_config() -> MiddlewareConfig {
     let mut config = MiddlewareConfig {
         enabled: BTreeSet::new(),
+        subagents: SubagentConfig::default(),
     };
     for feature in MIDDLEWARE.iter().filter(|feature| !feature.required) {
         config.set_enabled(feature.id, feature.default_enabled);
@@ -125,6 +128,16 @@ pub(crate) fn default_config() -> MiddlewareConfig {
 }
 
 pub(crate) fn validate(config: &MiddlewareConfig) -> Result<()> {
+    if config
+        .subagents
+        .model_route
+        .as_ref()
+        .is_some_and(|route| route.trim().is_empty() || route.len() > MAX_MODEL_ROUTE_BYTES)
+    {
+        return Err(Error::Config(format!(
+            "subagent model route must be 1–{MAX_MODEL_ROUTE_BYTES} bytes"
+        )));
+    }
     for id in config.entries() {
         let feature = MIDDLEWARE
             .iter()
