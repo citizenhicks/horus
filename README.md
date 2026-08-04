@@ -42,11 +42,15 @@ chat-scoped. The gateway owns the available-model catalog and new-chat default;
 a chat only selects from that catalog. The core `horus` crate is linked into the
 binaries and is not a separate runtime prerequisite.
 
-Plaintext is limited to loopback. A remote gateway must listen with a TLS
-certificate and clients pair with `tls://host:port`; setting an explicit
-`HORUS_GATEWAY_ENDPOINT` disables automatic local management. See the
+Plaintext is limited to loopback. An iPhone or another machine needs a
+routable `tls://host:port` endpoint with a publicly trusted certificate for
+that hostname. After initializing a stopped TLS gateway as shown in the gateway
+guide, run `horus-gateway connect --endpoint tls://host:port` on its host, then
+enter the displayed endpoint and one-time code in the client. Pairing exchanges
+that code for a per-client token used on later connections. See the
 [gateway guide](https://github.com/citizenhicks/horus/blob/main/crates/horus-gateway/README.md),
-[CLI guide](https://github.com/citizenhicks/horus/blob/main/crates/horus-cli/README.md)
+the [CLI guide](https://github.com/citizenhicks/horus/blob/main/crates/horus-cli/README.md),
+and the [Apple guide](https://github.com/citizenhicks/horus/blob/main/horus-app/apple/README.md)
 for manual and remote setup.
 
 To run the Rust binaries from this checkout:
@@ -62,7 +66,7 @@ Horus requires Rust 1.89 or newer.
 
 ```toml
 [dependencies]
-horus = "0.2"
+horus = "0.3"
 ```
 
 The caller owns composition:
