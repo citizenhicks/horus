@@ -329,7 +329,7 @@ impl State {
         let code = self.pairing_code.trim().to_owned();
         if code.is_empty() {
             return Err(horus_gateway::Error::Config(
-                "enter the one-time pairing code".into(),
+                "enter the one-time code".into(),
             ));
         }
         Ok((endpoint, code))
@@ -464,7 +464,7 @@ fn render_add(lines: &mut Vec<Line<'static>>, state: &State) {
     );
     field(
         lines,
-        "One-time pairing code",
+        "One-time code",
         &masked(&state.pairing_code),
         state.field == Field::PairingCode,
     );

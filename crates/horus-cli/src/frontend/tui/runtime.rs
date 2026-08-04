@@ -74,6 +74,7 @@ pub(in crate::frontend) async fn run(
         catalog.workspace().to_path_buf(),
         model,
         model_route,
+        agent_summary(gateway, session),
     );
     let mut tick = tokio::time::interval(INPUT_POLL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -128,6 +129,9 @@ pub(in crate::frontend) async fn run(
                                 *gateway = payload;
                                 sync_gateway_models(&mut state, &mut catalog, gateway);
                             }
+                            ServerMessage::Sessions { sessions, .. } => {
+                                gateway.sessions = sessions;
+                            }
                             ServerMessage::SessionChanged { payload }
                                 if payload.session.session_id == session_id
                                     && payload.config.revision >= session.config.revision =>
@@ -135,7 +139,7 @@ pub(in crate::frontend) async fn run(
                                 if payload.workspace.id == session.workspace.id
                                     && payload.contributions == session.contributions
                                 {
-                                    refresh_session(&mut state, session, payload);
+                                    refresh_session(&mut state, session, payload, gateway);
                                 } else {
                                     *session = payload;
                                     exit = FrontendExit::Resume(session_id.clone());
@@ -276,7 +280,7 @@ pub(in crate::frontend) async fn run(
                                 break 'ui;
                             }
                             sync_gateway_models(&mut state, &mut catalog, gateway);
-                            sync_session(&mut state, session);
+                            sync_session(&mut state, session, gateway);
                             if let Err(error) = result {
                                 state.push(error.to_string(), TranscriptTone::Error);
                             }
@@ -309,12 +313,13 @@ fn refresh_session(
     state: &mut TuiState,
     session: &mut SessionReadyPayload,
     payload: SessionReadyPayload,
+    gateway: &ReadyPayload,
 ) {
-    sync_session(state, &payload);
+    sync_session(state, &payload, gateway);
     *session = payload;
 }
 
-fn sync_session(state: &mut TuiState, session: &SessionReadyPayload) {
+fn sync_session(state: &mut TuiState, session: &SessionReadyPayload, gateway: &ReadyPayload) {
     state.model.model = super::terminal_text(&session.session.model.model);
     state.model.reasoning_effort = session
         .session
@@ -323,6 +328,73 @@ fn sync_session(state: &mut TuiState, session: &SessionReadyPayload) {
         .as_deref()
         .map(super::terminal_text);
     state.model_route.clone_from(&session.session.model.route);
+    state.agent_summary = agent_summary(gateway, session);
+}
+
+fn agent_summary(gateway: &ReadyPayload, session: &SessionReadyPayload) -> String {
+    let providers = gateway
+        .providers
+        .iter()
+        .filter(|provider| provider.configured)
+        .map(|provider| provider.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let middleware = gateway
+        .middleware_features
+        .iter()
+        .filter(|feature| feature.required || session.config.config.middleware.enabled(&feature.id))
+        .map(|feature| feature.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let counts = session
+        .contributions
+        .iter()
+        .filter_map(|contribution| {
+            contribution.count.map(|count| {
+                let label = gateway
+                    .middleware_features
+                    .iter()
+                    .find(|feature| feature.id == contribution.capability)
+                    .map_or(contribution.capability.as_str(), |feature| {
+                        feature.label.as_str()
+                    });
+                format!("{label}: {count}")
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let reasoning = session
+        .session
+        .model
+        .reasoning_effort
+        .as_deref()
+        .unwrap_or("default");
+    let approval = match session.config.config.approval {
+        horus::backend::sandbox::ApprovalPolicy::On => "ask",
+        horus::backend::sandbox::ApprovalPolicy::Allow => "allow",
+        horus::backend::sandbox::ApprovalPolicy::AllowNetwork => "allow network",
+    };
+    format!(
+        "HORUS AGENT\nmodel: {} · {reasoning}\nproviders: {}\nmiddleware: {}\n{}tools: {} · approval: {approval}\nworkspace: {}",
+        super::terminal_text(&session.session.model.model),
+        if providers.is_empty() {
+            "none"
+        } else {
+            &providers
+        },
+        if middleware.is_empty() {
+            "none"
+        } else {
+            &middleware
+        },
+        if counts.is_empty() {
+            String::new()
+        } else {
+            format!("{counts} · ")
+        },
+        session.tool_count,
+        super::terminal_text(&session.workspace.path.display().to_string()),
+    )
 }
 
 fn sync_gateway_models(state: &mut TuiState, catalog: &mut UiCatalog, gateway: &ReadyPayload) {

@@ -27,7 +27,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 use uuid::Uuid;
 
-const USAGE: &str = "usage: horus [run <task-file> | pair <endpoint> <code>]";
+const USAGE: &str = "usage: horus [run <task-file> | pair <endpoint> <one-time-code>]";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_LOCAL_ENDPOINT: &str = "tcp://127.0.0.1:8741";
@@ -50,7 +50,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             if args.next().is_some() {
                 return Err(Error::Config(USAGE.into()).into());
             }
-            pair(text(&endpoint, "endpoint")?, text(&code, "pairing code")?).await?;
+            pair(text(&endpoint, "endpoint")?, text(&code, "one-time code")?).await?;
         }
         Some(command) if command == OsStr::new("--help") || command == OsStr::new("-h") => {
             println!("{USAGE}");
@@ -484,7 +484,7 @@ async fn read_bootstrap(
     {
         stop_child(child).await;
         return Err(horus_gateway::Error::Protocol(
-            "horus-gateway returned an invalid pairing code".into(),
+            "horus-gateway returned an invalid one-time code".into(),
         ));
     }
     Ok(payload.pairing_code)
@@ -577,7 +577,7 @@ fn startup_error(
 
 fn missing_local_token(endpoint: &Endpoint) -> horus_gateway::Error {
     horus_gateway::Error::Config(format!(
-        "local gateway state exists but horus-cli is not paired; stop the gateway, run `horus-gateway pair-code`, restart `horus-gateway serve`, then run `horus pair {endpoint} <code>`"
+        "local gateway state exists but horus-cli is not paired; stop the gateway, run `horus-gateway connect` in another terminal, then run `horus pair {endpoint} <one-time-code>`"
     ))
 }
 

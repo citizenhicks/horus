@@ -178,6 +178,16 @@ pub(super) fn live_transcript_lines(
             width,
         );
     }
+    if lines.is_empty() {
+        let card = responsive_welcome_card(state, width);
+        push_lines(
+            &mut lines,
+            &card,
+            TranscriptTone::Welcome,
+            FrontendBlockFormat::PlainText,
+            width,
+        );
+    }
     lines
 }
 
@@ -480,36 +490,7 @@ fn transcript_role(tone: TranscriptTone) -> Role {
 }
 
 pub(super) fn welcome_card(state: &TuiState) -> String {
-    let model = state.model.model.chars().take(20).collect::<String>();
-    let reasoning = state
-        .model
-        .reasoning_effort
-        .as_deref()
-        .unwrap_or("—")
-        .chars()
-        .take(10)
-        .collect::<String>();
-    let directory_length = state.cwd.chars().count();
-    let directory = if directory_length > 30 {
-        format!(
-            "…{}",
-            state
-                .cwd
-                .chars()
-                .skip(directory_length.saturating_sub(29))
-                .collect::<String>()
-        )
-    } else {
-        state.cwd.clone()
-    };
-    let details = [
-        format!("HORUS v{}", env!("CARGO_PKG_VERSION")),
-        String::new(),
-        format!("model: {model} {reasoning}"),
-        format!("directory: {directory}"),
-        "type / for commands".into(),
-        "ctrl+t transcript / copy".into(),
-    ];
+    let details = state.agent_summary.lines().chain(std::iter::repeat(""));
     let rows = WELCOME_EYE
         .iter()
         .zip(details)
@@ -521,6 +502,39 @@ pub(super) fn welcome_card(state: &TuiState) -> String {
             }
         })
         .collect::<Vec<_>>();
+    bordered_card(rows)
+}
+
+fn responsive_welcome_card(state: &TuiState, width: u16) -> String {
+    let welcome = welcome_card(state);
+    if card_fits(&welcome, width) {
+        return welcome;
+    }
+    let stacked = bordered_card(
+        WELCOME_EYE
+            .iter()
+            .map(|line| (*line).to_owned())
+            .chain(std::iter::once(String::new()))
+            .chain(state.agent_summary.lines().map(str::to_owned))
+            .collect(),
+    );
+    if card_fits(&stacked, width) {
+        return stacked;
+    }
+    let agent = bordered_card(state.agent_summary.lines().map(str::to_owned).collect());
+    if card_fits(&agent, width) {
+        agent
+    } else {
+        "◉ HORUS AGENT · type / for commands".into()
+    }
+}
+
+fn card_fits(card: &str, width: u16) -> bool {
+    card.lines()
+        .all(|line| Line::from(line).width() <= usize::from(width))
+}
+
+fn bordered_card(rows: Vec<String>) -> String {
     let width = rows
         .iter()
         .map(|row| Line::from(row.as_str()).width())
@@ -767,10 +781,17 @@ fn render_picker_menu(frame: &mut Frame<'_>, area: Rect, picker: &super::PickerS
     let items = picker
         .options
         .iter()
-        .map(|option| MenuItem {
-            value: String::new(),
-            label: terminal_text(&option.label),
-            description: terminal_text(&option.description),
+        .map(|option| {
+            let description = if option.detail.is_empty() {
+                option.description.clone()
+            } else {
+                format!("{} · {}", option.description, option.detail)
+            };
+            MenuItem {
+                value: String::new(),
+                label: terminal_text(&option.label),
+                description: terminal_text(&description),
+            }
         })
         .collect::<Vec<_>>();
     render_menu(frame, areas[1], &items, picker.selected);

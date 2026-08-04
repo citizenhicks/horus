@@ -49,6 +49,7 @@ fn state() -> TuiState {
             reasoning_effort: Some("high".into()),
         },
         "kimi".into(),
+        "HORUS AGENT\nmodel: kimi-k3 · high".into(),
     )
 }
 
@@ -163,6 +164,7 @@ fn generic_picker_submits_the_selected_operation() {
                 horus::protocol::FrontendPickerOption {
                     label: "first".into(),
                     description: "older".into(),
+                    detail: String::new(),
                     op: Op::ResumeSession {
                         session_id: "first".into(),
                     },
@@ -170,6 +172,7 @@ fn generic_picker_submits_the_selected_operation() {
                 horus::protocol::FrontendPickerOption {
                     label: "second".into(),
                     description: "newer".into(),
+                    detail: String::new(),
                     op: Op::ResumeSession {
                         session_id: "second".into(),
                     },
@@ -425,6 +428,10 @@ fn capability_header_is_live_styled_and_transparent() {
             slot: FrontendSlot::Header,
             text: "skills 2".into(),
             tone: FrontendTone::Neutral,
+            symbol: None,
+            icon_only: false,
+            progress: None,
+            content: None,
             action: None,
         },
     );
@@ -663,15 +670,18 @@ fn capped_composer_keeps_a_wide_wrapped_cursor_visible() {
 }
 
 #[test]
-fn session_card_keeps_the_eye_and_session_details() {
+fn empty_chat_shows_the_agent_card_without_polluting_the_transcript() {
     let mut state = state();
-    state.cwd = "/work/horus.nosync".into();
     let card = view::welcome_card(&state);
 
+    assert!(state.transcript.is_empty());
     assert!(card.contains("⣠⡤⢶"));
-    assert!(card.contains("HORUS v"));
-    assert!(card.contains("model: kimi-k3 high"));
-    assert!(card.contains("horus.nosync"));
+    assert!(card.contains("HORUS AGENT"));
+    assert!(card.contains("model: kimi-k3 · high"));
+
+    state.push("hello", TranscriptTone::User);
+    let rendered = rendered_text(&view::live_transcript_lines(&mut state, 0, 80));
+    assert!(!rendered.contains("HORUS AGENT"));
 }
 
 #[test]
@@ -679,17 +689,18 @@ fn narrow_terminal_keeps_session_card_and_compact_footer() {
     let catalog = default_catalog();
     let mut state = state();
     state.cwd = "/work/horus".into();
-    let mut terminal = Terminal::new(TestBackend::new(50, 15)).expect("terminal");
+    let mut terminal = Terminal::new(TestBackend::new(35, 15)).expect("terminal");
 
     terminal
         .draw(|frame| view::render(frame, &mut state, &catalog))
         .expect("draw");
     let rendered = terminal.backend().to_string();
 
+    assert!(rendered.contains("HORUS AGENT"), "{rendered}");
     assert!(rendered.contains("⣠⡤⢶"), "{rendered}");
-    assert!(rendered.contains("directory: /work/horus"), "{rendered}");
-    assert!(rendered.contains("kimi-k3 high · horus"), "{rendered}");
-    assert!(rendered.contains("╭"), "{rendered}");
+    assert!(rendered.contains("model: kimi-k3 · high"), "{rendered}");
+    assert!(rendered.contains("kimi-k3 high"), "{rendered}");
+    assert!(rendered.contains("╰"), "{rendered}");
 }
 
 #[test]

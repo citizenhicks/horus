@@ -188,6 +188,7 @@ struct TuiState {
     model: ModelInfo,
     model_route: String,
     model_choices: Vec<ModelChoice>,
+    agent_summary: String,
     disconnected: bool,
     slash_selection: usize,
     slash_menu_dismissed: bool,
@@ -205,10 +206,11 @@ impl TuiState {
         cwd: std::path::PathBuf,
         mut model: ModelInfo,
         model_route: String,
+        agent_summary: String,
     ) -> Self {
         model.model = terminal_text(&model.model);
         model.reasoning_effort = model.reasoning_effort.map(|effort| terminal_text(&effort));
-        let mut state = Self {
+        Self {
             widgets: initial_widgets(catalog),
             transcript: VecDeque::new(),
             transcript_viewport: Viewport::default(),
@@ -231,6 +233,7 @@ impl TuiState {
             model,
             model_route,
             model_choices: catalog.model_choices().to_vec(),
+            agent_summary,
             disconnected: false,
             slash_selection: 0,
             slash_menu_dismissed: false,
@@ -240,10 +243,7 @@ impl TuiState {
             picker: None,
             preview: None,
             requested_resume: None,
-        };
-        let welcome = view::welcome_card(&state);
-        state.push(welcome, TranscriptTone::Welcome);
-        state
+        }
     }
 
     fn is_working(&self) -> bool {

@@ -1,11 +1,7 @@
 use std::path::PathBuf;
 
-use horus::backend::model::provider::{ProviderAuth, ProviderDefinition, provider};
 use horus::{Error, Result};
-use horus_gateway::wire::{
-    ClientMessage, CronRun, CronTask, ProfileSnapshot, ProviderAuthKind, ProviderStatus,
-    ServerMessage,
-};
+use horus_gateway::wire::{ClientMessage, CronRun, CronTask, ProfileSnapshot, ServerMessage};
 use uuid::Uuid;
 
 use super::catalog::GatewayAction;
@@ -25,35 +21,6 @@ pub(super) fn prepare(action: GatewayAction, session_id: &str) -> Result<Prepare
         })),
         GatewayAction::Cron(action) => prepare_cron(action, session_id),
     }
-}
-
-pub(super) fn validated_provider(
-    provider_id: &str,
-    advertised: &[ProviderStatus],
-) -> Result<&'static ProviderDefinition> {
-    let definition = provider(provider_id).map_err(|_| {
-        Error::Config(format!(
-            "unknown provider `{provider_id}`; run `/login` to choose an available provider"
-        ))
-    })?;
-    let status = advertised
-        .iter()
-        .find(|status| status.provider == provider_id)
-        .ok_or_else(|| {
-            Error::Config(format!(
-                "provider `{provider_id}` is not advertised by this gateway"
-            ))
-        })?;
-    let local_auth = match definition.auth() {
-        ProviderAuth::ApiKey(_) => ProviderAuthKind::ApiKey,
-        ProviderAuth::Browser(_) => ProviderAuthKind::DeviceCode,
-    };
-    if status.auth != local_auth {
-        return Err(Error::Config(format!(
-            "provider `{provider_id}` authentication does not match this CLI"
-        )));
-    }
-    Ok(definition)
 }
 
 pub(super) fn render_response(
@@ -79,7 +46,7 @@ pub(super) fn render_response(
         )),
         ServerMessage::PairingCode {
             code, expires_at, ..
-        } => Some(format!("pairing code {code} · expires {expires_at}")),
+        } => Some(format!("one-time code {code} · expires {expires_at}")),
         ServerMessage::ProviderLoginStarted {
             provider,
             verification_url,

@@ -45,22 +45,37 @@ cargo build -p horus-cli
 cargo run -p horus-cli --bin horus
 ```
 
-Plaintext is restricted to loopback. A gateway reachable over the network must use TLS; point the
-client at that exact endpoint before pairing and connecting. Explicit endpoint or token settings
-disable automatic local management:
+Plaintext is restricted to loopback. A gateway reachable over the network must use a
+publicly trusted TLS certificate matching its public hostname. Initialize it once, then run the
+supervised connection flow while the gateway is stopped:
 
 ```sh
-horus pair tls://gateway.example:443 <pairing-code>
-export HORUS_GATEWAY_ENDPOINT=tls://gateway.example:443
+horus-gateway init --listen 0.0.0.0:8741 \
+  --tls-cert /absolute/path/fullchain.pem \
+  --tls-key /absolute/path/private-key.pem
+horus-gateway connect --endpoint tls://gateway.example:8741
+```
+
+Then use the endpoint and one-time code it displays on the client machine:
+
+```sh
+horus pair tls://gateway.example:8741 <one-time-code>
 horus
 ```
 
-If local state already exists without a saved CLI token, stop the gateway and pair manually:
+`horus pair` saves and selects the endpoint together with the token returned by the gateway; no
+environment variable is needed. A remote terminal opens an existing gateway chat, so create the
+first gateway-host workspace chat from an Apple or local frontend.
+If the gateway is already running, create another code with `/pair` from an authenticated terminal
+or **Gateway → Pair another device** in an Apple client.
+
+If local state already exists without a saved CLI token, stop the gateway and run the supervised
+pairing flow in another terminal:
 
 ```sh
-horus-gateway pair-code
-horus-gateway serve # keep this running in another terminal
-horus pair tcp://127.0.0.1:8741 <pairing-code>
+horus-gateway exit
+horus-gateway connect
+horus pair tcp://127.0.0.1:8741 <one-time-code>
 ```
 
 Run one task file without the TUI:

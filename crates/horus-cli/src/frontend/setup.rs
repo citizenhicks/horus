@@ -3,13 +3,14 @@
 use std::collections::BTreeSet;
 use std::io;
 
-use horus::backend::model::provider::{ProviderAuth, ProviderDefinition};
+use horus::backend::model::ModelChoice;
+use horus::backend::model::provider::HostedWebSearch;
 use horus::backend::sandbox::ApprovalPolicy;
 use horus::{Error, Result};
 use horus_gateway::client::{GatewayEvents, GatewaySender, MAX_PENDING_FRAMES};
 use horus_gateway::wire::{
-    AgentComposition, ClientMessage, MiddlewareConfig, MiddlewareFeature, ProviderConfig,
-    ProviderStatus, ReadyPayload, ServerFrame, ServerMessage, SessionReadyPayload,
+    AgentComposition, ClientMessage, MiddlewareConfig, MiddlewareFeature, ProviderAuthKind,
+    ProviderConfig, ProviderStatus, ReadyPayload, ServerFrame, ServerMessage, SessionReadyPayload,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -21,7 +22,6 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
-use super::gateway_actions::validated_provider;
 use super::terminal::{INPUT_POLL, MAX_INPUT_BATCH, poll_event};
 use super::terminal_text;
 use super::theme::{Role, current};
@@ -61,7 +61,6 @@ pub(crate) async fn run(
 
 struct ProviderEntry {
     status: ProviderStatus,
-    definition: &'static ProviderDefinition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +103,12 @@ enum Flow {
     Cancel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyTarget {
+    Session,
+    Default,
+}
+
 struct Progress {
     title: &'static str,
     detail: String,
@@ -123,9 +128,14 @@ struct SetupState {
     model: usize,
     custom_model: String,
     reasoning: usize,
+    web_search: usize,
     features: Vec<MiddlewareFeature>,
+    models: Vec<ModelChoice>,
     middleware: MiddlewareConfig,
+    subagent_model: usize,
+    subagent_reasoning: usize,
     approval: usize,
+    target: ApplyTarget,
     row: usize,
     error: Option<String>,
     progress: Option<Progress>,
@@ -142,6 +152,7 @@ impl SetupState {
             mode,
             validated_providers(&gateway.providers)?,
             gateway.middleware_features.clone(),
+            gateway.models.clone(),
             session.config.config.clone(),
         )?;
         if let Some(provider) = preferred_provider {
@@ -154,6 +165,7 @@ impl SetupState {
         mode: SetupMode,
         providers: Vec<ProviderEntry>,
         features: Vec<MiddlewareFeature>,
+        models: Vec<ModelChoice>,
         original: AgentComposition,
     ) -> Result<Self> {
         if providers.is_empty() {
@@ -163,19 +175,21 @@ impl SetupState {
         }
         let provider = providers
             .iter()
-            .position(|entry| entry.definition.id() == original.provider.provider)
-            .or_else(|| (mode == SetupMode::Login).then_some(0))
+            .position(|entry| entry.status.provider == original.provider.provider)
             .ok_or_else(|| {
                 Error::Config(format!(
                     "the gateway did not advertise the active provider `{}`",
                     original.provider.provider
                 ))
             })?;
+        validate_active_provider(&providers[provider].status, &original.provider)?;
         let middleware = original.middleware.clone();
         let approval = APPROVALS
             .iter()
             .position(|choice| choice.policy == original.approval)
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                Error::Config("gateway advertised an unsupported approval policy".into())
+            })?;
         let mut state = Self {
             mode,
             providers,
@@ -192,14 +206,20 @@ impl SetupState {
             model: 0,
             custom_model: String::new(),
             reasoning: 0,
+            web_search: 0,
             features,
+            models,
             middleware,
+            subagent_model: 0,
+            subagent_reasoning: 0,
             approval,
+            target: ApplyTarget::Session,
             row: 0,
             error: None,
             progress: None,
         };
         state.reset_provider_fields();
+        state.reset_subagent_fields()?;
         Ok(state)
     }
 
@@ -207,15 +227,15 @@ impl SetupState {
         &self.providers[self.provider]
     }
 
-    fn definition(&self) -> &'static ProviderDefinition {
-        self.entry().definition
+    fn definition(&self) -> &ProviderStatus {
+        &self.entry().status
     }
 
     fn select_provider(&mut self, provider: &str) -> Result<()> {
         self.provider = self
             .providers
             .iter()
-            .position(|entry| entry.definition.id() == provider)
+            .position(|entry| entry.status.provider == provider)
             .ok_or_else(|| {
                 Error::Config(format!(
                     "provider `{provider}` is not advertised by this gateway; run `/login` to choose an available provider"
@@ -226,22 +246,87 @@ impl SetupState {
     }
 
     fn model_choice_count(&self) -> usize {
-        self.definition().models().len() + 1
+        self.definition().models.len().max(1)
     }
 
     fn reasoning_choice_count(&self) -> usize {
         self.definition()
-            .models()
+            .models
             .get(self.model)
             .map_or(1, |model| model.reasoning.len() + 1)
+    }
+
+    fn search_choice_count(&self) -> usize {
+        let count = self.definition().web_search.len();
+        if count > 1 { count } else { 0 }
+    }
+
+    fn distinct_subagent_models(&self) -> Vec<&ModelChoice> {
+        let mut seen = BTreeSet::new();
+        self.models
+            .iter()
+            .filter(|choice| seen.insert((choice.group.as_str(), choice.model.as_str())))
+            .collect()
+    }
+
+    fn subagent_reasoning_choices(&self) -> Vec<&ModelChoice> {
+        let Some(selected) = self
+            .subagent_model
+            .checked_sub(1)
+            .and_then(|index| self.distinct_subagent_models().get(index).copied())
+        else {
+            return Vec::new();
+        };
+        self.models
+            .iter()
+            .filter(|choice| choice.group == selected.group && choice.model == selected.model)
+            .collect()
+    }
+
+    fn models_action_start(&self) -> usize {
+        self.model_choice_count() + self.reasoning_choice_count() + self.search_choice_count()
+    }
+
+    fn agent_model_row(&self) -> usize {
+        self.features.len()
+    }
+
+    fn agent_reasoning_row(&self) -> usize {
+        self.features.len() + 1
+    }
+
+    fn agent_approval_row(&self) -> usize {
+        self.features.len() + 2
+    }
+
+    fn agent_action_start(&self) -> usize {
+        self.features.len() + 3
+    }
+
+    fn apply_target_for_row(&self) -> Option<ApplyTarget> {
+        let start = match self.page {
+            Page::Models => self.models_action_start(),
+            Page::Agent => self.agent_action_start(),
+            Page::Provider | Page::Authentication => return None,
+        };
+        match self.row.checked_sub(start) {
+            Some(0) => Some(ApplyTarget::Session),
+            Some(1) => Some(ApplyTarget::Default),
+            _ => None,
+        }
     }
 
     fn row_count(&self) -> usize {
         match self.page {
             Page::Provider => self.providers.len(),
             Page::Authentication => 0,
-            Page::Models => self.model_choice_count() + self.reasoning_choice_count(),
-            Page::Agent => self.features.len() + 1,
+            Page::Models => {
+                self.model_choice_count()
+                    + self.reasoning_choice_count()
+                    + self.search_choice_count()
+                    + 2
+            }
+            Page::Agent => self.features.len() + 5,
         }
     }
 
@@ -286,7 +371,7 @@ impl SetupState {
             KeyCode::Down => self.move_selection(1),
             KeyCode::Enter => {
                 self.endpoint_focused = self.definition().configurable_base_url()
-                    && matches!(self.definition().auth(), ProviderAuth::Browser(_));
+                    && self.definition().auth == ProviderAuthKind::DeviceCode;
                 self.page = Page::Authentication;
                 self.error = None;
             }
@@ -303,7 +388,7 @@ impl SetupState {
             }
             KeyCode::Tab | KeyCode::BackTab
                 if self.definition().configurable_base_url()
-                    && matches!(self.definition().auth(), ProviderAuth::ApiKey(_)) =>
+                    && self.definition().auth == ProviderAuthKind::ApiKey =>
             {
                 self.endpoint_focused = !self.endpoint_focused;
                 self.error = None;
@@ -338,31 +423,43 @@ impl SetupState {
     }
 
     fn handle_models_key(&mut self, key: KeyEvent) -> Flow {
-        let custom_row = self.definition().models().len();
+        let custom_row = self.definition().models.is_empty().then_some(0);
         match key.code {
             KeyCode::Esc => {
                 self.page = Page::Authentication;
                 self.error = None;
             }
-            KeyCode::Backspace if self.row == custom_row => {
-                self.model = custom_row;
+            KeyCode::Backspace if Some(self.row) == custom_row => {
+                self.model = 0;
                 self.custom_model.pop();
                 self.error = None;
             }
             KeyCode::Char(character)
-                if self.row == custom_row
+                if Some(self.row) == custom_row
                     && character != ' '
                     && !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.model = custom_row;
+                self.model = 0;
                 self.push_text(&character.to_string());
             }
             KeyCode::Up | KeyCode::BackTab => self.move_selection(-1),
             KeyCode::Down | KeyCode::Tab => self.move_selection(1),
-            KeyCode::Char(' ') => self.select_model_row(),
-            KeyCode::Enter => return self.finish(),
+            KeyCode::Char(' ') => {
+                if let Some(target) = self.apply_target_for_row() {
+                    self.target = target;
+                    return self.finish();
+                }
+                self.select_model_row();
+            }
+            KeyCode::Enter => {
+                if let Some(target) = self.apply_target_for_row() {
+                    self.target = target;
+                    return self.finish();
+                }
+                self.select_model_row();
+            }
             _ => {}
         }
         Flow::Continue
@@ -380,13 +477,30 @@ impl SetupState {
                         .set_enabled(&feature.id, !self.middleware.enabled(&feature.id));
                 }
             }
-            KeyCode::Char(' ') | KeyCode::Right if self.row == self.features.len() => {
+            KeyCode::Char(' ') | KeyCode::Right if self.row == self.agent_model_row() => {
+                self.cycle_subagent_model(1);
+            }
+            KeyCode::Left if self.row == self.agent_model_row() => {
+                self.cycle_subagent_model(-1);
+            }
+            KeyCode::Char(' ') | KeyCode::Right if self.row == self.agent_reasoning_row() => {
+                self.cycle_subagent_reasoning(1);
+            }
+            KeyCode::Left if self.row == self.agent_reasoning_row() => {
+                self.cycle_subagent_reasoning(-1);
+            }
+            KeyCode::Char(' ') | KeyCode::Right if self.row == self.agent_approval_row() => {
                 self.approval = (self.approval + 1) % APPROVALS.len();
             }
-            KeyCode::Left if self.row == self.features.len() => {
+            KeyCode::Left if self.row == self.agent_approval_row() => {
                 self.approval = (self.approval + APPROVALS.len() - 1) % APPROVALS.len();
             }
-            KeyCode::Enter => return self.finish(),
+            KeyCode::Enter | KeyCode::Char(' ') if self.apply_target_for_row().is_some() => {
+                self.target = self
+                    .apply_target_for_row()
+                    .expect("guard requires an apply target");
+                return self.finish();
+            }
             _ => {}
         }
         Flow::Continue
@@ -399,9 +513,26 @@ impl SetupState {
                 self.model = self.row;
                 self.reasoning = 0;
             }
-        } else {
+        } else if self.row < models + self.reasoning_choice_count() {
             self.reasoning = self.row - models;
+        } else if self.row < self.models_action_start() {
+            self.web_search = self.row - models - self.reasoning_choice_count();
         }
+        self.error = None;
+    }
+
+    fn cycle_subagent_model(&mut self, delta: isize) {
+        let count = self.distinct_subagent_models().len() + 1;
+        self.subagent_model =
+            (self.subagent_model as isize + delta).rem_euclid(count as isize) as usize;
+        self.subagent_reasoning = 0;
+        self.error = None;
+    }
+
+    fn cycle_subagent_reasoning(&mut self, delta: isize) {
+        let count = self.subagent_reasoning_choices().len().max(1);
+        self.subagent_reasoning =
+            (self.subagent_reasoning as isize + delta).rem_euclid(count as isize) as usize;
         self.error = None;
     }
 
@@ -418,15 +549,15 @@ impl SetupState {
     }
 
     fn authentication_is_editable(&self) -> bool {
-        self.endpoint_focused || matches!(self.definition().auth(), ProviderAuth::ApiKey(_))
+        self.endpoint_focused || self.definition().auth == ProviderAuthKind::ApiKey
     }
 
     fn paste(&mut self, text: &str) {
-        let custom_row = self.definition().models().len();
         if self.page == Page::Authentication && self.authentication_is_editable() {
             self.push_text(text.trim());
-        } else if self.page == Page::Models && self.row == custom_row {
-            self.model = custom_row;
+        } else if self.page == Page::Models && self.definition().models.is_empty() && self.row == 0
+        {
+            self.model = 0;
             self.push_text(text.trim());
         }
     }
@@ -455,37 +586,31 @@ impl SetupState {
     fn reset_provider_fields(&mut self) {
         self.credential.clear();
         self.authenticated = None;
-        let definition = self.definition();
-        let status = self.entry().status.clone();
+        let definition = self.entry().status.clone();
         let current = &self.original.provider;
-        let same_provider = current.provider == definition.id();
+        let same_provider = current.provider == definition.provider;
         self.endpoint = if same_provider {
             current
                 .base_url
                 .as_deref()
-                .or_else(|| definition.default_base_url())
+                .or(definition.default_base_url.as_deref())
         } else {
-            status
-                .default_base_url
-                .as_deref()
-                .or_else(|| definition.default_base_url())
+            definition.default_base_url.as_deref()
         }
         .unwrap_or_default()
         .into();
-        self.model = if same_provider {
+        self.model = if definition.models.is_empty() {
+            0
+        } else if same_provider {
             definition
-                .models()
+                .models
                 .iter()
                 .position(|model| model.id == current.model)
-                .unwrap_or(definition.models().len())
+                .expect("active provider model was validated")
         } else {
-            status
-                .default_model
-                .as_deref()
-                .and_then(|id| definition.models().iter().position(|model| model.id == id))
-                .unwrap_or(0)
+            0
         };
-        self.custom_model = if same_provider && self.model == definition.models().len() {
+        self.custom_model = if same_provider && definition.models.is_empty() {
             current.model.clone()
         } else {
             String::new()
@@ -493,10 +618,13 @@ impl SetupState {
         let reasoning = if same_provider {
             current.reasoning_effort.as_deref()
         } else {
-            status.default_reasoning_effort.as_deref()
+            definition
+                .models
+                .get(self.model)
+                .and_then(|model| model.default_reasoning.as_deref())
         };
         self.reasoning = definition
-            .models()
+            .models
             .get(self.model)
             .and_then(|model| {
                 reasoning.and_then(|effort| {
@@ -507,16 +635,57 @@ impl SetupState {
                 })
             })
             .map_or(0, |index| index + 1);
+        self.web_search = if same_provider {
+            definition
+                .web_search
+                .iter()
+                .position(|search| *search == current.web_search)
+                .expect("active provider search mode was validated")
+        } else {
+            0
+        };
         self.endpoint_focused = false;
         self.row = self.model;
         self.error = None;
     }
 
+    fn reset_subagent_fields(&mut self) -> Result<()> {
+        let Some(route) = self.original.middleware.subagents.model_route.as_deref() else {
+            self.subagent_model = 0;
+            self.subagent_reasoning = 0;
+            return Ok(());
+        };
+        let choice = self
+            .models
+            .iter()
+            .find(|choice| choice.route == route)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Config("subagent model route is not in the gateway catalog".into())
+            })?;
+        self.subagent_model = self
+            .distinct_subagent_models()
+            .iter()
+            .position(|candidate| {
+                candidate.group == choice.group && candidate.model == choice.model
+            })
+            .ok_or_else(|| Error::Config("subagent model is not in the gateway catalog".into()))?
+            + 1;
+        self.subagent_reasoning = self
+            .subagent_reasoning_choices()
+            .iter()
+            .position(|candidate| candidate.route == route)
+            .ok_or_else(|| {
+                Error::Config("subagent reasoning route is not in the gateway catalog".into())
+            })?;
+        Ok(())
+    }
+
     fn selected_model(&self) -> &str {
         self.definition()
-            .models()
+            .models
             .get(self.model)
-            .map_or_else(|| self.custom_model.trim(), |model| model.id)
+            .map_or_else(|| self.custom_model.trim(), |model| model.id.as_str())
     }
 
     fn selected_base_url(&self) -> Option<String> {
@@ -526,7 +695,7 @@ impl SetupState {
     }
 
     fn authentication_target(&self) -> (String, Option<String>) {
-        (self.definition().id().into(), self.selected_base_url())
+        (self.definition().provider.clone(), self.selected_base_url())
     }
 
     fn authentication_succeeded(&mut self) {
@@ -546,19 +715,22 @@ impl SetupState {
         if self.mode == SetupMode::Agent {
             return Ok(());
         }
-        self.definition()
-            .validate_base_url(self.selected_base_url().as_deref())?;
-        match self.definition().auth() {
-            ProviderAuth::ApiKey(environment)
-                if self.credential.trim().is_empty()
-                    && environment_api_key(environment).is_none()
-                    && !self.has_matching_credential() =>
+        if self.definition().configurable_base_url()
+            && self
+                .selected_base_url()
+                .is_none_or(|url| url.trim().is_empty())
+        {
+            return Err(Error::Config("Base URL is required".into()));
+        }
+        match self.definition().auth {
+            ProviderAuthKind::ApiKey
+                if self.credential.trim().is_empty() && !self.has_matching_credential() =>
             {
-                Err(Error::Config(format!(
-                    "Paste an API key or set `{environment}`"
-                )))
+                Err(Error::Config(
+                    "Paste an API key or configure this provider on the gateway".into(),
+                ))
             }
-            ProviderAuth::ApiKey(_) | ProviderAuth::Browser(_) => Ok(()),
+            ProviderAuthKind::ApiKey | ProviderAuthKind::DeviceCode => Ok(()),
         }
     }
 
@@ -567,19 +739,19 @@ impl SetupState {
         if self.mode == SetupMode::Agent {
             return Ok(Authentication::Reuse);
         }
-        match self.definition().auth() {
-            ProviderAuth::ApiKey(environment) => {
+        match self.definition().auth {
+            ProviderAuthKind::ApiKey => {
                 let credential = take_trimmed(&mut self.credential);
                 if !credential.is_empty() {
-                    Ok(Authentication::ApiKey(credential))
-                } else if let Some(credential) = environment_api_key(environment) {
                     Ok(Authentication::ApiKey(credential))
                 } else {
                     Ok(Authentication::Reuse)
                 }
             }
-            ProviderAuth::Browser(_) if self.has_matching_credential() => Ok(Authentication::Reuse),
-            ProviderAuth::Browser(_) => Ok(Authentication::DeviceCode),
+            ProviderAuthKind::DeviceCode if self.has_matching_credential() => {
+                Ok(Authentication::Reuse)
+            }
+            ProviderAuthKind::DeviceCode => Ok(Authentication::DeviceCode),
         }
     }
 
@@ -587,41 +759,47 @@ impl SetupState {
         let mut config = current.clone();
         if self.mode == SetupMode::Agent {
             config.middleware = self.middleware.clone();
+            config.middleware.subagents.model_route = if self.subagent_model == 0 {
+                None
+            } else {
+                Some(
+                    self.subagent_reasoning_choices()
+                        .get(self.subagent_reasoning)
+                        .ok_or_else(|| {
+                            Error::Config("Subagent reasoning selection is invalid".into())
+                        })?
+                        .route
+                        .clone(),
+                )
+            };
             config.approval = APPROVALS[self.approval].policy;
             return Ok(config);
         }
         let definition = self.definition();
         let model = self.selected_model();
-        let reasoning_effort = if let Some(model) = definition.models().get(self.model) {
+        let reasoning_effort = if let Some(model) = definition.models.get(self.model) {
             self.reasoning
                 .checked_sub(1)
                 .and_then(|index| model.reasoning.get(index))
                 .map(|preset| preset.id.to_string())
-        } else if current.provider.provider == definition.id() && current.provider.model == model {
+        } else if current.provider.provider == definition.provider
+            && current.provider.model == model
+        {
             current.provider.reasoning_effort.clone()
         } else {
             None
         };
-        let web_search = (current.provider.provider == definition.id())
-            .then_some(current.provider.web_search)
-            .filter(|search| definition.web_search().contains(search))
-            .or_else(|| {
-                definition
-                    .web_search()
-                    .contains(&self.entry().status.default_web_search)
-                    .then_some(self.entry().status.default_web_search)
-            })
-            .or_else(|| definition.web_search().first().copied())
-            .unwrap_or_default();
+        let web_search = definition
+            .web_search
+            .get(self.web_search)
+            .copied()
+            .ok_or_else(|| Error::Config("Hosted web-search selection is invalid".into()))?;
         let base_url = self.selected_base_url();
-        definition.build_config_is_valid(
-            model,
-            base_url.as_deref(),
-            reasoning_effort.as_deref(),
-            web_search,
-        )?;
+        if model.is_empty() {
+            return Err(Error::Config("Model is required".into()));
+        }
         config.provider = ProviderConfig {
-            provider: definition.id().into(),
+            provider: definition.provider.clone(),
             model: model.into(),
             base_url,
             reasoning_effort,
@@ -658,27 +836,63 @@ fn validated_providers(statuses: &[ProviderStatus]) -> Result<Vec<ProviderEntry>
     statuses
         .iter()
         .map(|status| {
-            if !seen.insert(status.provider.as_str()) {
+            if status.provider.trim().is_empty() || !seen.insert(status.provider.as_str()) {
                 return Err(Error::Config(format!(
-                    "gateway advertised provider `{}` more than once",
+                    "gateway advertised invalid or duplicate provider `{}`",
                     status.provider
                 )));
             }
-            let definition = validated_provider(&status.provider, statuses)?;
-            if let ProviderAuth::Browser(auth) = definition.auth()
-                && !auth.supports_device_login()
+            if status.label.trim().is_empty()
+                || status.description.trim().is_empty()
+                || status.web_search.first() != Some(&HostedWebSearch::Off)
             {
                 return Err(Error::Config(format!(
-                    "provider `{}` does not support gateway device login",
-                    definition.id()
+                    "gateway advertised an incomplete manifest for `{}`",
+                    status.provider
                 )));
             }
             Ok(ProviderEntry {
                 status: status.clone(),
-                definition,
             })
         })
         .collect()
+}
+
+fn validate_active_provider(status: &ProviderStatus, config: &ProviderConfig) -> Result<()> {
+    if !status.web_search.contains(&config.web_search) {
+        return Err(Error::Config(format!(
+            "gateway active provider `{}` has an unadvertised web-search mode",
+            status.provider
+        )));
+    }
+    if status.configurable_base_url() != config.base_url.is_some() {
+        return Err(Error::Config(format!(
+            "gateway active provider `{}` has invalid endpoint settings",
+            status.provider
+        )));
+    }
+    if status.models.is_empty() {
+        return Ok(());
+    }
+    let model = status
+        .models
+        .iter()
+        .find(|model| model.id == config.model)
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "gateway active provider `{}` has unadvertised model `{}`",
+                status.provider, config.model
+            ))
+        })?;
+    if let Some(effort) = config.reasoning_effort.as_deref()
+        && !model.reasoning.iter().any(|choice| choice.id == effort)
+    {
+        return Err(Error::Config(format!(
+            "gateway active model `{}` has unadvertised reasoning `{effort}`",
+            model.id
+        )));
+    }
+    Ok(())
 }
 
 fn take_trimmed(value: &mut String) -> String {
@@ -687,12 +901,6 @@ fn take_trimmed(value: &mut String) -> String {
     let start = value.len() - value.trim_start().len();
     value.drain(..start);
     value
-}
-
-fn environment_api_key(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
 }
 
 async fn edit(
@@ -747,7 +955,7 @@ async fn authenticate(
     events: &mut GatewayEvents,
     gateway: &mut ReadyPayload,
 ) -> Result<()> {
-    let provider = state.definition().id().to_string();
+    let provider = state.definition().provider.clone();
     let base_url = state.selected_base_url();
     match state.take_authentication()? {
         Authentication::Reuse => {}
@@ -787,7 +995,6 @@ async fn apply(
     gateway: &mut ReadyPayload,
     session: &mut SessionReadyPayload,
 ) -> Result<()> {
-    let expected_revision = session.config.revision;
     let config = state.agent_composition(&session.config.config)?;
     if state.mode == SetupMode::Login {
         state.set_progress(
@@ -798,26 +1005,45 @@ async fn apply(
         *gateway =
             register_provider(terminal, state, sender, events, config.provider.clone()).await?;
     }
-    if config == session.config.config {
-        return Ok(());
+    match state.target {
+        ApplyTarget::Session => {
+            if config == session.config.config {
+                return Ok(());
+            }
+            state.set_progress(
+                "Applying agent configuration",
+                "The gateway is restarting the agent while preserving this session…",
+            );
+            draw(terminal, state)?;
+            let session_id = session.session.session_id.clone();
+            *session = configure_session(
+                terminal,
+                state,
+                sender,
+                events,
+                &session_id,
+                session.config.revision,
+                config,
+            )
+            .await?;
+        }
+        ApplyTarget::Default => {
+            let default = gateway.default_config.as_ref().ok_or_else(|| {
+                Error::Config("configure a provider before saving defaults".into())
+            })?;
+            if config == default.config {
+                return Ok(());
+            }
+            state.set_progress(
+                "Saving gateway defaults",
+                "Future chats will use this agent configuration…",
+            );
+            draw(terminal, state)?;
+            *gateway =
+                configure_default_agent(terminal, state, sender, events, default.revision, config)
+                    .await?;
+        }
     }
-    state.set_progress(
-        "Applying agent configuration",
-        "The gateway is restarting the agent while preserving this session…",
-    );
-    draw(terminal, state)?;
-    let session_id = session.session.session_id.clone();
-    let payload = configure_session(
-        terminal,
-        state,
-        sender,
-        events,
-        &session_id,
-        expected_revision,
-        config,
-    )
-    .await?;
-    *session = payload;
     Ok(())
 }
 
@@ -836,6 +1062,50 @@ async fn register_provider(
         })
         .await
         .map_err(gateway_error)?;
+    wait_gateway_configured(
+        terminal,
+        state,
+        events,
+        &request_id,
+        "registering a provider",
+    )
+    .await
+}
+
+async fn configure_default_agent(
+    terminal: &mut SetupTerminal,
+    state: &mut SetupState,
+    sender: &GatewaySender,
+    events: &mut GatewayEvents,
+    expected_revision: u64,
+    config: AgentComposition,
+) -> Result<ReadyPayload> {
+    let request_id = Uuid::new_v4().to_string();
+    sender
+        .send(ClientMessage::ConfigureDefaultAgent {
+            request_id: request_id.clone(),
+            expected_revision,
+            config,
+        })
+        .await
+        .map_err(gateway_error)?;
+    wait_gateway_configured(
+        terminal,
+        state,
+        events,
+        &request_id,
+        "saving gateway defaults",
+    )
+    .await
+}
+
+async fn wait_gateway_configured(
+    terminal: &mut SetupTerminal,
+    state: &mut SetupState,
+    events: &mut GatewayEvents,
+    request_id: &str,
+    operation: &str,
+) -> Result<ReadyPayload> {
     let mut deferred = Vec::new();
     let result = loop {
         let frame = match next_frame(terminal, state, events, false).await {
@@ -855,7 +1125,7 @@ async fn register_provider(
             ServerMessage::Error { message, .. } => break Err(Error::Stopped(message)),
             message if deferred.len() == MAX_PENDING_FRAMES => {
                 break Err(Error::Stopped(format!(
-                    "gateway event backlog exceeds {MAX_PENDING_FRAMES} frames while registering a provider: {message:?}"
+                    "gateway event backlog exceeds {MAX_PENDING_FRAMES} frames while {operation}: {message:?}"
                 )));
             }
             message => deferred.push(ServerFrame::new(message)),
@@ -1257,7 +1527,7 @@ fn page_prompt(state: &SetupState) -> (&'static str, String) {
     match state.page {
         Page::Provider => (
             "Choose a model provider",
-            "Only providers validated against this CLI are shown.".into(),
+            "Providers are loaded from the connected gateway.".into(),
         ),
         Page::Authentication => (
             "Set up provider access",
@@ -1286,8 +1556,8 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState) {
                 };
                 choice(
                     lines,
-                    entry.definition.label(),
-                    &format!("{} · {configured}", entry.definition.description()),
+                    &entry.status.label,
+                    &format!("{} · {configured}", entry.status.description),
                     index == state.provider,
                     if index == state.provider {
                         "●"
@@ -1298,8 +1568,8 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState) {
             }
         }
         Page::Authentication => {
-            match state.definition().auth() {
-                ProviderAuth::ApiKey(environment) => {
+            match state.definition().auth {
+                ProviderAuthKind::ApiKey => {
                     let focused = !state.endpoint_focused;
                     lines.push(Line::styled(
                         format!(
@@ -1314,16 +1584,26 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState) {
                             "    Paste a new key, or leave empty to reuse the gateway credential."
                                 .into()
                         } else {
-                            format!(
-                                "    Paste a key, or leave empty to use {environment} when set."
-                            )
+                            state
+                                .definition()
+                                .default_api_key_env
+                                .as_deref()
+                                .map_or_else(
+                                    || "    Paste a key configured for this gateway endpoint.".into(),
+                                    |environment| format!(
+                                        "    Paste a key, or leave empty to use {environment} when set."
+                                    ),
+                                )
                         },
                         theme.style(Role::Muted),
                     ));
                 }
-                ProviderAuth::Browser(auth) => {
+                ProviderAuthKind::DeviceCode => {
                     lines.push(Line::styled(
-                        format!("  Press Enter to start {} device login.", auth.label()),
+                        format!(
+                            "  Press Enter to start {} device login.",
+                            state.definition().label
+                        ),
                         theme.style(Role::Info),
                     ));
                 }
@@ -1347,27 +1627,28 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState) {
         }
         Page::Models => {
             lines.push(Line::styled("  Model", theme.style(Role::Muted)));
-            for (index, model) in state.definition().models().iter().enumerate() {
+            for (index, model) in state.definition().models.iter().enumerate() {
                 choice(
                     lines,
-                    model.label,
-                    model.description,
+                    &model.label,
+                    &model.description,
                     state.row == index,
                     if state.model == index { "●" } else { "○" },
                 );
             }
-            let custom = state.definition().models().len();
-            choice(
-                lines,
-                "Custom model",
-                if state.custom_model.is_empty() {
-                    "Type or paste an exact model ID"
-                } else {
-                    &state.custom_model
-                },
-                state.row == custom,
-                if state.model == custom { "●" } else { "○" },
-            );
+            if state.definition().models.is_empty() {
+                choice(
+                    lines,
+                    "Custom model",
+                    if state.custom_model.is_empty() {
+                        "Type or paste an exact model ID"
+                    } else {
+                        &state.custom_model
+                    },
+                    state.row == 0,
+                    "●",
+                );
+            }
             lines.push(Line::from(""));
             lines.push(Line::styled("  Reasoning", theme.style(Role::Muted)));
             let reasoning_start = state.model_choice_count();
@@ -1380,16 +1661,16 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState) {
             );
             for (index, preset) in state
                 .definition()
-                .models()
+                .models
                 .get(state.model)
                 .into_iter()
-                .flat_map(|model| model.reasoning)
+                .flat_map(|model| &model.reasoning)
                 .enumerate()
             {
                 choice(
                     lines,
-                    preset.label,
-                    preset.description,
+                    &preset.label,
+                    &preset.description,
                     state.row == reasoning_start + index + 1,
                     if state.reasoning == index + 1 {
                         "●"
@@ -1398,6 +1679,40 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState) {
                     },
                 );
             }
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                "  Hosted web search",
+                theme.style(Role::Muted),
+            ));
+            if state.definition().web_search.len() == 1 {
+                choice(
+                    lines,
+                    state.definition().web_search[0].label(),
+                    "This provider does not expose another hosted-search mode",
+                    false,
+                    "[fixed]",
+                );
+            } else {
+                let search_start = state.model_choice_count() + state.reasoning_choice_count();
+                for (index, search) in state.definition().web_search.iter().enumerate() {
+                    choice(
+                        lines,
+                        search.label(),
+                        match search {
+                            HostedWebSearch::Off => "Do not use provider-hosted web search",
+                            HostedWebSearch::Cached => "Allow cached provider-hosted search",
+                            HostedWebSearch::Live => "Allow live provider-hosted search",
+                        },
+                        state.row == search_start + index,
+                        if state.web_search == index {
+                            "●"
+                        } else {
+                            "○"
+                        },
+                    );
+                }
+            }
+            render_apply_actions(lines, state, state.models_action_start());
         }
         Page::Agent => {
             for (index, feature) in state.features.iter().enumerate() {
@@ -1414,15 +1729,60 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState) {
                 );
             }
             lines.push(Line::from(""));
+            let subagent_model = state
+                .subagent_model
+                .checked_sub(1)
+                .and_then(|index| state.distinct_subagent_models().get(index).copied());
+            choice(
+                lines,
+                &format!(
+                    "Subagent model  ‹ {} ›",
+                    subagent_model.map_or("Inherit parent", |choice| choice.group.as_str())
+                ),
+                "Default route used when spawn_agent does not choose a model",
+                state.row == state.agent_model_row(),
+                "",
+            );
+            let reasoning = state
+                .subagent_reasoning_choices()
+                .get(state.subagent_reasoning)
+                .and_then(|choice| choice.reasoning_effort.as_deref())
+                .unwrap_or("inherit parent");
+            choice(
+                lines,
+                &format!("Subagent reasoning  ‹ {reasoning} ›"),
+                "Reasoning attached to the default subagent model route",
+                state.row == state.agent_reasoning_row(),
+                "",
+            );
             choice(
                 lines,
                 &format!("Approval  ‹ {} ›", APPROVALS[state.approval].label),
                 APPROVALS[state.approval].description,
-                state.row == state.features.len(),
+                state.row == state.agent_approval_row(),
                 "",
             );
+            render_apply_actions(lines, state, state.agent_action_start());
         }
     }
+}
+
+fn render_apply_actions(lines: &mut Vec<Line<'static>>, state: &SetupState, start: usize) {
+    lines.push(Line::from(""));
+    choice(
+        lines,
+        "Change for this chat only",
+        "Restart the active chat without changing future chats",
+        state.row == start,
+        "→",
+    );
+    choice(
+        lines,
+        "Save as default",
+        "Use these settings for future chats only",
+        state.row == start + 1,
+        "→",
+    );
 }
 
 fn choice(
@@ -1467,19 +1827,19 @@ fn footer(state: &SetupState) -> &'static str {
         Page::Provider => "  ↑↓ select · enter continue · esc cancel",
         Page::Authentication
             if state.definition().configurable_base_url()
-                && matches!(state.definition().auth(), ProviderAuth::ApiKey(_)) =>
+                && state.definition().auth == ProviderAuthKind::ApiKey =>
         {
             "  type/paste · tab switch field · enter continue · esc back"
         }
-        Page::Authentication if matches!(state.definition().auth(), ProviderAuth::ApiKey(_)) => {
+        Page::Authentication if state.definition().auth == ProviderAuthKind::ApiKey => {
             "  type/paste · enter continue · esc back"
         }
         Page::Authentication if state.definition().configurable_base_url() => {
             "  type/paste endpoint · enter continue · esc back"
         }
         Page::Authentication => "  enter continue · esc back",
-        Page::Models => "  ↑↓ move · space select · type custom ID · enter apply · esc back",
-        Page::Agent => "  ↑↓ move · space toggle · ←→ approval · enter apply · esc cancel",
+        Page::Models => "  ↑↓ move · space select · enter activate · esc back",
+        Page::Agent => "  ↑↓ move · space/←→ change · enter activate · esc cancel",
     }
 }
 
@@ -1517,27 +1877,69 @@ fn render_progress(lines: &mut Vec<Line<'static>>, progress: &Progress) {
 
 #[cfg(test)]
 mod tests {
-    use horus::backend::model::provider::{HostedWebSearch, ProviderAuth};
-    use horus_gateway::wire::{ProviderAuthKind, ProviderStatus};
+    use horus_gateway::wire::{ProviderAuthKind, ProviderModel, ProviderStatus, ReasoningChoice};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
 
     fn status(provider: &str, configured: bool) -> ProviderStatus {
-        let definition = horus::backend::model::provider::provider(provider).expect("provider");
+        let (auth, default_base_url, default_api_key_env, models, web_search) = match provider {
+            "responses" => (
+                ProviderAuthKind::ApiKey,
+                Some("https://api.openai.com/v1".into()),
+                None,
+                Vec::new(),
+                vec![HostedWebSearch::Off],
+            ),
+            "kimi" => (
+                ProviderAuthKind::ApiKey,
+                None,
+                Some("MOONSHOT_API_KEY".into()),
+                vec![model("kimi-k3", "Kimi K3", Some("max"))],
+                vec![HostedWebSearch::Off],
+            ),
+            "openai_socket" => (
+                ProviderAuthKind::ApiKey,
+                None,
+                Some("OPENAI_API_KEY".into()),
+                vec![model("gpt-5.6-sol", "Sol", Some("medium"))],
+                vec![
+                    HostedWebSearch::Off,
+                    HostedWebSearch::Cached,
+                    HostedWebSearch::Live,
+                ],
+            ),
+            _ => panic!("unknown fixture provider"),
+        };
         ProviderStatus {
             provider: provider.into(),
-            label: "untrusted label".into(),
+            label: provider.into(),
+            symbol: "hard-drives".into(),
+            description: format!("{provider} provider"),
             configured,
-            auth: match definition.auth() {
-                ProviderAuth::ApiKey(_) => ProviderAuthKind::ApiKey,
-                ProviderAuth::Browser(_) => ProviderAuthKind::DeviceCode,
-            },
-            default_model: None,
-            default_base_url: None,
-            default_api_key_env: None,
-            default_reasoning_effort: None,
-            default_web_search: HostedWebSearch::Off,
+            auth,
+            default_base_url,
+            default_api_key_env,
+            models,
+            web_search,
+        }
+    }
+
+    fn model(id: &str, label: &str, default_reasoning: Option<&str>) -> ProviderModel {
+        ProviderModel {
+            id: id.into(),
+            label: label.into(),
+            description: format!("{label} capabilities"),
+            context_window: 1_000_000,
+            reasoning: default_reasoning
+                .into_iter()
+                .map(|id| ReasoningChoice {
+                    id: id.into(),
+                    label: id.into(),
+                    description: format!("{id} reasoning"),
+                })
+                .collect(),
+            default_reasoning: default_reasoning.map(str::to_string),
         }
     }
 
@@ -1546,16 +1948,18 @@ mod tests {
         let providers = validated_providers(&statuses).expect("validated providers");
         let mut original = AgentComposition::default();
         original.provider.provider = provider.into();
-        if let Some(model) = providers[0].definition.models().first() {
-            original.provider.model = model.id.into();
+        if let Some(model) = providers[0].status.models.first() {
+            original.provider.model.clone_from(&model.id);
+            original
+                .provider
+                .reasoning_effort
+                .clone_from(&model.default_reasoning);
         }
-        if providers[0].definition.configurable_base_url() {
-            original.provider.base_url = providers[0]
-                .definition
-                .default_base_url()
-                .map(str::to_string);
+        if providers[0].status.configurable_base_url() {
+            original.provider.base_url = providers[0].status.default_base_url.clone();
         }
-        SetupState::from_parts(mode, providers, features(), original).expect("setup state")
+        SetupState::from_parts(mode, providers, features(), model_choices(), original)
+            .expect("setup state")
     }
 
     fn features() -> Vec<MiddlewareFeature> {
@@ -1570,6 +1974,33 @@ mod tests {
             label: label.into(),
             description: label.into(),
             required,
+        })
+        .collect()
+    }
+
+    fn model_choices() -> Vec<ModelChoice> {
+        [
+            (
+                "openai_socket::gpt-5.6-sol::medium",
+                "OpenAI · Sol",
+                "gpt-5.6-sol",
+                "medium",
+            ),
+            (
+                "openai_socket::gpt-5.6-sol::high",
+                "OpenAI · Sol",
+                "gpt-5.6-sol",
+                "high",
+            ),
+            ("kimi::kimi-k3::max", "Kimi · K3", "kimi-k3", "max"),
+        ]
+        .into_iter()
+        .map(|(route, group, model, effort)| ModelChoice {
+            route: route.into(),
+            group: group.into(),
+            model: model.into(),
+            reasoning_effort: Some(effort.into()),
+            context_window: Some(1_000_000),
         })
         .collect()
     }
@@ -1595,8 +2026,9 @@ mod tests {
         assert_eq!(state.page, Page::Authentication);
         state.authentication_succeeded();
         assert_eq!(state.page, Page::Models);
-        state.row = state.definition().models().len();
+        state.row = 0;
         state.paste("custom-model");
+        state.row = state.models_action_start();
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Flow::Finish
@@ -1621,12 +2053,15 @@ mod tests {
             .expect("validated providers");
         let mut original = AgentComposition::default();
         original.provider.provider = "responses".into();
-        original.provider.base_url = providers[0]
-            .definition
-            .default_base_url()
-            .map(str::to_string);
-        let mut state = SetupState::from_parts(SetupMode::Login, providers, features(), original)
-            .expect("setup state");
+        original.provider.base_url = providers[0].status.default_base_url.clone();
+        let mut state = SetupState::from_parts(
+            SetupMode::Login,
+            providers,
+            features(),
+            model_choices(),
+            original,
+        )
+        .expect("setup state");
 
         state.select_provider("kimi").expect("select Kimi");
 
@@ -1659,7 +2094,30 @@ mod tests {
     }
 
     #[test]
-    fn agent_is_one_page_and_only_changes_features_and_approval() {
+    fn hosted_search_is_selected_only_from_the_gateway_manifest() {
+        let mut selectable = state(SetupMode::Login, "openai_socket", true);
+        let search_start = selectable.model_choice_count() + selectable.reasoning_choice_count();
+        selectable.row = search_start + 2;
+        selectable.select_model_row();
+        let configured = selectable
+            .agent_composition(&selectable.original)
+            .expect("select live search");
+        assert_eq!(configured.provider.web_search, HostedWebSearch::Live);
+
+        let fixed = state(SetupMode::Login, "kimi", true);
+        assert_eq!(fixed.definition().web_search, [HostedWebSearch::Off]);
+        assert_eq!(
+            fixed
+                .agent_composition(&fixed.original)
+                .expect("fixed search")
+                .provider
+                .web_search,
+            HostedWebSearch::Off
+        );
+    }
+
+    #[test]
+    fn agent_is_one_page_and_preserves_unedited_provider_settings() {
         let mut state = state(SetupMode::Agent, "openai_socket", true);
         state.original.provider.web_search = HostedWebSearch::Live;
         state.original.system_prompt = "Keep this system prompt".into();
@@ -1674,6 +2132,7 @@ mod tests {
             .position(|choice| choice.policy == ApprovalPolicy::AllowNetwork)
             .expect("network approval choice");
         let original = state.original.clone();
+        state.row = state.agent_action_start();
 
         assert_eq!(state.page, Page::Agent);
         assert_eq!(
@@ -1688,6 +2147,42 @@ mod tests {
         assert!(!configured.middleware.enabled("skills"));
         assert_eq!(configured.approval, ApprovalPolicy::AllowNetwork);
         assert_eq!(configured.system_prompt, "Keep this system prompt");
+    }
+
+    #[test]
+    fn agent_selects_an_exact_subagent_route_from_the_gateway_catalog() {
+        let mut state = state(SetupMode::Agent, "openai_socket", true);
+        state.subagent_model = state
+            .distinct_subagent_models()
+            .iter()
+            .position(|choice| choice.model == "gpt-5.6-sol")
+            .map(|index| index + 1)
+            .expect("OpenAI model");
+        state.subagent_reasoning = state
+            .subagent_reasoning_choices()
+            .iter()
+            .position(|choice| choice.reasoning_effort.as_deref() == Some("high"))
+            .expect("high reasoning");
+
+        let configured = state
+            .agent_composition(&state.original)
+            .expect("agent composition");
+
+        assert_eq!(
+            configured.middleware.subagents.model_route.as_deref(),
+            Some("openai_socket::gpt-5.6-sol::high")
+        );
+    }
+
+    #[test]
+    fn save_as_default_row_selects_the_default_target() {
+        let mut state = state(SetupMode::Agent, "openai_socket", true);
+        state.row = state.agent_action_start() + 1;
+
+        let flow = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(flow, Flow::Finish);
+        assert_eq!(state.target, ApplyTarget::Default);
     }
 
     #[test]
@@ -1712,16 +2207,16 @@ mod tests {
     }
 
     #[test]
-    fn provider_validation_rejects_an_authentication_mismatch() {
+    fn provider_validation_rejects_an_incomplete_manifest() {
         let mut advertised = status("openai_socket", false);
-        advertised.auth = ProviderAuthKind::DeviceCode;
+        advertised.web_search.clear();
 
         let error = match validated_providers(&[advertised]) {
-            Ok(_) => panic!("mismatched provider authentication must fail"),
+            Ok(_) => panic!("incomplete provider manifest must fail"),
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("authentication does not match"));
+        assert!(error.to_string().contains("incomplete manifest"));
     }
 
     #[test]
@@ -1733,7 +2228,75 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("more than once"));
+        assert!(error.to_string().contains("duplicate provider"));
+    }
+
+    #[test]
+    fn setup_rejects_active_provider_values_outside_the_manifest() {
+        let reject = |status: ProviderStatus, config: ProviderConfig| {
+            let original = AgentComposition {
+                provider: config,
+                ..AgentComposition::default()
+            };
+            match SetupState::from_parts(
+                SetupMode::Login,
+                validated_providers(&[status]).expect("provider manifest"),
+                features(),
+                model_choices(),
+                original,
+            ) {
+                Ok(_) => panic!("invalid active provider state must fail"),
+                Err(error) => error.to_string(),
+            }
+        };
+
+        let missing_provider = reject(
+            status("kimi", true),
+            ProviderConfig {
+                provider: "missing".into(),
+                model: "model".into(),
+                base_url: None,
+                reasoning_effort: None,
+                web_search: HostedWebSearch::Off,
+            },
+        );
+        assert!(missing_provider.contains("active provider"));
+
+        let missing_model = reject(
+            status("openai_socket", true),
+            ProviderConfig {
+                provider: "openai_socket".into(),
+                model: "missing".into(),
+                base_url: None,
+                reasoning_effort: None,
+                web_search: HostedWebSearch::Off,
+            },
+        );
+        assert!(missing_model.contains("unadvertised model"));
+
+        let missing_search = reject(
+            status("kimi", true),
+            ProviderConfig {
+                provider: "kimi".into(),
+                model: "kimi-k3".into(),
+                base_url: None,
+                reasoning_effort: Some("max".into()),
+                web_search: HostedWebSearch::Live,
+            },
+        );
+        assert!(missing_search.contains("unadvertised web-search"));
+
+        let missing_reasoning = reject(
+            status("openai_socket", true),
+            ProviderConfig {
+                provider: "openai_socket".into(),
+                model: "gpt-5.6-sol".into(),
+                base_url: None,
+                reasoning_effort: Some("missing".into()),
+                web_search: HostedWebSearch::Off,
+            },
+        );
+        assert!(missing_reasoning.contains("unadvertised reasoning"));
     }
 
     #[test]

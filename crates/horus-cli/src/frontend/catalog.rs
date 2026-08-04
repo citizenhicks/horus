@@ -434,7 +434,7 @@ fn cli_commands() -> Vec<UiCommand> {
         ),
         command(
             "pair",
-            "create a pairing code for another client",
+            "create a one-time code for another client",
             false,
             CommandHandler::Pair,
         ),
@@ -564,6 +564,7 @@ fn model_picker(choices: &[ModelChoice]) -> CommandAction {
                 || choice.group.clone(),
                 |effort| format!("{} · {effort}", choice.group),
             ),
+            detail: String::new(),
             op: Op::SetModel {
                 route: choice.route.clone(),
             },
@@ -595,6 +596,7 @@ fn reasoning_picker(route: &str, choices: &[ModelChoice]) -> CommandAction {
             } else {
                 choice.model.clone()
             },
+            detail: String::new(),
             op: Op::SetModel {
                 route: choice.route.clone(),
             },
@@ -730,6 +732,7 @@ mod tests {
     fn contribution(command: &str) -> FrontendContribution {
         FrontendContribution {
             capability: "test".into(),
+            count: None,
             commands: vec![FrontendCommand {
                 name: command.into(),
                 arguments: String::new(),
