@@ -15,7 +15,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         Some(FrontendCommand::Provider(state_dir)) => {
             horus_cli::frontend::run_gateway_provider(state_dir).await?
         }
-        None => horus_gateway::command::run(arguments, save_local_client).await?,
+        None => {
+            horus_gateway::command::run(arguments, save_local_client, load_local_client).await?
+        }
     }
     Ok(())
 }
@@ -89,6 +91,7 @@ async fn initialize_cloudflare(state_dir: PathBuf) -> horus_gateway::Result<()> 
             state_dir.into_os_string(),
         ],
         save_local_client,
+        load_local_client,
     )
     .await
 }
@@ -97,6 +100,10 @@ fn save_local_client(endpoint: &Endpoint, token: String) -> horus_gateway::Resul
     let mut accounts = GatewayAccounts::load()?;
     accounts.add(endpoint, token)?;
     accounts.save()
+}
+
+fn load_local_client(endpoint: &Endpoint) -> horus_gateway::Result<Option<String>> {
+    Ok(GatewayAccounts::load()?.token(endpoint).map(str::to_owned))
 }
 
 fn state_dir_argument(arguments: &[OsString]) -> horus_gateway::Result<PathBuf> {

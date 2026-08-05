@@ -29,14 +29,14 @@ use url::Url;
 use crate::auth::AuthStore;
 #[cfg(unix)]
 use crate::auth::PairingStatus;
-use crate::client::Endpoint;
+use crate::client::{Endpoint, GatewayClient, MAX_PENDING_FRAMES};
 use crate::cloudflare::CloudflareTunnel;
 use crate::config::{
     CloudflareConfig, ConfigStore, DEFAULT_LISTEN, GatewayConfig, TlsConfig, load_cloudflare_token,
     state_dir,
 };
 use crate::server::GatewayServer;
-use crate::wire::BootstrapPayload;
+use crate::wire::{BootstrapPayload, ClientKind, ClientMessage, ServerMessage};
 use crate::{Error, Result};
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
@@ -48,6 +48,8 @@ use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command as TokioCommand};
 #[cfg(unix)]
 use tokio::signal::unix::{Signal as TokioSignal, SignalKind, signal};
+#[cfg(unix)]
+use uuid::Uuid;
 
 pub const USAGE: &str = "usage: horus-gateway [--state-dir PATH]\n       \
                      horus-gateway provider [--state-dir PATH]\n       \
@@ -154,6 +156,7 @@ struct StartupGuard {
 pub async fn run(
     arguments: Vec<OsString>,
     save_local_client: fn(&Endpoint, String) -> Result<()>,
+    load_local_client: fn(&Endpoint) -> Result<Option<String>>,
 ) -> Result<()> {
     if matches!(arguments.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!("{USAGE}");
@@ -166,7 +169,7 @@ pub async fn run(
     match parse(arguments)? {
         Command::Init(options) => initialize(options),
         Command::Bootstrap(options) => bootstrap(options).await,
-        Command::Connect(options) => connect(options).await,
+        Command::Connect(options) => connect(options, load_local_client).await,
         Command::Serve {
             state_dir,
             background,
@@ -333,10 +336,28 @@ fn invalid_reset_target(path: &Path) -> Error {
 }
 
 #[cfg(unix)]
-async fn connect(options: ConnectOptions) -> Result<()> {
+async fn connect(
+    options: ConnectOptions,
+    load_local_client: fn(&Endpoint) -> Result<Option<String>>,
+) -> Result<()> {
     let (store, config) = ConfigStore::open(options.state_dir)?;
     let configured_endpoint = connection_endpoint(&config, options.endpoint)?;
     let startup = StartupGuard::create(store.state_dir())?;
+    if let Some((client_endpoint, pairing_endpoint)) =
+        running_connection_endpoints(&store, &config, configured_endpoint.clone())?
+    {
+        let token = load_local_client(&client_endpoint)?.ok_or_else(|| {
+            Error::Config(
+                "this machine has no local gateway credential; restart the gateway once and retry"
+                    .into(),
+            )
+        })?;
+        drop(startup);
+        let code = request_running_pairing_code(client_endpoint, token).await?;
+        print_connection(&pairing_endpoint, &code)?;
+        println!("gateway remains running");
+        return Ok(());
+    }
     ensure_gateway_stopped(&store, &config)?;
     let mut interrupts = signal(SignalKind::interrupt())?;
     let mut terminations = signal(SignalKind::terminate())?;
@@ -389,6 +410,7 @@ async fn connect(options: ConnectOptions) -> Result<()> {
     if let Err(error) = print_connection(&endpoint, &grant.code) {
         return stop_connect_gateway(&store, pid, &grant.code, error.into());
     }
+    println!("waiting for a client…");
 
     let process_path = store.state_dir().join(PROCESS_FILE);
     loop {
@@ -425,12 +447,8 @@ async fn connect(options: ConnectOptions) -> Result<()> {
                 return Ok(());
             }
             PairingStatus::Replaced => {
-                return stop_connect_gateway(
-                    &store,
-                    pid,
-                    &grant.code,
-                    Error::Config("one-time code was replaced before a client paired".into()),
-                );
+                println!("another pairing code was issued; gateway remains running");
+                return Ok(());
             }
             PairingStatus::Pending => {}
         }
@@ -456,8 +474,68 @@ async fn connect(options: ConnectOptions) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn connect(_options: ConnectOptions) -> Result<()> {
+async fn connect(
+    _options: ConnectOptions,
+    _load_local_client: fn(&Endpoint) -> Result<Option<String>>,
+) -> Result<()> {
     Err(unsupported_lifecycle())
+}
+
+#[cfg(unix)]
+fn running_connection_endpoints(
+    store: &ConfigStore,
+    config: &GatewayConfig,
+    configured_endpoint: Option<Endpoint>,
+) -> Result<Option<(Endpoint, Endpoint)>> {
+    let Some(process) = running_process_record(&store.state_dir().join(PROCESS_FILE))? else {
+        return Ok(None);
+    };
+    let pairing_endpoint = process
+        .endpoint()?
+        .or(configured_endpoint)
+        .ok_or_else(|| Error::Config("gateway did not publish its runtime endpoint".into()))?;
+    let client_endpoint = if config.cloudflare.is_some() {
+        format!("tcp://{}", config.listen).parse()?
+    } else {
+        pairing_endpoint.clone()
+    };
+    Ok(Some((client_endpoint, pairing_endpoint)))
+}
+
+#[cfg(unix)]
+async fn request_running_pairing_code(client_endpoint: Endpoint, token: String) -> Result<String> {
+    let client =
+        GatewayClient::connect(&client_endpoint, token, ClientKind::GatewayDashboard).await?;
+    let (sender, mut events) = client.into_parts();
+    let request_id = Uuid::new_v4().to_string();
+    sender
+        .send(ClientMessage::CreatePairingCode {
+            request_id: request_id.clone(),
+        })
+        .await?;
+
+    for _ in 0..MAX_PENDING_FRAMES {
+        let frame = events.next().await?.ok_or_else(|| {
+            Error::Protocol("gateway disconnected before returning a pairing code".into())
+        })?;
+        match frame.message {
+            ServerMessage::PairingCode {
+                request_id: actual,
+                code,
+                ..
+            } if actual == request_id => return Ok(code),
+            ServerMessage::Rejected {
+                request_id: actual,
+                message,
+                ..
+            } if actual == request_id => return Err(Error::Protocol(message)),
+            ServerMessage::Error { message, .. } => return Err(Error::Protocol(message)),
+            _ => {}
+        }
+    }
+    Err(Error::Protocol(format!(
+        "gateway sent {MAX_PENDING_FRAMES} unrelated frames before the pairing response"
+    )))
 }
 
 fn connection_endpoint(
@@ -558,7 +636,6 @@ fn print_connection(endpoint: &Endpoint, code: &str) -> std::io::Result<()> {
         }
     }
     writeln!(output, "another terminal: horus pair {endpoint} {code}")?;
-    writeln!(output, "waiting for a client…")?;
     output.flush()
 }
 
@@ -1552,6 +1629,62 @@ mod tests {
             .expect("process record");
 
         assert_eq!(record.endpoint().expect("valid endpoint"), Some(endpoint));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_connect_controls_quick_tunnel_over_loopback() {
+        let directory = tempfile::tempdir().expect("gateway state parent");
+        let state = directory.path().join("gateway");
+        let (store, config) = ConfigStore::initialize_quick_cloudflare(state, DEFAULT_LISTEN)
+            .expect("gateway config");
+        let public_endpoint: Endpoint = "wss://bright-river.trycloudflare.com"
+            .parse()
+            .expect("public endpoint");
+        let _process = ProcessRecordGuard::create(store.state_dir(), Some(&public_endpoint))
+            .expect("running process");
+
+        let (client_endpoint, pairing_endpoint) =
+            running_connection_endpoints(&store, &config, None)
+                .expect("running connect")
+                .expect("running gateway");
+
+        assert_eq!(client_endpoint.to_string(), "tcp://127.0.0.1:8741");
+        assert_eq!(pairing_endpoint, public_endpoint);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn running_gateway_issues_a_code_for_another_client() {
+        let directory = tempfile::tempdir().expect("gateway state");
+        let (server, grant) = GatewayServer::bootstrap(
+            directory.path().join("gateway"),
+            "127.0.0.1:0".parse().expect("listen address"),
+        )
+        .await
+        .expect("bootstrap gateway");
+        let endpoint: Endpoint = format!("tcp://{}", server.listen_addr())
+            .parse()
+            .expect("gateway endpoint");
+        let (shutdown, signal) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(server.serve_until(async move {
+            let _ = signal.await;
+        }));
+        let (_first, identity) =
+            GatewayClient::pair(&endpoint, grant.code, "first", ClientKind::Cli)
+                .await
+                .expect("pair first client");
+
+        let code = request_running_pairing_code(endpoint.clone(), identity.token)
+            .await
+            .expect("request another code");
+        let (_second, _) = GatewayClient::pair(&endpoint, code, "second", ClientKind::Ios)
+            .await
+            .expect("pair second client");
+
+        assert!(!serving.is_finished());
+        shutdown.send(()).expect("stop gateway");
+        serving.await.expect("gateway task").expect("stop gateway");
     }
 
     #[cfg(unix)]
