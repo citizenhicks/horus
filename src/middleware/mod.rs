@@ -27,6 +27,7 @@ use crate::protocol::ToolCallBeginEvent;
 use crate::protocol::ToolCallEndEvent;
 
 pub mod compaction;
+pub mod context_offloading;
 pub mod cron;
 pub mod instructions;
 pub mod sessions;
@@ -693,6 +694,12 @@ fn validate_frontend(contributions: &[FrontendContribution]) -> Result<()> {
 
 pub(crate) const fn approximate_tokens(bytes: usize) -> usize {
     bytes / ESTIMATED_BYTES_PER_TOKEN
+}
+
+pub(crate) fn approximate_item_tokens(item: &Value) -> usize {
+    serde_json::to_vec(item)
+        .map_or(0, |bytes| approximate_tokens(bytes.len()))
+        .max(1)
 }
 
 #[cfg(test)]

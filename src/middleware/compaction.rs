@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::Middleware;
 use super::ModelContext;
-use super::approximate_tokens;
+use super::approximate_item_tokens;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -334,12 +334,6 @@ fn truncate_chars(text: &str, limit: usize) -> String {
     text.char_indices()
         .nth(limit)
         .map_or_else(|| text.to_string(), |(end, _)| format!("{}…", &text[..end]))
-}
-
-fn approximate_item_tokens(item: &Value) -> usize {
-    serde_json::to_vec(item)
-        .map_or(0, |bytes| approximate_tokens(bytes.len()))
-        .max(1)
 }
 
 #[cfg(test)]
