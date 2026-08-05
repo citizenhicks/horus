@@ -126,8 +126,8 @@ distinct.
 | Module | Owns |
 | --- | --- |
 | `agent` | Session handles and the linear command/model/tool loop |
-| `middleware` | Lifecycle hooks, tools, instructions, skills, tasks, steering, compaction, sessions, and subagents |
-| `protocol` | Commands, events, approvals, usage, and UI-neutral contribution records |
+| `middleware` | Lifecycle hooks, tools, instructions, skills, tasks, steering, context offloading, compaction, sessions, and subagents |
+| `protocol` | Commands, events, approvals, usage, and UI-neutral contribution and setting records |
 | `backend` | Model, sandbox, and checkpoint interfaces plus built-in adapters |
 
 Middleware declaration order is execution order. A loop may run with no optional middleware.
@@ -137,6 +137,8 @@ created; runtime hooks do not repeatedly append them to conversation state. Skil
 expose `prompt` builder overrides, while workspace instructions load a bounded root
 `AGENTS.override.md` or `AGENTS.md` when that middleware is installed.
 Subagents may set default model and reasoning choices at construction, with per-spawn overrides.
+Context offloading masks successful tool output older than its configured trailing token window
+while leaving the latest user turn intact.
 Compaction defaults to 250,000 tokens. Its middleware uses a provider's native endpoint when
 advertised; otherwise it creates a rolling summary while retaining recent raw context.
 Checkpoint backends expose cursor-paginated session catalogs and sequence-bounded transcript

@@ -4,7 +4,7 @@ use horus::backend::model::provider::{ProviderAuth, provider};
 use uuid::Uuid;
 
 use crate::Error;
-use crate::assembly::credential_is_configured;
+use crate::assembly::{configured_model_choices, credential_is_configured};
 use crate::wire::{AgentComposition, ProviderConfig, ReadyPayload, ServerFrame, ServerMessage};
 
 use super::{GatewayHost, Rejection, gateway_ready, internal, invalid_config};
@@ -21,6 +21,10 @@ impl GatewayHost {
                 .config
                 .lock()
                 .map_err(|_| internal("gateway configuration lock is poisoned"))?;
+            let models = configured_model_choices(&current, &state.store, &state.credentials)
+                .map_err(internal)?;
+            crate::middleware_manifest::validate_choices(&config.middleware, &models)
+                .map_err(invalid_config)?;
             let next = current
                 .replacing_default_agent(expected_revision, config)
                 .map_err(invalid_config)?;

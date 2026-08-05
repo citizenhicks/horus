@@ -1262,47 +1262,108 @@ enum HostedWebSearch: String, Codable, CaseIterable, Identifiable, Sendable {
 
 struct MiddlewareConfig: Codable, Equatable, Sendable {
     var enabled: Set<String>
-    var subagents: SubagentConfig
+    var settings: [String: [String: FrontendSettingValue]]
 }
 
-struct SubagentConfig: Codable, Equatable, Sendable {
-    var modelRoute: String?
-}
-
-extension SubagentConfig {
-    private enum CodingKeys: String, CodingKey {
-        case modelRoute
+extension MiddlewareConfig {
+    mutating func setSetting(
+        _ value: FrontendSettingValue?,
+        middleware: String,
+        setting: String
+    ) {
+        if let value {
+            settings[middleware, default: [:]][setting] = value
+        } else {
+            settings[middleware]?[setting] = nil
+            if settings[middleware]?.isEmpty == true { settings[middleware] = nil }
+        }
     }
+}
+
+enum FrontendSettingValue: Codable, Equatable, Sendable {
+    case integer(Int64)
+    case string(String)
 
     init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        guard container.contains(.modelRoute) else {
-            throw DecodingError.keyNotFound(
-                CodingKeys.modelRoute,
-                .init(
-                    codingPath: container.codingPath,
-                    debugDescription: "Subagent configuration requires model_route."
-                )
-            )
+        let container = try decoder.singleValueContainer()
+        if let value = try? container.decode(Int64.self) {
+            self = .integer(value)
+        } else {
+            self = .string(try container.decode(String.self))
         }
-        modelRoute = try container.decodeIfPresent(String.self, forKey: .modelRoute)
     }
 
     func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        if let modelRoute {
-            try container.encode(modelRoute, forKey: .modelRoute)
-        } else {
-            try container.encodeNil(forKey: .modelRoute)
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .integer(let value): try container.encode(value)
+        case .string(let value): try container.encode(value)
         }
     }
 }
 
-struct MiddlewareFeature: Identifiable, Codable, Equatable, Sendable {
+struct MiddlewareFeature: Identifiable, Decodable, Equatable, Sendable {
     let id: String
     let label: String
     let description: String
     let required: Bool
+    let settings: [FrontendSetting]
+}
+
+struct FrontendSetting: Identifiable, Decodable, Equatable, Sendable {
+    let id: String
+    let label: String
+    let description: String
+    let kind: FrontendSettingKind
+
+    init(id: String, label: String, description: String, kind: FrontendSettingKind) {
+        self.id = id
+        self.label = label
+        self.description = description
+        self.kind = kind
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, label, description, type, min, max, step, options, unsetLabel
+    }
+
+    private enum Kind: String, Decodable {
+        case integer
+        case select
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        label = try container.decode(String.self, forKey: .label)
+        description = try container.decode(String.self, forKey: .description)
+        switch try container.decode(Kind.self, forKey: .type) {
+        case .integer:
+            kind = .integer(
+                min: try container.decode(Int64.self, forKey: .min),
+                max: try container.decodeIfPresent(Int64.self, forKey: .max),
+                step: try container.decode(Int64.self, forKey: .step)
+            )
+        case .select:
+            kind = .select(
+                options: try container.decode([FrontendSettingOption].self, forKey: .options),
+                unsetLabel: try container.decodeIfPresent(String.self, forKey: .unsetLabel)
+            )
+        }
+    }
+}
+
+enum FrontendSettingKind: Equatable, Sendable {
+    case integer(min: Int64, max: Int64?, step: Int64)
+    case select(options: [FrontendSettingOption], unsetLabel: String?)
+}
+
+struct FrontendSettingOption: Identifiable, Decodable, Equatable, Sendable {
+    var id: String { value }
+
+    let value: String
+    let label: String
+    let description: String
 }
 
 struct ProviderStatus: Identifiable, Codable, Equatable, Sendable {

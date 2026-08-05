@@ -37,7 +37,12 @@ final class AppModelTests: XCTestCase {
             ),
             middleware: MiddlewareConfig(
                 enabled: ["skills", "subagents"],
-                subagents: SubagentConfig(modelRoute: "openai_socket::gpt-5.6-sol::high")
+                settings: [
+                    "context_offloading": ["stale_after_tokens": .integer(50_000)],
+                    "subagents": [
+                        "model_route": .string("openai_socket::gpt-5.6-sol::high")
+                    ]
+                ]
             ),
             approval: .on,
             systemPrompt: systemPrompt
@@ -421,7 +426,8 @@ final class AppModelTests: XCTestCase {
             id: "tasks",
             label: "Work items",
             description: "Tracks work items.",
-            required: false
+            required: false,
+            settings: []
         )]
         model.mountedWidgets = model.contributions.flatMap { contribution in
             contribution.widgets.map {
@@ -605,7 +611,9 @@ final class AppModelTests: XCTestCase {
             ),
             middleware: MiddlewareConfig(
                 enabled: [],
-                subagents: SubagentConfig(modelRoute: nil)
+                settings: [
+                    "context_offloading": ["stale_after_tokens": .integer(50_000)]
+                ]
             ),
             approval: .on,
             systemPrompt: "Test"
@@ -656,75 +664,14 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.agentDraft?.provider.reasoningEffort)
     }
 
-    func testSubagentDefaultsUseExactGatewayModelRoutes() throws {
-        let model = try model()
-        model.agentDraft = AgentComposition(
-            provider: ProviderConfig(
-                provider: "openai_socket",
-                model: "gpt-5.6-sol",
-                baseUrl: nil,
-                reasoningEffort: "medium",
-                webSearch: .off
-            ),
-            middleware: MiddlewareConfig(
-                enabled: ["subagents"],
-                subagents: SubagentConfig(modelRoute: nil)
-            ),
-            approval: .on,
-            systemPrompt: "Test"
-        )
-        model.middlewareFeatures = [MiddlewareFeature(
-            id: "subagents",
-            label: "Subagents",
-            description: "Delegate focused work.",
-            required: false
-        )]
-        model.modelChoices = [
-            ModelChoice(
-                route: "openai_socket::gpt-5.6-sol::medium",
-                group: "OpenAI · GPT-5.6 Sol",
-                model: "gpt-5.6-sol",
-                reasoningEffort: "medium",
-                contextWindow: 1_050_000
-            ),
-            ModelChoice(
-                route: "openai_socket::gpt-5.6-sol::high",
-                group: "OpenAI · GPT-5.6 Sol",
-                model: "gpt-5.6-sol",
-                reasoningEffort: "high",
-                contextWindow: 1_050_000
-            ),
-            ModelChoice(
-                route: "kimi::kimi-k3",
-                group: "Kimi · K3",
-                model: "kimi-k3",
-                reasoningEffort: nil,
-                contextWindow: 1_048_576
-            )
-        ]
+    func testMiddlewareSettingsSetAndClearWithoutCapabilityLogic() {
+        var middleware = MiddlewareConfig(enabled: ["example"], settings: [:])
 
-        XCTAssertTrue(model.isSubagentsEnabledInDraft)
-        XCTAssertEqual(model.subagentModelOptions.map(\.group), [
-            "OpenAI · GPT-5.6 Sol",
-            "Kimi · K3"
-        ])
+        middleware.setSetting(.string("route-a"), middleware: "example", setting: "route")
+        XCTAssertEqual(middleware.settings["example"]?["route"], .string("route-a"))
 
-        let openAI = try XCTUnwrap(model.subagentModelOptions.first)
-        model.selectSubagentModelOption(openAI.id)
-        XCTAssertEqual(
-            model.agentDraft?.middleware.subagents.modelRoute,
-            "openai_socket::gpt-5.6-sol::medium"
-        )
-        XCTAssertEqual(model.subagentReasoningChoices.map(\.reasoningEffort), ["medium", "high"])
-
-        model.selectSubagentReasoningRoute("openai_socket::gpt-5.6-sol::high")
-        XCTAssertEqual(
-            model.agentDraft?.middleware.subagents.modelRoute,
-            "openai_socket::gpt-5.6-sol::high"
-        )
-
-        model.selectSubagentModelOption(nil)
-        XCTAssertNil(model.agentDraft?.middleware.subagents.modelRoute)
+        middleware.setSetting(nil, middleware: "example", setting: "route")
+        XCTAssertNil(middleware.settings["example"])
     }
 
     func testGatewayDefaultRefreshDoesNotOverwriteActiveAgentDraft() throws {
@@ -739,7 +686,9 @@ final class AppModelTests: XCTestCase {
             ),
             middleware: MiddlewareConfig(
                 enabled: ["skills"],
-                subagents: SubagentConfig(modelRoute: nil)
+                settings: [
+                    "context_offloading": ["stale_after_tokens": .integer(50_000)]
+                ]
             ),
             approval: .on,
             systemPrompt: "Active"

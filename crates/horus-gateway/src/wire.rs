@@ -1,6 +1,6 @@
 //! Versioned, bounded JSON frames shared by gateway clients and the server.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use horus::backend::checkpoint::SessionSummary;
@@ -8,8 +8,8 @@ use horus::backend::model::ModelChoice;
 use horus::backend::model::provider::HostedWebSearch;
 use horus::backend::sandbox::ApprovalPolicy;
 use horus::protocol::{
-    Event, EventMsg, FrontendBlock, FrontendContribution, SessionConfiguredEvent, Submission,
-    TokenUsage,
+    Event, EventMsg, FrontendBlock, FrontendContribution, FrontendSettingValue, MiddlewareFeature,
+    SessionConfiguredEvent, Submission, TokenUsage,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
@@ -526,19 +526,12 @@ pub enum ProviderAuthKind {
     DeviceCode,
 }
 
-/// Enabled optional middleware IDs.
+/// Enabled optional middleware IDs and their schema-backed settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MiddlewareConfig {
     pub(crate) enabled: BTreeSet<String>,
-    pub subagents: SubagentConfig,
-}
-
-/// Default model route used when the subagent tool does not choose one explicitly.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubagentConfig {
-    pub model_route: Option<String>,
+    pub settings: BTreeMap<String, BTreeMap<String, FrontendSettingValue>>,
 }
 
 impl MiddlewareConfig {
@@ -558,19 +551,37 @@ impl MiddlewareConfig {
         }
     }
 
+    /// Returns one advertised middleware setting.
+    #[must_use]
+    pub fn setting(&self, middleware: &str, setting: &str) -> Option<&FrontendSettingValue> {
+        self.settings.get(middleware)?.get(setting)
+    }
+
+    /// Sets or clears one advertised middleware setting before gateway validation.
+    pub fn set_setting(
+        &mut self,
+        middleware: impl Into<String>,
+        setting: impl Into<String>,
+        value: Option<FrontendSettingValue>,
+    ) {
+        let middleware = middleware.into();
+        let setting = setting.into();
+        if let Some(value) = value {
+            self.settings
+                .entry(middleware)
+                .or_default()
+                .insert(setting, value);
+        } else if let Some(settings) = self.settings.get_mut(&middleware) {
+            settings.remove(&setting);
+            if settings.is_empty() {
+                self.settings.remove(&middleware);
+            }
+        }
+    }
+
     pub(crate) fn entries(&self) -> impl Iterator<Item = &str> {
         self.enabled.iter().map(String::as_str)
     }
-}
-
-/// Gateway-owned middleware presentation and selection policy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MiddlewareFeature {
-    pub id: String,
-    pub label: String,
-    pub description: String,
-    pub required: bool,
 }
 
 /// Capability-rendered preview whose inner events remain provider-neutral.
@@ -1216,9 +1227,12 @@ mod tests {
                         },
                         "middleware": {
                             "enabled": [
-                                "compaction", "skills", "steering", "subagents", "tools"
+                                "compaction", "context_offloading", "skills", "steering",
+                                "subagents", "tools"
                             ],
-                            "subagents": {"model_route": null}
+                            "settings": {
+                                "context_offloading": {"stale_after_tokens": 50000}
+                            }
                         },
                         "approval": "on",
                         "system_prompt": "test"

@@ -112,6 +112,20 @@ private struct ChatOptionsMenu: View {
                 }
                 .disabled(!model.canCreateSession)
             }
+            if !model.capabilityCommands.isEmpty {
+                Section("Commands") {
+                    ForEach(model.capabilityCommands) { mounted in
+                        Button("/\(mounted.command.name)") {
+                            if mounted.command.arguments.isEmpty {
+                                model.submitCommand(mounted, arguments: "")
+                            } else {
+                                pendingCommand = mounted
+                            }
+                        }
+                        .disabled(!model.canOpenSession)
+                    }
+                }
+            }
         } label: {
             Image(systemName: "ellipsis")
         }
@@ -470,18 +484,8 @@ private struct TranscriptRow: View {
 
     @ViewBuilder
     private var controls: some View {
-        HStack(spacing: 0) {
-            MessageActionButton(title: "Copy", systemImage: "doc.on.doc") {
-                copyToPasteboard(entry.text)
-            }
-            if let fork = model.forkCommand {
-                MessageActionButton(
-                    title: "Fork chat",
-                    systemImage: "arrow.trianglehead.branch"
-                ) {
-                    model.submitCommand(fork, arguments: "")
-                }
-            }
+        MessageActionButton(title: "Copy", systemImage: "doc.on.doc") {
+            copyToPasteboard(entry.text)
         }
     }
 
@@ -489,11 +493,6 @@ private struct TranscriptRow: View {
     private var transcriptActions: some View {
         if hasMessageActions {
             Button("Copy", systemImage: "doc.on.doc") { copyToPasteboard(entry.text) }
-            if let fork = model.forkCommand {
-                Button("Fork chat", systemImage: "arrow.trianglehead.branch") {
-                    model.submitCommand(fork, arguments: "")
-                }
-            }
         }
     }
 

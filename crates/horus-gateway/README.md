@@ -5,8 +5,11 @@ credentials, usage, and scheduled tasks while hosting up to 32 independent
 chat agents. Every chat owns its canonical workspace, model, reasoning, agent
 features, approval policy, and prompt. The terminal, macOS, iPhone, and iPad
 clients can independently open different chats or subscribe to the same one.
-Chats store only enabled optional middleware IDs. The gateway advertises the
-ordered catalog to clients and always installs scheduling and durable sessions.
+Chats store enabled optional middleware IDs and generic scalar settings. The gateway advertises
+the ordered middleware catalog plus integer and select control schemas, so terminal and Apple
+clients render new middleware and settings without capability-specific code. Context offloading
+is enabled by default and masks successful tool output after a 50,000-token trailing window. The
+gateway always installs scheduling and durable sessions.
 
 Install `horus-cli` to get both the client and gateway commands:
 

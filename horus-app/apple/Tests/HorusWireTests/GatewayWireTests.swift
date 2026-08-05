@@ -27,7 +27,7 @@ final class GatewayWireTests: XCTestCase {
     }
 
     private var configJSON: String {
-        #"{"revision":4,"config":{"provider":{"provider":"openai_socket","model":"gpt-5.6-sol","reasoning_effort":"high","web_search":"cached"},"middleware":{"enabled":["skills","subagents","tools"],"subagents":{"model_route":"openai_socket/gpt-5.6-sol"}},"approval":"on","system_prompt":"Stay focused."}}"#
+        #"{"revision":4,"config":{"provider":{"provider":"openai_socket","model":"gpt-5.6-sol","reasoning_effort":"high","web_search":"cached"},"middleware":{"enabled":["skills","subagents","tools"],"settings":{"context_offloading":{"stale_after_tokens":50000},"subagents":{"model_route":"openai_socket/gpt-5.6-sol"}}},"approval":"on","system_prompt":"Stay focused."}}"#
     }
 
     private var sessionRecordJSON: String {
@@ -35,7 +35,7 @@ final class GatewayWireTests: XCTestCase {
     }
 
     private var readyPayloadJSON: String {
-        #"{"sessions":[\#(sessionRecordJSON)],"providers":[{"provider":"openai_socket","label":"OpenAI","symbol":"sparkle","description":"Persistent Responses API","configured":true,"auth":"api_key","default_base_url":null,"default_api_key_env":"OPENAI_API_KEY","models":[{"id":"gpt-5.6-sol","label":"Sol","description":"Frontier capability for complex work","context_window":1050000,"reasoning":[{"id":"medium","label":"Medium","description":"Balanced reasoning and latency"}],"default_reasoning":"medium"}],"web_search":["off","cached","live"]}],"default_config":\#(configJSON),"models":[{"route":"openai_socket/gpt-5.6-sol","group":"OpenAI","model":"gpt-5.6-sol","reasoning_effort":"medium","context_window":200000}],"middleware_features":[{"id":"skills","label":"Skills","description":"Load focused instructions.","required":false}],"max_active_sessions":4}"#
+        #"{"sessions":[\#(sessionRecordJSON)],"providers":[{"provider":"openai_socket","label":"OpenAI","symbol":"sparkle","description":"Persistent Responses API","configured":true,"auth":"api_key","default_base_url":null,"default_api_key_env":"OPENAI_API_KEY","models":[{"id":"gpt-5.6-sol","label":"Sol","description":"Frontier capability for complex work","context_window":1050000,"reasoning":[{"id":"medium","label":"Medium","description":"Balanced reasoning and latency"}],"default_reasoning":"medium"}],"web_search":["off","cached","live"]}],"default_config":\#(configJSON),"models":[{"route":"openai_socket/gpt-5.6-sol","group":"OpenAI","model":"gpt-5.6-sol","reasoning_effort":"medium","context_window":200000}],"middleware_features":[{"id":"skills","label":"Skills","description":"Load focused instructions.","required":false,"settings":[{"id":"limit","label":"Limit","description":"Maximum items","type":"integer","min":1,"step":10},{"id":"route","label":"Route","description":"Default route","type":"select","options":[{"value":"route-a","label":"Route A","description":"First route"}],"unset_label":"Inherit"}]}],"max_active_sessions":4}"#
     }
 
     private var sessionReadyPayloadJSON: String {
@@ -53,7 +53,10 @@ final class GatewayWireTests: XCTestCase {
             ),
             middleware: MiddlewareConfig(
                 enabled: ["skills", "subagents", "tools"],
-                subagents: SubagentConfig(modelRoute: "openai_socket/gpt-5.6-sol")
+                settings: [
+                    "context_offloading": ["stale_after_tokens": .integer(50_000)],
+                    "subagents": ["model_route": .string("openai_socket/gpt-5.6-sol")]
+                ]
             ),
             approval: .on,
             systemPrompt: "Stay focused."
@@ -141,7 +144,8 @@ final class GatewayWireTests: XCTestCase {
         let middleware = try XCTUnwrap(encodedConfig["middleware"] as? [String: Any])
         let enabled = try XCTUnwrap(middleware["enabled"] as? [String])
         XCTAssertEqual(Set(enabled), ["skills", "subagents", "tools"])
-        let subagents = try XCTUnwrap(middleware["subagents"] as? [String: Any])
+        let settings = try XCTUnwrap(middleware["settings"] as? [String: Any])
+        let subagents = try XCTUnwrap(settings["subagents"] as? [String: Any])
         XCTAssertEqual(subagents["model_route"] as? String, "openai_socket/gpt-5.6-sol")
 
         let branch = try requestObject(.switchGitBranch(
@@ -214,11 +218,12 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertNil(request["session_id"])
         let config = try XCTUnwrap(request["config"] as? [String: Any])
         let middleware = try XCTUnwrap(config["middleware"] as? [String: Any])
-        let subagents = try XCTUnwrap(middleware["subagents"] as? [String: Any])
+        let settings = try XCTUnwrap(middleware["settings"] as? [String: Any])
+        let subagents = try XCTUnwrap(settings["subagents"] as? [String: Any])
         XCTAssertEqual(subagents["model_route"] as? String, "openai_socket/gpt-5.6-sol")
 
         var inherited = composition
-        inherited.middleware.subagents.modelRoute = nil
+        inherited.middleware.setSetting(nil, middleware: "subagents", setting: "model_route")
         let inheritedRequest = try requestObject(.configureDefaultAgent(
             requestID: "default-2",
             expectedRevision: 4,
@@ -226,8 +231,8 @@ final class GatewayWireTests: XCTestCase {
         ))
         let inheritedConfig = try XCTUnwrap(inheritedRequest["config"] as? [String: Any])
         let inheritedMiddleware = try XCTUnwrap(inheritedConfig["middleware"] as? [String: Any])
-        let inheritedSubagents = try XCTUnwrap(inheritedMiddleware["subagents"] as? [String: Any])
-        XCTAssertTrue(inheritedSubagents["model_route"] is NSNull)
+        let inheritedSettings = try XCTUnwrap(inheritedMiddleware["settings"] as? [String: Any])
+        XCTAssertNil(inheritedSettings["subagents"])
     }
 
     func testGatewayWideReadyPayloadDecodesV6State() throws {
@@ -254,6 +259,18 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(payload.models.first?.route, "openai_socket/gpt-5.6-sol")
         XCTAssertEqual(payload.middlewareFeatures.first?.id, "skills")
         XCTAssertEqual(payload.maxActiveSessions, 4)
+        let settings = try XCTUnwrap(payload.middlewareFeatures.first?.settings)
+        guard case .integer(let minimum, let maximum, let step) = settings[0].kind else {
+            return XCTFail("Expected integer setting")
+        }
+        XCTAssertEqual(minimum, 1)
+        XCTAssertNil(maximum)
+        XCTAssertEqual(step, 10)
+        guard case .select(let options, let unsetLabel) = settings[1].kind else {
+            return XCTFail("Expected select setting")
+        }
+        XCTAssertEqual(options.first?.value, "route-a")
+        XCTAssertEqual(unsetLabel, "Inherit")
 
         let configured = try decodeEnvelope(
             #"{"version":6,"type":"gateway_configured","request_id":"gateway-1","payload":\#(readyPayloadJSON)}"#
@@ -334,29 +351,29 @@ final class GatewayWireTests: XCTestCase {
         ))
     }
 
-    func testV6RequiresSubagentConfigurationAndNullableRouteKey() {
-        let withoutSubagents = configJSON.replacingOccurrences(
-            of: #","subagents":{"model_route":"openai_socket/gpt-5.6-sol"}"#,
+    func testV7RequiresGenericSettingsAndScalarValues() {
+        let withoutSettings = configJSON.replacingOccurrences(
+            of: #","settings":{"context_offloading":{"stale_after_tokens":50000},"subagents":{"model_route":"openai_socket/gpt-5.6-sol"}}"#,
             with: ""
         )
-        let payloadWithoutSubagents = readyPayloadJSON.replacingOccurrences(
+        let payloadWithoutSettings = readyPayloadJSON.replacingOccurrences(
             of: configJSON,
-            with: withoutSubagents
+            with: withoutSettings
         )
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":6,"type":"ready","payload":\#(payloadWithoutSubagents)}"#
+            #"{"version":6,"type":"ready","payload":\#(payloadWithoutSettings)}"#
         ))
 
-        let withoutRoute = configJSON.replacingOccurrences(
-            of: #"{"model_route":"openai_socket/gpt-5.6-sol"}"#,
-            with: "{}"
+        let invalidScalar = configJSON.replacingOccurrences(
+            of: #""stale_after_tokens":50000"#,
+            with: #""stale_after_tokens":true"#
         )
-        let payloadWithoutRoute = readyPayloadJSON.replacingOccurrences(
+        let payloadWithInvalidScalar = readyPayloadJSON.replacingOccurrences(
             of: configJSON,
-            with: withoutRoute
+            with: invalidScalar
         )
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":6,"type":"ready","payload":\#(payloadWithoutRoute)}"#
+            #"{"version":6,"type":"ready","payload":\#(payloadWithInvalidScalar)}"#
         ))
     }
 

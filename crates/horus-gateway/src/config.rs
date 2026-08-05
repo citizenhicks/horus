@@ -23,8 +23,8 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 6;
-const CHAT_SPEC_VERSION: u32 = 3;
+const CONFIG_VERSION: u32 = 7;
+const CHAT_SPEC_VERSION: u32 = 4;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
 const CONFIG_HEADER: &str = "# approval options: \"on\" (prompt), \"allow\" (no prompt, no network),\n# \"allow_network\" (no prompt, network allowed).\n\n";
@@ -264,8 +264,11 @@ impl GatewayConfig {
                     "the gateway default must reference a configured provider".into(),
                 ));
             }
-            if let Some(route) = default.config.middleware.subagents.model_route.as_deref()
-                && !crate::assembly::configured_route_exists(self, route)?
+            if let Some(route) = crate::middleware_manifest::string_setting(
+                &default.config.middleware,
+                "subagents",
+                "model_route",
+            )? && !crate::assembly::configured_route_exists(self, route)?
             {
                 return Err(Error::Config(
                     "the gateway default subagent route is not configured".into(),
@@ -818,7 +821,7 @@ mod tests {
 
         assert!(contents.starts_with(CONFIG_HEADER));
         assert!(contents.contains("approval = \"on\""));
-        assert!(contents.contains("[default_agent.config.middleware.subagents]"));
+        assert!(contents.contains("[default_agent.config.middleware.settings.context_offloading]"));
         assert!(!contents.contains("sessions"));
         assert_eq!(restored, config);
     }

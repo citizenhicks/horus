@@ -3,14 +3,16 @@
 use std::collections::BTreeSet;
 use std::io;
 
-use horus::backend::model::ModelChoice;
 use horus::backend::model::provider::HostedWebSearch;
 use horus::backend::sandbox::ApprovalPolicy;
+use horus::protocol::{
+    FrontendSetting, FrontendSettingKind, FrontendSettingValue, MiddlewareFeature,
+};
 use horus::{Error, Result};
 use horus_gateway::client::{GatewayEvents, GatewaySender, MAX_PENDING_FRAMES};
 use horus_gateway::wire::{
-    AgentComposition, ClientMessage, MiddlewareConfig, MiddlewareFeature, ProviderAuthKind,
-    ProviderConfig, ProviderStatus, ReadyPayload, ServerFrame, ServerMessage, SessionReadyPayload,
+    AgentComposition, ClientMessage, MiddlewareConfig, ProviderAuthKind, ProviderConfig,
+    ProviderStatus, ReadyPayload, ServerFrame, ServerMessage, SessionReadyPayload,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -109,6 +111,12 @@ enum ApplyTarget {
     Default,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MiddlewareRow {
+    Feature(usize),
+    Setting { feature: usize, setting: usize },
+}
+
 struct Progress {
     title: &'static str,
     detail: String,
@@ -130,10 +138,7 @@ struct SetupState {
     reasoning: usize,
     web_search: usize,
     features: Vec<MiddlewareFeature>,
-    models: Vec<ModelChoice>,
     middleware: MiddlewareConfig,
-    subagent_model: usize,
-    subagent_reasoning: usize,
     approval: usize,
     target: ApplyTarget,
     row: usize,
@@ -152,7 +157,6 @@ impl SetupState {
             mode,
             validated_providers(&gateway.providers)?,
             gateway.middleware_features.clone(),
-            gateway.models.clone(),
             session.config.config.clone(),
         )?;
         if let Some(provider) = preferred_provider {
@@ -165,7 +169,6 @@ impl SetupState {
         mode: SetupMode,
         providers: Vec<ProviderEntry>,
         features: Vec<MiddlewareFeature>,
-        models: Vec<ModelChoice>,
         original: AgentComposition,
     ) -> Result<Self> {
         if providers.is_empty() {
@@ -208,10 +211,7 @@ impl SetupState {
             reasoning: 0,
             web_search: 0,
             features,
-            models,
             middleware,
-            subagent_model: 0,
-            subagent_reasoning: 0,
             approval,
             target: ApplyTarget::Session,
             row: 0,
@@ -219,7 +219,6 @@ impl SetupState {
             progress: None,
         };
         state.reset_provider_fields();
-        state.reset_subagent_fields()?;
         Ok(state)
     }
 
@@ -261,46 +260,41 @@ impl SetupState {
         if count > 1 { count } else { 0 }
     }
 
-    fn distinct_subagent_models(&self) -> Vec<&ModelChoice> {
-        let mut seen = BTreeSet::new();
-        self.models
-            .iter()
-            .filter(|choice| seen.insert((choice.group.as_str(), choice.model.as_str())))
-            .collect()
-    }
-
-    fn subagent_reasoning_choices(&self) -> Vec<&ModelChoice> {
-        let Some(selected) = self
-            .subagent_model
-            .checked_sub(1)
-            .and_then(|index| self.distinct_subagent_models().get(index).copied())
-        else {
-            return Vec::new();
-        };
-        self.models
-            .iter()
-            .filter(|choice| choice.group == selected.group && choice.model == selected.model)
-            .collect()
-    }
-
     fn models_action_start(&self) -> usize {
         self.model_choice_count() + self.reasoning_choice_count() + self.search_choice_count()
     }
 
-    fn agent_model_row(&self) -> usize {
-        self.features.len()
-    }
-
-    fn agent_reasoning_row(&self) -> usize {
-        self.features.len() + 1
-    }
-
     fn agent_approval_row(&self) -> usize {
-        self.features.len() + 2
+        self.middleware_row_count()
     }
 
     fn agent_action_start(&self) -> usize {
-        self.features.len() + 3
+        self.agent_approval_row() + 1
+    }
+
+    fn middleware_row_count(&self) -> usize {
+        self.features
+            .iter()
+            .map(|feature| feature.settings.len() + 1)
+            .sum()
+    }
+
+    fn middleware_row(&self, row: usize) -> Option<MiddlewareRow> {
+        let mut start = 0;
+        for (feature, definition) in self.features.iter().enumerate() {
+            if row == start {
+                return Some(MiddlewareRow::Feature(feature));
+            }
+            let settings = start + 1..start + 1 + definition.settings.len();
+            if settings.contains(&row) {
+                return Some(MiddlewareRow::Setting {
+                    feature,
+                    setting: row - start - 1,
+                });
+            }
+            start = settings.end;
+        }
+        None
     }
 
     fn apply_target_for_row(&self) -> Option<ApplyTarget> {
@@ -326,7 +320,7 @@ impl SetupState {
                     + self.search_choice_count()
                     + 2
             }
-            Page::Agent => self.features.len() + 5,
+            Page::Agent => self.agent_action_start() + 2,
         }
     }
 
@@ -466,28 +460,29 @@ impl SetupState {
     }
 
     fn handle_agent_key(&mut self, key: KeyEvent) -> Flow {
+        let middleware_row = self.middleware_row(self.row);
         match key.code {
             KeyCode::Esc => return Flow::Cancel,
             KeyCode::Up | KeyCode::BackTab => self.move_selection(-1),
             KeyCode::Down | KeyCode::Tab => self.move_selection(1),
-            KeyCode::Char(' ') if self.row < self.features.len() => {
-                let feature = &self.features[self.row];
+            KeyCode::Char(' ') if matches!(middleware_row, Some(MiddlewareRow::Feature(_))) => {
+                let MiddlewareRow::Feature(index) = middleware_row.expect("guarded feature row")
+                else {
+                    unreachable!()
+                };
+                let feature = &self.features[index];
                 if !feature.required {
                     self.middleware
                         .set_enabled(&feature.id, !self.middleware.enabled(&feature.id));
                 }
             }
-            KeyCode::Char(' ') | KeyCode::Right if self.row == self.agent_model_row() => {
-                self.cycle_subagent_model(1);
+            KeyCode::Char(' ') | KeyCode::Right
+                if matches!(middleware_row, Some(MiddlewareRow::Setting { .. })) =>
+            {
+                self.adjust_middleware_setting(middleware_row.expect("guarded setting row"), 1);
             }
-            KeyCode::Left if self.row == self.agent_model_row() => {
-                self.cycle_subagent_model(-1);
-            }
-            KeyCode::Char(' ') | KeyCode::Right if self.row == self.agent_reasoning_row() => {
-                self.cycle_subagent_reasoning(1);
-            }
-            KeyCode::Left if self.row == self.agent_reasoning_row() => {
-                self.cycle_subagent_reasoning(-1);
+            KeyCode::Left if matches!(middleware_row, Some(MiddlewareRow::Setting { .. })) => {
+                self.adjust_middleware_setting(middleware_row.expect("guarded setting row"), -1);
             }
             KeyCode::Char(' ') | KeyCode::Right if self.row == self.agent_approval_row() => {
                 self.approval = (self.approval + 1) % APPROVALS.len();
@@ -521,19 +516,84 @@ impl SetupState {
         self.error = None;
     }
 
-    fn cycle_subagent_model(&mut self, delta: isize) {
-        let count = self.distinct_subagent_models().len() + 1;
-        self.subagent_model =
-            (self.subagent_model as isize + delta).rem_euclid(count as isize) as usize;
-        self.subagent_reasoning = 0;
-        self.error = None;
+    fn adjust_middleware_setting(&mut self, row: MiddlewareRow, delta: isize) {
+        let MiddlewareRow::Setting { feature, setting } = row else {
+            return;
+        };
+        self.error = self
+            .adjust_setting(feature, setting, delta)
+            .err()
+            .map(|error| error.to_string());
     }
 
-    fn cycle_subagent_reasoning(&mut self, delta: isize) {
-        let count = self.subagent_reasoning_choices().len().max(1);
-        self.subagent_reasoning =
-            (self.subagent_reasoning as isize + delta).rem_euclid(count as isize) as usize;
-        self.error = None;
+    fn adjust_setting(&mut self, feature: usize, setting: usize, delta: isize) -> Result<()> {
+        let feature = &self.features[feature];
+        let setting = &feature.settings[setting];
+        if !feature.required && !self.middleware.enabled(&feature.id) {
+            return Ok(());
+        }
+        let value = match &setting.kind {
+            FrontendSettingKind::Integer { min, max, step } => {
+                let Some(FrontendSettingValue::Integer(current)) =
+                    self.middleware.setting(&feature.id, &setting.id)
+                else {
+                    return Err(Error::Config(format!(
+                        "{} requires an integer value",
+                        setting.label
+                    )));
+                };
+                let step = (*step).max(1);
+                let next = if delta.is_positive() {
+                    current.saturating_add(step)
+                } else {
+                    current.saturating_sub(step)
+                };
+                FrontendSettingValue::Integer(
+                    max.map_or(next.max(*min), |max| next.max(*min).min(max)),
+                )
+            }
+            FrontendSettingKind::Select {
+                options,
+                unset_label,
+            } => {
+                let offset = usize::from(unset_label.is_some());
+                let count = options.len() + offset;
+                if count == 0 {
+                    return Err(Error::Config(format!(
+                        "{} has no advertised choices",
+                        setting.label
+                    )));
+                }
+                let current = match self.middleware.setting(&feature.id, &setting.id) {
+                    Some(FrontendSettingValue::String(value)) => options
+                        .iter()
+                        .position(|option| option.value == *value)
+                        .map(|index| index + offset)
+                        .ok_or_else(|| {
+                            Error::Config(format!(
+                                "{} is not in the gateway catalog",
+                                setting.label
+                            ))
+                        })?,
+                    None if unset_label.is_some() => 0,
+                    Some(FrontendSettingValue::Integer(_)) | None => {
+                        return Err(Error::Config(format!(
+                            "{} requires a selected value",
+                            setting.label
+                        )));
+                    }
+                };
+                let next = (current as isize + delta).rem_euclid(count as isize) as usize;
+                if next < offset {
+                    self.middleware.set_setting(&feature.id, &setting.id, None);
+                    return Ok(());
+                }
+                FrontendSettingValue::String(options[next - offset].value.clone())
+            }
+        };
+        self.middleware
+            .set_setting(&feature.id, &setting.id, Some(value));
+        Ok(())
     }
 
     fn finish(&mut self) -> Flow {
@@ -649,38 +709,6 @@ impl SetupState {
         self.error = None;
     }
 
-    fn reset_subagent_fields(&mut self) -> Result<()> {
-        let Some(route) = self.original.middleware.subagents.model_route.as_deref() else {
-            self.subagent_model = 0;
-            self.subagent_reasoning = 0;
-            return Ok(());
-        };
-        let choice = self
-            .models
-            .iter()
-            .find(|choice| choice.route == route)
-            .cloned()
-            .ok_or_else(|| {
-                Error::Config("subagent model route is not in the gateway catalog".into())
-            })?;
-        self.subagent_model = self
-            .distinct_subagent_models()
-            .iter()
-            .position(|candidate| {
-                candidate.group == choice.group && candidate.model == choice.model
-            })
-            .ok_or_else(|| Error::Config("subagent model is not in the gateway catalog".into()))?
-            + 1;
-        self.subagent_reasoning = self
-            .subagent_reasoning_choices()
-            .iter()
-            .position(|candidate| candidate.route == route)
-            .ok_or_else(|| {
-                Error::Config("subagent reasoning route is not in the gateway catalog".into())
-            })?;
-        Ok(())
-    }
-
     fn selected_model(&self) -> &str {
         self.definition()
             .models
@@ -759,19 +787,6 @@ impl SetupState {
         let mut config = current.clone();
         if self.mode == SetupMode::Agent {
             config.middleware = self.middleware.clone();
-            config.middleware.subagents.model_route = if self.subagent_model == 0 {
-                None
-            } else {
-                Some(
-                    self.subagent_reasoning_choices()
-                        .get(self.subagent_reasoning)
-                        .ok_or_else(|| {
-                            Error::Config("Subagent reasoning selection is invalid".into())
-                        })?
-                        .route
-                        .clone(),
-                )
-            };
             config.approval = APPROVALS[self.approval].policy;
             return Ok(config);
         }
@@ -1715,46 +1730,36 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState) {
             render_apply_actions(lines, state, state.models_action_start());
         }
         Page::Agent => {
-            for (index, feature) in state.features.iter().enumerate() {
+            let mut row = 0;
+            for feature in &state.features {
                 choice(
                     lines,
                     &feature.label,
                     &feature.description,
-                    state.row == index,
+                    state.row == row,
                     if feature.required || state.middleware.enabled(&feature.id) {
                         "[x]"
                     } else {
                         "[ ]"
                     },
                 );
+                row += 1;
+                for setting in &feature.settings {
+                    choice(
+                        lines,
+                        &format!(
+                            "  {}  ‹ {} ›",
+                            setting.label,
+                            middleware_setting_label(&state.middleware, &feature.id, setting)
+                        ),
+                        &setting.description,
+                        state.row == row,
+                        "",
+                    );
+                    row += 1;
+                }
             }
             lines.push(Line::from(""));
-            let subagent_model = state
-                .subagent_model
-                .checked_sub(1)
-                .and_then(|index| state.distinct_subagent_models().get(index).copied());
-            choice(
-                lines,
-                &format!(
-                    "Subagent model  ‹ {} ›",
-                    subagent_model.map_or("Inherit parent", |choice| choice.group.as_str())
-                ),
-                "Default route used when spawn_agent does not choose a model",
-                state.row == state.agent_model_row(),
-                "",
-            );
-            let reasoning = state
-                .subagent_reasoning_choices()
-                .get(state.subagent_reasoning)
-                .and_then(|choice| choice.reasoning_effort.as_deref())
-                .unwrap_or("inherit parent");
-            choice(
-                lines,
-                &format!("Subagent reasoning  ‹ {reasoning} ›"),
-                "Reasoning attached to the default subagent model route",
-                state.row == state.agent_reasoning_row(),
-                "",
-            );
             choice(
                 lines,
                 &format!("Approval  ‹ {} ›", APPROVALS[state.approval].label),
@@ -1764,6 +1769,29 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState) {
             );
             render_apply_actions(lines, state, state.agent_action_start());
         }
+    }
+}
+
+fn middleware_setting_label(
+    config: &MiddlewareConfig,
+    middleware: &str,
+    setting: &FrontendSetting,
+) -> String {
+    match (&setting.kind, config.setting(middleware, &setting.id)) {
+        (FrontendSettingKind::Integer { .. }, Some(FrontendSettingValue::Integer(value))) => {
+            value.to_string()
+        }
+        (
+            FrontendSettingKind::Select { options, .. },
+            Some(FrontendSettingValue::String(value)),
+        ) => options
+            .iter()
+            .find(|option| option.value == *value)
+            .map_or_else(|| value.clone(), |option| option.label.clone()),
+        (FrontendSettingKind::Select { unset_label, .. }, None) => {
+            unset_label.clone().unwrap_or_else(|| "Not selected".into())
+        }
+        _ => "Invalid value".into(),
     }
 }
 
@@ -1877,6 +1905,7 @@ fn render_progress(lines: &mut Vec<Line<'static>>, progress: &Progress) {
 
 #[cfg(test)]
 mod tests {
+    use horus::protocol::FrontendSettingOption;
     use horus_gateway::wire::{ProviderAuthKind, ProviderModel, ProviderStatus, ReasoningChoice};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -1958,51 +1987,83 @@ mod tests {
         if providers[0].status.configurable_base_url() {
             original.provider.base_url = providers[0].status.default_base_url.clone();
         }
-        SetupState::from_parts(mode, providers, features(), model_choices(), original)
-            .expect("setup state")
+        original.middleware.set_enabled("plain", true);
+        original.middleware.set_enabled("configured", true);
+        SetupState::from_parts(mode, providers, features(), original).expect("setup state")
     }
 
     fn features() -> Vec<MiddlewareFeature> {
-        [
-            ("tools", "Tools", false),
-            ("sessions", "Sessions", true),
-            ("skills", "Skills", false),
+        vec![
+            MiddlewareFeature {
+                id: "plain".into(),
+                label: "Plain".into(),
+                description: "Plain optional capability".into(),
+                required: false,
+                settings: Vec::new(),
+            },
+            MiddlewareFeature {
+                id: "configured".into(),
+                label: "Configured".into(),
+                description: "Capability with advertised settings".into(),
+                required: false,
+                settings: vec![
+                    FrontendSetting {
+                        id: "limit".into(),
+                        label: "Limit".into(),
+                        description: "An advertised integer".into(),
+                        kind: FrontendSettingKind::Integer {
+                            min: 1,
+                            max: Some(100),
+                            step: 10,
+                        },
+                    },
+                    FrontendSetting {
+                        id: "route".into(),
+                        label: "Route".into(),
+                        description: "An advertised selection".into(),
+                        kind: FrontendSettingKind::Select {
+                            options: vec![FrontendSettingOption {
+                                value: "route-a".into(),
+                                label: "Route A".into(),
+                                description: "First route".into(),
+                            }],
+                            unset_label: Some("Inherit".into()),
+                        },
+                    },
+                ],
+            },
+            MiddlewareFeature {
+                id: "required".into(),
+                label: "Required".into(),
+                description: "Required capability".into(),
+                required: true,
+                settings: Vec::new(),
+            },
         ]
-        .into_iter()
-        .map(|(id, label, required)| MiddlewareFeature {
-            id: id.into(),
-            label: label.into(),
-            description: label.into(),
-            required,
-        })
-        .collect()
     }
 
-    fn model_choices() -> Vec<ModelChoice> {
-        [
-            (
-                "openai_socket::gpt-5.6-sol::medium",
-                "OpenAI · Sol",
-                "gpt-5.6-sol",
-                "medium",
-            ),
-            (
-                "openai_socket::gpt-5.6-sol::high",
-                "OpenAI · Sol",
-                "gpt-5.6-sol",
-                "high",
-            ),
-            ("kimi::kimi-k3::max", "Kimi · K3", "kimi-k3", "max"),
-        ]
-        .into_iter()
-        .map(|(route, group, model, effort)| ModelChoice {
-            route: route.into(),
-            group: group.into(),
-            model: model.into(),
-            reasoning_effort: Some(effort.into()),
-            context_window: Some(1_000_000),
-        })
-        .collect()
+    fn feature_row(state: &SetupState, id: &str) -> usize {
+        (0..state.middleware_row_count())
+            .find(|row| {
+                matches!(
+                    state.middleware_row(*row),
+                    Some(MiddlewareRow::Feature(index)) if state.features[index].id == id
+                )
+            })
+            .expect("feature row")
+    }
+
+    fn setting_row(state: &SetupState, feature_id: &str, setting_id: &str) -> usize {
+        (0..state.middleware_row_count())
+            .find(|row| {
+                matches!(
+                    state.middleware_row(*row),
+                    Some(MiddlewareRow::Setting { feature, setting })
+                        if state.features[feature].id == feature_id
+                            && state.features[feature].settings[setting].id == setting_id
+                )
+            })
+            .expect("setting row")
     }
 
     #[test]
@@ -2054,13 +2115,7 @@ mod tests {
         let mut original = AgentComposition::default();
         original.provider.provider = "responses".into();
         original.provider.base_url = providers[0].status.default_base_url.clone();
-        let mut state = SetupState::from_parts(
-            SetupMode::Login,
-            providers,
-            features(),
-            model_choices(),
-            original,
-        )
+        let mut state = SetupState::from_parts(SetupMode::Login, providers, features(), original)
         .expect("setup state");
 
         state.select_provider("kimi").expect("select Kimi");
@@ -2121,11 +2176,8 @@ mod tests {
         let mut state = state(SetupMode::Agent, "openai_socket", true);
         state.original.provider.web_search = HostedWebSearch::Live;
         state.original.system_prompt = "Keep this system prompt".into();
-        state.row = state
-            .features
-            .iter()
-            .position(|feature| feature.id == "skills")
-            .expect("skills feature");
+        state.middleware.set_enabled("plain", true);
+        state.row = feature_row(&state, "plain");
         state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         state.approval = APPROVALS
             .iter()
@@ -2144,33 +2196,47 @@ mod tests {
             .expect("agent composition");
 
         assert_eq!(configured.provider, original.provider);
-        assert!(!configured.middleware.enabled("skills"));
+        assert!(!configured.middleware.enabled("plain"));
         assert_eq!(configured.approval, ApprovalPolicy::AllowNetwork);
         assert_eq!(configured.system_prompt, "Keep this system prompt");
     }
 
     #[test]
-    fn agent_selects_an_exact_subagent_route_from_the_gateway_catalog() {
+    fn agent_edits_an_advertised_select_without_knowing_the_middleware() {
         let mut state = state(SetupMode::Agent, "openai_socket", true);
-        state.subagent_model = state
-            .distinct_subagent_models()
-            .iter()
-            .position(|choice| choice.model == "gpt-5.6-sol")
-            .map(|index| index + 1)
-            .expect("OpenAI model");
-        state.subagent_reasoning = state
-            .subagent_reasoning_choices()
-            .iter()
-            .position(|choice| choice.reasoning_effort.as_deref() == Some("high"))
-            .expect("high reasoning");
+        state.row = setting_row(&state, "configured", "route");
+
+        state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
 
         let configured = state
             .agent_composition(&state.original)
             .expect("agent composition");
 
         assert_eq!(
-            configured.middleware.subagents.model_route.as_deref(),
-            Some("openai_socket::gpt-5.6-sol::high")
+            configured.middleware.setting("configured", "route"),
+            Some(&FrontendSettingValue::String("route-a".into()))
+        );
+    }
+
+    #[test]
+    fn agent_edits_an_advertised_integer_without_knowing_the_middleware() {
+        let mut state = state(SetupMode::Agent, "openai_socket", true);
+        state.middleware.set_setting(
+            "configured",
+            "limit",
+            Some(FrontendSettingValue::Integer(50)),
+        );
+        state.row = setting_row(&state, "configured", "limit");
+
+        state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+
+        assert_eq!(
+            state
+                .agent_composition(&state.original)
+                .expect("agent composition")
+                .middleware
+                .setting("configured", "limit"),
+            Some(&FrontendSettingValue::Integer(60))
         );
     }
 
@@ -2188,21 +2254,17 @@ mod tests {
     #[test]
     fn required_features_are_visible_but_cannot_be_toggled() {
         let mut state = state(SetupMode::Agent, "openai_socket", true);
-        state.row = state
-            .features
-            .iter()
-            .position(|feature| feature.id == "sessions")
-            .expect("sessions feature");
+        state.row = feature_row(&state, "required");
 
         state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
 
-        assert!(!state.middleware.enabled("sessions"));
+        assert!(!state.middleware.enabled("required"));
         let mut lines = Vec::new();
         render_page(&mut lines, &state);
         assert!(
             lines
                 .iter()
-                .any(|line| line.to_string().contains("[x] Sessions"))
+                .any(|line| line.to_string().contains("[x] Required"))
         );
     }
 
@@ -2242,7 +2304,6 @@ mod tests {
                 SetupMode::Login,
                 validated_providers(&[status]).expect("provider manifest"),
                 features(),
-                model_choices(),
                 original,
             ) {
                 Ok(_) => panic!("invalid active provider state must fail"),

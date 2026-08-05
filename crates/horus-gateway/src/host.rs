@@ -1167,25 +1167,25 @@ impl HostState {
                 fatal: false,
             });
         }
+        let gateway = self
+            .gateway
+            .lock()
+            .map_err(|_| internal("gateway configuration lock is poisoned"))?
+            .clone();
+        let models =
+            configured_model_choices(&gateway, &self.store, &self.credentials).map_err(internal)?;
+        crate::middleware_manifest::validate_choices(&composition.middleware, &models)
+            .map_err(invalid_config)?;
         let next = self
             .spec
             .replacing_agent(
                 expected_revision,
                 composition,
                 self.store.state_dir(),
-                self.gateway
-                    .lock()
-                    .map_err(|_| internal("gateway configuration lock is poisoned"))?
-                    .tls
-                    .as_ref(),
+                gateway.tls.as_ref(),
             )
             .map_err(invalid_config)?;
         let session_id = self.running.session_id.clone();
-        let gateway = self
-            .gateway
-            .lock()
-            .map_err(|_| internal("gateway configuration lock is poisoned"))?
-            .clone();
         let replacement = start_agent(
             &gateway,
             &next,
@@ -1706,15 +1706,17 @@ async fn gateway_ready(state: &GatewayState) -> std::result::Result<ReadyPayload
         .lock()
         .map_err(|_| internal("gateway configuration lock is poisoned"))?
         .clone();
+    let models =
+        configured_model_choices(&config, &state.store, &state.credentials).map_err(internal)?;
+    let middleware_features = crate::middleware_manifest::features(&models);
     Ok(ReadyPayload {
         sessions: session_catalog(&state.checkpoints, &state.activities)
             .await
             .map_err(internal)?,
         providers: provider_statuses(&state.store, &state.credentials).map_err(internal)?,
-        models: configured_model_choices(&config, &state.store, &state.credentials)
-            .map_err(internal)?,
+        models,
         default_config: config.default_agent,
-        middleware_features: crate::middleware_manifest::features(),
+        middleware_features,
         max_active_sessions: MAX_ACTIVE_SESSIONS,
     })
 }

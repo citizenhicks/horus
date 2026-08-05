@@ -14,6 +14,7 @@ use horus::backend::model::{
 };
 use horus::backend::sandbox::{Sandbox, SandboxBackend};
 use horus::middleware::compaction::Compaction;
+use horus::middleware::context_offloading::ContextOffloading;
 use horus::middleware::cron::Cron;
 use horus::middleware::instructions::Instructions;
 use horus::middleware::sessions::Sessions;
@@ -74,14 +75,11 @@ pub(crate) async fn assemble(
     )?);
     let backend: Arc<dyn SandboxBackend> = gateway_sandbox.clone();
     let sandbox = Arc::new(Sandbox::new(backend, chat.agent.config.approval));
-    if let Some(route) = chat
-        .agent
-        .config
-        .middleware
-        .subagents
-        .model_route
-        .as_deref()
-    {
+    if let Some(route) = crate::middleware_manifest::string_setting(
+        &chat.agent.config.middleware,
+        "subagents",
+        "model_route",
+    )? {
         models.resolve_choice(route, None)?;
     }
     let (middleware, template) =
@@ -584,7 +582,11 @@ fn build_middleware(
             BuiltinMiddleware::Subagents => {
                 let template = Arc::new(OnceLock::<AgentConfig>::new());
                 let middleware = Subagents::new(4, 8, 32, subagent_launcher(&template))?;
-                let middleware = match settings.subagents.model_route.as_deref() {
+                let middleware = match crate::middleware_manifest::string_setting(
+                    settings,
+                    "subagents",
+                    "model_route",
+                )? {
                     Some(route) => middleware.default_model(route),
                     None => middleware,
                 };
@@ -592,6 +594,13 @@ fn build_middleware(
                 Arc::new(middleware)
             }
             BuiltinMiddleware::Steering => Arc::new(Steering::default()),
+            BuiltinMiddleware::ContextOffloading => Arc::new(ContextOffloading::new(
+                crate::middleware_manifest::integer_setting(
+                    settings,
+                    "context_offloading",
+                    "stale_after_tokens",
+                )?,
+            )?),
             BuiltinMiddleware::Compaction => Arc::new(Compaction::default()),
             BuiltinMiddleware::Sessions => Arc::new(Sessions::default()),
         };

@@ -23,33 +23,14 @@ struct AgentSettingsView: View {
                 Section("Capabilities") {
                     ForEach(model.middlewareFeatures, id: \.id) { feature in
                         capabilityToggle(feature)
+                        ForEach(feature.settings) { setting in
+                            middlewareSetting(feature, setting)
+                                .padding(.leading, 12)
+                                .disabled(!middlewareEnabled(feature))
+                        }
                     }
                 }
                 .toggleStyle(.switch)
-
-                if model.isSubagentsEnabledInDraft {
-                    Section("Subagents") {
-                        Picker("Default model", selection: subagentModel) {
-                            Text("Inherit parent").tag(String?.none)
-                            ForEach(model.subagentModelOptions) { option in
-                                Text(option.group).tag(Optional(option.id))
-                            }
-                        }
-                        .settingsPickerStyle()
-                        SettingsCaption("Used when a subagent does not choose a model.")
-
-                        if !model.subagentReasoningChoices.isEmpty {
-                            Picker("Reasoning", selection: subagentReasoning) {
-                                ForEach(model.subagentReasoningChoices) { choice in
-                                    Text(choice.reasoningEffort?.capitalized ?? "Provider default")
-                                        .tag(choice.route)
-                                }
-                            }
-                            .settingsPickerStyle()
-                            SettingsCaption("Attached to the default subagent model route.")
-                        }
-                    }
-                }
 
                 Section("Execution approval") {
                     Picker("Approval policy", selection: approvalPolicy) {
@@ -134,6 +115,52 @@ struct AgentSettingsView: View {
         .disabled(feature.required)
     }
 
+    @ViewBuilder
+    private func middlewareSetting(
+        _ feature: MiddlewareFeature,
+        _ setting: FrontendSetting
+    ) -> some View {
+        switch setting.kind {
+        case .integer(let minimum, let maximum, let step):
+            let value = integerSetting(
+                feature,
+                setting,
+                minimum: minimum,
+                maximum: maximum
+            )
+            let increment = Swift.max(Int(clamping: step), 1)
+            VStack(alignment: .leading, spacing: 3) {
+                if let maximum {
+                    Stepper(
+                        value: value,
+                        in: minimum...maximum,
+                        step: increment
+                    ) {
+                        Text("\(setting.label): \(value.wrappedValue.formatted())")
+                    }
+                } else {
+                    Stepper(value: value, step: increment) {
+                        Text("\(setting.label): \(value.wrappedValue.formatted())")
+                    }
+                }
+                SettingsCaption(setting.description)
+            }
+        case .select(let options, let unsetLabel):
+            VStack(alignment: .leading, spacing: 3) {
+                Picker(setting.label, selection: selectSetting(feature, setting)) {
+                    if let unsetLabel {
+                        Text(unsetLabel).tag(String?.none)
+                    }
+                    ForEach(options) { option in
+                        Text(option.label).tag(Optional(option.value))
+                    }
+                }
+                .settingsPickerStyle()
+                SettingsCaption(setting.description)
+            }
+        }
+    }
+
     private var systemPrompt: Binding<String> {
         Binding(
             get: { model.agentDraft?.systemPrompt ?? "" },
@@ -143,9 +170,7 @@ struct AgentSettingsView: View {
 
     private func middleware(_ feature: MiddlewareFeature) -> Binding<Bool> {
         Binding(
-            get: {
-                feature.required || (model.agentDraft?.middleware.enabled.contains(feature.id) ?? false)
-            },
+            get: { middlewareEnabled(feature) },
             set: { isEnabled in
                 guard !feature.required, var enabled = model.agentDraft?.middleware.enabled else { return }
                 if isEnabled { enabled.insert(feature.id) }
@@ -155,24 +180,62 @@ struct AgentSettingsView: View {
         )
     }
 
+    private func middlewareEnabled(_ feature: MiddlewareFeature) -> Bool {
+        feature.required || (model.agentDraft?.middleware.enabled.contains(feature.id) ?? false)
+    }
+
+    private func integerSetting(
+        _ feature: MiddlewareFeature,
+        _ setting: FrontendSetting,
+        minimum: Int64,
+        maximum: Int64?
+    ) -> Binding<Int64> {
+        Binding(
+            get: {
+                guard let configured = model.agentDraft?
+                    .middleware.settings[feature.id]?[setting.id],
+                    case .integer(let value) = configured
+                else { return minimum }
+                return value
+            },
+            set: { value in
+                let bounded = maximum.map { Swift.min(Swift.max(value, minimum), $0) }
+                    ?? Swift.max(value, minimum)
+                model.agentDraft?.middleware.setSetting(
+                    .integer(bounded),
+                    middleware: feature.id,
+                    setting: setting.id
+                )
+            }
+        )
+    }
+
+    private func selectSetting(
+        _ feature: MiddlewareFeature,
+        _ setting: FrontendSetting
+    ) -> Binding<String?> {
+        Binding(
+            get: {
+                guard let configured = model.agentDraft?
+                    .middleware.settings[feature.id]?[setting.id],
+                    case .string(let value) = configured
+                else { return nil }
+                return value
+            },
+            set: { value in
+                model.agentDraft?.middleware.setSetting(
+                    value.map(FrontendSettingValue.string),
+                    middleware: feature.id,
+                    setting: setting.id
+                )
+            }
+        )
+    }
+
     private var approvalPolicy: Binding<ApprovalPolicy> {
         Binding(
             get: { model.agentDraft?.approval ?? .on },
             set: { model.agentDraft?.approval = $0 }
-        )
-    }
-
-    private var subagentModel: Binding<String?> {
-        Binding(
-            get: { model.selectedSubagentModelOptionID },
-            set: { model.selectSubagentModelOption($0) }
-        )
-    }
-
-    private var subagentReasoning: Binding<String> {
-        Binding(
-            get: { model.agentDraft?.middleware.subagents.modelRoute ?? "" },
-            set: { model.selectSubagentReasoningRoute($0) }
         )
     }
 

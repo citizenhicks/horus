@@ -167,13 +167,6 @@ struct MiddlewareContributionCount: Identifiable, Equatable, Sendable {
     let value: Int
 }
 
-struct SubagentModelOption: Identifiable, Equatable, Sendable {
-    let group: String
-    let model: String
-
-    var id: String { "\(group)\u{0}\(model)" }
-}
-
 private enum ConfigurationTarget {
     case session
     case defaultAgent
@@ -370,56 +363,6 @@ final class AppModel {
             || applyState == .restarting
     }
 
-    var isSubagentsEnabledInDraft: Bool {
-        guard let feature = middlewareFeatures.first(where: { $0.id == "subagents" }) else {
-            return false
-        }
-        return feature.required
-            || (agentDraft?.middleware.enabled.contains(feature.id) ?? false)
-    }
-
-    var subagentModelOptions: [SubagentModelOption] {
-        var seen: Set<String> = []
-        return modelChoices.compactMap { choice in
-            let option = SubagentModelOption(group: choice.group, model: choice.model)
-            return seen.insert(option.id).inserted ? option : nil
-        }
-    }
-
-    var selectedSubagentModelOptionID: String? {
-        guard let route = agentDraft?.middleware.subagents.modelRoute,
-              let choice = modelChoices.first(where: { $0.route == route })
-        else { return nil }
-        return SubagentModelOption(group: choice.group, model: choice.model).id
-    }
-
-    var subagentReasoningChoices: [ModelChoice] {
-        guard let route = agentDraft?.middleware.subagents.modelRoute,
-              let selected = modelChoices.first(where: { $0.route == route })
-        else { return [] }
-        return modelChoices.filter {
-            $0.group == selected.group && $0.model == selected.model
-        }
-    }
-
-    func selectSubagentModelOption(_ optionID: String?) {
-        guard let optionID else {
-            agentDraft?.middleware.subagents.modelRoute = nil
-            return
-        }
-        guard let option = subagentModelOptions.first(where: { $0.id == optionID }),
-              let choice = modelChoices.first(where: {
-                  $0.group == option.group && $0.model == option.model
-              })
-        else { return }
-        agentDraft?.middleware.subagents.modelRoute = choice.route
-    }
-
-    func selectSubagentReasoningRoute(_ route: String) {
-        guard subagentReasoningChoices.contains(where: { $0.route == route }) else { return }
-        agentDraft?.middleware.subagents.modelRoute = route
-    }
-
     var contextFillFraction: Double {
         guard let modelContextWindow, modelContextWindow > 0 else { return 0 }
         return min(max(Double(contextTokens) / Double(modelContextWindow), 0), 1)
@@ -470,14 +413,6 @@ final class AppModel {
             contribution.commands.map {
                 MountedCommand(capability: contribution.capability, command: $0)
             }
-        }
-    }
-
-    /// Backs the fork action under a message, when the gateway mounts the sessions capability.
-    var forkCommand: MountedCommand? {
-        guard canOpenSession else { return nil }
-        return capabilityCommands.first {
-            $0.command.name == "fork" && $0.command.arguments.isEmpty
         }
     }
 
