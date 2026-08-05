@@ -814,7 +814,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "horus"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "base64",
  "cap-std",
@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "horus-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "diffy",
  "horus",
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "horus-gateway"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "croner",

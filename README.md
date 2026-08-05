@@ -66,7 +66,7 @@ Horus requires Rust 1.89 or newer.
 
 ```toml
 [dependencies]
-horus = "0.3"
+horus = "0.4"
 ```
 
 The caller owns composition:

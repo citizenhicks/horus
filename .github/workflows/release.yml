@@ -96,8 +96,8 @@ jobs:
             .dependencies[] | select(.name == "horus") | .req | ltrimstr("=")' <<<"$metadata")"
           gateway_version="$(jq -r '.packages[] | select(.name == "horus-cli") |
             .dependencies[] | select(.name == "horus-gateway") | .req | ltrimstr("=")' <<<"$metadata")"
-          cargo info "horus@$horus_version" >/dev/null
-          cargo info "horus-gateway@$gateway_version" >/dev/null
+          cargo info --registry crates-io "horus@$horus_version" >/dev/null
+          cargo info --registry crates-io "horus-gateway@$gateway_version" >/dev/null
       - name: Publish
         run: cargo publish --locked -p horus-cli
         env:
@@ -125,7 +125,7 @@ jobs:
           horus_version="$(cargo metadata --no-deps --format-version 1 |
             jq -r '.packages[] | select(.name == "horus-gateway") |
               .dependencies[] | select(.name == "horus") | .req | ltrimstr("=")')"
-          cargo info "horus@$horus_version" >/dev/null
+          cargo info --registry crates-io "horus@$horus_version" >/dev/null
       - name: Publish
         run: cargo publish --locked -p horus-gateway
         env:
