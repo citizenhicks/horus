@@ -102,6 +102,7 @@ final class TranscriptEntry: Identifiable {
     var format: String
     var tone: String
     var pending: Bool
+    var messageTarget: MessageTarget?
 
     init(
         id: String,
@@ -110,7 +111,8 @@ final class TranscriptEntry: Identifiable {
         group: String? = nil,
         format: String,
         tone: String = "neutral",
-        pending: Bool
+        pending: Bool,
+        messageTarget: MessageTarget? = nil
     ) {
         self.id = id
         self.text = text
@@ -119,6 +121,7 @@ final class TranscriptEntry: Identifiable {
         self.format = format
         self.tone = tone
         self.pending = pending
+        self.messageTarget = messageTarget
     }
 }
 
@@ -777,6 +780,25 @@ final class AppModel {
         guard let sessionID = selectedSessionID, let action = mounted.widget.action else { return }
         let id = requestID("widget")
         transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: action)))
+    }
+
+    func submitMessageAction(_ mounted: MountedWidget, target: MessageTarget) {
+        guard let sessionID = selectedSessionID, let action = mounted.widget.action else { return }
+        let submittedAction = switch action {
+        case .capabilityCommand(let capability, let command, let arguments, _):
+            AgentOperation.capabilityCommand(
+                capability: capability,
+                command: command,
+                arguments: arguments,
+                target: target
+            )
+        default:
+            action
+        }
+        transmit(.submit(
+            sessionID: sessionID,
+            submission: Submission(id: requestID("widget"), op: submittedAction)
+        ))
     }
 
     func submitPickerOption(_ option: FrontendPickerOption) {
@@ -1605,7 +1627,11 @@ final class AppModel {
                 )
             }
         case "user_message":
-            appendText(event.msg["message"]?.stringValue, kind: .user)
+            appendText(
+                event.msg["message"]?.stringValue,
+                kind: .user,
+                messageTarget: messageTarget(from: event.msg)
+            )
         case "agent_message_content_delta":
             let phase = event.msg["phase"]?.stringValue
             guard let itemID = event.msg["itemId"]?.stringValue else { return }
@@ -1627,7 +1653,11 @@ final class AppModel {
             if wasRendered {
                 transcript.removeAll { $0.pending && $0.kind == kind }
             } else {
-                completeStream(text: event.msg["message"]?.stringValue ?? "", kind: kind)
+                completeStream(
+                    text: event.msg["message"]?.stringValue ?? "",
+                    kind: kind,
+                    messageTarget: messageTarget(from: event.msg)
+                )
             }
         case "task_started":
             activeTurnID = event.msg["turnId"]?.stringValue
@@ -1863,7 +1893,8 @@ final class AppModel {
     private func appendText(
         _ text: String?,
         kind: TranscriptEntry.Kind,
-        tone: String = "neutral"
+        tone: String = "neutral",
+        messageTarget: MessageTarget? = nil
     ) {
         guard let text, !text.isEmpty else { return }
         transcript.append(TranscriptEntry(
@@ -1872,7 +1903,8 @@ final class AppModel {
             kind: kind,
             format: "plain_text",
             tone: tone,
-            pending: false
+            pending: false,
+            messageTarget: messageTarget
         ))
     }
 
@@ -1892,13 +1924,22 @@ final class AppModel {
         }
     }
 
-    private func completeStream(text: String, kind: TranscriptEntry.Kind) {
+    private func completeStream(
+        text: String,
+        kind: TranscriptEntry.Kind,
+        messageTarget: MessageTarget?
+    ) {
         if let index = transcript.lastIndex(where: { $0.pending && $0.kind == kind }) {
             transcript[index].text = text
             transcript[index].pending = false
+            transcript[index].messageTarget = messageTarget
         } else {
-            appendText(text, kind: kind)
+            appendText(text, kind: kind, messageTarget: messageTarget)
         }
+    }
+
+    private func messageTarget(from event: JSONValue) -> MessageTarget? {
+        event["messageTarget"].flatMap { MessageTarget(json: $0) }
     }
 
     private func finishPendingTranscriptEntries() {

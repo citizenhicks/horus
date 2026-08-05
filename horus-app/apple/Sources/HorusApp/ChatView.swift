@@ -178,8 +178,10 @@ private struct TranscriptView: View {
         .onChange(of: scrollToBottomRequest) {
             withAnimation(.easeOut(duration: 0.2)) { position.scrollTo(edge: .bottom) }
         }
+        // Streaming deltas land several times per frame, which is more often than `onChange` may
+        // fire. Growing content is what `defaultScrollAnchor(.bottom, for: .sizeChanges)` follows,
+        // so only a new row needs an explicit scroll.
         .onChange(of: model.transcript.count) { followTranscript() }
-        .onChange(of: model.transcript.last?.text) { followTranscript() }
         .task(id: model.selectedSessionID) { await openAtLatest() }
     }
 
@@ -429,14 +431,16 @@ private struct TranscriptRow: View {
             MessageActionButton(title: "Copy", systemImage: "doc.on.doc") {
                 copyToPasteboard(entry.text)
             }
-            ForEach(model.messageActionWidgets) { widget in
-                MessageActionButton(
-                    title: widget.widget.text,
-                    systemImage: messageActionSystemImage(widget)
-                ) {
-                    model.submitWidget(widget)
+            if let target = entry.messageTarget {
+                ForEach(model.messageActionWidgets) { widget in
+                    MessageActionButton(
+                        title: widget.widget.text,
+                        systemImage: messageActionSystemImage(widget)
+                    ) {
+                        model.submitMessageAction(widget, target: target)
+                    }
+                    .disabled(!model.canOpenSession)
                 }
-                .disabled(!model.canOpenSession)
             }
         }
     }
@@ -445,11 +449,13 @@ private struct TranscriptRow: View {
     private var transcriptActions: some View {
         if hasMessageActions {
             Button("Copy", systemImage: "doc.on.doc") { copyToPasteboard(entry.text) }
-            ForEach(model.messageActionWidgets) { widget in
-                Button(widget.widget.text, systemImage: messageActionSystemImage(widget)) {
-                    model.submitWidget(widget)
+            if let target = entry.messageTarget {
+                ForEach(model.messageActionWidgets) { widget in
+                    Button(widget.widget.text, systemImage: messageActionSystemImage(widget)) {
+                        model.submitMessageAction(widget, target: target)
+                    }
+                    .disabled(!model.canOpenSession)
                 }
-                .disabled(!model.canOpenSession)
             }
         }
     }
@@ -491,15 +497,21 @@ private struct MessageActionButton: View {
     let action: () -> Void
 
     var body: some View {
-        Button(title, systemImage: systemImage, action: action)
-        .labelStyle(.iconOnly)
-        .buttonStyle(.borderless)
-        .font(HorusStyle.badgeFont)
-        .foregroundStyle(isHovered ? palette.accent : palette.muted)
-        .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
-        .contentShape(Rectangle())
+        // Secondary actions, so a smaller glyph in a smaller box than a standalone icon button:
+        // the box is what spaces these apart, and the context menu carries the same actions.
+        Button(action: action) {
+            HorusIcon(
+                systemName: systemImage,
+                size: 13,
+                foreground: isHovered ? palette.accent : palette.muted
+            )
+            .frame(width: 26, height: 26)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
         .onHover { isHovered = $0 }
         .animation(.easeOut(duration: 0.12), value: isHovered)
+        .accessibilityLabel(title)
         .help(title)
     }
 }
@@ -999,7 +1011,13 @@ private struct ComposerOptionsView: View {
             Button("Send", systemImage: "arrow.up") { model.sendMessage() }
                 .labelStyle(.iconOnly)
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
-                .disabled(!model.connectionState.isReady || !hasComposerText)
+                // `sendMessage()` also needs a session: a gateway with no chats left the button
+                // enabled and the tap silent.
+                .disabled(
+                    !model.connectionState.isReady
+                        || !hasComposerText
+                        || model.selectedSessionID == nil
+                )
                 .help(model.activeTurnID == nil ? "Send" : "Send steering message")
         }
     }
@@ -1211,8 +1229,22 @@ private struct FrontendPickerView: View {
     var body: some View {
         HorusCard {
             VStack(alignment: .leading, spacing: 11) {
-                Text(picker.title)
-                    .font(.headline)
+                HStack {
+                    Text(picker.title)
+                        .font(.headline)
+                    Spacer(minLength: 8)
+                    Button { model.pendingPicker = nil } label: {
+                        HorusIcon(systemName: "xmark", size: 14, foreground: palette.muted)
+                            .frame(
+                                width: HorusStyle.iconButtonSize,
+                                height: HorusStyle.iconButtonSize
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss \(picker.title)")
+                    .help("Dismiss")
+                }
                 ForEach(picker.options) { option in
                     Button { model.submitPickerOption(option) } label: {
                         HStack(alignment: .firstTextBaseline, spacing: 12) {

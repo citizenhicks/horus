@@ -329,6 +329,9 @@ struct HorusIconButtonStyle: ButtonStyle {
                 .font(HorusStyle.controlFont)
                 .foregroundStyle(prominent ? palette.onAccent : .primary)
                 .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                // A glass effect adds no hit area, so without this the tap target is the
+                // 16pt glyph, not the 44pt circle: unusable by touch, fine with a cursor.
+                .contentShape(Circle())
                 .horusGlass(in: Circle(), interactive: true, prominent: prominent)
                 .opacity(isPressed ? 0.72 : 1)
         }
@@ -350,13 +353,17 @@ extension View {
     func horusProminentButton() -> some View { modifier(HorusProminentButton()) }
 
     /// Lets a row of badges scroll instead of squeezing when it outgrows the width.
+    /// A centred scroll anchor re-resolves a frame late, so a row that changes width mid-turn
+    /// visibly snaps from leading to centre. Only reach for the scroll view when it overflows.
     func scrollableRow() -> some View {
-        ScrollView(.horizontal) {
-            fixedSize(horizontal: true, vertical: false)
+        ViewThatFits(in: .horizontal) {
+            frame(maxWidth: .infinity)
+            ScrollView(.horizontal) {
+                fixedSize(horizontal: true, vertical: false)
+            }
+            .scrollIndicators(.hidden)
+            .scrollBounceBehavior(.basedOnSize)
         }
-        .defaultScrollAnchor(.center, for: .alignment)
-        .scrollIndicators(.hidden)
-        .scrollBounceBehavior(.basedOnSize)
     }
 
     func horusGlass<S: Shape>(

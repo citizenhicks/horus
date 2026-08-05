@@ -341,7 +341,8 @@ final class AppModelTests: XCTestCase {
                 "type": .string("capability_command"),
                 "capability": .string("subagents"),
                 "command": .string("subagents"),
-                "arguments": .string("reviewer")
+                "arguments": .string("reviewer"),
+                "target": .null
             ])
         ])))
         try await Task.sleep(for: .milliseconds(20))
@@ -396,7 +397,8 @@ final class AppModelTests: XCTestCase {
                         "type": .string("capability_command"),
                         "capability": .string("reviewer"),
                         "command": .string("accept"),
-                        "arguments": .string("")
+                        "arguments": .string(""),
+                        "target": .null
                     ])
                 ])])
             ])),
@@ -465,7 +467,8 @@ final class AppModelTests: XCTestCase {
                     action: .capabilityCommand(
                         capability: "sessions",
                         command: "fork",
-                        arguments: ""
+                        arguments: "",
+                        target: nil
                     )
                 )
             ],
@@ -496,6 +499,69 @@ final class AppModelTests: XCTestCase {
         let suggestions = try XCTUnwrap(model.referenceSuggestions(in: text, cursor: text.endIndex))
         XCTAssertEqual(String(text[suggestions.range]), "$plan")
         XCTAssertEqual(suggestions.matches.first?.replacement, "$planning")
+    }
+
+    func testMessageActionSubmitsTheClickedHistoryTarget() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.selectedSessionID = "chat-1"
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("session_history"),
+                "events": .array([])
+            ])),
+            blocks: [],
+            history: [RenderedEventRecord(event: .object([
+                "type": .string("user_message"),
+                "message": .string("Fork here"),
+                "messageTarget": .object([
+                    "checkpointSequence": .number(12),
+                    "batchItemCount": .number(3)
+                ])
+            ]), blocks: [])],
+            preview: nil
+        )
+        let target = try XCTUnwrap(model.transcript.first?.messageTarget)
+        let widget = MountedWidget(
+            capability: "sessions",
+            widget: FrontendWidget(
+                id: "fork",
+                slot: "message_actions",
+                text: "Fork chat",
+                tone: "neutral",
+                symbol: "arrow.triangle.branch",
+                iconOnly: true,
+                progress: nil,
+                content: nil,
+                action: .capabilityCommand(
+                    capability: "sessions",
+                    command: "fork",
+                    arguments: "",
+                    target: nil
+                )
+            )
+        )
+
+        model.submitMessageAction(widget, target: target)
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        guard case .submit(let sessionID, let submission) = try XCTUnwrap(requests.first),
+              case .capabilityCommand(
+                  let capability,
+                  let command,
+                  let arguments,
+                  let submittedTarget
+              ) = submission.op
+        else { return XCTFail("Expected a targeted capability command") }
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(capability, "sessions")
+        XCTAssertEqual(command, "fork")
+        XCTAssertEqual(arguments, "")
+        XCTAssertEqual(submittedTarget, MessageTarget(checkpointSequence: 12, batchItemCount: 3))
     }
 
     func testWebSearchAbortAndLiveUsageMatchCLI() throws {

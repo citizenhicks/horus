@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 7
+let gatewayProtocolVersion = 8
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 
@@ -189,12 +189,39 @@ struct Submission: Encodable, Sendable {
     let op: AgentOperation
 }
 
+struct MessageTarget: Codable, Hashable, Sendable {
+    let checkpointSequence: UInt64
+    let batchItemCount: Int
+
+    init(checkpointSequence: UInt64, batchItemCount: Int) {
+        self.checkpointSequence = checkpointSequence
+        self.batchItemCount = batchItemCount
+    }
+
+    init?(json: JSONValue) {
+        guard let sequenceValue = json["checkpointSequence"],
+              case .number(let sequence) = sequenceValue,
+              let checkpointSequence = UInt64(exactly: sequence),
+              let countValue = json["batchItemCount"],
+              case .number(let count) = countValue,
+              let batchItemCount = Int(exactly: count),
+              batchItemCount > 0
+        else { return nil }
+        self.init(checkpointSequence: checkpointSequence, batchItemCount: batchItemCount)
+    }
+}
+
 enum AgentOperation: Codable, Sendable {
     case userInput(text: String)
     case activeInput(operation: String, turnID: String, text: String)
     case interrupt(turnID: String)
     case execApproval(id: String, decision: ReviewDecision)
-    case capabilityCommand(capability: String, command: String, arguments: String)
+    case capabilityCommand(
+        capability: String,
+        command: String,
+        arguments: String,
+        target: MessageTarget?
+    )
     case setModel(route: String)
     case resumeSession(sessionID: String)
 
@@ -232,10 +259,23 @@ enum AgentOperation: Codable, Sendable {
                 decision: try ReviewDecision(json: decision)
             )
         case "capability_command":
+            guard let value = value["target"] else {
+                throw GatewayWireError.invalidFrame("capability_command has no target")
+            }
+            let target: MessageTarget?
+            if value != .null {
+                guard let decoded = MessageTarget(json: value) else {
+                    throw GatewayWireError.invalidFrame("capability_command has invalid target")
+                }
+                target = decoded
+            } else {
+                target = nil
+            }
             self = .capabilityCommand(
                 capability: try required("capability"),
                 command: try required("command"),
-                arguments: try required("arguments")
+                arguments: try required("arguments"),
+                target: target
             )
         case "set_model":
             self = .setModel(route: try required("route"))
@@ -264,11 +304,12 @@ enum AgentOperation: Codable, Sendable {
             try container.encode("exec_approval", forKey: "type")
             try container.encode(id, forKey: "id")
             try container.encode(decision, forKey: "decision")
-        case .capabilityCommand(let capability, let command, let arguments):
+        case .capabilityCommand(let capability, let command, let arguments, let target):
             try container.encode("capability_command", forKey: "type")
             try container.encode(capability, forKey: "capability")
             try container.encode(command, forKey: "command")
             try container.encode(arguments, forKey: "arguments")
+            try container.encode(target, forKey: "target")
         case .setModel(let route):
             try container.encode("set_model", forKey: "type")
             try container.encode(route, forKey: "route")
@@ -1174,6 +1215,14 @@ extension AgentEventRecord {
             }
         }
 
+        func validateMessageTarget() throws {
+            guard let value = msg["messageTarget"],
+                  value == .null || MessageTarget(json: value) != nil
+            else {
+                throw GatewayWireError.invalidFrame("\(type) has invalid message target")
+            }
+        }
+
         func validateUsage(_ value: JSONValue) throws {
             guard value.objectValue != nil else {
                 throw GatewayWireError.invalidFrame("\(type) has invalid token usage")
@@ -1187,8 +1236,11 @@ extension AgentEventRecord {
         }
 
         switch type {
-        case "error", "warning", "user_message":
+        case "error", "warning":
             try requireString("message")
+        case "user_message":
+            try requireString("message")
+            try validateMessageTarget()
         case "session_configured":
             try requireString("sessionId")
             guard let context = msg["context"], let model = msg["model"] else {
@@ -1208,6 +1260,7 @@ extension AgentEventRecord {
         case "agent_message":
             try requireString("message")
             try validatePhase()
+            try validateMessageTarget()
         case "agent_message_content_delta":
             for key in ["threadId", "turnId", "itemId", "delta"] { try requireString(key) }
             try validatePhase()

@@ -71,8 +71,10 @@ struct AppShell: View {
                 "\(toast.tone.title): \(toast.message)"
             ).post()
         }
+        // Only a backgrounded scene loses its socket. `.inactive` covers a window losing focus
+        // or a notification banner, and reconnecting on those drops a healthy session.
         .onChange(of: scenePhase) { _, newPhase in
-            model.setSceneActive(newPhase == .active)
+            model.setSceneActive(newPhase != .background)
         }
         .task { model.start() }
     }
