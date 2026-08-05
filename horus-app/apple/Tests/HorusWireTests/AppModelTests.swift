@@ -398,27 +398,40 @@ final class AppModelTests: XCTestCase {
         })
     }
 
-    func testContributionCatalogReferencesAndHeaderWidgetsAreGeneric() throws {
+    func testContributionCatalogReferencesAndWidgetsAreGeneric() throws {
         let model = try model()
         model.contributions = [FrontendContribution(
             capability: "tasks",
             count: 3,
-            commands: [FrontendCommand(
-                name: "tasks",
-                arguments: "[filter]",
-                description: "List tasks"
-            )],
-            widgets: [FrontendWidget(
-                id: "count",
-                slot: "header",
-                text: "3 tasks",
-                tone: "success",
-                symbol: nil,
-                iconOnly: false,
-                progress: nil,
-                content: nil,
-                action: nil
-            )],
+            commands: [],
+            widgets: [
+                FrontendWidget(
+                    id: "count",
+                    slot: "header",
+                    text: "3 tasks",
+                    tone: "success",
+                    symbol: nil,
+                    iconOnly: false,
+                    progress: nil,
+                    content: nil,
+                    action: nil
+                ),
+                FrontendWidget(
+                    id: "fork",
+                    slot: "message_actions",
+                    text: "Fork chat",
+                    tone: "neutral",
+                    symbol: "fork",
+                    iconOnly: true,
+                    progress: nil,
+                    content: nil,
+                    action: .capabilityCommand(
+                        capability: "sessions",
+                        command: "fork",
+                        arguments: ""
+                    )
+                )
+            ],
             references: [FrontendReference(trigger: "$", value: "planning", description: "Planning skill")],
             activeInput: nil
         )]
@@ -435,8 +448,8 @@ final class AppModelTests: XCTestCase {
             }
         }
 
-        XCTAssertEqual(model.capabilityCommands.first?.command.name, "tasks")
         XCTAssertEqual(model.headerWidgets.first?.widget.text, "3 tasks")
+        XCTAssertEqual(model.messageActionWidgets.first?.widget.text, "Fork chat")
         XCTAssertEqual(model.middlewareContributionCounts, [MiddlewareContributionCount(
             id: "tasks",
             label: "Work items",

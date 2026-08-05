@@ -63,7 +63,6 @@ struct ChatView: View {
 
 private struct ChatOptionsMenu: View {
     @Environment(AppModel.self) private var model
-    @State private var pendingCommand: MountedCommand?
 
     var body: some View {
         Menu {
@@ -112,20 +111,6 @@ private struct ChatOptionsMenu: View {
                 }
                 .disabled(!model.canCreateSession)
             }
-            if !model.capabilityCommands.isEmpty {
-                Section("Commands") {
-                    ForEach(model.capabilityCommands) { mounted in
-                        Button("/\(mounted.command.name)") {
-                            if mounted.command.arguments.isEmpty {
-                                model.submitCommand(mounted, arguments: "")
-                            } else {
-                                pendingCommand = mounted
-                            }
-                        }
-                        .disabled(!model.canOpenSession)
-                    }
-                }
-            }
         } label: {
             Image(systemName: "ellipsis")
         }
@@ -134,49 +119,6 @@ private struct ChatOptionsMenu: View {
         .accessibilityLabel("Chat options")
         .tint(.primary)
         .help("Chat options")
-        .sheet(item: $pendingCommand) { mounted in
-            CapabilityCommandSheet(mounted: mounted)
-        }
-    }
-}
-
-private struct CapabilityCommandSheet: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
-    @State private var arguments = ""
-    let mounted: MountedCommand
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                if !mounted.command.description.isEmpty {
-                    Text(mounted.command.description)
-                }
-                TextField(mounted.command.arguments, text: $arguments, axis: .vertical)
-                    .lineLimit(1 ... 6)
-                    .accessibilityLabel("Command arguments")
-            }
-            .navigationTitle("/\(mounted.command.name)")
-            #if os(iOS)
-            .toolbarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Run") {
-                        model.submitCommand(
-                            mounted,
-                            arguments: arguments.trimmingCharacters(in: .whitespacesAndNewlines)
-                        )
-                        dismiss()
-                    }
-                    .disabled(!model.canOpenSession)
-                }
-            }
-        }
-        .presentationDetents([.medium])
     }
 }
 
@@ -482,10 +424,20 @@ private struct TranscriptRow: View {
         }
     }
 
-    @ViewBuilder
     private var controls: some View {
-        MessageActionButton(title: "Copy", systemImage: "doc.on.doc") {
-            copyToPasteboard(entry.text)
+        HStack(spacing: 0) {
+            MessageActionButton(title: "Copy", systemImage: "doc.on.doc") {
+                copyToPasteboard(entry.text)
+            }
+            ForEach(model.messageActionWidgets) { widget in
+                MessageActionButton(
+                    title: widget.widget.text,
+                    systemImage: messageActionSystemImage(widget)
+                ) {
+                    model.submitWidget(widget)
+                }
+                .disabled(!model.canOpenSession)
+            }
         }
     }
 
@@ -493,7 +445,17 @@ private struct TranscriptRow: View {
     private var transcriptActions: some View {
         if hasMessageActions {
             Button("Copy", systemImage: "doc.on.doc") { copyToPasteboard(entry.text) }
+            ForEach(model.messageActionWidgets) { widget in
+                Button(widget.widget.text, systemImage: messageActionSystemImage(widget)) {
+                    model.submitWidget(widget)
+                }
+                .disabled(!model.canOpenSession)
+            }
         }
+    }
+
+    private func messageActionSystemImage(_ widget: MountedWidget) -> String {
+        widget.widget.symbol.map { HorusSymbol.systemName(for: $0) } ?? "ellipsis"
     }
 
     private var hasMessageActions: Bool {

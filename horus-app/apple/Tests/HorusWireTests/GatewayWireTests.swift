@@ -477,6 +477,21 @@ final class GatewayWireTests: XCTestCase {
         ))
     }
 
+    func testMessageActionWidgetSlotIsAccepted() throws {
+        let payload = sessionReadyPayloadJSON.replacingOccurrences(
+            of: #""slot":"composer_footer""#,
+            with: #""slot":"message_actions""#
+        )
+        let envelope = try decodeEnvelope(
+            #"{"version":7,"type":"session_opened","request_id":"open-1","payload":\#(payload)}"#
+        )
+        guard case .sessionOpened(_, let ready) = envelope else {
+            return XCTFail("Expected session opened envelope")
+        }
+
+        XCTAssertEqual(ready.contributions.first?.widgets.first?.slot, "message_actions")
+    }
+
     func testMalformedKnownAgentEventIsRejected() {
         let fixtures = [
             #"{"version":7,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"turn_aborted","turn_id":"turn-1"}},"blocks":[]}"#,

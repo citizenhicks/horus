@@ -17,7 +17,9 @@ use crate::protocol::FrontendCommand;
 use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendEvent;
 use crate::protocol::FrontendPickerOption;
+use crate::protocol::FrontendSlot;
 use crate::protocol::FrontendTone;
+use crate::protocol::FrontendWidget;
 use crate::protocol::Op;
 
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -68,7 +70,21 @@ impl Middleware for Sessions {
                     description: "create a resumable branch from this chat".into(),
                 },
             ],
-            widgets: Vec::new(),
+            widgets: vec![FrontendWidget {
+                id: "fork".into(),
+                slot: FrontendSlot::MessageActions,
+                text: "Fork chat".into(),
+                tone: FrontendTone::Neutral,
+                symbol: Some("fork".into()),
+                icon_only: true,
+                progress: None,
+                content: None,
+                action: Some(Op::CapabilityCommand {
+                    capability: "sessions".into(),
+                    command: "fork".into(),
+                    arguments: String::new(),
+                }),
+            }],
             references: Vec::new(),
             active_input: None,
         }
@@ -287,6 +303,24 @@ mod tests {
     #[test]
     fn sessions_rejects_zero_page_size() {
         assert!(Sessions::new(0).is_err());
+    }
+
+    #[test]
+    fn fork_is_exposed_as_a_generic_message_action() {
+        let contribution = Sessions::default().frontend();
+        let widget = contribution.widgets.first().expect("fork widget");
+
+        assert_eq!(widget.slot, FrontendSlot::MessageActions);
+        assert_eq!(widget.text, "Fork chat");
+        assert_eq!(widget.symbol.as_deref(), Some("fork"));
+        assert_eq!(
+            widget.action,
+            Some(Op::CapabilityCommand {
+                capability: "sessions".into(),
+                command: "fork".into(),
+                arguments: String::new(),
+            })
+        );
     }
 
     #[test]

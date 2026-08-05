@@ -864,7 +864,7 @@ extension FrontendWidget {
         else {
             throw GatewayWireError.invalidFrame("frontend widget is missing a required field")
         }
-        guard ["header", "composer_header", "composer_footer"].contains(slot),
+        guard ["header", "composer_header", "composer_footer", "message_actions"].contains(slot),
               ["neutral", "success", "warning", "error"].contains(tone)
         else {
             throw GatewayWireError.invalidFrame("frontend widget has an unknown slot or tone")

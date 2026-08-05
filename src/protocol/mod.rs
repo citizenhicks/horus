@@ -335,6 +335,7 @@ pub enum FrontendSlot {
     Header,
     ComposerHeader,
     ComposerFooter,
+    MessageActions,
 }
 
 /// Capability-rendered transcript content with frontend-neutral formatting and tone.

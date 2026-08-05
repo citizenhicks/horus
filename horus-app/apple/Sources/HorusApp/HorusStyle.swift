@@ -137,6 +137,7 @@ enum HorusSymbol {
         switch semanticName {
         case "brain": "brain.head.profile"
         case "chat-circle": "text.bubble"
+        case "fork": "arrow.trianglehead.branch"
         case "hard-drives": "externaldrive.connected.to.line.below"
         case "magnifying-glass": "magnifyingglass"
         case "moon": "moon"

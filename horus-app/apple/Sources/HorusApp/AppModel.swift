@@ -146,13 +146,6 @@ struct MountedWidget: Identifiable, Sendable {
     var id: String { "\(capability)\u{0}\(widget.id)" }
 }
 
-struct MountedCommand: Identifiable, Sendable {
-    let capability: String
-    let command: FrontendCommand
-
-    var id: String { "\(capability)\u{0}\(command.name)" }
-}
-
 struct MountedReference: Identifiable, Sendable {
     let capability: String
     let reference: FrontendReference
@@ -408,14 +401,6 @@ final class AppModel {
         }
     }
 
-    var capabilityCommands: [MountedCommand] {
-        contributions.flatMap { contribution in
-            contribution.commands.map {
-                MountedCommand(capability: contribution.capability, command: $0)
-            }
-        }
-    }
-
     var capabilityReferences: [MountedReference] {
         contributions.flatMap { contribution in
             contribution.references.map {
@@ -455,6 +440,9 @@ final class AppModel {
     var headerWidgets: [MountedWidget] { widgets(in: "header") }
     var composerHeaderWidgets: [MountedWidget] { widgets(in: "composer_header") }
     var composerFooterWidgets: [MountedWidget] { widgets(in: "composer_footer") }
+    var messageActionWidgets: [MountedWidget] {
+        widgets(in: "message_actions").filter { $0.widget.action != nil }
+    }
 
     func referenceSuggestions(in text: String, cursor: String.Index) -> ReferenceSuggestions? {
         guard text.indices.contains(cursor) || cursor == text.endIndex else { return nil }
@@ -820,21 +808,6 @@ final class AppModel {
         } else {
             showInspector()
         }
-    }
-
-    func submitCommand(_ mounted: MountedCommand, arguments: String) {
-        guard canOpenSession, let sessionID = selectedSessionID else { return }
-        transmit(.submit(
-            sessionID: sessionID,
-            submission: Submission(
-                id: requestID("command"),
-                op: .capabilityCommand(
-                    capability: mounted.capability,
-                    command: mounted.command.name,
-                    arguments: arguments
-                )
-            )
-        ))
     }
 
     func changeAgentForCurrentChat() {
