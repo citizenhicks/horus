@@ -1,6 +1,9 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
+use horus_cli::gateway_accounts::GatewayAccounts;
+use horus_gateway::client::Endpoint;
+
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -12,7 +15,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         Some(FrontendCommand::Provider(state_dir)) => {
             horus_cli::frontend::run_gateway_provider(state_dir).await?
         }
-        None => horus_gateway::command::run(arguments).await?,
+        None => horus_gateway::command::run(arguments, save_local_client).await?,
     }
     Ok(())
 }
@@ -61,13 +64,39 @@ async fn initialize_cloudflare(state_dir: PathBuf) -> horus_gateway::Result<()> 
     let Some(setup) = horus_cli::frontend::run_cloudflare_setup().await? else {
         return Ok(());
     };
-    horus_gateway::command::initialize_cloudflare(state_dir.clone(), setup.hostname, setup.token)?;
-    horus_gateway::command::run(vec![
-        "connect".into(),
-        "--state-dir".into(),
-        state_dir.into_os_string(),
-    ])
+    if state_dir.try_exists()? {
+        if !horus_cli::frontend::confirm_gateway_reinitialize(&state_dir).await? {
+            return Ok(());
+        }
+        horus_gateway::command::reset_gateway_state(state_dir.clone())?;
+    }
+    match setup {
+        horus_cli::frontend::CloudflareInit::Quick => {
+            horus_gateway::command::initialize_quick_cloudflare(state_dir.clone())?;
+        }
+        horus_cli::frontend::CloudflareInit::Named { hostname, token } => {
+            horus_gateway::command::initialize_named_cloudflare(
+                state_dir.clone(),
+                hostname,
+                token,
+            )?;
+        }
+    }
+    horus_gateway::command::run(
+        vec![
+            "connect".into(),
+            "--state-dir".into(),
+            state_dir.into_os_string(),
+        ],
+        save_local_client,
+    )
     .await
+}
+
+fn save_local_client(endpoint: &Endpoint, token: String) -> horus_gateway::Result<()> {
+    let mut accounts = GatewayAccounts::load()?;
+    accounts.add(endpoint, token)?;
+    accounts.save()
 }
 
 fn state_dir_argument(arguments: &[OsString]) -> horus_gateway::Result<PathBuf> {

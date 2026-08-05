@@ -20,6 +20,8 @@ const MAX_CLIENT_LABEL_BYTES: usize = 128;
 const MAX_CLIENTS: usize = 32;
 const PAIRING_LIFETIME_SECONDS: i64 = 10 * 60;
 const REVOKED_PAIRING_EXPIRY: i64 = 0;
+const LOCAL_CLIENT_ID: &str = "00000000-0000-0000-0000-000000000001";
+const LOCAL_CLIENT_LABEL: &str = "Local Horus CLI";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -153,6 +155,37 @@ impl AuthStore {
         save_private_json(&self.path, &next, false)?;
         *state = next;
         Ok(IssuedToken { client_id, token })
+    }
+
+    pub(crate) fn provision_local_client(&self) -> Result<IssuedToken> {
+        let token = random_secret(2);
+        let now = unix_timestamp()?;
+        let mut state = self.lock_state()?;
+        let mut next = state.clone();
+        if let Some(client) = next
+            .clients
+            .iter_mut()
+            .find(|client| client.id == LOCAL_CLIENT_ID)
+        {
+            client.digest = digest(&token);
+            client.created_at = now;
+        } else {
+            if next.clients.len() == MAX_CLIENTS {
+                return Err(Error::Config("paired client limit reached".into()));
+            }
+            next.clients.push(ClientToken {
+                id: LOCAL_CLIENT_ID.into(),
+                label: LOCAL_CLIENT_LABEL.into(),
+                digest: digest(&token),
+                created_at: now,
+            });
+        }
+        save_private_json(&self.path, &next, false)?;
+        *state = next;
+        Ok(IssuedToken {
+            client_id: LOCAL_CLIENT_ID.into(),
+            token,
+        })
     }
 
     /// Replaces any unused pairing code without invalidating paired clients.
@@ -357,6 +390,21 @@ mod tests {
         assert!(auth.authenticate(&first.token).is_ok());
         assert!(auth.authenticate(&second.token).is_ok());
         assert!(auth.authenticate(&third.token).is_ok());
+    }
+
+    #[test]
+    fn provisioning_local_client_preserves_remote_pairing() {
+        let directory = tempfile::tempdir().expect("state directory");
+        let path = directory.path().join("auth.json");
+        let (auth, grant) = AuthStore::initialize(path).expect("initialize auth");
+
+        let local = auth
+            .provision_local_client()
+            .expect("provision local client");
+        let remote = auth.pair(&grant.code, "iPhone").expect("pair iPhone");
+
+        assert!(auth.authenticate(&local.token).is_ok());
+        assert!(auth.authenticate(&remote.token).is_ok());
     }
 
     #[test]

@@ -97,6 +97,12 @@ impl Endpoint {
         matches!(self.security, Security::WebSocketTls)
     }
 
+    /// Returns the validated endpoint host for server-side routing policy.
+    #[must_use]
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
     async fn connect(&self) -> Result<BoxedTransport> {
         if self.is_websocket() {
             return self.connect_websocket().await;

@@ -19,10 +19,10 @@ cargo install --locked horus-cli
 
 The separately versioned `horus-gateway` crate is the runtime library used by those binaries.
 
-Initialize and pair a local gateway:
+Initialize and pair a local-only gateway:
 
 ```sh
-horus-gateway init
+horus-gateway init --listen 127.0.0.1:8741
 horus-gateway connect
 ```
 
@@ -30,18 +30,23 @@ horus-gateway connect
 one-use code, then waits. Enter both values in a client. Once a client pairs,
 the command returns and the gateway keeps running in the background.
 
-For remote Apple clients without a separate VPN app, use an existing dedicated
-named Cloudflare Tunnel. In the Cloudflare dashboard, create a published
-application whose public hostname is your chosen Horus hostname and whose
-service URL is `http://127.0.0.1:8741`. Then run:
+For remote Apple clients without a separate VPN app, run:
 
 ```sh
 horus-gateway init
 ```
 
-Enter that hostname and the tunnel connector token. Horus stores the token in
-an owner-only file outside `gateway.toml`, starts `cloudflared` with
-`--token-file`, and displays a `wss://` endpoint and one-time pairing code. The
+**Quick Connect** is selected by default. It starts an account-free Cloudflare
+Quick Tunnel, captures its temporary `trycloudflare.com` address, and displays
+the `wss://` endpoint and one-time pairing code. No Cloudflare account, domain,
+route, or connector token is required. The address changes whenever the gateway
+restarts, so use the advanced stable-hostname option for a durable endpoint.
+
+For that advanced option, enter the intended hostname and connector token.
+Horus starts the connector first and waits for pairing; you can then publish the
+hostname to `http://127.0.0.1:8741` in Cloudflare without the missing-route
+failure aborting setup. Horus stores the token in an owner-only file outside
+`gateway.toml` and starts `cloudflared` with `--token-file`. The
 GitHub binary archives include a pinned `cloudflared` sidecar; source and
 `cargo install` builds require `cloudflared` beside `horus-gateway` or on
 `PATH`. The gateway also prints a copyable `horus-pair:v1` setup code and, in an
@@ -49,12 +54,17 @@ interactive terminal, an iPhone/iPad QR. Both contain only the public endpoint
 and short-lived Horus pairing code. They prefill the Apple pairing form for
 confirmation and never contain the Cloudflare token.
 
+If the selected state directory already exists, interactive initialization asks
+for explicit confirmation before stopping the old gateway and deleting its
+configuration, chats, providers, and paired devices.
+
 For non-interactive setup, keep the token in an owner-only file and use:
 
 ```sh
 horus-gateway init \
   --cloudflare-hostname horus.example.com \
   --cloudflare-token-file /private/path/tunnel-token
+horus-gateway connect
 ```
 
 Plaintext listeners and clients are restricted to loopback. An iPhone, iPad,

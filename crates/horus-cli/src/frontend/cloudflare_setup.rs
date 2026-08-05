@@ -1,4 +1,4 @@
-//! First-run setup for one existing user-owned Cloudflare Tunnel.
+//! First-run setup for account-free or stable Cloudflare Tunnel exposure.
 
 use std::io;
 
@@ -19,13 +19,14 @@ const MAX_HOSTNAME_BYTES: usize = 253;
 const MAX_TOKEN_BYTES: usize = 16 * 1024;
 
 /// Validated values consumed by gateway initialization and never displayed again.
-pub struct CloudflareInit {
-    pub hostname: String,
-    pub token: String,
+pub enum CloudflareInit {
+    Quick,
+    Named { hostname: String, token: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
+    Quick,
     Hostname,
     Token,
     Connect,
@@ -41,7 +42,7 @@ struct State {
 impl State {
     fn new() -> Self {
         Self {
-            field: Field::Hostname,
+            field: Field::Quick,
             hostname: String::new(),
             token: String::new(),
             error: None,
@@ -50,13 +51,15 @@ impl State {
 
     fn move_field(&mut self, delta: isize) {
         let current = match self.field {
-            Field::Hostname => 0,
-            Field::Token => 1,
-            Field::Connect => 2,
+            Field::Quick => 0,
+            Field::Hostname => 1,
+            Field::Token => 2,
+            Field::Connect => 3,
         };
-        self.field = match (current + delta).rem_euclid(3) {
-            0 => Field::Hostname,
-            1 => Field::Token,
+        self.field = match (current + delta).rem_euclid(4) {
+            0 => Field::Quick,
+            1 => Field::Hostname,
+            2 => Field::Token,
             _ => Field::Connect,
         };
         self.error = None;
@@ -64,6 +67,7 @@ impl State {
 
     fn push(&mut self, text: &str) {
         let (target, limit) = match self.field {
+            Field::Quick => return,
             Field::Hostname => (&mut self.hostname, MAX_HOSTNAME_BYTES),
             Field::Token => (&mut self.token, MAX_TOKEN_BYTES),
             Field::Connect => return,
@@ -80,6 +84,7 @@ impl State {
 
     fn backspace(&mut self) {
         match self.field {
+            Field::Quick => return,
             Field::Hostname => {
                 self.hostname.pop();
             }
@@ -92,10 +97,16 @@ impl State {
     }
 
     fn finish(&mut self) -> Result<CloudflareInit> {
-        let cloudflare = CloudflareConfig::new(&self.hostname).map_err(gateway_error)?;
+        if self.field == Field::Quick {
+            return Ok(CloudflareInit::Quick);
+        }
+        let cloudflare = CloudflareConfig::named(&self.hostname).map_err(gateway_error)?;
         CloudflareConfig::validate_token(&self.token).map_err(gateway_error)?;
-        Ok(CloudflareInit {
-            hostname: cloudflare.hostname().to_owned(),
+        let hostname = cloudflare
+            .hostname()
+            .ok_or_else(|| Error::Config("named Cloudflare hostname is missing".into()))?;
+        Ok(CloudflareInit::Named {
+            hostname: hostname.to_owned(),
             token: std::mem::take(&mut self.token).trim().to_owned(),
         })
     }
@@ -166,7 +177,7 @@ fn handle_key(state: &mut State, key: KeyEvent) -> Action {
             state.move_field(1);
             Action::Continue
         }
-        KeyCode::Enter if state.field == Field::Connect => Action::Finish,
+        KeyCode::Enter if matches!(state.field, Field::Quick | Field::Connect) => Action::Finish,
         KeyCode::Enter => {
             state.move_field(1);
             Action::Continue
@@ -208,12 +219,15 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State) {
     };
     let mut lines = vec![
         Line::from(""),
+        Line::from(Span::styled("  Quick Connect", selected(Field::Quick))),
         Line::styled(
-            "  Use a dedicated named tunnel already created in your Cloudflare account.",
+            "  No Cloudflare account or route. The address changes when the gateway restarts.",
             theme.style(Role::Muted),
         ),
+        Line::from(""),
+        Line::styled("  Stable hostname (advanced)", theme.style(Role::Muted)),
         Line::styled(
-            "  Published application service: http://127.0.0.1:8741",
+            "  Start the connector here, then publish the hostname to http://127.0.0.1:8741.",
             theme.style(Role::Muted),
         ),
         Line::from(""),
@@ -226,7 +240,10 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State) {
         Line::styled("  Tunnel token", theme.style(Role::Muted)),
         Line::from(Span::styled(format!("  {token}"), selected(Field::Token))),
         Line::from(""),
-        Line::from(Span::styled("  Connect tunnel", selected(Field::Connect))),
+        Line::from(Span::styled(
+            "  Connect stable tunnel",
+            selected(Field::Connect),
+        )),
         Line::from(""),
     ];
     if let Some(error) = &state.error {
@@ -282,11 +299,22 @@ mod tests {
             error: None,
         };
 
-        let config = state.finish().expect("valid setup");
+        let CloudflareInit::Named { hostname, token } = state.finish().expect("valid setup") else {
+            panic!("expected named tunnel");
+        };
 
         assert_eq!(
-            (config.hostname.as_str(), config.token.as_str()),
+            (hostname.as_str(), token.as_str()),
             ("horus.example.com", "secret-tunnel-token")
         );
+    }
+
+    #[test]
+    fn quick_connect_is_the_default() {
+        let mut state = State::new();
+
+        let config = state.finish().expect("quick setup");
+
+        assert!(matches!(config, CloudflareInit::Quick));
     }
 }

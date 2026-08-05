@@ -89,6 +89,9 @@ struct DashboardAreas {
 async fn connect(state_dir: PathBuf) -> Result<(GatewaySender, GatewayEvents, DashboardState)> {
     let (_, config) = ConfigStore::open(state_dir.clone()).map_err(gateway_error)?;
     let endpoint = dashboard_endpoint(&config)?;
+    horus_gateway::command::ensure_background_gateway(state_dir)
+        .await
+        .map_err(gateway_error)?;
     let token = configured_token(&endpoint)
         .map_err(gateway_error)?
         .ok_or_else(|| {
@@ -96,9 +99,6 @@ async fn connect(state_dir: PathBuf) -> Result<(GatewaySender, GatewayEvents, Da
                 "this machine is not paired with {endpoint}; pair it before opening the gateway dashboard"
             ))
         })?;
-    horus_gateway::command::ensure_background_gateway(state_dir)
-        .await
-        .map_err(gateway_error)?;
     let client = GatewayClient::connect(&endpoint, token, ClientKind::GatewayDashboard)
         .await
         .map_err(gateway_error)?;

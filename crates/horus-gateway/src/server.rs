@@ -238,37 +238,79 @@ impl GatewayServer {
 
     /// Serves until a process shutdown signal or 72 hours of inactivity.
     pub async fn serve(self) -> Result<()> {
+        let websocket_host = self.configured_websocket_host()?;
+        self.serve_with_host(websocket_host).await
+    }
+
+    /// Serves Cloudflare WebSockets using the resolved public hostname.
+    pub(crate) async fn serve_cloudflare(self, hostname: String) -> Result<()> {
+        let cloudflare = self.config.cloudflare.as_ref().ok_or_else(|| {
+            Error::Config("a Cloudflare hostname requires tunnel configuration".into())
+        })?;
+        if cloudflare
+            .hostname()
+            .is_some_and(|configured| configured != hostname)
+        {
+            return Err(Error::Config(
+                "runtime Cloudflare hostname does not match gateway configuration".into(),
+            ));
+        }
+        self.serve_with_host(Some(hostname)).await
+    }
+
+    async fn serve_with_host(self, websocket_host: Option<String>) -> Result<()> {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
 
             let mut interrupts = signal(SignalKind::interrupt())?;
             let mut terminations = signal(SignalKind::terminate())?;
-            self.serve_until(async move {
-                tokio::select! {
-                    _ = interrupts.recv() => {}
-                    _ = terminations.recv() => {}
-                }
-            })
+            self.serve_until_inactive_with_host(
+                async move {
+                    tokio::select! {
+                        _ = interrupts.recv() => {}
+                        _ = terminations.recv() => {}
+                    }
+                },
+                INACTIVITY_TIMEOUT,
+                websocket_host,
+            )
             .await
         }
         #[cfg(not(unix))]
-        self.serve_until(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        self.serve_until_inactive_with_host(
+            async {
+                let _ = tokio::signal::ctrl_c().await;
+            },
+            INACTIVITY_TIMEOUT,
+            websocket_host,
+        )
         .await
     }
 
     /// Serves until shutdown or the same inactivity policy as [`Self::serve`].
     pub async fn serve_until(self, shutdown: impl Future<Output = ()>) -> Result<()> {
-        self.serve_until_inactive(shutdown, INACTIVITY_TIMEOUT)
+        let websocket_host = self.configured_websocket_host()?;
+        self.serve_until_inactive_with_host(shutdown, INACTIVITY_TIMEOUT, websocket_host)
             .await
     }
 
+    #[cfg(test)]
     async fn serve_until_inactive(
         self,
         shutdown: impl Future<Output = ()>,
         inactivity_timeout: Duration,
+    ) -> Result<()> {
+        let websocket_host = self.configured_websocket_host()?;
+        self.serve_until_inactive_with_host(shutdown, inactivity_timeout, websocket_host)
+            .await
+    }
+
+    async fn serve_until_inactive_with_host(
+        self,
+        shutdown: impl Future<Output = ()>,
+        inactivity_timeout: Duration,
+        websocket_host: Option<String>,
     ) -> Result<()> {
         self.config.validate()?;
         let tls = self.config.tls.as_ref().map(tls_acceptor).transpose()?;
@@ -280,11 +322,6 @@ impl GatewayServer {
         let mut connections = JoinSet::new();
         let client_connections = Arc::new(ClientConnections::default());
         let (client_revocations, _) = broadcast::channel(MAX_CONNECTIONS);
-        let websocket_host = self
-            .config
-            .cloudflare
-            .as_ref()
-            .map(|cloudflare| cloudflare.hostname().to_owned());
         let mut has_scheduled_tasks = self.cron.has_tasks()?;
         let inactivity = tokio::time::sleep(inactivity_timeout);
         tokio::pin!(inactivity);
@@ -374,6 +411,20 @@ impl GatewayServer {
                 }
             }
         }
+    }
+
+    fn configured_websocket_host(&self) -> Result<Option<String>> {
+        self.config
+            .cloudflare
+            .as_ref()
+            .map(|cloudflare| {
+                cloudflare.hostname().map(str::to_owned).ok_or_else(|| {
+                    Error::Config(
+                        "quick tunnel hostname is unavailable before cloudflared starts".into(),
+                    )
+                })
+            })
+            .transpose()
     }
 
     /// Returns the bound address from persisted configuration.
@@ -1481,12 +1532,36 @@ mod tests {
         .await
         .expect("bootstrap gateway");
         let listen = server.listen_addr();
-        let (shutdown, signal) = tokio::sync::oneshot::channel();
-        let serving = tokio::spawn(server.serve_until(async move {
-            let _ = signal.await;
-        }));
+        let GatewayServer {
+            listener,
+            auth,
+            host,
+            cron,
+            ..
+        } = server;
+        let client_connections = Arc::new(ClientConnections::default());
+        let (client_revocations, _) = broadcast::channel(MAX_CONNECTIONS);
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            let auth_deadline = Instant::now() + AUTH_TIMEOUT;
+            accepted_tx.send(()).expect("report accepted connection");
+            serve_plaintext_connection(
+                stream,
+                auth,
+                host,
+                cron,
+                client_connections,
+                client_revocations,
+                PlaintextHandshake {
+                    expected_websocket_host: None,
+                    auth_deadline,
+                },
+            )
+            .await
+        });
         let mut stream = TcpStream::connect(listen).await.expect("connect gateway");
-        tokio::task::yield_now().await;
+        accepted_rx.await.expect("connection accepted");
 
         tokio::time::advance(Duration::from_secs(5)).await;
         stream.write_all(b"G").await.expect("start upgrade");
@@ -1512,6 +1587,7 @@ mod tests {
         let mut websocket = WebSocketStream::from_raw_socket(stream, Role::Client, None).await;
 
         tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::time::resume();
         let closed = tokio::time::timeout(Duration::from_secs(1), websocket.next())
             .await
             .expect("authentication deadline must close the socket");
@@ -1520,8 +1596,10 @@ mod tests {
             closed,
             None | Some(Ok(Message::Close(_))) | Some(Err(_))
         ));
-        shutdown.send(()).expect("stop gateway");
-        serving.await.expect("gateway task").expect("gateway stop");
+        assert!(matches!(
+            serving.await.expect("gateway task"),
+            Err(Error::Unauthorized)
+        ));
     }
 
     async fn wait_gateway_ready(events: &mut GatewayEvents) {

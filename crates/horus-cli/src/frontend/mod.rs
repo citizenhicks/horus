@@ -10,6 +10,7 @@ mod dashboard;
 mod gateway;
 mod gateway_actions;
 mod headless;
+mod reinitialize;
 mod setup;
 mod terminal;
 mod theme;
@@ -20,6 +21,7 @@ pub use tui::terminal_text;
 
 pub use cloudflare_setup::{CloudflareInit, run as run_cloudflare_setup};
 pub use dashboard::{run as run_gateway_dashboard, run_provider as run_gateway_provider};
+pub use reinitialize::confirm as confirm_gateway_reinitialize;
 
 pub async fn run(
     sender: GatewaySender,

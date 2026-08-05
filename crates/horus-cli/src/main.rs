@@ -301,9 +301,11 @@ async fn start_local_gateway(endpoint: &Endpoint) -> horus_gateway::Result<Gatew
                 "saved endpoint {endpoint} is not the local gateway configured at {configured_endpoint}; start it separately or select the configured endpoint"
             )));
         }
-        let token = saved_token.ok_or_else(|| missing_local_token(endpoint))?;
+        if saved_token.is_none() && config.cloudflare.is_none() {
+            return Err(missing_local_token(endpoint));
+        }
         let (child, log) = spawn_gateway(&binary, &configured_state_dir, false)?;
-        return connect_started_gateway(endpoint, &token, child, log).await;
+        return connect_started_gateway(endpoint, child, log).await;
     }
     if endpoint.to_string() != DEFAULT_LOCAL_ENDPOINT {
         return Err(horus_gateway::Error::Config(format!(
@@ -494,7 +496,6 @@ async fn read_bootstrap(
 
 async fn connect_started_gateway(
     endpoint: &Endpoint,
-    token: &str,
     mut child: Child,
     log: tempfile::NamedTempFile,
 ) -> horus_gateway::Result<GatewayClient> {
@@ -504,7 +505,25 @@ async fn connect_started_gateway(
         if child_exit.is_none() {
             child_exit = child.try_wait()?;
         }
-        match connect_local_once(endpoint, token).await {
+        let token = configured_token(endpoint)?;
+        let Some(token) = token else {
+            if let Some(status) = child_exit {
+                return Err(startup_error(
+                    format!("horus-gateway exited during startup with {status}"),
+                    &log,
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                stop_child(&mut child).await;
+                return Err(startup_error(
+                    "horus-gateway did not provision its local client within 10 seconds",
+                    &log,
+                ));
+            }
+            tokio::time::sleep(STARTUP_RETRY).await;
+            continue;
+        };
+        match connect_local_once(endpoint, &token).await {
             Ok(client) => {
                 if child_exit.is_none() {
                     detach_child(child);

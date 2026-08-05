@@ -32,7 +32,8 @@ use crate::auth::PairingStatus;
 use crate::client::Endpoint;
 use crate::cloudflare::CloudflareTunnel;
 use crate::config::{
-    ConfigStore, DEFAULT_LISTEN, GatewayConfig, TlsConfig, load_cloudflare_token, state_dir,
+    CloudflareConfig, ConfigStore, DEFAULT_LISTEN, GatewayConfig, TlsConfig, load_cloudflare_token,
+    state_dir,
 };
 use crate::server::GatewayServer;
 use crate::wire::BootstrapPayload;
@@ -62,6 +63,8 @@ pub const USAGE: &str = "usage: horus-gateway [--state-dir PATH]\n       \
 const PROCESS_FILE: &str = "gateway-process.json";
 #[cfg(unix)]
 const STARTUP_FILE: &str = "gateway-start.lock";
+#[cfg(unix)]
+const STATE_MARKER_FILE: &str = "gateway.toml";
 #[cfg(any(unix, test))]
 const MAX_PROCESS_RECORD_BYTES: usize = 4 * 1024;
 #[cfg(unix)]
@@ -102,18 +105,21 @@ struct InitOptions {
     cloudflare: Option<CloudflareInit>,
 }
 
-struct CloudflareInit {
-    hostname: String,
-    token: String,
+enum CloudflareInit {
+    Quick,
+    Named { hostname: String, token: String },
 }
 
 impl std::fmt::Debug for CloudflareInit {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CloudflareInit")
-            .field("hostname", &self.hostname)
-            .field("token", &"[redacted]")
-            .finish()
+        match self {
+            Self::Quick => formatter.write_str("CloudflareInit::Quick"),
+            Self::Named { hostname, .. } => formatter
+                .debug_struct("CloudflareInit::Named")
+                .field("hostname", hostname)
+                .field("token", &"[redacted]")
+                .finish(),
+        }
     }
 }
 
@@ -128,6 +134,7 @@ struct ConnectOptions {
 #[serde(deny_unknown_fields)]
 struct ProcessRecord {
     pid: u32,
+    endpoint: Option<String>,
 }
 
 struct ProcessRecordGuard {
@@ -144,7 +151,10 @@ struct StartupGuard {
 }
 
 /// Runs a gateway command with arguments excluding the executable name.
-pub async fn run(arguments: Vec<OsString>) -> Result<()> {
+pub async fn run(
+    arguments: Vec<OsString>,
+    save_local_client: fn(&Endpoint, String) -> Result<()>,
+) -> Result<()> {
     if matches!(arguments.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!("{USAGE}");
         return Ok(());
@@ -164,10 +174,10 @@ pub async fn run(arguments: Vec<OsString>) -> Result<()> {
             if background {
                 serve_in_background(state_dir).await
             } else {
-                serve(state_dir, true).await
+                serve(state_dir, true, save_local_client).await
             }
         }
-        Command::ServeChild { state_dir } => serve(state_dir, false).await,
+        Command::ServeChild { state_dir } => serve(state_dir, false, save_local_client).await,
         Command::Exit { state_dir } => exit_gateway(state_dir),
     }
 }
@@ -180,7 +190,7 @@ async fn bootstrap(options: InitOptions) -> Result<()> {
     }
     let state_dir = options.state_dir.clone();
     let (server, grant) = GatewayServer::bootstrap(options.state_dir, options.listen).await?;
-    let _process_record = ProcessRecordGuard::create(&state_dir)?;
+    let _process_record = ProcessRecordGuard::create(&state_dir, None)?;
     serde_json::to_writer(
         std::io::stdout().lock(),
         &BootstrapPayload {
@@ -194,17 +204,22 @@ async fn bootstrap(options: InitOptions) -> Result<()> {
 
 fn initialize(options: InitOptions) -> Result<()> {
     let (store, config) = match options.cloudflare {
-        Some(cloudflare) => ConfigStore::initialize_cloudflare(
-            options.state_dir,
-            options.listen,
-            &cloudflare.hostname,
-            &cloudflare.token,
-        )?,
+        Some(CloudflareInit::Quick) => {
+            ConfigStore::initialize_quick_cloudflare(options.state_dir, options.listen)?
+        }
+        Some(CloudflareInit::Named { hostname, token }) => {
+            ConfigStore::initialize_named_cloudflare(
+                options.state_dir,
+                options.listen,
+                &hostname,
+                &token,
+            )?
+        }
         None => ConfigStore::initialize(options.state_dir, options.listen, options.tls)?,
     };
     initialize_auth(&store)?;
     println!("initialized Horus gateway");
-    print_listener(&config);
+    print_listener(&config, None);
     println!("run `horus-gateway connect` to pair a client");
     Ok(())
 }
@@ -222,20 +237,105 @@ fn initialize_auth(store: &ConfigStore) -> Result<()> {
     Ok(())
 }
 
-/// Initializes one gateway against an existing user-owned Cloudflare Tunnel.
-pub fn initialize_cloudflare(state_dir: PathBuf, hostname: String, token: String) -> Result<()> {
+fn provision_cloudflare_local_client(
+    auth: &AuthStore,
+    config: &GatewayConfig,
+) -> Result<Option<(Endpoint, String)>> {
+    if config.cloudflare.is_none() {
+        return Ok(None);
+    }
+    let endpoint = format!("tcp://{}", config.listen).parse()?;
+    let issued = auth.provision_local_client()?;
+    Ok(Some((endpoint, issued.token)))
+}
+
+/// Initializes one gateway with an account-free Cloudflare Quick Tunnel.
+pub fn initialize_quick_cloudflare(state_dir: PathBuf) -> Result<()> {
     initialize(InitOptions {
         state_dir,
         listen: DEFAULT_LISTEN,
         tls: None,
-        cloudflare: Some(CloudflareInit { hostname, token }),
+        cloudflare: Some(CloudflareInit::Quick),
     })
+}
+
+/// Initializes one gateway against a user-owned named Cloudflare Tunnel.
+pub fn initialize_named_cloudflare(
+    state_dir: PathBuf,
+    hostname: String,
+    token: String,
+) -> Result<()> {
+    initialize(InitOptions {
+        state_dir,
+        listen: DEFAULT_LISTEN,
+        tls: None,
+        cloudflare: Some(CloudflareInit::Named { hostname, token }),
+    })
+}
+
+/// Permanently removes previously confirmed gateway state after stopping its process.
+///
+/// # Errors
+///
+/// Returns an error unless the target is an empty real directory or contains a regular
+/// `gateway.toml` marker. Lifecycle or filesystem failures are also returned.
+pub fn reset_gateway_state(state_dir: PathBuf) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let had_config = validate_reset_target(&state_dir, false)?;
+        let state_dir = fs::canonicalize(state_dir)?;
+        let _startup = StartupGuard::create(&state_dir)?;
+        if validate_reset_target(&state_dir, true)? != had_config {
+            return Err(invalid_reset_target(&state_dir));
+        }
+        stop_gateway(&state_dir, None)?;
+        fs::remove_dir_all(state_dir)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = state_dir;
+        Err(unsupported_lifecycle())
+    }
+}
+
+#[cfg(unix)]
+fn validate_reset_target(path: &Path, ignore_startup_lock: bool) -> Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(invalid_reset_target(path));
+    }
+    let mut empty = true;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if ignore_startup_lock && entry.file_name() == STARTUP_FILE {
+            continue;
+        }
+        empty = false;
+    }
+    if empty {
+        return Ok(false);
+    }
+    let marker = fs::symlink_metadata(path.join(STATE_MARKER_FILE))
+        .map_err(|_| invalid_reset_target(path))?;
+    if !marker.is_file() || marker.file_type().is_symlink() {
+        return Err(invalid_reset_target(path));
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn invalid_reset_target(path: &Path) -> Error {
+    Error::Config(format!(
+        "refusing to reset {}: expected an empty directory or Horus gateway state with a regular {STATE_MARKER_FILE}",
+        path.display()
+    ))
 }
 
 #[cfg(unix)]
 async fn connect(options: ConnectOptions) -> Result<()> {
     let (store, config) = ConfigStore::open(options.state_dir)?;
-    let endpoint = connection_endpoint(&config, options.endpoint)?;
+    let configured_endpoint = connection_endpoint(&config, options.endpoint)?;
     let startup = StartupGuard::create(store.state_dir())?;
     ensure_gateway_stopped(&store, &config)?;
     let mut interrupts = signal(SignalKind::interrupt())?;
@@ -244,28 +344,48 @@ async fn connect(options: ConnectOptions) -> Result<()> {
     let auth = AuthStore::open(store.auth_path())?;
     let grant = auth.create_pairing_code()?;
     let deadline = pairing_deadline(grant.expires_at)?;
-    let pid = match start_background_gateway(store.state_dir(), &mut interrupts, &mut terminations)
-        .await
-    {
-        Ok(Some(pid)) => pid,
-        Ok(None) => {
-            AuthStore::open(store.auth_path())?.revoke_pairing_code(&grant.code)?;
-            println!("connection cancelled");
-            return Ok(());
-        }
-        Err(error) => {
-            if let Err(revoke) =
-                AuthStore::open(store.auth_path())?.revoke_pairing_code(&grant.code)
-            {
-                return Err(Error::Config(format!(
-                    "{error}; failed to revoke one-time code: {revoke}"
-                )));
+    let process =
+        match start_background_gateway(store.state_dir(), &mut interrupts, &mut terminations).await
+        {
+            Ok(Some(process)) => process,
+            Ok(None) => {
+                AuthStore::open(store.auth_path())?.revoke_pairing_code(&grant.code)?;
+                println!("connection cancelled");
+                return Ok(());
             }
-            return Err(error);
-        }
+            Err(error) => {
+                if let Err(revoke) =
+                    AuthStore::open(store.auth_path())?.revoke_pairing_code(&grant.code)
+                {
+                    return Err(Error::Config(format!(
+                        "{error}; failed to revoke one-time code: {revoke}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
+    let pid = process.pid;
+    let endpoint = match process.endpoint().and_then(|runtime| {
+        runtime
+            .or(configured_endpoint)
+            .ok_or_else(|| Error::Config("gateway did not publish its runtime endpoint".into()))
+    }) {
+        Ok(endpoint) => endpoint,
+        Err(error) => return stop_connect_gateway(&store, pid, &grant.code, error),
     };
     drop(startup);
 
+    if let Some(hostname) = config
+        .cloudflare
+        .as_ref()
+        .and_then(CloudflareConfig::hostname)
+    {
+        println!("Cloudflare connector is running.");
+        println!(
+            "If needed, publish {hostname} to http://{} now; Horus will keep waiting for pairing.",
+            config.listen,
+        );
+    }
     if let Err(error) = print_connection(&endpoint, &grant.code) {
         return stop_connect_gateway(&store, pid, &grant.code, error.into());
     }
@@ -340,15 +460,18 @@ async fn connect(_options: ConnectOptions) -> Result<()> {
     Err(unsupported_lifecycle())
 }
 
-fn connection_endpoint(config: &GatewayConfig, endpoint: Option<Endpoint>) -> Result<Endpoint> {
+fn connection_endpoint(
+    config: &GatewayConfig,
+    endpoint: Option<Endpoint>,
+) -> Result<Option<Endpoint>> {
     if let Some(cloudflare) = &config.cloudflare {
         if endpoint.is_some() {
-            return Err(Error::Config(format!(
-                "Cloudflare gateway endpoint is {}; do not use --endpoint",
-                cloudflare.endpoint()
-            )));
+            return Err(Error::Config(
+                "Cloudflare gateways determine their endpoint at startup; do not use --endpoint"
+                    .into(),
+            ));
         }
-        return cloudflare.endpoint().parse();
+        return cloudflare.endpoint().as_deref().map(str::parse).transpose();
     }
     match (config.tls.is_some(), endpoint) {
         (true, None) => Err(Error::Config(
@@ -360,8 +483,8 @@ fn connection_endpoint(config: &GatewayConfig, endpoint: Option<Endpoint>) -> Re
         (false, Some(endpoint)) if !endpoint.is_plaintext() => Err(Error::Config(
             "a plaintext gateway connection endpoint must use tcp://".into(),
         )),
-        (_, Some(endpoint)) => Ok(endpoint),
-        (false, None) => format!("tcp://{}", config.listen).parse(),
+        (_, Some(endpoint)) => Ok(Some(endpoint)),
+        (false, None) => format!("tcp://{}", config.listen).parse().map(Some),
     }
 }
 
@@ -410,7 +533,7 @@ fn stop_connect_gateway<T>(store: &ConfigStore, pid: u32, code: &str, error: Err
 
 #[cfg(unix)]
 fn cleanup_connect(store: &ConfigStore, pid: u32, code: &str) -> Result<()> {
-    stop_gateway(store, Some(pid))?;
+    stop_gateway(store.state_dir(), Some(pid))?;
     AuthStore::open(store.auth_path())?.revoke_pairing_code(code)
 }
 
@@ -462,35 +585,37 @@ fn pairing_setup_qr(
     Ok(QrCode::new(url.as_str())?.render::<Dense1x2>().build())
 }
 
-async fn serve(state_dir: PathBuf, lock_startup: bool) -> Result<()> {
+async fn serve(
+    state_dir: PathBuf,
+    lock_startup: bool,
+    save_local_client: fn(&Endpoint, String) -> Result<()>,
+) -> Result<()> {
     let (store, config) = ConfigStore::open(state_dir)?;
     let state_dir = store.state_dir().to_path_buf();
     let startup = lock_startup
         .then(|| StartupGuard::create(&state_dir))
         .transpose()?;
+    #[cfg(unix)]
+    ensure_gateway_stopped(&store, &config)?;
+    let auth = AuthStore::open(store.auth_path())?;
+    if let Some((endpoint, token)) = provision_cloudflare_local_client(&auth, &config)? {
+        save_local_client(&endpoint, token)?;
+    }
     let server = GatewayServer::open(state_dir.clone()).await?;
     let Some(mut tunnel) = CloudflareTunnel::start(&store, &config)? else {
-        let _process_record = ProcessRecordGuard::create(&state_dir)?;
+        let _process_record = ProcessRecordGuard::create(&state_dir, None)?;
         drop(startup);
         println!("gateway serving in foreground");
-        print_listener(&config);
+        print_listener(&config, None);
         return server.serve().await;
     };
-    let endpoint = config
-        .cloudflare
-        .as_ref()
-        .expect("Cloudflare tunnel requires config")
-        .endpoint();
-    let server = server.serve();
+    let endpoint = tunnel.endpoint().await?;
+    let server = server.serve_cloudflare(endpoint.host().to_owned());
     tokio::pin!(server);
-    tokio::select! {
-        result = &mut server => return result,
-        result = tunnel.wait_ready(&endpoint) => result?,
-    }
-    let _process_record = ProcessRecordGuard::create(&state_dir)?;
+    let _process_record = ProcessRecordGuard::create(&state_dir, Some(&endpoint))?;
     drop(startup);
     println!("gateway serving in foreground");
-    print_listener(&config);
+    print_listener(&config, Some(&endpoint));
     tokio::select! {
         result = &mut server => result,
         result = tunnel.wait() => result,
@@ -503,14 +628,14 @@ async fn serve_in_background(state_dir: PathBuf) -> Result<()> {
     let _startup = StartupGuard::create(store.state_dir())?;
     let mut interrupts = signal(SignalKind::interrupt())?;
     let mut terminations = signal(SignalKind::terminate())?;
-    let Some(pid) =
+    let Some(process) =
         start_background_gateway(store.state_dir(), &mut interrupts, &mut terminations).await?
     else {
         println!("gateway start cancelled");
         return Ok(());
     };
-    println!("gateway started in background (pid {pid})");
-    print_listener(&config);
+    println!("gateway started in background (pid {})", process.pid);
+    print_listener(&config, process.endpoint()?.as_ref());
     Ok(())
 }
 
@@ -529,7 +654,7 @@ async fn start_background_gateway(
     state_dir: &Path,
     interrupts: &mut TokioSignal,
     terminations: &mut TokioSignal,
-) -> Result<Option<u32>> {
+) -> Result<Option<ProcessRecord>> {
     let state_dir = fs::canonicalize(state_dir)?;
     let process_path = state_dir.join(PROCESS_FILE);
     if running_process_pid(&process_path)?.is_some() {
@@ -570,12 +695,15 @@ async fn start_background_gateway(
             }
         }
 
-        let process_error = match running_process_pid(&process_path) {
-            Ok(Some(running)) if running == pid => return Ok(Some(pid)),
-            Ok(Some(running)) => {
+        let process_error = match running_process_record(&process_path) {
+            Ok(Some(record)) if record.pid == pid => return Ok(Some(record)),
+            Ok(Some(record)) => {
                 stop_background_child(&mut child, &process_path).await;
                 return Err(background_startup_error(
-                    format!("gateway process {running} claimed the process record during startup"),
+                    format!(
+                        "gateway process {} claimed the process record during startup",
+                        record.pid
+                    ),
                     &log,
                 ));
             }
@@ -659,9 +787,16 @@ fn background_startup_error(
     })
 }
 
-fn print_listener(config: &GatewayConfig) {
+fn print_listener(config: &GatewayConfig, runtime_endpoint: Option<&Endpoint>) {
     if let Some(cloudflare) = &config.cloudflare {
-        println!("public endpoint: {}", cloudflare.endpoint());
+        if let Some(endpoint) = runtime_endpoint
+            .map(ToString::to_string)
+            .or_else(|| cloudflare.endpoint())
+        {
+            println!("public endpoint: {endpoint}");
+        } else {
+            println!("public endpoint: assigned when the gateway starts");
+        }
         println!("tunnel origin: http://{}", config.listen);
         return;
     }
@@ -673,12 +808,12 @@ fn print_listener(config: &GatewayConfig) {
 fn exit_gateway(state_dir: PathBuf) -> Result<()> {
     let (store, _) = ConfigStore::open(state_dir)?;
     let _startup = StartupGuard::create(store.state_dir())?;
-    stop_gateway(&store, None)
+    stop_gateway(store.state_dir(), None)
 }
 
 #[cfg(unix)]
-fn stop_gateway(store: &ConfigStore, expected_pid: Option<u32>) -> Result<()> {
-    let path = store.state_dir().join(PROCESS_FILE);
+fn stop_gateway(state_dir: &Path, expected_pid: Option<u32>) -> Result<()> {
+    let path = state_dir.join(PROCESS_FILE);
     let Some((record, file)) = open_process_record(&path)? else {
         println!("gateway is stopped");
         return Ok(());
@@ -733,13 +868,24 @@ impl ProcessRecord {
         if self.pid == 0 || i32::try_from(self.pid).is_err() {
             return Err(Error::Config("invalid gateway process record".into()));
         }
+        if let Some(endpoint) = self.endpoint()?
+            && !endpoint.is_websocket()
+        {
+            return Err(Error::Config(
+                "gateway process endpoint must use wss://".into(),
+            ));
+        }
         Ok(())
+    }
+
+    fn endpoint(&self) -> Result<Option<Endpoint>> {
+        self.endpoint.as_deref().map(str::parse).transpose()
     }
 }
 
 impl ProcessRecordGuard {
     #[cfg(unix)]
-    fn create(state_dir: &Path) -> Result<Self> {
+    fn create(state_dir: &Path, endpoint: Option<&Endpoint>) -> Result<Self> {
         let state_dir = fs::canonicalize(state_dir)?;
         let path = state_dir.join(PROCESS_FILE);
         let mut file = OpenOptions::new()
@@ -757,6 +903,7 @@ impl ProcessRecordGuard {
         file.seek(SeekFrom::Start(0))?;
         let record = ProcessRecord {
             pid: std::process::id(),
+            endpoint: endpoint.map(ToString::to_string),
         };
         serde_json::to_writer(&mut file, &record)?;
         file.flush()?;
@@ -765,7 +912,7 @@ impl ProcessRecordGuard {
     }
 
     #[cfg(not(unix))]
-    fn create(_state_dir: &Path) -> Result<Self> {
+    fn create(_state_dir: &Path, _endpoint: Option<&Endpoint>) -> Result<Self> {
         Ok(Self {})
     }
 }
@@ -850,10 +997,15 @@ fn process_is_running(file: &File) -> Result<bool> {
 
 #[cfg(unix)]
 fn running_process_pid(path: &Path) -> Result<Option<u32>> {
+    Ok(running_process_record(path)?.map(|record| record.pid))
+}
+
+#[cfg(unix)]
+fn running_process_record(path: &Path) -> Result<Option<ProcessRecord>> {
     let Some((record, file)) = open_process_record(path)? else {
         return Ok(None);
     };
-    Ok(process_is_running(&file)?.then_some(record.pid))
+    Ok(process_is_running(&file)?.then_some(record))
 }
 
 #[cfg(not(unix))]
@@ -1002,7 +1154,7 @@ fn parse_init(arguments: Vec<OsString>) -> Result<InitOptions> {
                     "Cloudflare and direct TLS listener options cannot be combined".into(),
                 ));
             }
-            Some(CloudflareInit {
+            Some(CloudflareInit::Named {
                 hostname,
                 token: load_cloudflare_token(&path)?,
             })
@@ -1043,6 +1195,61 @@ fn set_once<T>(target: &mut Option<T>, value: T, flag: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn reset_gateway_state_removes_an_empty_directory() {
+        let root = tempfile::tempdir().expect("state parent");
+        let state = root.path().join("gateway");
+        std::fs::create_dir(&state).expect("empty state");
+
+        reset_gateway_state(state.clone()).expect("reset empty state");
+
+        assert!(!state.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_gateway_state_removes_incompatible_marked_state() {
+        let root = tempfile::tempdir().expect("state parent");
+        let state = root.path().join("gateway");
+        std::fs::create_dir(&state).expect("gateway state");
+        std::fs::write(state.join(STATE_MARKER_FILE), "version = 999\n")
+            .expect("incompatible marker");
+
+        reset_gateway_state(state.clone()).expect("reset incompatible state");
+
+        assert!(!state.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_gateway_state_preserves_an_unrelated_nonempty_directory() {
+        let root = tempfile::tempdir().expect("state parent");
+        let state = root.path().join("not-horus");
+        std::fs::create_dir(&state).expect("unrelated directory");
+        let unrelated = state.join("keep.txt");
+        std::fs::write(&unrelated, "keep").expect("unrelated file");
+
+        let error = reset_gateway_state(state).expect_err("unrelated state must be refused");
+
+        assert!(error.to_string().contains("refusing to reset") && unrelated.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_gateway_state_refuses_a_symlinked_directory() {
+        let root = tempfile::tempdir().expect("state parent");
+        let real = root.path().join("real");
+        let link = root.path().join("gateway");
+        std::fs::create_dir(&real).expect("real directory");
+        std::fs::write(real.join(STATE_MARKER_FILE), "version = 999\n").expect("gateway marker");
+        std::os::unix::fs::symlink(&real, &link).expect("gateway symlink");
+
+        reset_gateway_state(link).expect_err("symlinked state must be refused");
+
+        assert!(real.exists());
+    }
+
     #[test]
     fn failed_auth_initialization_removes_only_the_new_gateway_state() {
         let root = tempfile::tempdir().expect("state parent");
@@ -1056,6 +1263,22 @@ mod tests {
         initialize_auth(&store).expect_err("auth initialization must fail");
 
         assert_eq!((state.exists(), sibling.exists()), (false, true));
+    }
+
+    #[test]
+    fn cloudflare_local_client_uses_the_authenticated_loopback_endpoint() {
+        let directory = tempfile::tempdir().expect("gateway state");
+        let path = directory.path().join("auth.json");
+        let (auth, _) = AuthStore::initialize(path).expect("initialize auth");
+        let config = GatewayConfig::new_cloudflare(DEFAULT_LISTEN, CloudflareConfig::Quick)
+            .expect("Cloudflare config");
+
+        let (endpoint, token) = provision_cloudflare_local_client(&auth, &config)
+            .expect("provision local client")
+            .expect("Cloudflare local client");
+
+        assert_eq!(endpoint.to_string(), "tcp://127.0.0.1:8741");
+        assert!(auth.authenticate(&token).is_ok());
     }
 
     #[test]
@@ -1140,13 +1363,28 @@ mod tests {
 
     #[test]
     fn cloudflare_connection_uses_the_configured_wss_endpoint() {
-        let config = GatewayConfig::new_cloudflare(DEFAULT_LISTEN, "horus.example.com")
+        let config = GatewayConfig::new_cloudflare(
+            DEFAULT_LISTEN,
+            CloudflareConfig::named("horus.example.com").expect("hostname"),
+        )
+        .expect("Cloudflare config");
+
+        let endpoint = connection_endpoint(&config, None)
+            .expect("Cloudflare endpoint")
+            .expect("named endpoint");
+
+        assert_eq!(endpoint.to_string(), "wss://horus.example.com");
+        assert!(endpoint.is_websocket());
+    }
+
+    #[test]
+    fn quick_cloudflare_connection_waits_for_the_runtime_endpoint() {
+        let config = GatewayConfig::new_cloudflare(DEFAULT_LISTEN, CloudflareConfig::Quick)
             .expect("Cloudflare config");
 
         let endpoint = connection_endpoint(&config, None).expect("Cloudflare endpoint");
 
-        assert_eq!(endpoint.to_string(), "wss://horus.example.com");
-        assert!(endpoint.is_websocket());
+        assert!(endpoint.is_none());
     }
 
     #[test]
@@ -1281,11 +1519,39 @@ mod tests {
     fn process_record_rejects_an_invalid_pid() {
         let directory = tempfile::tempdir().expect("process record directory");
         let path = directory.path().join(PROCESS_FILE);
-        std::fs::write(&path, r#"{"pid":0}"#).expect("write process record");
+        std::fs::write(&path, r#"{"pid":0,"endpoint":null}"#).expect("write process record");
 
         let error = open_process_record(&path).expect_err("invalid PID must fail");
 
         assert!(error.to_string().contains("invalid gateway process record"));
+    }
+
+    #[test]
+    fn process_record_rejects_a_non_websocket_runtime_endpoint() {
+        let directory = tempfile::tempdir().expect("process record directory");
+        let path = directory.path().join(PROCESS_FILE);
+        std::fs::write(&path, r#"{"pid":1,"endpoint":"tcp://127.0.0.1:8741"}"#)
+            .expect("write process record");
+
+        let error = open_process_record(&path).expect_err("plaintext endpoint must fail");
+
+        assert!(error.to_string().contains("must use wss://"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_record_carries_the_quick_tunnel_endpoint() {
+        let directory = tempfile::tempdir().expect("process record directory");
+        let endpoint: Endpoint = "wss://bright-river.trycloudflare.com"
+            .parse()
+            .expect("endpoint");
+        let guard =
+            ProcessRecordGuard::create(directory.path(), Some(&endpoint)).expect("process record");
+        let (record, _) = open_process_record(&guard.path)
+            .expect("read process record")
+            .expect("process record");
+
+        assert_eq!(record.endpoint().expect("valid endpoint"), Some(endpoint));
     }
 
     #[cfg(unix)]
@@ -1298,7 +1564,8 @@ mod tests {
         remove_unlocked_process_record(&path);
 
         assert!(!path.exists());
-        let guard = ProcessRecordGuard::create(directory.path()).expect("locked process record");
+        let guard =
+            ProcessRecordGuard::create(directory.path(), None).expect("locked process record");
         remove_unlocked_process_record(&path);
         assert!(path.exists());
         drop(guard);
@@ -1308,7 +1575,7 @@ mod tests {
     #[test]
     fn process_record_lock_tracks_the_gateway_lifetime() {
         let directory = tempfile::tempdir().expect("process record directory");
-        let guard = ProcessRecordGuard::create(directory.path()).expect("process record");
+        let guard = ProcessRecordGuard::create(directory.path(), None).expect("process record");
         let (_, file) = open_process_record(&guard.path)
             .expect("read process record")
             .expect("process record");

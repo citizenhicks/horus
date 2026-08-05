@@ -23,7 +23,7 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 8;
+const CONFIG_VERSION: u32 = 9;
 const CHAT_SPEC_VERSION: u32 = 4;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
@@ -51,11 +51,14 @@ pub struct TlsConfig {
     pub private_key: PathBuf,
 }
 
-/// Public endpoint for one pre-provisioned Cloudflare Tunnel.
+/// Cloudflare Tunnel exposure selected for this gateway.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CloudflareConfig {
-    hostname: String,
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CloudflareConfig {
+    /// Account-free tunnel with an address assigned at process startup.
+    Quick,
+    /// User-owned tunnel with a stable published hostname.
+    Named { hostname: String },
 }
 
 /// Durable machine-wide settings and defaults for one gateway process.
@@ -144,10 +147,10 @@ impl GatewayConfig {
         Ok(config)
     }
 
-    /// Builds a loopback gateway exposed through one existing Cloudflare Tunnel.
-    pub fn new_cloudflare(listen: SocketAddr, hostname: &str) -> Result<Self> {
+    /// Builds a loopback gateway exposed through Cloudflare Tunnel.
+    pub fn new_cloudflare(listen: SocketAddr, cloudflare: CloudflareConfig) -> Result<Self> {
         let mut config = Self::new(listen, None)?;
-        config.cloudflare = Some(CloudflareConfig::new(hostname)?);
+        config.cloudflare = Some(cloudflare);
         config.validate()?;
         Ok(config)
     }
@@ -418,24 +421,27 @@ impl TlsConfig {
 }
 
 impl CloudflareConfig {
-    /// Validates and normalizes a public Cloudflare hostname.
-    pub fn new(hostname: &str) -> Result<Self> {
+    /// Validates and normalizes a stable public hostname.
+    pub fn named(hostname: &str) -> Result<Self> {
         let hostname = hostname.trim().to_ascii_lowercase();
-        let config = Self { hostname };
+        let config = Self::Named { hostname };
         config.validate()?;
         Ok(config)
     }
 
-    /// Returns the public WebSocket endpoint presented to Horus clients.
+    /// Returns the stable endpoint when one exists before startup.
     #[must_use]
-    pub fn endpoint(&self) -> String {
-        format!("wss://{}", self.hostname)
+    pub fn endpoint(&self) -> Option<String> {
+        self.hostname().map(|hostname| format!("wss://{hostname}"))
     }
 
-    /// Returns the normalized public hostname.
+    /// Returns the stable hostname when this is a named tunnel.
     #[must_use]
-    pub fn hostname(&self) -> &str {
-        &self.hostname
+    pub fn hostname(&self) -> Option<&str> {
+        match self {
+            Self::Quick => None,
+            Self::Named { hostname } => Some(hostname),
+        }
     }
 
     /// Validates one tunnel-scoped connector token without retaining it.
@@ -444,11 +450,12 @@ impl CloudflareConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.hostname.len() > 253
-            || !self.hostname.is_ascii()
-            || self.hostname != self.hostname.to_ascii_lowercase()
-            || !self.hostname.contains('.')
-            || !self.hostname.split('.').all(valid_hostname_label)
+        if let Self::Named { hostname } = self
+            && (hostname.len() > 253
+                || !hostname.is_ascii()
+                || hostname != &hostname.to_ascii_lowercase()
+                || !hostname.contains('.')
+                || !hostname.split('.').all(valid_hostname_label))
         {
             return Err(invalid_cloudflare_hostname());
         }
@@ -470,19 +477,40 @@ impl ConfigStore {
         Ok((store, config))
     }
 
-    /// Initializes state for one user-owned, pre-provisioned Cloudflare Tunnel.
-    pub fn initialize_cloudflare(
+    /// Initializes state for an account-free Cloudflare Quick Tunnel.
+    pub fn initialize_quick_cloudflare(
+        state_dir: PathBuf,
+        listen: SocketAddr,
+    ) -> Result<(Self, GatewayConfig)> {
+        Self::initialize_cloudflare(state_dir, listen, CloudflareConfig::Quick, None)
+    }
+
+    /// Initializes state for one user-owned Cloudflare Tunnel.
+    pub fn initialize_named_cloudflare(
         state_dir: PathBuf,
         listen: SocketAddr,
         hostname: &str,
         token: &str,
     ) -> Result<(Self, GatewayConfig)> {
-        let config = GatewayConfig::new_cloudflare(listen, hostname)?;
-        let token = validate_cloudflare_token(token)?;
+        Self::initialize_cloudflare(
+            state_dir,
+            listen,
+            CloudflareConfig::named(hostname)?,
+            Some(validate_cloudflare_token(token)?),
+        )
+    }
+
+    fn initialize_cloudflare(
+        state_dir: PathBuf,
+        listen: SocketAddr,
+        cloudflare: CloudflareConfig,
+        token: Option<&str>,
+    ) -> Result<(Self, GatewayConfig)> {
+        let config = GatewayConfig::new_cloudflare(listen, cloudflare)?;
         let state_dir = prepare_state_dir(state_dir)?;
         let store = Self::at(state_dir);
-        let result = store
-            .save_cloudflare_token(token)
+        let result = token
+            .map_or(Ok(()), |token| store.save_cloudflare_token(token))
             .and_then(|()| store.save_with_mode(&config, true));
         if let Err(error) = result {
             fs::remove_dir_all(&store.state_dir).map_err(|cleanup| {
@@ -591,7 +619,10 @@ impl ConfigStore {
 
     fn validate_config(&self, config: &GatewayConfig) -> Result<()> {
         config.validate()?;
-        if config.cloudflare.is_some() {
+        if matches!(
+            config.cloudflare.as_ref(),
+            Some(CloudflareConfig::Named { .. })
+        ) {
             load_cloudflare_token(&self.cloudflare_token_path())?;
         }
         Ok(())
@@ -1015,20 +1046,60 @@ mod tests {
 
     #[test]
     fn cloudflare_config_normalizes_a_dns_hostname() {
-        let config = CloudflareConfig::new("  Horus.Example.com ").expect("Cloudflare config");
+        let config = CloudflareConfig::named("  Horus.Example.com ").expect("Cloudflare config");
 
-        assert_eq!(config.endpoint(), "wss://horus.example.com");
+        assert_eq!(
+            config.endpoint().as_deref(),
+            Some("wss://horus.example.com")
+        );
     }
 
     #[test]
     fn cloudflare_config_rejects_a_url_instead_of_a_hostname() {
-        let error = CloudflareConfig::new("wss://horus.example.com/path")
+        let error = CloudflareConfig::named("wss://horus.example.com/path")
             .expect_err("URL must be rejected");
 
         assert!(
             error
                 .to_string()
                 .contains("without a scheme, path, or port")
+        );
+    }
+
+    #[test]
+    fn quick_cloudflare_config_round_trips_without_a_token() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let state = root.path().join("state");
+        let (store, _) = ConfigStore::initialize_quick_cloudflare(state.clone(), DEFAULT_LISTEN)
+            .expect("initialize quick tunnel");
+
+        let contents = fs::read_to_string(state.join(CONFIG_FILE)).expect("gateway config");
+        let (_, opened) = ConfigStore::open(state).expect("open quick tunnel config");
+
+        assert!(
+            contents.contains("mode = \"quick\"")
+                && !store.cloudflare_token_path().exists()
+                && opened.cloudflare == Some(CloudflareConfig::Quick)
+        );
+    }
+
+    #[test]
+    fn gateway_config_rejects_v8_without_migration() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let state = root.path().join("state");
+        ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
+        let path = state.join(CONFIG_FILE);
+        let contents = fs::read_to_string(&path)
+            .expect("read gateway config")
+            .replacen("version = 9", "version = 8", 1);
+        fs::write(&path, contents).expect("write v8 config");
+
+        let error = ConfigStore::open(state).expect_err("v8 must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported gateway config version 8")
         );
     }
 
@@ -1417,7 +1488,7 @@ mod tests {
     fn cloudflare_token_is_owner_only_and_absent_from_gateway_config() {
         let state_parent = tempfile::tempdir().expect("state parent");
         let state = state_parent.path().join("gateway");
-        let (store, _) = ConfigStore::initialize_cloudflare(
+        let (store, _) = ConfigStore::initialize_named_cloudflare(
             state.clone(),
             DEFAULT_LISTEN,
             "horus.example.com",
@@ -1465,7 +1536,7 @@ mod tests {
     fn opening_cloudflare_state_rejects_a_public_token_file() {
         let state_parent = tempfile::tempdir().expect("state parent");
         let state = state_parent.path().join("gateway");
-        let (store, _) = ConfigStore::initialize_cloudflare(
+        let (store, _) = ConfigStore::initialize_named_cloudflare(
             state.clone(),
             DEFAULT_LISTEN,
             "horus.example.com",
