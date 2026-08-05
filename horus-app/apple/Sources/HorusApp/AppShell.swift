@@ -11,6 +11,7 @@ private let debugStartsOnDetail: Bool = {
 
 struct AppShell: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.scenePhase) private var scenePhase
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     #endif
@@ -30,7 +31,7 @@ struct AppShell: View {
                     columnVisibility: $columnVisibility,
                     preferredCompactColumn: $compactColumn
                 ) {
-                    SidebarView { compactColumn = .detail }
+                    SidebarView(showDetail: showDetail)
                         .navigationSplitViewColumnWidth(min: 230, ideal: 272, max: 340)
                 } detail: {
                     destination
@@ -70,6 +71,9 @@ struct AppShell: View {
                 "\(toast.tone.title): \(toast.message)"
             ).post()
         }
+        .onChange(of: scenePhase) { _, newPhase in
+            model.setSceneActive(newPhase == .active)
+        }
         .task { model.start() }
     }
 
@@ -91,6 +95,22 @@ struct AppShell: View {
         case .dark: .dark
         case .light: .light
         }
+    }
+
+    private func showDetail() {
+        #if os(iOS)
+        // Back can reveal the compact sidebar without updating this binding. Reassert the
+        // visible column first so a second sidebar selection still produces a transition.
+        if horizontalSizeClass == .compact, compactColumn == .detail {
+            compactColumn = .sidebar
+            Task { @MainActor in
+                await Task.yield()
+                compactColumn = .detail
+            }
+            return
+        }
+        #endif
+        compactColumn = .detail
     }
 
     private var chatIsVisible: Bool {

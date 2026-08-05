@@ -58,7 +58,9 @@ struct AgentSettingsView: View {
                 HorusUnavailable(
                     title: "Agent unavailable",
                     systemImage: "switch.2",
-                    detail: "Connect to a gateway first."
+                    detail: model.connectionState.isReady
+                        ? "Configure a provider first."
+                        : "Connect to a gateway first."
                 )
             }
         }
@@ -287,7 +289,7 @@ struct ProvidersView: View {
             title: "Providers",
             detail: "Provider state belongs to the gateway. Credential material is write-only and is never returned here."
         ) {
-            if model.agentDraft != nil {
+            if model.providerDraft != nil {
                 Section("Configured") {
                     if configuredProviders.isEmpty {
                         Text("No provider configured on this gateway.")
@@ -455,7 +457,7 @@ struct ProvidersView: View {
     }
 
     private var selectedStatus: ProviderStatus? {
-        guard let provider = model.agentDraft?.provider.provider else { return nil }
+        guard let provider = model.providerDraft?.provider else { return nil }
         return model.providerStatuses.first { $0.provider == provider }
     }
 
@@ -465,48 +467,46 @@ struct ProvidersView: View {
 
     private var providerID: Binding<String> {
         Binding(
-            get: { model.agentDraft?.provider.provider ?? "" },
+            get: { model.providerDraft?.provider ?? "" },
             set: { model.selectProvider($0) }
         )
     }
 
     private var providerBaseURL: Binding<String> {
         Binding(
-            get: { model.agentDraft?.provider.baseUrl ?? "" },
-            set: { model.agentDraft?.provider.baseUrl = $0.nonEmpty }
+            get: { model.providerDraft?.baseUrl ?? "" },
+            set: { model.providerDraft?.baseUrl = $0.nonEmpty }
         )
     }
 
     private var providerModelID: Binding<String> {
         Binding(
-            get: { model.agentDraft?.provider.model ?? "" },
+            get: { model.providerDraft?.model ?? "" },
             set: { model.selectProviderModel($0) }
         )
     }
 
     private var providerWebSearch: Binding<HostedWebSearch> {
         Binding(
-            get: { model.agentDraft?.provider.webSearch ?? .off },
-            set: { model.agentDraft?.provider.webSearch = $0 }
+            get: { model.providerDraft?.webSearch ?? .off },
+            set: { model.providerDraft?.webSearch = $0 }
         )
     }
 
     private var selectedProviderModel: ProviderModel? {
         guard let status = selectedStatus,
-              let modelID = model.agentDraft?.provider.model
+              let modelID = model.providerDraft?.model
         else { return nil }
         return status.models.first { $0.id == modelID }
     }
 
     private var hasDefaultChanges: Bool {
-        guard let snapshot = model.defaultAgentSnapshot, let draft = model.agentDraft else {
-            return false
-        }
-        return snapshot.config != draft
+        guard let draft = model.providerDraft else { return false }
+        return model.defaultAgentSnapshot?.config.provider != draft
     }
 
     private var providerConfigurationValid: Bool {
-        guard let provider = model.agentDraft?.provider,
+        guard let provider = model.providerDraft,
               let status = selectedStatus,
               status.configured,
               status.webSearch.contains(provider.webSearch),
@@ -811,6 +811,8 @@ struct GatewayView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
     @State private var confirmsForget = false
+    @State private var renameDraft = ""
+    @State private var showsRename = false
 
     var body: some View {
         PageScaffold(
@@ -823,7 +825,10 @@ struct GatewayView: View {
                     set: { model.selectAccount($0) }
                 )) {
                     ForEach(model.accounts) { account in
-                        Text(account.displayName).tag(Optional(account.id))
+                        Text(account.displayName)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .tag(Optional(account.id))
                     }
                 }
                 .settingsPickerStyle()
@@ -836,14 +841,27 @@ struct GatewayView: View {
                     }
                     .font(HorusStyle.controlFont)
                 }
-                LabeledContent("Endpoint", value: model.selectedAccount?.endpoint.rawValue ?? "—")
-                LabeledContent("Transport", value: model.selectedAccount?.endpoint.usesTLS == true ? "TLS" : "Loopback TCP")
-                LabeledContent("Protocol", value: "Horus gateway v\(gatewayProtocolVersion)")
+                HStack(spacing: 12) {
+                    Text("Endpoint")
+                    Spacer(minLength: 8)
+                    Text(model.selectedAccount?.endpoint.rawValue ?? "—")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .textSelection(.enabled)
+                }
+                LabeledContent("Transport", value: transportName)
+                LabeledContent("Wire protocol", value: "v\(gatewayProtocolVersion)")
             }
 
             HorusActionRow(collapsesToIcons: true) {
                 Button("Reconnect", systemImage: "arrow.clockwise", action: model.reconnect)
                 Button("Add gateway", systemImage: "plus") { model.showsPairing = true }
+                Button("Rename", systemImage: "pencil") {
+                    renameDraft = model.selectedAccount?.displayName ?? ""
+                    showsRename = true
+                }
+                .disabled(model.selectedAccount == nil)
                 Button("Forget", systemImage: "trash", role: .destructive) {
                     confirmsForget = true
                 }
@@ -888,6 +906,18 @@ struct GatewayView: View {
         } message: {
             Text("You will need to pair with this gateway again.")
         }
+        .alert("Rename gateway", isPresented: $showsRename) {
+            TextField("Gateway name", text: $renameDraft)
+            Button("Cancel", role: .cancel) {}
+            Button("Rename") { model.renameSelectedGateway(renameDraft) }
+                .disabled(renameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    private var transportName: String {
+        guard let endpoint = model.selectedAccount?.endpoint else { return "—" }
+        if endpoint.usesWebSocket { return "WebSocket TLS" }
+        return endpoint.usesTLS ? "TLS" : "Loopback TCP"
     }
 }
 

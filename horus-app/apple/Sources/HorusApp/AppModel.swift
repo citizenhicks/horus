@@ -239,6 +239,7 @@ final class AppModel {
     var agentSnapshot: VersionedAgentConfig?
     var defaultAgentSnapshot: VersionedAgentConfig?
     var agentDraft: AgentComposition?
+    private var setupProviderDraft: ProviderConfig?
     var applyState: ApplyState = .idle
     var providerStatuses: [ProviderStatus] = []
     var providerAPIKey = ""
@@ -257,6 +258,7 @@ final class AppModel {
         @MainActor @Sendable (GatewayRequest) async throws -> Void
     @ObservationIgnored private var eventTask: Task<Void, Never>?
     @ObservationIgnored private var connectionGeneration = UUID()
+    @ObservationIgnored private var reconnectsOnActivation = false
     @ObservationIgnored private var pendingPairingAccount: GatewayAccount?
     @ObservationIgnored private var pendingDrafts: [String: String] = [:]
     @ObservationIgnored private var sessionRequestID: String?
@@ -354,6 +356,21 @@ final class AppModel {
             || providerRegistrationRequestID != nil
             || applyState == .applying
             || applyState == .restarting
+    }
+
+    var providerDraft: ProviderConfig? {
+        get { agentDraft?.provider ?? setupProviderDraft }
+        set {
+            guard let newValue else {
+                setupProviderDraft = nil
+                return
+            }
+            if agentDraft != nil {
+                agentDraft?.provider = newValue
+            } else {
+                setupProviderDraft = newValue
+            }
+        }
     }
 
     var contextFillFraction: Double {
@@ -532,9 +549,31 @@ final class AppModel {
         connect(to: account)
     }
 
+    func renameSelectedGateway(_ name: String) {
+        guard let account = selectedAccount else { return }
+        do {
+            let renamed = try store.rename(account, to: name)
+            guard let index = accounts.firstIndex(where: { $0.id == renamed.id }) else { return }
+            accounts[index] = renamed
+            showToast("Gateway renamed.", tone: .success)
+        } catch {
+            showToast(error.localizedDescription, tone: .error)
+        }
+    }
+
     func reconnect() {
         guard let account = selectedAccount else { return }
         connect(to: account)
+    }
+
+    func setSceneActive(_ active: Bool) {
+        guard active else {
+            reconnectsOnActivation = true
+            return
+        }
+        guard reconnectsOnActivation, pendingPairingAccount == nil else { return }
+        reconnectsOnActivation = false
+        reconnect()
     }
 
     func repairSelectedGateway() {
@@ -882,7 +921,7 @@ final class AppModel {
               let webSearch = status.webSearch.first
         else { return }
         let selectedModel = status.models.first
-        agentDraft?.provider = ProviderConfig(
+        providerDraft = status.selection ?? ProviderConfig(
             provider: status.provider,
             model: selectedModel?.id ?? "",
             baseUrl: status.defaultBaseUrl,
@@ -895,10 +934,10 @@ final class AppModel {
 
     func selectProviderModel(_ modelID: String) {
         guard let status = providerStatuses.first(where: {
-            $0.provider == agentDraft?.provider.provider
+            $0.provider == providerDraft?.provider
         }) else { return }
-        agentDraft?.provider.model = modelID
-        agentDraft?.provider.reasoningEffort = status.models
+        providerDraft?.model = modelID
+        providerDraft?.reasoningEffort = status.models
             .first(where: { $0.id == modelID })?
             .defaultReasoning
     }
@@ -915,7 +954,7 @@ final class AppModel {
         credentialRequestID = id
         providerActionState = .savingCredential(provider)
         let request: GatewayRequest
-        if let baseURL = agentDraft?.provider.baseUrl {
+        if let baseURL = providerDraft?.baseUrl {
             request = .setProviderEndpointCredential(
                 requestID: id,
                 provider: provider,
@@ -939,7 +978,8 @@ final class AppModel {
     }
 
     private func registerProvider(for target: ConfigurationTarget) {
-        guard selectedSessionID != nil, let config = agentDraft?.provider else { return }
+        if case .session = target, selectedSessionID == nil { return }
+        guard let config = providerDraft else { return }
         let id = requestID("provider")
         providerRegistrationRequestID = id
         providerRegistrationTarget = target
@@ -1284,10 +1324,23 @@ final class AppModel {
     }
 
     func applyGatewayCatalog(_ payload: ReadyPayload) {
+        let previousDefault = defaultAgentSnapshot
         providerStatuses = payload.providers
         modelChoices = payload.models
         middlewareFeatures = payload.middlewareFeatures
         defaultAgentSnapshot = payload.defaultConfig
+        if agentSnapshot == nil {
+            agentDraft = payload.defaultConfig.map {
+                refreshedAgentDraft(
+                    currentDraft: agentDraft,
+                    currentSnapshot: previousDefault,
+                    incomingSnapshot: $0
+                )
+            }
+        }
+        if providerDraft == nil, let provider = providerStatuses.first {
+            selectProvider(provider.provider)
+        }
     }
 
     private func applySessionReady(
@@ -1965,6 +2018,7 @@ final class AppModel {
             middlewareFeatures = []
             providerStatuses = []
             defaultAgentSnapshot = nil
+            setupProviderDraft = nil
         }
         providerAPIKey = ""
         providerActionState = .idle
@@ -1992,7 +2046,7 @@ final class AppModel {
         contributions = []
         toolCount = 0
         agentSnapshot = nil
-        agentDraft = nil
+        agentDraft = defaultAgentSnapshot?.config
         applyState = .idle
         configRequestID = nil
         cronTasks = []

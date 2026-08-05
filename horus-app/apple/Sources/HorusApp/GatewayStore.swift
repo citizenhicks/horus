@@ -41,6 +41,24 @@ final class GatewayStore {
         defaults.set(account.id.uuidString, forKey: selectedAccountKey)
     }
 
+    func rename(_ account: GatewayAccount, to rawName: String) throws -> GatewayAccount {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+              name.utf8.count <= 128,
+              !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else { throw StoreError.invalidDisplayName }
+
+        var accounts = loadAccounts()
+        guard let index = accounts.firstIndex(where: { $0.id == account.id }) else {
+            throw StoreError.missingAccount
+        }
+        var renamed = account
+        renamed.displayName = name
+        accounts[index] = renamed
+        defaults.set(try encoder.encode(accounts), forKey: accountsKey)
+        return renamed
+    }
+
     func token(for account: GatewayAccount) throws -> String {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
@@ -103,12 +121,16 @@ final class GatewayStore {
 
 extension GatewayStore {
     enum StoreError: LocalizedError {
+        case invalidDisplayName
+        case missingAccount
         case invalidToken
         case missingToken
         case keychain(OSStatus)
 
         var errorDescription: String? {
             switch self {
+            case .invalidDisplayName: "Use a gateway name between 1 and 128 characters."
+            case .missingAccount: "This gateway is no longer saved."
             case .invalidToken: "The gateway token is invalid."
             case .missingToken: "This gateway needs to be paired again."
             case .keychain(let status):

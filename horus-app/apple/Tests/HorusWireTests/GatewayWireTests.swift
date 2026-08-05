@@ -697,6 +697,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(endpoint.rawValue, "wss://gateway.example")
         XCTAssertEqual(endpoint.host, "gateway.example")
         XCTAssertEqual(endpoint.port, 443)
+        XCTAssertTrue(endpoint.usesTLS)
         XCTAssertTrue(endpoint.usesWebSocket)
         XCTAssertEqual(
             try GatewayEndpoint("wss://gateway.example:8443").rawValue,
@@ -704,6 +705,16 @@ final class GatewayWireTests: XCTestCase {
         )
         XCTAssertThrowsError(try GatewayEndpoint("ws://gateway.example"))
         XCTAssertThrowsError(try GatewayEndpoint("wss://gateway.example/chat"))
+    }
+
+    func testGatewayAccountsGetFriendlyDefaultNames() throws {
+        let quick = GatewayAccount(endpoint: try GatewayEndpoint(
+            "wss://pupils-convention-ban-format.trycloudflare.com"
+        ))
+        let named = GatewayAccount(endpoint: try GatewayEndpoint("wss://gateway.example"))
+
+        XCTAssertEqual(quick.displayName, "Cloudflare · pupils…format")
+        XCTAssertEqual(named.displayName, "gateway.example")
     }
 
     func testPairingSetupParsesValidatedEndpointAndCode() throws {

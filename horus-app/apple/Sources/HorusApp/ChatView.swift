@@ -226,7 +226,7 @@ private struct AgentCard: View {
     @Environment(\.horusPalette) private var palette
 
     var body: some View {
-        if let config = model.agentSnapshot?.config {
+        if let config = model.agentSnapshot?.config ?? model.defaultAgentSnapshot?.config {
             HorusCard {
                 VStack(spacing: 16) {
                     VStack(spacing: 10) {
@@ -1111,17 +1111,27 @@ struct FrontendWidgetView: View {
         if let content = widget.widget.content {
             Button(action: openDetail) {
                 badge
+                    .frame(
+                        minWidth: HorusStyle.iconButtonSize,
+                        minHeight: HorusStyle.iconButtonSize
+                    )
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .frame(minHeight: HorusStyle.iconButtonSize)
             .accessibilityLabel(accessibilityTitle)
             .popover(isPresented: $showsDetail) {
                 WidgetContentPopover(content: content, isPresented: $showsDetail)
             }
         } else if widget.widget.action != nil {
-            Button(action: submit) { badge }
+            Button(action: submit) {
+                badge
+                    .frame(
+                        minWidth: HorusStyle.iconButtonSize,
+                        minHeight: HorusStyle.iconButtonSize
+                    )
+                    .contentShape(Rectangle())
+            }
                 .buttonStyle(.plain)
-                .frame(minHeight: HorusStyle.iconButtonSize)
                 .accessibilityLabel(accessibilityTitle)
         } else {
             badge

@@ -125,7 +125,7 @@ struct GatewayEndpoint: Hashable, Codable, Sendable {
         try self.init(container.decode(String.self, forKey: .rawValue))
     }
 
-    var usesTLS: Bool { rawValue.hasPrefix("tls://") }
+    var usesTLS: Bool { rawValue.hasPrefix("tls://") || usesWebSocket }
 
     var usesWebSocket: Bool { rawValue.hasPrefix("wss://") }
 
@@ -138,7 +138,22 @@ struct GatewayEndpoint: Hashable, Codable, Sendable {
     }
 
     var displayName: String {
-        "\(host):\(port)"
+        if Self.isLoopback(host) {
+            #if os(macOS)
+            return "This Mac · \(port)"
+            #else
+            return "This device · \(port)"
+            #endif
+        }
+        let quickSuffix = ".trycloudflare.com"
+        if host.hasSuffix(quickSuffix) {
+            let words = host.dropLast(quickSuffix.count).split(separator: "-")
+            let tunnel = words.count > 1
+                ? "\(words[0])…\(words[words.count - 1])"
+                : String(words.first ?? "Tunnel")
+            return "Cloudflare · \(tunnel)"
+        }
+        return port == 443 ? host : "\(host):\(port)"
     }
 
     private static func isLoopback(_ host: String) -> Bool {

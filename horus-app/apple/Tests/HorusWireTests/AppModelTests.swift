@@ -185,6 +185,43 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.pairingCodeInfo)
     }
 
+    func testRenamingGatewayPersistsItsFriendlyName() throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let account = GatewayAccount(
+            endpoint: try GatewayEndpoint("wss://gateway.example"),
+            displayName: "Gateway"
+        )
+        defaults.set(try JSONEncoder().encode([account]), forKey: "paired-gateways")
+        defaults.set(account.id.uuidString, forKey: "selected-gateway")
+        let store = GatewayStore(defaults: defaults)
+        let model = AppModel(client: GatewayClient(), store: store)
+
+        model.renameSelectedGateway("Home gateway")
+
+        XCTAssertEqual(model.selectedAccount?.displayName, "Home gateway")
+        XCTAssertEqual(store.loadAccounts().first?.displayName, "Home gateway")
+    }
+
+    func testReactivationReplacesAStaleConnectionAndPreservesTheActiveChat() throws {
+        let model = try model()
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.selectedSessionID = "chat-1"
+        model.connectionState = .ready
+
+        model.setSceneActive(true)
+        XCTAssertEqual(model.connectionState, .ready)
+
+        model.setSceneActive(false)
+        model.setSceneActive(true)
+
+        XCTAssertEqual(model.connectionState, .connecting)
+        XCTAssertEqual(model.selectedSessionID, "chat-1")
+    }
+
     func testApprovalRemainsAvailableWhenSendFails() async throws {
         let suiteName = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -644,6 +681,59 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.pairingError)
         let requests = await recorder.requests()
         XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testEmptyGatewayCanRegisterItsFirstProviderWithoutAChat() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        model.applyGatewayCatalog(ReadyPayload(
+            sessions: [],
+            providers: [ProviderStatus(
+                provider: "openai_socket",
+                label: "OpenAI",
+                symbol: "sparkle",
+                description: "Persistent Responses API",
+                configured: true,
+                selection: nil,
+                auth: .apiKey,
+                defaultBaseUrl: nil,
+                defaultApiKeyEnv: "OPENAI_API_KEY",
+                models: [ProviderModel(
+                    id: "gpt-5.6-sol",
+                    label: "Sol",
+                    description: "Frontier capability",
+                    contextWindow: 1_050_000,
+                    reasoning: [ReasoningChoice(
+                        id: "high",
+                        label: "High",
+                        description: "Deep reasoning"
+                    )],
+                    defaultReasoning: "high"
+                )],
+                webSearch: [.off, .cached, .live]
+            )],
+            defaultConfig: nil,
+            models: [],
+            middlewareFeatures: [],
+            maxActiveSessions: 4
+        ))
+
+        XCTAssertNil(model.selectedSessionID)
+        XCTAssertNil(model.agentDraft)
+        XCTAssertEqual(model.providerDraft?.model, "gpt-5.6-sol")
+
+        model.saveProviderAsDefault()
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        guard case .registerProvider(_, let provider) = try XCTUnwrap(requests.first) else {
+            return XCTFail("Expected first-provider registration")
+        }
+        XCTAssertEqual(provider, model.providerDraft)
+
+        let defaultConfig = VersionedAgentConfig(revision: 1, config: composition())
+        model.applyGatewayCatalog(ready(defaultConfig: defaultConfig))
+        XCTAssertEqual(model.agentDraft, defaultConfig.config)
     }
 
     func testProviderSelectionUsesGatewayManifestDefaults() throws {

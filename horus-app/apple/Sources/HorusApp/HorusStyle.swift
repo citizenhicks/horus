@@ -351,15 +351,12 @@ extension View {
 
     /// Lets a row of badges scroll instead of squeezing when it outgrows the width.
     func scrollableRow() -> some View {
-        ViewThatFits(in: .horizontal) {
+        ScrollView(.horizontal) {
             fixedSize(horizontal: true, vertical: false)
-                .frame(maxWidth: .infinity, alignment: .center)
-            ScrollView(.horizontal) {
-                fixedSize(horizontal: true, vertical: false)
-            }
-            .scrollIndicators(.hidden)
-            .scrollBounceBehavior(.basedOnSize)
         }
+        .defaultScrollAnchor(.center, for: .alignment)
+        .scrollIndicators(.hidden)
+        .scrollBounceBehavior(.basedOnSize)
     }
 
     func horusGlass<S: Shape>(
