@@ -1,6 +1,6 @@
 import Foundation
 
-let gatewayProtocolVersion = 6
+let gatewayProtocolVersion = 7
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 
