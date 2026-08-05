@@ -275,6 +275,7 @@ async fn sandbox_commands_use_capability_dispatch() {
             capability: "sandbox".into(),
             command: "permissions".into(),
             arguments: String::new(),
+            target: None,
         })
         .expect("submit sandbox command");
     let event = agent.next_event().await.expect("sandbox command result");

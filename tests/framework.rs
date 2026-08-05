@@ -42,6 +42,7 @@ use horus::middleware::subagents::SubagentLauncher;
 use horus::middleware::subagents::Subagents;
 use horus::middleware::tools::Tools;
 use horus::protocol::EventMsg;
+use horus::protocol::MessageTarget;
 use horus::protocol::ModelEvent;
 use horus::protocol::Op;
 use horus::protocol::ReviewDecision;
@@ -123,6 +124,46 @@ async fn middleware_prompt_is_composed_once_per_agent() {
             .expect("requests")
             .iter()
             .all(|request| request.instructions == "test system prompt\n\ncapability prompt")
+    );
+}
+
+#[tokio::test]
+async fn live_messages_expose_their_durable_transcript_boundaries() {
+    let workspace = TempDir::new().expect("create workspace");
+    let model = Arc::new(ScriptedModel::new(vec![text_response("answer")]));
+    let mut agent = create_agent(test_config(workspace.path(), model, Vec::new()))
+        .await
+        .expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "question".into(),
+        })
+        .expect("submit turn");
+
+    let mut targets = Vec::new();
+    while let Some(event) = agent.next_event().await {
+        match event.msg {
+            EventMsg::UserMessage(message) => targets.push(message.message_target),
+            EventMsg::AgentMessage(message) => targets.push(message.message_target),
+            EventMsg::TurnComplete(_) => break,
+            EventMsg::Error(error) => panic!("{}", error.message),
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        targets,
+        [
+            Some(MessageTarget {
+                checkpoint_sequence: 1,
+                batch_item_count: 1,
+            }),
+            Some(MessageTarget {
+                checkpoint_sequence: 2,
+                batch_item_count: 1,
+            }),
+        ]
     );
 }
 
@@ -484,7 +525,27 @@ async fn steering_is_injected_before_native_compaction() {
         .expect("steer active turn");
     model.release.notify_one();
 
-    assert_eq!(final_message(&mut agent).await, "done");
+    let mut message = String::new();
+    let mut steered_target = None;
+    while let Some(event) = agent.next_event().await {
+        match event.msg {
+            EventMsg::UserMessage(event) if event.message == "steered" => {
+                steered_target = event.message_target;
+            }
+            EventMsg::AgentMessage(event) => message = event.message,
+            EventMsg::TurnComplete(_) => break,
+            EventMsg::Error(error) => panic!("{}", error.message),
+            _ => {}
+        }
+    }
+    assert_eq!(message, "done");
+    assert_eq!(
+        steered_target,
+        Some(MessageTarget {
+            checkpoint_sequence: 3,
+            batch_item_count: 1,
+        })
+    );
     let requests = scripted.compact_requests.lock().expect("compact requests");
     assert_eq!(requests.len(), 1);
     assert!(
@@ -841,7 +902,10 @@ async fn sqlite_persists_latest_checkpoint_transcript_and_fork_lineage() {
         )
         .await
         .expect("load transcript")
-        .into_items_chronological();
+        .into_positioned_items_chronological()
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
     let branch_transcript = store
         .transcript_page(
             "branch",
@@ -852,7 +916,10 @@ async fn sqlite_persists_latest_checkpoint_transcript_and_fork_lineage() {
         )
         .await
         .expect("load branch transcript")
-        .into_items_chronological();
+        .into_positioned_items_chronological()
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
 
     assert_eq!(
         (

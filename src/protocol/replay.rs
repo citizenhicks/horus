@@ -4,10 +4,12 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+use crate::backend::model::tool_complete_boundaries;
 use crate::protocol::AgentMessageEvent;
 use crate::protocol::AgentMessagePhase;
 use crate::protocol::AgentReasoningContentDeltaEvent;
 use crate::protocol::EventMsg;
+use crate::protocol::MessageTarget;
 use crate::protocol::ToolCallBeginEvent;
 use crate::protocol::ToolCallEndEvent;
 use crate::protocol::UserMessageEvent;
@@ -24,17 +26,25 @@ pub(crate) fn is_internal_message(message: &Value) -> bool {
     internal_message_kind(message).is_some()
 }
 
-pub(crate) fn events(context: &[Value], session_id: &str) -> Vec<EventMsg> {
+pub(crate) fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Vec<EventMsg> {
     let mut events = Vec::new();
     let mut tools = BTreeMap::new();
     let mut turn = 0;
     let mut item = 0;
-    for value in context {
+    let complete = tool_complete_boundaries(context.iter().map(|(_, value)| value));
+    for (index, (target, value)) in context.iter().enumerate() {
+        let message_target = complete
+            .binary_search(&(index + 1))
+            .is_ok()
+            .then_some(*target);
         let turn_id = format!("history-{turn}");
         if let Some(text) = message_text(value, "user") {
             if !is_internal_message(value) {
                 turn += 1;
-                events.push(EventMsg::UserMessage(UserMessageEvent { message: text }));
+                events.push(EventMsg::UserMessage(UserMessageEvent {
+                    message: text,
+                    message_target,
+                }));
             }
             continue;
         }
@@ -50,6 +60,7 @@ pub(crate) fn events(context: &[Value], session_id: &str) -> Vec<EventMsg> {
                 events.push(EventMsg::AgentMessage(AgentMessageEvent {
                     message,
                     phase: Some(AgentMessagePhase::FinalAnswer),
+                    message_target,
                 }));
             }
             item += 1;
@@ -181,7 +192,7 @@ mod tests {
 
     #[test]
     fn replay_uses_only_neutral_reasoning_and_hides_internal_messages() {
-        let history = [
+        let history = vec![
             serde_json::json!({"role": "user", "content": "hello"}),
             serde_json::json!({
                 "role": "assistant",
@@ -190,7 +201,19 @@ mod tests {
                 "_anthropic_content": "provider-private"
             }),
             internal_user_message("compaction", "hidden"),
-        ];
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            (
+                MessageTarget {
+                    checkpoint_sequence: 4,
+                    batch_item_count: index + 1,
+                },
+                item,
+            )
+        })
+        .collect::<Vec<_>>();
 
         let replayed = events(&history, "session");
 
@@ -203,6 +226,14 @@ mod tests {
         assert!(matches!(
             &replayed[2],
             EventMsg::AgentMessage(event) if event.message == "done"
+        ));
+        assert!(matches!(
+            &replayed[0],
+            EventMsg::UserMessage(event)
+                if event.message_target == Some(MessageTarget {
+                    checkpoint_sequence: 4,
+                    batch_item_count: 1,
+                })
         ));
     }
 }

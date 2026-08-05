@@ -22,7 +22,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use crate::{Error, Result};
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
@@ -958,6 +958,7 @@ mod tests {
                     capability: "subagents".into(),
                     command: "subagents".into(),
                     arguments: String::new(),
+                    target: None,
                 },
             },
         });
@@ -967,6 +968,29 @@ mod tests {
             serde_json::from_slice(&encoded).expect("decode nested submission");
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn protocol_v8_rejects_an_untargeted_legacy_capability_shape() {
+        let frame = serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "type": "submit",
+            "session_id": "session-a",
+            "submission": {
+                "id": "submission-a",
+                "op": {
+                    "type": "capability_command",
+                    "capability": "sessions",
+                    "command": "fork",
+                    "arguments": ""
+                }
+            }
+        });
+
+        let error = serde_json::from_value::<ClientFrame>(frame)
+            .expect_err("v8 capability commands require an explicit target field");
+
+        assert!(error.to_string().contains("missing field `target`"));
     }
 
     #[test]
@@ -1322,7 +1346,8 @@ mod tests {
                             "type": "capability_command",
                             "capability": "subagents",
                             "command": "subagents",
-                            "arguments": ""
+                            "arguments": "",
+                            "target": null
                         }
                     }],
                     "references": [],

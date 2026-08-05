@@ -378,10 +378,11 @@ impl CheckpointStore for SqliteCheckpoint {
                         [&parent_session_id],
                         |row| row.get::<_, i64>(0),
                     )
-                    .optional()?;
-                if durable_parent != Some(parent_sequence) {
+                    .optional()?
+                    .ok_or_else(|| Error::Checkpoint("fork parent does not exist".into()))?;
+                if parent_sequence > durable_parent {
                     return Err(Error::Checkpoint(
-                        "parent checkpoint changed before the fork".into(),
+                        "fork point is newer than the parent checkpoint".into(),
                     ));
                 }
                 transaction.execute(
@@ -766,6 +767,64 @@ mod tests {
                     .collect::<Vec<_>>(),
             ),
             (context.clone(), context.clone(), vec![&context, &context])
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_preserves_a_historical_parent_sequence() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+        let mut parent = Checkpoint::empty("parent");
+        store.save(&parent, &[]).await.expect("save parent");
+        for sequence in 1..=2 {
+            parent.sequence = sequence;
+            store.save(&parent, &[]).await.expect("advance parent");
+        }
+
+        let fork = store
+            .fork("parent", 1, &Checkpoint::empty("child"))
+            .await
+            .expect("fork historical checkpoint");
+
+        assert_eq!(fork.parent_sequence, Some(1));
+    }
+
+    #[tokio::test]
+    async fn fork_rejects_a_future_parent_sequence() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+        store
+            .save(&Checkpoint::empty("parent"), &[])
+            .await
+            .expect("save parent");
+
+        let error = store
+            .fork("parent", 1, &Checkpoint::empty("child"))
+            .await
+            .expect_err("future fork must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "checkpoint error: fork point is newer than the parent checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_rejects_a_missing_parent() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+
+        let error = store
+            .fork("missing", 0, &Checkpoint::empty("child"))
+            .await
+            .expect_err("missing parent must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "checkpoint error: fork parent does not exist"
         );
     }
 

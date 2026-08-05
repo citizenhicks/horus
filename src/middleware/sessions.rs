@@ -13,6 +13,8 @@ use crate::backend::checkpoint::SessionCursor;
 use crate::backend::checkpoint::SessionPage;
 use crate::backend::checkpoint::SessionPageRequest;
 use crate::backend::checkpoint::SessionSummary;
+use crate::backend::checkpoint::TranscriptPageRequest;
+use crate::protocol::EventMsg;
 use crate::protocol::FrontendCommand;
 use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendEvent;
@@ -20,7 +22,9 @@ use crate::protocol::FrontendPickerOption;
 use crate::protocol::FrontendSlot;
 use crate::protocol::FrontendTone;
 use crate::protocol::FrontendWidget;
+use crate::protocol::MessageTarget;
 use crate::protocol::Op;
+use crate::protocol::replay_events;
 
 const DEFAULT_PAGE_SIZE: usize = 100;
 
@@ -83,6 +87,7 @@ impl Middleware for Sessions {
                     capability: "sessions".into(),
                     command: "fork".into(),
                     arguments: String::new(),
+                    target: None,
                 }),
             }],
             references: Vec::new(),
@@ -112,45 +117,157 @@ async fn fork(context: MiddlewareCommandContext<'_>) -> Result<MiddlewareCommand
             FrontendTone::Warning,
         ));
     }
-    let checkpoint = manual_fork_checkpoint(context.checkpoint);
+    let target = context.target;
+    let through_sequence = target
+        .as_ref()
+        .map_or(context.checkpoint.sequence, |target| {
+            target.checkpoint_sequence
+        });
+    let items = transcript_items_through(&context, through_sequence).await?;
+    let Some(target) = target else {
+        let options = fork_options(&items, context.session_id);
+        if options.is_empty() {
+            return Ok(MiddlewareCommandOutput::render(
+                "sessions",
+                "no messages to fork",
+                FrontendTone::Neutral,
+            ));
+        }
+        return Ok(MiddlewareCommandOutput::events(vec![
+            FrontendEvent::Picker {
+                title: "Fork chat from message".into(),
+                options,
+            },
+        ]));
+    };
+    let transcript = fork_prefix(items, &target, context.session_id)?;
+    let checkpoint = manual_fork_checkpoint(context.checkpoint, transcript);
     context
         .checkpoints
         .fork(
             &context.checkpoint.session_id,
-            context.checkpoint.sequence,
+            target.checkpoint_sequence,
             &checkpoint,
         )
         .await?;
-    Ok(MiddlewareCommandOutput::events(vec![
-        FrontendEvent::Render {
-            capability: "sessions".into(),
-            block: crate::protocol::FrontendBlock {
-                id: None,
-                group: None,
-                append: false,
-                pending: false,
-                text: format!("◇ forked chat {}", compact_id(&checkpoint.session_id)),
-                format: crate::protocol::FrontendBlockFormat::PlainText,
-                tone: FrontendTone::Success,
-            },
-        },
-        FrontendEvent::Picker {
-            title: "Fork created".into(),
-            options: vec![FrontendPickerOption {
-                label: "Open fork".into(),
-                description: "Continue in the new chat".into(),
-                detail: String::new(),
-                op: Op::ResumeSession {
-                    session_id: checkpoint.session_id,
-                },
-            }],
-        },
-    ]))
+    // A picker here waits for a choice the reader has already made. The fork is listed with
+    // every other chat, so a confirmation that scrolls away is enough.
+    Ok(MiddlewareCommandOutput::render(
+        "sessions",
+        format!("◇ forked chat {}", compact_id(&checkpoint.session_id)),
+        FrontendTone::Success,
+    ))
 }
 
-fn manual_fork_checkpoint(parent: &Checkpoint) -> Checkpoint {
+async fn transcript_items_through(
+    context: &MiddlewareCommandContext<'_>,
+    through_sequence: u64,
+) -> Result<Vec<(MessageTarget, serde_json::Value)>> {
+    let mut before_sequence =
+        Some(through_sequence.checked_add(1).ok_or_else(|| {
+            Error::Checkpoint("fork sequence exceeds the supported range".into())
+        })?);
+    let mut pages = Vec::new();
+    loop {
+        let page = context
+            .checkpoints
+            .transcript_page(
+                context.session_id,
+                TranscriptPageRequest {
+                    before_sequence,
+                    max_batches: DEFAULT_PAGE_SIZE,
+                },
+            )
+            .await?;
+        before_sequence = page.next_before_sequence;
+        pages.push(page.into_positioned_items_chronological());
+        if before_sequence.is_none() {
+            break;
+        }
+    }
+    Ok(pages.into_iter().rev().flatten().collect())
+}
+
+fn fork_options(
+    items: &[(MessageTarget, serde_json::Value)],
+    session_id: &str,
+) -> Vec<FrontendPickerOption> {
+    replay_events(items, session_id)
+        .into_iter()
+        .rev()
+        .filter_map(|event| {
+            let (description, message, target) = match event {
+                EventMsg::UserMessage(message) => {
+                    ("User message", message.message, message.message_target?)
+                }
+                EventMsg::AgentMessage(message) => (
+                    "Assistant message",
+                    message.message,
+                    message.message_target?,
+                ),
+                _ => return None,
+            };
+            Some(FrontendPickerOption {
+                label: compact_message(&message),
+                description: description.into(),
+                detail: String::new(),
+                op: Op::CapabilityCommand {
+                    capability: "sessions".into(),
+                    command: "fork".into(),
+                    arguments: String::new(),
+                    target: Some(target),
+                },
+            })
+        })
+        .collect()
+}
+
+fn fork_prefix(
+    items: Vec<(MessageTarget, serde_json::Value)>,
+    target: &MessageTarget,
+    session_id: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let index = items
+        .iter()
+        .position(|(position, _)| position == target)
+        .ok_or_else(invalid_fork_target)?;
+    let prefix = &items[..=index];
+    if !replay_events(prefix, session_id)
+        .into_iter()
+        .any(|event| match event {
+            EventMsg::UserMessage(message) => message.message_target.as_ref() == Some(target),
+            EventMsg::AgentMessage(message) => message.message_target.as_ref() == Some(target),
+            _ => false,
+        })
+    {
+        return Err(invalid_fork_target());
+    }
+    Ok(items
+        .into_iter()
+        .take(index + 1)
+        .map(|(_, item)| item)
+        .collect())
+}
+
+fn invalid_fork_target() -> Error {
+    Error::Checkpoint("fork target is not a safe durable message boundary".into())
+}
+
+fn compact_message(message: &str) -> String {
+    message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(42)
+        .collect::<String>()
+        .trim_end()
+        .into()
+}
+
+fn manual_fork_checkpoint(parent: &Checkpoint, context: Vec<serde_json::Value>) -> Checkpoint {
     let mut checkpoint = Checkpoint::empty(Uuid::new_v4().to_string());
-    checkpoint.context.clone_from(&parent.context);
+    checkpoint.context = context;
     checkpoint
         .first_user_message
         .clone_from(&parent.first_user_message);
@@ -235,6 +352,7 @@ fn resume_page_options(
                 capability: "sessions".into(),
                 command: "resume".into(),
                 arguments: serde_json::to_string(&cursor)?,
+                target: None,
             },
         });
     }
@@ -261,17 +379,7 @@ fn resume_option(
                 compact_id(&session.session_id)
             )
         },
-        |message| {
-            message
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(42)
-                .collect::<String>()
-                .trim_end()
-                .into()
-        },
+        |message| compact_message(&message),
     );
     Some(FrontendPickerOption {
         label,
@@ -319,7 +427,109 @@ mod tests {
                 capability: "sessions".into(),
                 command: "fork".into(),
                 arguments: String::new(),
+                target: None,
             })
+        );
+    }
+
+    #[test]
+    fn fork_picker_lists_only_safe_user_and_assistant_messages() {
+        let items = [
+            serde_json::json!({"role": "user", "content": "Start here"}),
+            serde_json::json!({"type": "function_call", "call_id": "call-1", "name": "read"}),
+            serde_json::json!({"type": "function_call_output", "call_id": "call-1", "output": "done"}),
+            serde_json::json!({"role": "assistant", "content": "Finished"}),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            (
+                MessageTarget {
+                    checkpoint_sequence: index as u64 + 1,
+                    batch_item_count: 1,
+                },
+                item,
+            )
+        })
+        .collect::<Vec<_>>();
+
+        let targets = fork_options(&items, "session")
+            .into_iter()
+            .map(|option| match option.op {
+                Op::CapabilityCommand {
+                    target: Some(target),
+                    ..
+                } => target,
+                operation => panic!("expected targeted fork, got {operation:?}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(targets, [items[3].0, items[0].0]);
+    }
+
+    #[test]
+    fn fork_prefix_includes_the_selected_batch_item() {
+        let items = vec![
+            (
+                MessageTarget {
+                    checkpoint_sequence: 1,
+                    batch_item_count: 1,
+                },
+                serde_json::json!({"role": "user", "content": "Question"}),
+            ),
+            (
+                MessageTarget {
+                    checkpoint_sequence: 2,
+                    batch_item_count: 1,
+                },
+                serde_json::json!({"role": "assistant", "content": "Answer"}),
+            ),
+            (
+                MessageTarget {
+                    checkpoint_sequence: 2,
+                    batch_item_count: 2,
+                },
+                serde_json::json!({"type": "function_call", "call_id": "call-1", "name": "read"}),
+            ),
+        ];
+
+        let target = items[1].0;
+        let prefix = fork_prefix(items, &target, "session").expect("fork prefix");
+
+        assert_eq!(
+            prefix,
+            [
+                serde_json::json!({"role": "user", "content": "Question"}),
+                serde_json::json!({"role": "assistant", "content": "Answer"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn fork_prefix_rejects_a_message_with_an_open_tool_call() {
+        let items = vec![
+            (
+                MessageTarget {
+                    checkpoint_sequence: 1,
+                    batch_item_count: 1,
+                },
+                serde_json::json!({"type": "function_call", "call_id": "call-1", "name": "read"}),
+            ),
+            (
+                MessageTarget {
+                    checkpoint_sequence: 1,
+                    batch_item_count: 2,
+                },
+                serde_json::json!({"role": "assistant", "content": "Working"}),
+            ),
+        ];
+        let target = items[1].0;
+
+        let error = fork_prefix(items, &target, "session").expect_err("unsafe fork must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "checkpoint error: fork target is not a safe durable message boundary"
         );
     }
 
@@ -486,7 +696,7 @@ mod tests {
             ..crate::protocol::SessionContext::default()
         };
 
-        let fork = manual_fork_checkpoint(&parent);
+        let fork = manual_fork_checkpoint(&parent, parent.context.clone());
 
         assert_eq!(fork.context, parent.context);
         assert_eq!(fork.first_user_message, parent.first_user_message);

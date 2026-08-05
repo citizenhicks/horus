@@ -81,7 +81,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
                 },
             )
             .await?
-            .into_items_chronological();
+            .into_positioned_items_chronological();
         replay_events(&transcript, &config.session_id)
     };
     if let Some(turn_id) = &state.active_turn_id {

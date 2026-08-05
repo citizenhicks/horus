@@ -214,12 +214,18 @@ fn validate_submission(submission: &Submission) -> Result<()> {
             capability,
             command,
             arguments,
+            target,
         } => {
             validate_identifier("capability ID", capability, MAX_OPERATION_BYTES)?;
             validate_identifier("command", command, MAX_OPERATION_BYTES)?;
             if arguments.len() > MAX_COMMAND_ARGUMENT_BYTES {
                 return Err(Error::Config(
                     "middleware command arguments exceed size limit".into(),
+                ));
+            }
+            if target.is_some_and(|target| target.batch_item_count == 0) {
+                return Err(Error::Config(
+                    "message target item count must be positive".into(),
                 ));
             }
             Ok(())
@@ -390,8 +396,9 @@ impl Runner {
                     capability,
                     command,
                     arguments,
+                    target,
                 } => {
-                    self.capability_command(submission.id, capability, command, arguments)
+                    self.capability_command(submission.id, capability, command, arguments, target)
                         .await?;
                 }
                 Op::SetModel { route } => {
@@ -476,6 +483,7 @@ impl Runner {
         capability: String,
         command: String,
         arguments: String,
+        target: Option<crate::protocol::MessageTarget>,
     ) -> Result<()> {
         let output = self
             .config
@@ -485,6 +493,7 @@ impl Runner {
                 MiddlewareCommandContext {
                     command: &command,
                     arguments: &arguments,
+                    target,
                     session_id: &self.config.session_id,
                     session_context: &self.config.session_context,
                     checkpoint: &self.state,
@@ -512,7 +521,7 @@ impl Runner {
         Ok(())
     }
 
-    async fn save(&mut self) -> Result<()> {
+    async fn save(&mut self) -> Result<u64> {
         let previous_sequence = self.state.sequence;
         self.state.sequence += 1;
         if let Err(error) = self
@@ -525,7 +534,7 @@ impl Runner {
             return Err(error);
         }
         self.transcript_delta.clear();
-        Ok(())
+        Ok(self.state.sequence)
     }
 
     fn push_context(&mut self, item: Value) {

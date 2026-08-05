@@ -21,6 +21,7 @@ use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendEvent;
 use crate::protocol::FrontendTone;
+use crate::protocol::MessageTarget;
 use crate::protocol::SessionContext;
 use crate::protocol::TokenUsage;
 use crate::protocol::ToolCallBeginEvent;
@@ -66,6 +67,7 @@ pub struct ModelContext<'a> {
     pub model_step: usize,
     pub context_window: i64,
     pub instructions: &'a str,
+    pub(crate) checkpoint_sequence: u64,
     pub(crate) input: &'a mut Vec<Value>,
     pub(crate) transcript_delta: &'a mut Vec<Value>,
     pub queued_input: &'a mut Vec<String>,
@@ -91,9 +93,14 @@ impl ModelContext<'_> {
     }
 
     /// Appends durable input to model context and its transcript journal.
-    pub fn push_input(&mut self, item: Value) {
+    pub fn push_input(&mut self, item: Value) -> MessageTarget {
         self.input.push(item.clone());
         self.transcript_delta.push(item);
+        *self.checkpoint_changed = true;
+        MessageTarget {
+            checkpoint_sequence: self.checkpoint_sequence + 1,
+            batch_item_count: self.transcript_delta.len(),
+        }
     }
 
     /// Estimates serialized model input at four bytes per token.
@@ -171,6 +178,7 @@ pub struct SessionEndContext {
 pub struct MiddlewareCommandContext<'a> {
     pub command: &'a str,
     pub arguments: &'a str,
+    pub target: Option<MessageTarget>,
     pub session_id: &'a str,
     pub session_context: &'a SessionContext,
     pub checkpoint: &'a Checkpoint,

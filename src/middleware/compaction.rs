@@ -1,6 +1,5 @@
 //! Context compaction policy and provider routing.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::Middleware;
@@ -16,6 +15,7 @@ use crate::backend::model::CompactOutput;
 use crate::backend::model::CompactRequest;
 use crate::backend::model::ModelRequest;
 use crate::backend::model::internal_user_message;
+use crate::backend::model::tool_complete_boundaries;
 use crate::backend::model::user_message;
 use crate::protocol::EventMsg;
 use crate::protocol::FrontendBlock;
@@ -188,26 +188,10 @@ fn recent_cut(input: &[Value], keep_tokens: usize) -> Option<usize> {
 }
 
 fn safe_boundaries(input: &[Value]) -> Vec<usize> {
-    let mut open_calls = BTreeSet::new();
-    let mut safe = Vec::new();
-    for (index, item) in input.iter().enumerate() {
-        match item.get("type").and_then(Value::as_str) {
-            Some("function_call") => {
-                open_calls.insert(call_id(item, index));
-            }
-            Some("function_call_output") => {
-                if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
-                    open_calls.remove(call_id);
-                }
-            }
-            Some(_) | None => {}
-        }
-        let boundary = index + 1;
-        if open_calls.is_empty() && (boundary == input.len() || safe_start(&input[boundary])) {
-            safe.push(boundary);
-        }
-    }
-    safe
+    tool_complete_boundaries(input)
+        .into_iter()
+        .filter(|&boundary| boundary == input.len() || safe_start(&input[boundary]))
+        .collect()
 }
 
 fn safe_start(item: &Value) -> bool {
@@ -219,13 +203,6 @@ fn safe_start(item: &Value) -> bool {
         ),
         Some(_) => false,
     }
-}
-
-fn call_id(item: &Value, index: usize) -> String {
-    item.get("call_id")
-        .and_then(Value::as_str)
-        .filter(|call_id| !call_id.is_empty())
-        .map_or_else(|| format!("missing-{index}"), str::to_string)
 }
 
 fn summary_prompt(history: &[Value]) -> Option<String> {

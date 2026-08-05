@@ -365,6 +365,7 @@ impl UiCatalog {
                     capability: capability.clone(),
                     command: command.name.clone(),
                     arguments: arguments.to_string(),
+                    target: None,
                 })
             }
         })

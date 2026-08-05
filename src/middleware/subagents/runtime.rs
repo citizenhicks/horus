@@ -347,7 +347,7 @@ impl Shared {
                 },
             )
             .await?
-            .into_items_chronological();
+            .into_positioned_items_chronological();
         Ok(replay_events(&transcript, &session_id))
     }
 
@@ -553,6 +553,7 @@ fn picker_options(tree: &Tree) -> Vec<FrontendPickerOption> {
                 capability: "subagents".into(),
                 command: "subagents".into(),
                 arguments: path.clone(),
+                target: None,
             },
         })
         .collect()

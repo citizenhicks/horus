@@ -133,17 +133,17 @@ impl Middleware for Steering {
         Box::pin(async move {
             let queued = std::mem::take(context.queued_input);
             if !queued.is_empty() {
-                *context.checkpoint_changed = true;
                 context
                     .events
                     .push(EventMsg::Frontend(self.queued_widget(&[])));
             }
             for message in queued {
                 let item = user_message(&message);
+                let message_target = context.push_input(item);
                 context.events.push(EventMsg::UserMessage(UserMessageEvent {
                     message: message.clone(),
+                    message_target: Some(message_target),
                 }));
-                context.push_input(item);
             }
             Ok(())
         })

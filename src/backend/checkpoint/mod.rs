@@ -11,6 +11,7 @@ use crate::Error;
 use crate::Result;
 use crate::backend::model::ToolCall;
 use crate::backend::sandbox::NetworkAccess;
+use crate::protocol::MessageTarget;
 use crate::protocol::SessionContext;
 use crate::protocol::TokenUsage;
 
@@ -134,13 +135,27 @@ pub struct TranscriptPage {
 }
 
 impl TranscriptPage {
-    /// Flattens this newest-first page into chronological transcript items.
+    /// Flattens this newest-first page into chronological items with durable positions.
     #[must_use]
-    pub fn into_items_chronological(self) -> Vec<Value> {
+    pub fn into_positioned_items_chronological(self) -> Vec<(MessageTarget, Value)> {
         self.batches
             .into_iter()
             .rev()
-            .flat_map(|batch| batch.items)
+            .flat_map(|batch| {
+                batch
+                    .items
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, item)| {
+                        (
+                            MessageTarget {
+                                checkpoint_sequence: batch.sequence,
+                                batch_item_count: index + 1,
+                            },
+                            item,
+                        )
+                    })
+            })
             .collect()
     }
 }

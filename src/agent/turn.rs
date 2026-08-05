@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -15,6 +16,7 @@ use crate::Error;
 use crate::Result;
 use crate::backend::model::ModelEventSink;
 use crate::backend::model::ModelRequest;
+use crate::backend::model::tool_complete_boundaries;
 use crate::backend::model::user_message;
 use crate::backend::sandbox::SandboxAuthorization;
 use crate::middleware::AfterModelContext;
@@ -25,6 +27,7 @@ use crate::protocol::AgentMessagePhase;
 use crate::protocol::ErrorEvent;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
+use crate::protocol::MessageTarget;
 use crate::protocol::Submission;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsageInfo;
@@ -89,18 +92,23 @@ impl Runner {
             }),
         )
         .await?;
-        self.emit(
-            &submission_id,
-            EventMsg::UserMessage(UserMessageEvent {
-                message: message.clone(),
-            }),
-        )
-        .await?;
         if self.state.first_user_message.is_none() && !message.trim().is_empty() {
             self.state.first_user_message = Some(message.clone());
         }
         self.push_context(user_message(&message));
-        self.save().await?;
+        let batch_item_count = self.transcript_delta.len();
+        let checkpoint_sequence = self.save().await?;
+        self.emit(
+            &submission_id,
+            EventMsg::UserMessage(UserMessageEvent {
+                message: message.clone(),
+                message_target: Some(MessageTarget {
+                    checkpoint_sequence,
+                    batch_item_count,
+                }),
+            }),
+        )
+        .await?;
         self.continue_turn(commands, submission_id, turn_id).await
     }
 
@@ -128,6 +136,7 @@ impl Runner {
             model_step,
             context_window: self.config.context_window,
             instructions: &self.system_prompt,
+            checkpoint_sequence: self.state.sequence,
             input: &mut self.state.context,
             transcript_delta: &mut self.transcript_delta,
             queued_input: &mut self.state.pending_input,
@@ -165,17 +174,17 @@ impl Runner {
             self.state.last_usage = Some(last_usage);
         }
         checkpoint_changed |= usage_changed;
-        for event in middleware_events {
-            self.emit(submission_id, event).await?;
-        }
-        if usage_changed {
-            self.emit_usage(submission_id)?;
-        }
         if !queued_during_middleware.is_empty() {
             self.state
                 .pending_input
                 .append(&mut queued_during_middleware);
             self.save().await?;
+            for event in middleware_events {
+                self.emit(submission_id, event).await?;
+            }
+            if usage_changed {
+                self.emit_usage(submission_id)?;
+            }
             return Ok(BeforeModel::Repeat);
         }
         if !self.state.pending_input.is_empty() {
@@ -185,6 +194,12 @@ impl Runner {
         }
         if checkpoint_changed {
             self.save().await?;
+        }
+        for event in middleware_events {
+            self.emit(submission_id, event).await?;
+        }
+        if usage_changed {
+            self.emit_usage(submission_id)?;
         }
         Ok(BeforeModel::Ready)
     }
@@ -290,7 +305,16 @@ impl Runner {
                 self.emit(&submission_id, event).await?;
             }
             checked_add_usage(&mut self.state.total_usage, &output.usage)?;
+            let context_before = self.state.context.len();
+            let batch_before = self.transcript_delta.len();
+            let message_index = output.output.iter().rposition(has_visible_output_text);
             self.extend_context(output.output);
+            let message_boundary = message_index.map(|index| context_before + index + 1);
+            let message_is_safe = message_boundary.is_some_and(|boundary| {
+                tool_complete_boundaries(&self.state.context)
+                    .binary_search(&boundary)
+                    .is_ok()
+            });
             self.state.pending_tools.clone_from(&output.tool_calls);
             self.state.last_usage = Some(output.usage);
             let no_tools = output.tool_calls.is_empty();
@@ -309,7 +333,7 @@ impl Runner {
             if complete {
                 self.state.active_turn_id = None;
             }
-            self.save().await?;
+            let checkpoint_sequence = self.save().await?;
             self.emit_usage(&submission_id)?;
             if !output.text.is_empty() {
                 last_agent_message = Some(output.text.clone());
@@ -318,6 +342,12 @@ impl Runner {
                     EventMsg::AgentMessage(AgentMessageEvent {
                         message: output.text,
                         phase: Some(AgentMessagePhase::FinalAnswer),
+                        message_target: message_index.filter(|_| message_is_safe).map(|index| {
+                            MessageTarget {
+                                checkpoint_sequence,
+                                batch_item_count: batch_before + index + 1,
+                            }
+                        }),
                     }),
                 )
                 .await?;
@@ -476,6 +506,24 @@ impl Runner {
         }
         Ok(())
     }
+}
+
+fn has_visible_output_text(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("message")
+        && item.get("role").and_then(Value::as_str) == Some("assistant")
+        && item.get("phase").and_then(Value::as_str) != Some("commentary")
+        && item
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("output_text")
+                    && part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+            })
 }
 
 fn checked_add_usage(

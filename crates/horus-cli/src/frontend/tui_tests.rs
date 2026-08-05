@@ -540,6 +540,7 @@ fn snapshot_preview_scrolls_with_the_mouse_wheel() {
                 .map(|index| RenderedEvent {
                     event: EventMsg::UserMessage(horus::protocol::UserMessageEvent {
                         message: format!("subagent row {index}"),
+                        message_target: None,
                     }),
                     blocks: Vec::new(),
                 })
@@ -745,6 +746,7 @@ fn final_message_replaces_an_incomplete_stream() {
         EventMsg::AgentMessage(horus::protocol::AgentMessageEvent {
             message: "complete answer".into(),
             phase: Some(AgentMessagePhase::FinalAnswer),
+            message_target: None,
         }),
         Vec::new(),
     );
@@ -762,6 +764,7 @@ fn gateway_history_preserves_child_diff_rendering() {
     let message = EventMsg::AgentMessage(horus::protocol::AgentMessageEvent {
         message: "changed the file".into(),
         phase: Some(AgentMessagePhase::FinalAnswer),
+        message_target: None,
     });
     let history_event = EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent {
         events: vec![message.clone()],

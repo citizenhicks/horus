@@ -1,6 +1,7 @@
 //! The small event protocol shared by agent frontends.
 
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
 
 pub(crate) use self::replay::{
@@ -74,11 +75,21 @@ pub enum Op {
         capability: String,
         command: String,
         arguments: String,
+        #[serde(deserialize_with = "required_option")]
+        target: Option<MessageTarget>,
     },
     /// Selects one immutable registered model route.
     SetModel { route: String },
     /// Requests that the frontend reopen an existing session.
     ResumeSession { session_id: String },
+}
+
+fn required_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
 }
 
 /// An event emitted to a frontend.
@@ -454,15 +465,42 @@ pub struct TurnAbortedEvent {
     pub reason: String,
 }
 
+/// Exact durable transcript prefix selected by a message action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageTarget {
+    /// Durable checkpoint sequence containing the selected message.
+    pub checkpoint_sequence: u64,
+    /// One-based item count within the checkpoint's transcript batch.
+    #[serde(deserialize_with = "positive_usize")]
+    pub batch_item_count: usize,
+}
+
+fn positive_usize<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom(
+            "message target item count must be positive",
+        ));
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserMessageEvent {
     pub message: String,
+    #[serde(deserialize_with = "required_option")]
+    pub message_target: Option<MessageTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentMessageEvent {
     pub message: String,
     pub phase: Option<AgentMessagePhase>,
+    #[serde(deserialize_with = "required_option")]
+    pub message_target: Option<MessageTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

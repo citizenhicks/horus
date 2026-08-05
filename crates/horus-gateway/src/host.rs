@@ -2446,11 +2446,13 @@ mod tests {
             capability: "subagents".into(),
             command: "subagents".into(),
             arguments: String::new(),
+            target: None,
         };
         let event = EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent {
             events: vec![
                 EventMsg::UserMessage(horus::protocol::UserMessageEvent {
                     message: "inspect".into(),
+                    message_target: None,
                 }),
                 EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent {
                     events: vec![EventMsg::Frontend(FrontendEvent::Widget {
