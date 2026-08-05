@@ -225,6 +225,59 @@ pub struct FrontendContribution {
     pub active_input: Option<FrontendActiveInput>,
 }
 
+/// One middleware entry and its frontend-neutral configuration controls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MiddlewareFeature {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub required: bool,
+    pub settings: Vec<FrontendSetting>,
+}
+
+/// One schema-advertised setting rendered by a thin frontend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendSetting {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    #[serde(flatten)]
+    pub kind: FrontendSettingKind,
+}
+
+/// Generic control metadata for a schema-advertised setting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FrontendSettingKind {
+    Integer {
+        min: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<i64>,
+        step: i64,
+    },
+    Select {
+        options: Vec<FrontendSettingOption>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unset_label: Option<String>,
+    },
+}
+
+/// One exact value in a schema-advertised select control.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendSettingOption {
+    pub value: String,
+    pub label: String,
+    pub description: String,
+}
+
+/// Scalar value accepted by the generic setting controls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FrontendSettingValue {
+    Integer(i64),
+    String(String),
+}
+
 /// How normal composer input is submitted while a turn is active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrontendActiveInput {
@@ -565,6 +618,44 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn middleware_settings_have_a_generic_wire_shape() {
+        let feature = MiddlewareFeature {
+            id: "example".into(),
+            label: "Example".into(),
+            description: "Example capability".into(),
+            required: false,
+            settings: vec![FrontendSetting {
+                id: "limit".into(),
+                label: "Limit".into(),
+                description: "Example limit".into(),
+                kind: FrontendSettingKind::Integer {
+                    min: 1,
+                    max: None,
+                    step: 10,
+                },
+            }],
+        };
+
+        assert_eq!(
+            serde_json::to_value(feature).expect("serialize middleware setting"),
+            json!({
+                "id": "example",
+                "label": "Example",
+                "description": "Example capability",
+                "required": false,
+                "settings": [{
+                    "id": "limit",
+                    "label": "Limit",
+                    "description": "Example limit",
+                    "type": "integer",
+                    "min": 1,
+                    "step": 10
+                }]
+            })
+        );
+    }
 
     #[test]
     fn session_configured_has_a_stable_wire_shape() {
