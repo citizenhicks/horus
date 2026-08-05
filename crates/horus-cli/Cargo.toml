@@ -23,7 +23,7 @@ doc = false
 
 [dependencies]
 diffy = "0.4.2"
-horus = { version = "=0.3.0", path = "../.." }
+horus = { version = "=0.3.1", path = "../.." }
 horus-gateway = { version = "=0.3.0", path = "../horus-gateway" }
 pulldown-cmark = { version = "0.10", default-features = false }
 ratatui = { version = "0.30.2", features = [

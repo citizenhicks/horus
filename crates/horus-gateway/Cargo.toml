@@ -18,7 +18,7 @@ path = "src/lib.rs"
 [dependencies]
 chrono = "0.4"
 croner = "3"
-horus = { version = "=0.3.0", path = "../.." }
+horus = { version = "=0.3.1", path = "../.." }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
