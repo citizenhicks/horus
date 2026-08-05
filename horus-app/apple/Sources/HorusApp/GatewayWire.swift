@@ -1,4 +1,7 @@
 import Foundation
+#if os(iOS)
+import UIKit
+#endif
 
 let gatewayProtocolVersion = 7
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
@@ -6,6 +9,7 @@ let maximumComposerBytes = 1024 * 1024
 
 enum GatewayWireError: LocalizedError, Equatable {
     case invalidEndpoint(String)
+    case invalidPairingSetup
     case insecureRemoteEndpoint
     case unsupportedVersion(Int)
     case oversizedFrame(Int)
@@ -15,13 +19,61 @@ enum GatewayWireError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .invalidEndpoint(let message): message
+        case .invalidPairingSetup:
+            "Use a complete Horus pairing setup from the gateway."
         case .insecureRemoteEndpoint:
-            "Plaintext gateway connections are allowed only on this device. Use tls:// for remote gateways."
+            "Plaintext gateway connections are allowed only on this device. Use tls:// or wss:// for remote gateways."
         case .unsupportedVersion(let version): "Gateway protocol version \(version) is not supported."
         case .oversizedFrame(let size): "Gateway frame is too large (\(size) bytes)."
         case .invalidFrame(let message): "Invalid gateway frame: \(message)"
         case .disconnected: "The gateway disconnected."
         }
+    }
+}
+
+struct GatewayPairingSetup: Equatable, Sendable {
+    private static let maximumCodeBytes = 512
+
+    let endpoint: GatewayEndpoint
+    let code: String
+
+    init(_ rawValue: String) throws {
+        let parts = rawValue.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count == 3, parts[0] == "horus-pair:v1" else {
+            throw GatewayWireError.invalidPairingSetup
+        }
+        try self.init(endpoint: String(parts[1]), code: String(parts[2]))
+    }
+
+    init(url: URL) throws {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme?.lowercased() == "horus",
+              components.host?.lowercased() == "pair",
+              components.user == nil,
+              components.password == nil,
+              components.port == nil,
+              components.path.isEmpty || components.path == "/",
+              components.fragment == nil,
+              let queryItems = components.queryItems,
+              queryItems.count == 2,
+              Set(queryItems.map(\.name)) == ["endpoint", "code"],
+              let endpoint = queryItems.first(where: { $0.name == "endpoint" })?.value,
+              let code = queryItems.first(where: { $0.name == "code" })?.value
+        else {
+            throw GatewayWireError.invalidPairingSetup
+        }
+        try self.init(endpoint: endpoint, code: code)
+    }
+
+    private init(endpoint: String, code: String) throws {
+        guard !code.isEmpty,
+              code.utf8.count <= Self.maximumCodeBytes,
+              code.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e })
+        else {
+            throw GatewayWireError.invalidPairingSetup
+        }
+        self.endpoint = try GatewayEndpoint(endpoint)
+        self.code = code
     }
 }
 
@@ -33,27 +85,39 @@ struct GatewayEndpoint: Hashable, Codable, Sendable {
         guard let components = URLComponents(string: trimmed),
               let scheme = components.scheme?.lowercased(),
               let parsedHost = components.host,
-              let port = components.port,
-              (1...65_535).contains(port),
               components.user == nil,
               components.password == nil,
               components.query == nil,
               components.fragment == nil,
               components.path.isEmpty || components.path == "/"
         else {
-            throw GatewayWireError.invalidEndpoint("Use tcp://host:port or tls://host:port.")
+            throw GatewayWireError.invalidEndpoint(
+                "Use tcp://host:port, tls://host:port, or wss://host."
+            )
         }
-        guard scheme == "tcp" || scheme == "tls" else {
-            throw GatewayWireError.invalidEndpoint("The endpoint scheme must be tcp:// or tls://.")
+        guard scheme == "tcp" || scheme == "tls" || scheme == "wss" else {
+            throw GatewayWireError.invalidEndpoint(
+                "The endpoint scheme must be tcp://, tls://, or wss://."
+            )
+        }
+        guard let port = components.port ?? (scheme == "wss" ? 443 : nil),
+              (1...65_535).contains(port)
+        else {
+            throw GatewayWireError.invalidEndpoint(
+                "Use tcp://host:port, tls://host:port, or wss://host."
+            )
         }
         let host = Self.normalized(host: parsedHost)
         guard !host.isEmpty else {
-            throw GatewayWireError.invalidEndpoint("Use tcp://host:port or tls://host:port.")
+            throw GatewayWireError.invalidEndpoint(
+                "Use tcp://host:port, tls://host:port, or wss://host."
+            )
         }
         if scheme == "tcp" && !Self.isLoopback(host) {
             throw GatewayWireError.insecureRemoteEndpoint
         }
-        self.rawValue = "\(scheme)://\(Self.formatted(host: host)):\(port)"
+        let suffix = scheme == "wss" && port == 443 ? "" : ":\(port)"
+        self.rawValue = "\(scheme)://\(Self.formatted(host: host))\(suffix)"
     }
 
     init(from decoder: Decoder) throws {
@@ -63,12 +127,14 @@ struct GatewayEndpoint: Hashable, Codable, Sendable {
 
     var usesTLS: Bool { rawValue.hasPrefix("tls://") }
 
+    var usesWebSocket: Bool { rawValue.hasPrefix("wss://") }
+
     var host: String {
         Self.normalized(host: URLComponents(string: rawValue)?.host ?? "")
     }
 
     var port: UInt16 {
-        UInt16(URLComponents(string: rawValue)?.port ?? 0)
+        UInt16(URLComponents(string: rawValue)?.port ?? (usesWebSocket ? 443 : 0))
     }
 
     var displayName: String {
@@ -244,8 +310,10 @@ enum ReviewDecision: Codable, Sendable {
 }
 
 enum GatewayRequest: Encodable, Sendable {
-    case pair(code: String, clientLabel: String)
-    case authenticate(token: String)
+    case pair(code: String, clientLabel: String, clientKind: GatewayClientKind)
+    case authenticate(token: String, clientKind: GatewayClientKind)
+    case listClients(requestID: String)
+    case unpairClient(requestID: String, clientID: String)
     case listSessions(requestID: String)
     case createSession(requestID: String, workspace: String)
     case openSession(requestID: String, sessionID: String, lastSequence: UInt64?)
@@ -290,13 +358,22 @@ enum GatewayRequest: Encodable, Sendable {
         var container = encoder.container(keyedBy: DynamicCodingKey.self)
         try container.encode(gatewayProtocolVersion, forKey: "version")
         switch self {
-        case .pair(let code, let clientLabel):
+        case .pair(let code, let clientLabel, let clientKind):
             try container.encode("pair", forKey: "type")
             try container.encode(code, forKey: "code")
             try container.encode(clientLabel, forKey: "clientLabel")
-        case .authenticate(let token):
+            try container.encode(clientKind, forKey: "clientKind")
+        case .authenticate(let token, let clientKind):
             try container.encode("authenticate", forKey: "type")
             try container.encode(token, forKey: "token")
+            try container.encode(clientKind, forKey: "clientKind")
+        case .listClients(let requestID):
+            try container.encode("list_clients", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+        case .unpairClient(let requestID, let clientID):
+            try container.encode("unpair_client", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(clientID, forKey: "clientId")
         case .listSessions(let requestID):
             try container.encode("list_sessions", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -433,6 +510,7 @@ enum GatewayEnvelope: Decodable, Sendable {
         preview: RenderedPreview?
     )
     case sessions(requestID: String?, sessions: [SessionRecord])
+    case clients(requestID: String, currentClientID: String, clients: [ClientStatus])
     case providerCredentialStatus(requestID: String, provider: String, configured: Bool)
     case pairingCode(requestID: String, code: String, expiresAt: Int64)
     case providerLoginStarted(
@@ -499,6 +577,12 @@ enum GatewayEnvelope: Decodable, Sendable {
             self = .sessions(
                 requestID: try container.decodeIfPresent(String.self, forKey: "requestId"),
                 sessions: try container.decode([SessionRecord].self, forKey: "sessions")
+            )
+        case "clients":
+            self = .clients(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                currentClientID: try container.decode(String.self, forKey: "currentClientId"),
+                clients: try container.decode([ClientStatus].self, forKey: "clients")
             )
         case "provider_credential_status":
             self = .providerCredentialStatus(
@@ -1374,11 +1458,37 @@ struct ProviderStatus: Identifiable, Codable, Equatable, Sendable {
     let symbol: String
     let description: String
     var configured: Bool
+    let selection: ProviderConfig?
     let auth: ProviderAuthKind
     let defaultBaseUrl: String?
     let defaultApiKeyEnv: String?
     let models: [ProviderModel]
     let webSearch: [HostedWebSearch]
+}
+
+enum GatewayClientKind: String, Codable, Sendable {
+    case cli
+    case macos
+    case ios
+    case ipados
+    case gatewayDashboard = "gateway_dashboard"
+
+    @MainActor static var currentApplePlatform: Self {
+        #if os(macOS)
+        .macos
+        #elseif os(iOS)
+        UIDevice.current.userInterfaceIdiom == .pad ? .ipados : .ios
+        #else
+        #error("Unsupported Horus Apple platform")
+        #endif
+    }
+}
+
+struct ClientStatus: Codable, Equatable, Sendable {
+    let clientId: String
+    let label: String
+    let kinds: [GatewayClientKind]
+    let connections: Int
 }
 
 enum ProviderAuthKind: String, Codable, Sendable {

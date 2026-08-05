@@ -21,32 +21,32 @@ struct TokenStoreRecord {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct GatewayAccounts {
+pub struct GatewayAccounts {
     path: PathBuf,
     record: TokenStoreRecord,
 }
 
 impl GatewayAccounts {
-    pub(crate) fn load() -> Result<Self> {
+    pub fn load() -> Result<Self> {
         Self::load_from(token_path()?)
     }
 
-    pub(crate) fn endpoints(&self) -> impl ExactSizeIterator<Item = &str> {
+    pub fn endpoints(&self) -> impl ExactSizeIterator<Item = &str> {
         self.record.tokens.keys().map(String::as_str)
     }
 
-    pub(crate) fn selected(&self) -> Option<&str> {
+    pub fn selected(&self) -> Option<&str> {
         self.record.selected_endpoint.as_deref()
     }
 
-    pub(crate) fn token(&self, endpoint: &Endpoint) -> Option<&str> {
+    pub fn token(&self, endpoint: &Endpoint) -> Option<&str> {
         self.record
             .tokens
             .get(&endpoint.to_string())
             .map(String::as_str)
     }
 
-    pub(crate) fn select(&mut self, endpoint: &str) -> Result<()> {
+    pub fn select(&mut self, endpoint: &str) -> Result<()> {
         if !self.record.tokens.contains_key(endpoint) {
             return Err(Error::Config(format!(
                 "gateway endpoint `{endpoint}` is not saved"
@@ -56,7 +56,7 @@ impl GatewayAccounts {
         Ok(())
     }
 
-    pub(crate) fn add(&mut self, endpoint: &Endpoint, token: String) -> Result<()> {
+    pub fn add(&mut self, endpoint: &Endpoint, token: String) -> Result<()> {
         validate_token(&token)?;
         let endpoint = endpoint.to_string();
         if !self.record.tokens.contains_key(&endpoint) && self.record.tokens.len() >= MAX_ACCOUNTS {
@@ -69,14 +69,14 @@ impl GatewayAccounts {
         Ok(())
     }
 
-    pub(crate) fn forget(&mut self, endpoint: &str) {
+    pub fn forget(&mut self, endpoint: &str) {
         self.record.tokens.remove(endpoint);
         if self.selected() == Some(endpoint) {
             self.record.selected_endpoint = None;
         }
     }
 
-    pub(crate) fn prepare(&self) -> Result<()> {
+    pub fn prepare(&self) -> Result<()> {
         let parent = parent(&self.path)?;
         std::fs::create_dir_all(parent)?;
         let file = tempfile::NamedTempFile::new_in(parent)?;
@@ -84,7 +84,7 @@ impl GatewayAccounts {
         Ok(())
     }
 
-    pub(crate) fn save(&self) -> Result<()> {
+    pub fn save(&self) -> Result<()> {
         validate_record(&self.record)?;
         let contents = serde_json::to_vec(&self.record)?;
         if contents.len() > MAX_STORE_BYTES {
@@ -134,7 +134,7 @@ impl GatewayAccounts {
     }
 }
 
-pub(crate) fn configured_endpoint() -> Result<Endpoint> {
+pub fn configured_endpoint() -> Result<Endpoint> {
     if environment_override_message().is_some() {
         return Endpoint::from_env();
     }
@@ -143,14 +143,14 @@ pub(crate) fn configured_endpoint() -> Result<Endpoint> {
         .map_or_else(Endpoint::from_env, str::parse)
 }
 
-pub(crate) fn configured_token(endpoint: &Endpoint) -> Result<Option<String>> {
+pub fn configured_token(endpoint: &Endpoint) -> Result<Option<String>> {
     if env::var_os("HORUS_GATEWAY_TOKEN").is_some() {
         return token_from_env().map(Some);
     }
     Ok(GatewayAccounts::load()?.token(endpoint).map(str::to_owned))
 }
 
-pub(crate) fn environment_override_message() -> Option<&'static str> {
+pub fn environment_override_message() -> Option<&'static str> {
     match (
         env::var_os("HORUS_GATEWAY_ENDPOINT").is_some(),
         env::var_os("HORUS_GATEWAY_TOKEN").is_some(),

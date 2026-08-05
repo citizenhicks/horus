@@ -51,7 +51,13 @@ pub(crate) async fn run(
     gateway: &mut ReadyPayload,
     session: &mut SessionReadyPayload,
 ) -> Result<()> {
-    let mut state = SetupState::new(mode, preferred_provider, gateway, session)?;
+    let mut state = SetupState::new(
+        mode,
+        preferred_provider,
+        gateway,
+        session.config.config.clone(),
+        false,
+    )?;
     terminal.clear()?;
 
     if !edit(terminal, &mut state, sender, events, gateway).await? {
@@ -59,6 +65,32 @@ pub(crate) async fn run(
     }
     apply(terminal, &mut state, sender, events, gateway, session).await?;
     Ok(())
+}
+
+/// Runs provider or default-agent setup without creating or changing a chat.
+pub(crate) async fn run_gateway(
+    terminal: &mut SetupTerminal,
+    mode: SetupMode,
+    sender: &GatewaySender,
+    events: &mut GatewayEvents,
+    gateway: &mut ReadyPayload,
+) -> Result<()> {
+    let original = gateway
+        .default_config
+        .as_ref()
+        .map(|default| default.config.clone())
+        .unwrap_or_default();
+    if mode == SetupMode::Agent && gateway.default_config.is_none() {
+        return Err(Error::Config(
+            "configure a provider before changing gateway defaults".into(),
+        ));
+    }
+    let mut state = SetupState::new(mode, None, gateway, original, true)?;
+    terminal.clear()?;
+    if !edit(terminal, &mut state, sender, events, gateway).await? {
+        return Ok(());
+    }
+    apply_gateway(terminal, &mut state, sender, events, gateway).await
 }
 
 struct ProviderEntry {
@@ -141,6 +173,7 @@ struct SetupState {
     middleware: MiddlewareConfig,
     approval: usize,
     target: ApplyTarget,
+    default_only: bool,
     row: usize,
     error: Option<String>,
     progress: Option<Progress>,
@@ -151,13 +184,15 @@ impl SetupState {
         mode: SetupMode,
         preferred_provider: Option<&str>,
         gateway: &ReadyPayload,
-        session: &SessionReadyPayload,
+        original: AgentComposition,
+        default_only: bool,
     ) -> Result<Self> {
         let mut state = Self::from_parts(
             mode,
             validated_providers(&gateway.providers)?,
             gateway.middleware_features.clone(),
-            session.config.config.clone(),
+            original,
+            default_only,
         )?;
         if let Some(provider) = preferred_provider {
             state.select_provider(provider)?;
@@ -170,6 +205,7 @@ impl SetupState {
         providers: Vec<ProviderEntry>,
         features: Vec<MiddlewareFeature>,
         original: AgentComposition,
+        default_only: bool,
     ) -> Result<Self> {
         if providers.is_empty() {
             return Err(Error::Config(
@@ -213,7 +249,12 @@ impl SetupState {
             features,
             middleware,
             approval,
-            target: ApplyTarget::Session,
+            target: if default_only {
+                ApplyTarget::Default
+            } else {
+                ApplyTarget::Session
+            },
+            default_only,
             row: 0,
             error: None,
             progress: None,
@@ -303,9 +344,10 @@ impl SetupState {
             Page::Agent => self.agent_action_start(),
             Page::Provider | Page::Authentication => return None,
         };
-        match self.row.checked_sub(start) {
-            Some(0) => Some(ApplyTarget::Session),
-            Some(1) => Some(ApplyTarget::Default),
+        match (self.default_only, self.row.checked_sub(start)) {
+            (true, Some(0)) => Some(ApplyTarget::Default),
+            (false, Some(0)) => Some(ApplyTarget::Session),
+            (false, Some(1)) => Some(ApplyTarget::Default),
             _ => None,
         }
     }
@@ -318,9 +360,9 @@ impl SetupState {
                 self.model_choice_count()
                     + self.reasoning_choice_count()
                     + self.search_choice_count()
-                    + 2
+                    + if self.default_only { 1 } else { 2 }
             }
-            Page::Agent => self.agent_action_start() + 2,
+            Page::Agent => self.agent_action_start() + if self.default_only { 1 } else { 2 },
         }
     }
 
@@ -1062,6 +1104,40 @@ async fn apply(
     Ok(())
 }
 
+async fn apply_gateway(
+    terminal: &mut SetupTerminal,
+    state: &mut SetupState,
+    sender: &GatewaySender,
+    events: &mut GatewayEvents,
+    gateway: &mut ReadyPayload,
+) -> Result<()> {
+    let config = state.agent_composition(&state.original)?;
+    if state.mode == SetupMode::Login {
+        state.set_progress(
+            "Registering provider",
+            "Updating the gateway model catalog…",
+        );
+        draw(terminal, state)?;
+        *gateway =
+            register_provider(terminal, state, sender, events, config.provider.clone()).await?;
+    }
+    let default = gateway
+        .default_config
+        .as_ref()
+        .ok_or_else(|| Error::Config("configure a provider before saving defaults".into()))?;
+    if config == default.config {
+        return Ok(());
+    }
+    state.set_progress(
+        "Saving gateway defaults",
+        "Future chats will use this agent configuration…",
+    );
+    draw(terminal, state)?;
+    *gateway =
+        configure_default_agent(terminal, state, sender, events, default.revision, config).await?;
+    Ok(())
+}
+
 async fn register_provider(
     terminal: &mut SetupTerminal,
     state: &mut SetupState,
@@ -1797,6 +1873,16 @@ fn middleware_setting_label(
 
 fn render_apply_actions(lines: &mut Vec<Line<'static>>, state: &SetupState, start: usize) {
     lines.push(Line::from(""));
+    if state.default_only {
+        choice(
+            lines,
+            "Save as default",
+            "Use these settings for future chats",
+            state.row == start,
+            "→",
+        );
+        return;
+    }
     choice(
         lines,
         "Change for this chat only",
@@ -1946,6 +2032,7 @@ mod tests {
             symbol: "hard-drives".into(),
             description: format!("{provider} provider"),
             configured,
+            selection: None,
             auth,
             default_base_url,
             default_api_key_env,
@@ -1989,7 +2076,7 @@ mod tests {
         }
         original.middleware.set_enabled("plain", true);
         original.middleware.set_enabled("configured", true);
-        SetupState::from_parts(mode, providers, features(), original).expect("setup state")
+        SetupState::from_parts(mode, providers, features(), original, false).expect("setup state")
     }
 
     fn features() -> Vec<MiddlewareFeature> {
@@ -2115,8 +2202,9 @@ mod tests {
         let mut original = AgentComposition::default();
         original.provider.provider = "responses".into();
         original.provider.base_url = providers[0].status.default_base_url.clone();
-        let mut state = SetupState::from_parts(SetupMode::Login, providers, features(), original)
-        .expect("setup state");
+        let mut state =
+            SetupState::from_parts(SetupMode::Login, providers, features(), original, false)
+                .expect("setup state");
 
         state.select_provider("kimi").expect("select Kimi");
 
@@ -2305,6 +2393,7 @@ mod tests {
                 validated_providers(&[status]).expect("provider manifest"),
                 features(),
                 original,
+                false,
             ) {
                 Ok(_) => panic!("invalid active provider state must fail"),
                 Err(error) => error.to_string(),

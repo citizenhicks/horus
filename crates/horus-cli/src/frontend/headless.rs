@@ -4,7 +4,7 @@ use horus_gateway::client::{GatewayEvents, GatewaySender};
 use horus_gateway::wire::{ClientMessage, ServerMessage};
 use uuid::Uuid;
 
-pub(crate) async fn run(
+pub async fn run(
     sender: GatewaySender,
     mut events: GatewayEvents,
     session_id: String,

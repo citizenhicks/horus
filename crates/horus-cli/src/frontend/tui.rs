@@ -19,7 +19,7 @@ use self::events::UsageStatus;
 use self::input::UiAction;
 use self::view::bounded_terminal_text;
 use self::view::initial_widgets;
-pub(crate) use self::view::terminal_text;
+pub use self::view::terminal_text;
 use super::catalog::{MenuItem, UiCatalog};
 use horus::backend::model::ModelChoice;
 use horus::backend::model::ModelInfo;

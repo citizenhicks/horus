@@ -18,7 +18,9 @@ path = "src/lib.rs"
 [dependencies]
 chrono = "0.4"
 croner = "3"
+futures-util = { version = "0.3", features = ["sink"] }
 horus = { version = "=0.3.1", path = "../.." }
+qrcode = { version = "0.14.1", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
@@ -29,8 +31,10 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 toml = "1"
 uuid = { version = "1", features = ["v4"] }
+url = "2"
 webpki-roots = "1"
 
 [dev-dependencies]

@@ -30,6 +30,33 @@ horus-gateway connect
 one-use code, then waits. Enter both values in a client. Once a client pairs,
 the command returns and the gateway keeps running in the background.
 
+For remote Apple clients without a separate VPN app, use an existing dedicated
+named Cloudflare Tunnel. In the Cloudflare dashboard, create a published
+application whose public hostname is your chosen Horus hostname and whose
+service URL is `http://127.0.0.1:8741`. Then run:
+
+```sh
+horus-gateway init
+```
+
+Enter that hostname and the tunnel connector token. Horus stores the token in
+an owner-only file outside `gateway.toml`, starts `cloudflared` with
+`--token-file`, and displays a `wss://` endpoint and one-time pairing code. The
+GitHub binary archives include a pinned `cloudflared` sidecar; source and
+`cargo install` builds require `cloudflared` beside `horus-gateway` or on
+`PATH`. The gateway also prints a copyable `horus-pair:v1` setup code and, in an
+interactive terminal, an iPhone/iPad QR. Both contain only the public endpoint
+and short-lived Horus pairing code. They prefill the Apple pairing form for
+confirmation and never contain the Cloudflare token.
+
+For non-interactive setup, keep the token in an owner-only file and use:
+
+```sh
+horus-gateway init \
+  --cloudflare-hostname horus.example.com \
+  --cloudflare-token-file /private/path/tunnel-token
+```
+
 Plaintext listeners and clients are restricted to loopback. An iPhone, iPad,
 or another machine therefore needs a routable TLS endpoint with a
 publicly trusted certificate whose hostname matches that endpoint:
@@ -62,15 +89,24 @@ then stores its own selected model and runtime recipe beside its durable
 checkpoint; changing one chat never changes the catalog, another chat, or its
 workspace.
 
-On macOS or Linux, inspect or gracefully stop the configured gateway from
-another terminal:
+On macOS or Linux, open the live dashboard or gracefully stop the configured
+gateway from another terminal:
 
 ```sh
-horus-gateway status
+horus-gateway
+horus-gateway provider
 horus-gateway exit
 ```
 
-Status prints the configured listener together with `running` or `stopped`.
+The no-command form starts the gateway in the background when needed, then
+shows every paired device and chat with active entries first, plus configured
+providers, editable defaults, and usage. Use Tab plus the arrow, page, or mouse
+wheel controls to scroll device and chat history. In Devices, press `u` or
+Delete and confirm to unpair the selected device; the dashboard cannot unpair
+its own credential. Press `p` for provider setup, `d` for defaults, or `q` to
+leave without stopping the gateway. `provider` opens the same provider setup
+directly. These views use this machine's saved gateway pairing.
+
 Exit verifies the gateway's locked process record before sending
 SIGINT and waits up to five seconds for shutdown.
 `serve --background` starts a detached process on macOS or Linux and returns

@@ -132,6 +132,7 @@ pub(crate) async fn assemble(
 }
 
 pub(crate) fn provider_statuses(
+    gateway: &GatewayConfig,
     store: &ConfigStore,
     credentials: &CredentialStore,
 ) -> Result<Vec<ProviderStatus>> {
@@ -147,7 +148,11 @@ pub(crate) fn provider_statuses(
                 }
                 ProviderAuth::Browser(auth) => auth.configured(&store.provider_auth_path())?,
             };
-            Ok(provider_status(definition, configured))
+            Ok(provider_status(
+                definition,
+                configured,
+                gateway.configured_providers.get(definition.id()).cloned(),
+            ))
         })
         .collect()
 }
@@ -280,7 +285,11 @@ struct CatalogRoute {
     provider: ProviderConfig,
 }
 
-fn provider_status(definition: &ProviderDefinition, configured: bool) -> ProviderStatus {
+fn provider_status(
+    definition: &ProviderDefinition,
+    configured: bool,
+    selection: Option<ProviderConfig>,
+) -> ProviderStatus {
     let (auth, default_api_key_env) = match definition.auth() {
         ProviderAuth::ApiKey(default_env) => (
             ProviderAuthKind::ApiKey,
@@ -294,6 +303,7 @@ fn provider_status(definition: &ProviderDefinition, configured: bool) -> Provide
         symbol: definition.symbol().into(),
         description: definition.description().into(),
         configured,
+        selection,
         auth,
         default_base_url: definition.default_base_url().map(str::to_string),
         default_api_key_env,
@@ -618,7 +628,7 @@ mod tests {
 
     #[test]
     fn provider_status_uses_manifest_defaults() {
-        let status = provider_status(provider("openai_socket").expect("provider"), false);
+        let status = provider_status(provider("openai_socket").expect("provider"), false, None);
 
         assert_eq!(status.provider, "openai_socket");
         assert_eq!(status.label, "OpenAI (API key)");
@@ -634,7 +644,7 @@ mod tests {
         );
         assert_eq!(status.web_search[0], HostedWebSearch::Off);
 
-        let custom = provider_status(provider("responses").expect("provider"), false);
+        let custom = provider_status(provider("responses").expect("provider"), false, None);
         assert!(custom.models.is_empty());
         assert_eq!(
             custom.default_base_url.as_deref(),

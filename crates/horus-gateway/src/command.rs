@@ -3,6 +3,8 @@
 use std::ffi::OsString;
 #[cfg(any(unix, test))]
 use std::fs::{self, File, OpenOptions, TryLockError};
+#[cfg(unix)]
+use std::io::IsTerminal as _;
 use std::io::Write as _;
 #[cfg(any(unix, test))]
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -17,11 +19,21 @@ use std::process::Stdio;
 #[cfg(unix)]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(any(unix, test))]
+use qrcode::QrCode;
+#[cfg(any(unix, test))]
+use qrcode::render::unicode::Dense1x2;
+#[cfg(any(unix, test))]
+use url::Url;
+
 use crate::auth::AuthStore;
 #[cfg(unix)]
 use crate::auth::PairingStatus;
 use crate::client::Endpoint;
-use crate::config::{ConfigStore, DEFAULT_LISTEN, GatewayConfig, TlsConfig, state_dir};
+use crate::cloudflare::CloudflareTunnel;
+use crate::config::{
+    ConfigStore, DEFAULT_LISTEN, GatewayConfig, TlsConfig, load_cloudflare_token, state_dir,
+};
 use crate::server::GatewayServer;
 use crate::wire::BootstrapPayload;
 use crate::{Error, Result};
@@ -36,12 +48,14 @@ use tokio::process::{Child, Command as TokioCommand};
 #[cfg(unix)]
 use tokio::signal::unix::{Signal as TokioSignal, SignalKind, signal};
 
-const USAGE: &str = "usage: horus-gateway init [--state-dir PATH] [--listen ADDR] \
-                     [--tls-cert PATH --tls-key PATH]\n       \
+pub const USAGE: &str = "usage: horus-gateway [--state-dir PATH]\n       \
+                     horus-gateway provider [--state-dir PATH]\n       \
+                     horus-gateway init [--state-dir PATH] [--listen ADDR] \
+                     [--tls-cert PATH --tls-key PATH] \
+                     [--cloudflare-hostname HOST --cloudflare-token-file PATH]\n       \
                      horus-gateway bootstrap [--state-dir PATH] [--listen ADDR]\n       \
                      horus-gateway connect [--state-dir PATH] [--endpoint ENDPOINT]\n       \
                      horus-gateway serve [--state-dir PATH] [--background]\n       \
-                     horus-gateway status [--state-dir PATH]\n       \
                      horus-gateway exit [--state-dir PATH]";
 
 #[cfg(any(unix, test))]
@@ -55,7 +69,7 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(unix)]
-const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(40);
 #[cfg(unix)]
 const BACKGROUND_START_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(unix)]
@@ -75,9 +89,6 @@ enum Command {
     ServeChild {
         state_dir: PathBuf,
     },
-    Status {
-        state_dir: PathBuf,
-    },
     Exit {
         state_dir: PathBuf,
     },
@@ -88,6 +99,22 @@ struct InitOptions {
     state_dir: PathBuf,
     listen: SocketAddr,
     tls: Option<TlsConfig>,
+    cloudflare: Option<CloudflareInit>,
+}
+
+struct CloudflareInit {
+    hostname: String,
+    token: String,
+}
+
+impl std::fmt::Debug for CloudflareInit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CloudflareInit")
+            .field("hostname", &self.hostname)
+            .field("token", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -141,13 +168,12 @@ pub async fn run(arguments: Vec<OsString>) -> Result<()> {
             }
         }
         Command::ServeChild { state_dir } => serve(state_dir, false).await,
-        Command::Status { state_dir } => show_status(state_dir),
         Command::Exit { state_dir } => exit_gateway(state_dir),
     }
 }
 
 async fn bootstrap(options: InitOptions) -> Result<()> {
-    if options.tls.is_some() || !options.listen.ip().is_loopback() {
+    if options.tls.is_some() || options.cloudflare.is_some() || !options.listen.ip().is_loopback() {
         return Err(Error::Config(
             "automatic bootstrap supports only the local plaintext gateway".into(),
         ));
@@ -167,12 +193,43 @@ async fn bootstrap(options: InitOptions) -> Result<()> {
 }
 
 fn initialize(options: InitOptions) -> Result<()> {
-    let (store, config) = ConfigStore::initialize(options.state_dir, options.listen, options.tls)?;
-    AuthStore::initialize(store.auth_path())?;
+    let (store, config) = match options.cloudflare {
+        Some(cloudflare) => ConfigStore::initialize_cloudflare(
+            options.state_dir,
+            options.listen,
+            &cloudflare.hostname,
+            &cloudflare.token,
+        )?,
+        None => ConfigStore::initialize(options.state_dir, options.listen, options.tls)?,
+    };
+    initialize_auth(&store)?;
     println!("initialized Horus gateway");
     print_listener(&config);
     println!("run `horus-gateway connect` to pair a client");
     Ok(())
+}
+
+fn initialize_auth(store: &ConfigStore) -> Result<()> {
+    if let Err(error) = AuthStore::initialize(store.auth_path()) {
+        std::fs::remove_dir_all(store.state_dir()).map_err(|cleanup| {
+            Error::Config(format!(
+                "{error}; failed to remove incomplete gateway state at {}: {cleanup}",
+                store.state_dir().display()
+            ))
+        })?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Initializes one gateway against an existing user-owned Cloudflare Tunnel.
+pub fn initialize_cloudflare(state_dir: PathBuf, hostname: String, token: String) -> Result<()> {
+    initialize(InitOptions {
+        state_dir,
+        listen: DEFAULT_LISTEN,
+        tls: None,
+        cloudflare: Some(CloudflareInit { hostname, token }),
+    })
 }
 
 #[cfg(unix)]
@@ -284,13 +341,22 @@ async fn connect(_options: ConnectOptions) -> Result<()> {
 }
 
 fn connection_endpoint(config: &GatewayConfig, endpoint: Option<Endpoint>) -> Result<Endpoint> {
+    if let Some(cloudflare) = &config.cloudflare {
+        if endpoint.is_some() {
+            return Err(Error::Config(format!(
+                "Cloudflare gateway endpoint is {}; do not use --endpoint",
+                cloudflare.endpoint()
+            )));
+        }
+        return cloudflare.endpoint().parse();
+    }
     match (config.tls.is_some(), endpoint) {
         (true, None) => Err(Error::Config(
             "TLS gateways require --endpoint tls://HOST:PORT using the certificate hostname".into(),
         )),
-        (true, Some(endpoint)) if endpoint.is_plaintext() => Err(Error::Config(
-            "a TLS gateway connection endpoint must use tls://".into(),
-        )),
+        (true, Some(endpoint)) if endpoint.is_plaintext() || endpoint.is_websocket() => Err(
+            Error::Config("a TLS gateway connection endpoint must use tls://".into()),
+        ),
         (false, Some(endpoint)) if !endpoint.is_plaintext() => Err(Error::Config(
             "a plaintext gateway connection endpoint must use tcp://".into(),
         )),
@@ -351,16 +417,49 @@ fn cleanup_connect(store: &ConfigStore, pid: u32, code: &str) -> Result<()> {
 #[cfg(unix)]
 fn print_connection(endpoint: &Endpoint, code: &str) -> std::io::Result<()> {
     let stdout = std::io::stdout();
+    let show_qr = stdout.is_terminal() && !endpoint.is_plaintext();
     let mut output = stdout.lock();
     writeln!(output, "endpoint: {endpoint}")?;
     writeln!(output, "one-time code: {code}")?;
     writeln!(
         output,
-        "iPhone, iPad, or Mac: Add gateway, then enter the endpoint and code above"
+        "setup code: {}",
+        pairing_setup_payload(endpoint, code)
     )?;
+    writeln!(output, "copy the setup code into Horus")?;
+    if show_qr {
+        writeln!(output, "iPhone or iPad: scan this QR")?;
+        let qr = pairing_setup_qr(endpoint, code).map_err(std::io::Error::other)?;
+        for line in qr.lines() {
+            writeln!(output, "\x1b[30;47m{line}\x1b[0m")?;
+        }
+    }
     writeln!(output, "another terminal: horus pair {endpoint} {code}")?;
     writeln!(output, "waiting for a client…")?;
     output.flush()
+}
+
+#[cfg(any(unix, test))]
+fn pairing_setup_payload(endpoint: &Endpoint, code: &str) -> String {
+    format!("horus-pair:v1|{endpoint}|{code}")
+}
+
+#[cfg(any(unix, test))]
+fn pairing_setup_url(endpoint: &Endpoint, code: &str) -> Url {
+    let mut url = Url::parse("horus://pair").expect("static pairing URL must be valid");
+    url.query_pairs_mut()
+        .append_pair("endpoint", &endpoint.to_string())
+        .append_pair("code", code);
+    url
+}
+
+#[cfg(any(unix, test))]
+fn pairing_setup_qr(
+    endpoint: &Endpoint,
+    code: &str,
+) -> std::result::Result<String, qrcode::types::QrError> {
+    let url = pairing_setup_url(endpoint, code);
+    Ok(QrCode::new(url.as_str())?.render::<Dense1x2>().build())
 }
 
 async fn serve(state_dir: PathBuf, lock_startup: bool) -> Result<()> {
@@ -370,11 +469,32 @@ async fn serve(state_dir: PathBuf, lock_startup: bool) -> Result<()> {
         .then(|| StartupGuard::create(&state_dir))
         .transpose()?;
     let server = GatewayServer::open(state_dir.clone()).await?;
+    let Some(mut tunnel) = CloudflareTunnel::start(&store, &config)? else {
+        let _process_record = ProcessRecordGuard::create(&state_dir)?;
+        drop(startup);
+        println!("gateway serving in foreground");
+        print_listener(&config);
+        return server.serve().await;
+    };
+    let endpoint = config
+        .cloudflare
+        .as_ref()
+        .expect("Cloudflare tunnel requires config")
+        .endpoint();
+    let server = server.serve();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => return result,
+        result = tunnel.wait_ready(&endpoint) => result?,
+    }
     let _process_record = ProcessRecordGuard::create(&state_dir)?;
     drop(startup);
     println!("gateway serving in foreground");
     print_listener(&config);
-    server.serve().await
+    tokio::select! {
+        result = &mut server => result,
+        result = tunnel.wait() => result,
+    }
 }
 
 #[cfg(unix)]
@@ -392,6 +512,16 @@ async fn serve_in_background(state_dir: PathBuf) -> Result<()> {
     println!("gateway started in background (pid {pid})");
     print_listener(&config);
     Ok(())
+}
+
+/// Starts the configured detached gateway unless its process is already running.
+#[cfg(unix)]
+pub async fn ensure_background_gateway(state_dir: PathBuf) -> Result<()> {
+    let (store, _) = ConfigStore::open(state_dir.clone())?;
+    if running_process_pid(&store.state_dir().join(PROCESS_FILE))?.is_some() {
+        return Ok(());
+    }
+    serve_in_background(state_dir).await
 }
 
 #[cfg(unix)]
@@ -489,6 +619,11 @@ async fn serve_in_background(_state_dir: PathBuf) -> Result<()> {
     Err(unsupported_lifecycle())
 }
 
+#[cfg(not(unix))]
+pub async fn ensure_background_gateway(_state_dir: PathBuf) -> Result<()> {
+    Err(unsupported_lifecycle())
+}
+
 #[cfg(unix)]
 async fn stop_background_child(child: &mut Child, process_path: &Path) {
     let _ = child.kill().await;
@@ -524,27 +659,14 @@ fn background_startup_error(
     })
 }
 
-#[cfg(unix)]
-fn show_status(state_dir: PathBuf) -> Result<()> {
-    let (store, config) = ConfigStore::open(state_dir)?;
-    let path = store.state_dir().join(PROCESS_FILE);
-    let running = match open_process_record(&path)? {
-        Some((_, file)) => process_is_running(&file)?,
-        None => false,
-    };
-    print_listener(&config);
-    println!("status: {}", if running { "running" } else { "stopped" });
-    Ok(())
-}
-
 fn print_listener(config: &GatewayConfig) {
+    if let Some(cloudflare) = &config.cloudflare {
+        println!("public endpoint: {}", cloudflare.endpoint());
+        println!("tunnel origin: http://{}", config.listen);
+        return;
+    }
     let scheme = if config.tls.is_some() { "tls" } else { "tcp" };
     println!("listener: {scheme}://{}", config.listen);
-}
-
-#[cfg(not(unix))]
-fn show_status(_state_dir: PathBuf) -> Result<()> {
-    Err(unsupported_lifecycle())
 }
 
 #[cfg(unix)]
@@ -754,8 +876,6 @@ fn parse(arguments: Vec<OsString>) -> Result<Command> {
         parse_serve(arguments.collect())
     } else if command == "__serve" {
         parse_state_dir(arguments.collect()).map(|state_dir| Command::ServeChild { state_dir })
-    } else if command == "status" {
-        parse_state_dir(arguments.collect()).map(|state_dir| Command::Status { state_dir })
     } else if command == "exit" {
         parse_state_dir(arguments.collect()).map(|state_dir| Command::Exit { state_dir })
     } else {
@@ -822,6 +942,8 @@ fn parse_init(arguments: Vec<OsString>) -> Result<InitOptions> {
     let mut listen = None;
     let mut certificate = None;
     let mut private_key = None;
+    let mut cloudflare_hostname = None;
+    let mut cloudflare_token_file = None;
     let mut arguments = arguments.into_iter();
     while let Some(flag) = arguments.next() {
         let value = arguments
@@ -844,6 +966,17 @@ fn parse_init(arguments: Vec<OsString>) -> Result<InitOptions> {
             set_once(&mut certificate, PathBuf::from(value), "--tls-cert")?;
         } else if flag == "--tls-key" {
             set_once(&mut private_key, PathBuf::from(value), "--tls-key")?;
+        } else if flag == "--cloudflare-hostname" {
+            let value = value
+                .into_string()
+                .map_err(|_| Error::Config("--cloudflare-hostname is not valid UTF-8".into()))?;
+            set_once(&mut cloudflare_hostname, value, "--cloudflare-hostname")?;
+        } else if flag == "--cloudflare-token-file" {
+            set_once(
+                &mut cloudflare_token_file,
+                PathBuf::from(value),
+                "--cloudflare-token-file",
+            )?;
         } else {
             return Err(Error::Config(USAGE.into()));
         }
@@ -862,10 +995,31 @@ fn parse_init(arguments: Vec<OsString>) -> Result<InitOptions> {
             ));
         }
     };
+    let cloudflare = match (cloudflare_hostname, cloudflare_token_file) {
+        (Some(hostname), Some(path)) => {
+            if tls.is_some() {
+                return Err(Error::Config(
+                    "Cloudflare and direct TLS listener options cannot be combined".into(),
+                ));
+            }
+            Some(CloudflareInit {
+                hostname,
+                token: load_cloudflare_token(&path)?,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(Error::Config(
+                "--cloudflare-hostname and --cloudflare-token-file must be supplied together"
+                    .into(),
+            ));
+        }
+    };
     Ok(InitOptions {
         state_dir,
         listen,
         tls,
+        cloudflare,
     })
 }
 
@@ -888,6 +1042,46 @@ fn set_once<T>(target: &mut Option<T>, value: T, flag: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_auth_initialization_removes_only_the_new_gateway_state() {
+        let root = tempfile::tempdir().expect("state parent");
+        let state = root.path().join("gateway");
+        let sibling = root.path().join("keep");
+        std::fs::write(&sibling, "keep").expect("sibling state");
+        let (store, _) =
+            ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("gateway config");
+        std::fs::create_dir(store.auth_path()).expect("conflicting auth path");
+
+        initialize_auth(&store).expect_err("auth initialization must fail");
+
+        assert_eq!((state.exists(), sibling.exists()), (false, true));
+    }
+
+    #[test]
+    fn pairing_setup_payload_formats_a_wss_endpoint() {
+        let endpoint = "wss://horus.example.com".parse().expect("WSS endpoint");
+
+        assert_eq!(
+            pairing_setup_payload(&endpoint, "one-time-code"),
+            "horus-pair:v1|wss://horus.example.com|one-time-code"
+        );
+    }
+
+    #[test]
+    fn pairing_qr_contains_the_validated_endpoint_and_code() {
+        let endpoint = "wss://horus.example.com".parse().expect("WSS endpoint");
+
+        assert_eq!(
+            pairing_setup_url(&endpoint, "one-time-code").as_str(),
+            "horus://pair?endpoint=wss%3A%2F%2Fhorus.example.com&code=one-time-code"
+        );
+        assert!(
+            !pairing_setup_qr(&endpoint, "one-time-code")
+                .expect("pairing QR")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn parse_serve_accepts_an_explicit_state_directory() {
@@ -945,6 +1139,17 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_connection_uses_the_configured_wss_endpoint() {
+        let config = GatewayConfig::new_cloudflare(DEFAULT_LISTEN, "horus.example.com")
+            .expect("Cloudflare config");
+
+        let endpoint = connection_endpoint(&config, None).expect("Cloudflare endpoint");
+
+        assert_eq!(endpoint.to_string(), "wss://horus.example.com");
+        assert!(endpoint.is_websocket());
+    }
+
+    #[test]
     fn parse_serve_accepts_background_with_an_explicit_state_directory() {
         let command = parse(vec![
             "serve".into(),
@@ -986,10 +1191,11 @@ mod tests {
 
         assert!(matches!(
             command,
-            Command::Bootstrap(InitOptions { state_dir, listen, tls })
+            Command::Bootstrap(InitOptions { state_dir, listen, tls, cloudflare })
                 if state_dir == std::path::Path::new("/tmp/horus")
                     && listen == DEFAULT_LISTEN
                     && tls.is_none()
+                    && cloudflare.is_none()
         ));
     }
 
@@ -1006,11 +1212,33 @@ mod tests {
 
         assert!(matches!(
             command,
-            Command::Init(InitOptions { state_dir, listen, tls })
+            Command::Init(InitOptions { state_dir, listen, tls, cloudflare })
                 if state_dir == std::path::Path::new("/tmp/horus")
                     && listen == "127.0.0.1:9000".parse().expect("listen")
                     && tls.is_none()
+                    && cloudflare.is_none()
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_init_loads_a_private_cloudflare_token_without_debugging_it() {
+        let token = tempfile::NamedTempFile::new().expect("token file");
+        std::fs::write(token.path(), "secret-tunnel-token").expect("write token");
+        token
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .expect("secure token");
+        let command = parse(vec![
+            "init".into(),
+            "--cloudflare-hostname".into(),
+            "horus.example.com".into(),
+            "--cloudflare-token-file".into(),
+            token.path().into(),
+        ])
+        .expect("parse Cloudflare init");
+
+        assert!(!format!("{command:?}").contains("secret-tunnel-token"));
     }
 
     #[test]
@@ -1028,18 +1256,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_status_accepts_an_explicit_state_directory() {
-        let command = parse(vec![
-            "status".into(),
-            "--state-dir".into(),
-            "/tmp/horus".into(),
-        ])
-        .expect("parse status");
+    fn parse_rejects_the_removed_status_command() {
+        let error = parse(vec!["status".into()]).expect_err("status must be removed");
 
-        assert!(matches!(
-            command,
-            Command::Status { state_dir } if state_dir == std::path::Path::new("/tmp/horus")
-        ));
+        assert!(error.to_string().contains("usage:"));
     }
 
     #[test]

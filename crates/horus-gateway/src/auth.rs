@@ -191,6 +191,43 @@ impl AuthStore {
         matched.ok_or(Error::Unauthorized)
     }
 
+    pub(crate) fn clients(&self) -> Result<Vec<ClientIdentity>> {
+        Ok(self
+            .lock_state()?
+            .clients
+            .iter()
+            .map(|client| ClientIdentity {
+                id: client.id.clone(),
+                label: client.label.clone(),
+            })
+            .collect())
+    }
+
+    pub(crate) fn unpair_client(&self, actor_id: &str, client_id: &str) -> Result<bool> {
+        if actor_id == client_id
+            || Uuid::parse_str(actor_id).is_err()
+            || Uuid::parse_str(client_id).is_err()
+        {
+            return Ok(false);
+        }
+        let mut state = self.lock_state()?;
+        if !state.clients.iter().any(|client| client.id == actor_id) {
+            return Ok(false);
+        }
+        let Some(index) = state
+            .clients
+            .iter()
+            .position(|client| client.id == client_id)
+        else {
+            return Ok(false);
+        };
+        let mut next = state.clone();
+        next.clients.remove(index);
+        save_private_json(&self.path, &next, false)?;
+        *state = next;
+        Ok(true)
+    }
+
     #[cfg(any(unix, test))]
     pub(crate) fn pairing_status(&self, code: &str) -> Result<PairingStatus> {
         let state = self.lock_state()?;
@@ -320,6 +357,53 @@ mod tests {
         assert!(auth.authenticate(&first.token).is_ok());
         assert!(auth.authenticate(&second.token).is_ok());
         assert!(auth.authenticate(&third.token).is_ok());
+    }
+
+    #[test]
+    fn paired_clients_are_listed_without_credentials() {
+        let directory = tempfile::tempdir().expect("state directory");
+        let path = directory.path().join("auth.json");
+        let (auth, grant) = AuthStore::initialize(&path).expect("initialize auth");
+        auth.pair(&grant.code, "Mac").expect("pair Mac");
+
+        assert_eq!(
+            auth.clients().expect("paired clients"),
+            [ClientIdentity {
+                id: pairing_client_id(&grant.code),
+                label: "Mac".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unpairing_revokes_the_token_and_blocks_the_stale_client() {
+        let directory = tempfile::tempdir().expect("state directory");
+        let path = directory.path().join("auth.json");
+        let (auth, first_code) = AuthStore::initialize(&path).expect("initialize auth");
+        let first = auth.pair(&first_code.code, "Mac").expect("pair Mac");
+        let second_code = auth.create_pairing_code().expect("second code");
+        let second = auth.pair(&second_code.code, "iPhone").expect("pair iPhone");
+        let third_code = auth.create_pairing_code().expect("third code");
+        let third = auth.pair(&third_code.code, "CLI").expect("pair CLI");
+
+        let removed = auth
+            .unpair_client(&first.client_id, &second.client_id)
+            .expect("unpair iPhone");
+        let stale_removal = auth
+            .unpair_client(&second.client_id, &third.client_id)
+            .expect("reject stale client");
+        let reopened = AuthStore::open(path).expect("reopen auth");
+
+        assert_eq!(
+            (
+                removed,
+                stale_removal,
+                reopened.authenticate(&second.token).is_err(),
+                reopened.authenticate(&first.token).is_ok(),
+                reopened.authenticate(&third.token).is_ok(),
+            ),
+            (true, false, true, true, true)
+        );
     }
 
     #[test]

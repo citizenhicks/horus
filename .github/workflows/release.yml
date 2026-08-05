@@ -12,6 +12,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CLOUDFLARED_VERSION: 2026.7.3
 
 jobs:
   verify:
@@ -154,14 +155,54 @@ jobs:
             jq -r '.packages[] | select(.name == "horus-gateway") | .version')"
           test "$version" = "$manifest_version"
       - run: cargo build --release --locked -p horus-cli --bin horus-gateway
+      - name: Bundle pinned cloudflared
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          case "$host" in
+            x86_64-unknown-linux-gnu)
+              asset="cloudflared-linux-amd64"
+              checksum="9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17"
+              ;;
+            aarch64-unknown-linux-gnu)
+              asset="cloudflared-linux-arm64"
+              checksum="65259e652a7bea08bf5df603233ab22b8bf3116af8df9f9206209af6a1b955c0"
+              ;;
+            x86_64-apple-darwin)
+              asset="cloudflared-darwin-amd64.tgz"
+              checksum="70d1c8684fa6d14b5843787ec8d1ea8e18b23650e424f4ea43d849a506487c3b"
+              ;;
+            aarch64-apple-darwin)
+              asset="cloudflared-darwin-arm64.tgz"
+              checksum="90c5a4f914d705fd70c135dba6d80b1791d254b08d6d4136301941f88330dd09"
+              ;;
+            *) exit 1 ;;
+          esac
+          mkdir package
+          curl --fail --location --silent --show-error \
+            --output "$asset" \
+            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/${asset}"
+          printf '%s  %s\n' "$checksum" "$asset" | shasum -a 256 --check
+          if [[ "$asset" == *.tgz ]]; then
+            tar -C package -xzf "$asset"
+          else
+            install -m 755 "$asset" package/cloudflared
+          fi
+          package/cloudflared --version
+          curl --fail --location --silent --show-error \
+            --output package/cloudflared-LICENSE \
+            "https://raw.githubusercontent.com/cloudflare/cloudflared/${CLOUDFLARED_VERSION}/LICENSE"
+          printf '%s  %s\n' \
+            "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd" \
+            package/cloudflared-LICENSE | shasum -a 256 --check
       - name: Package binary
         run: |
           host="$(rustc -vV | sed -n 's/^host: //p')"
           version="${GITHUB_REF_NAME#horus-gateway-v}"
           archive="horus-gateway-${version}-${host}.tar.gz"
-          mkdir dist package
+          mkdir dist
           cp target/release/horus-gateway LICENSE NOTICE package/
-          tar -C package -czf "dist/$archive" horus-gateway LICENSE NOTICE
+          tar -C package -czf "dist/$archive" \
+            horus-gateway cloudflared cloudflared-LICENSE LICENSE NOTICE
           cd dist
           shasum -a 256 "$archive" > "$archive.sha256"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -194,14 +235,54 @@ jobs:
             jq -r '.packages[] | select(.name == "horus-cli") | .version')"
           test "$version" = "$manifest_version"
       - run: cargo build --release --locked -p horus-cli
+      - name: Bundle pinned cloudflared
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          case "$host" in
+            x86_64-unknown-linux-gnu)
+              asset="cloudflared-linux-amd64"
+              checksum="9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17"
+              ;;
+            aarch64-unknown-linux-gnu)
+              asset="cloudflared-linux-arm64"
+              checksum="65259e652a7bea08bf5df603233ab22b8bf3116af8df9f9206209af6a1b955c0"
+              ;;
+            x86_64-apple-darwin)
+              asset="cloudflared-darwin-amd64.tgz"
+              checksum="70d1c8684fa6d14b5843787ec8d1ea8e18b23650e424f4ea43d849a506487c3b"
+              ;;
+            aarch64-apple-darwin)
+              asset="cloudflared-darwin-arm64.tgz"
+              checksum="90c5a4f914d705fd70c135dba6d80b1791d254b08d6d4136301941f88330dd09"
+              ;;
+            *) exit 1 ;;
+          esac
+          mkdir package
+          curl --fail --location --silent --show-error \
+            --output "$asset" \
+            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/${asset}"
+          printf '%s  %s\n' "$checksum" "$asset" | shasum -a 256 --check
+          if [[ "$asset" == *.tgz ]]; then
+            tar -C package -xzf "$asset"
+          else
+            install -m 755 "$asset" package/cloudflared
+          fi
+          package/cloudflared --version
+          curl --fail --location --silent --show-error \
+            --output package/cloudflared-LICENSE \
+            "https://raw.githubusercontent.com/cloudflare/cloudflared/${CLOUDFLARED_VERSION}/LICENSE"
+          printf '%s  %s\n' \
+            "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd" \
+            package/cloudflared-LICENSE | shasum -a 256 --check
       - name: Package binary
         run: |
           host="$(rustc -vV | sed -n 's/^host: //p')"
           version="${GITHUB_REF_NAME#horus-cli-v}"
           archive="horus-${version}-${host}.tar.gz"
-          mkdir dist package
+          mkdir dist
           cp target/release/horus target/release/horus-gateway LICENSE NOTICE package/
-          tar -C package -czf "dist/$archive" horus horus-gateway LICENSE NOTICE
+          tar -C package -czf "dist/$archive" \
+            horus horus-gateway cloudflared cloudflared-LICENSE LICENSE NOTICE
           cd dist
           shasum -a 256 "$archive" > "$archive.sha256"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

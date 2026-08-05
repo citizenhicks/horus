@@ -1713,7 +1713,8 @@ async fn gateway_ready(state: &GatewayState) -> std::result::Result<ReadyPayload
         sessions: session_catalog(&state.checkpoints, &state.activities)
             .await
             .map_err(internal)?,
-        providers: provider_statuses(&state.store, &state.credentials).map_err(internal)?,
+        providers: provider_statuses(&config, &state.store, &state.credentials)
+            .map_err(internal)?,
         models,
         default_config: config.default_agent,
         middleware_features,

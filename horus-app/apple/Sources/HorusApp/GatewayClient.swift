@@ -6,6 +6,7 @@ actor GatewayClient {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private var connection: NWConnection?
+    private var webSocketTask: URLSessionWebSocketTask?
     private var streamContinuation: AsyncThrowingStream<GatewayEnvelope, Error>.Continuation?
     private var connectionGeneration = UUID()
 
@@ -21,6 +22,9 @@ actor GatewayClient {
 
     func connect(to endpoint: GatewayEndpoint) async throws -> AsyncThrowingStream<GatewayEnvelope, Error> {
         disconnect()
+        if endpoint.usesWebSocket {
+            return try connectWebSocket(to: endpoint)
+        }
         guard let port = NWEndpoint.Port(rawValue: endpoint.port) else {
             throw GatewayWireError.invalidEndpoint("Gateway port is invalid.")
         }
@@ -65,11 +69,15 @@ actor GatewayClient {
     }
 
     func send(_ request: GatewayRequest) async throws {
-        guard let connection else { throw GatewayWireError.disconnected }
         let payload = try encoder.encode(request)
         guard !payload.isEmpty, payload.count <= maximumGatewayFrameBytes else {
             throw GatewayWireError.oversizedFrame(payload.count)
         }
+        if let webSocketTask {
+            try await webSocketTask.send(.data(payload))
+            return
+        }
+        guard let connection else { throw GatewayWireError.disconnected }
         guard let length = UInt32(exactly: payload.count) else {
             throw GatewayWireError.oversizedFrame(payload.count)
         }
@@ -84,7 +92,31 @@ actor GatewayClient {
         streamContinuation = nil
         connection?.cancel()
         connection = nil
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
         connectionGeneration = UUID()
+    }
+
+    private func connectWebSocket(
+        to endpoint: GatewayEndpoint
+    ) throws -> AsyncThrowingStream<GatewayEnvelope, Error> {
+        guard let url = URL(string: endpoint.rawValue) else {
+            throw GatewayWireError.invalidEndpoint("The WebSocket gateway address is invalid.")
+        }
+        let task = URLSession.shared.webSocketTask(with: url)
+        let generation = UUID()
+        connectionGeneration = generation
+        webSocketTask = task
+
+        var continuation: AsyncThrowingStream<GatewayEnvelope, Error>.Continuation!
+        let stream = AsyncThrowingStream<GatewayEnvelope, Error> { continuation = $0 }
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.cancel(generation: generation) }
+        }
+        streamContinuation = continuation
+        task.resume()
+        Task { await receiveFrames(from: task, generation: generation, into: continuation) }
+        return stream
     }
 
     private func start(_ connection: NWConnection) async throws {
@@ -133,6 +165,30 @@ actor GatewayClient {
                     throw GatewayWireError.oversizedFrame(Int(length))
                 }
                 let payload = try await receiveExactly(Int(length), from: connection)
+                continuation.yield(try decoder.decode(GatewayEnvelope.self, from: payload))
+            }
+        } catch {
+            continuation.finish(throwing: error)
+        }
+        cancel(generation: generation)
+    }
+
+    private func receiveFrames(
+        from task: URLSessionWebSocketTask,
+        generation: UUID,
+        into continuation: AsyncThrowingStream<GatewayEnvelope, Error>.Continuation
+    ) async {
+        do {
+            while !Task.isCancelled {
+                let message = try await task.receive()
+                guard case .data(let payload) = message else {
+                    throw GatewayWireError.invalidFrame(
+                        "WebSocket gateways must send binary messages."
+                    )
+                }
+                guard !payload.isEmpty, payload.count <= maximumGatewayFrameBytes else {
+                    throw GatewayWireError.oversizedFrame(payload.count)
+                }
                 continuation.yield(try decoder.decode(GatewayEnvelope.self, from: payload))
             }
         } catch {

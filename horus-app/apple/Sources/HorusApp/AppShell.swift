@@ -552,29 +552,57 @@ struct SidebarView: View {
 
     private func workspaceGroup(_ group: WorkspaceSessions) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button {
-                expansionBinding(for: group.id).wrappedValue.toggle()
-            } label: {
-                HStack(spacing: 6) {
-                    HorusIcon(systemName: "folder", foreground: palette.muted)
-                    Text(group.name)
-                        .font(HorusStyle.controlFont)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    HorusIcon(
-                        systemName: collapsedWorkspaces.contains(group.id)
-                            ? "chevron.right"
-                            : "chevron.down",
-                        size: 12,
-                        foreground: palette.muted
+            HStack(spacing: 0) {
+                Button {
+                    expansionBinding(for: group.id).wrappedValue.toggle()
+                } label: {
+                    HStack(spacing: 6) {
+                        HorusIcon(systemName: "folder", foreground: palette.muted)
+                        Text(group.name)
+                            .font(HorusStyle.controlFont)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        HorusIcon(
+                            systemName: collapsedWorkspaces.contains(group.id)
+                                ? "chevron.right"
+                                : "chevron.down",
+                            size: 12,
+                            foreground: palette.muted
+                        )
+                    }
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: HorusStyle.iconButtonSize,
+                        alignment: .leading
                     )
+                    .contentShape(Rectangle())
                 }
-                .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                .accessibilityValue(
+                    collapsedWorkspaces.contains(group.id) ? "Collapsed" : "Expanded"
+                )
+                .help(group.path)
+
+                Button {
+                    model.chooseWorkspace(group.path)
+                    model.destination = .chat
+                    showDetail()
+                } label: {
+                    HorusLabel(
+                        title: "New chat in \(group.name)",
+                        systemImage: "square.and.pencil",
+                        iconColor: palette.muted,
+                        iconSize: 14
+                    )
+                    .labelStyle(.iconOnly)
+                    .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!model.canCreateSession)
+                .help("New chat in \(group.path)")
             }
-            .buttonStyle(.plain)
-            .help(group.path)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             if !collapsedWorkspaces.contains(group.id) {
                 ForEach(group.sessions) { session in
@@ -773,11 +801,21 @@ struct PairingView: View {
                             VStack(alignment: .leading, spacing: 7) {
                                 Text("Gateway address")
                                     .font(HorusStyle.controlFont)
-                                TextField("tls://gateway.example:7443", text: $model.pairingEndpoint)
-                                    .textFieldStyle(.roundedBorder)
-                                    .textContentType(.URL)
-                                    .autocorrectionDisabled()
+                                HStack {
+                                    TextField("wss://gateway.example", text: $model.pairingEndpoint)
+                                        .textFieldStyle(.roundedBorder)
+                                        .textContentType(.URL)
+                                        .autocorrectionDisabled()
+                                        .controlSize(.large)
+                                    PasteButton(payloadType: String.self) { values in
+                                        if let value = values.first {
+                                            model.applyPairingSetup(value)
+                                        }
+                                    }
                                     .controlSize(.large)
+                                    .accessibilityLabel("Paste pairing setup")
+                                    .help("Paste pairing setup")
+                                }
                             }
                             VStack(alignment: .leading, spacing: 7) {
                                 Text("One-time code")
@@ -789,7 +827,7 @@ struct PairingView: View {
                         }
                     }
 
-                    Text("Remote gateways require tls://. tcp:// is accepted only for localhost or a loopback address.")
+                    Text("Cloud gateways use wss://. tcp:// is accepted only for localhost; direct remote gateways can use tls://.")
                         .font(HorusStyle.bodyFont)
                         .foregroundStyle(palette.muted)
                         .multilineTextAlignment(.center)

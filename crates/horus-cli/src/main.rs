@@ -1,6 +1,3 @@
-mod frontend;
-mod gateway_accounts;
-
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -13,15 +10,16 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use frontend::FrontendExit;
-use gateway_accounts::{GatewayAccounts, configured_endpoint, configured_token};
 use horus::{Error, Result};
+use horus_cli::frontend::{self, FrontendExit};
+use horus_cli::gateway_accounts::{GatewayAccounts, configured_endpoint, configured_token};
 use horus_gateway::client::{
     Endpoint, GatewayClient, GatewayEvents, GatewaySender, MAX_PENDING_FRAMES,
 };
 use horus_gateway::config::{ConfigStore, state_dir};
 use horus_gateway::wire::{
-    BootstrapPayload, ClientMessage, ReadyPayload, ServerFrame, ServerMessage, SessionReadyPayload,
+    BootstrapPayload, ClientKind, ClientMessage, ReadyPayload, ServerFrame, ServerMessage,
+    SessionReadyPayload,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 use tokio::process::{Child, Command};
@@ -160,7 +158,8 @@ async fn pair(endpoint: &str, code: &str) -> std::result::Result<(), horus_gatew
     let endpoint = endpoint.parse::<Endpoint>()?;
     let mut accounts = GatewayAccounts::load()?;
     accounts.prepare()?;
-    let (_client, paired) = GatewayClient::pair(&endpoint, code, "horus-cli").await?;
+    let (_client, paired) =
+        GatewayClient::pair(&endpoint, code, "horus-cli", ClientKind::Cli).await?;
     accounts.add(&endpoint, paired.token)?;
     accounts.save()?;
     println!("paired {} · token saved", paired.client_id);
@@ -186,7 +185,7 @@ async fn connect(
         connect_local(&endpoint, token).await
     } else {
         match token {
-            Some(token) => GatewayClient::connect(&endpoint, token).await,
+            Some(token) => GatewayClient::connect(&endpoint, token, ClientKind::Cli).await,
             None => Err(missing_token(&endpoint)),
         }
     };
@@ -264,11 +263,14 @@ async fn connect_local_once(
     endpoint: &Endpoint,
     token: &str,
 ) -> horus_gateway::Result<GatewayClient> {
-    tokio::time::timeout(CONNECT_TIMEOUT, GatewayClient::connect(endpoint, token))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "gateway connection timed out")
-        })?
+    tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        GatewayClient::connect(endpoint, token, ClientKind::Cli),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "gateway connection timed out")
+    })?
 }
 
 async fn start_local_gateway(endpoint: &Endpoint) -> horus_gateway::Result<GatewayClient> {
@@ -349,7 +351,7 @@ async fn bootstrap_local_gateway(
     let pairing_code = read_bootstrap(&mut child, &log).await?;
     let paired = match tokio::time::timeout(
         STARTUP_TIMEOUT,
-        GatewayClient::pair(endpoint, pairing_code, "horus-cli"),
+        GatewayClient::pair(endpoint, pairing_code, "horus-cli", ClientKind::Cli),
     )
     .await
     {

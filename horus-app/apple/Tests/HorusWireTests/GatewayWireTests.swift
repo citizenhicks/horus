@@ -63,16 +63,44 @@ final class GatewayWireTests: XCTestCase {
         )
     }
 
-    func testProtocolV7PairAndAuthenticateRequestsHaveNoReplayCursor() throws {
-        let pair = try requestObject(.pair(code: "123456", clientLabel: "Phone"))
+    func testProtocolV7PairAndAuthenticateRequireClientKind() throws {
+        let pair = try requestObject(.pair(
+            code: "123456",
+            clientLabel: "Phone",
+            clientKind: .ios
+        ))
         XCTAssertEqual(pair["type"] as? String, "pair")
         XCTAssertEqual(pair["client_label"] as? String, "Phone")
+        XCTAssertEqual(pair["client_kind"] as? String, "ios")
         XCTAssertNil(pair["last_sequence"])
 
-        let authenticate = try requestObject(.authenticate(token: "bearer"))
+        let authenticate = try requestObject(.authenticate(token: "bearer", clientKind: .macos))
         XCTAssertEqual(authenticate["type"] as? String, "authenticate")
         XCTAssertEqual(authenticate["token"] as? String, "bearer")
+        XCTAssertEqual(authenticate["client_kind"] as? String, "macos")
         XCTAssertNil(authenticate["last_sequence"])
+    }
+
+    func testProtocolV7ClientInventoryRoundTrip() throws {
+        let request = try requestObject(.listClients(requestID: "clients-1"))
+        XCTAssertEqual(request["type"] as? String, "list_clients")
+        XCTAssertEqual(request["request_id"] as? String, "clients-1")
+        let unpair = try requestObject(.unpairClient(
+            requestID: "unpair-1",
+            clientID: "phone-7"
+        ))
+        XCTAssertEqual(unpair["type"] as? String, "unpair_client")
+        XCTAssertEqual(unpair["client_id"] as? String, "phone-7")
+
+        let fixture = #"{"version":7,"type":"clients","request_id":"clients-1","current_client_id":"mac-2","clients":[{"client_id":"phone-7","label":"Phone","kinds":["ios"],"connections":1},{"client_id":"mac-2","label":"Mac","kinds":[],"connections":0}]}"#
+        guard case .clients(let requestID, let currentClientID, let clients) = try decodeEnvelope(fixture) else {
+            return XCTFail("Expected client inventory envelope")
+        }
+        XCTAssertEqual(requestID, "clients-1")
+        XCTAssertEqual(currentClientID, "mac-2")
+        XCTAssertEqual(clients.first?.clientId, "phone-7")
+        XCTAssertEqual(clients.first?.kinds, [.ios])
+        XCTAssertEqual(clients.last?.connections, 0)
     }
 
     func testSessionCatalogRequestsMatchV7() throws {
@@ -235,7 +263,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertNil(inheritedSettings["subagents"])
     }
 
-    func testGatewayWideReadyPayloadDecodesV7State() throws {
+    func testGatewayWideReadyPayloadDecodesV6State() throws {
         let envelope = try decodeEnvelope(
             #"{"version":7,"type":"ready","payload":\#(readyPayloadJSON)}"#
         )
@@ -282,7 +310,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(refreshed.maxActiveSessions, 4)
     }
 
-    func testV7RejectsLegacyProviderMetadata() {
+    func testV6RejectsLegacyProviderMetadata() {
         let legacyProvider = #"{"provider":"openai_socket","label":"OpenAI","configured":true,"auth":"api_key","default_model":"gpt-5.6-sol","default_base_url":null,"default_api_key_env":"OPENAI_API_KEY","default_reasoning_effort":"medium","default_web_search":"off"}"#
         let payload = #"{"sessions":[],"providers":[\#(legacyProvider)],"default_config":\#(configJSON),"models":[],"middleware_features":[],"max_active_sessions":4}"#
 
@@ -330,7 +358,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(changedPayload.workspace.id, "workspace-1")
     }
 
-    func testV7RequiresSessionActivityAndToolCount() {
+    func testV6RequiresSessionActivityAndToolCount() {
         let sessionWithoutActivity = #"{"version":7,"type":"sessions","sessions":[{"session_id":"chat-1","session_context":{},"parent_session_id":null,"parent_sequence":null,"sequence":0,"catalog_visible":true,"first_user_message":null,"created_at":100,"updated_at":100,"title":null,"pinned":false}]}"#
         XCTAssertThrowsError(try decodeEnvelope(sessionWithoutActivity))
 
@@ -377,7 +405,7 @@ final class GatewayWireTests: XCTestCase {
         ))
     }
 
-    func testV7RequiresCacheWriteInputTokens() {
+    func testV6RequiresCacheWriteInputTokens() {
         let usage = #"{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2}"#
         let fixture = #"{"version":7,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"token_count","info":{"total_token_usage":\#(usage),"last_token_usage":\#(usage),"model_context_window":200}}},"blocks":[]}"#
 
@@ -499,7 +527,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(sessions.first?.pinned, true)
     }
 
-    func testScopedArtifactGitAndCronResponsesDecodeV7Fields() throws {
+    func testScopedArtifactGitAndCronResponsesDecodeV6Fields() throws {
         let artifacts = try decodeEnvelope(#"{"version":7,"type":"artifacts","request_id":"artifacts-1","session_id":"chat-1","artifacts":[{"id":"artifact-1","session_id":"chat-1","kind":"code_diff","title":"Patch","block":{"id":null,"group":null,"append":false,"pending":false,"text":"diff","format":"plain_text","tone":"neutral"}}]}"#)
         guard case .artifacts(let artifactRequestID, let artifactSessionID, let records) = artifacts else {
             return XCTFail("Expected artifacts envelope")
@@ -646,6 +674,74 @@ final class GatewayWireTests: XCTestCase {
             XCTAssertEqual(error as? GatewayWireError, .insecureRemoteEndpoint)
         }
         XCTAssertEqual(try GatewayEndpoint("tls://example.com:443").rawValue, "tls://example.com:443")
+    }
+
+    func testSecureWebSocketEndpointUsesImplicitPort443() throws {
+        let endpoint = try GatewayEndpoint("wss://gateway.example/")
+
+        XCTAssertEqual(endpoint.rawValue, "wss://gateway.example")
+        XCTAssertEqual(endpoint.host, "gateway.example")
+        XCTAssertEqual(endpoint.port, 443)
+        XCTAssertTrue(endpoint.usesWebSocket)
+        XCTAssertEqual(
+            try GatewayEndpoint("wss://gateway.example:8443").rawValue,
+            "wss://gateway.example:8443"
+        )
+        XCTAssertThrowsError(try GatewayEndpoint("ws://gateway.example"))
+        XCTAssertThrowsError(try GatewayEndpoint("wss://gateway.example/chat"))
+    }
+
+    func testPairingSetupParsesValidatedEndpointAndCode() throws {
+        let setup = try GatewayPairingSetup(
+            "horus-pair:v1|wss://gateway.example:443|0123456789abcdef"
+        )
+
+        XCTAssertEqual(setup.endpoint.rawValue, "wss://gateway.example")
+        XCTAssertEqual(setup.code, "0123456789abcdef")
+    }
+
+    func testPairingSetupRejectsMalformedOrUnsafeValues() {
+        let invalid = [
+            "horus-pair:v2|wss://gateway.example|code",
+            "horus-pair:v1|wss://gateway.example|",
+            "horus-pair:v1|wss://gateway.example|code with spaces",
+            "horus-pair:v1|wss://gateway.example|café",
+            "horus-pair:v1|wss://gateway.example|code|extra",
+            "horus-pair:v1|wss://gateway.example|\(String(repeating: "a", count: 513))",
+        ]
+
+        for value in invalid {
+            XCTAssertThrowsError(try GatewayPairingSetup(value))
+        }
+        XCTAssertThrowsError(
+            try GatewayPairingSetup("horus-pair:v1|tcp://gateway.example:9191|code")
+        ) { error in
+            XCTAssertEqual(error as? GatewayWireError, .insecureRemoteEndpoint)
+        }
+    }
+
+    func testPairingURLParsesOnlyTheExactHorusPairRoute() throws {
+        let setup = try GatewayPairingSetup(url: try XCTUnwrap(URL(string:
+            "horus://pair?endpoint=wss%3A%2F%2Fgateway.example&code=0123456789abcdef"
+        )))
+
+        XCTAssertEqual(setup.endpoint.rawValue, "wss://gateway.example")
+        XCTAssertEqual(setup.code, "0123456789abcdef")
+
+        let invalid = [
+            "other://pair?endpoint=wss%3A%2F%2Fgateway.example&code=code",
+            "horus://other?endpoint=wss%3A%2F%2Fgateway.example&code=code",
+            "horus://pair/path?endpoint=wss%3A%2F%2Fgateway.example&code=code",
+            "horus://pair?endpoint=wss%3A%2F%2Fgateway.example",
+            "horus://pair?endpoint=wss%3A%2F%2Fone.example&endpoint=wss%3A%2F%2Ftwo.example&code=code",
+            "horus://pair?endpoint=wss%3A%2F%2Fgateway.example&code=code&extra=value",
+            "horus://pair?endpoint=wss%3A%2F%2Fgateway.example&code=code#fragment",
+        ]
+        for value in invalid {
+            XCTAssertThrowsError(
+                try GatewayPairingSetup(url: try XCTUnwrap(URL(string: value)))
+            )
+        }
     }
 
     func testSameRevisionRefreshPreservesProviderDraft() {

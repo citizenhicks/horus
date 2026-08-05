@@ -253,7 +253,7 @@ final class AppModel {
     var pairingCodeInfo: PairingCodeInfo?
 
     var showsPairing = false
-    var pairingEndpoint = "tls://"
+    var pairingEndpoint = "wss://"
     var pairingCode = ""
     var pairingError: String?
     var theme: ThemePreference
@@ -484,6 +484,26 @@ final class AppModel {
         connect(to: account)
     }
 
+    func applyPairingSetup(_ rawValue: String) {
+        prefillPairing { try GatewayPairingSetup(rawValue) }
+    }
+
+    func applyPairingURL(_ url: URL) {
+        prefillPairing { try GatewayPairingSetup(url: url) }
+    }
+
+    private func prefillPairing(_ parse: () throws -> GatewayPairingSetup) {
+        showsPairing = true
+        do {
+            let setup = try parse()
+            pairingEndpoint = setup.endpoint.rawValue
+            pairingCode = setup.code
+            pairingError = nil
+        } catch {
+            pairingError = error.localizedDescription
+        }
+    }
+
     func pair() {
         pairingError = nil
         do {
@@ -507,7 +527,11 @@ final class AppModel {
             pendingPairingAccount = account
             beginConnection(to: endpoint, generation: generation) { [weak self] in
                 guard let self, self.connectionGeneration == generation else { return }
-                try await self.client.send(.pair(code: code, clientLabel: "Horus Apple"))
+                try await self.client.send(.pair(
+                    code: code,
+                    clientLabel: "Horus Apple",
+                    clientKind: .currentApplePlatform
+                ))
             }
         } catch {
             pairingError = error.localizedDescription
@@ -1063,7 +1087,10 @@ final class AppModel {
                 let token = try self.store.token(for: account)
                 self.beginConnection(to: account.endpoint, generation: generation) { [weak self] in
                     guard let self, self.connectionGeneration == generation else { return }
-                    try await self.client.send(.authenticate(token: token))
+                    try await self.client.send(.authenticate(
+                        token: token,
+                        clientKind: .currentApplePlatform
+                    ))
                 }
             } catch {
                 self.connectionState = .failed(error.localizedDescription)
@@ -1167,6 +1194,8 @@ final class AppModel {
         case .sessions(let requestID, let sessions):
             if requestID == sessionMutationRequestID { sessionMutationRequestID = nil }
             applySessions(sessions)
+        case .clients:
+            break
         case .providerCredentialStatus(let requestID, let provider, let configured):
             if let index = providerStatuses.firstIndex(where: { $0.provider == provider }) {
                 providerStatuses[index].configured = configured

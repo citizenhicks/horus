@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,14 +23,16 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 7;
+const CONFIG_VERSION: u32 = 8;
 const CHAT_SPEC_VERSION: u32 = 4;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
+const CLOUDFLARE_TOKEN_FILE: &str = "cloudflare-token";
 const CONFIG_HEADER: &str = "# approval options: \"on\" (prompt), \"allow\" (no prompt, no network),\n# \"allow_network\" (no prompt, network allowed).\n\n";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_API_KEY_BYTES: usize = 16 * 1024;
+const MAX_CLOUDFLARE_TOKEN_BYTES: usize = 16 * 1024;
 const SECONDS_PER_DAY: u64 = 86_400;
 const USAGE_HISTORY_DAYS: u64 = 52 * 7;
 
@@ -49,6 +51,13 @@ pub struct TlsConfig {
     pub private_key: PathBuf,
 }
 
+/// Public endpoint for one pre-provisioned Cloudflare Tunnel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudflareConfig {
+    hostname: String,
+}
+
 /// Durable machine-wide settings and defaults for one gateway process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +65,7 @@ pub struct GatewayConfig {
     version: u32,
     pub listen: SocketAddr,
     pub tls: Option<TlsConfig>,
+    pub cloudflare: Option<CloudflareConfig>,
     pub default_agent: Option<VersionedAgentConfig>,
     pub configured_providers: BTreeMap<String, ProviderConfig>,
     usage: UsageHistory,
@@ -125,10 +135,19 @@ impl GatewayConfig {
             version: CONFIG_VERSION,
             listen,
             tls,
+            cloudflare: None,
             default_agent: None,
             configured_providers: BTreeMap::new(),
             usage: UsageHistory::default(),
         };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Builds a loopback gateway exposed through one existing Cloudflare Tunnel.
+    pub fn new_cloudflare(listen: SocketAddr, hostname: &str) -> Result<Self> {
+        let mut config = Self::new(listen, None)?;
+        config.cloudflare = Some(CloudflareConfig::new(hostname)?);
         config.validate()?;
         Ok(config)
     }
@@ -234,6 +253,14 @@ impl GatewayConfig {
             }
             (Some(tls), _) => tls.validate()?,
             (None, true) => {}
+        }
+        if self.cloudflare.is_some() && (!self.listen.ip().is_loopback() || self.tls.is_some()) {
+            return Err(Error::Config(
+                "Cloudflare gateways require a plaintext loopback listener".into(),
+            ));
+        }
+        if let Some(cloudflare) = &self.cloudflare {
+            cloudflare.validate()?;
         }
         if self.configured_providers.is_empty() != self.default_agent.is_none() {
             return Err(Error::Config(
@@ -390,6 +417,45 @@ impl TlsConfig {
     }
 }
 
+impl CloudflareConfig {
+    /// Validates and normalizes a public Cloudflare hostname.
+    pub fn new(hostname: &str) -> Result<Self> {
+        let hostname = hostname.trim().to_ascii_lowercase();
+        let config = Self { hostname };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Returns the public WebSocket endpoint presented to Horus clients.
+    #[must_use]
+    pub fn endpoint(&self) -> String {
+        format!("wss://{}", self.hostname)
+    }
+
+    /// Returns the normalized public hostname.
+    #[must_use]
+    pub fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    /// Validates one tunnel-scoped connector token without retaining it.
+    pub fn validate_token(token: &str) -> Result<()> {
+        validate_cloudflare_token(token).map(|_| ())
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.hostname.len() > 253
+            || !self.hostname.is_ascii()
+            || self.hostname != self.hostname.to_ascii_lowercase()
+            || !self.hostname.contains('.')
+            || !self.hostname.split('.').all(valid_hostname_label)
+        {
+            return Err(invalid_cloudflare_hostname());
+        }
+        Ok(())
+    }
+}
+
 impl ConfigStore {
     /// Initializes an owner-only state directory and new config file.
     pub fn initialize(
@@ -404,9 +470,36 @@ impl ConfigStore {
         Ok((store, config))
     }
 
+    /// Initializes state for one user-owned, pre-provisioned Cloudflare Tunnel.
+    pub fn initialize_cloudflare(
+        state_dir: PathBuf,
+        listen: SocketAddr,
+        hostname: &str,
+        token: &str,
+    ) -> Result<(Self, GatewayConfig)> {
+        let config = GatewayConfig::new_cloudflare(listen, hostname)?;
+        let token = validate_cloudflare_token(token)?;
+        let state_dir = prepare_state_dir(state_dir)?;
+        let store = Self::at(state_dir);
+        let result = store
+            .save_cloudflare_token(token)
+            .and_then(|()| store.save_with_mode(&config, true));
+        if let Err(error) = result {
+            fs::remove_dir_all(&store.state_dir).map_err(|cleanup| {
+                Error::Config(format!(
+                    "{error}; failed to remove incomplete gateway state at {}: {cleanup}",
+                    store.state_dir.display()
+                ))
+            })?;
+            return Err(error);
+        }
+        Ok((store, config))
+    }
+
     /// Opens and validates persisted gateway configuration.
     pub fn open(state_dir: PathBuf) -> Result<(Self, GatewayConfig)> {
         let state_dir = fs::canonicalize(state_dir)?;
+        validate_private_state_dir(&state_dir)?;
         let store = Self::at(state_dir);
         let mut file = fs::File::open(&store.path)?;
         let mut contents = Vec::new();
@@ -461,6 +554,12 @@ impl ConfigStore {
         self.state_dir.join("auth.json")
     }
 
+    /// Returns the owner-only Cloudflare connector-token path.
+    #[must_use]
+    pub fn cloudflare_token_path(&self) -> PathBuf {
+        self.state_dir.join(CLOUDFLARE_TOKEN_FILE)
+    }
+
     fn at(state_dir: PathBuf) -> Self {
         let path = state_dir.join(CONFIG_FILE);
         Self { state_dir, path }
@@ -491,7 +590,24 @@ impl ConfigStore {
     }
 
     fn validate_config(&self, config: &GatewayConfig) -> Result<()> {
-        config.validate()
+        config.validate()?;
+        if config.cloudflare.is_some() {
+            load_cloudflare_token(&self.cloudflare_token_path())?;
+        }
+        Ok(())
+    }
+
+    fn save_cloudflare_token(&self, token: &str) -> Result<()> {
+        let token = validate_cloudflare_token(token)?;
+        let mut file = tempfile::NamedTempFile::new_in(&self.state_dir)?;
+        #[cfg(unix)]
+        file.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(token.as_bytes())?;
+        file.as_file().sync_all()?;
+        file.persist_noclobber(self.cloudflare_token_path())
+            .map_err(|error| error.error)?;
+        Ok(())
     }
 }
 
@@ -591,6 +707,49 @@ pub fn state_dir() -> Result<PathBuf> {
         })
 }
 
+/// Loads a connector token from an owner-only regular file without exposing its contents.
+pub fn load_cloudflare_token(path: &Path) -> Result<String> {
+    #[cfg(unix)]
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| -> Error {
+            if error.raw_os_error() == Some(nix::libc::ELOOP) {
+                invalid_cloudflare_token_file()
+            } else {
+                error.into()
+            }
+        })?;
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(invalid_cloudflare_token_file());
+        }
+        fs::File::open(path)?
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid_cloudflare_token_file());
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(Error::Config(
+            "Cloudflare tunnel token file must not be accessible by group or others (use mode 0600)"
+                .into(),
+        ));
+    }
+    if metadata.len() > MAX_CLOUDFLARE_TOKEN_BYTES as u64 {
+        return Err(invalid_cloudflare_token());
+    }
+    let mut contents = String::new();
+    file.take(MAX_CLOUDFLARE_TOKEN_BYTES as u64 + 1)
+        .read_to_string(&mut contents)?;
+    let token = validate_cloudflare_token(&contents)?;
+    Ok(token.to_owned())
+}
+
 /// Validates the complete frontend-writable agent composition.
 pub fn validate_agent_composition(config: &AgentComposition) -> Result<()> {
     if config.system_prompt.trim().is_empty()
@@ -619,6 +778,49 @@ fn validate_provider_config(config: &ProviderConfig) -> Result<()> {
         config.web_search,
     )?;
     Ok(())
+}
+
+fn valid_hostname_label(label: &str) -> bool {
+    (1..=63).contains(&label.len())
+        && label
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && label
+            .bytes()
+            .next_back()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn invalid_cloudflare_hostname() -> Error {
+    Error::Config(
+        "Cloudflare hostname must be a DNS name such as horus.example.com, without a scheme, path, or port"
+            .into(),
+    )
+}
+
+fn validate_cloudflare_token(token: &str) -> Result<&str> {
+    let token = token.trim();
+    if token.is_empty()
+        || token.len() > MAX_CLOUDFLARE_TOKEN_BYTES
+        || !token.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(invalid_cloudflare_token());
+    }
+    Ok(token)
+}
+
+fn invalid_cloudflare_token() -> Error {
+    Error::Config(format!(
+        "Cloudflare tunnel token must be 1–{MAX_CLOUDFLARE_TOKEN_BYTES} visible ASCII bytes"
+    ))
+}
+
+fn invalid_cloudflare_token_file() -> Error {
+    Error::Config("Cloudflare tunnel token must be stored in a regular file".into())
 }
 
 fn validate_chat_workspace(
@@ -671,6 +873,23 @@ fn prepare_state_dir(path: PathBuf) -> Result<PathBuf> {
     #[cfg(unix)]
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
     Ok(path)
+}
+
+fn validate_private_state_dir(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(Error::Config(
+            "gateway state path must be a directory".into(),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(Error::Config(
+            "gateway state directory must not be accessible by group or others (use mode 0700)"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn save_private_map<T: Serialize>(path: &Path, values: &BTreeMap<String, T>) -> Result<()> {
@@ -788,9 +1007,29 @@ mod tests {
         let serialized = serde_json::to_value(config).expect("serialize gateway config");
 
         assert!(serialized.get("workspace").is_none());
+        assert!(serialized["cloudflare"].is_null());
         assert!(serialized["default_agent"].is_null());
         assert_eq!(serialized["configured_providers"], serde_json::json!({}));
         assert!(serialized["usage"].get("sessions").is_none());
+    }
+
+    #[test]
+    fn cloudflare_config_normalizes_a_dns_hostname() {
+        let config = CloudflareConfig::new("  Horus.Example.com ").expect("Cloudflare config");
+
+        assert_eq!(config.endpoint(), "wss://horus.example.com");
+    }
+
+    #[test]
+    fn cloudflare_config_rejects_a_url_instead_of_a_hostname() {
+        let error = CloudflareConfig::new("wss://horus.example.com/path")
+            .expect_err("URL must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("without a scheme, path, or port")
+        );
     }
 
     #[test]
@@ -1171,6 +1410,91 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!((directory_mode, file_mode), (0o700, 0o600));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloudflare_token_is_owner_only_and_absent_from_gateway_config() {
+        let state_parent = tempfile::tempdir().expect("state parent");
+        let state = state_parent.path().join("gateway");
+        let (store, _) = ConfigStore::initialize_cloudflare(
+            state.clone(),
+            DEFAULT_LISTEN,
+            "horus.example.com",
+            "secret-tunnel-token",
+        )
+        .expect("initialize Cloudflare config");
+
+        let mode = fs::metadata(store.cloudflare_token_path())
+            .expect("token metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let config = fs::read_to_string(state.join(CONFIG_FILE)).expect("gateway config");
+
+        assert_eq!(mode, 0o600);
+        assert!(!config.contains("secret-tunnel-token"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloudflare_token_loader_rejects_a_symlink() {
+        let directory = tempfile::tempdir().expect("token directory");
+        let target = directory.path().join("target");
+        let link = directory.path().join("token");
+        fs::write(&target, "secret-tunnel-token").expect("token");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("token permissions");
+        std::os::unix::fs::symlink(target, &link).expect("token symlink");
+
+        let error = load_cloudflare_token(&link).expect_err("symlink must fail");
+
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[test]
+    fn cloudflare_token_loader_rejects_a_nonregular_file() {
+        let directory = tempfile::tempdir().expect("token directory");
+
+        let error = load_cloudflare_token(directory.path()).expect_err("directory must fail");
+
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_cloudflare_state_rejects_a_public_token_file() {
+        let state_parent = tempfile::tempdir().expect("state parent");
+        let state = state_parent.path().join("gateway");
+        let (store, _) = ConfigStore::initialize_cloudflare(
+            state.clone(),
+            DEFAULT_LISTEN,
+            "horus.example.com",
+            "secret-tunnel-token",
+        )
+        .expect("initialize Cloudflare config");
+        fs::set_permissions(
+            store.cloudflare_token_path(),
+            fs::Permissions::from_mode(0o644),
+        )
+        .expect("loosen token permissions");
+
+        let error = ConfigStore::open(state).expect_err("public token file must fail");
+
+        assert!(error.to_string().contains("mode 0600"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_state_rejects_a_public_state_directory() {
+        let state_parent = tempfile::tempdir().expect("state parent");
+        let state = state_parent.path().join("gateway");
+        ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755))
+            .expect("loosen state permissions");
+
+        let error = ConfigStore::open(state).expect_err("public state directory must fail");
+
+        assert!(error.to_string().contains("mode 0700"));
     }
 
     #[cfg(unix)]

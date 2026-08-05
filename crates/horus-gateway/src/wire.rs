@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use futures_util::{Sink, SinkExt as _, Stream, StreamExt as _};
 use horus::backend::checkpoint::SessionSummary;
 use horus::backend::model::ModelChoice;
 use horus::backend::model::provider::HostedWebSearch;
@@ -15,6 +16,8 @@ use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::{Error, Result};
 
@@ -77,9 +80,18 @@ pub enum ClientMessage {
     Pair {
         code: String,
         client_label: String,
+        client_kind: ClientKind,
     },
     Authenticate {
         token: String,
+        client_kind: ClientKind,
+    },
+    ListClients {
+        request_id: String,
+    },
+    UnpairClient {
+        request_id: String,
+        client_id: String,
     },
     ListSessions {
         request_id: String,
@@ -273,6 +285,11 @@ pub enum ServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
         sessions: Vec<SessionRecord>,
+    },
+    Clients {
+        request_id: String,
+        current_client_id: String,
+        clients: Vec<ClientStatus>,
     },
     ProviderCredentialStatus {
         request_id: String,
@@ -480,11 +497,32 @@ pub struct ProviderStatus {
     pub symbol: String,
     pub description: String,
     pub configured: bool,
+    pub selection: Option<ProviderConfig>,
     pub auth: ProviderAuthKind,
     pub default_base_url: Option<String>,
     pub default_api_key_env: Option<String>,
     pub models: Vec<ProviderModel>,
     pub web_search: Vec<HostedWebSearch>,
+}
+
+/// Frontend type attached to one authenticated connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientKind {
+    Cli,
+    Macos,
+    Ios,
+    Ipados,
+    GatewayDashboard,
+}
+
+/// One paired client and its current connection state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientStatus {
+    pub client_id: String,
+    pub label: String,
+    pub kinds: Vec<ClientKind>,
+    pub connections: usize,
 }
 
 impl ProviderStatus {
@@ -730,6 +768,66 @@ where
     Ok(())
 }
 
+pub(crate) async fn websocket_to_framed(
+    mut incoming: impl Stream<Item = std::result::Result<Message, WebSocketError>> + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
+) -> Result<()> {
+    while let Some(message) = incoming.next().await {
+        match message.map_err(websocket_error)? {
+            Message::Binary(payload) if (1..=MAX_FRAME_BYTES).contains(&payload.len()) => {
+                let length = u32::try_from(payload.len())
+                    .map_err(|_| Error::Protocol("WebSocket message is too large".into()))?;
+                writer.write_all(&length.to_be_bytes()).await?;
+                writer.write_all(&payload).await?;
+            }
+            Message::Ping(_) | Message::Pong(_) => {}
+            Message::Close(_) => return Ok(()),
+            Message::Binary(payload) => {
+                return Err(Error::Protocol(format!(
+                    "WebSocket message length must be 1–{MAX_FRAME_BYTES} bytes, got {}",
+                    payload.len()
+                )));
+            }
+            Message::Text(_) | Message::Frame(_) => {
+                return Err(Error::Protocol(
+                    "WebSocket messages must be binary JSON frames".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn framed_to_websocket(
+    mut reader: impl AsyncRead + Unpin,
+    mut outgoing: impl Sink<Message, Error = WebSocketError> + Unpin,
+) -> Result<()> {
+    loop {
+        let mut prefix = [0_u8; 4];
+        if reader.read(&mut prefix[..1]).await? == 0 {
+            return outgoing.close().await.map_err(websocket_error);
+        }
+        reader.read_exact(&mut prefix[1..]).await?;
+        let length = usize::try_from(u32::from_be_bytes(prefix))
+            .map_err(|_| Error::Protocol("frame length is unsupported".into()))?;
+        if length == 0 || length > MAX_FRAME_BYTES {
+            return Err(Error::Protocol(format!(
+                "frame length must be 1–{MAX_FRAME_BYTES} bytes"
+            )));
+        }
+        let mut payload = vec![0_u8; length];
+        reader.read_exact(&mut payload).await?;
+        outgoing
+            .send(Message::Binary(payload.into()))
+            .await
+            .map_err(websocket_error)?;
+    }
+}
+
+pub(crate) fn websocket_error(error: WebSocketError) -> Error {
+    Error::Protocol(format!("WebSocket transport failed: {error}"))
+}
+
 /// Rejects frames from incompatible clients before interpreting their message.
 pub fn validate_version(version: u16) -> Result<()> {
     if version != PROTOCOL_VERSION {
@@ -750,6 +848,7 @@ mod tests {
     async fn framed_json_round_trip_preserves_the_versioned_message() {
         let expected = ClientFrame::new(ClientMessage::Authenticate {
             token: "secret".into(),
+            client_kind: ClientKind::Cli,
         });
         let (mut writer, reader) = duplex(1024);
         let mut reader = FrameReader::new(reader);
@@ -765,15 +864,29 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[tokio::test]
+    async fn websocket_bridge_rejects_text_messages() {
+        let incoming = futures_util::stream::iter([Ok(Message::Text("{}".into()))]);
+        let (writer, _reader) = duplex(64);
+
+        let error = websocket_to_framed(incoming, writer)
+            .await
+            .expect_err("text message must fail");
+
+        assert!(error.to_string().contains("must be binary"));
+    }
+
     #[test]
     fn connection_handshakes_have_no_session_replay_cursor() {
         let frames = [
             ClientMessage::Authenticate {
                 token: "secret".into(),
+                client_kind: ClientKind::Cli,
             },
             ClientMessage::Pair {
                 code: "pairing-code".into(),
                 client_label: "client".into(),
+                client_kind: ClientKind::Macos,
             },
         ];
 

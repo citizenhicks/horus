@@ -9,6 +9,7 @@ struct HorusAppleApp: App {
             AppShell()
                 .environment(model)
                 .horusTheme()
+                .onOpenURL { model.applyPairingURL($0) }
         }
 #if os(macOS)
         .defaultSize(width: 1180, height: 780)

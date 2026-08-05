@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use futures_util::StreamExt as _;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
@@ -14,14 +15,19 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
+use tokio_tungstenite::tungstenite::http::uri::Authority;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 use crate::wire::{
-    ClientFrame, ClientMessage, FrameReader, ServerFrame, ServerMessage, read_frame,
-    validate_version, write_frame,
+    ClientFrame, ClientKind, ClientMessage, FrameReader, MAX_FRAME_BYTES, ServerFrame,
+    ServerMessage, framed_to_websocket, read_frame, validate_version, websocket_error,
+    websocket_to_framed, write_frame,
 };
 use crate::{Error, Result};
 
 const DEFAULT_ENDPOINT: &str = "tcp://127.0.0.1:8741";
+const WEBSOCKET_BRIDGE_BYTES: usize = 16 * 1024;
 /// Maximum number of frames a focused client flow may temporarily defer.
 pub const MAX_PENDING_FRAMES: usize = 1024;
 
@@ -29,8 +35,9 @@ trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> Transport for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 type BoxedTransport = Box<dyn Transport>;
+type GatewayWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Validated plaintext-loopback or authenticated-root TLS endpoint.
+/// Validated plaintext-loopback, authenticated-root TLS, or WSS endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
     security: Security,
@@ -42,6 +49,7 @@ pub struct Endpoint {
 enum Security {
     Plaintext,
     Tls,
+    WebSocketTls,
 }
 
 /// Token returned while pairing a new client.
@@ -83,7 +91,16 @@ impl Endpoint {
         matches!(self.security, Security::Plaintext)
     }
 
+    /// Returns whether this endpoint uses secure WebSocket transport.
+    #[must_use]
+    pub const fn is_websocket(&self) -> bool {
+        matches!(self.security, Security::WebSocketTls)
+    }
+
     async fn connect(&self) -> Result<BoxedTransport> {
+        if self.is_websocket() {
+            return self.connect_websocket().await;
+        }
         let address = format_address(&self.host, self.port);
         let stream = TcpStream::connect(&address).await?;
         if self.security == Security::Plaintext {
@@ -109,6 +126,20 @@ impl Endpoint {
             .map_err(|error| Error::Protocol(format!("TLS handshake failed: {error}")))?;
         Ok(Box::new(stream))
     }
+
+    async fn connect_websocket(&self) -> Result<BoxedTransport> {
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_FRAME_BYTES))
+            .max_frame_size(Some(MAX_FRAME_BYTES));
+        let (websocket, _) = connect_async_with_config(self.to_string(), Some(config), false)
+            .await
+            .map_err(websocket_error)?;
+        let (transport, bridge) = tokio::io::duplex(WEBSOCKET_BRIDGE_BYTES);
+        tokio::spawn(async move {
+            let _result = bridge_websocket(websocket, bridge).await;
+        });
+        Ok(Box::new(transport))
+    }
 }
 
 impl FromStr for Endpoint {
@@ -119,9 +150,11 @@ impl FromStr for Endpoint {
             (Security::Plaintext, authority)
         } else if let Some(authority) = value.strip_prefix("tls://") {
             (Security::Tls, authority)
+        } else if let Some(authority) = value.strip_prefix("wss://") {
+            (Security::WebSocketTls, authority)
         } else {
             return Err(Error::Config(
-                "gateway endpoint must use tcp:// or tls://".into(),
+                "gateway endpoint must use tcp://, tls://, or wss://".into(),
             ));
         };
         if authority.contains(['/', '?', '#', '@']) {
@@ -129,19 +162,25 @@ impl FromStr for Endpoint {
                 "gateway endpoint must contain only a host and port".into(),
             ));
         }
-        let (host, port) = authority
-            .rsplit_once(':')
-            .ok_or_else(|| Error::Config("gateway endpoint requires a port".into()))?;
-        let host = host
+        let authority = authority
+            .parse::<Authority>()
+            .map_err(|_| Error::Config("gateway endpoint has an invalid host or port".into()))?;
+        let host = authority
+            .host()
             .strip_prefix('[')
             .and_then(|host| host.strip_suffix(']'))
-            .unwrap_or(host);
+            .unwrap_or_else(|| authority.host());
         if host.is_empty() {
             return Err(Error::Config("gateway endpoint requires a host".into()));
         }
-        let port = port
-            .parse::<u16>()
-            .map_err(|_| Error::Config("gateway endpoint has an invalid port".into()))?;
+        let port = match authority.port_u16() {
+            Some(port) => port,
+            None if authority.as_str().len() != authority.host().len() => {
+                return Err(Error::Config("gateway endpoint has an invalid port".into()));
+            }
+            None if security == Security::WebSocketTls => 443,
+            None => return Err(Error::Config("gateway endpoint requires a port".into())),
+        };
         if port == 0 {
             return Err(Error::Config(
                 "gateway endpoint port must be greater than zero".into(),
@@ -149,7 +188,7 @@ impl FromStr for Endpoint {
         }
         if security == Security::Plaintext && !plaintext_host_is_loopback(host) {
             return Err(Error::Config(
-                "tcp:// endpoints are restricted to loopback; use tls:// remotely".into(),
+                "tcp:// endpoints are restricted to loopback; use tls:// or wss:// remotely".into(),
             ));
         }
         Ok(Self {
@@ -165,7 +204,14 @@ impl fmt::Display for Endpoint {
         let scheme = match self.security {
             Security::Plaintext => "tcp",
             Security::Tls => "tls",
+            Security::WebSocketTls => "wss",
         };
+        if self.security == Security::WebSocketTls && self.port == 443 {
+            if self.host.contains(':') {
+                return write!(formatter, "{scheme}://[{}]", self.host);
+            }
+            return write!(formatter, "{scheme}://{}", self.host);
+        }
         write!(
             formatter,
             "{scheme}://{}",
@@ -174,9 +220,25 @@ impl fmt::Display for Endpoint {
     }
 }
 
+async fn bridge_websocket(
+    websocket: GatewayWebSocket,
+    bridge: tokio::io::DuplexStream,
+) -> Result<()> {
+    let (outgoing, incoming) = websocket.split();
+    let (reader, writer) = tokio::io::split(bridge);
+    tokio::select! {
+        result = websocket_to_framed(incoming, writer) => result,
+        result = framed_to_websocket(reader, outgoing) => result,
+    }
+}
+
 impl GatewayClient {
     /// Authenticates an existing client and leaves the gateway Ready frame for `events`.
-    pub async fn connect(endpoint: &Endpoint, token: impl Into<String>) -> Result<Self> {
+    pub async fn connect(
+        endpoint: &Endpoint,
+        token: impl Into<String>,
+        client_kind: ClientKind,
+    ) -> Result<Self> {
         let transport = endpoint.connect().await?;
         let (reader, writer) = tokio::io::split(transport);
         let client = Self::from_parts(reader, writer);
@@ -184,6 +246,7 @@ impl GatewayClient {
             .sender
             .write(ClientMessage::Authenticate {
                 token: token.into(),
+                client_kind,
             })
             .await?;
         client.expect_authenticated().await
@@ -194,6 +257,7 @@ impl GatewayClient {
         endpoint: &Endpoint,
         code: impl Into<String>,
         client_label: impl Into<String>,
+        client_kind: ClientKind,
     ) -> Result<(Self, PairedClient)> {
         let transport = endpoint.connect().await?;
         let (reader, writer) = tokio::io::split(transport);
@@ -203,6 +267,7 @@ impl GatewayClient {
             .write(ClientMessage::Pair {
                 code: code.into(),
                 client_label: client_label.into(),
+                client_kind,
             })
             .await?;
         let frame = client
@@ -366,7 +431,7 @@ mod tests {
             frame
         });
 
-        let _client = GatewayClient::connect(&endpoint, "secret")
+        let _client = GatewayClient::connect(&endpoint, "secret", ClientKind::Cli)
             .await
             .expect("connect client");
         let frame = gateway.await.expect("gateway task");
@@ -374,7 +439,8 @@ mod tests {
         assert_eq!(
             frame.message,
             ClientMessage::Authenticate {
-                token: "secret".into()
+                token: "secret".into(),
+                client_kind: ClientKind::Cli,
             }
         );
     }
@@ -390,18 +456,23 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_accepts_loopback_plaintext_and_remote_tls() {
+    fn endpoint_accepts_loopback_plaintext_and_remote_encrypted_transports() {
         let loopback = "tcp://127.0.0.1:8741"
             .parse::<Endpoint>()
             .expect("loopback endpoint");
         let remote = "tls://gateway.example:443"
             .parse::<Endpoint>()
             .expect("TLS endpoint");
+        let websocket = "wss://gateway.example"
+            .parse::<Endpoint>()
+            .expect("WSS endpoint");
 
         assert_eq!(loopback.to_string(), "tcp://127.0.0.1:8741");
         assert_eq!(remote.to_string(), "tls://gateway.example:443");
+        assert_eq!(websocket.to_string(), "wss://gateway.example");
         assert!(loopback.is_plaintext());
         assert!(!remote.is_plaintext());
+        assert!(websocket.is_websocket());
     }
 
     #[test]

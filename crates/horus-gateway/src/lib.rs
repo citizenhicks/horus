@@ -3,6 +3,7 @@
 mod assembly;
 pub mod auth;
 pub mod client;
+mod cloudflare;
 pub mod command;
 pub mod config;
 pub mod cron;

@@ -5,6 +5,8 @@ use horus_gateway::client::{GatewayEvents, GatewaySender};
 use horus_gateway::wire::{ReadyPayload, SessionReadyPayload};
 
 mod catalog;
+mod cloudflare_setup;
+mod dashboard;
 mod gateway;
 mod gateway_actions;
 mod headless;
@@ -13,10 +15,13 @@ mod terminal;
 mod theme;
 mod tui;
 
-pub(crate) use headless::run as run_headless;
-pub(crate) use tui::terminal_text;
+pub use headless::run as run_headless;
+pub use tui::terminal_text;
 
-pub(crate) async fn run(
+pub use cloudflare_setup::{CloudflareInit, run as run_cloudflare_setup};
+pub use dashboard::{run as run_gateway_dashboard, run_provider as run_gateway_provider};
+
+pub async fn run(
     sender: GatewaySender,
     events: GatewayEvents,
     gateway: &mut ReadyPayload,
@@ -39,7 +44,7 @@ pub(crate) async fn run(
 }
 
 /// Why a frontend returned control to its launcher.
-pub(crate) enum FrontendExit {
+pub enum FrontendExit {
     Exit,
     Discard,
     New,

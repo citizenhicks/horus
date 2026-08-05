@@ -4,6 +4,7 @@ use std::io;
 
 use horus::{Error, Result};
 use horus_gateway::client::{Endpoint, GatewayClient};
+use horus_gateway::wire::ClientKind;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -65,7 +66,8 @@ pub(crate) async fn run(terminal: &mut GatewayTerminal, connected: &str) -> Resu
                     state.pairing = true;
                     state.error = None;
                     draw(terminal, &state)?;
-                    let paired = GatewayClient::pair(&endpoint, code, "horus-cli").await;
+                    let paired =
+                        GatewayClient::pair(&endpoint, code, "horus-cli", ClientKind::Cli).await;
                     state.pairing = false;
                     match paired {
                         Ok((_client, paired)) => {

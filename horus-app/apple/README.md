@@ -23,9 +23,10 @@ horus-gateway init --listen 0.0.0.0:8741 \
 horus-gateway connect --endpoint tls://gateway.example:8741
 ```
 
-Choose **Add gateway** in the app, and enter the displayed **Gateway address** and
-**One-time code**. The remote hostname must be routable, covered by a
-publicly trusted TLS certificate, and reachable through the host firewall.
+Choose **Add gateway** and paste the displayed setup code, or scan its QR with
+the iPhone/iPad Camera. The QR opens Horus with the `wss://` address and
+one-time code prefilled; pairing still requires confirmation. The remote
+hostname must be routable and covered by a publicly trusted TLS certificate.
 Plaintext remote endpoints are rejected.
 
 The one-time code is only the first pairing credential. A successful pairing

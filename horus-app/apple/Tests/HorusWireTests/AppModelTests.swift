@@ -599,6 +599,40 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.toast?.tone, .error)
     }
 
+    func testPairingSetupPrefillsWithoutPairing() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        model.showsPairing = false
+        model.pairingError = "Old error"
+
+        model.applyPairingSetup(
+            "horus-pair:v1|wss://gateway.example|0123456789abcdef"
+        )
+
+        XCTAssertTrue(model.showsPairing)
+        XCTAssertEqual(model.pairingEndpoint, "wss://gateway.example")
+        XCTAssertEqual(model.pairingCode, "0123456789abcdef")
+        XCTAssertNil(model.pairingError)
+        let requests = await recorder.requests()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testPairingURLPrefillsWithoutPairing() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+
+        model.applyPairingURL(try XCTUnwrap(URL(string:
+            "horus://pair?endpoint=wss%3A%2F%2Fgateway.example&code=0123456789abcdef"
+        )))
+
+        XCTAssertTrue(model.showsPairing)
+        XCTAssertEqual(model.pairingEndpoint, "wss://gateway.example")
+        XCTAssertEqual(model.pairingCode, "0123456789abcdef")
+        XCTAssertNil(model.pairingError)
+        let requests = await recorder.requests()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
     func testProviderSelectionUsesGatewayManifestDefaults() throws {
         let model = try model()
         model.agentDraft = AgentComposition(
@@ -624,6 +658,7 @@ final class AppModelTests: XCTestCase {
             symbol: "moon",
             description: "Kimi Chat Completions API",
             configured: true,
+            selection: nil,
             auth: .apiKey,
             defaultBaseUrl: nil,
             defaultApiKeyEnv: "MOONSHOT_API_KEY",
