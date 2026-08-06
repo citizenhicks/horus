@@ -9,11 +9,22 @@ use cap_std::fs::Dir;
 use cap_std::fs::MetadataExt as _;
 
 use super::Middleware;
+use super::manifest::MiddlewareManifest;
 use crate::{Error, Result};
 
 const OVERRIDE_FILE: &str = "AGENTS.override.md";
 const INSTRUCTIONS_FILE: &str = "AGENTS.md";
 const MAX_INSTRUCTIONS_BYTES: u64 = 40_000;
+
+/// Configuration and presentation metadata for workspace instructions.
+pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
+    id: "instructions",
+    label: "Workspace instructions",
+    description: "Load optional root AGENTS.md guidance",
+    required: false,
+    default_enabled: true,
+    settings: &[],
+};
 
 /// Optional root workspace instructions composed into the system prompt once.
 pub struct Instructions {
@@ -43,7 +54,7 @@ impl Instructions {
 
 impl Middleware for Instructions {
     fn name(&self) -> &'static str {
-        "instructions"
+        MANIFEST.id
     }
 
     fn prompt_fragment(&self, _runtime: &super::RuntimeContext) -> Result<Option<String>> {

@@ -553,6 +553,7 @@ fn picker_options(tree: &Tree) -> Vec<FrontendPickerOption> {
                 capability: "subagents".into(),
                 command: "subagents".into(),
                 arguments: path.clone(),
+                input: None,
                 target: None,
             },
         })

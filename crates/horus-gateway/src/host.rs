@@ -13,6 +13,7 @@ use horus::agent::{AgentConfig, AgentSender};
 use horus::backend::checkpoint::{Checkpoint, CheckpointStore, sqlite::SqliteCheckpoint};
 use horus::backend::model::provider::provider;
 use horus::middleware::FrontendExtensions;
+use horus::middleware::scratchpad::ScratchpadStore;
 use horus::protocol::{
     Event, EventMsg, FrontendBlock, FrontendBlockFormat, FrontendEvent, Op, ReviewDecision,
     Submission, TokenUsage,
@@ -73,6 +74,7 @@ struct GatewayState {
     credentials: Arc<CredentialStore>,
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
+    scratchpad: ScratchpadStore,
     // ponytail: one lock is enough for at most 32 tiny catalog writes.
     catalog_lock: Arc<Mutex<()>>,
     activities: SessionActivities,
@@ -99,6 +101,7 @@ struct HostState {
     credentials: Arc<CredentialStore>,
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
+    scratchpad: ScratchpadStore,
     catalog_lock: Arc<Mutex<()>>,
     activities: SessionActivities,
     running: RunningAgent,
@@ -213,6 +216,7 @@ impl GatewayHost {
     ) -> Result<Self> {
         let checkpoints: Arc<dyn CheckpointStore> =
             Arc::new(SqliteCheckpoint::new(store.checkpoints_path())?);
+        let scratchpad = ScratchpadStore::new(Arc::clone(&checkpoints));
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Self {
             state: Arc::new(Mutex::new(GatewayState {
@@ -221,6 +225,7 @@ impl GatewayHost {
                 credentials,
                 cron,
                 checkpoints,
+                scratchpad,
                 catalog_lock: Arc::new(Mutex::new(())),
                 activities: Arc::new(StdMutex::new(HashMap::new())),
                 provider_login: Arc::new(StdMutex::new(None)),
@@ -280,6 +285,7 @@ impl GatewayHost {
             Arc::clone(&state.credentials),
             Arc::clone(&state.cron),
             Arc::clone(&state.checkpoints),
+            state.scratchpad.clone(),
             Arc::clone(&state.catalog_lock),
             Arc::clone(&state.activities),
             self.events.clone(),
@@ -333,6 +339,7 @@ impl GatewayHost {
             Arc::clone(&state.credentials),
             Arc::clone(&state.cron),
             Arc::clone(&state.checkpoints),
+            state.scratchpad.clone(),
             Arc::clone(&state.catalog_lock),
             Arc::clone(&state.activities),
             self.events.clone(),
@@ -430,6 +437,7 @@ impl GatewayHost {
             Arc::clone(&state.credentials),
             Arc::clone(&state.cron),
             Arc::clone(&state.checkpoints),
+            state.scratchpad.clone(),
             Arc::clone(&state.catalog_lock),
             Arc::clone(&state.activities),
             self.events.clone(),
@@ -540,6 +548,7 @@ impl HostHandle {
         credentials: Arc<CredentialStore>,
         cron: Arc<CronStore>,
         checkpoints: Arc<dyn CheckpointStore>,
+        scratchpad: ScratchpadStore,
         catalog_lock: Arc<Mutex<()>>,
         activities: SessionActivities,
         gateway_events: broadcast::Sender<ServerFrame>,
@@ -557,6 +566,7 @@ impl HostHandle {
             Arc::clone(&credentials),
             Arc::clone(&cron),
             Arc::clone(&checkpoints),
+            scratchpad.clone(),
             session_id.clone(),
             origin_label,
             false,
@@ -576,6 +586,7 @@ impl HostHandle {
             credentials,
             cron,
             checkpoints,
+            scratchpad,
             catalog_lock,
             activities,
             running,
@@ -1204,6 +1215,7 @@ impl HostState {
             Arc::clone(&self.credentials),
             Arc::clone(&self.cron),
             Arc::clone(&self.checkpoints),
+            self.scratchpad.clone(),
             session_id,
             "horus-gateway",
             true,
@@ -1280,6 +1292,7 @@ impl HostState {
             Arc::clone(&self.credentials),
             Arc::clone(&self.cron),
             Arc::clone(&self.checkpoints),
+            self.scratchpad.clone(),
             self.running.session_id.clone(),
             origin_label,
             false,
@@ -1752,6 +1765,7 @@ async fn start_agent(
     credentials: Arc<CredentialStore>,
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
+    scratchpad: ScratchpadStore,
     session_id: String,
     origin_label: &str,
     override_saved_model_route: bool,
@@ -1767,6 +1781,7 @@ async fn start_agent(
         credentials,
         cron,
         checkpoints,
+        scratchpad,
         Some(session_id),
         origin_label,
         override_saved_model_route,
@@ -2470,6 +2485,7 @@ mod tests {
             capability: "subagents".into(),
             command: "subagents".into(),
             arguments: String::new(),
+            input: None,
             target: None,
         };
         let event = EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent {

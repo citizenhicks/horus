@@ -214,6 +214,7 @@ fn validate_submission(submission: &Submission) -> Result<()> {
             capability,
             command,
             arguments,
+            input,
             target,
         } => {
             validate_identifier("capability ID", capability, MAX_OPERATION_BYTES)?;
@@ -221,6 +222,14 @@ fn validate_submission(submission: &Submission) -> Result<()> {
             if arguments.len() > MAX_COMMAND_ARGUMENT_BYTES {
                 return Err(Error::Config(
                     "middleware command arguments exceed size limit".into(),
+                ));
+            }
+            if input
+                .as_ref()
+                .is_some_and(|input| input.len() > MAX_COMMAND_ARGUMENT_BYTES)
+            {
+                return Err(Error::Config(
+                    "middleware command input exceeds size limit".into(),
                 ));
             }
             if target.is_some_and(|target| target.batch_item_count == 0) {
@@ -333,6 +342,7 @@ struct Runner {
     system_prompt: Arc<str>,
     catalog: Catalog,
     state: Checkpoint,
+    review_session_id: String,
     transcript_delta: Vec<Value>,
     deferred: VecDeque<Submission>,
     events: mpsc::Sender<Event>,
@@ -396,10 +406,18 @@ impl Runner {
                     capability,
                     command,
                     arguments,
+                    input,
                     target,
                 } => {
-                    self.capability_command(submission.id, capability, command, arguments, target)
-                        .await?;
+                    self.capability_command(
+                        submission.id,
+                        capability,
+                        command,
+                        arguments,
+                        input,
+                        target,
+                    )
+                    .await?;
                 }
                 Op::SetModel { route } => {
                     self.set_model(submission.id, route).await?;
@@ -483,6 +501,7 @@ impl Runner {
         capability: String,
         command: String,
         arguments: String,
+        input: Option<String>,
         target: Option<crate::protocol::MessageTarget>,
     ) -> Result<()> {
         let output = self
@@ -493,6 +512,7 @@ impl Runner {
                 MiddlewareCommandContext {
                     command: &command,
                     arguments: &arguments,
+                    input: input.as_deref(),
                     target,
                     session_id: &self.config.session_id,
                     session_context: &self.config.session_context,

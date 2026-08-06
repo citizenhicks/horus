@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::Middleware;
+use super::manifest::MiddlewareManifest;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
@@ -34,6 +35,16 @@ const MAX_TOOL_UI_LINES: usize = 5;
 const MAX_MUTATION_BYTES: usize = 40_000;
 const MAX_COMMAND_BYTES: usize = 8_000;
 const MAX_PATCH_MATCH_WORK: usize = 32 * 1024 * 1024;
+
+/// Configuration and presentation metadata for workspace tools.
+pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
+    id: "tools",
+    label: "Tools",
+    description: "Read and modify workspace files and run sandboxed commands",
+    required: false,
+    default_enabled: true,
+    settings: &[],
+};
 
 /// Whether a tool can overlap other calls in its model-produced batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +224,14 @@ async fn execute_one(catalog: &Catalog, call: ToolCall, context: ToolContext) ->
             is_error: true,
         };
     };
+    if tool.approval == ApprovalRequirement::Always && !context.permissions.allows_mutation() {
+        return ToolResult {
+            call_id,
+            name,
+            output: "tool call is not authorized to mutate state".into(),
+            is_error: true,
+        };
+    }
     let result = AssertUnwindSafe(async move { tool.handler.call(context, arguments).await })
         .catch_unwind()
         .await;
@@ -332,7 +351,7 @@ impl Tools {
 
 impl Middleware for Tools {
     fn name(&self) -> &'static str {
-        "tools"
+        MANIFEST.id
     }
 
     fn register(&self, catalog: &mut Catalog, _runtime: &super::RuntimeContext) -> Result<()> {

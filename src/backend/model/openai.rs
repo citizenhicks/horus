@@ -151,7 +151,7 @@ impl OpenAi {
             "model": self.model,
             "instructions": request.instructions,
             "input": wire_input(request.input),
-            "tools": wire_tools(request.tools, &self.hosted_tools),
+            "tools": wire_tools(request.tools, &self.hosted_tools, request.allow_hosted_tools),
             "tool_choice": "auto",
             "parallel_tool_calls": true,
             "include": ["reasoning.encrypted_content"],
@@ -267,7 +267,7 @@ impl OpenAi {
             "model": self.model,
             "instructions": request.instructions,
             "input": wire_input(request.input),
-            "tools": wire_tools(request.tools, &self.hosted_tools),
+            "tools": wire_tools(request.tools, &self.hosted_tools, true),
             "parallel_tool_calls": true
         })
     }
@@ -347,7 +347,11 @@ pub(super) fn attach_stream_output(mut response: Value, output: &BTreeMap<u64, V
     response
 }
 
-pub(super) fn wire_tools(tools: &[ToolDefinition], hosted_tools: &[Value]) -> Vec<Value> {
+pub(super) fn wire_tools(
+    tools: &[ToolDefinition],
+    hosted_tools: &[Value],
+    allow_hosted_tools: bool,
+) -> Vec<Value> {
     let mut tools = tools
         .iter()
         .map(|tool| {
@@ -360,7 +364,9 @@ pub(super) fn wire_tools(tools: &[ToolDefinition], hosted_tools: &[Value]) -> Ve
             })
         })
         .collect::<Vec<_>>();
-    tools.extend_from_slice(hosted_tools);
+    if allow_hosted_tools {
+        tools.extend_from_slice(hosted_tools);
+    }
     tools
 }
 

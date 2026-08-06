@@ -7,7 +7,6 @@ use futures_util::{Sink, SinkExt as _, Stream, StreamExt as _};
 use horus::backend::checkpoint::SessionSummary;
 use horus::backend::model::ModelChoice;
 use horus::backend::model::provider::HostedWebSearch;
-use horus::backend::sandbox::ApprovalPolicy;
 use horus::protocol::{
     Event, EventMsg, FrontendBlock, FrontendContribution, FrontendSettingValue, MiddlewareFeature,
     SessionConfiguredEvent, Submission, TokenUsage,
@@ -22,7 +21,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use crate::{Error, Result};
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
@@ -471,7 +470,6 @@ pub struct VersionedAgentConfig {
 pub struct AgentComposition {
     pub provider: ProviderConfig,
     pub middleware: MiddlewareConfig,
-    pub approval: ApprovalPolicy,
     pub system_prompt: String,
 }
 
@@ -957,6 +955,7 @@ mod tests {
                     capability: "subagents".into(),
                     command: "subagents".into(),
                     arguments: String::new(),
+                    input: None,
                     target: None,
                 },
             },
@@ -970,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v9_rejects_an_untargeted_legacy_capability_shape() {
+    fn protocol_v10_rejects_an_untargeted_capability_shape() {
         let frame = serde_json::json!({
             "version": PROTOCOL_VERSION,
             "type": "submit",
@@ -981,13 +980,14 @@ mod tests {
                     "type": "capability_command",
                     "capability": "sessions",
                     "command": "fork",
-                    "arguments": ""
+                    "arguments": "",
+                    "input": null
                 }
             }
         });
 
         let error = serde_json::from_value::<ClientFrame>(frame)
-            .expect_err("v9 capability commands require an explicit target field");
+            .expect_err("v10 capability commands require an explicit target field");
 
         assert!(error.to_string().contains("missing field `target`"));
     }
@@ -1349,6 +1349,7 @@ mod tests {
                             "capability": "subagents",
                             "command": "subagents",
                             "arguments": "",
+                            "input": null,
                             "target": null
                         }
                     }],
@@ -1374,7 +1375,6 @@ mod tests {
                                 "context_offloading": {"stale_after_tokens": 50000}
                             }
                         },
-                        "approval": "on",
                         "system_prompt": "test"
                     }
                 }

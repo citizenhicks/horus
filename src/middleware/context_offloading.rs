@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 
+use super::manifest::{MiddlewareManifest, MiddlewareSettingManifest};
 use super::{Middleware, ModelContext, approximate_item_tokens};
 use crate::protocol::{TOOL_ERROR_FIELD, is_internal_message};
 use crate::{BoxFuture, Error, Result};
@@ -10,6 +11,25 @@ const MASKED_TOOL_OUTPUT: &str = "[offloaded]";
 
 /// Default trailing token window retained by context offloading.
 pub const DEFAULT_STALE_AFTER_TOKENS: i64 = 50_000;
+const SETTINGS: &[MiddlewareSettingManifest] = &[MiddlewareSettingManifest::Integer {
+    id: "stale_after_tokens",
+    label: "Stale after tokens",
+    description: "Successful tool results older than this trailing window are masked",
+    min: 1,
+    max: None,
+    step: 10_000,
+    default: DEFAULT_STALE_AFTER_TOKENS,
+}];
+
+/// Configuration and presentation metadata for context offloading.
+pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
+    id: "context_offloading",
+    label: "Context offloading",
+    description: "Mask stale successful tool output from active model context",
+    required: false,
+    default_enabled: true,
+    settings: SETTINGS,
+};
 
 /// Masks successful tool output older than a trailing token window.
 pub struct ContextOffloading {
@@ -32,7 +52,7 @@ impl ContextOffloading {
 
 impl Middleware for ContextOffloading {
     fn name(&self) -> &'static str {
-        "context_offloading"
+        MANIFEST.id
     }
 
     fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {

@@ -21,45 +21,49 @@ struct AppShell: View {
     var body: some View {
         @Bindable var model = model
         ZStack(alignment: .top) {
-            HorusBackdrop()
-            if model.accounts.isEmpty {
-                PairingView(canCancel: false)
-                    .frame(maxWidth: 620)
-                    .padding(24)
+            if model.isAppLocked || model.appLockEnabled && scenePhase != .active {
+                AppLockView()
             } else {
-                NavigationSplitView(
-                    columnVisibility: $columnVisibility,
-                    preferredCompactColumn: $compactColumn
-                ) {
-                    SidebarView(showDetail: showDetail)
-                        .navigationSplitViewColumnWidth(min: 230, ideal: 272, max: 340)
-                } detail: {
-                    destination
-                }
-                .navigationSplitViewStyle(.balanced)
-                .inspector(isPresented: $model.showsInspector) {
-                    ArtifactInspector()
-                        .overlay(alignment: .top) {
-                            #if os(iOS)
-                            if horizontalSizeClass == .compact { AppToastOverlay() }
-                            #endif
-                        }
-                }
-                .sheet(isPresented: $model.showsPairing) {
-                    PairingView(canCancel: true)
-                        .frame(maxWidth: 560)
+                HorusBackdrop()
+                if model.accounts.isEmpty {
+                    PairingView(canCancel: false)
+                        .frame(maxWidth: 620)
                         .padding(24)
-                        .overlay(alignment: .top) { AppToastOverlay() }
-                        .presentationDetents([.medium, .large])
+                } else {
+                    NavigationSplitView(
+                        columnVisibility: $columnVisibility,
+                        preferredCompactColumn: $compactColumn
+                    ) {
+                        SidebarView(showDetail: showDetail)
+                            .navigationSplitViewColumnWidth(min: 230, ideal: 272, max: 340)
+                    } detail: {
+                        destination
+                    }
+                    .navigationSplitViewStyle(.balanced)
+                    .inspector(isPresented: $model.showsInspector) {
+                        ArtifactInspector()
+                            .overlay(alignment: .top) {
+                                #if os(iOS)
+                                if horizontalSizeClass == .compact { AppToastOverlay() }
+                                #endif
+                            }
+                    }
+                    .sheet(isPresented: $model.showsPairing) {
+                        PairingView(canCancel: true)
+                            .frame(maxWidth: 560)
+                            .padding(24)
+                            .overlay(alignment: .top) { AppToastOverlay() }
+                            .presentationDetents([.medium, .large])
+                    }
+                    .sheet(isPresented: $model.showsWorkspaceBrowser) {
+                        WorkspaceBrowserView()
+                            .frame(idealWidth: 520, idealHeight: 620)
+                            .overlay(alignment: .top) { AppToastOverlay() }
+                            .presentationDetents([.medium, .large])
+                    }
                 }
-                .sheet(isPresented: $model.showsWorkspaceBrowser) {
-                    WorkspaceBrowserView()
-                        .frame(idealWidth: 520, idealHeight: 620)
-                        .overlay(alignment: .top) { AppToastOverlay() }
-                        .presentationDetents([.medium, .large])
-                }
+                AppToastOverlay().zIndex(10)
             }
-            AppToastOverlay().zIndex(10)
         }
         .preferredColorScheme(preferredColorScheme)
         .onChange(of: chatIsVisible, initial: true) { _, visible in
@@ -78,8 +82,16 @@ struct AppShell: View {
         // or a notification banner, and reconnecting on those drops a healthy session.
         .onChange(of: scenePhase) { _, newPhase in
             model.setSceneActive(newPhase != .background)
+            if newPhase == .background {
+                model.appDidEnterBackground()
+            } else if newPhase == .active {
+                Task { await model.appDidBecomeActive() }
+            }
         }
-        .task { model.start() }
+        .task {
+            model.start()
+            if scenePhase == .active { await model.appDidBecomeActive() }
+        }
     }
 
     @ViewBuilder
@@ -91,6 +103,16 @@ struct AppShell: View {
         case .providers: ProvidersView()
         case .cron: CronView()
         case .profile: ProfileView()
+        case .contribution(let id):
+            if let widget = model.navigationWidgets.first(where: { $0.id == id }) {
+                FrontendContributionPage(widget: widget)
+            } else {
+                HorusUnavailable(
+                    title: "Capability unavailable",
+                    systemImage: "square.grid.2x2",
+                    detail: "This capability is not available in the current chat."
+                )
+            }
         }
     }
 
@@ -121,6 +143,8 @@ struct AppShell: View {
     private var chatIsVisible: Bool {
         guard !model.accounts.isEmpty,
               model.destination == .chat,
+              scenePhase == .active,
+              !model.isAppLocked,
               !model.showsPairing,
               !model.showsWorkspaceBrowser
         else { return false }
@@ -130,6 +154,53 @@ struct AppShell: View {
         #else
         return true
         #endif
+    }
+}
+
+private struct AppLockView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+
+    var body: some View {
+        ZStack {
+            HorusBackdrop()
+            HorusCard {
+                VStack(spacing: 16) {
+                    HorusIcon(
+                        systemName: model.appLockAuthenticationMethod.systemImage,
+                        size: 36,
+                        foreground: palette.accent
+                    )
+                    Text("Horus is locked")
+                        .font(.title2.weight(.semibold))
+                    Text(status)
+                        .foregroundStyle(palette.muted)
+                        .multilineTextAlignment(.center)
+                        .accessibilityLabel("App lock status: \(status)")
+                    if model.isAppLockAuthenticating {
+                        ProgressView("Authenticating")
+                    } else {
+                        Button(
+                            model.appLockError == nil
+                                ? model.appLockAuthenticationMethod.unlockTitle
+                                : "Try Again",
+                            systemImage: model.appLockError == nil ? "lock.open" : "arrow.clockwise"
+                        ) {
+                            Task { await model.unlockApp() }
+                        }
+                        .horusProminentButton()
+                        .controlSize(.large)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .frame(maxWidth: 380)
+            .padding(24)
+        }
+    }
+
+    private var status: String {
+        model.appLockError ?? "Use Face ID or Touch ID to continue."
     }
 }
 
@@ -339,6 +410,42 @@ private struct ArtifactInspector: View {
     }
 }
 
+private struct FrontendContributionPage: View {
+    @Environment(AppModel.self) private var model
+    let widget: MountedWidget
+
+    var body: some View {
+        PageScaffold(title: widget.title, detail: detail) {
+            if let content = widget.widget.content {
+                Section {
+                    FrontendWidgetContentView(content: content) { option in
+                        model.submitPickerOption(option)
+                    }
+                }
+            } else if widget.widget.action != nil {
+                Section {
+                    Button(
+                        widget.widget.text,
+                        systemImage: widget.systemImage,
+                        action: { model.submitWidget(widget) }
+                    )
+                }
+            } else {
+                HorusUnavailable(
+                    title: widget.widget.text,
+                    systemImage: widget.systemImage,
+                    detail: "No content is currently available."
+                )
+            }
+        }
+    }
+
+    private var detail: String {
+        if case .actionList? = widget.widget.content { return "" }
+        return widget.widget.text == widget.title ? "" : widget.widget.text
+    }
+}
+
 struct SidebarView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -354,9 +461,11 @@ struct SidebarView: View {
         ScrollView {
             VStack(spacing: 0) {
                 HStack(spacing: 10) {
-                    Text("𓂀")
-                        .font(.system(size: 27, weight: .regular, design: .serif))
-                        .foregroundStyle(palette.accent)
+                    Image("HorusLogo")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 28, height: 28)
+                        .clipShape(.rect(cornerRadius: 6))
                         .accessibilityHidden(true)
                     Text("HORUS")
                         .font(.system(.subheadline, design: .serif, weight: .bold))
@@ -393,6 +502,9 @@ struct SidebarView: View {
                     navigationButton("Providers", destination: .providers)
                     navigationButton("Agent settings", destination: .agent)
                     navigationButton("Cron", destination: .cron)
+                    ForEach(model.navigationWidgets) { widget in
+                        contributionNavigationButton(widget)
+                    }
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 10)
@@ -535,6 +647,30 @@ struct SidebarView: View {
                 .foregroundStyle(model.destination == destination ? palette.accent : Color.primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 4)
+        .frame(minHeight: HorusStyle.iconButtonSize)
+    }
+
+    private func contributionNavigationButton(_ widget: MountedWidget) -> some View {
+        let destination = AppDestination.contribution(widget.id)
+        return Button {
+            if widget.widget.action != nil {
+                model.submitWidget(widget)
+            }
+            model.destination = destination
+            showDetail()
+        } label: {
+            HorusLabel(
+                title: widget.widget.text,
+                systemImage: widget.systemImage,
+                iconColor: model.destination == destination ? palette.accent : Color.primary
+            )
+            .font(HorusStyle.controlFont)
+            .foregroundStyle(model.destination == destination ? palette.accent : Color.primary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 4)

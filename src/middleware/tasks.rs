@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::manifest::MiddlewareManifest;
 use super::tools::{Catalog, Tool, ToolContext, render_tool_event};
 use super::{Middleware, MiddlewareCommandContext, MiddlewareCommandOutput, RuntimeContext};
 use crate::backend::checkpoint::CheckpointStore;
@@ -19,6 +20,16 @@ const STATE_KEY: &str = "tasks.v1";
 const MAX_TODOS: usize = 50;
 const MAX_TODO_BYTES: usize = 500;
 const PROMPT: &str = "Use `write_todos` only for genuinely multi-step work. Keep the list short, mark work in_progress before starting and completed immediately after finishing, and end with a substantive answer.";
+
+/// Configuration and presentation metadata for durable tasks.
+pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
+    id: "tasks",
+    label: "Tasks",
+    description: "Maintain a durable todo list for multi-step work",
+    required: false,
+    default_enabled: false,
+    settings: &[],
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,7 +58,7 @@ pub struct Tasks;
 
 impl Middleware for Tasks {
     fn name(&self) -> &'static str {
-        "tasks"
+        MANIFEST.id
     }
 
     fn register(&self, catalog: &mut Catalog, runtime: &RuntimeContext) -> Result<()> {
@@ -203,7 +214,7 @@ async fn load_todos(checkpoints: &Arc<dyn CheckpointStore>, session_id: &str) ->
 fn widget_event(todos: &[Todo]) -> FrontendEvent {
     if todos.is_empty() {
         return FrontendEvent::RemoveWidget {
-            capability: "tasks".into(),
+            capability: MANIFEST.id.into(),
             id: "status".into(),
         };
     }
@@ -212,7 +223,7 @@ fn widget_event(todos: &[Todo]) -> FrontendEvent {
         .filter(|todo| todo.status == TodoStatus::Completed)
         .count();
     FrontendEvent::Widget {
-        capability: "tasks".into(),
+        capability: MANIFEST.id.into(),
         item: FrontendWidget {
             id: "status".into(),
             slot: FrontendSlot::ComposerFooter,
@@ -302,7 +313,7 @@ mod tests {
         tasks.register(&mut catalog, &runtime).expect("register");
         let sandbox = Arc::new(Sandbox::new(
             Arc::new(LocalSandbox::new(temporary.path()).expect("sandbox")),
-            ApprovalPolicy::On,
+            ApprovalPolicy::Ask,
         ));
         let permissions =
             SandboxPermissions::restore("session-a", NetworkAccess::Denied, Vec::new());

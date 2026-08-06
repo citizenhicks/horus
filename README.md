@@ -65,7 +65,7 @@ Horus requires Rust 1.89 or newer.
 
 ```toml
 [dependencies]
-horus = "0.4"
+horus = "0.5"
 ```
 
 The caller owns composition:
@@ -95,7 +95,7 @@ async fn build_agent(
     let models = Arc::new(ModelRouter::new("default", model));
     let sandbox = Arc::new(Sandbox::new(
         Arc::new(LocalSandbox::new(workspace)?),
-        ApprovalPolicy::On,
+        ApprovalPolicy::Ask,
     ));
     let checkpoints: Arc<dyn CheckpointStore> =
         Arc::new(SqliteCheckpoint::new(workspace.join("horus.sqlite3"))?);

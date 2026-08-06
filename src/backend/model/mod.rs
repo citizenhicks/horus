@@ -86,6 +86,10 @@ pub struct ModelRequest<'a> {
     pub instructions: &'a str,
     pub input: &'a [Value],
     pub tools: &'a [ToolDefinition],
+    /// Whether provider-hosted tools such as web search may be attached.
+    pub allow_hosted_tools: bool,
+    /// Whether a transport may continue a previous response for this session.
+    pub allow_continuation: bool,
 }
 
 /// Input for a provider's native compaction endpoint.

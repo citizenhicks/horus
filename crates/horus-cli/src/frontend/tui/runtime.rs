@@ -369,13 +369,8 @@ fn agent_summary(gateway: &ReadyPayload, session: &SessionReadyPayload) -> Strin
         .reasoning_effort
         .as_deref()
         .unwrap_or("default");
-    let approval = match session.config.config.approval {
-        horus::backend::sandbox::ApprovalPolicy::On => "ask",
-        horus::backend::sandbox::ApprovalPolicy::Allow => "allow",
-        horus::backend::sandbox::ApprovalPolicy::AllowNetwork => "allow network",
-    };
     format!(
-        "HORUS AGENT\nmodel: {} · {reasoning}\nproviders: {}\nmiddleware: {}\n{}tools: {} · approval: {approval}\nworkspace: {}",
+        "HORUS AGENT\nmodel: {} · {reasoning}\nproviders: {}\nmiddleware: {}\n{}tools: {}\nworkspace: {}",
         super::terminal_text(&session.session.model.model),
         if providers.is_empty() {
             "none"

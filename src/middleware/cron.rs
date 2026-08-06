@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::manifest::MiddlewareManifest;
 use super::tools::{
     ApprovalRequirement, Catalog, Tool, ToolContext, labeled_tool_heading, render_tool_event,
 };
@@ -17,6 +18,16 @@ const PROMPT: &str = "Use `schedule_task` only during an explicit recurring-task
                       setup, ask only for missing task or timing details, then call it once with \
                       standalone task instructions and a five-field cron expression in the \
                       host's local time. Outside explicit setup, never call it.";
+
+/// Configuration and presentation metadata for scheduled work.
+pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
+    id: "cron",
+    label: "Scheduling",
+    description: "Schedule recurring agent work; always available",
+    required: true,
+    default_enabled: true,
+    settings: &[],
+};
 
 type TaskWriter = dyn Fn(&str, &str, &str) -> Result<String> + Send + Sync;
 
@@ -36,7 +47,7 @@ impl Cron {
 
 impl Middleware for Cron {
     fn name(&self) -> &'static str {
-        "cron"
+        MANIFEST.id
     }
 
     fn register(&self, catalog: &mut Catalog, runtime: &RuntimeContext) -> Result<()> {
@@ -164,7 +175,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let sandbox = Arc::new(Sandbox::new(
             Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
-            ApprovalPolicy::On,
+            ApprovalPolicy::Ask,
         ));
         let permissions =
             SandboxPermissions::restore("session-a", NetworkAccess::Denied, ["call".into()])

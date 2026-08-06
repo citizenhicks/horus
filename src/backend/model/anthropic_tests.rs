@@ -2,6 +2,12 @@ use super::*;
 use crate::backend::model::user_message;
 
 #[test]
+fn hosted_search_can_be_disabled_per_request() {
+    assert!(wire_tools(&[], false).is_empty());
+    assert_eq!(wire_tools(&[], true)[0]["name"], "web_search");
+}
+
+#[test]
 fn responses_history_translates_to_anthropic_tool_messages() {
     let messages = translate_messages(&[
         user_message("inspect it"),

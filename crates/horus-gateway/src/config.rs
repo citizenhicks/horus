@@ -23,12 +23,11 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 9;
-const CHAT_SPEC_VERSION: u32 = 4;
+const CONFIG_VERSION: u32 = 10;
+const CHAT_SPEC_VERSION: u32 = 5;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
 const CLOUDFLARE_TOKEN_FILE: &str = "cloudflare-token";
-const CONFIG_HEADER: &str = "# approval options: \"on\" (prompt), \"allow\" (no prompt, no network),\n# \"allow_network\" (no prompt, network allowed).\n\n";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_API_KEY_BYTES: usize = 16 * 1024;
@@ -125,7 +124,6 @@ impl Default for AgentComposition {
                     .expect("default provider web-search manifest"),
             },
             middleware: crate::middleware_manifest::default_config(),
-            approval: horus::backend::sandbox::ApprovalPolicy::default(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
         }
     }
@@ -294,15 +292,14 @@ impl GatewayConfig {
                     "the gateway default must reference a configured provider".into(),
                 ));
             }
-            if let Some(route) = crate::middleware_manifest::string_setting(
-                &default.config.middleware,
-                "subagents",
-                "model_route",
-            )? && !crate::assembly::configured_route_exists(self, route)?
+            for (middleware, setting, route) in
+                crate::middleware_manifest::configured_model_routes(&default.config.middleware)
             {
-                return Err(Error::Config(
-                    "the gateway default subagent route is not configured".into(),
-                ));
+                if !crate::assembly::configured_route_exists(self, route)? {
+                    return Err(Error::Config(format!(
+                        "gateway default middleware setting `{middleware}.{setting}` is not a configured model route"
+                    )));
+                }
             }
         }
         for usage in self.usage.days.values() {
@@ -598,7 +595,7 @@ impl ConfigStore {
         let config = toml::to_string_pretty(config).map_err(|error| {
             Error::Config(format!("cannot encode gateway configuration: {error}"))
         })?;
-        let contents = format!("{CONFIG_HEADER}{config}");
+        let contents = config;
         if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_CONFIG_BYTES {
             return Err(Error::Config("gateway configuration is too large".into()));
         }
@@ -1084,27 +1081,27 @@ mod tests {
     }
 
     #[test]
-    fn gateway_config_rejects_v8_without_migration() {
+    fn gateway_config_rejects_v9_without_migration() {
         let root = tempfile::tempdir().expect("temporary directory");
         let state = root.path().join("state");
         ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
         let path = state.join(CONFIG_FILE);
         let contents = fs::read_to_string(&path)
             .expect("read gateway config")
-            .replacen("version = 9", "version = 8", 1);
-        fs::write(&path, contents).expect("write v8 config");
+            .replacen("version = 10", "version = 9", 1);
+        fs::write(&path, contents).expect("write v9 config");
 
-        let error = ConfigStore::open(state).expect_err("v8 must be rejected");
+        let error = ConfigStore::open(state).expect_err("v9 must be rejected");
 
         assert!(
             error
                 .to_string()
-                .contains("unsupported gateway config version 8")
+                .contains("unsupported gateway config version 9")
         );
     }
 
     #[test]
-    fn generated_toml_documents_approval_and_round_trips() {
+    fn generated_toml_round_trips_manifest_settings() {
         let root = tempfile::tempdir().expect("temporary directory");
         let state = root.path().join("state");
         let (store, config) =
@@ -1129,10 +1126,9 @@ mod tests {
         let contents = fs::read_to_string(state.join(CONFIG_FILE)).expect("read config");
         let (_, restored) = ConfigStore::open(state).expect("open config");
 
-        assert!(contents.starts_with(CONFIG_HEADER));
-        assert!(contents.contains("approval = \"on\""));
+        assert!(contents.starts_with("version = 10"));
         assert!(contents.contains("[default_agent.config.middleware.settings.context_offloading]"));
-        assert!(!contents.contains("sessions"));
+        assert!(contents.contains("[default_agent.config.middleware.settings.sessions]"));
         assert_eq!(restored, config);
     }
 
@@ -1231,7 +1227,7 @@ mod tests {
             .expect("default")
             .config
             .clone();
-        replacement.approval = horus::backend::sandbox::ApprovalPolicy::Allow;
+        replacement.middleware.set_enabled("tasks", true);
 
         let updated = registered
             .replacing_default_agent(1, replacement.clone())

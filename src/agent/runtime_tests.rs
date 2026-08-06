@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -20,23 +21,46 @@ use crate::backend::model::ModelRequest;
 use crate::backend::model::ModelRouter;
 use crate::backend::model::TOOL_ERROR_FIELD;
 use crate::backend::model::ToolCall;
+use crate::backend::model::ToolDefinition;
 use crate::backend::sandbox::ApprovalPolicy;
 use crate::backend::sandbox::Sandbox;
 use crate::backend::sandbox::local::LocalSandbox;
 use crate::middleware::Middleware;
 use crate::middleware::MiddlewareStack;
+use crate::middleware::ModelContext;
 use crate::middleware::RuntimeContext;
+use crate::middleware::tools::ApprovalRequirement;
 use crate::middleware::tools::Catalog;
+use crate::middleware::tools::Tool;
+use crate::middleware::tools::ToolContext;
+use crate::middleware::tools::Tools;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::FrontendEvent;
 use crate::protocol::MAX_USER_INPUT_BYTES;
 use crate::protocol::Op;
 use crate::protocol::SessionContext;
+use crate::protocol::TokenUsage;
 use crate::protocol::ToolCallEndEvent;
 use crate::protocol::WarningEvent;
+use crate::protocol::internal_message_kind;
+use serde_json::Value;
 
 struct TestModel;
+
+struct ScriptedModel {
+    outputs: Mutex<VecDeque<ModelOutput>>,
+    tool_counts: Mutex<Vec<usize>>,
+    inputs: Mutex<Vec<Vec<Value>>>,
+}
+
+struct RequestOnlyMiddleware;
+
+struct DurableBeforeModel;
+
+struct FailingBeforeModel;
+
+struct ApprovalRequiredTestTool;
 
 struct SaturatingMiddleware;
 
@@ -70,6 +94,51 @@ impl Middleware for MetadataProbe {
     fn register(&self, _catalog: &mut Catalog, runtime: &RuntimeContext) -> Result<()> {
         *self.observed.lock().expect("metadata probe lock") = Some(runtime.metadata.clone());
         Ok(())
+    }
+}
+
+impl Middleware for RequestOnlyMiddleware {
+    fn name(&self) -> &'static str {
+        "request_only"
+    }
+
+    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let mut input = context.request_input().to_vec();
+            input.push(crate::backend::model::internal_user_message(
+                "request_only",
+                "temporary",
+            ));
+            context.replace_request_input(input);
+            Ok(())
+        })
+    }
+}
+
+impl Middleware for DurableBeforeModel {
+    fn name(&self) -> &'static str {
+        "durable_before_model"
+    }
+
+    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            context.push_input(crate::backend::model::internal_user_message(
+                "settled", "durable",
+            ));
+            context.usage.push(scripted_usage());
+            context.events.push(EventMsg::ContextCompacted);
+            Ok(())
+        })
+    }
+}
+
+impl Middleware for FailingBeforeModel {
+    fn name(&self) -> &'static str {
+        "failing_before_model"
+    }
+
+    fn before_model<'a>(&'a self, _context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Err(Error::Provider("later middleware failed".into())) })
     }
 }
 
@@ -153,6 +222,109 @@ impl Model for TestModel {
     }
 }
 
+impl Model for ScriptedModel {
+    fn respond<'a>(
+        &'a self,
+        request: ModelRequest,
+        _events: ModelEventSink,
+    ) -> BoxFuture<'a, Result<ModelOutput>> {
+        self.tool_counts
+            .lock()
+            .expect("tool count lock")
+            .push(request.tools.len());
+        self.inputs
+            .lock()
+            .expect("input lock")
+            .push(request.input.to_vec());
+        let output = self
+            .outputs
+            .lock()
+            .expect("scripted output lock")
+            .pop_front()
+            .ok_or_else(|| Error::Provider("scripted output exhausted".into()));
+        Box::pin(async move { output })
+    }
+}
+
+impl Tool for ApprovalRequiredTestTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "approval_required".into(),
+            description: "performs one reviewed mutation".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn approval(&self) -> ApprovalRequirement {
+        ApprovalRequirement::Always
+    }
+
+    fn call<'a>(
+        &'a self,
+        _context: ToolContext,
+        _arguments: serde_json::Value,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async { Ok("executed".into()) })
+    }
+}
+
+fn scripted_usage() -> TokenUsage {
+    TokenUsage {
+        input_tokens: 1,
+        total_tokens: 1,
+        ..TokenUsage::default()
+    }
+}
+
+fn scripted_tool_call() -> ModelOutput {
+    ModelOutput::from_output(
+        vec![serde_json::json!({
+            "type": "function_call",
+            "call_id": "reviewed-call",
+            "name": "approval_required",
+            "arguments": "{}"
+        })],
+        false,
+        scripted_usage(),
+    )
+    .expect("tool output")
+}
+
+fn scripted_message(text: &str) -> ModelOutput {
+    ModelOutput::from_output(
+        vec![serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]
+        })],
+        true,
+        scripted_usage(),
+    )
+    .expect("message output")
+}
+
+fn auto_review_config(
+    workspace: &Path,
+    checkpoints: Arc<dyn CheckpointStore>,
+    model: Arc<ScriptedModel>,
+    session_id: &str,
+) -> AgentConfig {
+    AgentConfig::new(
+        Arc::new(ModelRouter::new("main", model)),
+        Arc::new(Sandbox::new(
+            Arc::new(LocalSandbox::new(workspace).expect("local sandbox")),
+            ApprovalPolicy::AutoApprove,
+        )),
+        checkpoints,
+        MiddlewareStack::new(vec![Arc::new(Tools::new(vec![Arc::new(
+            ApprovalRequiredTestTool,
+        )]))])
+        .expect("middleware"),
+        "test prompt",
+    )
+    .session_id(session_id)
+}
+
 fn config(
     workspace: &Path,
     checkpoints: Arc<dyn CheckpointStore>,
@@ -171,7 +343,7 @@ fn config_with_route(
         Arc::new(ModelRouter::new(route, Arc::new(TestModel))),
         Arc::new(Sandbox::new(
             Arc::new(LocalSandbox::new(workspace).expect("local sandbox")),
-            ApprovalPolicy::On,
+            ApprovalPolicy::Ask,
         )),
         checkpoints,
         MiddlewareStack::new(Vec::new()).expect("middleware"),
@@ -195,7 +367,7 @@ fn config_with_two_routes(
         Arc::new(models),
         Arc::new(Sandbox::new(
             Arc::new(LocalSandbox::new(workspace).expect("local sandbox")),
-            ApprovalPolicy::On,
+            ApprovalPolicy::Ask,
         )),
         checkpoints,
         MiddlewareStack::new(Vec::new()).expect("middleware"),
@@ -215,7 +387,7 @@ fn config_with_metadata_probe(
         Arc::new(ModelRouter::new("test", Arc::new(TestModel))),
         Arc::new(Sandbox::new(
             Arc::new(LocalSandbox::new(workspace).expect("local sandbox")),
-            ApprovalPolicy::On,
+            ApprovalPolicy::Ask,
         )),
         checkpoints,
         MiddlewareStack::new(vec![Arc::new(MetadataProbe { observed })]).expect("middleware"),
@@ -250,42 +422,287 @@ async fn middleware_event_saturation_fails_agent_creation_instead_of_dropping_up
 }
 
 #[tokio::test]
-async fn sandbox_commands_use_capability_dispatch() {
+async fn configured_approval_policy_ignores_checkpoint_middleware_state() {
     let workspace = tempfile::tempdir().expect("workspace");
-    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+    let checkpoints = Arc::new(
         SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
             .expect("checkpoint store"),
     );
-    let mut agent = create_agent(config(workspace.path(), checkpoints, "sandbox-command"))
+    checkpoints
+        .save_state(
+            "policy-authority",
+            "sandbox.approval_policy",
+            &serde_json::json!("allow_network"),
+        )
         .await
-        .expect("create agent");
-    assert!(matches!(
-        agent.next_event().await.expect("configured event").msg,
-        EventMsg::SessionConfigured(_)
-    ));
-    assert!(matches!(
-        agent.next_event().await.expect("sandbox widget").msg,
-        EventMsg::Frontend(crate::protocol::FrontendEvent::Widget { capability, .. })
-            if capability == "sandbox"
-    ));
+        .expect("seed stale policy");
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints;
+    let mut agent = create_agent(config(
+        workspace.path(),
+        checkpoint_store,
+        "policy-authority",
+    ))
+    .await
+    .expect("create agent");
+    agent.next_event().await.expect("configured event");
+    let EventMsg::Frontend(FrontendEvent::Widget { item, .. }) =
+        agent.next_event().await.expect("sandbox widget").msg
+    else {
+        panic!("expected sandbox widget");
+    };
 
-    let submission_id = agent
+    assert_eq!(item.text, "approval ASK");
+}
+
+#[tokio::test]
+async fn request_only_input_reaches_the_model_without_entering_the_checkpoint() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let model = Arc::new(ScriptedModel {
+        outputs: Mutex::new(VecDeque::from([scripted_message("done")])),
+        tool_counts: Mutex::new(Vec::new()),
+        inputs: Mutex::new(Vec::new()),
+    });
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let config = AgentConfig::new(
+        Arc::new(ModelRouter::new("main", model.clone())),
+        Arc::new(Sandbox::new(
+            Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+            ApprovalPolicy::Ask,
+        )),
+        checkpoint_store,
+        MiddlewareStack::new(vec![Arc::new(RequestOnlyMiddleware)]).expect("middleware"),
+        "test prompt",
+    )
+    .session_id("request-only");
+    let mut agent = create_agent(config).await.expect("create agent");
+    agent.next_event().await.expect("configured event");
+    agent.next_event().await.expect("sandbox widget");
+    agent
         .sender()
-        .submit(Op::CapabilityCommand {
-            capability: "sandbox".into(),
-            command: "permissions".into(),
-            arguments: String::new(),
-            target: None,
+        .submit(Op::UserInput {
+            text: "hello".into(),
         })
-        .expect("submit sandbox command");
-    let event = agent.next_event().await.expect("sandbox command result");
+        .expect("submit input");
+    loop {
+        if matches!(
+            agent.next_event().await.expect("agent event").msg,
+            EventMsg::TurnComplete(_)
+        ) {
+            break;
+        }
+    }
+    let saved = checkpoints
+        .load("request-only")
+        .await
+        .expect("load checkpoint")
+        .expect("saved checkpoint");
 
-    assert_eq!(event.submission_id.as_deref(), Some(submission_id.as_str()));
-    assert!(matches!(
-        event.msg,
-        EventMsg::Frontend(crate::protocol::FrontendEvent::Render { capability, block })
-            if capability == "sandbox" && block.text == "approval ON"
-    ));
+    assert!(
+        model.inputs.lock().expect("input lock")[0]
+            .iter()
+            .any(|item| internal_message_kind(item) == Some("request_only"))
+    );
+    assert!(
+        saved
+            .context
+            .iter()
+            .all(|item| internal_message_kind(item) != Some("request_only"))
+    );
+}
+
+#[tokio::test]
+async fn completed_before_model_effects_are_settled_when_a_later_hook_fails() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let config = AgentConfig::new(
+        Arc::new(ModelRouter::new("main", Arc::new(TestModel))),
+        Arc::new(Sandbox::new(
+            Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+            ApprovalPolicy::Ask,
+        )),
+        checkpoint_store,
+        MiddlewareStack::new(vec![
+            Arc::new(DurableBeforeModel),
+            Arc::new(FailingBeforeModel),
+        ])
+        .expect("middleware"),
+        "test prompt",
+    )
+    .session_id("settled-hooks");
+    let mut agent = create_agent(config).await.expect("create agent");
+    agent.next_event().await.expect("configured event");
+    agent.next_event().await.expect("sandbox widget");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "hello".into(),
+        })
+        .expect("submit input");
+    let mut saw_effect = false;
+    loop {
+        match agent.next_event().await.expect("agent event").msg {
+            EventMsg::ContextCompacted => saw_effect = true,
+            EventMsg::TurnAborted(_) => break,
+            _ => {}
+        }
+    }
+    let saved = checkpoints
+        .load("settled-hooks")
+        .await
+        .expect("load checkpoint")
+        .expect("saved checkpoint");
+
+    assert!(saw_effect);
+    assert_eq!(saved.total_usage.total_tokens, 1);
+    assert!(
+        saved
+            .context
+            .iter()
+            .any(|item| internal_message_kind(item) == Some("settled"))
+    );
+}
+
+#[tokio::test]
+async fn automatic_approval_uses_an_isolated_toolless_review_and_counts_usage() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let mut review_output =
+        scripted_message("{\"decision\":\"approve\",\"call_ids\":[\"reviewed-call\"]}");
+    review_output.usage = TokenUsage {
+        input_tokens: 7,
+        total_tokens: 7,
+        ..TokenUsage::default()
+    };
+    let model = Arc::new(ScriptedModel {
+        outputs: Mutex::new(VecDeque::from([
+            scripted_tool_call(),
+            review_output,
+            scripted_message("done"),
+        ])),
+        tool_counts: Mutex::new(Vec::new()),
+        inputs: Mutex::new(Vec::new()),
+    });
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let mut agent = create_agent(auto_review_config(
+        workspace.path(),
+        checkpoint_store,
+        model.clone(),
+        "auto-review",
+    ))
+    .await
+    .expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "do it".into(),
+        })
+        .expect("submit input");
+    let mut usage_totals = Vec::new();
+    loop {
+        match agent.next_event().await.expect("agent event").msg {
+            EventMsg::TokenCount(count) => usage_totals.push(
+                count
+                    .info
+                    .expect("usage info")
+                    .total_token_usage
+                    .total_tokens,
+            ),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    let saved = checkpoints
+        .load("auto-review")
+        .await
+        .expect("load checkpoint")
+        .expect("saved checkpoint");
+
+    assert_eq!(
+        model
+            .tool_counts
+            .lock()
+            .expect("tool count lock")
+            .as_slice(),
+        [1, 0, 1]
+    );
+    assert_eq!(saved.total_usage.total_tokens, 9);
+    assert_eq!(saved.last_usage, Some(scripted_usage()));
+    assert_eq!(usage_totals, [1, 8, 9]);
+}
+
+#[tokio::test]
+async fn malformed_automatic_review_durably_asks_without_dropping_network_access() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let model = Arc::new(ScriptedModel {
+        outputs: Mutex::new(VecDeque::from([
+            scripted_tool_call(),
+            scripted_message("not a review decision"),
+        ])),
+        tool_counts: Mutex::new(Vec::new()),
+        inputs: Mutex::new(Vec::new()),
+    });
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let mut agent = create_agent(auto_review_config(
+        workspace.path(),
+        checkpoint_store,
+        model.clone(),
+        "review-escalation",
+    ))
+    .await
+    .expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "do it".into(),
+        })
+        .expect("submit input");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                agent.next_event().await.expect("agent event").msg,
+                EventMsg::ExecApprovalRequest(_)
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("approval escalation");
+    let saved = checkpoints
+        .load("review-escalation")
+        .await
+        .expect("load checkpoint")
+        .expect("saved checkpoint");
+    let pending = saved.pending_approval.expect("pending approval");
+
+    assert_eq!(
+        pending.network_access,
+        crate::backend::sandbox::NetworkAccess::Allowed
+    );
+    assert_eq!(saved.total_usage.total_tokens, 2);
+    assert_eq!(
+        model
+            .tool_counts
+            .lock()
+            .expect("tool count lock")
+            .as_slice(),
+        [1, 0]
+    );
 }
 
 #[tokio::test]
@@ -412,7 +829,7 @@ async fn new_agent_uses_its_configured_model_instead_of_global_state() {
             Arc::new(models),
             Arc::new(Sandbox::new(
                 Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
-                ApprovalPolicy::On,
+                ApprovalPolicy::Ask,
             )),
             checkpoint_store,
             MiddlewareStack::new(Vec::new()).expect("middleware"),

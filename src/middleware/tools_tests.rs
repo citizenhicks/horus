@@ -2,6 +2,8 @@ use super::*;
 
 struct PanickingTool;
 
+struct ApprovalRequiredTool;
+
 struct InterruptibleTool {
     name: &'static str,
     interruptible: bool,
@@ -51,6 +53,28 @@ impl Tool for PanickingTool {
     }
 }
 
+impl Tool for ApprovalRequiredTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "approval_required".into(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }
+    }
+
+    fn approval(&self) -> ApprovalRequirement {
+        ApprovalRequirement::Always
+    }
+
+    fn call<'a>(
+        &'a self,
+        _context: ToolContext,
+        _arguments: Value,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async { Ok("executed".into()) })
+    }
+}
+
 #[tokio::test]
 async fn parallel_tool_panic_preserves_call_identity() {
     let mut catalog = Catalog::default();
@@ -66,7 +90,7 @@ async fn parallel_tool_panic_preserves_call_identity() {
         Arc::new(crate::backend::sandbox::local::LocalSandbox::new(".").expect("local sandbox"));
     let sandbox = Arc::new(crate::backend::sandbox::Sandbox::new(
         backend,
-        crate::backend::sandbox::ApprovalPolicy::On,
+        crate::backend::sandbox::ApprovalPolicy::Ask,
     ));
     let permissions = SandboxPermissions::restore(
         "session",
@@ -83,6 +107,36 @@ async fn parallel_tool_panic_preserves_call_identity() {
             is_error: true,
         }]
     );
+}
+
+#[tokio::test]
+async fn approval_required_handler_cannot_run_without_exact_call_authority() {
+    let mut catalog = Catalog::default();
+    catalog
+        .register(Arc::new(ApprovalRequiredTool))
+        .expect("register tool");
+    let calls = [ToolCall {
+        call_id: "blocked".into(),
+        name: "approval_required".into(),
+        arguments: serde_json::json!({}),
+    }];
+    let sandbox = Arc::new(crate::backend::sandbox::Sandbox::new(
+        Arc::new(crate::backend::sandbox::local::LocalSandbox::new(".").expect("sandbox")),
+        crate::backend::sandbox::ApprovalPolicy::Ask,
+    ));
+    let permissions = SandboxPermissions::restore(
+        "session",
+        crate::backend::sandbox::NetworkAccess::Allowed,
+        ["different-call".into()],
+    );
+
+    let result = execute_batch(&catalog, &calls, sandbox, &permissions)
+        .await
+        .pop()
+        .expect("tool result");
+
+    assert!(result.is_error);
+    assert_eq!(result.output, "tool call is not authorized to mutate state");
 }
 
 #[test]
@@ -121,7 +175,7 @@ async fn apply_patch_returns_a_unified_diff_after_writing() {
             crate::backend::sandbox::local::LocalSandbox::new(workspace.path())
                 .expect("local sandbox"),
         ),
-        crate::backend::sandbox::ApprovalPolicy::On,
+        crate::backend::sandbox::ApprovalPolicy::Ask,
     ));
     let permissions = SandboxPermissions::restore(
         "session",
@@ -207,7 +261,7 @@ async fn apply_patch_cannot_make_a_file_unreadable() {
             crate::backend::sandbox::local::LocalSandbox::new(workspace.path())
                 .expect("local sandbox"),
         ),
-        crate::backend::sandbox::ApprovalPolicy::On,
+        crate::backend::sandbox::ApprovalPolicy::Ask,
     ));
     let context = ToolContext {
         sandbox,

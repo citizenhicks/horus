@@ -32,26 +32,6 @@ struct AgentSettingsView: View {
                 }
                 .toggleStyle(.switch)
 
-                Section("Execution approval") {
-                    Picker("Approval policy", selection: approvalPolicy) {
-                        Text("Ask").tag(ApprovalPolicy.on)
-                        Text("Allow · no network").tag(ApprovalPolicy.allow)
-                        Text("Allow · network").tag(ApprovalPolicy.allowNetwork)
-                    }
-                    .settingsPickerStyle()
-                    if let approvalDescription {
-                        SettingsCaption(approvalDescription)
-                    }
-                    if model.agentDraft?.approval == .allowNetwork {
-                        HorusLabel(
-                            title: "This permits unprompted network-capable tools. Only use it with a gateway and workspace you trust.",
-                            systemImage: "globe",
-                            iconColor: palette.danger
-                        )
-                        .foregroundStyle(palette.danger)
-                    }
-                }
-
                 HorusActionRow { agentConfigurationActions }
                     .settingsStandaloneRow()
             } else {
@@ -148,17 +128,44 @@ struct AgentSettingsView: View {
                 SettingsCaption(setting.description)
             }
         case .select(let options, let unsetLabel):
+            let selection = selectSetting(feature, setting)
+            let selectedDescription = selection.wrappedValue.flatMap { selected in
+                options.first { $0.value == selected }?.description
+            }
+            let selectedLabel = selection.wrappedValue.flatMap { selected in
+                options.first { $0.value == selected }?.label ?? selected
+            } ?? unsetLabel ?? "Select"
             VStack(alignment: .leading, spacing: 3) {
-                Picker(setting.label, selection: selectSetting(feature, setting)) {
-                    if let unsetLabel {
-                        Text(unsetLabel).tag(String?.none)
+                LabeledContent {
+                    Menu {
+                        Picker(setting.label, selection: selection) {
+                            if let unsetLabel {
+                                Text(unsetLabel).tag(String?.none)
+                            }
+                            ForEach(options) { option in
+                                Text(option.label).tag(Optional(option.value))
+                            }
+                        }
+                        .labelsHidden()
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text(selectedLabel)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption2)
+                                .accessibilityHidden(true)
+                        }
+                        .foregroundStyle(palette.accent)
                     }
-                    ForEach(options) { option in
-                        Text(option.label).tag(Optional(option.value))
-                    }
+                    .menuIndicator(.hidden)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(setting.label)
+                    .accessibilityValue(selectedLabel)
+                } label: {
+                    Text(setting.label)
+                        .foregroundStyle(.primary)
+                        .accessibilityHidden(true)
                 }
-                .settingsPickerStyle()
-                SettingsCaption(setting.description)
+                SettingsCaption(selectedDescription ?? setting.description)
             }
         }
     }
@@ -232,21 +239,6 @@ struct AgentSettingsView: View {
                 )
             }
         )
-    }
-
-    private var approvalPolicy: Binding<ApprovalPolicy> {
-        Binding(
-            get: { model.agentDraft?.approval ?? .on },
-            set: { model.agentDraft?.approval = $0 }
-        )
-    }
-
-    private var approvalDescription: String? {
-        switch model.agentDraft?.approval ?? .on {
-        case .on: "Workspace mutations pause in chat for an explicit decision."
-        case .allow: "Workspace mutations can proceed without prompting, but tools receive no network access."
-        case .allowNetwork: nil
-        }
     }
 
     @ViewBuilder
@@ -667,6 +659,9 @@ struct ProfileView: View {
             Section("Appearance") {
                 AppearanceSettings()
             }
+            Section("Security") {
+                AppLockSettings()
+            }
         }
     }
 }
@@ -807,6 +802,46 @@ private struct AppearanceSettings: View {
     }
 }
 
+private struct AppLockSettings: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+
+    var body: some View {
+        Toggle(model.appLockAuthenticationMethod.settingTitle, isOn: Binding(
+            get: { model.appLockEnabled },
+            set: { enabled in
+                Task { await model.setAppLockEnabled(enabled) }
+            }
+        ))
+        .toggleStyle(.switch)
+        .disabled(
+            model.isAppLockAuthenticating
+                || !model.appLockEnabled && !model.appLockAuthenticationMethod.isAvailable
+        )
+        .onAppear { model.refreshAppLockAuthenticationMethod() }
+        if model.isAppLockAuthenticating {
+            ProgressView("Authenticating")
+        }
+        SettingsCaption(description)
+        if let error = model.appLockError {
+            Text(error)
+                .foregroundStyle(palette.danger)
+                .accessibilityLabel("App lock status: \(error)")
+        }
+    }
+
+    private var description: String {
+        if model.appLockAuthenticationMethod.isAvailable {
+            return "Locks Horus when it enters the background. This setting stays on this device."
+        }
+        #if os(macOS)
+        return "Set up Touch ID in System Settings before enabling app lock."
+        #else
+        return "Set up Face ID or Touch ID in Settings before enabling app lock."
+        #endif
+    }
+}
+
 struct GatewayView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
@@ -943,9 +978,11 @@ struct PageScaffold<Content: View>: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
                     .font(.title2.weight(.semibold))
-                Text(detail)
-                    .font(HorusStyle.bodyFont)
-                    .foregroundStyle(palette.muted)
+                if !detail.isEmpty {
+                    Text(detail)
+                        .font(HorusStyle.bodyFont)
+                        .foregroundStyle(palette.muted)
+                }
             }
             .padding(.horizontal, 38)
             .padding(.top, 20)
@@ -954,11 +991,13 @@ struct PageScaffold<Content: View>: View {
 
             Form {
                 #if os(iOS)
-                Text(detail)
-                    .font(HorusStyle.bodyFont)
-                    .foregroundStyle(palette.muted)
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
+                if !detail.isEmpty {
+                    Text(detail)
+                        .font(HorusStyle.bodyFont)
+                        .foregroundStyle(palette.muted)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                }
                 #endif
 
                 content

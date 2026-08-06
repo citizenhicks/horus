@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::Middleware;
+use super::manifest::MiddlewareManifest;
 use super::tools::Catalog;
 use super::tools::ExecutionMode;
 use super::tools::Tool;
@@ -39,6 +40,16 @@ const SKILL_FILE: &str = "SKILL.md";
 const DEFAULT_PROMPT: &str = "When a skill is named or matches the task, call `load_skill` before \
                               using it. Load files referenced by its instructions with \
                               `load_skill`'s `path` argument.";
+
+/// Configuration and presentation metadata for local skills.
+pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
+    id: "skills",
+    label: "Skills",
+    description: "Discover local SKILL.md capabilities",
+    required: false,
+    default_enabled: true,
+    settings: &[],
+};
 
 #[derive(Clone)]
 struct Skill {
@@ -182,7 +193,7 @@ fn installed_skill_roots_from(home: Option<PathBuf>, codex_home: Option<PathBuf>
 
 impl Middleware for Skills {
     fn name(&self) -> &'static str {
-        "skills"
+        MANIFEST.id
     }
 
     fn register(&self, catalog: &mut Catalog, _runtime: &super::RuntimeContext) -> Result<()> {

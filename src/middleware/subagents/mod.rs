@@ -16,6 +16,7 @@ use super::MiddlewareCommandOutput;
 use super::ModelContext;
 use super::RuntimeContext;
 use super::SessionEndContext;
+use super::manifest::{MiddlewareManifest, MiddlewareSettingChoices, MiddlewareSettingManifest};
 use super::tools::Catalog;
 use super::tools::Tool;
 use super::tools::ToolContext;
@@ -51,6 +52,63 @@ const DEFAULT_WAIT_MS: u64 = 30_000;
 const MIN_WAIT_MS: u64 = 10_000;
 const MAX_WAIT_MS: u64 = 3_600_000;
 const DEFAULT_PROMPT: &str = "Complete the task and report concisely to your parent.";
+/// Default maximum child-agent nesting depth.
+pub const DEFAULT_MAX_DEPTH: u8 = 4;
+/// Default number of concurrently active agents, including the root.
+pub const DEFAULT_MAX_CONCURRENCY: usize = 8;
+/// Default number of retained agents, including the root.
+pub const DEFAULT_MAX_AGENTS: usize = 32;
+const MAX_CONFIGURED_DEPTH: u8 = 16;
+const MAX_CONFIGURED_CONCURRENCY: usize = 64;
+const MAX_CONFIGURED_AGENTS: usize = 256;
+const SETTINGS: &[MiddlewareSettingManifest] = &[
+    MiddlewareSettingManifest::Select {
+        id: "model_route",
+        label: "Default model",
+        description: "Model route used by child agents when a spawn does not select one",
+        choices: MiddlewareSettingChoices::ModelRoutes,
+        unset_label: Some("Inherit parent"),
+        default: None,
+        max_bytes: 4 * 1024,
+    },
+    MiddlewareSettingManifest::Integer {
+        id: "max_depth",
+        label: "Maximum depth",
+        description: "Maximum child-agent nesting depth",
+        min: 1,
+        max: Some(MAX_CONFIGURED_DEPTH as i64),
+        step: 1,
+        default: DEFAULT_MAX_DEPTH as i64,
+    },
+    MiddlewareSettingManifest::Integer {
+        id: "max_concurrency",
+        label: "Maximum concurrency",
+        description: "Maximum active agents, including the root",
+        min: 2,
+        max: Some(MAX_CONFIGURED_CONCURRENCY as i64),
+        step: 1,
+        default: DEFAULT_MAX_CONCURRENCY as i64,
+    },
+    MiddlewareSettingManifest::Integer {
+        id: "max_agents",
+        label: "Maximum agents",
+        description: "Maximum retained agents, including the root",
+        min: 2,
+        max: Some(MAX_CONFIGURED_AGENTS as i64),
+        step: 1,
+        default: DEFAULT_MAX_AGENTS as i64,
+    },
+];
+
+/// Configuration and presentation metadata for child-agent collaboration.
+pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
+    id: "subagents",
+    label: "Subagents",
+    description: "Delegate independent work to durable child agents",
+    required: false,
+    default_enabled: true,
+    settings: SETTINGS,
+};
 
 /// Child-agent parameters owned by the subagent capability.
 #[derive(Clone)]
@@ -232,8 +290,20 @@ impl Subagents {
         max_agents: usize,
         launch_agent: SubagentLauncher,
     ) -> Result<Self> {
-        if max_depth == 0 {
-            return Err(Error::Config("subagent max depth must be positive".into()));
+        if max_depth == 0 || max_depth > MAX_CONFIGURED_DEPTH {
+            return Err(Error::Config(format!(
+                "subagent max depth must be between 1 and {MAX_CONFIGURED_DEPTH}"
+            )));
+        }
+        if max_concurrency > MAX_CONFIGURED_CONCURRENCY {
+            return Err(Error::Config(format!(
+                "subagent max concurrency cannot exceed {MAX_CONFIGURED_CONCURRENCY}"
+            )));
+        }
+        if max_agents > MAX_CONFIGURED_AGENTS {
+            return Err(Error::Config(format!(
+                "subagent max agents cannot exceed {MAX_CONFIGURED_AGENTS}"
+            )));
         }
         Ok(Self {
             max_depth,
@@ -277,7 +347,7 @@ impl Subagents {
 
 impl Middleware for Subagents {
     fn name(&self) -> &'static str {
-        "subagents"
+        MANIFEST.id
     }
 
     fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
@@ -416,7 +486,7 @@ impl Middleware for Subagents {
         Box::pin(async move {
             let identity = AgentIdentity::read(context.session_id, context.metadata)?;
             let acknowledged = context
-                .input
+                .input()
                 .iter()
                 .filter_map(internal_message_kind)
                 .filter_map(|kind| kind.strip_prefix("subagent_mail:"))
@@ -434,9 +504,7 @@ impl Middleware for Subagents {
                 *context.checkpoint_changed = true;
             }
             for mail in mail {
-                context
-                    .input
-                    .push(internal_user_message(&mail.internal_kind(), &mail.render()));
+                context.push_input(internal_user_message(&mail.internal_kind(), &mail.render()));
             }
             Ok(())
         })

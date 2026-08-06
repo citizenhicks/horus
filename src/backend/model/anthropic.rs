@@ -158,7 +158,12 @@ impl Anthropic {
         request: ModelRequest<'_>,
         events: ModelEventSink,
     ) -> Result<ModelOutput> {
-        let body = self.request_body(request.instructions, request.input, request.tools)?;
+        let body = self.request_body(
+            request.instructions,
+            request.input,
+            request.tools,
+            request.allow_hosted_tools,
+        )?;
         let mut response = self.post(&body).await?;
         let mut bytes = Vec::new();
         let mut stream = StreamState::default();
@@ -190,13 +195,14 @@ impl Anthropic {
         instructions: &str,
         input: &[Value],
         tools: &[ToolDefinition],
+        allow_hosted_tools: bool,
     ) -> Result<Value> {
         let mut body = serde_json::json!({
             "model": self.model,
             "max_tokens": MAX_OUTPUT_TOKENS,
             "system": instructions,
             "messages": translate_messages(input)?,
-            "tools": wire_tools(tools, self.web_search),
+            "tools": wire_tools(tools, self.web_search && allow_hosted_tools),
             "cache_control": {"type": "ephemeral"},
             "stream": true
         });

@@ -75,6 +75,12 @@ pub enum Op {
         capability: String,
         command: String,
         arguments: String,
+        /// Optional caller-editable text kept separate from routing arguments.
+        ///
+        /// When an operation is embedded in a [`FrontendAction`], a present value is the initial
+        /// text a frontend edits before submitting the same operation.
+        #[serde(deserialize_with = "required_option")]
+        input: Option<String>,
         #[serde(deserialize_with = "required_option")]
         target: Option<MessageTarget>,
     },
@@ -337,16 +343,24 @@ pub enum FrontendWidgetContent {
         title: String,
         options: Vec<FrontendPickerOption>,
     },
+    ActionList {
+        title: String,
+        items: Vec<FrontendActionListItem>,
+    },
 }
 
 /// Stable locations a thin frontend shell makes available to capabilities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrontendSlot {
     Header,
     ComposerHeader,
     ComposerFooter,
     MessageActions,
+    /// A capability destination mounted by the frontend shell.
+    Navigation,
+    /// A capability action mounted in the current chat's menu.
+    ChatMenu,
 }
 
 /// Capability-rendered transcript content with frontend-neutral formatting and tone.
@@ -390,6 +404,24 @@ pub struct FrontendPickerOption {
     pub label: String,
     pub description: String,
     pub detail: String,
+    pub op: Op,
+}
+
+/// One primary value with compact trailing actions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendActionListItem {
+    pub id: String,
+    pub text: String,
+    pub actions: Vec<FrontendAction>,
+}
+
+/// One labeled, icon-forward action attached to a list item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendAction {
+    pub id: String,
+    pub label: String,
+    pub symbol: String,
+    pub tone: FrontendTone,
     pub op: Op,
 }
 
@@ -786,6 +818,18 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<EventMsg>(value).expect("deserialize frontend event"),
             event
+        );
+    }
+
+    #[test]
+    fn capability_surface_slots_have_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_value(FrontendSlot::Navigation).expect("navigation slot"),
+            json!("navigation")
+        );
+        assert_eq!(
+            serde_json::to_value(FrontendSlot::ChatMenu).expect("chat menu slot"),
+            json!("chat_menu")
         );
     }
 

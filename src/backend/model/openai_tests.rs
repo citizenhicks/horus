@@ -40,6 +40,14 @@ fn responses_input_strips_only_top_level_provider_metadata() {
 }
 
 #[test]
+fn hosted_tools_can_be_disabled_per_request() {
+    let hosted = [serde_json::json!({"type": "web_search"})];
+
+    assert!(wire_tools(&[], &hosted, false).is_empty());
+    assert_eq!(wire_tools(&[], &hosted, true), hosted);
+}
+
+#[test]
 fn responses_decode_preserves_reasoning_content_for_replay() {
     let decoded = decode_response(serde_json::json!({
         "output": [{

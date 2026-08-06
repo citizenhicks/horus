@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Observation
 
 enum AppDestination: Equatable {
@@ -8,6 +9,7 @@ enum AppDestination: Equatable {
     case providers
     case cron
     case profile
+    case contribution(String)
 
     var systemImage: String {
         switch self {
@@ -17,6 +19,7 @@ enum AppDestination: Equatable {
         case .providers: "network"
         case .cron: "calendar.badge.clock"
         case .profile: "gearshape"
+        case .contribution: "square.grid.2x2"
         }
     }
 }
@@ -84,6 +87,109 @@ enum ThemePreference: String, CaseIterable, Identifiable {
 
     var id: Self { self }
 }
+
+enum AppLockAuthenticationMethod: Equatable {
+    case faceID
+    case touchID
+    case biometrics
+    case unavailable
+
+    var settingTitle: String {
+        switch self {
+        case .faceID: "Require Face ID"
+        case .touchID: "Require Touch ID"
+        case .biometrics: "Require Biometric Authentication"
+        case .unavailable:
+            #if os(macOS)
+            "Require Touch ID"
+            #else
+            "Require Face ID or Touch ID"
+            #endif
+        }
+    }
+
+    var unlockTitle: String {
+        switch self {
+        case .faceID: "Unlock with Face ID"
+        case .touchID: "Unlock with Touch ID"
+        case .biometrics: "Unlock with Biometrics"
+        case .unavailable:
+            #if os(macOS)
+            "Unlock with Touch ID"
+            #else
+            "Unlock with Face ID or Touch ID"
+            #endif
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .faceID: "faceid"
+        case .touchID: "touchid"
+        case .biometrics, .unavailable: "touchid"
+        }
+    }
+
+    var isAvailable: Bool { self != .unavailable }
+}
+
+@MainActor
+struct AppLockAuthenticator {
+    private let methodProvider: () -> AppLockAuthenticationMethod
+    private let evaluator: (String) async -> Bool
+
+    init(
+        method: @escaping () -> AppLockAuthenticationMethod,
+        authenticate: @escaping (String) async -> Bool
+    ) {
+        methodProvider = method
+        evaluator = authenticate
+    }
+
+    init() {
+        methodProvider = {
+            let context = LAContext()
+            var error: NSError?
+            guard context.canEvaluatePolicy(
+                .deviceOwnerAuthenticationWithBiometrics,
+                error: &error
+            ) else {
+                return .unavailable
+            }
+            return switch context.biometryType {
+            case .faceID: .faceID
+            case .touchID: .touchID
+            case .opticID: .biometrics
+            case .none: .unavailable
+            @unknown default: .biometrics
+            }
+        }
+        evaluator = { reason in
+            let context = LAContext()
+            context.localizedCancelTitle = "Cancel"
+            context.localizedFallbackTitle = ""
+            var error: NSError?
+            guard context.canEvaluatePolicy(
+                .deviceOwnerAuthenticationWithBiometrics,
+                error: &error
+            ) else {
+                return false
+            }
+            return (try? await context.evaluatePolicy(
+                .deviceOwnerAuthenticationWithBiometrics,
+                localizedReason: reason
+            )) == true
+        }
+    }
+
+    var method: AppLockAuthenticationMethod { methodProvider() }
+
+    func authenticate(reason: String) async -> Bool {
+        await evaluator(reason)
+    }
+}
+
+private let appLockEnabledKey = "app-lock-enabled"
 
 @Observable
 final class TranscriptEntry: Identifiable {
@@ -155,6 +261,7 @@ struct MountedWidget: Identifiable, Sendable {
     let widget: FrontendWidget
 
     var id: String { "\(capability)\u{0}\(widget.id)" }
+    var title: String { widget.content?.title ?? widget.text }
 }
 
 struct MountedReference: Identifiable, Sendable {
@@ -266,9 +373,16 @@ final class AppModel {
     var pairingCode = ""
     var pairingError: String?
     var theme: ThemePreference
+    private(set) var appLockEnabled: Bool
+    private(set) var isAppLocked: Bool
+    private(set) var isAppLockAuthenticating = false
+    private(set) var appLockAuthenticationMethod: AppLockAuthenticationMethod
+    private(set) var appLockError: String?
 
     @ObservationIgnored private let client: GatewayClient
     @ObservationIgnored private let store: GatewayStore
+    @ObservationIgnored private let settingsDefaults: UserDefaults
+    @ObservationIgnored private let appLockAuthenticator: AppLockAuthenticator
     @ObservationIgnored private let requestSender:
         @MainActor @Sendable (GatewayRequest) async throws -> Void
     @ObservationIgnored private var eventTask: Task<Void, Never>?
@@ -304,22 +418,32 @@ final class AppModel {
     @ObservationIgnored private var replaySnapshotSequence: UInt64?
     @ObservationIgnored private var steeringSubmissionID: String?
     @ObservationIgnored private var previewSelections: [String: FrontendPickerOption] = [:]
+    @ObservationIgnored private var appIsInBackground = true
 
     init(
         client: GatewayClient? = nil,
         store: GatewayStore? = nil,
+        settingsDefaults: UserDefaults = .standard,
+        appLockAuthenticator: AppLockAuthenticator? = nil,
         requestSender: (@MainActor @Sendable (GatewayRequest) async throws -> Void)? = nil
     ) {
         let client = client ?? GatewayClient()
         let store = store ?? GatewayStore()
+        let appLockAuthenticator = appLockAuthenticator ?? AppLockAuthenticator()
+        let appLockEnabled = settingsDefaults.bool(forKey: appLockEnabledKey)
         self.client = client
         self.store = store
+        self.settingsDefaults = settingsDefaults
+        self.appLockAuthenticator = appLockAuthenticator
         self.requestSender = requestSender ?? { request in
             try await client.send(request)
         }
         self.accounts = store.loadAccounts()
         self.selectedAccountID = store.selectedAccountID()
         self.theme = ThemePreference(rawValue: UserDefaults.standard.string(forKey: "theme") ?? "") ?? .system
+        self.appLockEnabled = appLockEnabled
+        self.isAppLocked = appLockEnabled
+        self.appLockAuthenticationMethod = appLockAuthenticator.method
         if selectedAccountID == nil { selectedAccountID = accounts.first?.id }
         showsPairing = accounts.isEmpty
         #if DEBUG
@@ -475,12 +599,14 @@ final class AppModel {
         return String(message.prefix(72))
     }
 
-    var headerWidgets: [MountedWidget] { widgets(in: "header") }
-    var composerHeaderWidgets: [MountedWidget] { widgets(in: "composer_header") }
-    var composerFooterWidgets: [MountedWidget] { widgets(in: "composer_footer") }
+    var headerWidgets: [MountedWidget] { widgets(in: .header) }
+    var composerHeaderWidgets: [MountedWidget] { widgets(in: .composerHeader) }
+    var composerFooterWidgets: [MountedWidget] { widgets(in: .composerFooter) }
     var messageActionWidgets: [MountedWidget] {
-        widgets(in: "message_actions").filter { $0.widget.action != nil }
+        widgets(in: .messageActions).filter { $0.widget.action != nil }
     }
+    var navigationWidgets: [MountedWidget] { widgets(in: .navigation) }
+    var chatMenuWidgets: [MountedWidget] { widgets(in: .chatMenu) }
 
     func referenceSuggestions(in text: String, cursor: String.Index) -> ReferenceSuggestions? {
         guard text.indices.contains(cursor) || cursor == text.endIndex else { return nil }
@@ -854,11 +980,12 @@ final class AppModel {
     func submitMessageAction(_ mounted: MountedWidget, target: MessageTarget) {
         guard let sessionID = selectedSessionID, let action = mounted.widget.action else { return }
         let submittedAction = switch action {
-        case .capabilityCommand(let capability, let command, let arguments, _):
+        case .capabilityCommand(let capability, let command, let arguments, let input, _):
             AgentOperation.capabilityCommand(
                 capability: capability,
                 command: command,
                 arguments: arguments,
+                input: input,
                 target: target
             )
         default:
@@ -867,6 +994,14 @@ final class AppModel {
         transmit(.submit(
             sessionID: sessionID,
             submission: Submission(id: requestID("widget"), op: submittedAction)
+        ))
+    }
+
+    func submitFrontendOperation(_ operation: AgentOperation) {
+        guard let sessionID = selectedSessionID else { return }
+        transmit(.submit(
+            sessionID: sessionID,
+            submission: Submission(id: requestID("widget-action"), op: operation)
         ))
     }
 
@@ -985,20 +1120,6 @@ final class AppModel {
                 self?.applyState = .failed(message)
             }
         }
-    }
-
-    func setApprovalPolicy(_ policy: ApprovalPolicy) {
-        guard let snapshot = agentSnapshot, let draft = agentDraft else { return }
-        guard draft == snapshot.config else {
-            showToast(
-                "Apply or reload pending agent/provider edits before changing approval.",
-                tone: .warning
-            )
-            return
-        }
-        guard draft.approval != policy else { return }
-        agentDraft?.approval = policy
-        changeAgentForCurrentChat()
     }
 
     func reloadAgentDraft() {
@@ -1170,6 +1291,64 @@ final class AppModel {
     func setTheme(_ theme: ThemePreference) {
         self.theme = theme
         UserDefaults.standard.set(theme.rawValue, forKey: "theme")
+    }
+
+    func refreshAppLockAuthenticationMethod() {
+        appLockAuthenticationMethod = appLockAuthenticator.method
+    }
+
+    func setAppLockEnabled(_ enabled: Bool) async {
+        guard enabled != appLockEnabled, !isAppLockAuthenticating else { return }
+        guard enabled else {
+            appLockEnabled = false
+            isAppLocked = false
+            appLockError = nil
+            settingsDefaults.set(false, forKey: appLockEnabledKey)
+            return
+        }
+        guard await authenticateForAppLock(
+            reason: "Authenticate to enable app lock in Horus."
+        ) else { return }
+        appLockEnabled = true
+        isAppLocked = appIsInBackground
+        settingsDefaults.set(true, forKey: appLockEnabledKey)
+    }
+
+    func appDidEnterBackground() {
+        appIsInBackground = true
+        guard appLockEnabled else { return }
+        isAppLocked = true
+        appLockError = nil
+    }
+
+    func appDidBecomeActive() async {
+        appIsInBackground = false
+        await unlockApp()
+    }
+
+    func unlockApp() async {
+        guard appLockEnabled, isAppLocked, !isAppLockAuthenticating else { return }
+        guard await authenticateForAppLock(reason: "Authenticate to unlock Horus.") else {
+            return
+        }
+        isAppLocked = appIsInBackground
+    }
+
+    private func authenticateForAppLock(reason: String) async -> Bool {
+        refreshAppLockAuthenticationMethod()
+        guard appLockAuthenticationMethod.isAvailable else {
+            appLockError = "Biometric authentication is unavailable. Update Face ID or Touch ID, then try again."
+            return false
+        }
+        isAppLockAuthenticating = true
+        appLockError = nil
+        let succeeded = await appLockAuthenticator.authenticate(reason: reason)
+        isAppLockAuthenticating = false
+        guard succeeded else {
+            appLockError = "Authentication wasn’t completed. Try again."
+            return false
+        }
+        return true
     }
 
     private func connect(to account: GatewayAccount) {
@@ -2171,7 +2350,7 @@ final class AppModel {
         )
     }
 
-    private func widgets(in slot: String) -> [MountedWidget] {
+    private func widgets(in slot: FrontendSlot) -> [MountedWidget] {
         mountedWidgets.filter { $0.widget.slot == slot }
     }
 

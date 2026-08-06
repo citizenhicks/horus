@@ -43,7 +43,7 @@ enum BeforeModel {
     /// Middleware queued input during the phase; re-run it before the model call.
     Repeat,
     /// Proceed to the model request.
-    Ready,
+    Ready(Vec<Value>),
 }
 
 impl Runner {
@@ -126,6 +126,7 @@ impl Runner {
         let mut queued_during_middleware = Vec::new();
         let queued_before = self.state.pending_input.len();
         let mut checkpoint_changed = false;
+        let mut request_input = self.state.context.clone();
         let before_model = self.config.middleware.before_model(ModelContext {
             model: &self.config.model,
             provider: &self.config.provider,
@@ -137,7 +138,8 @@ impl Runner {
             context_window: self.config.context_window,
             instructions: &self.system_prompt,
             checkpoint_sequence: self.state.sequence,
-            input: &mut self.state.context,
+            request_input: &mut request_input,
+            durable_input: &mut self.state.context,
             transcript_delta: &mut self.transcript_delta,
             queued_input: &mut self.state.pending_input,
             last_usage: self.state.last_usage.as_ref(),
@@ -160,10 +162,11 @@ impl Runner {
             before_model,
         )
         .await?;
-        let Some(control) = self.ready_or_aborted(control, turn_id).await? else {
-            return Ok(BeforeModel::Aborted);
+        let (hook_error, interrupted_by) = match control {
+            Wait::Ready(Ok(())) => (None, None),
+            Wait::Ready(Err(error)) => (Some(error), None),
+            Wait::Interrupted { submission_id } => (None, Some(submission_id)),
         };
-        control?;
         let usage_changed = !middleware_usage.is_empty();
         if let Some(last_usage) = middleware_usage.last().cloned() {
             let mut total_usage = self.state.total_usage.clone();
@@ -174,6 +177,29 @@ impl Runner {
             self.state.last_usage = Some(last_usage);
         }
         checkpoint_changed |= usage_changed;
+        if let Some(error) = hook_error {
+            if checkpoint_changed {
+                self.save().await?;
+            }
+            for event in middleware_events {
+                self.emit(submission_id, event).await?;
+            }
+            if usage_changed {
+                self.emit_usage(submission_id)?;
+            }
+            return Err(error);
+        }
+        if let Some(interrupt_submission_id) = interrupted_by {
+            for event in middleware_events {
+                self.emit(submission_id, event).await?;
+            }
+            if usage_changed {
+                self.emit_usage(submission_id)?;
+            }
+            self.abort(&interrupt_submission_id, turn_id, "interrupted")
+                .await?;
+            return Ok(BeforeModel::Aborted);
+        }
         if !queued_during_middleware.is_empty() {
             self.state
                 .pending_input
@@ -201,7 +227,7 @@ impl Runner {
         if usage_changed {
             self.emit_usage(submission_id)?;
         }
-        Ok(BeforeModel::Ready)
+        Ok(BeforeModel::Ready(request_input))
     }
 
     pub(super) async fn continue_turn(
@@ -217,14 +243,14 @@ impl Runner {
                     .await?;
                 return Ok(());
             }
-            match self
+            let request_input = match self
                 .before_model_phase(commands, &submission_id, &turn_id, model_step)
                 .await?
             {
                 BeforeModel::Aborted => return Ok(()),
                 BeforeModel::Repeat => continue,
-                BeforeModel::Ready => {}
-            }
+                BeforeModel::Ready(input) => input,
+            };
 
             let item_id = Uuid::new_v4().to_string();
             let events = self.events.clone();
@@ -247,8 +273,10 @@ impl Runner {
                 ModelRequest {
                     session_id: &self.state.session_id,
                     instructions: &self.system_prompt,
-                    input: &self.state.context,
+                    input: &request_input,
                     tools: &tools,
+                    allow_hosted_tools: true,
+                    allow_continuation: true,
                 },
                 stream,
             );
@@ -414,6 +442,21 @@ impl Runner {
                     };
                     results
                 }
+                SandboxAuthorization::Review(review) => {
+                    let Some(results) = self
+                        .review_and_resolve(
+                            commands,
+                            &submission_id,
+                            &turn_id,
+                            output.tool_calls,
+                            review,
+                        )
+                        .await?
+                    else {
+                        return Ok(());
+                    };
+                    results
+                }
             };
             self.append_tool_results(results);
             self.state.pending_approval = None;
@@ -451,7 +494,7 @@ impl Runner {
         Ok(None)
     }
 
-    fn emit_usage(&self, submission_id: &str) -> Result<()> {
+    pub(super) fn emit_usage(&self, submission_id: &str) -> Result<()> {
         let Some(last) = self.state.last_usage.clone() else {
             return Ok(());
         };

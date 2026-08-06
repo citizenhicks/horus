@@ -17,10 +17,13 @@ use crate::backend::model::ModelOutput;
 use crate::backend::model::ModelRouter;
 use crate::backend::sandbox::Sandbox;
 use crate::protocol::EventMsg;
+use crate::protocol::FrontendActionListItem;
 use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendEvent;
+use crate::protocol::FrontendSlot;
 use crate::protocol::FrontendTone;
+use crate::protocol::FrontendWidgetContent;
 use crate::protocol::MessageTarget;
 use crate::protocol::SessionContext;
 use crate::protocol::TokenUsage;
@@ -31,6 +34,8 @@ pub mod compaction;
 pub mod context_offloading;
 pub mod cron;
 pub mod instructions;
+pub mod manifest;
+pub mod scratchpad;
 pub mod sessions;
 pub mod skills;
 pub mod steering;
@@ -68,7 +73,8 @@ pub struct ModelContext<'a> {
     pub context_window: i64,
     pub instructions: &'a str,
     pub(crate) checkpoint_sequence: u64,
-    pub(crate) input: &'a mut Vec<Value>,
+    pub(crate) request_input: &'a mut Vec<Value>,
+    pub(crate) durable_input: &'a mut Vec<Value>,
     pub(crate) transcript_delta: &'a mut Vec<Value>,
     pub queued_input: &'a mut Vec<String>,
     pub last_usage: Option<&'a TokenUsage>,
@@ -80,21 +86,34 @@ pub struct ModelContext<'a> {
 }
 
 impl ModelContext<'_> {
-    /// Returns the provider-neutral input for the next model request.
+    /// Returns durable provider-neutral model context.
     #[must_use]
     pub fn input(&self) -> &[Value] {
-        self.input
+        self.durable_input
+    }
+
+    /// Returns the request input including earlier request-only middleware additions.
+    #[must_use]
+    pub fn request_input(&self) -> &[Value] {
+        self.request_input
     }
 
     /// Replaces model context without adding synthetic history to the transcript.
     pub fn replace_input(&mut self, input: Vec<Value>) {
-        *self.input = input;
+        self.durable_input.clone_from(&input);
+        *self.request_input = input;
         *self.checkpoint_changed = true;
+    }
+
+    /// Replaces only the input sent by the next model request.
+    pub fn replace_request_input(&mut self, input: Vec<Value>) {
+        *self.request_input = input;
     }
 
     /// Appends durable input to model context and its transcript journal.
     pub fn push_input(&mut self, item: Value) -> MessageTarget {
-        self.input.push(item.clone());
+        self.request_input.push(item.clone());
+        self.durable_input.push(item.clone());
         self.transcript_delta.push(item);
         *self.checkpoint_changed = true;
         MessageTarget {
@@ -107,7 +126,7 @@ impl ModelContext<'_> {
     #[must_use]
     pub fn estimated_input_tokens(&self) -> i64 {
         let mut bytes = ByteCounter::default();
-        if serde_json::to_writer(&mut bytes, self.input).is_err() {
+        if serde_json::to_writer(&mut bytes, self.durable_input).is_err() {
             return i64::MAX;
         }
         i64::try_from(approximate_tokens(bytes.0)).unwrap_or(i64::MAX)
@@ -178,6 +197,7 @@ pub struct SessionEndContext {
 pub struct MiddlewareCommandContext<'a> {
     pub command: &'a str,
     pub arguments: &'a str,
+    pub input: Option<&'a str>,
     pub target: Option<MessageTarget>,
     pub session_id: &'a str,
     pub session_context: &'a SessionContext,
@@ -345,7 +365,7 @@ pub trait Middleware: Send + Sync {
 
 impl Middleware for Sandbox {
     fn name(&self) -> &'static str {
-        "sandbox"
+        crate::backend::sandbox::MANIFEST.id
     }
 
     fn frontend(&self) -> FrontendContribution {
@@ -356,28 +376,9 @@ impl Middleware for Sandbox {
         Sandbox::render(self, event)
     }
 
-    fn command<'a>(
-        &'a self,
-        context: MiddlewareCommandContext<'a>,
-    ) -> BoxFuture<'a, Result<MiddlewareCommandOutput>> {
-        Box::pin(async move {
-            Sandbox::command(
-                self,
-                context.session_id,
-                &context.checkpoints,
-                context.command,
-                context.arguments,
-            )
-            .await
-            .map(MiddlewareCommandOutput::events)
-        })
-    }
-
     fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            for event in
-                Sandbox::initialize(self, &context.session_id, &context.checkpoints).await?
-            {
+            for event in Sandbox::initialize(self, &context.session_id)? {
                 (context.frontend)(event)?;
             }
             Ok(())
@@ -674,6 +675,18 @@ fn validate_frontend(contributions: &[FrontendContribution]) -> Result<()> {
                     contribution.capability, item.id
                 )));
             }
+            if matches!(item.slot, FrontendSlot::Navigation | FrontendSlot::ChatMenu)
+                && (item.text.trim().is_empty()
+                    || (item.content.is_none() && item.action.is_none()))
+            {
+                return Err(Error::Config(format!(
+                    "frontend surface `{}/{}` requires a label and content or action",
+                    contribution.capability, item.id
+                )));
+            }
+            if let Some(FrontendWidgetContent::ActionList { title, items }) = &item.content {
+                validate_action_list(title, items)?;
+            }
         }
         for reference in &contribution.references {
             if reference.trigger.is_control()
@@ -700,6 +713,44 @@ fn validate_frontend(contributions: &[FrontendContribution]) -> Result<()> {
     Ok(())
 }
 
+fn validate_action_list(title: &str, items: &[FrontendActionListItem]) -> Result<()> {
+    if title.trim().is_empty() {
+        return Err(Error::Config("frontend action list title is empty".into()));
+    }
+    let mut item_ids = BTreeSet::new();
+    for item in items {
+        if item.id.trim().is_empty() || item.text.trim().is_empty() || item.actions.is_empty() {
+            return Err(Error::Config(
+                "frontend action list item requires an ID, text, and action".into(),
+            ));
+        }
+        if !item_ids.insert(&item.id) {
+            return Err(Error::Duplicate(format!(
+                "frontend action list item `{}`",
+                item.id
+            )));
+        }
+        let mut action_ids = BTreeSet::new();
+        for action in &item.actions {
+            if action.id.trim().is_empty()
+                || action.label.trim().is_empty()
+                || action.symbol.trim().is_empty()
+            {
+                return Err(Error::Config(
+                    "frontend list action requires an ID, label, and symbol".into(),
+                ));
+            }
+            if !action_ids.insert(&action.id) {
+                return Err(Error::Duplicate(format!(
+                    "frontend list action `{}`",
+                    action.id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) const fn approximate_tokens(bytes: usize) -> usize {
     bytes / ESTIMATED_BYTES_PER_TOKEN
 }
@@ -720,7 +771,9 @@ mod tests {
     use crate::backend::model::ToolDefinition;
     use crate::middleware::tools::Tool;
     use crate::middleware::tools::ToolContext;
+    use crate::protocol::FrontendAction;
     use crate::protocol::FrontendReference;
+    use crate::protocol::Op;
 
     struct UnrenderedTool;
 
@@ -834,6 +887,85 @@ mod tests {
                 .to_string(),
             "configuration error: invalid frontend reference ` item`"
         );
+    }
+
+    #[test]
+    fn frontend_surfaces_require_generic_content() {
+        let contribution = FrontendContribution {
+            capability: "example".into(),
+            count: None,
+            commands: Vec::new(),
+            widgets: vec![crate::protocol::FrontendWidget {
+                id: "page".into(),
+                slot: FrontendSlot::Navigation,
+                text: "Example".into(),
+                tone: FrontendTone::Neutral,
+                symbol: None,
+                icon_only: false,
+                progress: None,
+                content: None,
+                action: None,
+            }],
+            references: Vec::new(),
+            active_input: None,
+        };
+
+        assert!(validate_frontend(&[contribution]).is_err());
+    }
+
+    #[test]
+    fn action_lists_reject_invalid_and_duplicate_rows() {
+        let action = FrontendAction {
+            id: "edit:item".into(),
+            label: "Edit".into(),
+            symbol: "edit".into(),
+            tone: FrontendTone::Neutral,
+            op: Op::SetModel {
+                route: "default".into(),
+            },
+        };
+        let item = FrontendActionListItem {
+            id: "item".into(),
+            text: "One note".into(),
+            actions: vec![action.clone()],
+        };
+
+        assert!(validate_action_list("", std::slice::from_ref(&item)).is_err());
+        assert!(validate_action_list("Notes", &[item.clone(), item.clone()]).is_err());
+        let mut duplicate_action = item;
+        duplicate_action.actions.push(action);
+        assert!(validate_action_list("Notes", &[duplicate_action]).is_err());
+    }
+
+    #[test]
+    fn widget_ids_are_unique_per_capability_across_slots() {
+        let content = crate::protocol::FrontendWidgetContent::Blocks {
+            title: "Example".into(),
+            blocks: Vec::new(),
+        };
+        let navigation = crate::protocol::FrontendWidget {
+            id: "shared".into(),
+            slot: FrontendSlot::Navigation,
+            text: "Example".into(),
+            tone: FrontendTone::Neutral,
+            symbol: None,
+            icon_only: false,
+            progress: None,
+            content: Some(content),
+            action: None,
+        };
+        let mut chat_menu = navigation.clone();
+        chat_menu.slot = FrontendSlot::ChatMenu;
+        let contribution = FrontendContribution {
+            capability: "example".into(),
+            count: None,
+            commands: Vec::new(),
+            widgets: vec![navigation, chat_menu],
+            references: Vec::new(),
+            active_input: None,
+        };
+
+        assert!(validate_frontend(&[contribution]).is_err());
     }
 
     struct Observer(&'static str, Arc<Mutex<Vec<&'static str>>>);

@@ -395,7 +395,7 @@ async fn async_subagent_uses_configured_model_reasoning_and_durable_fork() {
     }
     let sandbox = Arc::new(Sandbox::new(
         Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
-        ApprovalPolicy::On,
+        ApprovalPolicy::Ask,
     ));
     let checkpoint_store = Arc::new(
         SqliteCheckpoint::new(workspace.path().join("subagents.sqlite3"))
@@ -1161,7 +1161,7 @@ fn test_config_with_router(
     let checkpoints: Arc<dyn CheckpointStore> = Arc::new(MemoryCheckpoints::default());
     let sandbox = Arc::new(Sandbox::new(
         Arc::new(LocalSandbox::new(workspace).expect("local sandbox")),
-        ApprovalPolicy::On,
+        ApprovalPolicy::Ask,
     ));
     AgentConfig::new(
         Arc::new(model),

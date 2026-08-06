@@ -371,7 +371,9 @@ struct PreviewBlockView: View {
             if block.pending { ProgressView().controlSize(.mini) }
             Text(block.text)
                 .font(block.format == "unified_diff" ? HorusStyle.metadataFont : HorusStyle.bodyFont)
-                .foregroundStyle(palette.tone(block.tone))
+                .foregroundStyle(
+                    block.tone == "neutral" ? Color.primary : palette.tone(block.tone)
+                )
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }

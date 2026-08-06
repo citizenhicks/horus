@@ -5,6 +5,7 @@ use std::sync::Arc;
 use super::Middleware;
 use super::ModelContext;
 use super::approximate_item_tokens;
+use super::manifest::{MiddlewareManifest, MiddlewareSettingManifest};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -27,6 +28,25 @@ const MAX_SUMMARY_TOOL_RESULT_CHARS: usize = 2_000;
 const COMPACTION_RESERVE_TOKENS: i64 = 16_384;
 /// Default compaction trigger for middleware instances without an override.
 pub const DEFAULT_COMPACTION_TOKENS: i64 = 250_000;
+const SETTINGS: &[MiddlewareSettingManifest] = &[MiddlewareSettingManifest::Integer {
+    id: "at_tokens",
+    label: "Compact after tokens",
+    description: "Compact conversation history after this many input tokens",
+    min: 1,
+    max: None,
+    step: 10_000,
+    default: DEFAULT_COMPACTION_TOKENS,
+}];
+
+/// Configuration and presentation metadata for compaction.
+pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
+    id: "compaction",
+    label: "Compaction",
+    description: "Compact long conversations as context fills",
+    required: false,
+    default_enabled: true,
+    settings: SETTINGS,
+};
 const SUMMARY_SYSTEM_PROMPT: &str = "Summarize coding-agent history for continuation. Do not \
     continue the conversation. Output only the checkpoint.";
 const SUMMARY_TASK: &str = "Create or update a concise checkpoint with: Goal; Constraints; \
@@ -66,7 +86,7 @@ impl Compaction {
 
 impl Middleware for Compaction {
     fn name(&self) -> &'static str {
-        "compaction"
+        MANIFEST.id
     }
 
     fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
@@ -139,6 +159,8 @@ async fn summarize(context: &ModelContext<'_>) -> Result<CompactOutput> {
                 instructions: SUMMARY_SYSTEM_PROMPT,
                 input: &input,
                 tools: &[],
+                allow_hosted_tools: false,
+                allow_continuation: false,
             },
             Arc::new(|_| Ok(())),
         )

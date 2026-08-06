@@ -19,13 +19,19 @@ final class AppModelTests: XCTestCase {
         requestSender: (@MainActor @Sendable (GatewayRequest) async throws -> Void)? = nil
     ) throws -> AppModel {
         let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         return AppModel(
             client: GatewayClient(),
             store: GatewayStore(
-                defaults: try XCTUnwrap(UserDefaults(suiteName: suiteName)),
+                defaults: defaults,
                 transcriptDirectory: directory
+            ),
+            settingsDefaults: defaults,
+            appLockAuthenticator: AppLockAuthenticator(
+                method: { .unavailable },
+                authenticate: { _ in false }
             ),
             requestSender: requestSender
         )
@@ -49,7 +55,6 @@ final class AppModelTests: XCTestCase {
                     ]
                 ]
             ),
-            approval: .on,
             systemPrompt: systemPrompt
         )
     }
@@ -170,6 +175,52 @@ final class AppModelTests: XCTestCase {
         // `session(state:)` starts a running turn at 100, not at the chat's creation time.
         model.sessions = [session(state: .running, createdAt: 20, updatedAt: 160)]
         XCTAssertEqual(model.sessionElapsed(at: Date(timeIntervalSince1970: 200)), 100)
+    }
+
+    func testAppLockAuthenticatesBeforePersistingAndRelocks() async throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        var method = AppLockAuthenticationMethod.unavailable
+        var results = [false, true, true]
+        let authenticator = AppLockAuthenticator(
+            method: { method },
+            authenticate: { _ in results.removeFirst() }
+        )
+        let app = AppModel(
+            client: GatewayClient(),
+            store: GatewayStore(defaults: defaults),
+            settingsDefaults: defaults,
+            appLockAuthenticator: authenticator
+        )
+        await app.appDidBecomeActive()
+
+        await app.setAppLockEnabled(true)
+        XCTAssertFalse(app.appLockEnabled)
+        XCTAssertFalse(defaults.bool(forKey: "app-lock-enabled"))
+
+        method = .faceID
+        await app.setAppLockEnabled(true)
+        XCTAssertFalse(app.appLockEnabled)
+        XCTAssertEqual(app.appLockAuthenticationMethod.settingTitle, "Require Face ID")
+
+        await app.setAppLockEnabled(true)
+        XCTAssertTrue(app.appLockEnabled)
+        XCTAssertFalse(app.isAppLocked)
+        XCTAssertTrue(defaults.bool(forKey: "app-lock-enabled"))
+
+        let relaunched = AppModel(
+            client: GatewayClient(),
+            store: GatewayStore(defaults: defaults),
+            settingsDefaults: defaults,
+            appLockAuthenticator: authenticator
+        )
+        XCTAssertTrue(relaunched.isAppLocked)
+        await relaunched.appDidBecomeActive()
+        XCTAssertFalse(relaunched.isAppLocked)
+        relaunched.appDidEnterBackground()
+        XCTAssertTrue(relaunched.isAppLocked)
+        XCTAssertTrue(results.isEmpty)
     }
 
     func testGitBranchSwitchUsesAnAdvertisedBranch() async throws {
@@ -379,6 +430,7 @@ final class AppModelTests: XCTestCase {
                 "capability": .string("subagents"),
                 "command": .string("subagents"),
                 "arguments": .string("reviewer"),
+                "input": .null,
                 "target": .null
             ])
         ])))
@@ -435,6 +487,7 @@ final class AppModelTests: XCTestCase {
                         "capability": .string("reviewer"),
                         "command": .string("accept"),
                         "arguments": .string(""),
+                        "input": .null,
                         "target": .null
                     ])
                 ])])
@@ -446,6 +499,40 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.pendingPicker?.title, "Choose a review action")
         XCTAssertEqual(model.pendingPicker?.options.first?.label, "Accept")
         XCTAssertFalse(model.showsInspector)
+    }
+
+    func testFrontendOperationSubmitsEditedCapabilityInput() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.selectedSessionID = "chat-1"
+
+        model.submitFrontendOperation(.capabilityCommand(
+            capability: "notes",
+            command: "edit",
+            arguments: "note-1",
+            input: "Use one row.",
+            target: nil
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        guard case .submit(let sessionID, let submission) = try XCTUnwrap(requests.first),
+              case .capabilityCommand(
+                  let capability,
+                  let command,
+                  let arguments,
+                  let input,
+                  let target
+              ) = submission.op
+        else { return XCTFail("Expected edited capability command") }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(capability, "notes")
+        XCTAssertEqual(command, "edit")
+        XCTAssertEqual(arguments, "note-1")
+        XCTAssertEqual(input, "Use one row.")
+        XCTAssertNil(target)
     }
 
     func testUnifiedDiffRefreshesGatewayArtifactsWithoutLocalDerivation() async throws {
@@ -483,7 +570,7 @@ final class AppModelTests: XCTestCase {
             widgets: [
                 FrontendWidget(
                     id: "count",
-                    slot: "header",
+                    slot: .header,
                     text: "3 tasks",
                     tone: "success",
                     symbol: nil,
@@ -494,7 +581,7 @@ final class AppModelTests: XCTestCase {
                 ),
                 FrontendWidget(
                     id: "fork",
-                    slot: "message_actions",
+                    slot: .messageActions,
                     text: "Fork chat",
                     tone: "neutral",
                     symbol: "fork",
@@ -505,8 +592,31 @@ final class AppModelTests: XCTestCase {
                         capability: "sessions",
                         command: "fork",
                         arguments: "",
+                        input: nil,
                         target: nil
                     )
+                ),
+                FrontendWidget(
+                    id: "journal",
+                    slot: .navigation,
+                    text: "Journal",
+                    tone: "neutral",
+                    symbol: "brain",
+                    iconOnly: false,
+                    progress: nil,
+                    content: nil,
+                    action: nil
+                ),
+                FrontendWidget(
+                    id: "journal-menu",
+                    slot: .chatMenu,
+                    text: "Open journal",
+                    tone: "neutral",
+                    symbol: "brain",
+                    iconOnly: false,
+                    progress: nil,
+                    content: nil,
+                    action: nil
                 )
             ],
             references: [FrontendReference(trigger: "$", value: "planning", description: "Planning skill")],
@@ -527,6 +637,8 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.headerWidgets.first?.widget.text, "3 tasks")
         XCTAssertEqual(model.messageActionWidgets.first?.widget.text, "Fork chat")
+        XCTAssertEqual(model.navigationWidgets.first?.id, "tasks\u{0}journal")
+        XCTAssertEqual(model.chatMenuWidgets.first?.widget.text, "Open journal")
         XCTAssertEqual(model.middlewareContributionCounts, [MiddlewareContributionCount(
             id: "tasks",
             label: "Work items",
@@ -565,7 +677,7 @@ final class AppModelTests: XCTestCase {
             capability: "sessions",
             widget: FrontendWidget(
                 id: "fork",
-                slot: "message_actions",
+                slot: .messageActions,
                 text: "Fork chat",
                 tone: "neutral",
                 symbol: "arrow.triangle.branch",
@@ -576,6 +688,7 @@ final class AppModelTests: XCTestCase {
                     capability: "sessions",
                     command: "fork",
                     arguments: "",
+                    input: nil,
                     target: nil
                 )
             )
@@ -590,6 +703,7 @@ final class AppModelTests: XCTestCase {
                   let capability,
                   let command,
                   let arguments,
+                  let input,
                   let submittedTarget
               ) = submission.op
         else { return XCTFail("Expected a targeted capability command") }
@@ -598,6 +712,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(capability, "sessions")
         XCTAssertEqual(command, "fork")
         XCTAssertEqual(arguments, "")
+        XCTAssertNil(input)
         XCTAssertEqual(submittedTarget, MessageTarget(checkpointSequence: 12, batchItemCount: 3))
     }
 
@@ -855,7 +970,6 @@ final class AppModelTests: XCTestCase {
                     "context_offloading": ["stale_after_tokens": .integer(50_000)]
                 ]
             ),
-            approval: .on,
             systemPrompt: "Test"
         )
         model.providerStatuses = [ProviderStatus(
@@ -931,7 +1045,6 @@ final class AppModelTests: XCTestCase {
                     "context_offloading": ["stale_after_tokens": .integer(50_000)]
                 ]
             ),
-            approval: .on,
             systemPrompt: "Active"
         )
         var edited = active
@@ -1053,7 +1166,11 @@ final class AppModelTests: XCTestCase {
         let model = try model { request in await recorder.record(request) }
         let active = composition()
         var draft = active
-        draft.approval = .allow
+        draft.middleware.setSetting(
+            .string("first"),
+            middleware: "example",
+            setting: "mode"
+        )
         model.selectedSessionID = "chat-1"
         model.sessions = [session(state: .idle)]
         model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
@@ -1106,7 +1223,11 @@ final class AppModelTests: XCTestCase {
         let model = try model { request in await recorder.record(request) }
         let active = composition()
         var draft = active
-        draft.approval = .allow
+        draft.middleware.setSetting(
+            .string("first"),
+            middleware: "example",
+            setting: "mode"
+        )
         model.selectedSessionID = "chat-1"
         model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
         model.defaultAgentSnapshot = VersionedAgentConfig(revision: 7, config: active)
@@ -1121,7 +1242,11 @@ final class AppModelTests: XCTestCase {
         }.first)
 
         var laterDraft = draft
-        laterDraft.approval = .allowNetwork
+        laterDraft.middleware.setSetting(
+            .string("second"),
+            middleware: "example",
+            setting: "mode"
+        )
         model.agentDraft = laterDraft
         model.applyGatewayConfigurationResponse(
             requestID: requestID,

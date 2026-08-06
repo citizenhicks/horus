@@ -184,7 +184,8 @@ impl OpenAiSocket {
                     connect(self.auth.as_ref(), self.socket_url, request.session_id).await?
                 }
             };
-            let (previous_response_id, input) = continuation_input(&mut state, request.input)?;
+            let (previous_response_id, input) =
+                response_input(&mut state, request.input, request.allow_continuation)?;
             let body = response_body(
                 &self.model,
                 &request,
@@ -206,13 +207,17 @@ impl OpenAiSocket {
                         .to_string();
                     let output = decode_response(response)?;
                     let known_items = request.input.len() + output.output().len();
-                    state.continuation = Some(Continuation {
-                        response_id,
-                        known_items,
-                        fingerprint: fingerprint(
-                            request.input.iter().chain(output.output().iter()),
-                        )?,
-                    });
+                    state.continuation = if request.allow_continuation {
+                        Some(Continuation {
+                            response_id,
+                            known_items,
+                            fingerprint: fingerprint(
+                                request.input.iter().chain(output.output().iter()),
+                            )?,
+                        })
+                    } else {
+                        None
+                    };
                     state.socket = Some(socket);
                     return Ok(output);
                 }
@@ -255,6 +260,19 @@ impl OpenAiSocket {
         }));
         sessions.insert(session_id.to_string(), Arc::clone(&session));
         Ok(session)
+    }
+}
+
+fn response_input<'a>(
+    state: &mut SocketState,
+    input: &'a [Value],
+    allow_continuation: bool,
+) -> Result<(Option<String>, &'a [Value])> {
+    if allow_continuation {
+        continuation_input(state, input)
+    } else {
+        state.continuation = None;
+        Ok((None, input))
     }
 }
 
@@ -333,7 +351,7 @@ fn response_body(
         "model": model,
         "instructions": request.instructions,
         "input": wire_input(input),
-        "tools": wire_tools(request.tools, hosted_tools),
+        "tools": wire_tools(request.tools, hosted_tools, request.allow_hosted_tools),
         "tool_choice": "auto",
         "parallel_tool_calls": true,
         "include": ["reasoning.encrypted_content"],

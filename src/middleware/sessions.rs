@@ -5,6 +5,7 @@ use uuid::Uuid;
 use super::Middleware;
 use super::MiddlewareCommandContext;
 use super::MiddlewareCommandOutput;
+use super::manifest::{MiddlewareManifest, MiddlewareSettingManifest};
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
@@ -26,7 +27,28 @@ use crate::protocol::MessageTarget;
 use crate::protocol::Op;
 use crate::protocol::replay_events;
 
-const DEFAULT_PAGE_SIZE: usize = 100;
+/// Default number of chats loaded per catalog page.
+pub const DEFAULT_PAGE_SIZE: usize = 100;
+const MAX_PAGE_SIZE: usize = 1_000;
+const SETTINGS: &[MiddlewareSettingManifest] = &[MiddlewareSettingManifest::Integer {
+    id: "page_size",
+    label: "Catalog page size",
+    description: "Maximum chats loaded in each catalog page",
+    min: 1,
+    max: Some(MAX_PAGE_SIZE as i64),
+    step: 10,
+    default: DEFAULT_PAGE_SIZE as i64,
+}];
+
+/// Configuration and presentation metadata for durable sessions.
+pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
+    id: "sessions",
+    label: "Sessions",
+    description: "Resume and fork durable chats; always available",
+    required: true,
+    default_enabled: true,
+    settings: SETTINGS,
+};
 
 /// Adds chat discovery and branching without changing the core loop.
 pub struct Sessions {
@@ -36,10 +58,10 @@ pub struct Sessions {
 impl Sessions {
     /// Creates session middleware with a bounded catalog page size.
     pub fn new(page_size: usize) -> Result<Self> {
-        if page_size == 0 {
-            return Err(Error::Config(
-                "chat catalog page size must be positive".into(),
-            ));
+        if page_size == 0 || page_size > MAX_PAGE_SIZE {
+            return Err(Error::Config(format!(
+                "chat catalog page size must be between 1 and {MAX_PAGE_SIZE}"
+            )));
         }
         Ok(Self { page_size })
     }
@@ -55,7 +77,7 @@ impl Default for Sessions {
 
 impl Middleware for Sessions {
     fn name(&self) -> &'static str {
-        "sessions"
+        MANIFEST.id
     }
 
     fn frontend(&self) -> FrontendContribution {
@@ -84,9 +106,10 @@ impl Middleware for Sessions {
                 progress: None,
                 content: None,
                 action: Some(Op::CapabilityCommand {
-                    capability: "sessions".into(),
+                    capability: MANIFEST.id.into(),
                     command: "fork".into(),
                     arguments: String::new(),
+                    input: None,
                     target: None,
                 }),
             }],
@@ -212,9 +235,10 @@ fn fork_options(
                 description: description.into(),
                 detail: String::new(),
                 op: Op::CapabilityCommand {
-                    capability: "sessions".into(),
+                    capability: MANIFEST.id.into(),
                     command: "fork".into(),
                     arguments: String::new(),
+                    input: None,
                     target: Some(target),
                 },
             })
@@ -349,9 +373,10 @@ fn resume_page_options(
             description: String::new(),
             detail: String::new(),
             op: Op::CapabilityCommand {
-                capability: "sessions".into(),
+                capability: MANIFEST.id.into(),
                 command: "resume".into(),
                 arguments: serde_json::to_string(&cursor)?,
+                input: None,
                 target: None,
             },
         });
@@ -409,8 +434,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sessions_rejects_zero_page_size() {
+    fn sessions_rejects_page_sizes_outside_its_manifest_bounds() {
         assert!(Sessions::new(0).is_err());
+        assert!(Sessions::new(MAX_PAGE_SIZE + 1).is_err());
     }
 
     #[test]
@@ -427,6 +453,7 @@ mod tests {
                 capability: "sessions".into(),
                 command: "fork".into(),
                 arguments: String::new(),
+                input: None,
                 target: None,
             })
         );

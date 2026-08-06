@@ -14,7 +14,7 @@ fn continuation_sends_only_new_items_and_resets_on_rewrite() {
             fingerprint: fingerprint(known.iter()).expect("fingerprint"),
         }),
     };
-    let mut continued = known;
+    let mut continued = known.clone();
     continued.push(serde_json::json!({"type": "function_call_output"}));
     let (response, input) = continuation_input(&mut state, &continued).expect("continue");
     assert_eq!(response.as_deref(), Some("resp-1"));
@@ -27,6 +27,16 @@ fn continuation_sends_only_new_items_and_resets_on_rewrite() {
     let (response, input) = continuation_input(&mut state, &rewritten).expect("reset");
     assert_eq!(response, None);
     assert_eq!(input, rewritten);
+    assert!(state.continuation.is_none());
+
+    state.continuation = Some(Continuation {
+        response_id: "resp-2".into(),
+        known_items: known.len(),
+        fingerprint: fingerprint(known.iter()).expect("fingerprint"),
+    });
+    let (response, input) = response_input(&mut state, &known, false).expect("stateless request");
+    assert_eq!(response, None);
+    assert_eq!(input, known);
     assert!(state.continuation.is_none());
 }
 

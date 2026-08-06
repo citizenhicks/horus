@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 9
+let gatewayProtocolVersion = 10
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 
@@ -220,6 +220,7 @@ enum AgentOperation: Codable, Sendable {
         capability: String,
         command: String,
         arguments: String,
+        input: String?,
         target: MessageTarget?
     )
     case setModel(route: String)
@@ -259,12 +260,18 @@ enum AgentOperation: Codable, Sendable {
                 decision: try ReviewDecision(json: decision)
             )
         case "capability_command":
-            guard let value = value["target"] else {
-                throw GatewayWireError.invalidFrame("capability_command has no target")
+            guard let inputValue = value["input"], let targetValue = value["target"] else {
+                throw GatewayWireError.invalidFrame("capability_command has no input or target")
+            }
+            let input: String?
+            switch inputValue {
+            case .string(let value): input = value
+            case .null: input = nil
+            default: throw GatewayWireError.invalidFrame("capability_command has invalid input")
             }
             let target: MessageTarget?
-            if value != .null {
-                guard let decoded = MessageTarget(json: value) else {
+            if targetValue != .null {
+                guard let decoded = MessageTarget(json: targetValue) else {
                     throw GatewayWireError.invalidFrame("capability_command has invalid target")
                 }
                 target = decoded
@@ -275,6 +282,7 @@ enum AgentOperation: Codable, Sendable {
                 capability: try required("capability"),
                 command: try required("command"),
                 arguments: try required("arguments"),
+                input: input,
                 target: target
             )
         case "set_model":
@@ -304,11 +312,12 @@ enum AgentOperation: Codable, Sendable {
             try container.encode("exec_approval", forKey: "type")
             try container.encode(id, forKey: "id")
             try container.encode(decision, forKey: "decision")
-        case .capabilityCommand(let capability, let command, let arguments, let target):
+        case .capabilityCommand(let capability, let command, let arguments, let input, let target):
             try container.encode("capability_command", forKey: "type")
             try container.encode(capability, forKey: "capability")
             try container.encode(command, forKey: "command")
             try container.encode(arguments, forKey: "arguments")
+            try container.encode(input, forKey: "input")
             try container.encode(target, forKey: "target")
         case .setModel(let route):
             try container.encode("set_model", forKey: "type")
@@ -317,6 +326,30 @@ enum AgentOperation: Codable, Sendable {
             try container.encode("resume_session", forKey: "type")
             try container.encode(sessionID, forKey: "sessionId")
         }
+    }
+}
+
+extension AgentOperation {
+    var capabilityInput: String? {
+        guard case .capabilityCommand(_, _, _, let input, _) = self else { return nil }
+        return input
+    }
+
+    func replacingCapabilityInput(with input: String) -> Self {
+        guard case .capabilityCommand(
+            let capability,
+            let command,
+            let arguments,
+            _,
+            let target
+        ) = self else { return self }
+        return .capabilityCommand(
+            capability: capability,
+            command: command,
+            arguments: arguments,
+            input: input,
+            target: target
+        )
     }
 }
 
@@ -898,14 +931,87 @@ struct FrontendProgress: Decodable, Sendable {
     var fraction: Double { Double(completed) / Double(total) }
 }
 
+struct FrontendContentBlock: Identifiable, Sendable {
+    let id = UUID()
+    let block: FrontendBlock
+}
+
 enum FrontendWidgetContent: Sendable {
-    case blocks(title: String, blocks: [FrontendBlock])
+    case blocks(title: String, blocks: [FrontendContentBlock])
     case picker(title: String, options: [FrontendPickerOption])
+    case actionList(title: String, items: [FrontendActionListItem])
+
+    var title: String {
+        switch self {
+        case .blocks(let title, _), .picker(let title, _), .actionList(let title, _): title
+        }
+    }
+}
+
+struct FrontendActionListItem: Identifiable, Sendable {
+    let id: String
+    let text: String
+    let actions: [FrontendActionListAction]
+
+    init(json: JSONValue) throws {
+        guard let id = json["id"]?.stringValue,
+              !id.isEmpty,
+              let text = json["text"]?.stringValue,
+              !text.isEmpty,
+              let values = json["actions"]?.arrayValue
+        else {
+            throw GatewayWireError.invalidFrame("frontend action list item is missing a required field")
+        }
+        let actions = try values.map(FrontendActionListAction.init(json:))
+        guard Set(actions.map(\.id)).count == actions.count else {
+            throw GatewayWireError.invalidFrame("frontend action list item has duplicate action IDs")
+        }
+        self.id = id
+        self.text = text
+        self.actions = actions
+    }
+}
+
+struct FrontendActionListAction: Identifiable, Sendable {
+    let id: String
+    let label: String
+    let symbol: String
+    let tone: String
+    let op: AgentOperation
+
+    init(json: JSONValue) throws {
+        guard let id = json["id"]?.stringValue,
+              !id.isEmpty,
+              let label = json["label"]?.stringValue,
+              !label.isEmpty,
+              let symbol = json["symbol"]?.stringValue,
+              !symbol.isEmpty,
+              let tone = json["tone"]?.stringValue,
+              ["neutral", "success", "warning", "error"].contains(tone),
+              let op = json["op"]
+        else {
+            throw GatewayWireError.invalidFrame("frontend action list action is missing a required field")
+        }
+        self.id = id
+        self.label = label
+        self.symbol = symbol
+        self.tone = tone
+        self.op = try AgentOperation(json: op)
+    }
+}
+
+enum FrontendSlot: String, Decodable, Equatable, Sendable {
+    case header
+    case composerHeader = "composer_header"
+    case composerFooter = "composer_footer"
+    case messageActions = "message_actions"
+    case navigation
+    case chatMenu = "chat_menu"
 }
 
 struct FrontendWidget: Identifiable, Decodable, Sendable {
     let id: String
-    let slot: String
+    let slot: FrontendSlot
     let text: String
     let tone: String
     let symbol: String?
@@ -933,7 +1039,7 @@ extension FrontendWidget {
         else {
             throw GatewayWireError.invalidFrame("frontend widget is missing a required field")
         }
-        guard ["header", "composer_header", "composer_footer", "message_actions"].contains(slot),
+        guard let slot = FrontendSlot(rawValue: slot),
               ["neutral", "success", "warning", "error"].contains(tone)
         else {
             throw GatewayWireError.invalidFrame("frontend widget has an unknown slot or tone")
@@ -974,12 +1080,26 @@ extension FrontendWidget {
                 guard let values = value["blocks"]?.arrayValue else {
                     throw GatewayWireError.invalidFrame("frontend widget blocks are missing")
                 }
-                content = .blocks(title: title, blocks: try values.map(FrontendBlock.init(json:)))
+                content = .blocks(
+                    title: title,
+                    blocks: try values.map { value in
+                        FrontendContentBlock(block: try FrontendBlock(json: value))
+                    }
+                )
             case "picker":
                 guard let values = value["options"]?.arrayValue else {
                     throw GatewayWireError.invalidFrame("frontend widget options are missing")
                 }
                 content = .picker(title: title, options: try values.map(FrontendPickerOption.init(json:)))
+            case "action_list":
+                guard let values = value["items"]?.arrayValue else {
+                    throw GatewayWireError.invalidFrame("frontend widget action list items are missing")
+                }
+                let items = try values.map(FrontendActionListItem.init(json:))
+                guard Set(items.map(\.id)).count == items.count else {
+                    throw GatewayWireError.invalidFrame("frontend widget action list has duplicate item IDs")
+                }
+                content = .actionList(title: title, items: items)
             default:
                 throw GatewayWireError.invalidFrame("frontend widget has unknown content")
             }
@@ -1389,16 +1509,7 @@ func refreshedAgentDraft(
 struct AgentComposition: Codable, Equatable, Sendable {
     var provider: ProviderConfig
     var middleware: MiddlewareConfig
-    var approval: ApprovalPolicy
     var systemPrompt: String
-}
-
-enum ApprovalPolicy: String, Codable, CaseIterable, Identifiable, Sendable {
-    case on
-    case allow
-    case allowNetwork = "allow_network"
-
-    var id: Self { self }
 }
 
 struct ProviderConfig: Codable, Equatable, Sendable {

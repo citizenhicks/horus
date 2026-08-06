@@ -9,8 +9,11 @@ use serde::Serialize;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
-use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::model::ToolCall;
+use crate::middleware::manifest::MiddlewareManifest;
+use crate::middleware::manifest::MiddlewareSettingChoice;
+use crate::middleware::manifest::MiddlewareSettingChoices;
+use crate::middleware::manifest::MiddlewareSettingManifest;
 use crate::protocol::EventMsg;
 use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendContribution;
@@ -24,7 +27,88 @@ mod process_group;
 
 pub(crate) const MAX_FILE_BYTES: usize = 1024 * 1024;
 
+const APPROVAL_POLICIES: &[MiddlewareSettingChoice] = &[
+    MiddlewareSettingChoice {
+        value: "ask",
+        label: "Ask",
+        description: "Pause approval-required actions for a human decision",
+    },
+    MiddlewareSettingChoice {
+        value: "allow",
+        label: "Allow · no network",
+        description: "Run approval-required actions without network access",
+    },
+    MiddlewareSettingChoice {
+        value: "allow_network",
+        label: "Allow · network",
+        description: "Run approval-required actions with network access",
+    },
+    MiddlewareSettingChoice {
+        value: "auto_approve",
+        label: "Auto approve",
+        description: "Use an independent reviewer with network access; ask when uncertain",
+    },
+];
+const REVIEWER_STRICTNESS: &[MiddlewareSettingChoice] = &[
+    MiddlewareSettingChoice {
+        value: "relaxed",
+        label: "Relaxed",
+        description: "Approve reasonably aligned and bounded actions",
+    },
+    MiddlewareSettingChoice {
+        value: "standard",
+        label: "Standard",
+        description: "Require actions to be clearly aligned and proportionate",
+    },
+    MiddlewareSettingChoice {
+        value: "strict",
+        label: "Strict",
+        description: "Require actions to be unambiguous and narrowly scoped",
+    },
+];
+const SETTINGS: &[MiddlewareSettingManifest] = &[
+    MiddlewareSettingManifest::Select {
+        id: "approval_policy",
+        label: "Approval policy",
+        description: "How approval-required actions receive mutation authority",
+        choices: MiddlewareSettingChoices::Static(APPROVAL_POLICIES),
+        unset_label: None,
+        default: Some("auto_approve"),
+        max_bytes: 32,
+    },
+    MiddlewareSettingManifest::Select {
+        id: "reviewer_model_route",
+        label: "Reviewer model",
+        description: "Model route used for independent automatic approval review",
+        choices: MiddlewareSettingChoices::ModelRoutes,
+        unset_label: Some("Inherit main"),
+        default: None,
+        max_bytes: 4 * 1024,
+    },
+    MiddlewareSettingManifest::Select {
+        id: "reviewer_strictness",
+        label: "Reviewer strictness",
+        description: "How cautiously the independent reviewer grants authority",
+        choices: MiddlewareSettingChoices::Static(REVIEWER_STRICTNESS),
+        unset_label: None,
+        default: Some("strict"),
+        max_bytes: 16,
+    },
+];
+
+/// Configuration and presentation metadata for sandbox approval policy.
+pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
+    id: "sandbox",
+    label: "Sandbox",
+    description: "Control mutation approval and sandbox network access",
+    required: true,
+    default_enabled: true,
+    settings: SETTINGS,
+};
+
 pub use approval::ApprovalPolicy;
+pub use approval::ApprovalReviewerConfig;
+pub use approval::ApprovalStrictness;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use process_group::MACOS_COMMAND_WRAPPER;
@@ -134,6 +218,13 @@ impl Sandbox {
         }
     }
 
+    /// Configures the isolated model reviewer used by automatic approval.
+    #[must_use]
+    pub fn approval_reviewer(mut self, reviewer: ApprovalReviewerConfig) -> Self {
+        self.approval = self.approval.with_reviewer(reviewer);
+        self
+    }
+
     /// Reads a UTF-8 file.
     pub fn read<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<String>> {
         self.backend.read(path)
@@ -222,24 +313,8 @@ impl Sandbox {
         self.approval.render(event)
     }
 
-    pub(crate) async fn initialize(
-        &self,
-        session_id: &str,
-        checkpoints: &Arc<dyn CheckpointStore>,
-    ) -> Result<Vec<FrontendEvent>> {
-        self.approval.initialize(session_id, checkpoints).await
-    }
-
-    pub(crate) async fn command(
-        &self,
-        session_id: &str,
-        checkpoints: &Arc<dyn CheckpointStore>,
-        command: &str,
-        arguments: &str,
-    ) -> Result<Vec<FrontendEvent>> {
-        self.approval
-            .command(session_id, checkpoints, command, arguments)
-            .await
+    pub(crate) fn initialize(&self, session_id: &str) -> Result<Vec<FrontendEvent>> {
+        self.approval.initialize(session_id)
     }
 
     pub(crate) fn authorize(
@@ -328,12 +403,25 @@ pub struct ToolPermissions {
     mutation: bool,
 }
 
+impl ToolPermissions {
+    pub(crate) fn allows_mutation(&self) -> bool {
+        self.mutation
+    }
+}
+
 pub(crate) enum SandboxAuthorization {
     Execute(SandboxPermissions),
+    Review(SandboxReview),
     Approval {
         request: SandboxApprovalRequest,
         permissions: SandboxPermissions,
     },
+}
+
+pub(crate) struct SandboxReview {
+    pub(crate) request: SandboxApprovalRequest,
+    pub(crate) reviewer: ApprovalReviewerConfig,
+    pub(crate) permissions: SandboxPermissions,
 }
 
 pub(crate) struct SandboxApprovalRequest {
@@ -352,7 +440,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let sandbox = Sandbox::new(
             Arc::new(LocalSandbox::new(workspace.path()).expect("backend")),
-            ApprovalPolicy::On,
+            ApprovalPolicy::Ask,
         );
         let permissions = SandboxPermissions::new("session", NetworkAccess::Allowed, Vec::new());
 

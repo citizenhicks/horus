@@ -6,11 +6,18 @@ import AppKit
 import UIKit
 #endif
 
+extension MountedWidget {
+    var systemImage: String {
+        widget.symbol.map { HorusSymbol.systemName(for: $0) } ?? "square.grid.2x2"
+    }
+}
+
 struct ChatView: View {
     @Environment(AppModel.self) private var model
     @State private var composerHeight: CGFloat = 0
     @State private var isAtBottom = true
     @State private var scrollToBottomRequest = 0
+    @State private var presentedWidget: MountedWidget?
 
     var body: some View {
         @Bindable var model = model
@@ -45,10 +52,11 @@ struct ChatView: View {
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 inspectorButton
-                ChatOptionsMenu()
+                ChatOptionsMenu(presentedWidget: $presentedWidget)
             }
         }
         .sheet(item: $model.presentedPreview, content: PreviewTranscriptSheet.init)
+        .sheet(item: $presentedWidget, content: FrontendWidgetSheet.init)
     }
 
     private var inspectorButton: some View {
@@ -63,6 +71,7 @@ struct ChatView: View {
 
 private struct ChatOptionsMenu: View {
     @Environment(AppModel.self) private var model
+    @Binding var presentedWidget: MountedWidget?
 
     var body: some View {
         Menu {
@@ -98,6 +107,14 @@ private struct ChatOptionsMenu: View {
                 }
             }
             Section {
+                ForEach(model.chatMenuWidgets) { widget in
+                    Button {
+                        activate(widget)
+                    } label: {
+                        Label(widget.widget.text, systemImage: widget.systemImage)
+                    }
+                    .disabled(widget.widget.content == nil && widget.widget.action == nil)
+                }
                 Button {
                     model.startCronSetup()
                 } label: {
@@ -119,6 +136,15 @@ private struct ChatOptionsMenu: View {
         .accessibilityLabel("Chat options")
         .tint(.primary)
         .help("Chat options")
+    }
+
+    private func activate(_ widget: MountedWidget) {
+        if widget.widget.action != nil {
+            model.submitWidget(widget)
+        }
+        if widget.widget.content != nil {
+            presentedWidget = widget
+        }
     }
 }
 
@@ -265,7 +291,6 @@ private struct AgentCard: View {
                     VStack(spacing: 10) {
                         AgentCardDetail(label: "Providers", value: configuredProviders)
                         AgentCardDetail(label: "Capabilities", value: activeMiddleware(config))
-                        AgentCardDetail(label: "Approval", value: approvalLabel(config.approval))
                     }
                 }
                 .frame(maxWidth: .infinity)
@@ -313,13 +338,6 @@ private struct AgentCard: View {
         return labels.isEmpty ? "Core only" : labels.joined(separator: ", ")
     }
 
-    private func approvalLabel(_ approval: ApprovalPolicy) -> String {
-        switch approval {
-        case .on: "Ask before workspace changes"
-        case .allow: "Allow changes · no network"
-        case .allowNetwork: "Allow changes · network"
-        }
-    }
 }
 
 private struct AgentCardMetric: View {
@@ -946,12 +964,10 @@ private struct BadgeStat: View {
 
 private struct ComposerOptionsView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.horusPalette) private var palette
 
     var body: some View {
         HStack(spacing: 8) {
             modelMenu
-            approvalMenu
             Spacer()
             actionButtons
         }
@@ -974,28 +990,6 @@ private struct ComposerOptionsView: View {
         .accessibilityValue(modelLabel)
     }
 
-    private var approvalMenu: some View {
-        Menu { approvalMenuContent } label: {
-            HorusLabel(
-                title: approvalLabel,
-                systemImage: approvalSystemImage,
-                iconColor: approvalForeground
-            )
-                .labelStyle(.iconOnly)
-                .foregroundStyle(approvalForeground)
-                .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        #if os(iOS)
-        .sensoryFeedback(.selection, trigger: model.agentDraft?.approval)
-        #endif
-        .disabled(model.agentDraft == nil)
-        .help(approvalLabel)
-        .accessibilityLabel("Approval policy")
-        .accessibilityValue(approvalLabel)
-    }
-
     @ViewBuilder
     private var modelMenuContent: some View {
         ForEach(distinctModels, id: \.route) { choice in
@@ -1016,13 +1010,6 @@ private struct ComposerOptionsView: View {
                 model.selectModel(choice.route)
             }
         }
-    }
-
-    @ViewBuilder
-    private var approvalMenuContent: some View {
-        Button("Ask") { selectApproval(.on) }
-        Button("Allow · no network") { selectApproval(.allow) }
-        Button("Allow · network", role: .destructive) { selectApproval(.allowNetwork) }
     }
 
     @ViewBuilder
@@ -1063,18 +1050,6 @@ private struct ComposerOptionsView: View {
         }
     }
 
-    private var approvalLabel: String {
-        approvalPolicyLabel(model.agentDraft?.approval ?? .on)
-    }
-
-    private var approvalSystemImage: String {
-        approvalPolicySystemImage(model.agentDraft?.approval ?? .on)
-    }
-
-    private var approvalForeground: Color {
-        model.agentDraft?.approval == .allowNetwork ? palette.warning : palette.muted
-    }
-
     private var modelLabel: String {
         guard let currentChoice else { return "Model" }
         return "\(currentChoice.model) · \(currentChoice.reasoningEffort?.capitalized ?? "Default")"
@@ -1084,9 +1059,6 @@ private struct ComposerOptionsView: View {
         !model.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private func selectApproval(_ policy: ApprovalPolicy) {
-        model.setApprovalPolicy(policy)
-    }
 }
 
 private struct ApprovalView: View {
@@ -1188,10 +1160,7 @@ struct FrontendWidgetView: View {
 
     /// Widget text can be as terse as a bare count, so the detail title carries the meaning.
     private var accessibilityTitle: String {
-        switch widget.widget.content {
-        case .blocks(let title, _), .picker(let title, _): "\(title) \(widget.widget.text)"
-        case nil: widget.widget.text
-        }
+        widget.widget.content.map { "\($0.title) \(widget.widget.text)" } ?? widget.widget.text
     }
 
     private var badge: HorusBadge {
@@ -1210,42 +1179,255 @@ struct FrontendWidgetView: View {
 
 private struct WidgetContentPopover: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.horusPalette) private var palette
     let content: FrontendWidgetContent
     @Binding var isPresented: Bool
 
     var body: some View {
-        switch content {
-        case .blocks(let title, let blocks):
-            BadgePopover(title: title) {
-                ForEach(blocks.enumerated(), id: \.offset) { _, block in
-                    PreviewBlockView(block: block)
-                }
-            }
-        case .picker(let title, let options):
-            BadgePopover(title: title) {
-                ForEach(options) { option in
-                    Button { select(option) } label: {
-                        HStack(spacing: 12) {
-                            Text(option.label)
-                                .font(HorusStyle.controlFont)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Text(option.description)
-                                .font(HorusStyle.metadataFont)
-                                .foregroundStyle(palette.muted)
-                        }
-                        .frame(minHeight: HorusStyle.iconButtonSize)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
+        BadgePopover(title: content.title) {
+            FrontendWidgetContentView(content: content, select: select)
         }
     }
 
     private func select(_ option: FrontendPickerOption) {
         isPresented = false
         model.submitPickerOption(option)
+    }
+}
+
+struct FrontendWidgetContentView: View {
+    @Environment(\.horusPalette) private var palette
+    let content: FrontendWidgetContent
+    let select: (FrontendPickerOption) -> Void
+
+    var body: some View {
+        switch content {
+        case .blocks(_, let blocks):
+            ForEach(blocks) { block in
+                PreviewBlockView(block: block.block)
+                    .padding(.vertical, 8)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+            }
+        case .picker(_, let options):
+            ForEach(options) { option in
+                Button { select(option) } label: {
+                    FrontendPickerOptionLabel(option: option)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(option.label)
+                .accessibilityValue(option.detail)
+                .accessibilityHint(option.description)
+            }
+        case .actionList(_, let items):
+            if items.isEmpty {
+                Text("Nothing here yet.")
+                    .foregroundStyle(palette.muted)
+                    .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize)
+            } else {
+                ForEach(items) { item in
+                    FrontendActionListRow(item: item)
+                }
+            }
+        }
+    }
+}
+
+private struct FrontendActionListRow: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+    @State private var pendingAction: PendingAction?
+    @State private var editedText = ""
+    let item: FrontendActionListItem
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(item.text)
+                .font(HorusStyle.bodyFont)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
+            #if os(iOS)
+            Menu {
+                ForEach(item.actions) { action in
+                    Button(role: action.tone == "error" ? .destructive : nil) {
+                        activate(action)
+                    } label: {
+                        Label(
+                            action.label,
+                            systemImage: HorusSymbol.systemName(for: action.symbol)
+                        )
+                    }
+                }
+            } label: {
+                HorusIcon(systemName: "ellipsis", foreground: palette.accent)
+                    .frame(
+                        width: HorusStyle.iconButtonSize,
+                        height: HorusStyle.iconButtonSize
+                    )
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel("More actions")
+            .accessibilityHint("Shows available actions for this item")
+            .help("More actions")
+            #else
+            HStack(spacing: 0) {
+                ForEach(item.actions) { action in
+                    Button(role: action.tone == "error" ? .destructive : nil) {
+                        activate(action)
+                    } label: {
+                        HorusIcon(
+                            systemName: HorusSymbol.systemName(for: action.symbol),
+                            foreground: actionColor(action)
+                        )
+                        .frame(
+                            width: HorusStyle.iconButtonSize,
+                            height: HorusStyle.iconButtonSize
+                        )
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(action.label)
+                    .help(action.label)
+                }
+            }
+            .fixedSize()
+            #endif
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .contain)
+        .alert(
+            pendingAction?.action.label ?? "",
+            isPresented: isPresentingAction,
+            presenting: pendingAction
+        ) { pending in
+            switch pending.kind {
+            case .edit:
+                TextField("Text", text: $editedText)
+                Button("Cancel", role: .cancel) { pendingAction = nil }
+                Button("Save") {
+                    model.submitFrontendOperation(
+                        pending.action.op.replacingCapabilityInput(with: editedText)
+                    )
+                    pendingAction = nil
+                }
+                .disabled(
+                    editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || editedText == pending.action.op.capabilityInput
+                )
+            case .destructive:
+                Button("Cancel", role: .cancel) { pendingAction = nil }
+                Button(pending.action.label, role: .destructive) {
+                    model.submitFrontendOperation(pending.action.op)
+                    pendingAction = nil
+                }
+            }
+        } message: { pending in
+            if pending.kind == .destructive {
+                Text(pending.itemText)
+            }
+        }
+    }
+
+    private var isPresentingAction: Binding<Bool> {
+        Binding(
+            get: { pendingAction != nil },
+            set: { if !$0 { pendingAction = nil } }
+        )
+    }
+
+    private func activate(_ action: FrontendActionListAction) {
+        if action.tone == "error" {
+            pendingAction = PendingAction(kind: .destructive, itemText: item.text, action: action)
+        } else if let input = action.op.capabilityInput {
+            editedText = input
+            pendingAction = PendingAction(kind: .edit, itemText: item.text, action: action)
+        } else {
+            model.submitFrontendOperation(action.op)
+        }
+    }
+
+    private func actionColor(_ action: FrontendActionListAction) -> Color {
+        action.tone == "neutral" ? palette.accent : palette.tone(action.tone)
+    }
+}
+
+private struct PendingAction {
+    enum Kind: Equatable {
+        case edit
+        case destructive
+    }
+
+    let kind: Kind
+    let itemText: String
+    let action: FrontendActionListAction
+}
+
+private struct FrontendPickerOptionLabel: View {
+    @Environment(\.horusPalette) private var palette
+    let option: FrontendPickerOption
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(option.label)
+                .font(HorusStyle.controlFont.weight(.semibold))
+                .foregroundStyle(palette.accent)
+            if !option.description.isEmpty {
+                Text(option.description)
+                    .font(HorusStyle.bodyFont)
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !option.detail.isEmpty {
+                Text(option.detail)
+                    .font(.footnote)
+                    .foregroundStyle(palette.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+    }
+}
+
+struct FrontendWidgetSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let widget: MountedWidget
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let content = currentWidget?.widget.content {
+                    Section {
+                        FrontendWidgetContentView(content: content) { option in
+                            model.submitPickerOption(option)
+                            dismiss()
+                        }
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .navigationTitle(currentWidget?.title ?? widget.title)
+            .toolbarTitleDisplayMode(.inline)
+            #if os(macOS)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done", action: dismiss.callAsFunction)
+                }
+            }
+            #endif
+            .background(HorusBackdrop())
+        }
+        #if os(macOS)
+        .frame(minWidth: 520, minHeight: 460)
+        #endif
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+    }
+
+    private var currentWidget: MountedWidget? {
+        model.chatMenuWidgets.first { $0.id == widget.id }
     }
 }
 
@@ -1275,16 +1457,12 @@ private struct FrontendPickerView: View {
                 }
                 ForEach(picker.options) { option in
                     Button { model.submitPickerOption(option) } label: {
-                        HStack(alignment: .firstTextBaseline, spacing: 12) {
-                            Text(option.label).fontWeight(.semibold)
-                            Text(option.description)
-                                .font(HorusStyle.bodyFont)
-                                .foregroundStyle(palette.muted)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .contentShape(Rectangle())
+                        FrontendPickerOptionLabel(option: option)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(option.label)
+                    .accessibilityValue(option.detail)
+                    .accessibilityHint(option.description)
                 }
             }
         }
@@ -1310,22 +1488,6 @@ private func diffTotals(_ text: String) -> (added: Int, removed: Int) {
 private func formatDuration(_ interval: TimeInterval) -> String {
     let seconds = max(0, Int(interval))
     return Duration.seconds(seconds).formatted(.time(pattern: .minuteSecond(padMinuteToLength: 1)))
-}
-
-private func approvalPolicyLabel(_ policy: ApprovalPolicy) -> String {
-    switch policy {
-    case .on: "Ask"
-    case .allow: "Allow · no network"
-    case .allowNetwork: "Allow · network"
-    }
-}
-
-private func approvalPolicySystemImage(_ policy: ApprovalPolicy) -> String {
-    switch policy {
-    case .on: "hand.raised"
-    case .allow: "checkmark.shield"
-    case .allowNetwork: "globe"
-    }
 }
 
 private func diffTitle(_ diff: String) -> String {

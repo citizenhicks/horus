@@ -12,11 +12,14 @@ use horus::backend::model::provider::{
 use horus::backend::model::{
     Model, ModelChoice, ModelEventSink, ModelInfo, ModelOutput, ModelRequest, ModelRouter,
 };
-use horus::backend::sandbox::{Sandbox, SandboxBackend};
+use horus::backend::sandbox::{
+    ApprovalPolicy, ApprovalReviewerConfig, ApprovalStrictness, Sandbox, SandboxBackend,
+};
 use horus::middleware::compaction::Compaction;
 use horus::middleware::context_offloading::ContextOffloading;
 use horus::middleware::cron::Cron;
 use horus::middleware::instructions::Instructions;
+use horus::middleware::scratchpad::{Scratchpad, ScratchpadStore};
 use horus::middleware::sessions::Sessions;
 use horus::middleware::skills::Skills;
 use horus::middleware::steering::Steering;
@@ -57,6 +60,7 @@ pub(crate) async fn assemble(
     credentials: Arc<CredentialStore>,
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
+    scratchpad: ScratchpadStore,
     session_id: Option<String>,
     origin_label: &str,
     override_saved_model_route: bool,
@@ -74,16 +78,39 @@ pub(crate) async fn assemble(
         COMMAND_TIMEOUT,
     )?);
     let backend: Arc<dyn SandboxBackend> = gateway_sandbox.clone();
-    let sandbox = Arc::new(Sandbox::new(backend, chat.agent.config.approval));
+    let model_choices = models.choices().cloned().collect::<Vec<_>>();
+    crate::middleware_manifest::validate_choices(&chat.agent.config.middleware, &model_choices)?;
+    let approval_policy = crate::middleware_manifest::string_setting(
+        &chat.agent.config.middleware,
+        "sandbox",
+        "approval_policy",
+    )?
+    .ok_or_else(|| Error::Config("missing middleware setting `sandbox.approval_policy`".into()))?
+    .parse::<ApprovalPolicy>()?;
+    let reviewer_strictness = crate::middleware_manifest::string_setting(
+        &chat.agent.config.middleware,
+        "sandbox",
+        "reviewer_strictness",
+    )?
+    .ok_or_else(|| {
+        Error::Config("missing middleware setting `sandbox.reviewer_strictness`".into())
+    })?
+    .parse::<ApprovalStrictness>()?;
+    let mut reviewer = ApprovalReviewerConfig::default().strictness(reviewer_strictness);
     if let Some(route) = crate::middleware_manifest::string_setting(
         &chat.agent.config.middleware,
-        "subagents",
-        "model_route",
+        "sandbox",
+        "reviewer_model_route",
     )? {
-        models.resolve_choice(route, None)?;
+        reviewer = reviewer.model_route(route)?;
     }
-    let (middleware, template) =
-        build_middleware(&chat.agent.config.middleware, &chat.workspace, cron)?;
+    let sandbox = Arc::new(Sandbox::new(backend, approval_policy).approval_reviewer(reviewer));
+    let (middleware, template) = build_middleware(
+        &chat.agent.config.middleware,
+        &chat.workspace,
+        cron,
+        scratchpad,
+    )?;
     let mut metadata = match session_id.as_deref() {
         Some(session_id) => checkpoints
             .load(session_id)
@@ -566,14 +593,16 @@ fn build_middleware(
     settings: &MiddlewareConfig,
     workspace: &std::path::Path,
     cron: Arc<CronStore>,
+    scratchpad: ScratchpadStore,
 ) -> Result<(MiddlewareStack, Option<Arc<OnceLock<AgentConfig>>>)> {
     let mut entries: Vec<Arc<dyn Middleware>> = Vec::new();
     let mut subagent_template = None;
     for feature in MIDDLEWARE
         .iter()
-        .filter(|feature| feature.required || settings.enabled(feature.id))
+        .filter(|feature| feature.manifest.required || settings.enabled(feature.manifest.id))
     {
         let middleware: Arc<dyn Middleware> = match feature.kind {
+            BuiltinMiddleware::Sandbox => continue,
             BuiltinMiddleware::Tools => Arc::new(Tools::coding()),
             BuiltinMiddleware::Instructions => Arc::new(Instructions::discover(workspace)?),
             BuiltinMiddleware::Cron => {
@@ -584,6 +613,7 @@ fn build_middleware(
                         .map_err(|error| HorusError::Tool(error.to_string()))
                 }))
             }
+            BuiltinMiddleware::Scratchpad => Arc::new(Scratchpad::new(scratchpad.clone())),
             BuiltinMiddleware::Skills => Arc::new(Skills::discover_installed([
                 workspace.join(".agents/skills"),
                 workspace.join(".codex/skills"),
@@ -591,7 +621,24 @@ fn build_middleware(
             BuiltinMiddleware::Tasks => Arc::new(Tasks),
             BuiltinMiddleware::Subagents => {
                 let template = Arc::new(OnceLock::<AgentConfig>::new());
-                let middleware = Subagents::new(4, 8, 32, subagent_launcher(&template))?;
+                let max_depth = u8::try_from(crate::middleware_manifest::integer_setting(
+                    settings,
+                    "subagents",
+                    "max_depth",
+                )?)
+                .map_err(|_| {
+                    Error::Config("subagent max depth must fit an unsigned byte".into())
+                })?;
+                let middleware = Subagents::new(
+                    max_depth,
+                    crate::middleware_manifest::usize_setting(
+                        settings,
+                        "subagents",
+                        "max_concurrency",
+                    )?,
+                    crate::middleware_manifest::usize_setting(settings, "subagents", "max_agents")?,
+                    subagent_launcher(&template),
+                )?;
                 let middleware = match crate::middleware_manifest::string_setting(
                     settings,
                     "subagents",
@@ -603,7 +650,9 @@ fn build_middleware(
                 subagent_template = Some(template);
                 Arc::new(middleware)
             }
-            BuiltinMiddleware::Steering => Arc::new(Steering::default()),
+            BuiltinMiddleware::Steering => Arc::new(Steering::new(
+                crate::middleware_manifest::usize_setting(settings, "steering", "max_pending")?,
+            )?),
             BuiltinMiddleware::ContextOffloading => Arc::new(ContextOffloading::new(
                 crate::middleware_manifest::integer_setting(
                     settings,
@@ -611,8 +660,12 @@ fn build_middleware(
                     "stale_after_tokens",
                 )?,
             )?),
-            BuiltinMiddleware::Compaction => Arc::new(Compaction::default()),
-            BuiltinMiddleware::Sessions => Arc::new(Sessions::default()),
+            BuiltinMiddleware::Compaction => Arc::new(Compaction::new(
+                crate::middleware_manifest::integer_setting(settings, "compaction", "at_tokens")?,
+            )?),
+            BuiltinMiddleware::Sessions => Arc::new(Sessions::new(
+                crate::middleware_manifest::usize_setting(settings, "sessions", "page_size")?,
+            )?),
         };
         entries.push(middleware);
     }
@@ -817,6 +870,7 @@ mod tests {
             credentials,
             cron,
             Arc::clone(&checkpoints),
+            ScratchpadStore::new(Arc::clone(&checkpoints)),
             Some("chat".into()),
             "test",
             true,

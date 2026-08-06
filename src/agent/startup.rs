@@ -232,6 +232,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         system_prompt,
         catalog,
         state,
+        review_session_id: uuid::Uuid::new_v4().to_string(),
         transcript_delta: Vec::new(),
         deferred: VecDeque::new(),
         events: event_tx.clone(),

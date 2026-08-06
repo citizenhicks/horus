@@ -46,6 +46,8 @@ fn responses_history_becomes_kimi_messages_and_tools() {
         instructions: "Be precise.",
         input: &input,
         tools: &tools,
+        allow_hosted_tools: true,
+        allow_continuation: true,
     };
 
     let body = provider.request_body(&request).expect("request body");
