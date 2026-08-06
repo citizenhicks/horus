@@ -2,15 +2,17 @@ import SwiftUI
 
 struct AgentSettingsView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.horusPalette) private var palette
+    @State private var showsAgentStatus = false
 
     var body: some View {
         PageScaffold(
             title: "Agent",
-            detail: "Change the prompt, capabilities, and execution policy used by the gateway agent."
+            detail: "Change the prompt, capabilities, and execution policy used by the gateway agent.",
+            headerAccessory: { agentStatusButton }
         ) {
             if model.agentDraft != nil {
-                applyStatus.settingsStandaloneRow()
                 Section("System prompt") {
                     TextField("System prompt", text: systemPrompt, axis: .vertical)
                         .font(HorusStyle.bodyFont)
@@ -48,40 +50,97 @@ struct AgentSettingsView: View {
 
     @ViewBuilder
     private var applyStatus: some View {
-        switch model.applyState {
-        case .idle, .applied:
-            if !hasActiveChanges && !hasDefaultChanges {
-                HStack(spacing: 7) {
-                    Circle()
-                        .fill(palette.signal)
-                        .frame(width: 7, height: 7)
-                        .accessibilityHidden(true)
-                    Text("Up to date")
-                        .font(HorusStyle.controlFont)
-                        .foregroundStyle(palette.signal)
+        if model.agentDraft == nil {
+            StatusBanner(
+                tone: .error,
+                title: "Agent unavailable",
+                detail: model.connectionState.isReady
+                    ? "Configure a provider first."
+                    : "Connect to a gateway first."
+            )
+        } else {
+            switch model.applyState {
+            case .idle, .applied:
+                if hasActiveChanges || hasDefaultChanges {
+                    StatusBanner(
+                        tone: .warning,
+                        title: "Unsaved changes",
+                        detail: "Apply the draft to this chat or save it as the gateway default."
+                    )
+                } else {
+                    StatusBanner(
+                        tone: .success,
+                        title: "Up to date",
+                        detail: "The draft matches the saved agent configuration."
+                    )
                 }
-                .padding(.horizontal, 12)
-                .frame(height: 32)
-                .horusGlass(in: Capsule())
-                .frame(maxWidth: .infinity, alignment: .center)
-                .listRowInsets(EdgeInsets())
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Agent is up to date")
+            case .applying:
+                StatusBanner(tone: .neutral, title: "Applying configuration", detail: "The gateway is validating this revision.", progress: true)
+            case .restarting:
+                StatusBanner(tone: .warning, title: "Restarting agent", detail: "The gateway accepted the configuration and is reopening the session.", progress: true)
+            case .busy(let message):
+                StatusBanner(tone: .warning, title: "Agent is busy", detail: message)
+            case .conflict(let message):
+                StatusBanner(tone: .warning, title: "Configuration changed elsewhere", detail: message, action: ("Reload", model.reloadAgentDraft))
+            case .invalid(let message):
+                StatusBanner(tone: .error, title: "Configuration rejected", detail: message)
+            case .failed(let message):
+                StatusBanner(tone: .error, title: "Could not apply", detail: message)
             }
+        }
+    }
+
+    private var agentStatusButton: some View {
+        Button {
+            showsAgentStatus = true
+        } label: {
+            Circle()
+                .fill(agentStatusColor)
+                .frame(width: 8, height: 8)
+                .symbolEffect(
+                    .pulse.byLayer,
+                    options: .repeat(.continuous),
+                    isActive: !reduceMotion
+                )
+                .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.horusPlain)
+        .accessibilityLabel("Agent status")
+        .accessibilityValue(agentStatusLabel)
+        .help("Agent: \(agentStatusLabel)")
+        .popover(isPresented: $showsAgentStatus) {
+            applyStatus
+                .padding(16)
+                .frame(width: 320)
+        }
+    }
+
+    private var agentStatusLabel: String {
+        guard model.agentDraft != nil else { return "Unavailable" }
+        return switch model.applyState {
+        case .idle, .applied:
+            hasActiveChanges || hasDefaultChanges ? "Unsaved changes" : "Up to date"
+        case .applying: "Applying configuration"
+        case .restarting: "Restarting"
+        case .busy: "Busy"
+        case .conflict: "Changed elsewhere"
+        case .invalid: "Configuration rejected"
+        case .failed: "Failed"
+        }
+    }
+
+    private var agentStatusColor: Color {
+        guard model.agentDraft != nil else { return palette.danger }
+        return switch model.applyState {
+        case .idle, .applied:
+            hasActiveChanges || hasDefaultChanges ? palette.warning : palette.signal
         case .applying:
-            StatusBanner(tone: .neutral, title: "Applying configuration", detail: "The gateway is validating this revision.", progress: true)
-        case .restarting:
-            StatusBanner(tone: .warning, title: "Restarting agent", detail: "The gateway accepted the configuration and is reopening the session.", progress: true)
-        case .busy(let message):
-            StatusBanner(tone: .warning, title: "Agent is busy", detail: message)
-        case .conflict(let message):
-            StatusBanner(tone: .warning, title: "Configuration changed elsewhere", detail: message, action: ("Reload", model.reloadAgentDraft))
-        case .invalid(let message):
-            StatusBanner(tone: .error, title: "Configuration rejected", detail: message)
-        case .failed(let message):
-            StatusBanner(tone: .error, title: "Could not apply", detail: message)
+            palette.accent
+        case .restarting, .busy, .conflict:
+            palette.warning
+        case .invalid, .failed:
+            palette.danger
         }
     }
 
@@ -127,6 +186,7 @@ struct AgentSettingsView: View {
                 }
                 SettingsCaption(setting.description)
             }
+            .sensoryFeedback(.selection, trigger: value.wrappedValue)
         case .select(let options, let unsetLabel):
             let selection = selectSetting(feature, setting)
             let selectedDescription = selection.wrappedValue.flatMap { selected in
@@ -167,6 +227,7 @@ struct AgentSettingsView: View {
                 }
                 SettingsCaption(selectedDescription ?? setting.description)
             }
+            .sensoryFeedback(.selection, trigger: selection.wrappedValue)
         }
     }
 
@@ -305,6 +366,7 @@ struct ProvidersView: View {
                         }
                     }
                     .settingsPickerStyle()
+                    .sensoryFeedback(.selection, trigger: providerID.wrappedValue)
 
                     if let status = selectedStatus {
                         SettingsCaption(status.description)
@@ -330,6 +392,7 @@ struct ProvidersView: View {
                             }
                         }
                         .settingsPickerStyle()
+                        .sensoryFeedback(.selection, trigger: providerWebSearch.wrappedValue)
                         .disabled(status.webSearch.count == 1)
                         .accessibilityHint(
                             status.webSearch.count == 1
@@ -799,6 +862,7 @@ private struct AppearanceSettings: View {
             ForEach(ThemePreference.allCases) { Text($0.rawValue.capitalized).tag($0) }
         }
         .pickerStyle(.segmented)
+        .sensoryFeedback(.selection, trigger: model.theme)
     }
 }
 
@@ -867,6 +931,7 @@ struct GatewayView: View {
                     }
                 }
                 .settingsPickerStyle()
+                .sensoryFeedback(.selection, trigger: model.selectedAccountID)
                 LabeledContent("Status") {
                     HStack(spacing: 7) {
                         Circle()
@@ -956,33 +1021,40 @@ struct GatewayView: View {
     }
 }
 
-struct PageScaffold<Content: View>: View {
+struct PageScaffold<HeaderAccessory: View, Content: View>: View {
     @Environment(\.horusPalette) private var palette
     let title: String
     let detail: String
+    let headerAccessory: HeaderAccessory
     let content: Content
 
     init(
         title: String,
         detail: String,
+        @ViewBuilder headerAccessory: () -> HeaderAccessory,
         @ViewBuilder content: () -> Content
     ) {
         self.title = title
         self.detail = detail
+        self.headerAccessory = headerAccessory()
         self.content = content()
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             #if os(macOS)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(.title2.weight(.semibold))
-                if !detail.isEmpty {
-                    Text(detail)
-                        .font(HorusStyle.bodyFont)
-                        .foregroundStyle(palette.muted)
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(.title2.weight(.semibold))
+                    if !detail.isEmpty {
+                        Text(detail)
+                            .font(HorusStyle.bodyFont)
+                            .foregroundStyle(palette.muted)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                headerAccessory
             }
             .padding(.horizontal, 38)
             .padding(.top, 20)
@@ -1011,8 +1083,26 @@ struct PageScaffold<Content: View>: View {
         #else
         .navigationTitle(title)
         .toolbarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) { headerAccessory }
+        }
         #endif
         .background(HorusBackdrop())
+    }
+}
+
+extension PageScaffold where HeaderAccessory == EmptyView {
+    init(
+        title: String,
+        detail: String,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.init(
+            title: title,
+            detail: detail,
+            headerAccessory: EmptyView.init,
+            content: content
+        )
     }
 }
 
