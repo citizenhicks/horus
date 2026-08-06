@@ -7,8 +7,8 @@ import UIKit
 #endif
 
 extension MountedWidget {
-    var systemImage: String {
-        widget.symbol.map { HorusSymbol.systemName(for: $0) } ?? "square.grid.2x2"
+    var glyph: HorusGlyph {
+        widget.symbol.map { HorusSymbol.glyph(for: $0) } ?? .squaresFour
     }
 }
 
@@ -35,7 +35,7 @@ struct ChatView: View {
                 }
                 .zIndex(1)
             if !isAtBottom {
-                Button("Scroll to latest", systemImage: "arrow.down") {
+                Button("Scroll to latest", glyph: .arrowDown) {
                     scrollToBottomRequest += 1
                 }
                 .labelStyle(.iconOnly)
@@ -61,7 +61,7 @@ struct ChatView: View {
 
     private var inspectorButton: some View {
         Button(action: model.toggleInspector) {
-            HorusIcon(systemName: "sidebar.right", foreground: .primary)
+            HorusIcon(.sidebarSimple, foreground: .primary)
         }
         .accessibilityLabel("Toggle artifact inspector")
         .tint(.primary)
@@ -82,27 +82,25 @@ private struct ChatOptionsMenu: View {
                             Button {
                                 model.switchGitBranch(to: branch)
                             } label: {
-                                Label(
-                                    branch,
-                                    systemImage: branch == git.currentBranch
-                                        ? "checkmark"
-                                        : "arrow.trianglehead.branch"
+                                HorusLabel(
+                                    title: branch,
+                                    glyph: branch == git.currentBranch ? .check : .gitBranch
                                 )
                             }
                             .disabled(branch == git.currentBranch)
                         }
                     } label: {
-                        Label(git.currentBranch, systemImage: "arrow.trianglehead.branch")
+                        HorusLabel(title: git.currentBranch, glyph: .gitBranch)
                     }
                     .disabled(model.isSwitchingGitBranch || !model.canOpenSession)
                 }
                 Button(action: model.showInspector) {
-                    Label("Open code diff", systemImage: "doc.text.magnifyingglass")
+                    HorusLabel(title: "Open code diff", glyph: .fileMagnifyingGlass)
                 }
                 .disabled(model.gitDiff.isEmpty)
                 if let path = model.workspace?.path {
                     Button { copyToPasteboard(path) } label: {
-                        Label("Copy workspace path", systemImage: "doc.on.doc")
+                        HorusLabel(title: "Copy workspace path", glyph: .copy)
                     }
                 }
             }
@@ -111,25 +109,25 @@ private struct ChatOptionsMenu: View {
                     Button {
                         activate(widget)
                     } label: {
-                        Label(widget.widget.text, systemImage: widget.systemImage)
+                        HorusLabel(title: widget.widget.text, glyph: widget.glyph)
                     }
                     .disabled(widget.widget.content == nil && widget.widget.action == nil)
                 }
                 Button {
                     model.startCronSetup()
                 } label: {
-                    Label("Schedule as a task…", systemImage: "calendar.badge.clock")
+                    HorusLabel(title: "Schedule as a task…", glyph: .calendarDots)
                 }
                 .disabled(!model.canOpenSession || model.selectedSessionID == nil)
                 Button {
                     model.openWorkspaceBrowser()
                 } label: {
-                    Label("New chat in another folder…", systemImage: "folder.badge.plus")
+                    HorusLabel(title: "New chat in another folder…", glyph: .folderPlus)
                 }
                 .disabled(!model.canCreateSession)
             }
         } label: {
-            Image(systemName: "ellipsis")
+            HorusIcon(.dotsThree)
         }
         .labelStyle(.titleAndIcon)
         .menuIndicator(.hidden)
@@ -261,7 +259,7 @@ private struct AgentCard: View {
                     VStack(spacing: 10) {
                         if let provider = selectedProvider(config) {
                             HorusIcon(
-                                systemName: HorusSymbol.systemName(for: provider.symbol),
+                                HorusSymbol.glyph(for: provider.symbol),
                                 size: 20,
                                 foreground: palette.accent
                             )
@@ -447,14 +445,14 @@ private struct TranscriptRow: View {
 
     private var controls: some View {
         HStack(spacing: 0) {
-            MessageActionButton(title: "Copy", systemImage: "doc.on.doc") {
+            MessageActionButton(title: "Copy", glyph: .copy) {
                 copyToPasteboard(entry.text)
             }
             if let target = entry.messageTarget {
                 ForEach(model.messageActionWidgets) { widget in
                     MessageActionButton(
                         title: widget.widget.text,
-                        systemImage: messageActionSystemImage(widget)
+                        glyph: messageActionGlyph(widget)
                     ) {
                         model.submitMessageAction(widget, target: target)
                     }
@@ -467,10 +465,10 @@ private struct TranscriptRow: View {
     @ViewBuilder
     private var transcriptActions: some View {
         if hasMessageActions {
-            Button("Copy", systemImage: "doc.on.doc") { copyToPasteboard(entry.text) }
+            Button("Copy", glyph: .copy) { copyToPasteboard(entry.text) }
             if let target = entry.messageTarget {
                 ForEach(model.messageActionWidgets) { widget in
-                    Button(widget.widget.text, systemImage: messageActionSystemImage(widget)) {
+                    Button(widget.widget.text, glyph: messageActionGlyph(widget)) {
                         model.submitMessageAction(widget, target: target)
                     }
                     .disabled(!model.canOpenSession)
@@ -479,8 +477,8 @@ private struct TranscriptRow: View {
         }
     }
 
-    private func messageActionSystemImage(_ widget: MountedWidget) -> String {
-        widget.widget.symbol.map { HorusSymbol.systemName(for: $0) } ?? "ellipsis"
+    private func messageActionGlyph(_ widget: MountedWidget) -> String {
+        widget.widget.symbol.map { HorusSymbol.glyph(for: $0) } ?? .dotsThree
     }
 
     private var hasMessageActions: Bool {
@@ -512,7 +510,7 @@ private struct MessageActionButton: View {
     @Environment(\.horusPalette) private var palette
     @State private var isHovered = false
     let title: String
-    let systemImage: String
+    let glyph: HorusGlyph
     let action: () -> Void
 
     var body: some View {
@@ -520,7 +518,7 @@ private struct MessageActionButton: View {
         // the box is what spaces these apart, and the context menu carries the same actions.
         Button(action: action) {
             HorusIcon(
-                systemName: systemImage,
+                glyph,
                 size: 13,
                 foreground: isHovered ? palette.accent : palette.muted
             )
@@ -545,7 +543,7 @@ private struct EventCard: View {
             if entry.pending {
                 ProgressView().controlSize(.mini).frame(width: 14, height: 14)
             } else {
-                HorusIcon(systemName: systemImage, size: 14, foreground: foreground)
+                HorusIcon(glyph, size: 14, foreground: foreground)
                     .padding(.top, 1)
             }
             VStack(alignment: .leading, spacing: 4) {
@@ -571,7 +569,7 @@ private struct EventCard: View {
             Spacer(minLength: 0)
             if isTruncatable {
                 HorusIcon(
-                    systemName: isExpanded ? "chevron.up" : "chevron.down",
+                    isExpanded ? .caretUp : .caretDown,
                     size: 12,
                     foreground: palette.muted
                 )
@@ -606,13 +604,13 @@ private struct EventCard: View {
         return capability.replacingOccurrences(of: "_", with: " ").capitalized
     }
 
-    private var systemImage: String {
-        if entry.format == "unified_diff" { return "doc.text.magnifyingglass" }
+    private var glyph: HorusGlyph {
+        if entry.format == "unified_diff" { return .fileMagnifyingGlass }
         switch entry.tone {
-        case "success": return "checkmark.circle"
-        case "warning": return "exclamationmark.triangle"
-        case "error": return "xmark.circle"
-        default: return "terminal"
+        case "success": return .checkCircle
+        case "warning": return .warning
+        case "error": return .xCircle
+        default: return .terminalWindow
         }
     }
 
@@ -810,7 +808,7 @@ private struct ComposerActivityView: View {
                 #if os(macOS)
                 if let workspace = model.workspace {
                     Button { showsWorkspace = true } label: {
-                        HorusBadge(text: "", systemImage: "folder", interactive: true)
+                        HorusBadge(text: "", glyph: .folder, interactive: true)
                     }
                         .buttonStyle(.plain)
                         .help(workspace.path)
@@ -829,7 +827,7 @@ private struct ComposerActivityView: View {
                     Button { showsBranch = true } label: {
                         HorusBadge(
                             text: "",
-                            systemImage: "arrow.trianglehead.branch",
+                            glyph: .gitBranch,
                             interactive: true
                         )
                     }
@@ -1015,12 +1013,12 @@ private struct ComposerOptionsView: View {
     @ViewBuilder
     private var actionButtons: some View {
         if model.activeTurnID != nil && !hasComposerText {
-            Button("Stop", systemImage: "stop.fill") { model.interrupt() }
+            Button("Stop", glyph: .stopFill) { model.interrupt() }
                 .labelStyle(.iconOnly)
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
                 .help("Stop")
         } else {
-            Button("Send", systemImage: "arrow.up") { model.sendMessage() }
+            Button("Send", glyph: .arrowUp) { model.sendMessage() }
                 .labelStyle(.iconOnly)
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
                 // `sendMessage()` also needs a session: a gateway with no chats left the button
@@ -1070,7 +1068,7 @@ private struct ApprovalView: View {
         VStack(alignment: .leading, spacing: 12) {
             HorusLabel(
                 title: "Approval required",
-                systemImage: "hand.raised",
+                glyph: .handPalm,
                 iconColor: palette.warning
             )
                 .font(.headline)
@@ -1167,7 +1165,7 @@ struct FrontendWidgetView: View {
         HorusBadge(
             text: widget.widget.iconOnly ? "" : widget.widget.text,
             tone: widget.widget.tone,
-            systemImage: widget.widget.symbol.map { HorusSymbol.systemName(for: $0) },
+            glyph: widget.widget.symbol.map { HorusSymbol.glyph(for: $0) },
             progress: widget.widget.progress?.fraction,
             interactive: widget.widget.content != nil || widget.widget.action != nil
         )
@@ -1252,14 +1250,14 @@ private struct FrontendActionListRow: View {
                     Button(role: action.tone == "error" ? .destructive : nil) {
                         activate(action)
                     } label: {
-                        Label(
-                            action.label,
-                            systemImage: HorusSymbol.systemName(for: action.symbol)
+                        HorusLabel(
+                            title: action.label,
+                            glyph: HorusSymbol.glyph(for: action.symbol)
                         )
                     }
                 }
             } label: {
-                HorusIcon(systemName: "ellipsis", foreground: palette.accent)
+                HorusIcon(.dotsThree, foreground: palette.accent)
                     .frame(
                         width: HorusStyle.iconButtonSize,
                         height: HorusStyle.iconButtonSize
@@ -1276,7 +1274,7 @@ private struct FrontendActionListRow: View {
                         activate(action)
                     } label: {
                         HorusIcon(
-                            systemName: HorusSymbol.systemName(for: action.symbol),
+                            HorusSymbol.glyph(for: action.symbol),
                             foreground: actionColor(action)
                         )
                         .frame(
@@ -1444,7 +1442,7 @@ private struct FrontendPickerView: View {
                         .font(.headline)
                     Spacer(minLength: 8)
                     Button { model.pendingPicker = nil } label: {
-                        HorusIcon(systemName: "xmark", size: 14, foreground: palette.muted)
+                        HorusIcon(.x, size: 14, foreground: palette.muted)
                             .frame(
                                 width: HorusStyle.iconButtonSize,
                                 height: HorusStyle.iconButtonSize

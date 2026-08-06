@@ -804,7 +804,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         PROVIDER_ID,
         "OpenAI (ChatGPT)",
-        FrontendSymbol::Chat,
+        FrontendSymbol::ChatGpt,
         "Use a ChatGPT Plus or Pro subscription",
         ProviderAuth::Browser(&BROWSER_AUTH),
         MODELS,

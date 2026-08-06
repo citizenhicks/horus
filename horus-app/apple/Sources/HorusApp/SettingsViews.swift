@@ -37,7 +37,7 @@ struct AgentSettingsView: View {
             } else {
                 HorusUnavailable(
                     title: "Agent unavailable",
-                    systemImage: "switch.2",
+                    glyph: .slidersHorizontal,
                     detail: model.connectionState.isReady
                         ? "Configure a provider first."
                         : "Connect to a gateway first."
@@ -150,7 +150,7 @@ struct AgentSettingsView: View {
                     } label: {
                         HStack(spacing: 5) {
                             Text(selectedLabel)
-                            Image(systemName: "chevron.up.chevron.down")
+                            HorusIcon(.caretUpDown)
                                 .font(.caption2)
                                 .accessibilityHidden(true)
                         }
@@ -245,7 +245,7 @@ struct AgentSettingsView: View {
     private var agentConfigurationActions: some View {
         Button(
             "Change for this chat only",
-            systemImage: "ellipsis.message",
+            glyph: .chatDots,
             action: model.changeAgentForCurrentChat
         )
             .horusProminentButton()
@@ -253,7 +253,7 @@ struct AgentSettingsView: View {
 
         Button(
             "Save as default",
-            systemImage: "square.and.arrow.down",
+            glyph: .floppyDisk,
             action: model.saveAgentAsDefault
         )
             .disabled(!hasDefaultChanges || model.isApplyingConfiguration)
@@ -350,7 +350,7 @@ struct ProvidersView: View {
                 HorusActionRow {
                     Button(
                         "Save to gateway",
-                        systemImage: "square.and.arrow.down",
+                        glyph: .floppyDisk,
                         action: model.saveProviderAsDefault
                     )
                         .horusProminentButton()
@@ -364,7 +364,7 @@ struct ProvidersView: View {
             } else {
                 HorusUnavailable(
                     title: "Providers unavailable",
-                    systemImage: "cpu",
+                    glyph: .cpu,
                     detail: "Connect to a gateway first."
                 )
             }
@@ -385,7 +385,7 @@ struct ProvidersView: View {
                 SecureField("New API key · write only", text: $model.providerAPIKey)
                     .textContentType(.password)
                 HorusActionRow {
-                    Button("Send key to gateway", systemImage: "key") {
+                    Button("Send key to gateway", glyph: .key) {
                         model.saveProviderCredential(provider: status.provider)
                     }
                     .horusProminentButton()
@@ -395,7 +395,7 @@ struct ProvidersView: View {
                 HorusActionRow {
                     Button(
                         "Start device sign-in",
-                        systemImage: "rectangle.portrait.and.arrow.forward"
+                        glyph: .signIn
                     ) {
                         model.startProviderLogin(provider: status.provider)
                     }
@@ -536,7 +536,7 @@ struct CronView: View {
                 HStack {
                     Text("Tasks")
                     Spacer()
-                    Button("Refresh", systemImage: "arrow.clockwise") { model.refreshCron() }
+                    Button("Refresh", glyph: .arrowClockwise) { model.refreshCron() }
                         .labelStyle(.iconOnly)
                         .buttonStyle(HorusIconButtonStyle())
                         .help("Refresh schedules")
@@ -583,13 +583,13 @@ private struct CronTaskRow: View {
                     .settingsField()
             }
             HorusActionRow(collapsesToIcons: true) {
-                Button("Run now", systemImage: "play.fill") { model.runCron(task) }
+                Button("Run now", glyph: .playFill) { model.runCron(task) }
                     .horusProminentButton()
-                Button("Reschedule", systemImage: "clock") {
+                Button("Reschedule", glyph: .clock) {
                     model.rescheduleCron(task, schedule: schedule)
                 }
                     .disabled(schedule == task.schedule)
-                Button("Delete", systemImage: "trash", role: .destructive) {
+                Button("Delete", glyph: .trash, role: .destructive) {
                     model.deleteCron(task)
                 }
             }
@@ -890,14 +890,14 @@ struct GatewayView: View {
             }
 
             HorusActionRow(collapsesToIcons: true) {
-                Button("Reconnect", systemImage: "arrow.clockwise", action: model.reconnect)
-                Button("Add gateway", systemImage: "plus") { model.showsPairing = true }
-                Button("Rename", systemImage: "pencil") {
+                Button("Reconnect", glyph: .arrowClockwise, action: model.reconnect)
+                Button("Add gateway", glyph: .plus) { model.showsPairing = true }
+                Button("Rename", glyph: .pencilSimple) {
                     renameDraft = model.selectedAccount?.displayName ?? ""
                     showsRename = true
                 }
                 .disabled(model.selectedAccount == nil)
-                Button("Forget", systemImage: "trash", role: .destructive) {
+                Button("Forget", glyph: .trash, role: .destructive) {
                     confirmsForget = true
                 }
             }
@@ -924,7 +924,7 @@ struct GatewayView: View {
                 } else {
                     Button(
                         "Create one-time code",
-                        systemImage: "key",
+                        glyph: .key,
                         action: model.createPairingCode
                     )
                         .horusProminentButton()
@@ -1069,7 +1069,7 @@ private struct StatusBanner: View {
     var body: some View {
         HStack(spacing: 12) {
             if progress { ProgressView().controlSize(.small) }
-            else { HorusIcon(systemName: systemImage, foreground: color) }
+            else { HorusIcon(glyph, foreground: color) }
             VStack(alignment: .leading, spacing: 3) {
                 Text(title).font(HorusStyle.controlFont)
                 Text(detail).font(HorusStyle.bodyFont).foregroundStyle(palette.muted)
@@ -1098,12 +1098,12 @@ private struct StatusBanner: View {
         }
     }
 
-    private var systemImage: String {
+    private var glyph: HorusGlyph {
         switch tone {
-        case .neutral: "info.circle"
-        case .success: "checkmark.seal"
-        case .warning: "exclamationmark.triangle"
-        case .error: "exclamationmark.octagon"
+        case .neutral: .info
+        case .success: .sealCheck
+        case .warning: .warning
+        case .error: .warningOctagon
         }
     }
 }

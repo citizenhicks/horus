@@ -106,7 +106,7 @@ struct AppShell: View {
                                         sidebarIsOpen.toggle()
                                     }
                                 } label: {
-                                    HorusIcon(systemName: "sidebar.leading", foreground: .primary)
+                                    HorusIcon(.list, foreground: .primary)
                                 }
                                 .tint(.primary)
                                 .accessibilityLabel(sidebarIsOpen ? "Hide sidebar" : "Show sidebar")
@@ -150,7 +150,7 @@ struct AppShell: View {
             } else {
                 HorusUnavailable(
                     title: "Capability unavailable",
-                    systemImage: "square.grid.2x2",
+                    glyph: .squaresFour,
                     detail: "This capability is not available in the current chat."
                 )
             }
@@ -208,7 +208,7 @@ private struct AppLockView: View {
             HorusCard {
                 VStack(spacing: 16) {
                     HorusIcon(
-                        systemName: model.appLockAuthenticationMethod.systemImage,
+                        model.appLockAuthenticationMethod.glyph,
                         size: 36,
                         foreground: palette.accent
                     )
@@ -225,7 +225,7 @@ private struct AppLockView: View {
                             model.appLockError == nil
                                 ? model.appLockAuthenticationMethod.unlockTitle
                                 : "Try Again",
-                            systemImage: model.appLockError == nil ? "lock.open" : "arrow.clockwise"
+                            glyph: model.appLockError == nil ? .lockOpen : .arrowClockwise
                         ) {
                             Task { await model.unlockApp() }
                         }
@@ -280,7 +280,7 @@ private struct AppToastView: View {
         HStack(spacing: 12) {
             HStack(alignment: .top, spacing: 10) {
                 HorusIcon(
-                    systemName: toast.tone.systemImage,
+                    toast.tone.glyph,
                     size: 18,
                     foreground: toast.tone.color(in: palette)
                 )
@@ -299,7 +299,7 @@ private struct AppToastView: View {
             .accessibilityLabel("\(toast.tone.title): \(toast.message)")
 
             Button(action: dismiss) {
-                HorusIcon(systemName: "xmark", size: 14, foreground: palette.muted)
+                HorusIcon(.x, size: 14, foreground: palette.muted)
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                     .contentShape(Rectangle())
             }
@@ -324,12 +324,12 @@ private extension ToastTone {
         }
     }
 
-    var systemImage: String {
+    var glyph: HorusGlyph {
         switch self {
-        case .info: "info.circle"
-        case .success: "checkmark.circle"
-        case .warning: "exclamationmark.triangle"
-        case .error: "xmark.circle"
+        case .info: .info
+        case .success: .checkCircle
+        case .warning: .warning
+        case .error: .xCircle
         }
     }
 
@@ -361,7 +361,7 @@ private struct WorkspaceBrowserView: View {
                     List {
                         ForEach(listing.entries) { entry in
                             Button { model.loadDirectory(entry.path) } label: {
-                                HorusLabel(title: entry.name, systemImage: "folder")
+                                HorusLabel(title: entry.name, glyph: .folder)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .contentShape(Rectangle())
                             }
@@ -376,7 +376,7 @@ private struct WorkspaceBrowserView: View {
                         if let error = model.directoryError ?? model.workspaceError {
                             HorusLabel(
                                 title: error,
-                                systemImage: "exclamationmark.triangle",
+                                glyph: .warning,
                                 iconColor: palette.danger
                             )
                                 .foregroundStyle(palette.danger)
@@ -431,7 +431,7 @@ private struct DirectoryBrowserHeader: View {
                     .font(HorusStyle.controlFont)
                 Spacer()
                 if let parent {
-                    Button("Parent folder", systemImage: "arrow.up") { onParent(parent) }
+                    Button("Parent folder", glyph: .arrowUp) { onParent(parent) }
                         .labelStyle(.iconOnly)
                         .buttonStyle(HorusIconButtonStyle())
                         .help("Parent folder")
@@ -467,14 +467,14 @@ private struct FrontendContributionPage: View {
                 Section {
                     Button(
                         widget.widget.text,
-                        systemImage: widget.systemImage,
+                        glyph: widget.glyph,
                         action: { model.submitWidget(widget) }
                     )
                 }
             } else {
                 HorusUnavailable(
                     title: widget.widget.text,
-                    systemImage: widget.systemImage,
+                    glyph: widget.glyph,
                     detail: "No content is currently available."
                 )
             }
@@ -599,11 +599,11 @@ struct SidebarView: View {
                     Button {
                         showsConnectionDetails = true
                     } label: {
-                        Image(systemName: "circle.fill")
-                            .font(.system(size: 8))
-                            .foregroundStyle(
-                                model.connectionState.isReady ? palette.signal : palette.danger
-                            )
+                        // A solid dot, not an icon: HugeIcons is a stroked set with no
+                        // filled circle, and an outlined ring reads as a control here.
+                        Circle()
+                            .fill(model.connectionState.isReady ? palette.signal : palette.danger)
+                            .frame(width: 8, height: 8)
                             .symbolEffect(
                                 .pulse.byLayer,
                                 options: .repeat(.continuous),
@@ -662,7 +662,7 @@ struct SidebarView: View {
                     model.destination = .chat
                     showDetail()
                 } label: {
-                    HorusLabel(title: "New chat", systemImage: "square.and.pencil")
+                    HorusLabel(title: "New chat", glyph: .notePencil)
                         .font(HorusStyle.controlFont)
                 }
                 .horusProminentButton()
@@ -675,7 +675,7 @@ struct SidebarView: View {
                     model.destination = .profile
                     showDetail()
                 } label: {
-                    HorusIcon(systemName: "gearshape")
+                    HorusIcon(.gear)
                 }
                 .buttonStyle(HorusIconButtonStyle())
                 .accessibilityLabel("Settings")
@@ -740,14 +740,14 @@ struct SidebarView: View {
                     showsConnectionDetails = false
                     model.reconnect()
                 } label: {
-                    Label("Retry connection", systemImage: "arrow.clockwise")
+                    HorusLabel(title: "Retry connection", glyph: .arrowClockwise)
                 }
                 .disabled(model.selectedAccount == nil)
                 Button {
                     showsConnectionDetails = false
                     model.repairSelectedGateway()
                 } label: {
-                    Label("Repair pairing", systemImage: "link")
+                    HorusLabel(title: "Repair pairing", glyph: .link)
                 }
                 .disabled(model.selectedAccount == nil)
             }
@@ -765,7 +765,7 @@ struct SidebarView: View {
         } label: {
             HorusLabel(
                 title: title,
-                systemImage: destination.systemImage,
+                glyph: destination.glyph,
                 iconColor: model.destination == destination ? palette.accent : Color.primary
             )
                 .font(HorusStyle.controlFont)
@@ -789,7 +789,7 @@ struct SidebarView: View {
         } label: {
             HorusLabel(
                 title: widget.widget.text,
-                systemImage: widget.systemImage,
+                glyph: widget.glyph,
                 iconColor: model.destination == destination ? palette.accent : Color.primary
             )
             .font(HorusStyle.controlFont)
@@ -843,15 +843,15 @@ struct SidebarView: View {
                     expansionBinding(for: group.id).wrappedValue.toggle()
                 } label: {
                     HStack(spacing: 6) {
-                        HorusIcon(systemName: "folder", foreground: palette.muted)
+                        HorusIcon(.folder, foreground: palette.muted)
                         Text(group.name)
                             .font(HorusStyle.controlFont)
                             .lineLimit(1)
                             .truncationMode(.middle)
                         HorusIcon(
-                            systemName: collapsedWorkspaces.contains(group.id)
-                                ? "chevron.right"
-                                : "chevron.down",
+                            collapsedWorkspaces.contains(group.id)
+                                ? .caretRight
+                                : .caretDown,
                             size: 12,
                             foreground: palette.muted
                         )
@@ -876,7 +876,7 @@ struct SidebarView: View {
                 } label: {
                     HorusLabel(
                         title: "New chat in \(group.name)",
-                        systemImage: "square.and.pencil",
+                        glyph: .notePencil,
                         iconColor: palette.muted,
                         iconSize: 14
                     )
@@ -936,32 +936,32 @@ struct SidebarView: View {
             .accessibilityAddTraits(isSelected ? .isSelected : [])
 
             if session.pinned {
-                HorusIcon(systemName: "pin", size: 12, foreground: palette.accent)
+                HorusIcon(.pushPin, size: 12, foreground: palette.accent)
             }
 
             Menu {
                 Button {
                     model.setSessionPinned(session, pinned: !session.pinned)
                 } label: {
-                    Label(
-                        session.pinned ? "Unpin" : "Pin",
-                        systemImage: session.pinned ? "pin.slash" : "pin"
+                    HorusLabel(
+                        title: session.pinned ? "Unpin" : "Pin",
+                        glyph: session.pinned ? .pushPinSlash : .pushPin
                     )
                 }
                 Button {
                     renameDraft = session.displayTitle
                     sessionToRename = session
                 } label: {
-                    Label("Rename", systemImage: "pencil")
+                    HorusLabel(title: "Rename", glyph: .pencilSimple)
                 }
                 Divider()
                 Button(role: .destructive) {
                     sessionToDelete = session
                 } label: {
-                    Label("Delete", systemImage: "trash")
+                    HorusLabel(title: "Delete", glyph: .trash)
                 }
             } label: {
-                Image(systemName: "ellipsis")
+                HorusIcon(.dotsThree)
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                     .contentShape(Rectangle())
             }
@@ -1071,7 +1071,7 @@ struct PairingView: View {
                     )
                     Spacer()
                     if canCancel {
-                        Button("Close", systemImage: "xmark") {
+                        Button("Close", glyph: .x) {
                             model.showsPairing = false
                             dismiss()
                         }
@@ -1123,7 +1123,7 @@ struct PairingView: View {
                     if let error = model.pairingError {
                         HorusLabel(
                             title: error,
-                            systemImage: "exclamationmark.triangle",
+                            glyph: .warning,
                             iconColor: palette.danger
                         )
                             .foregroundStyle(palette.danger)
@@ -1143,7 +1143,7 @@ struct PairingView: View {
         VStack(spacing: 14) {
             HorusLabel(
                 title: "4-byte framed JSON · protocol v\(gatewayProtocolVersion)",
-                systemImage: "checkmark.shield",
+                glyph: .shieldCheck,
                 iconColor: palette.muted
             )
                 .font(HorusStyle.metadataFont)

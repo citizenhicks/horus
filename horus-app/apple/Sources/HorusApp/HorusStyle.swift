@@ -1,9 +1,4 @@
 import SwiftUI
-#if os(macOS)
-import AppKit
-#else
-import UIKit
-#endif
 
 enum HorusStyle {
     #if os(iOS)
@@ -33,16 +28,103 @@ enum HorusStyle {
     static let borderWidth: CGFloat = 0.75
 }
 
+/// One HugeIcons glyph, vendored into the asset catalog under `hi.<name>`.
+///
+/// A type rather than a raw asset name: a missing SF Symbol at least logs, but a misspelled
+/// asset name draws nothing at all and says nothing about it, so the names are worth holding
+/// the compiler to. Add a case only alongside the matching imageset.
+struct HorusGlyph: Hashable {
+    let asset: String
+
+    private init(_ asset: String) { self.asset = asset }
+
+    static let arrowCircleUp = Self("hi.arrowCircleUp")
+    static let arrowClockwise = Self("hi.arrowClockwise")
+    static let arrowDown = Self("hi.arrowDown")
+    static let arrowUp = Self("hi.arrowUp")
+    static let brain = Self("hi.brain")
+    static let calendarDots = Self("hi.calendarDots")
+    static let caretDown = Self("hi.caretDown")
+    static let caretRight = Self("hi.caretRight")
+    static let caretUp = Self("hi.caretUp")
+    static let caretUpDown = Self("hi.caretUpDown")
+    static let cellTower = Self("hi.cellTower")
+    static let chatCircle = Self("hi.chatCircle")
+    static let chatDots = Self("hi.chatDots")
+    static let chatGpt = Self("hi.chatGpt")
+    static let chatsCircle = Self("hi.chatsCircle")
+    static let check = Self("hi.check")
+    static let checkCircle = Self("hi.checkCircle")
+    static let claude = Self("hi.claude")
+    static let clock = Self("hi.clock")
+    static let copy = Self("hi.copy")
+    static let cpu = Self("hi.cpu")
+    static let deepseek = Self("hi.deepseek")
+    static let dotsThree = Self("hi.dotsThree")
+    static let fileMagnifyingGlass = Self("hi.fileMagnifyingGlass")
+    static let fileText = Self("hi.fileText")
+    static let fingerprint = Self("hi.fingerprint")
+    static let floppyDisk = Self("hi.floppyDisk")
+    static let folder = Self("hi.folder")
+    static let folderPlus = Self("hi.folderPlus")
+    static let gear = Self("hi.gear")
+    static let gitBranch = Self("hi.gitBranch")
+    static let handPalm = Self("hi.handPalm")
+    static let hardDrives = Self("hi.hardDrives")
+    static let info = Self("hi.info")
+    static let key = Self("hi.key")
+    static let link = Self("hi.link")
+    static let list = Self("hi.list")
+    static let lockOpen = Self("hi.lockOpen")
+    static let magnifyingGlass = Self("hi.magnifyingGlass")
+    static let moon = Self("hi.moon")
+    static let notePencil = Self("hi.notePencil")
+    static let path = Self("hi.path")
+    static let pencilSimple = Self("hi.pencilSimple")
+    static let playFill = Self("hi.playFill")
+    static let plugsConnected = Self("hi.plugsConnected")
+    static let plus = Self("hi.plus")
+    static let pushPin = Self("hi.pushPin")
+    static let pushPinSlash = Self("hi.pushPinSlash")
+    static let question = Self("hi.question")
+    static let robot = Self("hi.robot")
+    static let sealCheck = Self("hi.sealCheck")
+    static let shieldCheck = Self("hi.shieldCheck")
+    static let sidebarSimple = Self("hi.sidebarSimple")
+    static let signIn = Self("hi.signIn")
+    static let slidersHorizontal = Self("hi.slidersHorizontal")
+    static let sparkle = Self("hi.sparkle")
+    static let squaresFour = Self("hi.squaresFour")
+    static let stopFill = Self("hi.stopFill")
+    static let terminalWindow = Self("hi.terminalWindow")
+    static let trash = Self("hi.trash")
+    static let userFocus = Self("hi.userFocus")
+    static let warning = Self("hi.warning")
+    static let warningOctagon = Self("hi.warningOctagon")
+    static let x = Self("hi.x")
+    static let xCircle = Self("hi.xCircle")
+}
+
 struct HorusIcon: View {
-    let systemName: String
+    let glyph: HorusGlyph
     var size = HorusStyle.iconSize
     var foreground: Color? = nil
 
+    init(_ glyph: HorusGlyph, size: CGFloat = HorusStyle.iconSize, foreground: Color? = nil) {
+        self.glyph = glyph
+        self.size = size
+        self.foreground = foreground
+    }
+
     @ViewBuilder
     var body: some View {
-        let icon = Image(systemName: systemName)
-            .symbolRenderingMode(.monochrome)
-            .font(.system(size: size, weight: .regular))
+        // The asset carries `template-rendering-intent`, so this tints from the foreground
+        // style the way a symbol does. Unlike a symbol it has no intrinsic text size, which is
+        // why every glyph is drawn into an explicit square instead of following the font.
+        let icon = Image(glyph.asset)
+            .renderingMode(.template)
+            .resizable()
+            .aspectRatio(contentMode: .fit)
             .frame(width: size, height: size)
             .accessibilityHidden(true)
         if let foreground {
@@ -55,7 +137,7 @@ struct HorusIcon: View {
 
 struct HorusLabel: View {
     let title: String
-    let systemImage: String
+    let glyph: HorusGlyph
     var iconColor: Color? = nil
     var iconSize = HorusStyle.iconSize
 
@@ -63,7 +145,7 @@ struct HorusLabel: View {
         Label {
             Text(title)
         } icon: {
-            HorusIcon(systemName: systemImage, size: iconSize, foreground: iconColor)
+            HorusIcon(glyph, size: iconSize, foreground: iconColor)
         }
     }
 }
@@ -111,12 +193,12 @@ struct HorusActionRow<Content: View>: View {
 
 struct HorusUnavailable: View {
     let title: String
-    let systemImage: String
+    let glyph: HorusGlyph
     var detail: String?
 
     var body: some View {
         ContentUnavailableView {
-            HorusLabel(title: title, systemImage: systemImage, iconSize: 32)
+            HorusLabel(title: title, glyph: glyph, iconSize: 32)
         } description: {
             if let detail { Text(detail) }
         }
@@ -129,58 +211,50 @@ struct HorusUnavailable: View {
 extension Button where Label == HorusLabel {
     init(
         _ title: String,
-        systemImage: String,
+        glyph: HorusGlyph,
         role: ButtonRole? = nil,
         action: @escaping () -> Void
     ) {
         self.init(role: role, action: action) {
-            HorusLabel(title: title, systemImage: systemImage)
+            HorusLabel(title: title, glyph: glyph)
         }
     }
 }
 
-/// Draws the gateway's `FrontendSymbol` vocabulary in SF Symbols.
+/// Draws the gateway's `FrontendSymbol` vocabulary in HugeIcons.
 ///
 /// The protocol names what a glyph stands for and leaves the artwork to each frontend, so
 /// this table is the Apple client's half of that contract: one entry per `FrontendSymbol`
-/// variant, and the gateway never names an SF Symbol itself. Keep it in step with the enum
-/// in `src/protocol/mod.rs` — a variant with no entry here renders as `placeholder`.
+/// variant, and the gateway never names an icon itself. Keep it in step with the enum in
+/// `src/protocol/mod.rs` — a variant with no entry here falls back to `placeholder`.
+///
+/// `FrontendSymbol::Custom` has no entry by definition. It carries a name from outside the
+/// protocol's vocabulary, which this app has no artwork for, so it draws the placeholder.
 enum HorusSymbol {
-    static let placeholder = "questionmark.square.dashed"
+    static let placeholder = HorusGlyph.question
 
-    static func systemName(for symbol: String) -> String {
-        if let known = vocabulary[symbol] { return known }
-        // `FrontendSymbol::Custom`, which the protocol documents as best-effort: try the name
-        // as an SF Symbol, then without the hyphens icon sets tend to use, then give up.
-        if isSystemSymbol(symbol) { return symbol }
-        let collapsed = symbol.replacingOccurrences(of: "-", with: "")
-        if collapsed != symbol, isSystemSymbol(collapsed) { return collapsed }
-        return placeholder
+    static func glyph(for symbol: String) -> HorusGlyph {
+        vocabulary[symbol] ?? placeholder
     }
 
     /// One entry per `FrontendSymbol` variant.
-    private static let vocabulary: [String: String] = [
-        "agent": "person.fill",
-        "brain": "brain.head.profile",
-        "branch": "arrow.trianglehead.branch",
-        "chat": "text.bubble",
-        "delete": "trash",
-        "edit": "pencil",
-        "moon": "moon",
-        "promote": "arrow.up.circle",
-        "route": "point.3.connected.trianglepath.dotted",
-        "search": "magnifyingglass",
-        "sparkle": "sparkles",
-        "storage": "externaldrive.connected.to.line.below",
+    private static let vocabulary: [String: HorusGlyph] = [
+        "agent": .robot,
+        "brain": .brain,
+        "branch": .gitBranch,
+        "chat": .chatCircle,
+        "chat_gpt": .chatGpt,
+        "claude": .claude,
+        "deepseek": .deepseek,
+        "delete": .trash,
+        "edit": .pencilSimple,
+        "moon": .moon,
+        "promote": .arrowCircleUp,
+        "route": .path,
+        "search": .magnifyingGlass,
+        "sparkle": .sparkle,
+        "storage": .hardDrives,
     ]
-
-    private static func isSystemSymbol(_ name: String) -> Bool {
-        #if os(macOS)
-        NSImage(systemSymbolName: name, accessibilityDescription: nil) != nil
-        #else
-        UIImage(systemName: name) != nil
-        #endif
-    }
 }
 
 struct HorusPalette: Sendable {
@@ -310,7 +384,7 @@ struct HorusBadge: View {
     @Environment(\.horusPalette) private var palette
     let text: String
     var tone = "neutral"
-    var systemImage: String?
+    var glyph: HorusGlyph?
     var progress: Double?
     var interactive = false
 
@@ -327,8 +401,8 @@ struct HorusBadge: View {
                 .frame(width: 12, height: 12)
                 .accessibilityHidden(true)
             }
-            if let systemImage {
-                HorusIcon(systemName: systemImage, size: 13, foreground: foreground)
+            if let glyph {
+                HorusIcon(glyph, size: 13, foreground: foreground)
             }
             if !text.isEmpty { Text(text).lineLimit(1) }
         }
@@ -344,13 +418,13 @@ struct HorusBadge: View {
 
 struct HorusMenuLabel: View {
     let text: String
-    var systemImage: String?
+    var glyph: HorusGlyph?
 
     var body: some View {
         HStack(spacing: 6) {
-            if let systemImage { HorusIcon(systemName: systemImage) }
+            if let glyph { HorusIcon(glyph) }
             Text(text).lineLimit(1)
-            HorusIcon(systemName: "chevron.up.chevron.down", size: 13)
+            HorusIcon(.caretUpDown, size: 13)
         }
         .font(HorusStyle.controlFont)
         .frame(height: HorusStyle.controlHeight)

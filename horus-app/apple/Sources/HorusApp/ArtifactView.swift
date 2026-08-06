@@ -21,7 +21,7 @@ private struct ArtifactContent: View {
         if model.gitDiff.isEmpty {
             HorusUnavailable(
                 title: "No code changes",
-                systemImage: "doc.text.magnifyingglass"
+                glyph: .fileMagnifyingGlass
             )
         } else {
             UnifiedDiffView(document: UnifiedDiffDocument(model.gitDiff))
@@ -189,7 +189,7 @@ private struct DiffFileView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         } label: {
             HStack(spacing: 8) {
-                HorusIcon(systemName: "doc.text", foreground: palette.accent)
+                HorusIcon(.fileText, foreground: palette.accent)
                 Text(file.path)
                     .font(HorusStyle.metadataFont.weight(.semibold))
                     .lineLimit(1)
@@ -350,7 +350,7 @@ struct PreviewTranscriptSheet: View {
             }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Close", systemImage: "xmark", action: dismiss.callAsFunction)
+                    Button("Close", glyph: .x, action: dismiss.callAsFunction)
                         .labelStyle(.iconOnly)
                 }
             }

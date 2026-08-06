@@ -48,7 +48,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "deepseek",
         "DeepSeek",
-        FrontendSymbol::Search,
+        FrontendSymbol::Deepseek,
         "DeepSeek Responses API",
         ProviderAuth::ApiKey("DEEPSEEK_API_KEY"),
         MODELS,

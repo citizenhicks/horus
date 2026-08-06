@@ -33,3 +33,16 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+The Apple client bundles icon artwork from HugeIcons (the free set), redrawn as
+SVG assets under horus-app/apple/Sources/HorusApp/Assets.xcassets as hi.*.
+
+  Hugeicons Core Free Icons — https://hugeicons.com
+  Copyright (c) Hugeicons
+  Licensed under the MIT License, reproduced above.
+
+Provider marks (Claude, ChatGPT, DeepSeek) identify the provider a route belongs
+to. They are used nominatively to refer to those services; the underlying
+trademarks remain with their respective owners.

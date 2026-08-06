@@ -661,7 +661,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "anthropic",
         "Anthropic",
-        FrontendSymbol::Brain,
+        FrontendSymbol::Claude,
         "Native Messages API with adaptive thinking",
         ProviderAuth::ApiKey("ANTHROPIC_API_KEY"),
         MODELS,

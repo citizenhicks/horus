@@ -466,9 +466,9 @@ pub enum FrontendTone {
 ///
 /// A gateway does not know whether the frontend draws SF Symbols, terminal glyphs, or
 /// SVGs, so it names what a glyph stands for and each frontend supplies its own artwork.
-/// Most variants are roles; the ones a provider uses as its mark (`Brain`, `Moon`,
-/// `Sparkle`) name what they depict, because identity is the point there and no role
-/// describes them.
+/// Most variants are roles. The rest are provider identity, where no role applies: some
+/// name the vendor outright (`Claude`, `ChatGpt`, `Deepseek`) and the others name what the
+/// mark depicts (`Moon`, `Sparkle`) where a frontend has no vendor artwork to draw.
 ///
 /// [`Self::Custom`] carries anything outside this list so a plugin can still ship a glyph
 /// this enum has never heard of. It is explicitly best-effort: a frontend that cannot
@@ -480,6 +480,9 @@ pub enum FrontendSymbol {
     Brain,
     Branch,
     Chat,
+    ChatGpt,
+    Claude,
+    Deepseek,
     Delete,
     Edit,
     Moon,
@@ -499,6 +502,9 @@ impl FrontendSymbol {
             Self::Brain => "brain",
             Self::Branch => "branch",
             Self::Chat => "chat",
+            Self::ChatGpt => "chat_gpt",
+            Self::Claude => "claude",
+            Self::Deepseek => "deepseek",
             Self::Delete => "delete",
             Self::Edit => "edit",
             Self::Moon => "moon",
@@ -519,6 +525,9 @@ impl FrontendSymbol {
             "brain" => Self::Brain,
             "branch" => Self::Branch,
             "chat" => Self::Chat,
+            "chat_gpt" => Self::ChatGpt,
+            "claude" => Self::Claude,
+            "deepseek" => Self::Deepseek,
             "delete" => Self::Delete,
             "edit" => Self::Edit,
             "moon" => Self::Moon,
@@ -1022,6 +1031,9 @@ mod tests {
             FrontendSymbol::Brain,
             FrontendSymbol::Branch,
             FrontendSymbol::Chat,
+            FrontendSymbol::ChatGpt,
+            FrontendSymbol::Claude,
+            FrontendSymbol::Deepseek,
             FrontendSymbol::Delete,
             FrontendSymbol::Edit,
             FrontendSymbol::Moon,

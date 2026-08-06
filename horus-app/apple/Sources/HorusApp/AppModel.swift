@@ -11,15 +11,15 @@ enum AppDestination: Equatable {
     case profile
     case contribution(String)
 
-    var systemImage: String {
+    var glyph: HorusGlyph {
         switch self {
-        case .chat: "bubble.left.and.bubble.right"
-        case .gateway: "server.rack"
-        case .agent: "slider.horizontal.3"
-        case .providers: "network"
-        case .cron: "calendar.badge.clock"
-        case .profile: "gearshape"
-        case .contribution: "square.grid.2x2"
+        case .chat: .chatsCircle
+        case .gateway: .cellTower
+        case .agent: .slidersHorizontal
+        case .providers: .plugsConnected
+        case .cron: .calendarDots
+        case .profile: .gear
+        case .contribution: .squaresFour
         }
     }
 }
@@ -122,11 +122,11 @@ enum AppLockAuthenticationMethod: Equatable {
         }
     }
 
-    var systemImage: String {
+    var glyph: HorusGlyph {
         switch self {
-        case .faceID: "faceid"
-        case .touchID: "touchid"
-        case .biometrics, .unavailable: "touchid"
+        case .faceID: .userFocus
+        case .touchID: .fingerprint
+        case .biometrics, .unavailable: .fingerprint
         }
     }
 
