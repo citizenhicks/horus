@@ -192,7 +192,7 @@ struct HorusActionRow<Content: View>: View {
         }
         .frame(maxWidth: .infinity)
         .lineLimit(1)
-        .buttonStyle(.glass)
+        .buttonStyle(.horusGlass)
         .buttonBorderShape(iconsOnly ? .circle : .capsule)
         .controlSize(.large)
     }
@@ -389,6 +389,7 @@ struct HorusTheme: ViewModifier {
             .foregroundStyle(.primary)
             .tint(palette.accent)
             .font(HorusStyle.bodyFont)
+            .buttonStyle(.horusAutomatic)
     }
 }
 
@@ -469,6 +470,54 @@ struct HorusMenuLabel: View {
     }
 }
 
+struct HorusFeedbackButtonStyle<Base: PrimitiveButtonStyle>: PrimitiveButtonStyle {
+    let base: Base
+
+    @ViewBuilder
+    func makeBody(configuration: Configuration) -> some View {
+        #if os(iOS)
+        FeedbackButton(configuration: configuration, base: base)
+        #else
+        base.makeBody(configuration: configuration)
+        #endif
+    }
+
+    #if os(iOS)
+    private struct FeedbackButton: View {
+        @State private var feedback = false
+        let configuration: PrimitiveButtonStyleConfiguration
+        let base: Base
+
+        var body: some View {
+            Button(role: configuration.role) {
+                feedback.toggle()
+                configuration.trigger()
+            } label: {
+                configuration.label
+            }
+            .buttonStyle(base)
+            .sensoryFeedback(.impact(weight: .light), trigger: feedback)
+        }
+    }
+    #endif
+}
+
+extension PrimitiveButtonStyle where Self == HorusFeedbackButtonStyle<DefaultButtonStyle> {
+    static var horusAutomatic: Self { Self(base: DefaultButtonStyle()) }
+}
+
+extension PrimitiveButtonStyle where Self == HorusFeedbackButtonStyle<PlainButtonStyle> {
+    static var horusPlain: Self { Self(base: PlainButtonStyle()) }
+}
+
+extension PrimitiveButtonStyle where Self == HorusFeedbackButtonStyle<GlassButtonStyle> {
+    static var horusGlass: Self { Self(base: GlassButtonStyle()) }
+}
+
+extension PrimitiveButtonStyle where Self == HorusFeedbackButtonStyle<GlassProminentButtonStyle> {
+    static var horusGlassProminent: Self { Self(base: GlassProminentButtonStyle()) }
+}
+
 struct HorusIconButtonStyle: ButtonStyle {
     var prominent = false
 
@@ -525,7 +574,7 @@ private struct HorusProminentButton: ViewModifier {
         // `.glassProminent` fills from the tint, so it needs the accessible one rather than
         // the global tint `HorusTheme` sets for switches, pickers, and links.
         content
-            .buttonStyle(.glassProminent)
+            .buttonStyle(.horusGlassProminent)
             .tint(palette.accentFill)
             .foregroundStyle(palette.onAccent)
         #endif

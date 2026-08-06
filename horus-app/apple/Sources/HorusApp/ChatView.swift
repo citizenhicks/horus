@@ -470,7 +470,7 @@ private struct TranscriptRow: View {
                 Button { model.selectArtifact(entry.id) } label: {
                     EventCard(entry: entry)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.horusPlain)
                 .accessibilityHint("Opens the code diff")
             } else {
                 EventCard(entry: entry)
@@ -560,7 +560,7 @@ private struct MessageActionButton: View {
             .frame(width: 26, height: 26)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.horusPlain)
         .onHover { isHovered = $0 }
         .animation(.easeOut(duration: 0.12), value: isHovered)
         .accessibilityLabel(title)
@@ -573,7 +573,20 @@ private struct EventCard: View {
     @State private var isExpanded = false
     let entry: TranscriptEntry
 
+    @ViewBuilder
     var body: some View {
+        if isTruncatable {
+            Button { isExpanded.toggle() } label: {
+                card
+            }
+            .buttonStyle(.horusPlain)
+            .accessibilityHint(isExpanded ? "Collapses details" : "Expands details")
+        } else {
+            card
+        }
+    }
+
+    private var card: some View {
         HStack(alignment: .top, spacing: 10) {
             if entry.pending {
                 ProgressView().controlSize(.mini).frame(width: 14, height: 14)
@@ -618,7 +631,6 @@ private struct EventCard: View {
             in: HorusStyle.controlShape
         )
         .contentShape(Rectangle())
-        .onTapGesture { if isTruncatable { isExpanded.toggle() } }
     }
 
     private var detail: String {
@@ -747,7 +759,7 @@ private struct ComposerSurface: View {
                                     interactive: true
                                 )
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.horusPlain)
                             .help(mounted.reference.description)
                             .accessibilityLabel(mounted.replacement)
                             .accessibilityHint(mounted.reference.description)
@@ -845,7 +857,7 @@ private struct ComposerActivityView: View {
                     Button { showsWorkspace = true } label: {
                         HorusBadge(text: "", glyph: .folder, interactive: true)
                     }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.horusPlain)
                         .help(workspace.path)
                         .accessibilityLabel("Workspace")
                         .accessibilityValue(workspace.path)
@@ -866,7 +878,7 @@ private struct ComposerActivityView: View {
                             interactive: true
                         )
                     }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.horusPlain)
                         .help(git.currentBranch)
                         .accessibilityLabel("Git branch")
                         .accessibilityValue(git.currentBranch)
@@ -902,10 +914,7 @@ private struct ComposerActivityView: View {
                         )
                         .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
-                    #if os(iOS)
-                    .sensoryFeedback(.impact(weight: .light), trigger: model.showsInspector) { _, shown in shown }
-                    #endif
+                    .buttonStyle(.horusPlain)
                     .accessibilityLabel("Code changes")
                     .accessibilityValue("\(totals.added) additions, \(totals.removed) deletions")
                     .accessibilityHint("Opens the latest code diff")
@@ -941,10 +950,7 @@ private struct SessionStatsBadge: View {
                 )
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            #if os(iOS)
-            .sensoryFeedback(.impact(weight: .light), trigger: showsDetail) { _, shown in shown }
-            #endif
+            .buttonStyle(.horusPlain)
             .accessibilityLabel("Context usage")
             .accessibilityValue("\(model.contextFillPercent) percent")
             .popover(isPresented: $showsDetail) {
@@ -1015,7 +1021,7 @@ private struct ComposerOptionsView: View {
                 .frame(minHeight: HorusStyle.iconButtonSize)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.horusPlain)
         #if os(iOS)
         .sensoryFeedback(.selection, trigger: model.selectedModelRoute)
         #endif
@@ -1128,7 +1134,7 @@ private struct ApprovalView: View {
                 HStack(spacing: 8) { actions }
                 VStack(spacing: 8) { actions }.buttonSizing(.flexible)
             }
-            .buttonStyle(.glass)
+            .buttonStyle(.horusGlass)
             .buttonBorderShape(.capsule)
             .frame(maxWidth: .infinity, alignment: .trailing)
         }
@@ -1165,10 +1171,7 @@ struct FrontendWidgetView: View {
                     )
                     .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            #if os(iOS)
-            .sensoryFeedback(.impact(weight: .light), trigger: showsDetail) { _, shown in shown }
-            #endif
+            .buttonStyle(.horusPlain)
             .accessibilityLabel(accessibilityTitle)
             .popover(isPresented: $showsDetail) {
                 WidgetContentPopover(content: content, isPresented: $showsDetail)
@@ -1182,8 +1185,8 @@ struct FrontendWidgetView: View {
                     )
                     .contentShape(Rectangle())
             }
-                .buttonStyle(.plain)
-                .accessibilityLabel(accessibilityTitle)
+            .buttonStyle(.horusPlain)
+            .accessibilityLabel(accessibilityTitle)
         } else {
             badge
                 .frame(minHeight: HorusStyle.iconButtonSize)
@@ -1246,7 +1249,7 @@ struct FrontendWidgetContentView: View {
                 Button { select(option) } label: {
                     FrontendPickerOptionLabel(option: option)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.horusPlain)
                 .accessibilityLabel(option.label)
                 .accessibilityValue(option.detail)
                 .accessibilityHint(option.description)
@@ -1318,7 +1321,7 @@ private struct FrontendActionListRow: View {
                         )
                         .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.horusPlain)
                     .accessibilityLabel(action.label)
                     .help(action.label)
                 }
@@ -1484,7 +1487,7 @@ private struct FrontendPickerView: View {
                             )
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.horusPlain)
                     .accessibilityLabel("Dismiss \(picker.title)")
                     .help("Dismiss")
                 }
@@ -1492,7 +1495,7 @@ private struct FrontendPickerView: View {
                     Button { model.submitPickerOption(option) } label: {
                         FrontendPickerOptionLabel(option: option)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.horusPlain)
                     .accessibilityLabel(option.label)
                     .accessibilityValue(option.detail)
                     .accessibilityHint(option.description)

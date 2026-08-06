@@ -310,7 +310,7 @@ private struct AppToastView: View {
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                     .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.horusPlain)
             .accessibilityLabel("Dismiss notification")
         }
         .padding(.leading, 16)
@@ -372,7 +372,7 @@ private struct WorkspaceBrowserView: View {
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .contentShape(Rectangle())
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.horusPlain)
                             .listRowSeparator(.hidden)
                         }
                         if listing.entries.isEmpty && !model.isLoadingDirectories {
@@ -522,6 +522,7 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
 
     @Environment(\.horusPalette) private var palette
     @GestureState private var drag: CGFloat = 0
+    @State private var drawerFeedback = false
 
     var body: some View {
         ZStack(alignment: .leading) {
@@ -554,9 +555,9 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
                 .mask { pageShape.ignoresSafeArea() }
                 .overlay { pageEdge }
                 .offset(x: offset)
-                .gesture(swipe)
+                .simultaneousGesture(swipe)
         }
-        .sensoryFeedback(.impact(weight: .light), trigger: isOpen)
+        .sensoryFeedback(.impact(weight: .light), trigger: drawerFeedback)
     }
 
     /// The display's shape, drawn in the display's own curve family rather than a plain rounded
@@ -642,6 +643,8 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
     }
 
     private func setOpen(_ open: Bool) {
+        guard isOpen != open else { return }
+        drawerFeedback.toggle()
         withAnimation(SidebarDrawerMetrics.animation) { isOpen = open }
     }
 }
@@ -688,7 +691,7 @@ struct SidebarView: View {
                             .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.horusPlain)
                     .accessibilityLabel("Gateway connection")
                     .accessibilityValue(model.connectionState.label)
                     .help("Gateway: \(model.connectionState.label)")
@@ -847,7 +850,7 @@ struct SidebarView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.horusPlain)
         .padding(.horizontal, 4)
         .frame(minHeight: HorusStyle.iconButtonSize)
     }
@@ -870,7 +873,7 @@ struct SidebarView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.horusPlain)
         .padding(.horizontal, 4)
         .frame(minHeight: HorusStyle.iconButtonSize)
     }
@@ -936,7 +939,7 @@ struct SidebarView: View {
                     )
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.horusPlain)
                 .accessibilityValue(
                     collapsedWorkspaces.contains(group.id) ? "Collapsed" : "Expanded"
                 )
@@ -956,7 +959,7 @@ struct SidebarView: View {
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.horusPlain)
                 .disabled(!model.canCreateSession)
                 .help("New chat in \(group.path)")
             }
@@ -1001,7 +1004,7 @@ struct SidebarView: View {
                 .frame(minHeight: HorusStyle.iconButtonSize)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.horusPlain)
             .disabled(!model.canOpenSession && session.sessionId != model.selectedSessionID)
             .accessibilityValue(activityValue)
             .accessibilityAddTraits(isSelected ? .isSelected : [])
@@ -1052,7 +1055,7 @@ struct SidebarView: View {
                 #endif
             }
             .labelStyle(.titleAndIcon)
-            .buttonStyle(.plain)
+            .buttonStyle(.horusPlain)
             .tint(.primary)
             .menuIndicator(.hidden)
             .accessibilityLabel("Chat actions")

@@ -157,7 +157,7 @@ struct AgentSettingsView: View {
                         .foregroundStyle(palette.accent)
                     }
                     .menuIndicator(.hidden)
-                    .buttonStyle(.plain)
+                    .buttonStyle(.horusPlain)
                     .accessibilityLabel(setting.label)
                     .accessibilityValue(selectedLabel)
                 } label: {
@@ -623,7 +623,7 @@ private struct CronRunRow: View {
                         model.openSession(sessionID)
                         model.destination = .chat
                     }
-                    .buttonStyle(.glass)
+                    .buttonStyle(.horusGlass)
                     .buttonBorderShape(.capsule)
                     .padding(.top, 2)
                 }
@@ -1077,7 +1077,7 @@ private struct StatusBanner: View {
             Spacer()
             if let action {
                 Button(action.0, action: action.1)
-                    .buttonStyle(.glass)
+                    .buttonStyle(.horusGlass)
                     .buttonBorderShape(.capsule)
             }
         }
