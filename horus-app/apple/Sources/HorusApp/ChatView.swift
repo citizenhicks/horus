@@ -38,7 +38,7 @@ struct ChatView: View {
                 .zIndex(2)
             }
         }
-        .navigationTitle(model.transcript.isEmpty ? "Hello" : model.currentSessionTitle)
+        .navigationTitle(model.displayedTranscript.isEmpty ? "Hello" : model.currentSessionTitle)
         #if os(iOS)
         .toolbarTitleDisplayMode(.inline)
         #endif
@@ -163,8 +163,9 @@ private struct TranscriptView: View {
         .scrollPosition($position)
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
         .scrollIndicators(.hidden)
+        .scrollDismissesKeyboard(.interactively)
         .overlay {
-            if model.transcript.isEmpty { emptyState }
+            if model.displayedTranscript.isEmpty { emptyState }
         }
         // Measured against the furthest reachable offset, including the bottom inset:
         // comparing the visible rect to the content height never reads as "at bottom".
@@ -181,7 +182,7 @@ private struct TranscriptView: View {
         // Streaming deltas land several times per frame, which is more often than `onChange` may
         // fire. Growing content is what `defaultScrollAnchor(.bottom, for: .sizeChanges)` follows,
         // so only a new row needs an explicit scroll.
-        .onChange(of: model.transcript.count) { followTranscript() }
+        .onChange(of: model.displayedTranscript.count) { followTranscript() }
         .task(id: model.selectedSessionID) { await openAtLatest() }
     }
 
@@ -205,7 +206,7 @@ private struct TranscriptView: View {
     // transcript, which can shrink between layout passes.
     private var rows: [TranscriptRowLayout] {
         var previousGroup: String?
-        return model.transcript.enumerated().map { index, entry in
+        return model.displayedTranscript.enumerated().map { index, entry in
             let joinsPrevious = index > 0 && entry.group != nil && entry.group == previousGroup
             previousGroup = entry.group
             return TranscriptRowLayout(
@@ -844,8 +845,16 @@ private struct ComposerActivityView: View {
                         .padding(.horizontal, 11)
                         .frame(height: HorusStyle.badgeHeight)
                         .horusGlass(in: Capsule(), interactive: true)
+                        .frame(
+                            minWidth: HorusStyle.iconButtonSize,
+                            minHeight: HorusStyle.iconButtonSize
+                        )
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    #if os(iOS)
+                    .sensoryFeedback(.impact(weight: .light), trigger: model.showsInspector) { _, shown in shown }
+                    #endif
                     .accessibilityLabel("Code changes")
                     .accessibilityValue("\(totals.added) additions, \(totals.removed) deletions")
                     .accessibilityHint("Opens the latest code diff")
@@ -862,29 +871,37 @@ private struct ComposerActivityView: View {
 
 }
 
-/// Context fill and turn duration in one bubble; cache hit joins them in the popover.
+/// Context fill stays compact in the bubble; cache hit and turn duration live in the popover.
 private struct SessionStatsBadge: View {
     @Environment(AppModel.self) private var model
     @State private var showsDetail = false
 
     var body: some View {
         if model.selectedSessionID != nil {
-            TimelineView(.periodic(from: .now, by: 1)) { timeline in
-                let elapsed = model.sessionElapsed(at: timeline.date)
-                Button { showsDetail = true } label: {
-                    HorusBadge(
-                        text: elapsed >= 1 ? formatDuration(elapsed) : "\(model.contextFillPercent)%",
-                        progress: model.contextFillFraction,
-                        interactive: true
-                    )
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Context and timing")
-                .accessibilityValue("\(model.contextFillPercent) percent context, \(formatDuration(elapsed))")
-                .popover(isPresented: $showsDetail) {
-                    BadgePopover(title: "Session") {
-                        BadgeStat(label: "Context", value: "\(model.contextTokens.formatted()) · \(model.contextFillPercent)%")
-                        BadgeStat(label: "Cache hit", value: cacheHit(model.lastUsage))
+            Button { showsDetail = true } label: {
+                HorusBadge(
+                    text: "\(model.contextFillPercent)%",
+                    progress: model.contextFillFraction,
+                    interactive: true
+                )
+                .frame(
+                    minWidth: HorusStyle.iconButtonSize,
+                    minHeight: HorusStyle.iconButtonSize
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            #if os(iOS)
+            .sensoryFeedback(.impact(weight: .light), trigger: showsDetail) { _, shown in shown }
+            #endif
+            .accessibilityLabel("Context usage")
+            .accessibilityValue("\(model.contextFillPercent) percent")
+            .popover(isPresented: $showsDetail) {
+                BadgePopover(title: "Session") {
+                    BadgeStat(label: "Context", value: "\(model.contextTokens.formatted()) · \(model.contextFillPercent)%")
+                    BadgeStat(label: "Cache hit", value: cacheHit(model.lastUsage))
+                    TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                        let elapsed = model.sessionElapsed(at: timeline.date)
                         BadgeStat(label: "Elapsed", value: formatDuration(elapsed))
                     }
                 }
@@ -946,9 +963,13 @@ private struct ComposerOptionsView: View {
             Section("Reasoning") { reasoningMenuContent }
         } label: {
             HorusMenuLabel(text: modelLabel)
+                .frame(minHeight: HorusStyle.iconButtonSize)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .frame(minHeight: HorusStyle.iconButtonSize)
+        #if os(iOS)
+        .sensoryFeedback(.selection, trigger: model.selectedModelRoute)
+        #endif
         .accessibilityLabel("Model and reasoning")
         .accessibilityValue(modelLabel)
     }
@@ -962,9 +983,13 @@ private struct ComposerOptionsView: View {
             )
                 .labelStyle(.iconOnly)
                 .foregroundStyle(approvalForeground)
+                .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+        #if os(iOS)
+        .sensoryFeedback(.selection, trigger: model.agentDraft?.approval)
+        #endif
         .disabled(model.agentDraft == nil)
         .help(approvalLabel)
         .accessibilityLabel("Approval policy")
@@ -1136,6 +1161,9 @@ struct FrontendWidgetView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            #if os(iOS)
+            .sensoryFeedback(.impact(weight: .light), trigger: showsDetail) { _, shown in shown }
+            #endif
             .accessibilityLabel(accessibilityTitle)
             .popover(isPresented: $showsDetail) {
                 WidgetContentPopover(content: content, isPresented: $showsDetail)

@@ -71,6 +71,9 @@ struct AppShell: View {
                 "\(toast.tone.title): \(toast.message)"
             ).post()
         }
+        #if os(iOS)
+        .sensoryFeedback(.impact(weight: .light), trigger: model.toast?.id) { _, id in id != nil }
+        #endif
         // Only a backgrounded scene loses its socket. `.inactive` covers a window losing focus
         // or a notification banner, and reconnecting on those drops a healthy session.
         .onChange(of: scenePhase) { _, newPhase in

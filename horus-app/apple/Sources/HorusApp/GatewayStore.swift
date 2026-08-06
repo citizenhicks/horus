@@ -1,17 +1,85 @@
 import Foundation
 import Security
 
+struct CachedTranscript: Codable {
+    private struct Entry: Codable {
+        let id: String
+        let text: String
+        let kind: TranscriptEntry.Kind
+        let group: String?
+        let format: String
+        let tone: String
+        let pending: Bool
+        let messageTarget: MessageTarget?
+
+        init(_ entry: TranscriptEntry) {
+            id = entry.id
+            text = entry.text
+            kind = entry.kind
+            group = entry.group
+            format = entry.format
+            tone = entry.tone
+            pending = entry.pending
+            messageTarget = entry.messageTarget
+        }
+
+        var transcriptEntry: TranscriptEntry {
+            TranscriptEntry(
+                id: id,
+                text: text,
+                kind: kind,
+                group: group,
+                format: format,
+                tone: tone,
+                pending: pending,
+                messageTarget: messageTarget
+            )
+        }
+    }
+
+    let replayEpoch: String
+    let sequence: UInt64
+    let currentUsage: TokenUsage
+    let lastUsage: TokenUsage
+    private let entries: [Entry]
+
+    init(
+        replayEpoch: String,
+        sequence: UInt64,
+        transcript: [TranscriptEntry],
+        currentUsage: TokenUsage,
+        lastUsage: TokenUsage
+    ) {
+        self.replayEpoch = replayEpoch
+        self.sequence = sequence
+        self.currentUsage = currentUsage
+        self.lastUsage = lastUsage
+        entries = transcript.map(Entry.init)
+    }
+
+    var transcript: [TranscriptEntry] { entries.map(\.transcriptEntry) }
+}
+
 @MainActor
 final class GatewayStore {
+    private let maximumCachedTranscriptsPerAccount = 20
+    private let maximumCachedTranscriptBytes = 4 * 1024 * 1024
+    private let maximumCachedTranscriptContentBytes = 3 * 1024 * 1024
+    private let maximumCachedTranscriptEntries = 10_000
     private let defaults: UserDefaults
+    private let transcriptDirectory: URL
     private let accountsKey = "paired-gateways"
     private let selectedAccountKey = "selected-gateway"
     private let keychainService = "app.horus.gateway"
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, transcriptDirectory: URL? = nil) {
         self.defaults = defaults
+        self.transcriptDirectory = transcriptDirectory
+            ?? URL.cachesDirectory
+                .appendingPathComponent("Horus", isDirectory: true)
+                .appendingPathComponent("Transcripts", isDirectory: true)
     }
 
     func loadAccounts() -> [GatewayAccount] {
@@ -94,6 +162,71 @@ final class GatewayStore {
         if selectedAccountID() == account.id {
             defaults.removeObject(forKey: selectedAccountKey)
         }
+        try? FileManager.default.removeItem(at: accountTranscriptDirectory(account.id))
+    }
+
+    func loadTranscript(accountID: UUID, sessionID: String) -> CachedTranscript? {
+        let url = transcriptURL(accountID: accountID, sessionID: sessionID)
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attributes[.size] as? NSNumber)?.intValue
+        else { return nil }
+        guard size <= maximumCachedTranscriptBytes,
+              let data = try? Data(contentsOf: url),
+              let cached = try? decoder.decode(CachedTranscript.self, from: data)
+        else {
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        return cached
+    }
+
+    func saveTranscript(
+        accountID: UUID,
+        sessionID: String,
+        replayEpoch: String,
+        sequence: UInt64,
+        transcript: [TranscriptEntry],
+        currentUsage: TokenUsage,
+        lastUsage: TokenUsage
+    ) {
+        guard !transcript.isEmpty else { return }
+        let url = transcriptURL(accountID: accountID, sessionID: sessionID)
+        guard transcriptFitsCache(transcript) else {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        let directory = accountTranscriptDirectory(accountID)
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        guard let data = try? encoder.encode(CachedTranscript(
+            replayEpoch: replayEpoch,
+            sequence: sequence,
+            transcript: transcript,
+            currentUsage: currentUsage,
+            lastUsage: lastUsage
+        )) else { return }
+        guard data.count <= maximumCachedTranscriptBytes else {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        trimTranscriptCache(in: directory, keeping: url)
+        #if os(iOS)
+        let options: Data.WritingOptions = [.atomic, .completeFileProtection]
+        #else
+        let options: Data.WritingOptions = .atomic
+        #endif
+        try? data.write(
+            to: url,
+            options: options
+        )
+    }
+
+    func removeTranscript(accountID: UUID, sessionID: String) {
+        try? FileManager.default.removeItem(
+            at: transcriptURL(accountID: accountID, sessionID: sessionID)
+        )
     }
 
     private func saveToken(_ token: String, accountID: UUID) throws {
@@ -116,6 +249,53 @@ final class GatewayStore {
         let item = query.merging(attributes) { _, new in new }
         let addStatus = SecItemAdd(item as CFDictionary, nil)
         guard addStatus == errSecSuccess else { throw StoreError.keychain(addStatus) }
+    }
+
+    private func accountTranscriptDirectory(_ accountID: UUID) -> URL {
+        transcriptDirectory.appendingPathComponent(accountID.uuidString, isDirectory: true)
+    }
+
+    private func transcriptURL(accountID: UUID, sessionID: String) -> URL {
+        let filename = Data(sessionID.utf8).base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "+", with: "-")
+        return accountTranscriptDirectory(accountID)
+            .appendingPathComponent(filename)
+            .appendingPathExtension("json")
+    }
+
+    private func trimTranscriptCache(in directory: URL, keeping url: URL) {
+        let cached = (try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ))?
+            .filter { $0.pathExtension == "json" && $0 != url }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            ?? []
+        for stale in cached.dropFirst(maximumCachedTranscriptsPerAccount - 1) {
+            try? FileManager.default.removeItem(at: stale)
+        }
+    }
+
+    private func transcriptFitsCache(_ transcript: [TranscriptEntry]) -> Bool {
+        guard transcript.count <= maximumCachedTranscriptEntries else { return false }
+        var remaining = maximumCachedTranscriptContentBytes
+        func consume(_ value: String?) -> Bool {
+            guard let value else { return true }
+            let count = value.utf8.count
+            guard count <= remaining else { return false }
+            remaining -= count
+            return true
+        }
+        for entry in transcript {
+            guard consume(entry.id),
+                  consume(entry.text),
+                  consume(entry.group),
+                  consume(entry.format),
+                  consume(entry.tone)
+            else { return false }
+        }
+        return true
     }
 }
 

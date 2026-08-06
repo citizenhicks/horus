@@ -18,19 +18,16 @@ use horus_gateway::client::{
 };
 use horus_gateway::config::{ConfigStore, state_dir};
 use horus_gateway::wire::{
-    BootstrapPayload, ClientKind, ClientMessage, ReadyPayload, ServerFrame, ServerMessage,
-    SessionReadyPayload,
+    ClientKind, ClientMessage, ReadyPayload, ServerFrame, ServerMessage, SessionReadyPayload,
 };
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 use uuid::Uuid;
 
 const USAGE: &str = "usage: horus [run <task-file> | pair <endpoint> <one-time-code>]";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(40);
 const DEFAULT_LOCAL_ENDPOINT: &str = "tcp://127.0.0.1:8741";
 const STARTUP_RETRY: Duration = Duration::from_millis(50);
-const MAX_BOOTSTRAP_BYTES: usize = 4096;
 const MAX_STARTUP_ERROR_BYTES: u64 = 8192;
 
 #[tokio::main]
@@ -304,7 +301,7 @@ async fn start_local_gateway(endpoint: &Endpoint) -> horus_gateway::Result<Gatew
         if saved_token.is_none() && config.cloudflare.is_none() {
             return Err(missing_local_token(endpoint));
         }
-        let (child, log) = spawn_gateway(&binary, &configured_state_dir, false)?;
+        let (child, log) = spawn_gateway(&binary, &configured_state_dir)?;
         return connect_started_gateway(endpoint, child, log).await;
     }
     if endpoint.to_string() != DEFAULT_LOCAL_ENDPOINT {
@@ -347,38 +344,41 @@ async fn bootstrap_local_gateway(
     binary: &Path,
     state_dir: &Path,
 ) -> horus_gateway::Result<GatewayClient> {
-    let mut accounts = GatewayAccounts::load()?;
-    accounts.prepare()?;
-    let (mut child, log) = spawn_gateway(binary, state_dir, true)?;
-    let pairing_code = read_bootstrap(&mut child, &log).await?;
-    let paired = match tokio::time::timeout(
-        STARTUP_TIMEOUT,
-        GatewayClient::pair(endpoint, pairing_code, "horus-cli", ClientKind::Cli),
-    )
-    .await
-    {
-        Ok(paired) => paired,
-        Err(_) => {
-            stop_child(&mut child).await;
-            return Err(startup_error("gateway pairing timed out", &log));
-        }
+    horus_gateway::command::initialize_quick_cloudflare(state_dir.to_path_buf())?;
+    let started = match spawn_gateway(binary, state_dir) {
+        Ok((child, log)) => connect_started_gateway(endpoint, child, log).await,
+        Err(error) => Err(error),
     };
-    let (client, paired) = match paired {
-        Ok(paired) => paired,
+    match started {
+        Ok(client) => Ok(client),
         Err(error) => {
-            stop_child(&mut child).await;
-            return Err(error);
+            if let Err(cleanup) = cleanup_failed_bootstrap(endpoint, state_dir) {
+                return Err(horus_gateway::Error::Config(format!(
+                    "{error}; failed to clean up incomplete gateway state: {cleanup}"
+                )));
+            }
+            Err(error)
         }
-    };
-    if let Err(error) = accounts
-        .add(endpoint, paired.token)
-        .and_then(|()| accounts.save())
-    {
-        stop_child(&mut child).await;
-        return Err(error);
     }
-    detach_child(child);
-    Ok(client)
+}
+
+fn cleanup_failed_bootstrap(endpoint: &Endpoint, state_dir: &Path) -> horus_gateway::Result<()> {
+    let state = horus_gateway::command::reset_gateway_state(state_dir.to_path_buf());
+    let client = (|| {
+        let mut accounts = GatewayAccounts::load()?;
+        if accounts.token(endpoint).is_some() {
+            accounts.forget(&endpoint.to_string());
+            accounts.save()?;
+        }
+        Ok(())
+    })();
+    match (state, client) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(state), Err(client)) => Err(horus_gateway::Error::Config(format!(
+            "{state}; failed to forget the local gateway credential: {client}"
+        ))),
+    }
 }
 
 fn gateway_binary() -> horus_gateway::Result<PathBuf> {
@@ -419,79 +419,22 @@ fn gateway_binary_beside(current_executable: &Path) -> horus_gateway::Result<Pat
 fn spawn_gateway(
     binary: &Path,
     state_dir: &Path,
-    bootstrap: bool,
 ) -> horus_gateway::Result<(Child, tempfile::NamedTempFile)> {
     let log = tempfile::NamedTempFile::new()?;
     #[cfg(unix)]
     log.as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let mut command = Command::new(binary);
-    if bootstrap {
-        command.arg("bootstrap").stdout(Stdio::piped());
-    } else {
-        command.arg("serve").stdout(Stdio::null());
-    }
     command
+        .arg("serve")
         .arg("--state-dir")
         .arg(state_dir)
         .stdin(Stdio::null())
+        .stdout(Stdio::null())
         .stderr(Stdio::from(log.reopen()?));
     #[cfg(unix)]
     command.as_std_mut().process_group(0);
     Ok((command.spawn()?, log))
-}
-
-async fn read_bootstrap(
-    child: &mut Child,
-    log: &tempfile::NamedTempFile,
-) -> horus_gateway::Result<String> {
-    let stdout = child.stdout.take().ok_or_else(|| {
-        horus_gateway::Error::Config("horus-gateway bootstrap output is unavailable".into())
-    })?;
-    let mut reader = BufReader::new(stdout).take((MAX_BOOTSTRAP_BYTES + 1) as u64);
-    let mut output = Vec::new();
-    let read =
-        match tokio::time::timeout(STARTUP_TIMEOUT, reader.read_until(b'\n', &mut output)).await {
-            Ok(Ok(read)) => read,
-            Ok(Err(error)) => {
-                stop_child(child).await;
-                return Err(error.into());
-            }
-            Err(_) => {
-                stop_child(child).await;
-                return Err(startup_error("horus-gateway bootstrap timed out", log));
-            }
-        };
-    if read == 0 {
-        let status = child.wait().await?;
-        return Err(startup_error(
-            format!("horus-gateway exited during bootstrap with {status}"),
-            log,
-        ));
-    }
-    if output.len() > MAX_BOOTSTRAP_BYTES || !output.ends_with(b"\n") {
-        stop_child(child).await;
-        return Err(horus_gateway::Error::Protocol(
-            "horus-gateway returned invalid bootstrap output".into(),
-        ));
-    }
-    let payload = match serde_json::from_slice::<BootstrapPayload>(&output) {
-        Ok(payload) => payload,
-        Err(error) => {
-            stop_child(child).await;
-            return Err(error.into());
-        }
-    };
-    if payload.pairing_code.trim() != payload.pairing_code
-        || payload.pairing_code.is_empty()
-        || payload.pairing_code.len() > 512
-    {
-        stop_child(child).await;
-        return Err(horus_gateway::Error::Protocol(
-            "horus-gateway returned an invalid one-time code".into(),
-        ));
-    }
-    Ok(payload.pairing_code)
 }
 
 async fn connect_started_gateway(
@@ -516,7 +459,10 @@ async fn connect_started_gateway(
             if tokio::time::Instant::now() >= deadline {
                 stop_child(&mut child).await;
                 return Err(startup_error(
-                    "horus-gateway did not provision its local client within 10 seconds",
+                    format!(
+                        "horus-gateway did not provision its local client within {} seconds",
+                        STARTUP_TIMEOUT.as_secs()
+                    ),
                     &log,
                 ));
             }
@@ -549,7 +495,10 @@ async fn connect_started_gateway(
                 format!("horus-gateway exited during startup with {status}")
             } else {
                 stop_child(&mut child).await;
-                "horus-gateway did not start within 10 seconds".into()
+                format!(
+                    "horus-gateway did not start within {} seconds",
+                    STARTUP_TIMEOUT.as_secs()
+                )
             };
             return Err(startup_error(message, &log));
         }
@@ -614,6 +563,7 @@ async fn open_session(
             request_id: request_id.clone(),
             session_id,
             last_sequence: None,
+            replay_epoch: None,
         })
         .await
         .map_err(gateway_error)?;
@@ -764,6 +714,24 @@ mod tests {
         let error = startup_error("gateway exited", &log);
 
         assert!(error.to_string().contains("Bubblewrap is unavailable"));
+    }
+
+    #[test]
+    fn first_run_initialization_enables_quick_cloudflare_and_loopback() {
+        let directory = tempfile::tempdir().expect("gateway state parent");
+        let state = directory.path().join("gateway");
+
+        horus_gateway::command::initialize_quick_cloudflare(state.clone())
+            .expect("initialize first-run gateway");
+        let (_, config) = ConfigStore::open(state).expect("open gateway config");
+
+        assert_eq!(
+            (config.cloudflare, config.listen),
+            (
+                Some(horus_gateway::config::CloudflareConfig::Quick),
+                "127.0.0.1:8741".parse().expect("loopback listener")
+            )
+        );
     }
 
     #[test]

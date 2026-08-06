@@ -2,14 +2,16 @@ import SwiftUI
 
 enum HorusStyle {
     #if os(iOS)
-    static let bodyFont: Font = .subheadline
-    static let controlFont: Font = .subheadline.weight(.medium)
+    static let bodyFont: Font = .body
+    static let controlFont: Font = .body.weight(.medium)
+    static let metadataFont: Font = .footnote.monospaced()
+    static let badgeFont: Font = .footnote.weight(.medium)
     #else
     static let bodyFont: Font = .system(size: 14)
     static let controlFont: Font = .system(size: 14, weight: .medium)
-    #endif
     static let metadataFont: Font = .caption.monospaced()
     static let badgeFont: Font = .caption.weight(.medium)
+    #endif
     static let cardRadius: CGFloat = 22
     static let controlRadius: CGFloat = 9
     static let cardShape = RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
@@ -142,7 +144,7 @@ enum HorusSymbol {
         case "magnifying-glass": "magnifyingglass"
         case "moon": "moon"
         case "path": "point.3.connected.trianglepath.dotted"
-        case "robot": "person.3.fill"
+        case "robot": "person.fill"
         case "sparkle": "sparkles"
         default: "questionmark.square.dashed"
         }
@@ -334,6 +336,9 @@ struct HorusIconButtonStyle: ButtonStyle {
                 .contentShape(Circle())
                 .horusGlass(in: Circle(), interactive: true, prominent: prominent)
                 .opacity(isPressed ? 0.72 : 1)
+                #if os(iOS)
+                .sensoryFeedback(.impact(weight: .light), trigger: isPressed) { _, pressed in pressed }
+                #endif
         }
     }
 }
@@ -353,17 +358,15 @@ extension View {
     func horusProminentButton() -> some View { modifier(HorusProminentButton()) }
 
     /// Lets a row of badges scroll instead of squeezing when it outgrows the width.
-    /// A centred scroll anchor re-resolves a frame late, so a row that changes width mid-turn
-    /// visibly snaps from leading to centre. Only reach for the scroll view when it overflows.
     func scrollableRow() -> some View {
-        ViewThatFits(in: .horizontal) {
-            frame(maxWidth: .infinity)
-            ScrollView(.horizontal) {
-                fixedSize(horizontal: true, vertical: false)
-            }
-            .scrollIndicators(.hidden)
-            .scrollBounceBehavior(.basedOnSize)
+        ScrollView(.horizontal) {
+            fixedSize(horizontal: true, vertical: false)
         }
+        // ponytail: centering can snap as badges arrive; keep one render until native overflow
+        // alignment can preserve state without duplicating the controls.
+        .defaultScrollAnchor(.center, for: .alignment)
+        .scrollIndicators(.hidden)
+        .scrollBounceBehavior(.basedOnSize)
     }
 
     func horusGlass<S: Shape>(

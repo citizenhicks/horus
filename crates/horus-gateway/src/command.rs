@@ -5,7 +5,8 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 #[cfg(unix)]
 use std::io::IsTerminal as _;
-use std::io::Write as _;
+#[cfg(any(unix, test))]
+use std::io::Write;
 #[cfg(any(unix, test))]
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::net::SocketAddr;
@@ -36,7 +37,7 @@ use crate::config::{
     state_dir,
 };
 use crate::server::GatewayServer;
-use crate::wire::{BootstrapPayload, ClientKind, ClientMessage, ServerMessage};
+use crate::wire::{ClientKind, ClientMessage, ServerMessage};
 use crate::{Error, Result};
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
@@ -56,7 +57,6 @@ pub const USAGE: &str = "usage: horus-gateway [--state-dir PATH]\n       \
                      horus-gateway init [--state-dir PATH] [--listen ADDR] \
                      [--tls-cert PATH --tls-key PATH] \
                      [--cloudflare-hostname HOST --cloudflare-token-file PATH]\n       \
-                     horus-gateway bootstrap [--state-dir PATH] [--listen ADDR]\n       \
                      horus-gateway connect [--state-dir PATH] [--endpoint ENDPOINT]\n       \
                      horus-gateway serve [--state-dir PATH] [--background]\n       \
                      horus-gateway exit [--state-dir PATH]";
@@ -85,7 +85,6 @@ const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Debug)]
 enum Command {
     Init(InitOptions),
-    Bootstrap(InitOptions),
     Connect(ConnectOptions),
     Serve {
         state_dir: PathBuf,
@@ -168,7 +167,6 @@ pub async fn run(
     }
     match parse(arguments)? {
         Command::Init(options) => initialize(options),
-        Command::Bootstrap(options) => bootstrap(options).await,
         Command::Connect(options) => connect(options, load_local_client).await,
         Command::Serve {
             state_dir,
@@ -185,26 +183,6 @@ pub async fn run(
     }
 }
 
-async fn bootstrap(options: InitOptions) -> Result<()> {
-    if options.tls.is_some() || options.cloudflare.is_some() || !options.listen.ip().is_loopback() {
-        return Err(Error::Config(
-            "automatic bootstrap supports only the local plaintext gateway".into(),
-        ));
-    }
-    let state_dir = options.state_dir.clone();
-    let (server, grant) = GatewayServer::bootstrap(options.state_dir, options.listen).await?;
-    let _process_record = ProcessRecordGuard::create(&state_dir, None)?;
-    serde_json::to_writer(
-        std::io::stdout().lock(),
-        &BootstrapPayload {
-            pairing_code: grant.code,
-        },
-    )?;
-    println!();
-    std::io::stdout().flush()?;
-    server.serve().await
-}
-
 fn initialize(options: InitOptions) -> Result<()> {
     let (store, config) = match options.cloudflare {
         Some(CloudflareInit::Quick) => {
@@ -217,6 +195,9 @@ fn initialize(options: InitOptions) -> Result<()> {
                 &hostname,
                 &token,
             )?
+        }
+        None if options.tls.is_none() => {
+            ConfigStore::initialize_quick_cloudflare(options.state_dir, options.listen)?
         }
         None => ConfigStore::initialize(options.state_dir, options.listen, options.tls)?,
     };
@@ -247,9 +228,13 @@ fn provision_cloudflare_local_client(
     if config.cloudflare.is_none() {
         return Ok(None);
     }
-    let endpoint = format!("tcp://{}", config.listen).parse()?;
+    let endpoint = loopback_endpoint(config)?;
     let issued = auth.provision_local_client()?;
     Ok(Some((endpoint, issued.token)))
+}
+
+fn loopback_endpoint(config: &GatewayConfig) -> Result<Endpoint> {
+    format!("tcp://{}", config.listen).parse()
 }
 
 /// Initializes one gateway with an account-free Cloudflare Quick Tunnel.
@@ -353,8 +338,12 @@ async fn connect(
             )
         })?;
         drop(startup);
-        let code = request_running_pairing_code(client_endpoint, token).await?;
-        print_connection(&pairing_endpoint, &code)?;
+        let code = request_running_pairing_code(&client_endpoint, &token).await?;
+        print_connection(
+            &pairing_endpoint,
+            config.cloudflare.is_some().then_some(&client_endpoint),
+            &code,
+        )?;
         println!("gateway remains running");
         return Ok(());
     }
@@ -407,7 +396,12 @@ async fn connect(
             config.listen,
         );
     }
-    if let Err(error) = print_connection(&endpoint, &grant.code) {
+    let local_endpoint = config
+        .cloudflare
+        .as_ref()
+        .map(|_| loopback_endpoint(&config))
+        .transpose()?;
+    if let Err(error) = print_connection(&endpoint, local_endpoint.as_ref(), &grant.code) {
         return stop_connect_gateway(&store, pid, &grant.code, error.into());
     }
     println!("waiting for a client…");
@@ -495,7 +489,7 @@ fn running_connection_endpoints(
         .or(configured_endpoint)
         .ok_or_else(|| Error::Config("gateway did not publish its runtime endpoint".into()))?;
     let client_endpoint = if config.cloudflare.is_some() {
-        format!("tcp://{}", config.listen).parse()?
+        loopback_endpoint(config)?
     } else {
         pairing_endpoint.clone()
     };
@@ -503,9 +497,9 @@ fn running_connection_endpoints(
 }
 
 #[cfg(unix)]
-async fn request_running_pairing_code(client_endpoint: Endpoint, token: String) -> Result<String> {
+async fn request_running_pairing_code(client_endpoint: &Endpoint, token: &str) -> Result<String> {
     let client =
-        GatewayClient::connect(&client_endpoint, token, ClientKind::GatewayDashboard).await?;
+        GatewayClient::connect(client_endpoint, token, ClientKind::GatewayDashboard).await?;
     let (sender, mut events) = client.into_parts();
     let request_id = Uuid::new_v4().to_string();
     sender
@@ -616,11 +610,30 @@ fn cleanup_connect(store: &ConfigStore, pid: u32, code: &str) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn print_connection(endpoint: &Endpoint, code: &str) -> std::io::Result<()> {
+fn print_connection(
+    endpoint: &Endpoint,
+    local_endpoint: Option<&Endpoint>,
+    code: &str,
+) -> std::io::Result<()> {
     let stdout = std::io::stdout();
     let show_qr = stdout.is_terminal() && !endpoint.is_plaintext();
-    let mut output = stdout.lock();
-    writeln!(output, "endpoint: {endpoint}")?;
+    write_connection(stdout.lock(), endpoint, local_endpoint, code, show_qr)
+}
+
+#[cfg(any(unix, test))]
+fn write_connection(
+    mut output: impl Write,
+    endpoint: &Endpoint,
+    local_endpoint: Option<&Endpoint>,
+    code: &str,
+    show_qr: bool,
+) -> std::io::Result<()> {
+    if let Some(local_endpoint) = local_endpoint {
+        writeln!(output, "public endpoint: {endpoint}")?;
+        writeln!(output, "local endpoint: {local_endpoint}")?;
+    } else {
+        writeln!(output, "endpoint: {endpoint}")?;
+    }
     writeln!(output, "one-time code: {code}")?;
     writeln!(
         output,
@@ -636,6 +649,9 @@ fn print_connection(endpoint: &Endpoint, code: &str) -> std::io::Result<()> {
         }
     }
     writeln!(output, "another terminal: horus pair {endpoint} {code}")?;
+    if let Some(local_endpoint) = local_endpoint {
+        writeln!(output, "local terminal: horus pair {local_endpoint} {code}")?;
+    }
     output.flush()
 }
 
@@ -874,6 +890,7 @@ fn print_listener(config: &GatewayConfig, runtime_endpoint: Option<&Endpoint>) {
         } else {
             println!("public endpoint: assigned when the gateway starts");
         }
+        println!("local endpoint: tcp://{}", config.listen);
         println!("tunnel origin: http://{}", config.listen);
         return;
     }
@@ -1097,8 +1114,6 @@ fn parse(arguments: Vec<OsString>) -> Result<Command> {
     };
     if command == "init" {
         parse_init(arguments.collect()).map(Command::Init)
-    } else if command == "bootstrap" {
-        parse_init(arguments.collect()).map(Command::Bootstrap)
     } else if command == "connect" {
         parse_connect(arguments.collect()).map(Command::Connect)
     } else if command == "serve" {
@@ -1343,6 +1358,26 @@ mod tests {
     }
 
     #[test]
+    fn default_initialization_enables_quick_cloudflare_and_loopback() {
+        let directory = tempfile::tempdir().expect("gateway state parent");
+        let state = directory.path().join("gateway");
+
+        initialize(InitOptions {
+            state_dir: state.clone(),
+            listen: DEFAULT_LISTEN,
+            tls: None,
+            cloudflare: None,
+        })
+        .expect("initialize gateway");
+        let (_, config) = ConfigStore::open(state).expect("open gateway config");
+
+        assert_eq!(
+            (config.cloudflare, config.listen),
+            (Some(CloudflareConfig::Quick), DEFAULT_LISTEN)
+        );
+    }
+
+    #[test]
     fn cloudflare_local_client_uses_the_authenticated_loopback_endpoint() {
         let directory = tempfile::tempdir().expect("gateway state");
         let path = directory.path().join("auth.json");
@@ -1380,6 +1415,33 @@ mod tests {
             !pairing_setup_qr(&endpoint, "one-time-code")
                 .expect("pairing QR")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn cloudflare_connection_advertises_public_and_local_endpoints_with_one_code() {
+        let public_endpoint = "wss://horus.example.com".parse().expect("WSS endpoint");
+        let local_endpoint = "tcp://127.0.0.1:8741".parse().expect("TCP endpoint");
+        let mut output = Vec::new();
+
+        write_connection(
+            &mut output,
+            &public_endpoint,
+            Some(&local_endpoint),
+            "one-time-code",
+            false,
+        )
+        .expect("write connection");
+
+        assert_eq!(
+            String::from_utf8(output).expect("UTF-8 output"),
+            "public endpoint: wss://horus.example.com\n\
+             local endpoint: tcp://127.0.0.1:8741\n\
+             one-time code: one-time-code\n\
+             setup code: horus-pair:v1|wss://horus.example.com|one-time-code\n\
+             copy the setup code into Horus\n\
+             another terminal: horus pair wss://horus.example.com one-time-code\n\
+             local terminal: horus pair tcp://127.0.0.1:8741 one-time-code\n"
         );
     }
 
@@ -1496,25 +1558,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_bootstrap_uses_machine_state_without_a_workspace() {
-        let command = parse(vec![
-            "bootstrap".into(),
-            "--state-dir".into(),
-            "/tmp/horus".into(),
-        ])
-        .expect("parse bootstrap");
-
-        assert!(matches!(
-            command,
-            Command::Bootstrap(InitOptions { state_dir, listen, tls, cloudflare })
-                if state_dir == std::path::Path::new("/tmp/horus")
-                    && listen == DEFAULT_LISTEN
-                    && tls.is_none()
-                    && cloudflare.is_none()
-        ));
-    }
-
-    #[test]
     fn parse_init_uses_machine_state_without_a_workspace() {
         let command = parse(vec![
             "init".into(),
@@ -1557,17 +1600,15 @@ mod tests {
     }
 
     #[test]
-    fn init_and_bootstrap_reject_the_removed_workspace_flag() {
-        for command in ["init", "bootstrap"] {
-            let error = parse(vec![
-                command.into(),
-                "--workspace".into(),
-                "/tmp/workspace".into(),
-            ])
-            .expect_err("workspace flag must be rejected");
+    fn init_rejects_the_removed_workspace_flag() {
+        let error = parse(vec![
+            "init".into(),
+            "--workspace".into(),
+            "/tmp/workspace".into(),
+        ])
+        .expect_err("workspace flag must be rejected");
 
-            assert!(error.to_string().contains("usage:"));
-        }
+        assert!(error.to_string().contains("usage:"));
     }
 
     #[test]
@@ -1675,7 +1716,7 @@ mod tests {
                 .await
                 .expect("pair first client");
 
-        let code = request_running_pairing_code(endpoint.clone(), identity.token)
+        let code = request_running_pairing_code(&endpoint, &identity.token)
             .await
             .expect("request another code");
         let (_second, _) = GatewayClient::pair(&endpoint, code, "second", ClientKind::Ios)

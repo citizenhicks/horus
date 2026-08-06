@@ -19,18 +19,7 @@ cargo install --locked horus-cli
 
 The separately versioned `horus-gateway` crate is the runtime library used by those binaries.
 
-Initialize and pair a local-only gateway:
-
-```sh
-horus-gateway init --listen 127.0.0.1:8741
-horus-gateway connect
-```
-
-`connect` starts the gateway, prints its client endpoint and a ten-minute,
-one-use code, then waits. Enter both values in a client. Once a client pairs,
-the command returns and the gateway keeps running in the background.
-
-For remote Apple clients without a separate VPN app, run:
+Initialize and pair the default gateway:
 
 ```sh
 horus-gateway init
@@ -38,9 +27,13 @@ horus-gateway init
 
 **Quick Connect** is selected by default. It starts an account-free Cloudflare
 Quick Tunnel, captures its temporary `trycloudflare.com` address, and displays
-the `wss://` endpoint and one-time pairing code. No Cloudflare account, domain,
-route, or connector token is required. The address changes whenever the gateway
-restarts, so use the advanced stable-hostname option for a durable endpoint.
+both the public `wss://` endpoint and local `tcp://127.0.0.1:8741` endpoint with
+one ten-minute, one-use pairing code. No Cloudflare account, domain, route, or
+connector token is required. The address changes whenever the gateway restarts,
+so use the advanced stable-hostname option for a durable endpoint. Once a client
+pairs through either endpoint, `connect` returns and the gateway keeps running in
+the background. Run `horus-gateway connect` later to advertise a fresh code while
+the gateway remains running.
 
 For that advanced option, enter the intended hostname and connector token.
 Horus starts the connector first and waits for pairing; you can then publish the

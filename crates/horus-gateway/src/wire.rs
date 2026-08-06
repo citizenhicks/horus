@@ -22,7 +22,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use crate::{Error, Result};
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
@@ -104,6 +104,7 @@ pub enum ClientMessage {
         request_id: String,
         session_id: String,
         last_sequence: Option<u64>,
+        replay_epoch: Option<String>,
     },
     RenameSession {
         request_id: String,
@@ -256,6 +257,10 @@ pub enum ServerMessage {
         request_id: String,
         payload: SessionReadyPayload,
     },
+    SessionReplayComplete {
+        request_id: String,
+        session_id: String,
+    },
     SessionChanged {
         payload: SessionReadyPayload,
     },
@@ -348,13 +353,6 @@ pub enum ServerMessage {
     },
 }
 
-/// Private startup payload emitted to a newly spawned local CLI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BootstrapPayload {
-    pub pairing_code: String,
-}
-
 /// Gateway-wide frontend-safe state sent after authentication.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReadyPayload {
@@ -369,6 +367,7 @@ pub struct ReadyPayload {
 /// Frontend-safe state for one opened session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionReadyPayload {
+    pub replay_epoch: String,
     pub latest_sequence: u64,
     pub workspace: WorkspaceInfo,
     pub git: Option<GitStatus>,
@@ -971,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v8_rejects_an_untargeted_legacy_capability_shape() {
+    fn protocol_v9_rejects_an_untargeted_legacy_capability_shape() {
         let frame = serde_json::json!({
             "version": PROTOCOL_VERSION,
             "type": "submit",
@@ -988,7 +987,7 @@ mod tests {
         });
 
         let error = serde_json::from_value::<ClientFrame>(frame)
-            .expect_err("v8 capability commands require an explicit target field");
+            .expect_err("v9 capability commands require an explicit target field");
 
         assert!(error.to_string().contains("missing field `target`"));
     }
@@ -1053,11 +1052,13 @@ mod tests {
             request_id: "request-open".into(),
             session_id: "session-a".into(),
             last_sequence: Some(7),
+            replay_epoch: Some("epoch-a".into()),
         });
 
         let encoded = serde_json::to_value(frame).expect("encode session open");
 
         assert_eq!(encoded["last_sequence"], 7);
+        assert_eq!(encoded["replay_epoch"], "epoch-a");
     }
 
     #[test]
@@ -1317,6 +1318,7 @@ mod tests {
             "type": "session_opened",
             "request_id": "request-open",
             "payload": {
+                "replay_epoch": "epoch-a",
                 "latest_sequence": 4,
                 "workspace": { "id": "workspace-a", "path": "/workspace" },
                 "git": null,
@@ -1397,6 +1399,20 @@ mod tests {
             ),
             ("request-open", "session-a", true)
         );
+    }
+
+    #[test]
+    fn replay_completion_is_correlated_to_the_open_request() {
+        let frame = ServerFrame::new(ServerMessage::SessionReplayComplete {
+            request_id: "request-open".into(),
+            session_id: "session-a".into(),
+        });
+
+        let encoded = serde_json::to_value(frame).expect("encode replay completion");
+
+        assert_eq!(encoded["type"], "session_replay_complete");
+        assert_eq!(encoded["request_id"], "request-open");
+        assert_eq!(encoded["session_id"], "session-a");
     }
 
     #[tokio::test]

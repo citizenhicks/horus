@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 8
+let gatewayProtocolVersion = 9
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 
@@ -372,7 +372,12 @@ enum GatewayRequest: Encodable, Sendable {
     case unpairClient(requestID: String, clientID: String)
     case listSessions(requestID: String)
     case createSession(requestID: String, workspace: String)
-    case openSession(requestID: String, sessionID: String, lastSequence: UInt64?)
+    case openSession(
+        requestID: String,
+        sessionID: String,
+        lastSequence: UInt64?,
+        replayEpoch: String?
+    )
     case renameSession(requestID: String, sessionID: String, title: String)
     case setSessionPinned(requestID: String, sessionID: String, pinned: Bool)
     case deleteSession(requestID: String, sessionID: String)
@@ -437,11 +442,12 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode("create_session", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(workspace, forKey: "workspace")
-        case .openSession(let requestID, let sessionID, let lastSequence):
+        case .openSession(let requestID, let sessionID, let lastSequence, let replayEpoch):
             try container.encode("open_session", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
             try container.encode(lastSequence, forKey: "lastSequence")
+            try container.encode(replayEpoch, forKey: "replayEpoch")
         case .renameSession(let requestID, let sessionID, let title):
             try container.encode("rename_session", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -553,6 +559,7 @@ enum GatewayEnvelope: Decodable, Sendable {
     case authenticated
     case ready(ReadyPayload)
     case sessionOpened(requestID: String, payload: SessionReadyPayload)
+    case sessionReplayComplete(requestID: String, sessionID: String)
     case sessionChanged(SessionReadyPayload)
     case gatewayConfigured(requestID: String, payload: ReadyPayload)
     case accepted(requestID: String)
@@ -606,6 +613,11 @@ enum GatewayEnvelope: Decodable, Sendable {
             self = .sessionOpened(
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 payload: try container.decode(SessionReadyPayload.self, forKey: "payload")
+            )
+        case "session_replay_complete":
+            self = .sessionReplayComplete(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId")
             )
         case "session_changed":
             self = .sessionChanged(
@@ -731,6 +743,7 @@ struct ReadyPayload: Decodable, Sendable {
 }
 
 struct SessionReadyPayload: Decodable, Sendable {
+    let replayEpoch: String
     let latestSequence: UInt64
     let workspace: WorkspaceInfo
     let git: GitStatus?

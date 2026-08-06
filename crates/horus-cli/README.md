@@ -33,7 +33,10 @@ horus
 ```
 
 With no explicit gateway endpoint or token, the first run initializes the machine-wide default
-loopback gateway, pairs the CLI, saves its token, and starts `horus-gateway` in the background.
+gateway with both a loopback listener and Cloudflare Quick Tunnel, provisions the CLI's local
+credential, and starts `horus-gateway` in the background. A later `horus-gateway connect`
+advertises the local TCP and public WSS endpoints with one pairing code that works through either
+endpoint.
 If no model provider is configured, the same three-page `/login` flow opens immediately. The
 first configured model becomes the gateway default for new chats.
 Each run creates a chat scoped to the current directory; `/workspace <gateway-path>` creates and

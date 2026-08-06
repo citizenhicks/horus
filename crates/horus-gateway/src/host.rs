@@ -110,6 +110,7 @@ struct HostState {
     suppress_history_broadcast: bool,
     pending_startup: Vec<ServerFrame>,
     active_cron: Option<ActiveCron>,
+    replay_epoch: String,
     sequence: u64,
     replay: VecDeque<ServerFrame>,
     artifacts: VecDeque<ArtifactRecord>,
@@ -140,6 +141,7 @@ struct ActiveCron {
 enum HostCommand {
     Snapshot {
         last_sequence: Option<u64>,
+        replay_epoch: Option<String>,
         reply: oneshot::Sender<std::result::Result<HostSnapshot, Rejection>>,
     },
     RenameSession {
@@ -585,6 +587,7 @@ impl HostHandle {
             suppress_history_broadcast: false,
             pending_startup: Vec::new(),
             active_cron: None,
+            replay_epoch: Uuid::new_v4().to_string(),
             sequence: 0,
             replay: VecDeque::with_capacity(REPLAY_CAPACITY),
             artifacts: VecDeque::with_capacity(ARTIFACT_CAPACITY),
@@ -615,10 +618,12 @@ impl HostHandle {
     pub(crate) async fn snapshot(
         &self,
         last_sequence: Option<u64>,
+        replay_epoch: Option<String>,
     ) -> std::result::Result<HostSnapshot, Rejection> {
         let (reply, receiver) = oneshot::channel();
         self.send(HostCommand::Snapshot {
             last_sequence,
+            replay_epoch,
             reply,
         })
         .await?;
@@ -853,9 +858,13 @@ impl HostState {
         match command {
             HostCommand::Snapshot {
                 last_sequence,
+                replay_epoch,
                 reply,
             } => {
-                let _ = reply.send(self.snapshot_value(last_sequence).await);
+                let _ = reply.send(
+                    self.snapshot_value(last_sequence, replay_epoch.as_deref())
+                        .await,
+                );
             }
             HostCommand::RenameSession {
                 session_id,
@@ -958,8 +967,9 @@ impl HostState {
     async fn snapshot_value(
         &self,
         last_sequence: Option<u64>,
+        replay_epoch: Option<&str>,
     ) -> std::result::Result<HostSnapshot, Rejection> {
-        let replay = self.replay_after(last_sequence)?;
+        let replay = self.replay_after(last_sequence, replay_epoch)?;
         Ok(HostSnapshot {
             ready: self.ready().await.map_err(internal)?,
             replay,
@@ -969,11 +979,12 @@ impl HostState {
     fn replay_after(
         &self,
         last_sequence: Option<u64>,
+        replay_epoch: Option<&str>,
     ) -> std::result::Result<Vec<ServerFrame>, Rejection> {
         let Some(last_sequence) = last_sequence else {
             return Ok(self.replay.iter().cloned().collect());
         };
-        if last_sequence > self.sequence {
+        if replay_epoch != Some(self.replay_epoch.as_str()) || last_sequence > self.sequence {
             return Err(Rejection {
                 code: "replay_unavailable",
                 message: "the gateway restarted; reload the active session".into(),
@@ -1486,6 +1497,7 @@ impl HostState {
 
     async fn ready(&self) -> Result<SessionReadyPayload> {
         Ok(SessionReadyPayload {
+            replay_epoch: self.replay_epoch.clone(),
             latest_sequence: self.sequence,
             workspace: self.spec.workspace_info(),
             git: git_status(&self.running.gateway_sandbox).await,
@@ -2168,15 +2180,23 @@ mod tests {
         let first_host = gateway.create_session(&first).await.expect("first chat");
         let second_host = gateway.create_session(&second).await.expect("second chat");
         let first_before = first_host
-            .snapshot(None)
+            .snapshot(None, None)
             .await
             .expect("first snapshot")
             .ready;
         let second_before = second_host
-            .snapshot(None)
+            .snapshot(None, None)
             .await
             .expect("second snapshot")
             .ready;
+        let rejection = match first_host
+            .snapshot(Some(0), Some(second_before.replay_epoch.clone()))
+            .await
+        {
+            Ok(_) => panic!("a cursor from another host epoch must be rejected"),
+            Err(rejection) => rejection,
+        };
+        assert_eq!(rejection.code, "replay_unavailable");
         let mut composition = first_before.config.config.clone();
         composition.middleware.set_enabled("tools", false);
 
@@ -2185,12 +2205,12 @@ mod tests {
             .await
             .expect("configure first chat");
         let first_after = first_host
-            .snapshot(None)
+            .snapshot(None, None)
             .await
             .expect("first updated")
             .ready;
         let second_after = second_host
-            .snapshot(None)
+            .snapshot(None, None)
             .await
             .expect("second unchanged")
             .ready;
@@ -2270,7 +2290,7 @@ mod tests {
             .await
             .expect("selected chat");
         let mut selected_config = selected
-            .snapshot(None)
+            .snapshot(None, None)
             .await
             .expect("selected snapshot")
             .ready
@@ -2293,7 +2313,7 @@ mod tests {
             .await
             .expect("select alternate model");
         let selected_ready = selected
-            .snapshot(None)
+            .snapshot(None, None)
             .await
             .expect("selected snapshot")
             .ready;
@@ -2301,7 +2321,11 @@ mod tests {
             .create_session(&workspace)
             .await
             .expect("fresh chat");
-        let fresh_ready = fresh.snapshot(None).await.expect("fresh snapshot").ready;
+        let fresh_ready = fresh
+            .snapshot(None, None)
+            .await
+            .expect("fresh snapshot")
+            .ready;
 
         assert_eq!(selected_ready.session.model.route, alternate);
         assert_eq!(selected_ready.config.config.provider.model, "gpt-5.6-terra");

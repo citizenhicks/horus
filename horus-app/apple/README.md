@@ -12,22 +12,22 @@ xcodebuild -project HorusApp.xcodeproj -scheme HorusApp \
   -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 ```
 
-On macOS, pair with `tcp://localhost:PORT` for a gateway on that Mac. For an
-iPhone, iPad, or a Mac connecting to another host, initialize a stopped TLS
-gateway on that host, then start its supervised connection flow:
+On macOS, pair with the advertised loopback endpoint for a gateway on that Mac.
+For an iPhone, iPad, or a Mac connecting to another host, select **Quick Connect**
+during first-time setup, or request a fresh code from an initialized gateway:
 
 ```sh
-horus-gateway init --listen 0.0.0.0:8741 \
-  --tls-cert /absolute/path/fullchain.pem \
-  --tls-key /absolute/path/private-key.pem
-horus-gateway connect --endpoint tls://gateway.example:8741
+horus-gateway init
+# Later, while the gateway is running:
+horus-gateway connect
 ```
 
 Choose **Add gateway** and paste the displayed setup code, or scan its QR with
-the iPhone/iPad Camera. The QR opens Horus with the `wss://` address and
-one-time code prefilled; pairing still requires confirmation. The remote
-hostname must be routable and covered by a publicly trusted TLS certificate.
-Plaintext remote endpoints are rejected.
+the iPhone/iPad Camera. The QR opens Horus with the public `wss://` address and
+one-time code prefilled; pairing still requires confirmation. The same one-use
+code works through the advertised local `tcp://` endpoint. Plaintext remote
+endpoints are rejected; a direct TLS listener remains available as an advanced
+option in the gateway guide.
 
 The one-time code is only the first pairing credential. A successful pairing
 returns a per-pairing bearer token, which this app stores in device-only Keychain

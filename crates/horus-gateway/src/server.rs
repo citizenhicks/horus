@@ -798,15 +798,26 @@ async fn handle_message(
             request_id,
             workspace,
         } => match gateway.create_session(&workspace).await {
-            Ok(host) => open_selected(writer, selected, request_id, host, None).await,
+            Ok(host) => open_selected(writer, selected, request_id, host, None, None).await,
             Err(rejection) => write_rejection(writer, request_id, rejection).await,
         },
         ClientMessage::OpenSession {
             request_id,
             session_id,
             last_sequence,
+            replay_epoch,
         } => match gateway.open_session(&session_id).await {
-            Ok(host) => open_selected(writer, selected, request_id, host, last_sequence).await,
+            Ok(host) => {
+                open_selected(
+                    writer,
+                    selected,
+                    request_id,
+                    host,
+                    last_sequence,
+                    replay_epoch,
+                )
+                .await
+            }
             Err(rejection) => write_rejection(writer, request_id, rejection).await,
         },
         ClientMessage::RenameSession {
@@ -1177,9 +1188,10 @@ async fn open_selected(
     request_id: String,
     host: HostHandle,
     last_sequence: Option<u64>,
+    replay_epoch: Option<String>,
 ) -> Result<()> {
     let broadcasts = host.subscribe();
-    let snapshot = match host.snapshot(last_sequence).await {
+    let snapshot = match host.snapshot(last_sequence, replay_epoch).await {
         Ok(snapshot) => snapshot,
         Err(rejection) => return write_rejection(writer, request_id, rejection).await,
     };
@@ -1187,7 +1199,7 @@ async fn open_selected(
     write_frame(
         writer,
         &ServerFrame::new(ServerMessage::SessionOpened {
-            request_id,
+            request_id: request_id.clone(),
             payload: snapshot.ready,
         }),
     )
@@ -1195,6 +1207,14 @@ async fn open_selected(
     for frame in snapshot.replay {
         write_frame(writer, &frame).await?;
     }
+    write_frame(
+        writer,
+        &ServerFrame::new(ServerMessage::SessionReplayComplete {
+            request_id,
+            session_id: host.session_id().into(),
+        }),
+    )
+    .await?;
     *selected = Some(SelectedChat {
         host,
         broadcasts,
@@ -1652,6 +1672,7 @@ mod tests {
                 request_id: request_id.clone(),
                 session_id: session_id.into(),
                 last_sequence: None,
+                replay_epoch: None,
             })
             .await
             .expect("open chat");

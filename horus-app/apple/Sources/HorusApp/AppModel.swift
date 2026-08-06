@@ -87,7 +87,7 @@ enum ThemePreference: String, CaseIterable, Identifiable {
 
 @Observable
 final class TranscriptEntry: Identifiable {
-    enum Kind: Equatable {
+    enum Kind: String, Codable {
         case user
         case assistant
         case reasoning
@@ -123,6 +123,14 @@ final class TranscriptEntry: Identifiable {
         self.pending = pending
         self.messageTarget = messageTarget
     }
+}
+
+private struct BufferedAgentEvent {
+    let sequence: UInt64
+    let event: AgentEventRecord
+    let blocks: [FrontendBlock]
+    let history: [RenderedEventRecord]?
+    let preview: RenderedPreview?
 }
 
 struct ApprovalCall: Identifiable, Equatable {
@@ -205,6 +213,10 @@ final class AppModel {
     var selectedSessionID: String?
     private(set) var unreadSessionIDs: Set<String> = []
     var transcript: [TranscriptEntry] = []
+    private var replayPresentedTranscript: [TranscriptEntry]?
+    var displayedTranscript: [TranscriptEntry] {
+        replayPresentedTranscript ?? transcript
+    }
     var composer = ""
     var toast: AppToast?
     var activeTurnID: String?
@@ -265,6 +277,9 @@ final class AppModel {
     @ObservationIgnored private var pendingPairingAccount: GatewayAccount?
     @ObservationIgnored private var pendingDrafts: [String: String] = [:]
     @ObservationIgnored private var sessionRequestID: String?
+    @ObservationIgnored private var sessionOpeningID: String?
+    @ObservationIgnored private var pendingCachedTranscript: CachedTranscript?
+    @ObservationIgnored private var pendingPresentedTranscript: [TranscriptEntry]?
     private var sessionMutationRequestID: String?
     @ObservationIgnored private var sessionToRestoreID: String?
     @ObservationIgnored private var configRequestID: String?
@@ -283,7 +298,10 @@ final class AppModel {
     @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
     @ObservationIgnored private var isChatVisible = false
     @ObservationIgnored private var latestSequence: UInt64?
+    @ObservationIgnored private var currentReplayEpoch: String?
     @ObservationIgnored private var sessionOpenCursor: UInt64?
+    @ObservationIgnored private var replayRequestID: String?
+    @ObservationIgnored private var replaySnapshotSequence: UInt64?
     @ObservationIgnored private var steeringSubmissionID: String?
     @ObservationIgnored private var previewSelections: [String: FrontendPickerOption] = [:]
 
@@ -659,28 +677,76 @@ final class AppModel {
 
     func openSession(_ sessionID: String) {
         guard canOpenSession, sessionID != selectedSessionID else { return }
-        requestSessionOpen(sessionID, lastSequence: nil)
+        let cached = selectedAccountID.flatMap {
+            store.loadTranscript(accountID: $0, sessionID: sessionID)
+        }
+        requestSessionOpen(
+            sessionID,
+            lastSequence: cached?.sequence,
+            replayEpoch: cached?.replayEpoch,
+            cachedTranscript: cached,
+            presentedTranscript: cached?.transcript
+        )
     }
 
-    private func restoreSession(_ sessionID: String) {
-        let cursor = sessionID == selectedSessionID ? latestSequence : nil
-        requestSessionOpen(sessionID, lastSequence: cursor)
+    func restoreSession(_ sessionID: String) {
+        guard sessionID == selectedSessionID,
+              let sequence = latestSequence,
+              let epoch = currentReplayEpoch
+        else {
+            requestSessionOpen(sessionID, lastSequence: nil, replayEpoch: nil)
+            return
+        }
+        let base = CachedTranscript(
+            replayEpoch: epoch,
+            sequence: sequence,
+            transcript: transcript,
+            currentUsage: currentUsage,
+            lastUsage: lastUsage
+        )
+        let presentation = CachedTranscript(
+            replayEpoch: epoch,
+            sequence: sequence,
+            transcript: displayedTranscript,
+            currentUsage: currentUsage,
+            lastUsage: lastUsage
+        ).transcript
+        requestSessionOpen(
+            sessionID,
+            lastSequence: sequence,
+            replayEpoch: epoch,
+            cachedTranscript: base,
+            presentedTranscript: presentation
+        )
     }
 
-    private func requestSessionOpen(_ sessionID: String, lastSequence: UInt64?) {
+    private func requestSessionOpen(
+        _ sessionID: String,
+        lastSequence: UInt64?,
+        replayEpoch: String?,
+        cachedTranscript: CachedTranscript? = nil,
+        presentedTranscript: [TranscriptEntry]? = nil
+    ) {
         sessionToRestoreID = nil
+        sessionOpeningID = sessionID
         sessionOpenCursor = lastSequence
+        pendingCachedTranscript = cachedTranscript
+        pendingPresentedTranscript = presentedTranscript
         let id = requestID("open")
         sessionRequestID = id
         connectionState = .loading
         transmit(.openSession(
             requestID: id,
             sessionID: sessionID,
-            lastSequence: lastSequence
+            lastSequence: lastSequence,
+            replayEpoch: replayEpoch
         )) { [weak self] _ in
             guard self?.sessionRequestID == id else { return }
             self?.sessionRequestID = nil
+            self?.sessionOpeningID = nil
             self?.sessionOpenCursor = nil
+            self?.pendingCachedTranscript = nil
+            self?.pendingPresentedTranscript = nil
             self?.connectionState = .ready
         }
     }
@@ -717,6 +783,9 @@ final class AppModel {
 
     func deleteSession(_ session: SessionRecord) {
         guard sessionMutationRequestID == nil else { return }
+        if let accountID = selectedAccountID {
+            store.removeTranscript(accountID: accountID, sessionID: session.sessionId)
+        }
         let id = requestID("session-delete")
         sessionMutationRequestID = id
         transmit(.deleteSession(
@@ -1187,7 +1256,7 @@ final class AppModel {
         }
     }
 
-    private func handle(_ envelope: GatewayEnvelope) {
+    func handle(_ envelope: GatewayEnvelope) {
         switch envelope {
         case .paired(_, let token):
             guard let account = pendingPairingAccount else { return }
@@ -1209,7 +1278,10 @@ final class AppModel {
             applyGatewayReady(payload)
         case .sessionOpened(let requestID, let payload):
             guard requestID == sessionRequestID else { break }
-            applySessionReady(payload, opened: true)
+            applySessionReady(payload, opened: true, replayRequestID: requestID)
+        case .sessionReplayComplete(let requestID, let sessionID):
+            guard requestID == replayRequestID, sessionID == selectedSessionID else { break }
+            finishSessionReplay()
         case .sessionChanged(let payload):
             guard payload.session.sessionId == selectedSessionID,
                   payload.config.revision >= (agentSnapshot?.revision ?? 0)
@@ -1223,9 +1295,17 @@ final class AppModel {
             handleRejected(rejection)
         case .agentEvent(let sessionID, let sequence, let event, let blocks, let history, let preview):
             guard sessionID == selectedSessionID else { break }
-            guard latestSequence.map({ sequence > $0 }) ?? true else { return }
-            latestSequence = sequence
-            reduce(event: event, blocks: blocks, history: history, preview: preview)
+            let buffered = BufferedAgentEvent(
+                sequence: sequence,
+                event: event,
+                blocks: blocks,
+                history: history,
+                preview: preview
+            )
+            applyAgentEvent(buffered)
+            if replayRequestID == nil, shouldCacheTranscript(after: event) {
+                cacheSelectedTranscript()
+            }
         case .sessions(let requestID, let sessions):
             if requestID == sessionMutationRequestID { sessionMutationRequestID = nil }
             applySessions(sessions)
@@ -1309,6 +1389,52 @@ final class AppModel {
         }
     }
 
+    private func applyAgentEvent(_ buffered: BufferedAgentEvent) {
+        guard latestSequence.map({ buffered.sequence > $0 }) ?? true else { return }
+        latestSequence = buffered.sequence
+        reduce(
+            event: buffered.event,
+            blocks: buffered.blocks,
+            history: buffered.history,
+            preview: buffered.preview
+        )
+    }
+
+    private func finishSessionReplay() {
+        if let replaySnapshotSequence { latestSequence = replaySnapshotSequence }
+        replayRequestID = nil
+        replaySnapshotSequence = nil
+        replayPresentedTranscript = nil
+        connectionState = .ready
+        cacheSelectedTranscript()
+    }
+
+    private func shouldCacheTranscript(after event: AgentEventRecord) -> Bool {
+        switch event.msg["type"]?.stringValue {
+        case "session_history", "task_complete", "turn_aborted": true
+        default: false
+        }
+    }
+
+    private func cacheSelectedTranscript() {
+        guard let accountID = selectedAccountID,
+              let sessionID = selectedSessionID,
+              let currentReplayEpoch,
+              let latestSequence,
+              activeTurnID == nil,
+              pendingApproval == nil
+        else { return }
+        store.saveTranscript(
+            accountID: accountID,
+            sessionID: sessionID,
+            replayEpoch: currentReplayEpoch,
+            sequence: latestSequence,
+            transcript: transcript,
+            currentUsage: currentUsage,
+            lastUsage: lastUsage
+        )
+    }
+
     private func applyGatewayReady(_ payload: ReadyPayload) {
         applyGatewayCatalog(payload)
         if sessionRequestID == nil { connectionState = .ready }
@@ -1340,8 +1466,17 @@ final class AppModel {
             if let target { applyAgentConfiguration(to: target) }
         } else if requestID == defaultConfigRequestID {
             defaultConfigRequestID = nil
-            applyState = .applied
-            showToast("Default agent saved for new chats.", tone: .success)
+            applyState = .idle
+            if selectedSessionID != nil,
+               let snapshot = agentSnapshot,
+               let draft = agentDraft,
+               draft == payload.defaultConfig?.config,
+               draft != snapshot.config {
+                applyAgentConfiguration(to: .session)
+            } else {
+                applyState = .applied
+                showToast("Default agent saved for new chats.", tone: .success)
+            }
         }
     }
 
@@ -1367,15 +1502,36 @@ final class AppModel {
 
     private func applySessionReady(
         _ payload: SessionReadyPayload,
-        opened: Bool
+        opened: Bool,
+        replayRequestID: String? = nil
     ) {
+        let cursor = sessionOpenCursor
+        let cached = opened && sessionOpeningID == payload.session.sessionId
+            ? pendingCachedTranscript
+            : nil
+        let presented = opened && sessionOpeningID == payload.session.sessionId
+            ? pendingPresentedTranscript
+            : nil
         if selectedSessionID != payload.session.sessionId {
             restorePendingDrafts()
             resetSessionState()
         }
         if opened {
-            latestSequence = sessionOpenCursor
+            latestSequence = cursor
+            currentReplayEpoch = payload.replayEpoch
+            self.replayRequestID = replayRequestID
+            replaySnapshotSequence = payload.latestSequence
             sessionOpenCursor = nil
+            sessionOpeningID = nil
+            pendingCachedTranscript = nil
+            pendingPresentedTranscript = nil
+            replayPresentedTranscript = presented ?? []
+            transcript = cached?.transcript ?? []
+            if let cached {
+                currentUsage = cached.currentUsage
+                lastUsage = cached.lastUsage
+                updateContextTokens()
+            }
         }
         sessionRequestID = nil
         workspace = payload.workspace
@@ -1399,7 +1555,7 @@ final class AppModel {
             incomingSnapshot: payload.config
         )
         agentSnapshot = payload.config
-        connectionState = .ready
+        if !opened { connectionState = .ready }
         if applyState == .restarting {
             applyState = .applied
             showToast("Agent configuration applied.", tone: .success)
@@ -1482,6 +1638,7 @@ final class AppModel {
 
     private func clearSelectedSession() {
         latestSequence = nil
+        currentReplayEpoch = nil
         sessionOpenCursor = nil
         selectedSessionID = nil
         resetSessionState()
@@ -1516,6 +1673,21 @@ final class AppModel {
     }
 
     private func handleRejected(_ rejection: GatewayRejection) {
+        if rejection.requestId == sessionRequestID,
+           rejection.code == "replay_unavailable",
+           let sessionID = sessionOpeningID,
+           sessionOpenCursor != nil {
+            if let accountID = selectedAccountID {
+                store.removeTranscript(accountID: accountID, sessionID: sessionID)
+            }
+            sessionRequestID = nil
+            sessionOpenCursor = nil
+            pendingCachedTranscript = nil
+            pendingPresentedTranscript = nil
+            if sessionID == selectedSessionID { resetSessionState() }
+            requestSessionOpen(sessionID, lastSequence: nil, replayEpoch: nil)
+            return
+        }
         if pendingDrafts[rejection.requestId] != nil {
             restoreDraft(id: rejection.requestId)
         }
@@ -1535,7 +1707,10 @@ final class AppModel {
         }
         if rejection.requestId == sessionRequestID {
             sessionRequestID = nil
+            sessionOpeningID = nil
             sessionOpenCursor = nil
+            pendingCachedTranscript = nil
+            pendingPresentedTranscript = nil
             connectionState = .ready
             if isChangingWorkspace { workspaceError = rejection.message }
             isChangingWorkspace = false
@@ -1592,6 +1767,21 @@ final class AppModel {
         preview: RenderedPreview?
     ) {
         let type = event.msg["type"]?.stringValue ?? "unknown"
+        if type == "session_history" {
+            transcript = []
+            currentUsage = TokenUsage()
+            lastUsage = TokenUsage()
+            contextTokens = 0
+            for rendered in history ?? [] {
+                guard rendered.event["frontendType"]?.stringValue != "picker" else { continue }
+                reduce(
+                    event: AgentEventRecord(submissionId: nil, msg: rendered.event),
+                    blocks: rendered.blocks,
+                    preview: nil
+                )
+            }
+            return
+        }
         let wasRendered = !blocks.isEmpty
         if let submissionID = event.submissionId {
             if type == "warning" || type == "error" {
@@ -1617,15 +1807,6 @@ final class AppModel {
         }
 
         switch type {
-        case "session_history":
-            for rendered in history ?? [] {
-                guard rendered.event["frontendType"]?.stringValue != "picker" else { continue }
-                reduce(
-                    event: AgentEventRecord(submissionId: nil, msg: rendered.event),
-                    blocks: rendered.blocks,
-                    preview: nil
-                )
-            }
         case "user_message":
             appendText(
                 event.msg["message"]?.stringValue,
@@ -1715,10 +1896,7 @@ final class AppModel {
             if let usage = event.msg["info"]?["lastTokenUsage"],
                let latest = TokenUsage(json: usage) {
                 lastUsage = latest
-                contextTokens = max(
-                    0,
-                    max(latest.totalTokens, latest.inputTokens + latest.outputTokens)
-                )
+                updateContextTokens()
             }
             if let window = event.msg["info"]?["modelContextWindow"]?.intValue {
                 modelContextWindow = Int64(window)
@@ -1948,6 +2126,13 @@ final class AppModel {
         }
     }
 
+    private func updateContextTokens() {
+        contextTokens = max(
+            0,
+            max(lastUsage.totalTokens, lastUsage.inputTokens + lastUsage.outputTokens)
+        )
+    }
+
     private func setPairingCode(_ code: String, expiresAt: Date) {
         pairingCodeExpiryTask?.cancel()
         guard expiresAt > .now else {
@@ -2026,8 +2211,14 @@ final class AppModel {
         connectionGeneration = UUID()
         eventTask?.cancel()
         eventTask = nil
-        if !preservingSession { latestSequence = nil }
+        if !preservingSession {
+            latestSequence = nil
+            currentReplayEpoch = nil
+        }
         sessionOpenCursor = nil
+        replayRequestID = nil
+        replaySnapshotSequence = nil
+        if !preservingSession { replayPresentedTranscript = nil }
         if preservingDrafts {
             restorePendingDrafts()
         } else {
@@ -2038,6 +2229,9 @@ final class AppModel {
         connectionState = .disconnected
         dismissToast()
         sessionRequestID = nil
+        sessionOpeningID = nil
+        pendingCachedTranscript = nil
+        pendingPresentedTranscript = nil
         sessionMutationRequestID = nil
         sessionToRestoreID = nil
         configRequestID = nil
@@ -2096,6 +2290,9 @@ final class AppModel {
         cronError = nil
         cronRequestIDs.removeAll()
         transcript = []
+        replayRequestID = nil
+        replaySnapshotSequence = nil
+        replayPresentedTranscript = nil
         activeTurnID = nil
         activeOperation = nil
         steeringQueued = false

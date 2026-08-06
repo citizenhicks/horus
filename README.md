@@ -31,10 +31,10 @@ cd /path/to/repository
 horus
 ```
 
-On first use, the CLI initializes the machine-wide local gateway, pairs itself,
-saves its token, starts the gateway in the background, and opens `/login` when no
-provider is configured. The first configured model becomes the gateway default
-for new chats. Each CLI invocation
+On first use, the CLI initializes the machine-wide gateway with a loopback listener
+and Cloudflare Quick Tunnel, provisions its local credential, starts the gateway in
+the background, and opens `/login` when no provider is configured. The first
+configured model becomes the gateway default for new chats. Each CLI invocation
 creates an independent chat for its current directory; other terminal and app
 frontends can connect to the same gateway and open separate or shared chats.
 Workspace, model, reasoning, agent features, approval policy, and prompt are
@@ -42,12 +42,11 @@ chat-scoped. The gateway owns the available-model catalog and new-chat default;
 a chat only selects from that catalog. The core `horus` crate is linked into the
 binaries and is not a separate runtime prerequisite.
 
-Plaintext is limited to loopback. An iPhone or another machine needs a
-routable `tls://host:port` endpoint with a publicly trusted certificate for
-that hostname. After initializing a stopped TLS gateway as shown in the gateway
-guide, run `horus-gateway connect --endpoint tls://host:port` on its host, then
-enter the displayed endpoint and one-time code in the client. Pairing exchanges
-that code for a per-client token used on later connections. See the
+Plaintext remains limited to loopback. Run `horus-gateway connect` to advertise
+both that local TCP endpoint and the Quick Tunnel's public WSS endpoint with one
+one-use code; pairing through either exchanges it for a per-client token used on
+later connections. A direct TLS listener remains available as an advanced
+alternative. See the
 [gateway guide](https://github.com/citizenhicks/horus/blob/main/crates/horus-gateway/README.md),
 the [CLI guide](https://github.com/citizenhicks/horus/blob/main/crates/horus-cli/README.md),
 and the [Apple guide](https://github.com/citizenhicks/horus/blob/main/horus-app/apple/README.md)

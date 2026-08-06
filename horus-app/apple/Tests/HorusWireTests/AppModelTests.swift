@@ -19,9 +19,14 @@ final class AppModelTests: XCTestCase {
         requestSender: (@MainActor @Sendable (GatewayRequest) async throws -> Void)? = nil
     ) throws -> AppModel {
         let suiteName = UUID().uuidString
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
         return AppModel(
             client: GatewayClient(),
-            store: GatewayStore(defaults: try XCTUnwrap(UserDefaults(suiteName: suiteName))),
+            store: GatewayStore(
+                defaults: try XCTUnwrap(UserDefaults(suiteName: suiteName)),
+                transcriptDirectory: directory
+            ),
             requestSender: requestSender
         )
     }
@@ -57,6 +62,38 @@ final class AppModelTests: XCTestCase {
             models: [],
             middlewareFeatures: [],
             maxActiveSessions: 4
+        )
+    }
+
+    private func sessionReady(
+        latestSequence: UInt64,
+        replayEpoch: String = "epoch-1"
+    ) -> SessionReadyPayload {
+        SessionReadyPayload(
+            replayEpoch: replayEpoch,
+            latestSequence: latestSequence,
+            workspace: WorkspaceInfo(id: "workspace-1", path: "/srv/horus"),
+            git: nil,
+            session: SessionConfigured(
+                sessionId: "chat-1",
+                context: SessionContext(
+                    tenantId: nil,
+                    userId: nil,
+                    userName: nil,
+                    workspaceId: "workspace-1",
+                    workspaceLabel: "/srv/horus",
+                    originLabel: nil
+                ),
+                model: ModelChanged(
+                    route: "openai",
+                    model: "gpt-5.6-sol",
+                    reasoningEffort: "high",
+                    modelContextWindow: 200_000
+                )
+            ),
+            contributions: [],
+            toolCount: 0,
+            config: VersionedAgentConfig(revision: 1, config: composition())
         )
     }
 
@@ -1009,6 +1046,538 @@ final class AppModelTests: XCTestCase {
         }
         XCTAssertEqual(expectedRevision, 8)
         XCTAssertEqual(config, draft)
+    }
+
+    func testSavingDefaultAlsoConfiguresActiveChat() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let active = composition()
+        var draft = active
+        draft.approval = .allow
+        model.selectedSessionID = "chat-1"
+        model.sessions = [session(state: .idle)]
+        model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
+        model.defaultAgentSnapshot = VersionedAgentConfig(revision: 7, config: active)
+        model.agentDraft = draft
+
+        model.saveAgentAsDefault()
+        try await Task.sleep(for: .milliseconds(20))
+
+        let defaultRequests = await recorder.requests()
+        let defaultRequest = try XCTUnwrap(
+            defaultRequests.first { request in
+                if case .configureDefaultAgent = request { return true }
+                return false
+            }
+        )
+        guard case .configureDefaultAgent(let requestID, _, let savedDraft) = defaultRequest else {
+            return XCTFail("Expected default-agent configuration")
+        }
+        XCTAssertEqual(savedDraft, draft)
+
+        model.applyGatewayConfigurationResponse(
+            requestID: requestID,
+            payload: ready(defaultConfig: VersionedAgentConfig(revision: 8, config: draft))
+        )
+        try await Task.sleep(for: .milliseconds(20))
+
+        let sessionRequests = await recorder.requests()
+        let sessionRequest = try XCTUnwrap(
+            sessionRequests.first { request in
+                if case .configureSession = request { return true }
+                return false
+            }
+        )
+        guard case .configureSession(
+            _,
+            let sessionID,
+            let expectedRevision,
+            let activeDraft
+        ) = sessionRequest else {
+            return XCTFail("Expected active-chat configuration")
+        }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(expectedRevision, 3)
+        XCTAssertEqual(activeDraft, draft)
+    }
+
+    func testSavingDefaultDoesNotApplyALaterDraftToActiveChat() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let active = composition()
+        var draft = active
+        draft.approval = .allow
+        model.selectedSessionID = "chat-1"
+        model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
+        model.defaultAgentSnapshot = VersionedAgentConfig(revision: 7, config: active)
+        model.agentDraft = draft
+
+        model.saveAgentAsDefault()
+        try await Task.sleep(for: .milliseconds(20))
+        let requests = await recorder.requests()
+        let requestID = try XCTUnwrap(requests.lazy.compactMap { request -> String? in
+            guard case .configureDefaultAgent(let requestID, _, _) = request else { return nil }
+            return requestID
+        }.first)
+
+        var laterDraft = draft
+        laterDraft.approval = .allowNetwork
+        model.agentDraft = laterDraft
+        model.applyGatewayConfigurationResponse(
+            requestID: requestID,
+            payload: ready(defaultConfig: VersionedAgentConfig(revision: 8, config: draft))
+        )
+        try await Task.sleep(for: .milliseconds(20))
+
+        let configuredSessions = await recorder.requests().filter { request in
+            if case .configureSession = request { return true }
+            return false
+        }
+        XCTAssertTrue(configuredSessions.isEmpty)
+        XCTAssertEqual(model.agentDraft, laterDraft)
+        XCTAssertEqual(model.applyState, .applied)
+    }
+
+    func testHistoricalReplayAppearsOnlyWhenTheSnapshotIsComplete() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+
+        model.openSession("chat-1")
+        try await Task.sleep(for: .milliseconds(20))
+        let requests = await recorder.requests()
+        let request = try XCTUnwrap(requests.first)
+        guard case .openSession(let requestID, _, nil, nil) = request else {
+            return XCTFail("Expected an uncached session open")
+        }
+        model.handle(.sessionOpened(requestID: requestID, payload: sessionReady(latestSequence: 2)))
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            sequence: 1,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("agent_message_content_delta"),
+                "itemId": .string("answer-1"),
+                "delta": .string("Hel")
+            ])),
+            blocks: [],
+            history: nil,
+            preview: nil
+        ))
+        XCTAssertTrue(model.displayedTranscript.isEmpty)
+
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            sequence: 2,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("agent_message"),
+                "message": .string("Hello")
+            ])),
+            blocks: [],
+            history: nil,
+            preview: nil
+        ))
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(model.displayedTranscript.isEmpty)
+        model.handle(.sessionReplayComplete(requestID: requestID, sessionID: "chat-1"))
+        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Hello"])
+    }
+
+    func testCachedTranscriptSuppliesTheOpenCursorAndRestoresOnce() async throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let recorder = GatewayRequestRecorder()
+        let store = GatewayStore(defaults: defaults, transcriptDirectory: directory)
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        var currentUsage = TokenUsage()
+        currentUsage.totalTokens = 55
+        var lastUsage = TokenUsage()
+        lastUsage.inputTokens = 30
+        lastUsage.outputTokens = 12
+        store.saveTranscript(
+            accountID: account.id,
+            sessionID: "chat-1",
+            replayEpoch: "epoch-1",
+            sequence: 7,
+            transcript: [TranscriptEntry(
+                id: "answer-1",
+                text: "Already rendered",
+                kind: .assistant,
+                format: "plain_text",
+                pending: false
+            )],
+            currentUsage: currentUsage,
+            lastUsage: lastUsage
+        )
+        let model = AppModel(
+            client: GatewayClient(),
+            store: store,
+            requestSender: { request in await recorder.record(request) }
+        )
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+
+        model.openSession("chat-1")
+        try await Task.sleep(for: .milliseconds(20))
+        let requests = await recorder.requests()
+        let request = try XCTUnwrap(requests.first)
+        guard case .openSession(let requestID, let sessionID, let cursor, let epoch) = request else {
+            return XCTFail("Expected a cached session open")
+        }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(cursor, 7)
+        XCTAssertEqual(epoch, "epoch-1")
+
+        model.handle(.sessionOpened(requestID: requestID, payload: sessionReady(latestSequence: 7)))
+        XCTAssertEqual(model.transcript.map(\.text), ["Already rendered"])
+        XCTAssertEqual(model.currentUsage.totalTokens, 55)
+        XCTAssertEqual(model.contextTokens, 42)
+        model.handle(.sessionReplayComplete(requestID: requestID, sessionID: "chat-1"))
+
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            sequence: 7,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("error"),
+                "message": .string("Duplicate")
+            ])),
+            blocks: [],
+            history: nil,
+            preview: nil
+        ))
+        XCTAssertEqual(model.transcript.map(\.text), ["Already rendered"])
+    }
+
+    func testAuthoritativeHistoryReplacesTheFrozenCachedTranscript() async throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let recorder = GatewayRequestRecorder()
+        let store = GatewayStore(defaults: defaults, transcriptDirectory: directory)
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        store.saveTranscript(
+            accountID: account.id,
+            sessionID: "chat-1",
+            replayEpoch: "epoch-1",
+            sequence: 7,
+            transcript: [TranscriptEntry(
+                id: "answer-1",
+                text: "Cached",
+                kind: .assistant,
+                format: "plain_text",
+                pending: false
+            )],
+            currentUsage: TokenUsage(),
+            lastUsage: TokenUsage()
+        )
+        let model = AppModel(
+            client: GatewayClient(),
+            store: store,
+            requestSender: { request in await recorder.record(request) }
+        )
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+
+        model.openSession("chat-1")
+        try await Task.sleep(for: .milliseconds(20))
+        let requests = await recorder.requests()
+        guard case .openSession(let requestID, _, _, _) = try XCTUnwrap(requests.first) else {
+            return XCTFail("Expected a session open")
+        }
+        model.handle(.sessionOpened(
+            requestID: requestID,
+            payload: sessionReady(latestSequence: 9)
+        ))
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            sequence: 8,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("agent_message_content_delta"),
+                "itemId": .string("answer-1"),
+                "delta": .string(" updated")
+            ])),
+            blocks: [],
+            history: nil,
+            preview: nil
+        ))
+        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Cached"])
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            sequence: 9,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("session_history"),
+                "events": .array([])
+            ])),
+            blocks: [],
+            history: [RenderedEventRecord(event: .object([
+                "type": .string("user_message"),
+                "message": .string("Canonical")
+            ]), blocks: [])],
+            preview: nil
+        ))
+        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Cached"])
+
+        model.handle(.sessionReplayComplete(requestID: requestID, sessionID: "chat-1"))
+
+        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Canonical"])
+    }
+
+    func testCursorRestoreKeepsTheReplayBaseAndFrozenPresentation() async throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let recorder = GatewayRequestRecorder()
+        let store = GatewayStore(defaults: defaults, transcriptDirectory: directory)
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        store.saveTranscript(
+            accountID: account.id,
+            sessionID: "chat-1",
+            replayEpoch: "epoch-1",
+            sequence: 7,
+            transcript: [TranscriptEntry(
+                id: "answer-1",
+                text: "Cached",
+                kind: .assistant,
+                format: "plain_text",
+                pending: false
+            )],
+            currentUsage: TokenUsage(),
+            lastUsage: TokenUsage()
+        )
+        let model = AppModel(
+            client: GatewayClient(),
+            store: store,
+            requestSender: { request in await recorder.record(request) }
+        )
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+
+        model.openSession("chat-1")
+        try await Task.sleep(for: .milliseconds(20))
+        var requests = await recorder.requests()
+        guard case .openSession(let firstRequestID, _, _, _) = try XCTUnwrap(requests.first) else {
+            return XCTFail("Expected the first session open")
+        }
+        model.handle(.sessionOpened(
+            requestID: firstRequestID,
+            payload: sessionReady(latestSequence: 9)
+        ))
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            sequence: 8,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("agent_message_content_delta"),
+                "itemId": .string("answer-1"),
+                "delta": .string(" updated")
+            ])),
+            blocks: [],
+            history: nil,
+            preview: nil
+        ))
+
+        model.restoreSession("chat-1")
+        try await Task.sleep(for: .milliseconds(20))
+        requests = await recorder.requests()
+        guard case .openSession(let secondRequestID, _, 8, "epoch-1") = try XCTUnwrap(
+            requests.last
+        ) else { return XCTFail("Expected the replay cursor to resume at sequence 8") }
+        model.handle(.sessionOpened(
+            requestID: secondRequestID,
+            payload: sessionReady(latestSequence: 9)
+        ))
+        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Cached"])
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            sequence: 9,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("agent_message_content_delta"),
+                "itemId": .string("answer-1"),
+                "delta": .string(" again")
+            ])),
+            blocks: [],
+            history: nil,
+            preview: nil
+        ))
+        model.handle(.sessionReplayComplete(
+            requestID: secondRequestID,
+            sessionID: "chat-1"
+        ))
+
+        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Cached updated again"])
+    }
+
+    func testTranscriptCacheIsProtectedAndBounded() throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let store = GatewayStore(defaults: defaults, transcriptDirectory: directory)
+        let accountID = UUID()
+        for index in 0..<21 {
+            store.saveTranscript(
+                accountID: accountID,
+                sessionID: "chat-\(index)",
+                replayEpoch: "epoch-1",
+                sequence: 1,
+                transcript: [TranscriptEntry(
+                    id: "answer-1",
+                    text: "Cached",
+                    kind: .assistant,
+                    format: "plain_text",
+                    pending: false
+                )],
+                currentUsage: TokenUsage(),
+                lastUsage: TokenUsage()
+            )
+        }
+        let files = try FileManager.default.contentsOfDirectory(
+            at: directory.appendingPathComponent(accountID.uuidString, isDirectory: true),
+            includingPropertiesForKeys: nil
+        )
+        XCTAssertEqual(files.count, 20)
+        #if os(iOS) && !targetEnvironment(simulator)
+        let attributes = try FileManager.default.attributesOfItem(atPath: XCTUnwrap(files.first).path)
+        XCTAssertEqual(attributes[.protectionKey] as? FileProtectionType, .complete)
+        #endif
+
+        let oversizedAccountID = UUID()
+        store.saveTranscript(
+            accountID: oversizedAccountID,
+            sessionID: "large",
+            replayEpoch: "epoch-1",
+            sequence: 1,
+            transcript: [TranscriptEntry(
+                id: "answer-1",
+                text: String(repeating: "x", count: 3 * 1024 * 1024 + 1),
+                kind: .assistant,
+                format: "plain_text",
+                pending: false
+            )],
+            currentUsage: TokenUsage(),
+            lastUsage: TokenUsage()
+        )
+        XCTAssertNil(store.loadTranscript(
+            accountID: oversizedAccountID,
+            sessionID: "large"
+        ))
+
+        store.saveTranscript(
+            accountID: oversizedAccountID,
+            sessionID: "corrupt",
+            replayEpoch: "epoch-1",
+            sequence: 1,
+            transcript: [TranscriptEntry(
+                id: "answer-1",
+                text: "Cached",
+                kind: .assistant,
+                format: "plain_text",
+                pending: false
+            )],
+            currentUsage: TokenUsage(),
+            lastUsage: TokenUsage()
+        )
+        let oversizedDirectory = directory.appendingPathComponent(
+            oversizedAccountID.uuidString,
+            isDirectory: true
+        )
+        let oversizedURL = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(
+                at: oversizedDirectory,
+                includingPropertiesForKeys: nil
+            ).first
+        )
+        try Data(count: 4 * 1024 * 1024 + 1).write(to: oversizedURL, options: .atomic)
+        XCTAssertNil(store.loadTranscript(
+            accountID: oversizedAccountID,
+            sessionID: "corrupt"
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oversizedURL.path))
+    }
+
+    func testUnavailableCachedCursorRetriesTheOpenWithoutIt() async throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let recorder = GatewayRequestRecorder()
+        let store = GatewayStore(defaults: defaults, transcriptDirectory: directory)
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        store.saveTranscript(
+            accountID: account.id,
+            sessionID: "chat-1",
+            replayEpoch: "epoch-1",
+            sequence: 7,
+            transcript: [TranscriptEntry(
+                id: "answer-1",
+                text: "Cached",
+                kind: .assistant,
+                format: "plain_text",
+                pending: false
+            )],
+            currentUsage: TokenUsage(),
+            lastUsage: TokenUsage()
+        )
+        let model = AppModel(
+            client: GatewayClient(),
+            store: store,
+            requestSender: { request in await recorder.record(request) }
+        )
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+
+        model.openSession("chat-1")
+        try await Task.sleep(for: .milliseconds(20))
+        let requests = await recorder.requests()
+        let first = try XCTUnwrap(requests.first)
+        guard case .openSession(let requestID, _, 7, "epoch-1") = first else {
+            return XCTFail("Expected the cached cursor")
+        }
+        model.handle(.rejected(GatewayRejection(
+            requestId: requestID,
+            code: "replay_unavailable",
+            message: "Reload",
+            fatal: false
+        )))
+        try await Task.sleep(for: .milliseconds(20))
+
+        let opens = await recorder.requests().compactMap { request -> (String, UInt64?)? in
+            guard case .openSession(_, let sessionID, let cursor, _) = request else { return nil }
+            return (sessionID, cursor)
+        }
+        XCTAssertEqual(opens.count, 2)
+        XCTAssertEqual(opens.last?.0, "chat-1")
+        XCTAssertNil(opens.last?.1)
+        XCTAssertNil(store.loadTranscript(accountID: account.id, sessionID: "chat-1"))
     }
 
     func testTranscriptReplayDoesNotShowStaleErrorToast() throws {
