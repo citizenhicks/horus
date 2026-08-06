@@ -187,13 +187,21 @@ struct HorusPalette: Sendable {
     let panel: Color
     let raised: Color
     let line: Color
+    /// Strokes, rings, and marks drawn *in* the accent. Not a background for text.
     let accent: Color
+    /// Fill behind `onAccent` labels, darker than `accent` so the pair clears WCAG AA.
+    ///
+    /// Glass composites its tint with whatever sits behind it, so a fill that only just
+    /// clears on paper drifts under one: the light scheme lightens the result and loses
+    /// contrast, the dark scheme darkens it and gains. Light therefore carries the extra
+    /// headroom, the same way `signal`, `warning`, and `danger` are already darkened there.
+    let accentFill: Color
     let accentSoft: Color
     let signal: Color
     let warning: Color
     let danger: Color
     let muted: Color
-    /// Label colour for anything filled with `accent`.
+    /// Label colour for anything filled with `accentFill`.
     let onAccent: Color
 
     // Nord (nordtheme.com): the canvas sits below Polar Night so nord0–nord3 read as
@@ -206,6 +214,8 @@ struct HorusPalette: Sendable {
             raised = .nord1
             line = .nord3
             accent = .nord10
+            // 4.84:1 against onAccent, and the dark backdrop only deepens it under glass.
+            accentFill = Color(red: 0.298, green: 0.416, blue: 0.557)
             accentSoft = Color(red: 0.227, green: 0.278, blue: 0.349)
             signal = .nord14
             warning = .nord13
@@ -217,6 +227,9 @@ struct HorusPalette: Sendable {
             raised = Color(red: 0.965, green: 0.973, blue: 0.984)
             line = .nord4
             accent = .nord10
+            // 6.15:1 against onAccent: the light backdrop lightens the tint under glass,
+            // so the extra headroom is what keeps the composited result above 4.5:1.
+            accentFill = Color(red: 0.239, green: 0.353, blue: 0.494)
             accentSoft = Color(red: 0.831, green: 0.871, blue: 0.918)
             signal = Color(red: 0.353, green: 0.482, blue: 0.243)
             warning = Color(red: 0.565, green: 0.435, blue: 0.153)
@@ -353,6 +366,9 @@ struct HorusIconButtonStyle: ButtonStyle {
 
     private struct IconButton: View {
         @Environment(\.horusPalette) private var palette
+        // A custom style gets no automatic disabled treatment: without this the send button
+        // keeps a full-strength accent glyph on a circle that no longer responds.
+        @Environment(\.isEnabled) private var isEnabled
         let label: ButtonStyleConfiguration.Label
         let isPressed: Bool
         let prominent: Bool
@@ -360,16 +376,21 @@ struct HorusIconButtonStyle: ButtonStyle {
         var body: some View {
             label
                 .font(HorusStyle.controlFont)
-                .foregroundStyle(prominent ? palette.onAccent : .primary)
+                .foregroundStyle(foreground)
                 .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                 // A glass effect adds no hit area, so without this the tap target is the
                 // 16pt glyph, not the 44pt circle: unusable by touch, fine with a cursor.
                 .contentShape(Circle())
-                .horusGlass(in: Circle(), interactive: true, prominent: prominent)
+                .horusGlass(in: Circle(), interactive: isEnabled, prominent: prominent && isEnabled)
                 .opacity(isPressed ? 0.72 : 1)
                 #if os(iOS)
                 .sensoryFeedback(.impact(weight: .light), trigger: isPressed) { _, pressed in pressed }
                 #endif
+        }
+
+        private var foreground: Color {
+            guard isEnabled else { return palette.muted }
+            return prominent ? palette.onAccent : .primary
         }
     }
 }
@@ -389,8 +410,11 @@ private struct HorusProminentButton: ViewModifier {
         #if os(macOS)
         content.buttonStyle(HorusProminentButtonStyle())
         #else
+        // `.glassProminent` fills from the tint, so it needs the accessible one rather than
+        // the global tint `HorusTheme` sets for switches, pickers, and links.
         content
             .buttonStyle(.glassProminent)
+            .tint(palette.accentFill)
             .foregroundStyle(palette.onAccent)
         #endif
     }
@@ -467,7 +491,7 @@ private struct HorusGlassModifier<S: Shape>: ViewModifier {
     let prominent: Bool
 
     func body(content: Content) -> some View {
-        let glass = prominent ? Glass.regular.tint(palette.accent) : Glass.regular
+        let glass = prominent ? Glass.regular.tint(palette.accentFill) : Glass.regular
         if interactive {
             content.glassEffect(glass.interactive(), in: shape)
         } else {
