@@ -1,4 +1,9 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 
 enum HorusStyle {
     #if os(iOS)
@@ -134,23 +139,46 @@ extension Button where Label == HorusLabel {
     }
 }
 
+/// Resolves the gateway's symbol names to SF Symbols.
+///
+/// The vocabulary is open — middleware and frontend plugins send whatever they like — and
+/// three conventions have accumulated in it: Phosphor names (`magnifying-glass`), semantic
+/// aliases (`delete`), and names that are already SF Symbols (`pencil`, sent by the CLI
+/// dashboard). A switch listing every name meant the third kind fell through to the
+/// placeholder, so names are now tried against SF Symbols directly and the table below
+/// carries only the ones spelled differently.
 enum HorusSymbol {
+    static let placeholder = "questionmark.square.dashed"
+
     static func systemName(for semanticName: String) -> String {
-        switch semanticName {
-        case "brain": "brain.head.profile"
-        case "chat-circle": "text.bubble"
-        case "delete": "trash"
-        case "edit": "pencil"
-        case "fork": "arrow.trianglehead.branch"
-        case "hard-drives": "externaldrive.connected.to.line.below"
-        case "magnifying-glass": "magnifyingglass"
-        case "moon": "moon"
-        case "path": "point.3.connected.trianglepath.dotted"
-        case "promote": "arrow.up.circle"
-        case "robot": "person.fill"
-        case "sparkle": "sparkles"
-        default: "questionmark.square.dashed"
-        }
+        if let alias = aliases[semanticName] { return alias }
+        if isSystemSymbol(semanticName) { return semanticName }
+        // Phosphor hyphenates what SF Symbols runs together: magnifying-glass, arrows-clockwise.
+        let collapsed = semanticName.replacingOccurrences(of: "-", with: "")
+        if collapsed != semanticName, isSystemSymbol(collapsed) { return collapsed }
+        return placeholder
+    }
+
+    /// Only the names SF Symbols spells differently; the rest resolve on their own.
+    private static let aliases: [String: String] = [
+        "brain": "brain.head.profile",
+        "chat-circle": "text.bubble",
+        "delete": "trash",
+        "edit": "pencil",
+        "fork": "arrow.trianglehead.branch",
+        "hard-drives": "externaldrive.connected.to.line.below",
+        "path": "point.3.connected.trianglepath.dotted",
+        "promote": "arrow.up.circle",
+        "robot": "person.fill",
+        "sparkle": "sparkles",
+    ]
+
+    private static func isSystemSymbol(_ name: String) -> Bool {
+        #if os(macOS)
+        NSImage(systemSymbolName: name, accessibilityDescription: nil) != nil
+        #else
+        UIImage(systemName: name) != nil
+        #endif
     }
 }
 
@@ -346,16 +374,66 @@ struct HorusIconButtonStyle: ButtonStyle {
     }
 }
 
-/// `.glassProminent` with a label that stays legible on the amber accent in both schemes.
+/// A prominent button with a label that stays legible on the accent in both schemes.
+///
+/// iOS draws `.glassProminent` from the tint this app sets, so the label colour and the
+/// fill agree. macOS lets the system own that fill: it desaturates for an inactive window
+/// and can follow the accent colour chosen in System Settings, neither of which the label
+/// colour here knows about, so a label picked for the Nord accent ends up on a surface the
+/// app never chose. Painting the fill in the style keeps the pair together — the same
+/// `Glass.regular.tint(...)` path `HorusIconButtonStyle` already uses on both platforms.
 private struct HorusProminentButton: ViewModifier {
     @Environment(\.horusPalette) private var palette
 
     func body(content: Content) -> some View {
+        #if os(macOS)
+        content.buttonStyle(HorusProminentButtonStyle())
+        #else
         content
             .buttonStyle(.glassProminent)
             .foregroundStyle(palette.onAccent)
+        #endif
     }
 }
+
+#if os(macOS)
+struct HorusProminentButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        ProminentLabel(label: configuration.label, isPressed: configuration.isPressed)
+    }
+
+    private struct ProminentLabel: View {
+        @Environment(\.horusPalette) private var palette
+        // A custom style gets no automatic disabled treatment: without this the label keeps
+        // its full-strength accent colour on a button that no longer responds.
+        @Environment(\.isEnabled) private var isEnabled
+        @Environment(\.controlSize) private var controlSize
+        let label: ButtonStyleConfiguration.Label
+        let isPressed: Bool
+
+        var body: some View {
+            label
+                .font(HorusStyle.controlFont)
+                .foregroundStyle(isEnabled ? palette.onAccent : palette.muted)
+                .padding(.horizontal, 14)
+                .frame(height: height)
+                // A glass effect adds no hit area of its own.
+                .contentShape(Capsule())
+                .horusGlass(in: Capsule(), interactive: isEnabled, prominent: isEnabled)
+                .opacity(isPressed ? 0.72 : 1)
+        }
+
+        // `buttonBorderShape` and `controlSize` only reach the built-in styles, so the
+        // call sites asking for a large capsule are honoured here instead.
+        private var height: CGFloat {
+            switch controlSize {
+            case .large, .extraLarge: 36
+            default: HorusStyle.controlHeight
+            }
+        }
+    }
+}
+#endif
 
 extension View {
     func horusProminentButton() -> some View { modifier(HorusProminentButton()) }
