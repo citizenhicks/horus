@@ -17,6 +17,9 @@ struct AppShell: View {
     #endif
     @State private var columnVisibility = NavigationSplitViewVisibility.all
     @State private var compactColumn = debugStartsOnDetail ? NavigationSplitViewColumn.detail : .sidebar
+    #if os(iOS)
+    @State private var sidebarIsOpen = !debugStartsOnDetail
+    #endif
 
     var body: some View {
         @Bindable var model = model
@@ -30,38 +33,29 @@ struct AppShell: View {
                         .frame(maxWidth: 620)
                         .padding(24)
                 } else {
-                    NavigationSplitView(
-                        columnVisibility: $columnVisibility,
-                        preferredCompactColumn: $compactColumn
-                    ) {
-                        SidebarView(showDetail: showDetail)
-                            .navigationSplitViewColumnWidth(min: 230, ideal: 272, max: 340)
-                    } detail: {
-                        destination
+                    shell
+                        .inspector(isPresented: $model.showsInspector) {
+                            ArtifactInspector()
+                                .overlay(alignment: .top) {
+                                    #if os(iOS)
+                                    if horizontalSizeClass == .compact { AppToastOverlay() }
+                                    #endif
+                                }
+                        }
+                        .sheet(isPresented: $model.showsPairing) {
+                            PairingView(canCancel: true)
+                                .frame(maxWidth: 560)
+                                .padding(24)
+                                .overlay(alignment: .top) { AppToastOverlay() }
+                                .presentationDetents([.medium, .large])
+                        }
+                        .sheet(isPresented: $model.showsWorkspaceBrowser) {
+                            WorkspaceBrowserView()
+                                .frame(idealWidth: 520, idealHeight: 620)
+                                .overlay(alignment: .top) { AppToastOverlay() }
+                                .presentationDetents([.medium, .large])
+                        }
                     }
-                    .navigationSplitViewStyle(.balanced)
-                    .inspector(isPresented: $model.showsInspector) {
-                        ArtifactInspector()
-                            .overlay(alignment: .top) {
-                                #if os(iOS)
-                                if horizontalSizeClass == .compact { AppToastOverlay() }
-                                #endif
-                            }
-                    }
-                    .sheet(isPresented: $model.showsPairing) {
-                        PairingView(canCancel: true)
-                            .frame(maxWidth: 560)
-                            .padding(24)
-                            .overlay(alignment: .top) { AppToastOverlay() }
-                            .presentationDetents([.medium, .large])
-                    }
-                    .sheet(isPresented: $model.showsWorkspaceBrowser) {
-                        WorkspaceBrowserView()
-                            .frame(idealWidth: 520, idealHeight: 620)
-                            .overlay(alignment: .top) { AppToastOverlay() }
-                            .presentationDetents([.medium, .large])
-                    }
-                }
                 AppToastOverlay().zIndex(10)
             }
         }
@@ -92,6 +86,53 @@ struct AppShell: View {
             model.start()
             if scenePhase == .active { await model.appDidBecomeActive() }
         }
+    }
+
+    /// Compact iOS reveals the sidebar under the detail; everything else keeps the split view,
+    /// where two columns fit side by side and nothing has to slide out of the way.
+    @ViewBuilder
+    private var shell: some View {
+        #if os(iOS)
+        if horizontalSizeClass == .compact {
+            SidebarDrawer(isOpen: $sidebarIsOpen) {
+                SidebarView(showDetail: showDetail)
+            } detail: {
+                NavigationStack {
+                    destination
+                        .toolbar {
+                            ToolbarItem(placement: .topBarLeading) {
+                                Button {
+                                    withAnimation(SidebarDrawerMetrics.animation) {
+                                        sidebarIsOpen.toggle()
+                                    }
+                                } label: {
+                                    HorusIcon(systemName: "sidebar.leading", foreground: .primary)
+                                }
+                                .tint(.primary)
+                                .accessibilityLabel(sidebarIsOpen ? "Hide sidebar" : "Show sidebar")
+                            }
+                        }
+                }
+            }
+        } else {
+            splitView
+        }
+        #else
+        splitView
+        #endif
+    }
+
+    private var splitView: some View {
+        NavigationSplitView(
+            columnVisibility: $columnVisibility,
+            preferredCompactColumn: $compactColumn
+        ) {
+            SidebarView(showDetail: showDetail)
+                .navigationSplitViewColumnWidth(min: 230, ideal: 272, max: 340)
+        } detail: {
+            destination
+        }
+        .navigationSplitViewStyle(.balanced)
     }
 
     @ViewBuilder
@@ -126,14 +167,11 @@ struct AppShell: View {
 
     private func showDetail() {
         #if os(iOS)
-        // Back can reveal the compact sidebar without updating this binding. Reassert the
-        // visible column first so a second sidebar selection still produces a transition.
-        if horizontalSizeClass == .compact, compactColumn == .detail {
-            compactColumn = .sidebar
-            Task { @MainActor in
-                await Task.yield()
-                compactColumn = .detail
-            }
+        // The drawer keeps the detail mounted the whole time, so picking something in the
+        // sidebar only has to slide it back over. The split view's compact column needed a
+        // round trip through `.sidebar` here to re-fire a transition; nothing pushes now.
+        if horizontalSizeClass == .compact {
+            withAnimation(SidebarDrawerMetrics.animation) { sidebarIsOpen = false }
             return
         }
         #endif
@@ -149,8 +187,11 @@ struct AppShell: View {
               !model.showsWorkspaceBrowser
         else { return false }
         #if os(iOS)
+        // The drawer, not the split view's column, decides whether the chat is on screen in
+        // compact: `compactColumn` no longer moves there, so reading it would report the chat
+        // permanently hidden and stop delivering it as visible.
         return horizontalSizeClass != .compact
-            || compactColumn == .detail && !model.showsInspector
+            || !sidebarIsOpen && !model.showsInspector
         #else
         return true
         #endif
@@ -445,6 +486,90 @@ private struct FrontendContributionPage: View {
         return widget.widget.text == widget.title ? "" : widget.widget.text
     }
 }
+
+enum SidebarDrawerMetrics {
+    static let width: CGFloat = 300
+    /// How far in from the leading edge a closed drawer answers to a drag. The detail is full
+    /// of scroll views that own horizontal drags of their own, so a closed drawer only takes
+    /// the ones that start at the edge, the way the system back gesture does.
+    static let edgeCatch: CGFloat = 24
+    static let animation: Animation = .snappy(duration: 0.28)
+}
+
+#if os(iOS)
+/// Compact navigation that reveals the sidebar underneath instead of pushing a page over it.
+///
+/// The detail stays mounted and slides aside, so its scroll position, keyboard focus, and any
+/// in-flight turn survive a trip to the sidebar and back — none of which a pushed page keeps.
+private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
+    @Binding var isOpen: Bool
+    @ViewBuilder let sidebar: Sidebar
+    @ViewBuilder let detail: Detail
+
+    @GestureState private var drag: CGFloat = 0
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            sidebar
+                .frame(width: SidebarDrawerMetrics.width)
+                .accessibilityHidden(!isOpen)
+            detail
+                // The sidebar sits directly behind, so the detail has to carry its own opaque
+                // backdrop or it reads as a single translucent pile while it slides.
+                .background { HorusBackdrop() }
+                .accessibilityHidden(isOpen)
+                .overlay { scrim }
+                .offset(x: offset)
+                .shadow(color: .black.opacity(0.22 * progress), radius: 14, x: -3)
+                .gesture(swipe)
+        }
+    }
+
+    @ViewBuilder
+    private var scrim: some View {
+        if progress > 0 {
+            Rectangle()
+                .fill(.black.opacity(0.22 * progress))
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture { setOpen(false) }
+                .accessibilityElement()
+                .accessibilityLabel("Close sidebar")
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction { setOpen(false) }
+        }
+    }
+
+    private var offset: CGFloat {
+        min(max((isOpen ? SidebarDrawerMetrics.width : 0) + drag, 0), SidebarDrawerMetrics.width)
+    }
+
+    private var progress: Double { Double(offset / SidebarDrawerMetrics.width) }
+
+    private var swipe: some Gesture {
+        DragGesture(minimumDistance: 12)
+            .updating($drag) { value, state, _ in
+                guard accepts(value) else { return }
+                state = value.translation.width
+            }
+            .onEnded { value in
+                guard accepts(value) else { return }
+                let projected = (isOpen ? SidebarDrawerMetrics.width : 0)
+                    + value.predictedEndTranslation.width
+                setOpen(projected > SidebarDrawerMetrics.width / 2)
+            }
+    }
+
+    private func accepts(_ value: DragGesture.Value) -> Bool {
+        guard abs(value.translation.width) > abs(value.translation.height) else { return false }
+        return isOpen || value.startLocation.x <= SidebarDrawerMetrics.edgeCatch
+    }
+
+    private func setOpen(_ open: Bool) {
+        withAnimation(SidebarDrawerMetrics.animation) { isOpen = open }
+    }
+}
+#endif
 
 struct SidebarView: View {
     @Environment(AppModel.self) private var model
