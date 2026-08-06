@@ -54,8 +54,10 @@ struct ChatView: View {
         .toolbarTitleDisplayMode(.inline)
         #endif
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
+            ToolbarItem(placement: .primaryAction) {
                 inspectorButton
+            }
+            ToolbarItem(placement: .primaryAction) {
                 ChatOptionsMenu(presentedWidget: $presentedWidget)
             }
         }
@@ -1003,10 +1005,12 @@ private struct BadgeStat: View {
 
 private struct ComposerOptionsView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
 
     var body: some View {
         HStack(spacing: 8) {
             modelMenu
+            approvalMenu
             Spacer()
             actionButtons
         }
@@ -1027,6 +1031,34 @@ private struct ComposerOptionsView: View {
         #endif
         .accessibilityLabel("Model and reasoning")
         .accessibilityValue(modelLabel)
+    }
+
+    private var approvalMenu: some View {
+        Menu {
+            ForEach(approvalOptions) { option in
+                Button(option.label) {
+                    model.setApprovalPolicyForCurrentChat(option.value)
+                }
+            }
+        } label: {
+            HorusLabel(
+                title: approvalLabel,
+                glyph: approvalGlyph,
+                iconColor: approvalForeground
+            )
+                .labelStyle(.iconOnly)
+                .foregroundStyle(approvalForeground)
+                .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.horusPlain)
+        #if os(iOS)
+        .sensoryFeedback(.selection, trigger: approvalValue)
+        #endif
+        .disabled(model.agentDraft == nil || approvalOptions.isEmpty)
+        .help(approvalLabel)
+        .accessibilityLabel("Approval policy")
+        .accessibilityValue(approvalLabel)
     }
 
     @ViewBuilder
@@ -1087,6 +1119,41 @@ private struct ComposerOptionsView: View {
         return model.modelChoices.filter {
             $0.group == currentChoice.group && $0.model == currentChoice.model
         }
+    }
+
+    private var approvalOptions: [FrontendSettingOption] {
+        guard let setting = model.middlewareFeatures
+            .first(where: { $0.id == "sandbox" })?
+            .settings.first(where: { $0.id == "approval_policy" }),
+              case .select(let options, _) = setting.kind
+        else { return [] }
+        return options
+    }
+
+    private var approvalValue: String? {
+        guard let value = model.agentDraft?
+            .middleware.settings["sandbox"]?["approval_policy"],
+              case .string(let policy) = value
+        else { return nil }
+        return policy
+    }
+
+    private var approvalLabel: String {
+        approvalOptions.first(where: { $0.value == approvalValue })?.label ?? "Approval"
+    }
+
+    private var approvalGlyph: HorusGlyph {
+        switch approvalValue {
+        case "allow": .shieldCheck
+        case "allow_network": .plugsConnected
+        case "auto_approve": .sealCheck
+        default: .handPalm
+        }
+    }
+
+    private var approvalForeground: Color {
+        guard let approvalValue else { return palette.muted }
+        return approvalValue == "ask" ? palette.muted : palette.warning
     }
 
     private var modelLabel: String {
@@ -1159,6 +1226,7 @@ private struct ApprovalView: View {
 struct FrontendWidgetView: View {
     @Environment(AppModel.self) private var model
     @State private var showsDetail = false
+    @State private var selectedOption: FrontendPickerOption?
     let widget: MountedWidget
 
     var body: some View {
@@ -1173,9 +1241,17 @@ struct FrontendWidgetView: View {
             }
             .buttonStyle(.horusPlain)
             .accessibilityLabel(accessibilityTitle)
-            .popover(isPresented: $showsDetail) {
-                WidgetContentPopover(content: content, isPresented: $showsDetail)
+            #if os(iOS)
+            .sheet(isPresented: $showsDetail, onDismiss: submitSelectedOption) {
+                WidgetContentPopover(content: content, select: select)
+                    .presentationDetents([.medium, .large])
+                    .presentationDragIndicator(.visible)
             }
+            #else
+            .popover(isPresented: $showsDetail) {
+                WidgetContentPopover(content: content, select: select)
+            }
+            #endif
         } else if widget.widget.action != nil {
             Button(action: submit) {
                 badge
@@ -1211,22 +1287,32 @@ struct FrontendWidgetView: View {
 
     private func openDetail() { showsDetail = true }
     private func submit() { model.submitWidget(widget) }
+
+    private func select(_ option: FrontendPickerOption) {
+        #if os(iOS)
+        selectedOption = option
+        #else
+        model.submitPickerOption(option)
+        #endif
+        showsDetail = false
+    }
+
+    private func submitSelectedOption() {
+        guard let selectedOption else { return }
+        self.selectedOption = nil
+        model.submitPickerOption(selectedOption)
+    }
 }
 
 private struct WidgetContentPopover: View {
-    @Environment(AppModel.self) private var model
     let content: FrontendWidgetContent
-    @Binding var isPresented: Bool
+    let select: (FrontendPickerOption) -> Void
 
     var body: some View {
         BadgePopover(title: content.title) {
             FrontendWidgetContentView(content: content, select: select)
         }
-    }
-
-    private func select(_ option: FrontendPickerOption) {
-        isPresented = false
-        model.submitPickerOption(option)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

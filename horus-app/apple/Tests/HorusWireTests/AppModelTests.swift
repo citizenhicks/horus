@@ -1071,6 +1071,34 @@ final class AppModelTests: XCTestCase {
         )
     }
 
+    func testApprovalPolicyConfiguresTheActiveChatThroughMiddleware() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        var active = composition()
+        active.middleware.setSetting(
+            .string("ask"),
+            middleware: "sandbox",
+            setting: "approval_policy"
+        )
+        model.selectedSessionID = "chat-1"
+        model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
+        model.agentDraft = active
+
+        model.setApprovalPolicyForCurrentChat("allow_network")
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        let request = try XCTUnwrap(requests.first)
+        guard case .configureSession(_, _, let expectedRevision, let config) = request else {
+            return XCTFail("Expected approval policy to configure the active chat")
+        }
+        XCTAssertEqual(expectedRevision, 3)
+        XCTAssertEqual(
+            config.middleware.settings["sandbox"]?["approval_policy"],
+            .string("allow_network")
+        )
+    }
+
     func testProviderRegistrationChainsIntoActiveChatConfiguration() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in

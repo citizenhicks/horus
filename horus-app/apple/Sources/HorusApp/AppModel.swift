@@ -1083,6 +1083,26 @@ final class AppModel {
         applyAgentConfiguration(to: .defaultAgent)
     }
 
+    func setApprovalPolicyForCurrentChat(_ policy: String) {
+        guard let snapshot = agentSnapshot, let draft = agentDraft else { return }
+        guard draft == snapshot.config else {
+            showToast(
+                "Apply or reload pending agent/provider edits before changing approval.",
+                tone: .warning
+            )
+            return
+        }
+        guard draft.middleware.settings["sandbox"]?["approval_policy"] != .string(policy) else {
+            return
+        }
+        agentDraft?.middleware.setSetting(
+            .string(policy),
+            middleware: "sandbox",
+            setting: "approval_policy"
+        )
+        changeAgentForCurrentChat()
+    }
+
     private func applyAgentConfiguration(to target: ConfigurationTarget) {
         guard !isApplyingConfiguration, let draft = agentDraft else { return }
         let id = requestID("configure")
