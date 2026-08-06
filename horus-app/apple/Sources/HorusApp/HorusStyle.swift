@@ -74,9 +74,9 @@ struct HorusGlyph: Hashable {
     static let info = Self("hi.info")
     static let key = Self("hi.key")
     static let link = Self("hi.link")
-    static let list = Self("hi.list")
     static let lockOpen = Self("hi.lockOpen")
     static let magnifyingGlass = Self("hi.magnifyingGlass")
+    static let menu = Self("hi.menu")
     static let moon = Self("hi.moon")
     static let notePencil = Self("hi.notePencil")
     static let path = Self("hi.path")
@@ -290,6 +290,10 @@ enum HorusSymbol {
 
 struct HorusPalette: Sendable {
     let canvas: Color
+    /// One step under `canvas`, for the surface the canvas slides over: the compact drawer
+    /// puts the sidebar directly behind the page, and two surfaces at the same value read as
+    /// one sheet however clean the cut between them is.
+    let recessed: Color
     let panel: Color
     let raised: Color
     let line: Color
@@ -316,6 +320,7 @@ struct HorusPalette: Sendable {
         onAccent = .nord6
         if scheme == .dark {
             canvas = Color(red: 0.141, green: 0.161, blue: 0.200)
+            recessed = Color(red: 0.094, green: 0.106, blue: 0.133)
             panel = .nord0
             raised = .nord1
             line = .nord3
@@ -329,6 +334,7 @@ struct HorusPalette: Sendable {
             muted = Color(red: 0.541, green: 0.588, blue: 0.671)
         } else {
             canvas = .nord6
+            recessed = .nord5
             panel = .nord5
             raised = Color(red: 0.965, green: 0.973, blue: 0.984)
             line = .nord4

@@ -106,7 +106,7 @@ struct AppShell: View {
                                         sidebarIsOpen.toggle()
                                     }
                                 } label: {
-                                    HorusIcon(.list, foreground: .primary)
+                                    HorusIcon(.menu, foreground: .primary)
                                 }
                                 .tint(.primary)
                                 .accessibilityLabel(sidebarIsOpen ? "Hide sidebar" : "Show sidebar")
@@ -165,16 +165,23 @@ struct AppShell: View {
         }
     }
 
-    private func showDetail() {
+    /// Switches the page and brings it back on screen. The two belong in one transaction:
+    /// setting the destination outside the animation swaps the page's content in a frame of its
+    /// own, which reads as a jump before the slide rather than one move.
+    private func showDetail(_ destination: AppDestination) {
         #if os(iOS)
         // The drawer keeps the detail mounted the whole time, so picking something in the
         // sidebar only has to slide it back over. The split view's compact column needed a
         // round trip through `.sidebar` here to re-fire a transition; nothing pushes now.
         if horizontalSizeClass == .compact {
-            withAnimation(SidebarDrawerMetrics.animation) { sidebarIsOpen = false }
+            withAnimation(SidebarDrawerMetrics.animation) {
+                model.destination = destination
+                sidebarIsOpen = false
+            }
             return
         }
         #endif
+        model.destination = destination
         compactColumn = .detail
     }
 
@@ -494,6 +501,13 @@ enum SidebarDrawerMetrics {
     /// the ones that start at the edge, the way the system back gesture does.
     static let edgeCatch: CGFloat = 24
     static let animation: Animation = .snappy(duration: 0.28)
+    /// The display's corner radius, so the page reads as the phone rather than as a card.
+    ///
+    /// Concentric corners are the sanctioned way to ask for this, but they resolve against a
+    /// container shape and nothing supplies one inside a mask — they come back square there.
+    /// UIScreen knows the number and answers only to a private key, so this is the measured
+    /// value for current iPhones instead; older, tighter displays round a touch generously.
+    static let displayCornerRadius: CGFloat = 62
 }
 
 #if os(iOS)
@@ -506,31 +520,93 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
     @ViewBuilder let sidebar: Sidebar
     @ViewBuilder let detail: Detail
 
+    @Environment(\.horusPalette) private var palette
     @GestureState private var drag: CGFloat = 0
 
     var body: some View {
         ZStack(alignment: .leading) {
+            // What the page's cut corners expose. The sidebar's own surface stops at its column,
+            // which is exactly where the page's leading corners are, so without this the corners
+            // reveal the app canvas — the same value the page carries, and the cut vanishes.
+            palette.recessed.ignoresSafeArea()
             sidebar
                 .frame(width: SidebarDrawerMetrics.width)
                 .accessibilityHidden(!isOpen)
             detail
-                // The sidebar sits directly behind, so the detail has to carry its own opaque
-                // backdrop or it reads as a single translucent pile while it slides.
-                .background { HorusBackdrop() }
+                // The sidebar sits directly behind, so the detail carries its own backdrop:
+                // glass, which is what draws the lit rim along the edge the drawer exposes. It
+                // is cut to `pageShape` so the page keeps the display's corners as it slides
+                // aside — a plain rectangle fills those corners back in and the cut disappears.
+                // Whatever sits over the glass has to stay clear of the rim, hence no scrim
+                // tint: dimming the page washes the rim out and the edge stops reading as glass.
+                .background {
+                    // `ignoresSafeArea` first: glass renders into the frame it is given, so
+                    // expanding it afterwards stretches a shape that was already cut to the
+                    // inset rect and the corners come out square.
+                    Color.clear
+                        .ignoresSafeArea()
+                        .glassEffect(.regular, in: pageShape)
+                }
                 .accessibilityHidden(isOpen)
-                .overlay { scrim }
+                // Every page paints its own opaque backdrop, and the toolbar its own scroll
+                // edge effect, both square and both over anything this view puts behind them.
+                // Cutting the corners has to happen after all of it, on the way out.
+                .mask { pageShape.ignoresSafeArea() }
+                .overlay { pageEdge }
                 .offset(x: offset)
-                .shadow(color: .black.opacity(0.22 * progress), radius: 14, x: -3)
                 .gesture(swipe)
         }
+        .sensoryFeedback(.impact(weight: .light), trigger: isOpen)
     }
 
+    /// The display's shape, drawn in the display's own curve family rather than a plain rounded
+    /// rectangle, so the page's corners sit on the bezel's.
+    private var pageShape: ConcentricRectangle {
+        ConcentricRectangle(corners: .fixed(SidebarDrawerMetrics.displayCornerRadius))
+    }
+
+    /// The lit rim of the page's glass, and the tap target that closes the drawer.
+    ///
+    /// Glass over the sidebar's flat canvas has nothing to refract, so the material alone barely
+    /// registers; the specular edge is the part that reads. Only the leading edge gets one —
+    /// stroking the whole shape runs a line along the top and bottom of the display, where it
+    /// meets the bezel's own curve and the two roundings visibly disagree. Fading the ends off
+    /// keeps the highlight clear of the corners entirely.
     @ViewBuilder
-    private var scrim: some View {
+    private var pageEdge: some View {
         if progress > 0 {
-            Rectangle()
-                .fill(.black.opacity(0.22 * progress))
+            pageShape
+                .stroke(
+                    LinearGradient(
+                        // The Nord swatches themselves are file-private to HorusStyle; the
+                        // palette's accent is that same frost blue and is what every other view
+                        // reaches for, so the tint follows it instead of a raw nord constant.
+                        stops: [
+                            .init(color: palette.accent.opacity(0.32), location: 0),
+                            .init(color: palette.accent.opacity(0.16), location: 0.06),
+                            .init(color: .clear, location: 0.22)
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .opacity(progress),
+                    lineWidth: 1
+                )
                 .ignoresSafeArea()
+                // Light falls off down the edge the way it does on a real bevel; an even line
+                // reads as a drawn border instead of a lit one.
+                .mask {
+                    LinearGradient(
+                        stops: [
+                            .init(color: .white, location: 0),
+                            .init(color: .white.opacity(0.45), location: 0.45),
+                            .init(color: .white.opacity(0.25), location: 1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .ignoresSafeArea()
+                }
                 .contentShape(Rectangle())
                 .onTapGesture { setOpen(false) }
                 .accessibilityElement()
@@ -575,7 +651,7 @@ struct SidebarView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.horusPalette) private var palette
-    let showDetail: () -> Void
+    let showDetail: (AppDestination) -> Void
     @State private var collapsedWorkspaces: Set<String> = []
     @State private var sessionToRename: SessionRecord?
     @State private var renameDraft = ""
@@ -653,14 +729,14 @@ struct SidebarView: View {
             .frame(maxWidth: .infinity)
         }
         .font(HorusStyle.bodyFont)
-        // The split view paints its own system background over the app backdrop.
-        .background { HorusBackdrop() }
+        // The split view paints its own system background over the app backdrop, and in compact
+        // the page slides over this, so it sits a step under the canvas rather than matching it.
+        .background { palette.recessed.ignoresSafeArea() }
         .safeAreaInset(edge: .bottom) {
             HStack {
                 Button {
                     model.openNewSession()
-                    model.destination = .chat
-                    showDetail()
+                    showDetail(.chat)
                 } label: {
                     HorusLabel(title: "New chat", glyph: .notePencil)
                         .font(HorusStyle.controlFont)
@@ -672,8 +748,7 @@ struct SidebarView: View {
                 .help("New chat")
                 Spacer()
                 Button {
-                    model.destination = .profile
-                    showDetail()
+                    showDetail(.profile)
                 } label: {
                     HorusIcon(.gear)
                 }
@@ -760,8 +835,7 @@ struct SidebarView: View {
 
     private func navigationButton(_ title: String, destination: AppDestination) -> some View {
         Button {
-            model.destination = destination
-            showDetail()
+            showDetail(destination)
         } label: {
             HorusLabel(
                 title: title,
@@ -784,8 +858,7 @@ struct SidebarView: View {
             if widget.widget.action != nil {
                 model.submitWidget(widget)
             }
-            model.destination = destination
-            showDetail()
+            showDetail(destination)
         } label: {
             HorusLabel(
                 title: widget.widget.text,
@@ -871,8 +944,7 @@ struct SidebarView: View {
 
                 Button {
                     model.chooseWorkspace(group.path)
-                    model.destination = .chat
-                    showDetail()
+                    showDetail(.chat)
                 } label: {
                     HorusLabel(
                         title: "New chat in \(group.name)",
@@ -913,8 +985,7 @@ struct SidebarView: View {
         return HStack(spacing: 4) {
             Button {
                 model.openSession(session.sessionId)
-                model.destination = .chat
-                showDetail()
+                showDetail(.chat)
             } label: {
                 HStack(spacing: 8) {
                     Text(session.displayTitle)

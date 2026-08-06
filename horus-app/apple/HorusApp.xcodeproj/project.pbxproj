@@ -27,6 +27,7 @@
 		200000000000000000000015 /* AppModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000011 /* AppModelTests.swift */; };
 		200000000000000000000016 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000001 /* AppModel.swift */; };
 		200000000000000000000017 /* GatewayClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000005 /* GatewayClient.swift */; };
+		200000000000000000000018 /* HorusStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000009 /* HorusStyle.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -280,6 +281,7 @@
 				200000000000000000000013 /* GatewayStore.swift in Sources */,
 				20000000000000000000000C /* GatewayWire.swift in Sources */,
 				20000000000000000000000D /* GatewayWireTests.swift in Sources */,
+				200000000000000000000018 /* HorusStyle.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
