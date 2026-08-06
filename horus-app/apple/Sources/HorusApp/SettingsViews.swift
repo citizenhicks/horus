@@ -10,6 +10,7 @@ struct AgentSettingsView: View {
         PageScaffold(
             title: "Agent",
             detail: "Change the prompt, capabilities, and execution policy used by the gateway agent.",
+            centersContentOnMac: model.agentDraft == nil,
             headerAccessory: { agentStatusButton }
         ) {
             if model.agentDraft != nil {
@@ -48,48 +49,6 @@ struct AgentSettingsView: View {
         }
     }
 
-    @ViewBuilder
-    private var applyStatus: some View {
-        if model.agentDraft == nil {
-            StatusBanner(
-                tone: .error,
-                title: "Agent unavailable",
-                detail: model.connectionState.isReady
-                    ? "Configure a provider first."
-                    : "Connect to a gateway first."
-            )
-        } else {
-            switch model.applyState {
-            case .idle, .applied:
-                if hasActiveChanges || hasDefaultChanges {
-                    StatusBanner(
-                        tone: .warning,
-                        title: "Unsaved changes",
-                        detail: "Apply the draft to this chat or save it as the gateway default."
-                    )
-                } else {
-                    StatusBanner(
-                        tone: .success,
-                        title: "Up to date",
-                        detail: "The draft matches the saved agent configuration."
-                    )
-                }
-            case .applying:
-                StatusBanner(tone: .neutral, title: "Applying configuration", detail: "The gateway is validating this revision.", progress: true)
-            case .restarting:
-                StatusBanner(tone: .warning, title: "Restarting agent", detail: "The gateway accepted the configuration and is reopening the session.", progress: true)
-            case .busy(let message):
-                StatusBanner(tone: .warning, title: "Agent is busy", detail: message)
-            case .conflict(let message):
-                StatusBanner(tone: .warning, title: "Configuration changed elsewhere", detail: message, action: ("Reload", model.reloadAgentDraft))
-            case .invalid(let message):
-                StatusBanner(tone: .error, title: "Configuration rejected", detail: message)
-            case .failed(let message):
-                StatusBanner(tone: .error, title: "Could not apply", detail: message)
-            }
-        }
-    }
-
     private var agentStatusButton: some View {
         Button {
             showsAgentStatus = true
@@ -110,10 +69,30 @@ struct AgentSettingsView: View {
         .accessibilityValue(agentStatusLabel)
         .help("Agent: \(agentStatusLabel)")
         .popover(isPresented: $showsAgentStatus) {
-            applyStatus
-                .padding(16)
-                .frame(width: 320)
+            agentStatusDetails
         }
+    }
+
+    private var agentStatusDetails: some View {
+        VStack(spacing: 10) {
+            Text(agentStatusLabel)
+                .font(HorusStyle.controlFont.weight(.semibold))
+                .foregroundStyle(agentStatusColor)
+            Text(agentStatusDetail)
+                .font(HorusStyle.bodyFont)
+                .foregroundStyle(palette.muted)
+            if case .conflict = model.applyState {
+                Divider()
+                Button("Reload") {
+                    showsAgentStatus = false
+                    model.reloadAgentDraft()
+                }
+            }
+        }
+        .multilineTextAlignment(.center)
+        .padding(16)
+        .frame(width: 280)
+        .presentationCompactAdaptation(.popover)
     }
 
     private var agentStatusLabel: String {
@@ -141,6 +120,26 @@ struct AgentSettingsView: View {
             palette.warning
         case .invalid, .failed:
             palette.danger
+        }
+    }
+
+    private var agentStatusDetail: String {
+        guard model.agentDraft != nil else {
+            return model.connectionState.isReady
+                ? "Configure a provider first."
+                : "Connect to a gateway first."
+        }
+        return switch model.applyState {
+        case .idle, .applied:
+            hasActiveChanges || hasDefaultChanges
+                ? "Apply the draft to this chat or save it as the gateway default."
+                : "The draft matches the saved agent configuration."
+        case .applying:
+            "The gateway is validating this revision."
+        case .restarting:
+            "The gateway accepted the configuration and is reopening the session."
+        case .busy(let message), .conflict(let message), .invalid(let message), .failed(let message):
+            message
         }
     }
 
@@ -340,7 +339,8 @@ struct ProvidersView: View {
     var body: some View {
         PageScaffold(
             title: "Providers",
-            detail: "Provider state belongs to the gateway. Credential material is write-only and is never returned here."
+            detail: "Provider state belongs to the gateway. Credential material is write-only and is never returned here.",
+            centersContentOnMac: model.providerDraft == nil
         ) {
             if model.providerDraft != nil {
                 Section("Configured") {
@@ -1025,17 +1025,20 @@ struct PageScaffold<HeaderAccessory: View, Content: View>: View {
     @Environment(\.horusPalette) private var palette
     let title: String
     let detail: String
+    let centersContentOnMac: Bool
     let headerAccessory: HeaderAccessory
     let content: Content
 
     init(
         title: String,
         detail: String,
+        centersContentOnMac: Bool = false,
         @ViewBuilder headerAccessory: () -> HeaderAccessory,
         @ViewBuilder content: () -> Content
     ) {
         self.title = title
         self.detail = detail
+        self.centersContentOnMac = centersContentOnMac
         self.headerAccessory = headerAccessory()
         self.content = content()
     }
@@ -1072,10 +1075,21 @@ struct PageScaffold<HeaderAccessory: View, Content: View>: View {
                 }
                 #endif
 
+                #if os(macOS)
+                if !centersContentOnMac { content }
+                #else
                 content
+                #endif
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
+            #if os(iOS)
+            .scrollDismissesKeyboard(.interactively)
+            #else
+            .overlay {
+                if centersContentOnMac { content }
+            }
+            #endif
         }
         #if os(macOS)
         .frame(maxWidth: 780)
@@ -1095,11 +1109,13 @@ extension PageScaffold where HeaderAccessory == EmptyView {
     init(
         title: String,
         detail: String,
+        centersContentOnMac: Bool = false,
         @ViewBuilder content: () -> Content
     ) {
         self.init(
             title: title,
             detail: detail,
+            centersContentOnMac: centersContentOnMac,
             headerAccessory: EmptyView.init,
             content: content
         )

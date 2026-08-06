@@ -1225,6 +1225,9 @@ struct PairingView: View {
         }
         .scrollIndicators(.hidden)
         .scrollBounceBehavior(.basedOnSize)
+        #if os(iOS)
+        .scrollDismissesKeyboard(.interactively)
+        #endif
         .safeAreaInset(edge: .bottom) { pairAction }
         .onSubmit { model.pair() }
     }
