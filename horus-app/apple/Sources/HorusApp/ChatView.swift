@@ -10,6 +10,10 @@ extension MountedWidget {
     var glyph: HorusGlyph {
         widget.symbol.map { HorusSymbol.glyph(for: $0) } ?? .squaresFour
     }
+
+    var systemImage: String {
+        widget.symbol.map { HorusSymbol.systemImage(for: $0) } ?? "square.grid.2x2"
+    }
 }
 
 struct ChatView: View {
@@ -82,25 +86,40 @@ private struct ChatOptionsMenu: View {
                             Button {
                                 model.switchGitBranch(to: branch)
                             } label: {
-                                HorusLabel(
+                                HorusPlatformMenuLabel(
                                     title: branch,
-                                    glyph: branch == git.currentBranch ? .check : .gitBranch
+                                    glyph: branch == git.currentBranch ? .check : .gitBranch,
+                                    systemImage: branch == git.currentBranch
+                                        ? "checkmark"
+                                        : "arrow.trianglehead.branch"
                                 )
                             }
                             .disabled(branch == git.currentBranch)
                         }
                     } label: {
-                        HorusLabel(title: git.currentBranch, glyph: .gitBranch)
+                        HorusPlatformMenuLabel(
+                            title: git.currentBranch,
+                            glyph: .gitBranch,
+                            systemImage: "arrow.trianglehead.branch"
+                        )
                     }
                     .disabled(model.isSwitchingGitBranch || !model.canOpenSession)
                 }
                 Button(action: model.showInspector) {
-                    HorusLabel(title: "Open code diff", glyph: .fileMagnifyingGlass)
+                    HorusPlatformMenuLabel(
+                        title: "Open code diff",
+                        glyph: .fileMagnifyingGlass,
+                        systemImage: "doc.text.magnifyingglass"
+                    )
                 }
                 .disabled(model.gitDiff.isEmpty)
                 if let path = model.workspace?.path {
                     Button { copyToPasteboard(path) } label: {
-                        HorusLabel(title: "Copy workspace path", glyph: .copy)
+                        HorusPlatformMenuLabel(
+                            title: "Copy workspace path",
+                            glyph: .copy,
+                            systemImage: "doc.on.doc"
+                        )
                     }
                 }
             }
@@ -109,25 +128,41 @@ private struct ChatOptionsMenu: View {
                     Button {
                         activate(widget)
                     } label: {
-                        HorusLabel(title: widget.widget.text, glyph: widget.glyph)
+                        HorusPlatformMenuLabel(
+                            title: widget.widget.text,
+                            glyph: widget.glyph,
+                            systemImage: widget.systemImage
+                        )
                     }
                     .disabled(widget.widget.content == nil && widget.widget.action == nil)
                 }
                 Button {
                     model.startCronSetup()
                 } label: {
-                    HorusLabel(title: "Schedule as a task…", glyph: .calendarDots)
+                    HorusPlatformMenuLabel(
+                        title: "Schedule as a task…",
+                        glyph: .calendarDots,
+                        systemImage: "calendar.badge.clock"
+                    )
                 }
                 .disabled(!model.canOpenSession || model.selectedSessionID == nil)
                 Button {
                     model.openWorkspaceBrowser()
                 } label: {
-                    HorusLabel(title: "New chat in another folder…", glyph: .folderPlus)
+                    HorusPlatformMenuLabel(
+                        title: "New chat in another folder…",
+                        glyph: .folderPlus,
+                        systemImage: "folder.badge.plus"
+                    )
                 }
                 .disabled(!model.canCreateSession)
             }
         } label: {
+            #if os(macOS)
+            Image(systemName: "ellipsis")
+            #else
             HorusIcon(.dotsThree)
+            #endif
         }
         .labelStyle(.titleAndIcon)
         .menuIndicator(.hidden)
@@ -477,7 +512,7 @@ private struct TranscriptRow: View {
         }
     }
 
-    private func messageActionGlyph(_ widget: MountedWidget) -> String {
+    private func messageActionGlyph(_ widget: MountedWidget) -> HorusGlyph {
         widget.widget.symbol.map { HorusSymbol.glyph(for: $0) } ?? .dotsThree
     }
 

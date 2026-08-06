@@ -943,30 +943,46 @@ struct SidebarView: View {
                 Button {
                     model.setSessionPinned(session, pinned: !session.pinned)
                 } label: {
-                    HorusLabel(
+                    HorusPlatformMenuLabel(
                         title: session.pinned ? "Unpin" : "Pin",
-                        glyph: session.pinned ? .pushPinSlash : .pushPin
+                        glyph: session.pinned ? .pushPinSlash : .pushPin,
+                        systemImage: session.pinned ? "pin.slash" : "pin"
                     )
                 }
                 Button {
                     renameDraft = session.displayTitle
                     sessionToRename = session
                 } label: {
-                    HorusLabel(title: "Rename", glyph: .pencilSimple)
+                    HorusPlatformMenuLabel(
+                        title: "Rename",
+                        glyph: .pencilSimple,
+                        systemImage: "pencil"
+                    )
                 }
                 Divider()
                 Button(role: .destructive) {
                     sessionToDelete = session
                 } label: {
-                    HorusLabel(title: "Delete", glyph: .trash)
+                    HorusPlatformMenuLabel(
+                        title: "Delete",
+                        glyph: .trash,
+                        systemImage: "trash"
+                    )
                 }
             } label: {
+                #if os(macOS)
+                Image(systemName: "ellipsis")
+                    .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                    .contentShape(Rectangle())
+                #else
                 HorusIcon(.dotsThree)
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                     .contentShape(Rectangle())
+                #endif
             }
             .labelStyle(.titleAndIcon)
             .buttonStyle(.plain)
+            .tint(.primary)
             .menuIndicator(.hidden)
             .accessibilityLabel("Chat actions")
             .help("Chat actions")

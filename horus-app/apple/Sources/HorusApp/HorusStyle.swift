@@ -150,6 +150,21 @@ struct HorusLabel: View {
     }
 }
 
+/// Uses SF Symbols for native macOS menus, whose tinting is owned by AppKit.
+struct HorusPlatformMenuLabel: View {
+    let title: String
+    let glyph: HorusGlyph
+    let systemImage: String
+
+    var body: some View {
+        #if os(macOS)
+        Label(title, systemImage: systemImage)
+        #else
+        HorusLabel(title: title, glyph: glyph)
+        #endif
+    }
+}
+
 /// Row of capsule actions. Rows of several actions drop their labels on a narrow
 /// screen; a single action keeps its label and goes full width instead.
 struct HorusActionRow<Content: View>: View {
@@ -231,30 +246,46 @@ extension Button where Label == HorusLabel {
 /// `FrontendSymbol::Custom` has no entry by definition. It carries a name from outside the
 /// protocol's vocabulary, which this app has no artwork for, so it draws the placeholder.
 enum HorusSymbol {
-    static let placeholder = HorusGlyph.question
+    private struct Artwork {
+        let glyph: HorusGlyph
+        let systemImage: String
+    }
+
+    private static let placeholder = Artwork(
+        glyph: .question,
+        systemImage: "questionmark.square.dashed"
+    )
 
     static func glyph(for symbol: String) -> HorusGlyph {
-        vocabulary[symbol] ?? placeholder
+        artwork(for: symbol).glyph
+    }
+
+    static func systemImage(for symbol: String) -> String {
+        artwork(for: symbol).systemImage
     }
 
     /// One entry per `FrontendSymbol` variant.
-    private static let vocabulary: [String: HorusGlyph] = [
-        "agent": .robot,
-        "brain": .brain,
-        "branch": .gitBranch,
-        "chat": .chatCircle,
-        "chat_gpt": .chatGpt,
-        "claude": .claude,
-        "deepseek": .deepseek,
-        "delete": .trash,
-        "edit": .pencilSimple,
-        "moon": .moon,
-        "promote": .arrowCircleUp,
-        "route": .path,
-        "search": .magnifyingGlass,
-        "sparkle": .sparkle,
-        "storage": .hardDrives,
+    private static let vocabulary: [String: Artwork] = [
+        "agent": Artwork(glyph: .robot, systemImage: "person.fill"),
+        "brain": Artwork(glyph: .brain, systemImage: "brain.head.profile"),
+        "branch": Artwork(glyph: .gitBranch, systemImage: "arrow.trianglehead.branch"),
+        "chat": Artwork(glyph: .chatCircle, systemImage: "text.bubble"),
+        "chat_gpt": Artwork(glyph: .chatGpt, systemImage: "bubble.left.and.text.bubble.right"),
+        "claude": Artwork(glyph: .claude, systemImage: "sparkles"),
+        "deepseek": Artwork(glyph: .deepseek, systemImage: "waveform.path.ecg"),
+        "delete": Artwork(glyph: .trash, systemImage: "trash"),
+        "edit": Artwork(glyph: .pencilSimple, systemImage: "pencil"),
+        "moon": Artwork(glyph: .moon, systemImage: "moon"),
+        "promote": Artwork(glyph: .arrowCircleUp, systemImage: "arrow.up.circle"),
+        "route": Artwork(glyph: .path, systemImage: "point.3.connected.trianglepath.dotted"),
+        "search": Artwork(glyph: .magnifyingGlass, systemImage: "magnifyingglass"),
+        "sparkle": Artwork(glyph: .sparkle, systemImage: "sparkles"),
+        "storage": Artwork(glyph: .hardDrives, systemImage: "externaldrive.connected.to.line.below"),
     ]
+
+    private static func artwork(for symbol: String) -> Artwork {
+        vocabulary[symbol] ?? placeholder
+    }
 }
 
 struct HorusPalette: Sendable {
