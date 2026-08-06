@@ -8,8 +8,8 @@ use horus::backend::checkpoint::SessionSummary;
 use horus::backend::model::ModelChoice;
 use horus::backend::model::provider::HostedWebSearch;
 use horus::protocol::{
-    Event, EventMsg, FrontendBlock, FrontendContribution, FrontendSettingValue, MiddlewareFeature,
-    SessionConfiguredEvent, Submission, TokenUsage,
+    Event, EventMsg, FrontendBlock, FrontendContribution, FrontendSettingValue, FrontendSymbol,
+    MiddlewareFeature, SessionConfiguredEvent, Submission, TokenUsage,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use crate::{Error, Result};
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
@@ -491,7 +491,7 @@ pub struct ProviderConfig {
 pub struct ProviderStatus {
     pub provider: String,
     pub label: String,
-    pub symbol: String,
+    pub symbol: FrontendSymbol,
     pub description: String,
     pub configured: bool,
     pub selection: Option<ProviderConfig>,

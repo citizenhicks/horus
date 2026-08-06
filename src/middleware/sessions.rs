@@ -21,6 +21,7 @@ use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendEvent;
 use crate::protocol::FrontendPickerOption;
 use crate::protocol::FrontendSlot;
+use crate::protocol::FrontendSymbol;
 use crate::protocol::FrontendTone;
 use crate::protocol::FrontendWidget;
 use crate::protocol::MessageTarget;
@@ -101,7 +102,7 @@ impl Middleware for Sessions {
                 slot: FrontendSlot::MessageActions,
                 text: "Fork chat".into(),
                 tone: FrontendTone::Neutral,
-                symbol: Some("fork".into()),
+                symbol: Some(FrontendSymbol::Branch),
                 icon_only: true,
                 progress: None,
                 content: None,
@@ -446,7 +447,7 @@ mod tests {
 
         assert_eq!(widget.slot, FrontendSlot::MessageActions);
         assert_eq!(widget.text, "Fork chat");
-        assert_eq!(widget.symbol.as_deref(), Some("fork"));
+        assert_eq!(widget.symbol, Some(FrontendSymbol::Branch));
         assert_eq!(
             widget.action,
             Some(Op::CapabilityCommand {

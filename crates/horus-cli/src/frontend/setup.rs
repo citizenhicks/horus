@@ -2200,7 +2200,7 @@ fn render_progress(lines: &mut Vec<Line<'static>>, progress: &Progress) {
 
 #[cfg(test)]
 mod tests {
-    use horus::protocol::FrontendSettingOption;
+    use horus::protocol::{FrontendSettingOption, FrontendSymbol};
     use horus_gateway::wire::{ProviderAuthKind, ProviderModel, ProviderStatus, ReasoningChoice};
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2239,7 +2239,7 @@ mod tests {
         ProviderStatus {
             provider: provider.into(),
             label: provider.into(),
-            symbol: "hard-drives".into(),
+            symbol: FrontendSymbol::Storage,
             description: format!("{provider} provider"),
             configured,
             selection: None,

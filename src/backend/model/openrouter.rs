@@ -11,6 +11,7 @@ use super::provider::ProviderBuildConfig;
 use super::provider::ProviderDefinition;
 use super::provider::ReasoningPreset;
 use crate::Result;
+use crate::protocol::FrontendSymbol;
 
 const BASE_URL: &str = "https://openrouter.ai/api/v1";
 
@@ -57,7 +58,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "openrouter",
         "OpenRouter",
-        "path",
+        FrontendSymbol::Route,
         "Responses API across multiple model vendors",
         ProviderAuth::ApiKey("OPENROUTER_API_KEY"),
         MODELS,

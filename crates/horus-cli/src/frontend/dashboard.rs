@@ -1624,8 +1624,8 @@ mod tests {
     use horus::backend::checkpoint::SessionSummary;
     use horus::protocol::{
         FrontendAction, FrontendActionListItem, FrontendBlock, FrontendBlockFormat, FrontendEvent,
-        FrontendPickerOption, FrontendSlot, FrontendTone, FrontendWidget, FrontendWidgetContent,
-        Op, SessionContext,
+        FrontendPickerOption, FrontendSlot, FrontendSymbol, FrontendTone, FrontendWidget,
+        FrontendWidgetContent, Op, SessionContext,
     };
     use horus_gateway::wire::{SessionActivity, SessionActivityState, SessionRecord};
     use ratatui::Terminal;
@@ -1867,14 +1867,14 @@ mod tests {
                     FrontendAction {
                         id: "edit".into(),
                         label: "Edit".into(),
-                        symbol: "pencil".into(),
+                        symbol: FrontendSymbol::Edit,
                         tone: FrontendTone::Neutral,
                         op: edit,
                     },
                     FrontendAction {
                         id: "delete".into(),
                         label: "Delete".into(),
-                        symbol: "trash".into(),
+                        symbol: FrontendSymbol::Delete,
                         tone: FrontendTone::Error,
                         op: delete,
                     },

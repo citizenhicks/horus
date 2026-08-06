@@ -30,6 +30,7 @@ use super::usage_i64;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
+use crate::protocol::FrontendSymbol;
 use crate::protocol::ModelEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::WebSearchAction;
@@ -660,7 +661,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "anthropic",
         "Anthropic",
-        "brain",
+        FrontendSymbol::Brain,
         "Native Messages API with adaptive thinking",
         ProviderAuth::ApiKey("ANTHROPIC_API_KEY"),
         MODELS,

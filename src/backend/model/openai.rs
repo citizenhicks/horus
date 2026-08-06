@@ -33,6 +33,7 @@ use super::usage_i64;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
+use crate::protocol::FrontendSymbol;
 use crate::protocol::ModelEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::WebSearchAction;
@@ -377,7 +378,7 @@ pub(super) const fn generic_provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "responses",
         "Local and Other",
-        "hard-drives",
+        FrontendSymbol::Storage,
         "Any local or remote OpenAI-compatible Responses endpoint",
         ProviderAuth::ApiKey("OPENAI_API_KEY"),
         MODELS,

@@ -327,7 +327,7 @@ fn provider_status(
     ProviderStatus {
         provider: definition.id().into(),
         label: definition.label().into(),
-        symbol: definition.symbol().into(),
+        symbol: definition.symbol().clone(),
         description: definition.description().into(),
         configured,
         selection,
@@ -676,6 +676,7 @@ fn build_middleware(
 mod tests {
     use horus::backend::checkpoint::{Checkpoint, sqlite::SqliteCheckpoint};
     use horus::backend::model::provider::HostedWebSearch;
+    use horus::protocol::FrontendSymbol;
 
     use super::*;
 
@@ -685,7 +686,7 @@ mod tests {
 
         assert_eq!(status.provider, "openai_socket");
         assert_eq!(status.label, "OpenAI (API key)");
-        assert_eq!(status.symbol, "sparkle");
+        assert_eq!(status.symbol, FrontendSymbol::Sparkle);
         assert_eq!(status.models[0].id, "gpt-5.6-sol");
         assert_eq!(
             status.default_api_key_env.as_deref(),

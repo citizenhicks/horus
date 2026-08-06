@@ -139,38 +139,39 @@ extension Button where Label == HorusLabel {
     }
 }
 
-/// Resolves the gateway's symbol names to SF Symbols.
+/// Draws the gateway's `FrontendSymbol` vocabulary in SF Symbols.
 ///
-/// The vocabulary is open — middleware and frontend plugins send whatever they like — and
-/// three conventions have accumulated in it: Phosphor names (`magnifying-glass`), semantic
-/// aliases (`delete`), and names that are already SF Symbols (`pencil`, sent by the CLI
-/// dashboard). A switch listing every name meant the third kind fell through to the
-/// placeholder, so names are now tried against SF Symbols directly and the table below
-/// carries only the ones spelled differently.
+/// The protocol names what a glyph stands for and leaves the artwork to each frontend, so
+/// this table is the Apple client's half of that contract: one entry per `FrontendSymbol`
+/// variant, and the gateway never names an SF Symbol itself. Keep it in step with the enum
+/// in `src/protocol/mod.rs` — a variant with no entry here renders as `placeholder`.
 enum HorusSymbol {
     static let placeholder = "questionmark.square.dashed"
 
-    static func systemName(for semanticName: String) -> String {
-        if let alias = aliases[semanticName] { return alias }
-        if isSystemSymbol(semanticName) { return semanticName }
-        // Phosphor hyphenates what SF Symbols runs together: magnifying-glass, arrows-clockwise.
-        let collapsed = semanticName.replacingOccurrences(of: "-", with: "")
-        if collapsed != semanticName, isSystemSymbol(collapsed) { return collapsed }
+    static func systemName(for symbol: String) -> String {
+        if let known = vocabulary[symbol] { return known }
+        // `FrontendSymbol::Custom`, which the protocol documents as best-effort: try the name
+        // as an SF Symbol, then without the hyphens icon sets tend to use, then give up.
+        if isSystemSymbol(symbol) { return symbol }
+        let collapsed = symbol.replacingOccurrences(of: "-", with: "")
+        if collapsed != symbol, isSystemSymbol(collapsed) { return collapsed }
         return placeholder
     }
 
-    /// Only the names SF Symbols spells differently; the rest resolve on their own.
-    private static let aliases: [String: String] = [
+    /// One entry per `FrontendSymbol` variant.
+    private static let vocabulary: [String: String] = [
+        "agent": "person.fill",
         "brain": "brain.head.profile",
-        "chat-circle": "text.bubble",
+        "branch": "arrow.trianglehead.branch",
+        "chat": "text.bubble",
         "delete": "trash",
         "edit": "pencil",
-        "fork": "arrow.trianglehead.branch",
-        "hard-drives": "externaldrive.connected.to.line.below",
-        "path": "point.3.connected.trianglepath.dotted",
+        "moon": "moon",
         "promote": "arrow.up.circle",
-        "robot": "person.fill",
+        "route": "point.3.connected.trianglepath.dotted",
+        "search": "magnifyingglass",
         "sparkle": "sparkles",
+        "storage": "externaldrive.connected.to.line.below",
     ]
 
     private static func isSystemSymbol(_ name: String) -> Bool {

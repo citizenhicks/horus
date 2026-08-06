@@ -12,6 +12,7 @@ use super::Model;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
+use crate::protocol::FrontendSymbol;
 
 pub use super::transport::streaming_client;
 pub use reqwest::Client as HttpClient;
@@ -205,7 +206,7 @@ type ProviderBuilder = fn(ProviderBuildConfig) -> Result<Arc<dyn Model>>;
 pub struct ProviderDefinition {
     id: &'static str,
     label: &'static str,
-    symbol: &'static str,
+    symbol: FrontendSymbol,
     description: &'static str,
     auth: ProviderAuth,
     models: &'static [ModelPreset],
@@ -222,7 +223,7 @@ impl ProviderDefinition {
     pub(crate) const fn new(
         id: &'static str,
         label: &'static str,
-        symbol: &'static str,
+        symbol: FrontendSymbol,
         description: &'static str,
         auth: ProviderAuth,
         models: &'static [ModelPreset],
@@ -258,8 +259,8 @@ impl ProviderDefinition {
     }
 
     #[must_use]
-    pub const fn symbol(&self) -> &'static str {
-        self.symbol
+    pub const fn symbol(&self) -> &FrontendSymbol {
+        &self.symbol
     }
 
     #[must_use]
@@ -448,7 +449,7 @@ mod tests {
         for provider in providers() {
             assert!(!provider.id().trim().is_empty());
             assert!(!provider.label().trim().is_empty());
-            assert!(!provider.symbol().trim().is_empty());
+            assert!(!provider.symbol().as_str().trim().is_empty());
             assert!(!provider.description().trim().is_empty());
             assert_eq!(provider.web_search().first(), Some(&HostedWebSearch::Off));
 

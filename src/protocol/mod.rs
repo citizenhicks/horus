@@ -316,7 +316,7 @@ pub struct FrontendWidget {
     pub slot: FrontendSlot,
     pub text: String,
     pub tone: FrontendTone,
-    pub symbol: Option<String>,
+    pub symbol: Option<FrontendSymbol>,
     pub icon_only: bool,
     pub progress: Option<FrontendProgress>,
     pub content: Option<FrontendWidgetContent>,
@@ -420,7 +420,7 @@ pub struct FrontendActionListItem {
 pub struct FrontendAction {
     pub id: String,
     pub label: String,
-    pub symbol: String,
+    pub symbol: FrontendSymbol,
     pub tone: FrontendTone,
     pub op: Op,
 }
@@ -459,6 +459,97 @@ pub enum FrontendTone {
     Success,
     Warning,
     Error,
+}
+
+/// A presentation hint rather than a name from any one icon set, the same way
+/// [`FrontendTone`] names a role instead of a color.
+///
+/// A gateway does not know whether the frontend draws SF Symbols, terminal glyphs, or
+/// SVGs, so it names what a glyph stands for and each frontend supplies its own artwork.
+/// Most variants are roles; the ones a provider uses as its mark (`Brain`, `Moon`,
+/// `Sparkle`) name what they depict, because identity is the point there and no role
+/// describes them.
+///
+/// [`Self::Custom`] carries anything outside this list so a plugin can still ship a glyph
+/// this enum has never heard of. It is explicitly best-effort: a frontend that cannot
+/// resolve the name falls back to a placeholder, which is why everything shipped in-tree
+/// should earn a variant instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontendSymbol {
+    Agent,
+    Brain,
+    Branch,
+    Chat,
+    Delete,
+    Edit,
+    Moon,
+    Promote,
+    Route,
+    Search,
+    Sparkle,
+    Storage,
+    Custom(String),
+}
+
+impl FrontendSymbol {
+    /// The wire name. Also the stable token capabilities build action ids from.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Agent => "agent",
+            Self::Brain => "brain",
+            Self::Branch => "branch",
+            Self::Chat => "chat",
+            Self::Delete => "delete",
+            Self::Edit => "edit",
+            Self::Moon => "moon",
+            Self::Promote => "promote",
+            Self::Route => "route",
+            Self::Search => "search",
+            Self::Sparkle => "sparkle",
+            Self::Storage => "storage",
+            Self::Custom(name) => name,
+        }
+    }
+
+    /// Unknown names become [`Self::Custom`] rather than an error: a frontend rendering a
+    /// placeholder is a better outcome than a gateway refusing to decode a whole frame.
+    fn from_wire(name: &str) -> Self {
+        match name {
+            "agent" => Self::Agent,
+            "brain" => Self::Brain,
+            "branch" => Self::Branch,
+            "chat" => Self::Chat,
+            "delete" => Self::Delete,
+            "edit" => Self::Edit,
+            "moon" => Self::Moon,
+            "promote" => Self::Promote,
+            "route" => Self::Route,
+            "search" => Self::Search,
+            "sparkle" => Self::Sparkle,
+            "storage" => Self::Storage,
+            other => Self::Custom(other.to_owned()),
+        }
+    }
+}
+
+impl std::fmt::Display for FrontendSymbol {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for FrontendSymbol {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for FrontendSymbol {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A known name round-trips out of `Custom` on the way back in, so the two spellings
+        // of the same glyph cannot drift apart once a frame has crossed the wire.
+        String::deserialize(deserializer).map(|name| Self::from_wire(&name))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -804,7 +895,7 @@ mod tests {
                 slot: FrontendSlot::ComposerHeader,
                 text: "2 agents".into(),
                 tone: FrontendTone::Neutral,
-                symbol: Some("robot".into()),
+                symbol: Some(FrontendSymbol::Agent),
                 icon_only: true,
                 progress: None,
                 content: None,
@@ -922,5 +1013,43 @@ mod tests {
                 .is_none()
         );
         assert_eq!(total, original);
+    }
+
+    #[test]
+    fn symbols_round_trip_and_keep_unknown_names() {
+        for symbol in [
+            FrontendSymbol::Agent,
+            FrontendSymbol::Brain,
+            FrontendSymbol::Branch,
+            FrontendSymbol::Chat,
+            FrontendSymbol::Delete,
+            FrontendSymbol::Edit,
+            FrontendSymbol::Moon,
+            FrontendSymbol::Promote,
+            FrontendSymbol::Route,
+            FrontendSymbol::Search,
+            FrontendSymbol::Sparkle,
+            FrontendSymbol::Storage,
+        ] {
+            let json = serde_json::to_string(&symbol).expect("symbol serializes");
+            assert_eq!(json, format!("\"{}\"", symbol.as_str()));
+            let decoded: FrontendSymbol = serde_json::from_str(&json).expect("symbol deserializes");
+            assert_eq!(decoded, symbol);
+        }
+
+        // A name this build has never heard of survives instead of failing the frame.
+        let custom: FrontendSymbol =
+            serde_json::from_str("\"telescope\"").expect("unknown symbol deserializes");
+        assert_eq!(custom, FrontendSymbol::Custom("telescope".into()));
+        assert_eq!(custom.as_str(), "telescope");
+
+        // A known name never lingers as a `Custom` once it has crossed the wire, so the two
+        // spellings of one glyph cannot compare unequal.
+        let normalized: FrontendSymbol = serde_json::from_str(
+            &serde_json::to_string(&FrontendSymbol::Custom("edit".into()))
+                .expect("custom serializes"),
+        )
+        .expect("custom deserializes");
+        assert_eq!(normalized, FrontendSymbol::Edit);
     }
 }

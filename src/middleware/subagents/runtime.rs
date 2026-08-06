@@ -19,6 +19,7 @@ use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendEvent;
 use crate::protocol::FrontendPickerOption;
 use crate::protocol::FrontendSlot;
+use crate::protocol::FrontendSymbol;
 use crate::protocol::FrontendTone;
 use crate::protocol::FrontendWidget;
 use crate::protocol::FrontendWidgetContent;
@@ -531,7 +532,7 @@ fn status_widget(tree: &Tree) -> FrontendWidget {
         } else {
             FrontendTone::Neutral
         },
-        symbol: Some("robot".into()),
+        symbol: Some(FrontendSymbol::Agent),
         icon_only: false,
         progress: None,
         content: Some(FrontendWidgetContent::Picker {
@@ -625,7 +626,7 @@ mod tests {
         );
 
         let widget = status_widget(&tree);
-        assert_eq!(widget.symbol.as_deref(), Some("robot"));
+        assert_eq!(widget.symbol, Some(FrontendSymbol::Agent));
         assert_eq!(widget.text, "1");
         assert!(!widget.icon_only);
         assert!(matches!(

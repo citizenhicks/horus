@@ -51,6 +51,7 @@ use super::transport::account_stream_bytes;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
+use crate::protocol::FrontendSymbol;
 use tokio::time::timeout;
 
 const OPENAI_HTTP_URL: &str = "https://api.openai.com/v1";
@@ -570,7 +571,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "openai_socket",
         "OpenAI (API key)",
-        "sparkle",
+        FrontendSymbol::Sparkle,
         "Persistent Responses WebSocket with native compaction",
         ProviderAuth::ApiKey("OPENAI_API_KEY"),
         MODELS,

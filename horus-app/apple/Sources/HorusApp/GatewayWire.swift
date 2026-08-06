@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 10
+let gatewayProtocolVersion = 11
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 

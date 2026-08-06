@@ -734,7 +734,7 @@ fn validate_action_list(title: &str, items: &[FrontendActionListItem]) -> Result
         for action in &item.actions {
             if action.id.trim().is_empty()
                 || action.label.trim().is_empty()
-                || action.symbol.trim().is_empty()
+                || action.symbol.as_str().trim().is_empty()
             {
                 return Err(Error::Config(
                     "frontend list action requires an ID, label, and symbol".into(),
@@ -773,6 +773,7 @@ mod tests {
     use crate::middleware::tools::ToolContext;
     use crate::protocol::FrontendAction;
     use crate::protocol::FrontendReference;
+    use crate::protocol::FrontendSymbol;
     use crate::protocol::Op;
 
     struct UnrenderedTool;
@@ -918,7 +919,7 @@ mod tests {
         let action = FrontendAction {
             id: "edit:item".into(),
             label: "Edit".into(),
-            symbol: "edit".into(),
+            symbol: FrontendSymbol::Edit,
             tone: FrontendTone::Neutral,
             op: Op::SetModel {
                 route: "default".into(),

@@ -39,7 +39,7 @@ final class GatewayWireTests: XCTestCase {
     }
 
     private var sessionReadyPayloadJSON: String {
-        #"{"replay_epoch":"epoch-1","latest_sequence":7,"workspace":{"id":"workspace-1","path":"/srv/horus"},"git":{"current_branch":"main","branches":["feature","main"]},"session":{"session_id":"chat-1","context":{"workspace_id":"workspace-1"},"model":{"route":"openai_socket/gpt-5.6-sol","model":"gpt-5.6-sol","reasoning_effort":"high","model_context_window":200000}},"contributions":[{"capability":"subagents","count":2,"commands":[],"widgets":[{"id":"subagents","slot":"composer_footer","text":"Subagents","tone":"neutral","symbol":"robot","icon_only":true,"progress":null,"content":{"type":"picker","title":"Subagents","options":[{"label":"reviewer","description":"running","detail":"gpt-5.6-sol","op":{"type":"capability_command","capability":"subagents","command":"subagents","arguments":"reviewer","input":null,"target":null}}]},"action":null}],"references":[],"active_input":null}],"tool_count":7,"config":\#(configJSON)}"#
+        #"{"replay_epoch":"epoch-1","latest_sequence":7,"workspace":{"id":"workspace-1","path":"/srv/horus"},"git":{"current_branch":"main","branches":["feature","main"]},"session":{"session_id":"chat-1","context":{"workspace_id":"workspace-1"},"model":{"route":"openai_socket/gpt-5.6-sol","model":"gpt-5.6-sol","reasoning_effort":"high","model_context_window":200000}},"contributions":[{"capability":"subagents","count":2,"commands":[],"widgets":[{"id":"subagents","slot":"composer_footer","text":"Subagents","tone":"neutral","symbol":"agent","icon_only":true,"progress":null,"content":{"type":"picker","title":"Subagents","options":[{"label":"reviewer","description":"running","detail":"gpt-5.6-sol","op":{"type":"capability_command","capability":"subagents","command":"subagents","arguments":"reviewer","input":null,"target":null}}]},"action":null}],"references":[],"active_input":null}],"tool_count":7,"config":\#(configJSON)}"#
     }
 
     private var composition: AgentComposition {
@@ -348,7 +348,7 @@ final class GatewayWireTests: XCTestCase {
         else { return XCTFail("Expected widget picker") }
         XCTAssertEqual(title, "Subagents")
         XCTAssertTrue(widget.iconOnly)
-        XCTAssertEqual(widget.symbol, "robot")
+        XCTAssertEqual(widget.symbol, "agent")
         XCTAssertEqual(option.description, "running")
         XCTAssertEqual(option.detail, "gpt-5.6-sol")
         XCTAssertEqual(capability, "subagents")

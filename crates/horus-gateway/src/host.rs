@@ -2502,7 +2502,7 @@ mod tests {
                             slot: horus::protocol::FrontendSlot::Header,
                             text: "subagents".into(),
                             tone: horus::protocol::FrontendTone::Neutral,
-                            symbol: Some("robot".into()),
+                            symbol: Some(horus::protocol::FrontendSymbol::Agent),
                             icon_only: true,
                             progress: None,
                             content: None,

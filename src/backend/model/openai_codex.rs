@@ -51,6 +51,7 @@ use super::provider::ProviderDefinition;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
+use crate::protocol::FrontendSymbol;
 
 const PROVIDER_ID: &str = "openai_codex";
 const HTTP_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -803,7 +804,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         PROVIDER_ID,
         "OpenAI (ChatGPT)",
-        "chat-circle",
+        FrontendSymbol::Chat,
         "Use a ChatGPT Plus or Pro subscription",
         ProviderAuth::Browser(&BROWSER_AUTH),
         MODELS,

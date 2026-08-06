@@ -11,6 +11,7 @@ use super::provider::ProviderBuildConfig;
 use super::provider::ProviderDefinition;
 use super::provider::ReasoningPreset;
 use crate::Result;
+use crate::protocol::FrontendSymbol;
 
 const BASE_URL: &str = "https://api.deepseek.com";
 
@@ -47,7 +48,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "deepseek",
         "DeepSeek",
-        "magnifying-glass",
+        FrontendSymbol::Search,
         "DeepSeek Responses API",
         ProviderAuth::ApiKey("DEEPSEEK_API_KEY"),
         MODELS,

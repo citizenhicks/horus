@@ -584,7 +584,7 @@ final class AppModelTests: XCTestCase {
                     slot: .messageActions,
                     text: "Fork chat",
                     tone: "neutral",
-                    symbol: "fork",
+                    symbol: "branch",
                     iconOnly: true,
                     progress: nil,
                     content: nil,

@@ -19,6 +19,7 @@ use super::transport::streaming_client;
 use super::transport::take_sse_frame;
 use super::usage_i64;
 use super::{Model, ModelEventSink, ModelInfo, ModelOutput, ModelRequest, ToolDefinition};
+use crate::protocol::FrontendSymbol;
 use crate::protocol::ModelEvent;
 use crate::protocol::TokenUsage;
 use crate::{BoxFuture, Error, Result};
@@ -515,7 +516,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "kimi",
         "Kimi",
-        "moon",
+        FrontendSymbol::Moon,
         "Kimi Chat Completions API",
         ProviderAuth::ApiKey("MOONSHOT_API_KEY"),
         MODELS,

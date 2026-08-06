@@ -21,8 +21,8 @@ use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::model::{ToolDefinition, internal_user_message};
 use crate::protocol::{
     EventMsg, FrontendAction, FrontendActionListItem, FrontendBlock, FrontendCommand,
-    FrontendContribution, FrontendEvent, FrontendSlot, FrontendTone, FrontendWidget,
-    FrontendWidgetContent, Op, internal_message_kind,
+    FrontendContribution, FrontendEvent, FrontendSlot, FrontendSymbol, FrontendTone,
+    FrontendWidget, FrontendWidgetContent, Op, internal_message_kind,
 };
 use crate::{BoxFuture, Error, Result};
 
@@ -654,7 +654,7 @@ fn frontend_widget(
         slot,
         text: text.into(),
         tone: FrontendTone::Neutral,
-        symbol: Some("brain".into()),
+        symbol: Some(FrontendSymbol::Brain),
         icon_only: false,
         progress: None,
         content: Some(content),
@@ -696,7 +696,7 @@ fn action_list_item(scope: Scope, entry: &Entry, already_global: bool) -> Fronte
     if scope == Scope::Session && !already_global {
         actions.push(list_action(
             entry,
-            "promote",
+            FrontendSymbol::Promote,
             "Promote",
             FrontendTone::Neutral,
             format!("promote {}", entry.id),
@@ -705,7 +705,7 @@ fn action_list_item(scope: Scope, entry: &Entry, already_global: bool) -> Fronte
     }
     actions.push(list_action(
         entry,
-        "edit",
+        FrontendSymbol::Edit,
         "Edit",
         FrontendTone::Neutral,
         format!("edit {scope_name} {}", entry.id),
@@ -713,7 +713,7 @@ fn action_list_item(scope: Scope, entry: &Entry, already_global: bool) -> Fronte
     ));
     actions.push(list_action(
         entry,
-        "delete",
+        FrontendSymbol::Delete,
         "Delete",
         FrontendTone::Error,
         format!("forget {scope_name} {}", entry.id),
@@ -728,16 +728,16 @@ fn action_list_item(scope: Scope, entry: &Entry, already_global: bool) -> Fronte
 
 fn list_action(
     entry: &Entry,
-    symbol: &str,
+    symbol: FrontendSymbol,
     label: &str,
     tone: FrontendTone,
     arguments: String,
     input: Option<&str>,
 ) -> FrontendAction {
     FrontendAction {
-        id: format!("{symbol}:{}", entry.id),
+        id: format!("{}:{}", symbol.as_str(), entry.id),
         label: label.into(),
-        symbol: symbol.into(),
+        symbol,
         tone,
         op: Op::CapabilityCommand {
             capability: MANIFEST.id.into(),
