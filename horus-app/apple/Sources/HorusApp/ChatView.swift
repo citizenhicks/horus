@@ -793,9 +793,6 @@ private struct TranscriptRow: View {
             HStack {
                 Spacer(minLength: 42)
                 UserMessageContent(entry: entry)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                    .background(palette.accentSoft, in: HorusStyle.cardShape)
             }
         case .assistant:
             MarkdownText(entry.text, streaming: entry.pending)
@@ -883,12 +880,16 @@ private struct TranscriptRow: View {
     }
 }
 
+/// Attachments sit above the bubble rather than inside it: nesting a bordered card in a
+/// filled bubble reads as a box in a box, and the pill carries the same fill so the pair
+/// still reads as one message.
 private struct UserMessageContent: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
     let entry: TranscriptEntry
 
     var body: some View {
-        VStack(alignment: .trailing, spacing: 8) {
+        VStack(alignment: .trailing, spacing: 6) {
             ForEach(entry.attachments) { attachment in
                 Button {
                     model.previewAttachment(attachment)
@@ -898,9 +899,14 @@ private struct UserMessageContent: View {
                 .buttonStyle(.horusPlain)
                 .disabled(model.isLoadingAttachmentPreview)
                 .accessibilityLabel("Open attachment \(attachment.name)")
+                .accessibilityHint("Opens a preview")
             }
             if !entry.text.isEmpty {
-                Text(entry.text).textSelection(.enabled)
+                Text(entry.text)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .background(palette.accentSoft, in: HorusStyle.cardShape)
             }
         }
     }
@@ -911,24 +917,70 @@ private struct AttachmentRecordLabel: View {
     let attachment: AttachmentRecord
 
     var body: some View {
+        AttachmentCard(
+            name: attachment.name,
+            detail: Text("\(Text(attachmentKind(name: attachment.name, mediaType: attachment.mediaType))) · \(Text(attachment.size, format: .byteCount(style: .file)))"),
+            detailColor: palette.muted
+        )
+    }
+}
+
+/// The shared shape for a file in the transcript and in the composer: a glyph tile, the
+/// name, and one line under it. No thumbnail — the tile carries the weight instead.
+private struct AttachmentCard<Trailing: View>: View {
+    @Environment(\.horusPalette) private var palette
+    let name: String
+    let detail: Text
+    let detailColor: Color
+    let trailing: Trailing
+
+    init(
+        name: String,
+        detail: Text,
+        detailColor: Color,
+        @ViewBuilder trailing: () -> Trailing
+    ) {
+        self.name = name
+        self.detail = detail
+        self.detailColor = detailColor
+        self.trailing = trailing()
+    }
+
+    var body: some View {
         HStack(spacing: 10) {
-            HorusIcon(.fileText, foreground: palette.accent)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(attachment.name)
-                    .font(HorusStyle.metadataFont.weight(.semibold))
+            HorusIcon(.fileText, size: 17, foreground: palette.accent)
+                .frame(width: 34, height: 34)
+                .background(palette.accent.opacity(0.16), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(name)
+                    .font(HorusStyle.badgeFont)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(attachment.size, format: .byteCount(style: .file))
-                    .font(HorusStyle.metadataFont)
-                    .foregroundStyle(palette.muted)
+                detail
+                    .font(HorusStyle.badgeFont)
+                    .foregroundStyle(detailColor)
+                    .lineLimit(1)
             }
-            HorusIcon(.caretRight, size: 12, foreground: palette.muted)
+            Spacer(minLength: 0)
+            trailing
         }
-        .frame(maxWidth: 320, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
-        .padding(.horizontal, 12)
-        .background(palette.panel.opacity(0.72), in: HorusStyle.controlShape)
-        .overlay(HorusStyle.controlShape.stroke(palette.line, lineWidth: HorusStyle.borderWidth))
-        .contentShape(Rectangle())
+        .padding(8)
+        .frame(maxWidth: 280, alignment: .leading)
+        .background(palette.accentSoft, in: HorusStyle.cardShape)
+        .contentShape(HorusStyle.cardShape)
+    }
+}
+
+/// The extension reads faster than a media type, but a name without one still needs a word.
+private func attachmentKind(name: String, mediaType: String) -> String {
+    let ext = URL(fileURLWithPath: name).pathExtension
+    if !ext.isEmpty { return ext.uppercased() }
+    return mediaType.split(separator: "/").last.map { $0.uppercased() } ?? "File"
+}
+
+extension AttachmentCard where Trailing == EmptyView {
+    init(name: String, detail: Text, detailColor: Color) {
+        self.init(name: name, detail: detail, detailColor: detailColor) { EmptyView() }
     }
 }
 
@@ -1799,7 +1851,7 @@ private struct ComposerAttachmentsView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        VStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 6) {
             if !model.canSubmitAttachments {
                 Text(model.attachmentSubmissionUnavailableMessage)
                     .font(HorusStyle.metadataFont)
@@ -1810,6 +1862,7 @@ private struct ComposerAttachmentsView: View {
                 ComposerAttachmentRow(attachment: attachment)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1819,19 +1872,7 @@ private struct ComposerAttachmentRow: View {
     let attachment: ComposerAttachment
 
     var body: some View {
-        HStack(spacing: 10) {
-            HorusIcon(.fileText, foreground: palette.accent)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(attachment.name)
-                    .font(HorusStyle.metadataFont.weight(.semibold))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                status
-                    .font(HorusStyle.metadataFont)
-                    .foregroundStyle(statusColor)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 8)
+        AttachmentCard(name: attachment.name, detail: status, detailColor: statusColor) {
             stateControl
             Button("Remove attachment", glyph: .x) {
                 model.removeComposerAttachment(attachment.id)
@@ -1841,9 +1882,6 @@ private struct ComposerAttachmentRow: View {
             .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
             .disabled(isUploading)
         }
-        .padding(.leading, 12)
-        .background(palette.panel.opacity(0.72), in: HorusStyle.controlShape)
-        .overlay(HorusStyle.controlShape.stroke(palette.line, lineWidth: HorusStyle.borderWidth))
         .accessibilityElement(children: .contain)
     }
 

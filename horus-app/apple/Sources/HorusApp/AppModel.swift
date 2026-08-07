@@ -203,6 +203,52 @@ enum WorkspaceViewerScope: String, CaseIterable, Identifiable {
     }
 }
 
+/// One entry in the workspace file tree. `children` is nil for a file, which is how
+/// `List(children:)` decides a row gets no disclosure control.
+struct FileTreeNode: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let size: Int64?
+    let children: [FileTreeNode]?
+
+    var isFolder: Bool { children != nil }
+
+    /// The gateway sends a flat list of paths; a browser needs them nested, folders first
+    /// and then in the case-insensitive order Finder uses.
+    static func tree(from files: [WorkspaceFileRecord]) -> [FileTreeNode] {
+        nodes(
+            files.map {
+                (components: $0.path.split(separator: "/").map(String.init), size: Int64(clamping: $0.size))
+            },
+            prefix: ""
+        )
+    }
+
+    private static func nodes(
+        _ entries: [(components: [String], size: Int64)],
+        prefix: String
+    ) -> [FileTreeNode] {
+        let groups = Dictionary(grouping: entries.filter { !$0.components.isEmpty }) {
+            $0.components[0]
+        }
+        return groups.map { name, group -> FileTreeNode in
+            let path = prefix.isEmpty ? name : "\(prefix)/\(name)"
+            let nested = group
+                .filter { $0.components.count > 1 }
+                .map { (components: Array($0.components.dropFirst()), size: $0.size) }
+            guard nested.isEmpty else {
+                return FileTreeNode(id: path, name: name, size: nil, children: nodes(nested, prefix: path))
+            }
+            return FileTreeNode(id: path, name: name, size: group[0].size, children: nil)
+        }
+        .sorted {
+            $0.isFolder == $1.isFolder
+                ? $0.name.localizedStandardCompare($1.name) == .orderedAscending
+                : $0.isFolder
+        }
+    }
+}
+
 enum AppLockAuthenticationMethod: Equatable {
     case faceID
     case touchID

@@ -3,22 +3,26 @@ import SwiftUI
 struct ArtifactView: View {
     @Environment(AppModel.self) private var model
 
+    // A NavigationStack for the title and, more to the point, for `.searchable`: the search
+    // field only renders inside a navigation container.
     var body: some View {
-        VStack(spacing: 0) {
-            Text(model.inspectorPage == .changes ? "Files" : "Uploaded files")
-                .font(HorusStyle.controlFont)
-                .frame(maxWidth: .infinity, minHeight: 44, alignment: .center)
-                .accessibilityAddTraits(.isHeader)
-            if model.inspectorPage == .changes {
-                WorkspaceScopePicker()
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 10)
+        NavigationStack {
+            VStack(spacing: 0) {
+                if model.inspectorPage == .changes {
+                    WorkspaceScopePicker()
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 10)
+                    Divider()
+                }
+                ArtifactContent()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
-            Divider()
-            ArtifactContent()
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .navigationTitle(model.inspectorPage == .changes ? "Files" : "Uploaded files")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 }
 
@@ -70,32 +74,99 @@ private struct WorkspaceScopePicker: View {
 
 private struct WorkspaceFileList: View {
     @Environment(AppModel.self) private var model
+    @State private var tree: [FileTreeNode] = []
+    @State private var query = ""
+
+    var body: some View {
+        content
+            .searchable(text: $query, prompt: "Search files")
+            .task(id: model.workspaceFiles) { tree = FileTreeNode.tree(from: model.workspaceFiles) }
+    }
 
     @ViewBuilder
-    var body: some View {
+    private var content: some View {
         if model.isLoadingWorkspaceFiles {
             InspectorLoadingView(title: "Loading workspace files")
         } else if model.workspaceFiles.isEmpty {
             HorusUnavailable(title: "No workspace files", glyph: .fileMagnifyingGlass)
+        } else if !query.isEmpty {
+            searchResults
         } else {
-            List(model.workspaceFiles) { file in
-                Button {
-                    model.previewWorkspaceFile(file)
-                } label: {
-                    InspectorFileRow(
-                        name: URL(fileURLWithPath: file.path).lastPathComponent,
-                        detail: file.path,
-                        size: Int64(clamping: file.size)
-                    )
+            List(tree, children: \.children) { node in
+                if node.isFolder {
+                    FileTreeRow(node: node).inspectorFileListRow()
+                } else {
+                    fileButton(path: node.id, label: FileTreeRow(node: node))
                 }
-                .buttonStyle(.horusPlain)
-                .disabled(model.isLoadingAttachmentPreview)
-                .accessibilityLabel("Open workspace file \(file.path)")
-                .inspectorFileListRow()
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
         }
+    }
+
+    /// A tree hides matches inside collapsed folders, so searching switches to the flat list
+    /// of hits with their full path.
+    @ViewBuilder
+    private var searchResults: some View {
+        let matches = model.workspaceFiles.filter {
+            $0.path.localizedCaseInsensitiveContains(query)
+        }
+        if matches.isEmpty {
+            HorusUnavailable(title: "No matching files", glyph: .magnifyingGlass)
+        } else {
+            List(matches) { file in
+                fileButton(
+                    path: file.path,
+                    label: InspectorFileRow(
+                        name: URL(fileURLWithPath: file.path).lastPathComponent,
+                        detail: file.path,
+                        size: Int64(clamping: file.size)
+                    )
+                )
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+        }
+    }
+
+    private func fileButton(path: String, label: some View) -> some View {
+        Button {
+            guard let file = model.workspaceFiles.first(where: { $0.path == path }) else { return }
+            model.previewWorkspaceFile(file)
+        } label: {
+            label
+        }
+        .buttonStyle(.horusPlain)
+        .disabled(model.isLoadingAttachmentPreview)
+        .accessibilityLabel("Open workspace file \(path)")
+        .inspectorFileListRow()
+    }
+}
+
+private struct FileTreeRow: View {
+    @Environment(\.horusPalette) private var palette
+    let node: FileTreeNode
+
+    var body: some View {
+        HStack(spacing: 10) {
+            HorusIcon(
+                node.isFolder ? .folder : .fileText,
+                size: 15,
+                foreground: node.isFolder ? palette.muted : palette.accent
+            )
+            Text(node.name)
+                .font(HorusStyle.bodyFont)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            if let size = node.size {
+                Text(size, format: .byteCount(style: .file))
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(palette.muted)
+            }
+        }
+        .frame(minHeight: 34)
+        .contentShape(Rectangle())
     }
 }
 
