@@ -305,7 +305,9 @@ mod tests {
 
     #[tokio::test]
     async fn modified_catalog_is_relative_to_a_nested_workspace() {
-        let repository = tempfile::tempdir().expect("repository");
+        // Bubblewrap intentionally masks host /tmp; keep the parent repository visible.
+        let repository = tempfile::tempdir_in(std::env::current_dir().expect("current directory"))
+            .expect("repository");
         let workspace = repository.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
         git(repository.path(), &["init", "--quiet"]);
