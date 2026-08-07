@@ -42,7 +42,7 @@ struct HorusGlyph: Hashable {
     static let arrowClockwise = Self("hi.arrowClockwise")
     static let arrowDown = Self("hi.arrowDown")
     static let arrowUp = Self("hi.arrowUp")
-    static let arrowUp02 = Self("hi.arrowUp")
+    static let arrowUp02 = Self("hi.arrowUp02")
     static let brain = Self("hi.brain")
     static let calendarDots = Self("hi.calendarDots")
     static let caretDown = Self("hi.caretDown")

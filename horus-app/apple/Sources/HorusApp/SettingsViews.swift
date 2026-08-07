@@ -30,13 +30,16 @@ struct AgentSettingsView: View {
                                 Button {
                                     model.selectAgentDraftModel(choice.route)
                                 } label: {
-                                    HorusPlatformMenuLabel(
-                                        title: "\(choice.group) · \(choice.model) · \(choice.reasoningEffort?.capitalized ?? "Default")",
-                                        glyph: choice.route == model.agentDraftModelRoute ? .check : .sparkle,
-                                        systemImage: choice.route == model.agentDraftModelRoute
-                                            ? "checkmark"
-                                            : "sparkles"
-                                    )
+                                    let title = "\(choice.group) · \(choice.model) · \(choice.reasoningEffort?.capitalized ?? "Default")"
+                                    if choice.route == model.agentDraftModelRoute {
+                                        HorusPlatformMenuLabel(
+                                            title: title,
+                                            glyph: .check,
+                                            systemImage: "checkmark"
+                                        )
+                                    } else {
+                                        Text(title)
+                                    }
                                 }
                             }
                         } label: {
@@ -385,7 +388,7 @@ struct ProvidersView: View {
             centersContentOnMac: model.providerDraft == nil
         ) {
             if model.providerDraft != nil {
-                Section("Configured") {
+                Section {
                     if configuredProviders.isEmpty {
                         Text("No provider configured on this gateway.")
                             .foregroundStyle(palette.muted)
@@ -396,6 +399,14 @@ struct ProvidersView: View {
                                     .foregroundStyle(palette.signal)
                             }
                         }
+                    }
+                } header: {
+                    HStack(spacing: 5) {
+                        Text("Configured")
+                        SettingsInfoButton(
+                            title: "Editing configured providers",
+                            detail: "Edit provider details by selecting a configured provider below. When saved to the gateway, all supplied information overrides the existing configuration."
+                        )
                     }
                 }
 
@@ -798,7 +809,7 @@ struct ProfileView: View {
                 }
             }
             Section("Recent runs") {
-                ProfileRecentRuns(runs: model.profile?.recentRuns ?? [])
+                ProfileRecentRuns(groups: model.profile?.recentRunGroups ?? [])
             }
             Section("Appearance") {
                 AppearanceSettings()
@@ -883,57 +894,58 @@ private struct ProfileRunStatsSection: View {
 private struct ProfileRecentRuns: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
-    let runs: [RunSummary]
+    let groups: [SessionRunGroup]
 
     var body: some View {
-        if runs.isEmpty {
+        if groups.isEmpty {
             Text("No completed runs yet.")
                 .font(HorusStyle.bodyFont)
                 .foregroundStyle(palette.muted)
         } else {
-            ForEach(runs) { run in
-                Button {
-                    model.openSession(run.sessionId)
-                    model.destination = .chat
-                } label: {
-                    HStack(spacing: 10) {
-                        HorusIcon(runGlyph(run), foreground: runColor(run))
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 6) {
-                                Text(runTitle(run))
-                                    .font(HorusStyle.controlFont)
-                                    .lineLimit(1)
-                                Text(runDate(run), format: .dateTime.month(.abbreviated).day().hour().minute())
-                                    .font(HorusStyle.metadataFont)
-                                    .foregroundStyle(palette.muted)
+            ForEach(groups) { group in
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(group.title)
+                        .font(HorusStyle.controlFont)
+                        .lineLimit(1)
+                        .padding(.bottom, 2)
+                    ForEach(group.runs) { run in
+                        Button {
+                            model.openSession(group.sessionId)
+                            model.destination = .chat
+                        } label: {
+                            HStack(spacing: 10) {
+                                HorusIcon(runGlyph(run), foreground: runColor(run))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 6) {
+                                        Text(run.sessionId == group.sessionId ? "Run" : "Sub-run")
+                                            .font(HorusStyle.metadataFont.weight(.semibold))
+                                        Text(
+                                            runDate(run),
+                                            format: .dateTime.month(.abbreviated).day().hour().minute()
+                                        )
+                                        .font(HorusStyle.metadataFont)
+                                        .foregroundStyle(palette.muted)
+                                    }
+                                    Text(runDetail(run))
+                                        .font(HorusStyle.metadataFont)
+                                        .foregroundStyle(palette.muted)
+                                        .lineLimit(1)
+                                }
+                                Spacer(minLength: 4)
+                                HorusIcon(.caretRight, size: 12, foreground: palette.muted)
                             }
-                            Text(runDetail(run))
-                                .font(HorusStyle.metadataFont)
-                                .foregroundStyle(palette.muted)
-                                .lineLimit(1)
+                            .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize)
+                            .contentShape(Rectangle())
                         }
-                        Spacer(minLength: 4)
-                        HorusIcon(.caretRight, size: 12, foreground: palette.muted)
+                        .buttonStyle(.horusPlain)
+                        .accessibilityLabel("\(runOutcome(run)), \(group.title)")
+                        .accessibilityValue(runDetail(run))
+                        .accessibilityHint("Opens the chat for this run")
                     }
-                    .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize)
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.horusPlain)
-                .accessibilityLabel("\(runOutcome(run)), \(runTitle(run))")
-                .accessibilityValue(runDetail(run))
-                .accessibilityHint("Opens the chat for this run")
+                .padding(.vertical, 4)
             }
         }
-    }
-
-    private func runTitle(_ run: RunSummary) -> String {
-        guard let session = model.sessions.first(where: { $0.sessionId == run.sessionId }),
-              let title = (session.title ?? session.firstUserMessage)?.trimmingCharacters(
-                in: .whitespacesAndNewlines
-              ),
-              !title.isEmpty
-        else { return "Run \(run.turnId.prefix(8))" }
-        return title
     }
 
     private func runDetail(_ run: RunSummary) -> String {
@@ -1133,7 +1145,7 @@ private struct SettingsInfoButton: View {
         .popover(
             isPresented: $showsDetail,
             attachmentAnchor: .rect(.bounds),
-            arrowEdge: .top
+            arrowEdge: .bottom
         ) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(title)

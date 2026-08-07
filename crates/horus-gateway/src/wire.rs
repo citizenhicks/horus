@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use crate::{Error, Result};
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
@@ -664,7 +664,15 @@ pub struct ProfileSnapshot {
     pub user_name: Option<String>,
     pub daily_usage: Vec<DailyUsage>,
     pub run_stats: RunStats,
-    pub recent_runs: Vec<RunSummary>,
+    pub recent_run_groups: Vec<SessionRunGroup>,
+}
+
+/// Recent executions grouped under their nearest visible session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRunGroup {
+    pub session_id: String,
+    pub title: String,
+    pub runs: Vec<RunSummary>,
 }
 
 /// Completed execution totals plus the active run, when one exists.

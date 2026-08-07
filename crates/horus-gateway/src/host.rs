@@ -12,7 +12,8 @@ use chrono::Utc;
 use horus::agent::{AgentConfig, AgentSender};
 use horus::backend::checkpoint::{
     ActiveExecution, Checkpoint, CheckpointStore, ExecutionOutcome, ExecutionRecord,
-    ExecutionStats, SessionPageRequest, TranscriptPageRequest, sqlite::SqliteCheckpoint,
+    ExecutionStats, SessionPageRequest, SessionSummary, TranscriptPageRequest,
+    sqlite::SqliteCheckpoint,
 };
 use horus::backend::model::provider::provider;
 use horus::middleware::FrontendExtensions;
@@ -35,12 +36,13 @@ use crate::wire::{
     AgentComposition, ArtifactKind, ArtifactRecord, CronRunStatus, ProfileSnapshot, ProviderConfig,
     ReadyPayload, RenderedEvent, RenderedPreview, RunStats, RunSummary, ServerFrame, ServerMessage,
     SessionActivity, SessionActivityState, SessionOutcome, SessionReadyPayload, SessionRecord,
-    SessionWidget, VersionedAgentConfig,
+    SessionRunGroup, SessionWidget, VersionedAgentConfig,
 };
 use crate::{Error, Result};
 
 use self::catalog::{
-    load_session_metadata, save_session_metadata, session_catalog, validate_session_title,
+    SessionCatalogMetadata, load_session_metadata, save_session_metadata, session_catalog,
+    validate_session_title,
 };
 use self::git::{
     diff as workspace_git_diff, status as git_status, switch_branch as switch_workspace_branch,
@@ -50,7 +52,7 @@ const COMMAND_CAPACITY: usize = 128;
 const BROADCAST_CAPACITY: usize = 512;
 const REPLAY_CAPACITY: usize = 1024;
 const ARTIFACT_CAPACITY: usize = 256;
-const EXECUTION_PAGE_SIZE: usize = 100;
+const SESSION_PAGE_SIZE: usize = 100;
 const RECENT_RUN_LIMIT: usize = 30;
 pub(crate) const MAX_ACTIVE_SESSIONS: usize = 32;
 
@@ -511,14 +513,20 @@ impl GatewayHost {
                 .profile();
             (profile, Arc::clone(&state.checkpoints))
         };
-        profile.run_stats = gateway_run_stats(&checkpoints).await.map_err(internal)?;
-        profile.recent_runs = checkpoints
+        let sessions = gateway_session_summaries(&checkpoints)
+            .await
+            .map_err(internal)?;
+        profile.run_stats = gateway_run_stats(&sessions).map_err(internal)?;
+        let recent_runs = checkpoints
             .recent_executions(RECENT_RUN_LIMIT)
             .await
-            .map_err(internal)?
-            .into_iter()
-            .map(run_summary)
-            .collect();
+            .map_err(internal)?;
+        if !recent_runs.is_empty() {
+            let metadata = load_session_metadata(&checkpoints)
+                .await
+                .map_err(internal)?;
+            profile.recent_run_groups = recent_run_groups(recent_runs, &sessions, &metadata);
+        }
         Ok(profile)
     }
 
@@ -1852,24 +1860,32 @@ fn fail_active_cron(
         .map(|_| ())
 }
 
-async fn gateway_run_stats(checkpoints: &Arc<dyn CheckpointStore>) -> Result<RunStats> {
+async fn gateway_session_summaries(
+    checkpoints: &Arc<dyn CheckpointStore>,
+) -> Result<Vec<SessionSummary>> {
     let mut cursor = None;
-    let mut totals = RunStats::default();
+    let mut sessions = Vec::new();
     loop {
         let page = checkpoints
             .list_sessions_page(SessionPageRequest {
                 cursor,
-                limit: EXECUTION_PAGE_SIZE,
+                limit: SESSION_PAGE_SIZE,
             })
             .await?;
-        for session in page.sessions {
-            add_execution_stats(&mut totals, &session.execution_stats)?;
-        }
+        sessions.extend(page.sessions);
         let Some(next) = page.next_cursor else {
-            return Ok(totals);
+            return Ok(sessions);
         };
         cursor = Some(next);
     }
+}
+
+fn gateway_run_stats(sessions: &[SessionSummary]) -> Result<RunStats> {
+    let mut totals = RunStats::default();
+    for session in sessions {
+        add_execution_stats(&mut totals, &session.execution_stats)?;
+    }
+    Ok(totals)
 }
 
 fn add_execution_stats(total: &mut RunStats, stats: &ExecutionStats) -> Result<()> {
@@ -1943,6 +1959,74 @@ fn run_summary(record: ExecutionRecord) -> RunSummary {
         failed_tool_calls: record.failed_tool_calls,
         usage: record.usage,
     }
+}
+
+fn recent_run_groups(
+    records: Vec<ExecutionRecord>,
+    sessions: &[SessionSummary],
+    metadata: &SessionCatalogMetadata,
+) -> Vec<SessionRunGroup> {
+    let sessions_by_id = sessions
+        .iter()
+        .map(|session| (session.session_id.as_str(), session))
+        .collect::<HashMap<_, _>>();
+    let mut groups: Vec<SessionRunGroup> = Vec::new();
+    for record in records {
+        let Some(root) = visible_session(&record.session_id, &sessions_by_id) else {
+            continue;
+        };
+        if metadata
+            .get(&root.session_id)
+            .is_some_and(|item| item.hidden)
+        {
+            continue;
+        }
+        let run = run_summary(record);
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.session_id == root.session_id)
+        {
+            group.runs.push(run);
+        } else {
+            groups.push(SessionRunGroup {
+                session_id: root.session_id.clone(),
+                title: session_run_group_title(root, metadata),
+                runs: vec![run],
+            });
+        }
+    }
+    groups
+}
+
+fn visible_session<'a>(
+    session_id: &str,
+    sessions: &'a HashMap<&str, &'a SessionSummary>,
+) -> Option<&'a SessionSummary> {
+    let mut session = *sessions.get(session_id)?;
+    for _ in 0..sessions.len() {
+        if session.catalog_visible {
+            return Some(session);
+        }
+        session = *sessions.get(session.parent_session_id.as_deref()?)?;
+    }
+    None
+}
+
+fn session_run_group_title(session: &SessionSummary, metadata: &SessionCatalogMetadata) -> String {
+    metadata
+        .get(&session.session_id)
+        .and_then(|item| item.title.as_deref())
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .or_else(|| {
+            session
+                .first_user_message
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+        })
+        .unwrap_or("Untitled")
+        .to_owned()
 }
 
 fn active_run_summary(session_id: &str, active: &ActiveExecution) -> RunSummary {
@@ -2316,7 +2400,7 @@ fn invalid_cron(error: impl std::fmt::Display) -> Rejection {
 mod tests {
     use horus::backend::checkpoint::Checkpoint;
     use horus::backend::model::user_message;
-    use horus::protocol::{TokenCountEvent, TokenUsageInfo};
+    use horus::protocol::{SessionContext, TokenCountEvent, TokenUsageInfo};
 
     use super::*;
 
@@ -2434,6 +2518,128 @@ mod tests {
             ),
             (3, 1, 1, 5, 8, 2, 900, 42, None)
         );
+    }
+
+    #[test]
+    fn recent_runs_group_under_the_nearest_visible_session_in_source_order() {
+        let sessions = vec![
+            session_summary("root", None, true, Some("Root preview")),
+            session_summary("nested-agent", Some("agent"), false, None),
+            session_summary("agent", Some("root"), false, None),
+            session_summary("fork", Some("root"), true, None),
+            session_summary("fork-agent", Some("fork"), false, None),
+        ];
+        let records = vec![
+            execution_record("nested-agent", "nested", 5),
+            execution_record("fork-agent", "fork-agent", 4),
+            execution_record("root", "root", 3),
+            execution_record("fork", "fork", 2),
+        ];
+        let mut metadata = SessionCatalogMetadata::new();
+        metadata.insert(
+            "root".into(),
+            catalog::SessionMetadata {
+                title: Some("Renamed root".into()),
+                ..catalog::SessionMetadata::default()
+            },
+        );
+
+        let groups = recent_run_groups(records, &sessions, &metadata);
+        let projection = groups
+            .iter()
+            .map(|group| {
+                (
+                    group.session_id.as_str(),
+                    group.title.as_str(),
+                    group
+                        .runs
+                        .iter()
+                        .map(|run| (run.session_id.as_str(), run.turn_id.as_str()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            projection,
+            vec![
+                (
+                    "root",
+                    "Renamed root",
+                    vec![("nested-agent", "nested"), ("root", "root")]
+                ),
+                (
+                    "fork",
+                    "Untitled",
+                    vec![("fork-agent", "fork-agent"), ("fork", "fork")]
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_runs_omit_metadata_hidden_roots() {
+        let sessions = vec![
+            session_summary("hidden", None, true, None),
+            session_summary("hidden-agent", Some("hidden"), false, None),
+            session_summary("shown", None, true, Some("  Shown thread  ")),
+        ];
+        let records = vec![
+            execution_record("hidden-agent", "hidden", 2),
+            execution_record("shown", "shown", 1),
+        ];
+        let mut metadata = SessionCatalogMetadata::new();
+        metadata.insert(
+            "hidden".into(),
+            catalog::SessionMetadata {
+                hidden: true,
+                ..catalog::SessionMetadata::default()
+            },
+        );
+
+        let groups = recent_run_groups(records, &sessions, &metadata);
+
+        assert!(matches!(
+            groups.as_slice(),
+            [SessionRunGroup { session_id, title, runs }]
+                if session_id == "shown" && title == "Shown thread" && runs[0].turn_id == "shown"
+        ));
+    }
+
+    fn session_summary(
+        session_id: &str,
+        parent_session_id: Option<&str>,
+        catalog_visible: bool,
+        first_user_message: Option<&str>,
+    ) -> SessionSummary {
+        SessionSummary {
+            session_id: session_id.into(),
+            session_context: SessionContext::default(),
+            parent_session_id: parent_session_id.map(str::to_owned),
+            parent_sequence: parent_session_id.map(|_| 0),
+            sequence: 0,
+            catalog_visible,
+            first_user_message: first_user_message.map(str::to_owned),
+            execution_stats: ExecutionStats::default(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn execution_record(session_id: &str, turn_id: &str, started_at_ms: i64) -> ExecutionRecord {
+        ExecutionRecord {
+            session_id: session_id.into(),
+            submission_id: format!("submission-{turn_id}"),
+            turn_id: turn_id.into(),
+            started_at_ms,
+            finished_at_ms: started_at_ms,
+            elapsed_ms: 0,
+            outcome: ExecutionOutcome::Completed,
+            model_calls: 0,
+            tool_calls: 0,
+            failed_tool_calls: 0,
+            usage: TokenUsage::default(),
+        }
     }
 
     #[tokio::test]

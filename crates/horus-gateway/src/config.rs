@@ -254,7 +254,7 @@ impl GatewayConfig {
                 })
                 .collect(),
             run_stats: crate::wire::RunStats::default(),
-            recent_runs: Vec::new(),
+            recent_run_groups: Vec::new(),
         }
     }
 

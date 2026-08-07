@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 14
+let gatewayProtocolVersion = 15
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 
@@ -1766,7 +1766,15 @@ struct ProfileSnapshot: Codable, Equatable, Sendable {
     let userName: String?
     let dailyUsage: [DailyUsage]
     let runStats: RunStats
-    let recentRuns: [RunSummary]
+    let recentRunGroups: [SessionRunGroup]
+}
+
+struct SessionRunGroup: Identifiable, Codable, Equatable, Sendable {
+    var id: String { sessionId }
+
+    let sessionId: String
+    let title: String
+    let runs: [RunSummary]
 }
 
 struct ExecutionStats: Codable, Hashable, Sendable {

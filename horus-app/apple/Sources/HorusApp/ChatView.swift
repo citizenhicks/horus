@@ -956,7 +956,8 @@ private struct SessionStatsBadge: View {
                 .accessibilityValue(
                     "\(model.contextFillPercent) percent context, \(formatDuration(elapsed)) elapsed"
                 )
-                .popover(isPresented: $showsDetail) {
+                .sensoryFeedback(.selection, trigger: showsDetail)
+                .popover(isPresented: $showsDetail, arrowEdge: .bottom) {
                     BadgePopover(title: "Session") {
                         BadgeStat(
                             label: "Context",
@@ -1055,11 +1056,15 @@ private struct ComposerOptionsView: View {
                 Button {
                     model.setApprovalPolicyForCurrentChat(option.value)
                 } label: {
-                    HorusPlatformMenuLabel(
-                        title: option.label,
-                        glyph: option.value == approvalValue ? .check : .handPalm,
-                        systemImage: option.value == approvalValue ? "checkmark" : "hand.raised"
-                    )
+                    if option.value == approvalValue {
+                        HorusPlatformMenuLabel(
+                            title: option.label,
+                            glyph: .check,
+                            systemImage: "checkmark"
+                        )
+                    } else {
+                        Text(option.label)
+                    }
                 }
             }
         } label: {
@@ -1095,11 +1100,15 @@ private struct ComposerOptionsView: View {
             } label: {
                 let selected = choice.group == currentChoice?.group
                     && choice.model == currentChoice?.model
-                HorusPlatformMenuLabel(
-                    title: "\(choice.group) · \(choice.model)",
-                    glyph: selected ? .check : .sparkle,
-                    systemImage: selected ? "checkmark" : "sparkles"
-                )
+                if selected {
+                    HorusPlatformMenuLabel(
+                        title: "\(choice.group) · \(choice.model)",
+                        glyph: .check,
+                        systemImage: "checkmark"
+                    )
+                } else {
+                    Text("\(choice.group) · \(choice.model)")
+                }
             }
         }
     }
@@ -1111,11 +1120,16 @@ private struct ComposerOptionsView: View {
                 model.selectModel(choice.route)
             } label: {
                 let selected = choice.route == model.selectedModelRoute
-                HorusPlatformMenuLabel(
-                    title: choice.reasoningEffort?.capitalized ?? "Default",
-                    glyph: selected ? .check : .brain,
-                    systemImage: selected ? "checkmark" : "brain.head.profile"
-                )
+                let title = choice.reasoningEffort?.capitalized ?? "Default"
+                if selected {
+                    HorusPlatformMenuLabel(
+                        title: title,
+                        glyph: .check,
+                        systemImage: "checkmark"
+                    )
+                } else {
+                    Text(title)
+                }
             }
         }
     }
@@ -1277,7 +1291,8 @@ struct FrontendWidgetView: View {
             }
             .buttonStyle(.horusPlain)
             .accessibilityLabel(accessibilityTitle)
-            .popover(isPresented: $showsDetail) {
+            .sensoryFeedback(.selection, trigger: showsDetail)
+            .popover(isPresented: $showsDetail, arrowEdge: .bottom) {
                 WidgetContentPopover(content: content, select: select)
             }
         } else if widget.widget.action != nil {
@@ -1364,8 +1379,10 @@ struct FrontendWidgetContentView: View {
                     .foregroundStyle(palette.muted)
                     .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize)
             } else {
-                ForEach(items) { item in
-                    FrontendActionListRow(item: item)
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(items) { item in
+                        FrontendActionListRow(item: item)
+                    }
                 }
             }
         }
@@ -1441,7 +1458,6 @@ private struct FrontendActionListRow: View {
                 #endif
             }
         }
-        .padding(.vertical, 4)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(statusLabel): \(item.text)")
         .alert(

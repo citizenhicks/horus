@@ -1052,11 +1052,13 @@ final class AppModel {
     func selectAgentDraftModel(_ route: String) {
         guard let choice = modelChoices.first(where: { $0.route == route }),
               let status = providerStatus(for: choice),
-              var provider = status.selection
+              var provider = status.selection,
+              var draft = agentDraft
         else { return }
         provider.model = choice.model
         provider.reasoningEffort = choice.reasoningEffort
-        agentDraft?.provider = provider
+        draft.provider = provider
+        agentDraft = draft
     }
 
     private func providerStatus(for choice: ModelChoice) -> ProviderStatus? {
@@ -2074,7 +2076,7 @@ final class AppModel {
             if type == "warning" || type == "error" {
                 if let draft = pendingDrafts.removeValue(forKey: submissionID) { restoreDraft(draft) }
                 previewSelections.removeValue(forKey: submissionID)
-            } else if type == "user_message" {
+            } else {
                 pendingDrafts.removeValue(forKey: submissionID)
             }
         }

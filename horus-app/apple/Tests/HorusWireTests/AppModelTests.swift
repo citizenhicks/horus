@@ -318,6 +318,62 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(branch, "feature")
     }
 
+    func testSteeringDraftSettlesOnSuccessAndRestoresOnWarning() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.selectedSessionID = "chat-1"
+        model.activeTurnID = "turn-1"
+        model.activeOperation = "steer"
+        model.composer = "Use the smaller patch"
+
+        model.sendMessage()
+        try await Task.sleep(for: .milliseconds(20))
+        let firstSubmissions = await recorder.requests().compactMap { request -> Submission? in
+            guard case .submit(_, let submission) = request else { return nil }
+            return submission
+        }
+        let first = try XCTUnwrap(firstSubmissions.first)
+        model.reduce(
+            event: AgentEventRecord(submissionId: first.id, msg: .object([
+                "type": .string("frontend"),
+                "frontendType": .string("remove_widget"),
+                "capability": .string("steering"),
+                "id": .string("queued")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        model.handle(.rejected(GatewayRejection(
+            requestId: "unrelated",
+            code: "connection_failed",
+            message: "Disconnected",
+            fatal: true
+        )))
+
+        XCTAssertEqual(model.composer, "")
+
+        model.composer = "Retry this steering"
+        model.sendMessage()
+        try await Task.sleep(for: .milliseconds(20))
+        let secondSubmissions = await recorder.requests().compactMap { request -> Submission? in
+            guard case .submit(_, let submission) = request else { return nil }
+            return submission
+        }
+        let second = try XCTUnwrap(secondSubmissions.last)
+        model.reduce(
+            event: AgentEventRecord(submissionId: second.id, msg: .object([
+                "type": .string("warning"),
+                "message": .string("Steering queue is full")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+
+        XCTAssertEqual(model.composer, "Retry this steering")
+    }
+
     func testSwitchingGatewaysClearsGatewayScopedStateBeforeTokenLookup() throws {
         let suiteName = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -1212,7 +1268,10 @@ final class AppModelTests: XCTestCase {
             reasoningEffort: target.reasoningEffort,
             contextWindow: 1_048_576
         )
-        model.agentDraft = composition()
+        let original = composition()
+        model.agentSnapshot = VersionedAgentConfig(revision: 1, config: original)
+        model.defaultAgentSnapshot = VersionedAgentConfig(revision: 1, config: original)
+        model.agentDraft = original
         model.modelChoices = [choice]
         model.modelProviders = [choice.route: target.provider]
         model.providerStatuses = [providerStatus(for: target)]
@@ -1221,6 +1280,8 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.agentDraft?.provider, target)
         XCTAssertEqual(model.agentDraftModelRoute, choice.route)
+        XCTAssertNotEqual(model.agentDraft, model.agentSnapshot?.config)
+        XCTAssertNotEqual(model.agentDraft, model.defaultAgentSnapshot?.config)
     }
 
     func testMiddlewareSettingsSetAndClearWithoutCapabilityLogic() {
