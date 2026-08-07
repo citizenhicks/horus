@@ -9,9 +9,10 @@ use horus::backend::sandbox::{
 };
 use horus::{BoxFuture, Error, Result};
 
-const GIT_ENVIRONMENT: [(&str, &str); 6] = [
+const GIT_ENVIRONMENT: [(&str, &str); 7] = [
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1"),
     ("GIT_NO_LAZY_FETCH", "1"),
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GIT_OPTIONAL_LOCKS", "0"),

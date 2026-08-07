@@ -325,9 +325,8 @@ mod tests {
                 "baseline",
             ],
         );
-        std::fs::write(workspace.join("inside.txt"), b"modified contents").expect("inside change");
-        std::fs::write(repository.path().join("outside.txt"), b"modified contents")
-            .expect("outside change");
+        std::fs::write(workspace.join("inside.txt"), b"modified").expect("inside change");
+        std::fs::write(repository.path().join("outside.txt"), b"modified").expect("outside change");
         git(repository.path(), &["add", "."]);
         let (_state, sandbox) = sandbox(&workspace);
 
