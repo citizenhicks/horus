@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -13,6 +15,8 @@ use crate::Result;
 use crate::backend::checkpoint::CHECKPOINT_VERSION;
 use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::CheckpointStore;
+use crate::backend::checkpoint::ExecutionOutcome;
+use crate::backend::checkpoint::ExecutionRecord;
 use crate::backend::model::ModelChoice;
 use crate::backend::model::ModelInfo;
 use crate::backend::model::ModelRouter;
@@ -542,12 +546,20 @@ impl Runner {
     }
 
     async fn save(&mut self) -> Result<u64> {
+        self.persist(None).await
+    }
+
+    async fn save_execution(&mut self, execution: &ExecutionRecord) -> Result<u64> {
+        self.persist(Some(execution)).await
+    }
+
+    async fn persist(&mut self, execution: Option<&ExecutionRecord>) -> Result<u64> {
         let previous_sequence = self.state.sequence;
         self.state.sequence += 1;
         if let Err(error) = self
             .config
             .checkpoints
-            .save(&self.state, &self.transcript_delta)
+            .save(&self.state, &self.transcript_delta, execution)
             .await
         {
             self.state.sequence = previous_sequence;
@@ -555,6 +567,68 @@ impl Runner {
         }
         self.transcript_delta.clear();
         Ok(self.state.sequence)
+    }
+
+    fn record_model_call(&mut self) -> Result<()> {
+        let active =
+            self.state.active_execution.as_mut().ok_or_else(|| {
+                Error::Checkpoint("model called without an active execution".into())
+            })?;
+        active.model_calls = active
+            .model_calls
+            .checked_add(1)
+            .ok_or_else(|| Error::Checkpoint("execution model-call count overflow".into()))?;
+        Ok(())
+    }
+
+    fn record_usage(&mut self, usage: &crate::protocol::TokenUsage) -> Result<()> {
+        let mut total_usage = self.state.total_usage.clone();
+        total_usage.checked_add(usage).ok_or_else(|| {
+            Error::Provider("provider token usage exceeds the supported range".into())
+        })?;
+        let active = self.state.active_execution.as_mut().ok_or_else(|| {
+            Error::Checkpoint("usage recorded without an active execution".into())
+        })?;
+        let mut execution_usage = active.usage.clone();
+        execution_usage.checked_add(usage).ok_or_else(|| {
+            Error::Provider("provider token usage exceeds the supported range".into())
+        })?;
+        self.state.total_usage = total_usage;
+        active.usage = execution_usage;
+        Ok(())
+    }
+
+    fn record_tools(&mut self, tool_calls: u64, failed_tool_calls: u64) -> Result<()> {
+        let active = self.state.active_execution.as_mut().ok_or_else(|| {
+            Error::Checkpoint("tools recorded without an active execution".into())
+        })?;
+        active.tool_calls = active
+            .tool_calls
+            .checked_add(tool_calls)
+            .ok_or_else(|| Error::Checkpoint("execution tool-call count overflow".into()))?;
+        active.failed_tool_calls = active
+            .failed_tool_calls
+            .checked_add(failed_tool_calls)
+            .ok_or_else(|| Error::Checkpoint("execution failed-tool count overflow".into()))?;
+        Ok(())
+    }
+
+    fn finish_execution(&mut self, outcome: ExecutionOutcome) -> Result<ExecutionRecord> {
+        self.state.finish_execution(outcome, unix_timestamp_ms()?)
+    }
+
+    async fn finish_and_save_execution(&mut self, outcome: ExecutionOutcome) -> Result<u64> {
+        let active_execution = self.state.active_execution.clone();
+        let execution_stats = self.state.execution_stats.clone();
+        let execution = self.finish_execution(outcome)?;
+        match self.save_execution(&execution).await {
+            Ok(sequence) => Ok(sequence),
+            Err(error) => {
+                self.state.active_execution = active_execution;
+                self.state.execution_stats = execution_stats;
+                Err(error)
+            }
+        }
     }
 
     fn push_context(&mut self, item: Value) {
@@ -577,6 +651,14 @@ impl Runner {
         )
         .await
     }
+}
+
+fn unix_timestamp_ms() -> Result<i64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::Checkpoint("system clock predates the Unix epoch".into()))?;
+    i64::try_from(elapsed.as_millis())
+        .map_err(|_| Error::Checkpoint("system clock exceeds the supported range".into()))
 }
 
 async fn send_event(events: &mpsc::Sender<Event>, event: Event) -> Result<()> {

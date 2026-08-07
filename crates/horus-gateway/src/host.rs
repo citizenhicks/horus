@@ -4,34 +4,38 @@ mod catalog;
 mod git;
 mod providers;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use chrono::Utc;
 use horus::agent::{AgentConfig, AgentSender};
-use horus::backend::checkpoint::{Checkpoint, CheckpointStore, sqlite::SqliteCheckpoint};
+use horus::backend::checkpoint::{
+    ActiveExecution, Checkpoint, CheckpointStore, ExecutionOutcome, ExecutionRecord,
+    ExecutionStats, SessionPageRequest, TranscriptPageRequest, sqlite::SqliteCheckpoint,
+};
 use horus::backend::model::provider::provider;
 use horus::middleware::FrontendExtensions;
 use horus::middleware::scratchpad::ScratchpadStore;
 use horus::protocol::{
     Event, EventMsg, FrontendBlock, FrontendBlockFormat, FrontendEvent, Op, ReviewDecision,
-    Submission, TokenUsage,
+    Submission, TokenUsage, replay_events,
 };
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::assembly::{
-    BuiltAgent, assemble, configured_model_choices, configured_provider_for_route,
-    provider_statuses,
+    BuiltAgent, assemble, configured_model_choices, configured_model_providers,
+    configured_provider_for_route, provider_statuses,
 };
 use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig, usage_delta};
 use crate::cron::{ActiveCronRun, BeginRun, CronStore};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{
     AgentComposition, ArtifactKind, ArtifactRecord, CronRunStatus, ProfileSnapshot, ProviderConfig,
-    ReadyPayload, RenderedEvent, RenderedPreview, ServerFrame, ServerMessage, SessionActivity,
-    SessionActivityState, SessionOutcome, SessionReadyPayload, SessionRecord, VersionedAgentConfig,
+    ReadyPayload, RenderedEvent, RenderedPreview, RunStats, RunSummary, ServerFrame, ServerMessage,
+    SessionActivity, SessionActivityState, SessionOutcome, SessionReadyPayload, SessionRecord,
+    SessionWidget, VersionedAgentConfig,
 };
 use crate::{Error, Result};
 
@@ -46,9 +50,12 @@ const COMMAND_CAPACITY: usize = 128;
 const BROADCAST_CAPACITY: usize = 512;
 const REPLAY_CAPACITY: usize = 1024;
 const ARTIFACT_CAPACITY: usize = 256;
+const EXECUTION_PAGE_SIZE: usize = 100;
+const RECENT_RUN_LIMIT: usize = 30;
 pub(crate) const MAX_ACTIVE_SESSIONS: usize = 32;
 
 type SessionActivities = Arc<StdMutex<HashMap<String, SessionActivity>>>;
+type SessionWidgets = BTreeMap<(String, String), horus::protocol::FrontendWidget>;
 
 #[derive(Clone)]
 pub(crate) struct HostHandle {
@@ -87,6 +94,11 @@ pub(crate) struct HostSnapshot {
     pub(crate) replay: Vec<ServerFrame>,
 }
 
+pub(crate) struct SessionHistoryPage {
+    pub(crate) events: Vec<RenderedEvent>,
+    pub(crate) next_before_sequence: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Rejection {
     pub(crate) code: &'static str,
@@ -117,6 +129,7 @@ struct HostState {
     sequence: u64,
     replay: VecDeque<ServerFrame>,
     artifacts: VecDeque<ArtifactRecord>,
+    widgets: SessionWidgets,
     commands: mpsc::Receiver<HostCommand>,
     events: broadcast::Sender<ServerFrame>,
     gateway_events: broadcast::Sender<ServerFrame>,
@@ -146,6 +159,11 @@ enum HostCommand {
         last_sequence: Option<u64>,
         replay_epoch: Option<String>,
         reply: oneshot::Sender<std::result::Result<HostSnapshot, Rejection>>,
+    },
+    HistoryPage {
+        before_sequence: Option<u64>,
+        max_batches: usize,
+        reply: oneshot::Sender<std::result::Result<SessionHistoryPage, Rejection>>,
     },
     RenameSession {
         session_id: String,
@@ -484,12 +502,23 @@ impl GatewayHost {
     }
 
     pub(crate) async fn profile(&self) -> std::result::Result<ProfileSnapshot, Rejection> {
-        let state = self.state.lock().await;
-        let profile = state
-            .config
-            .lock()
-            .map_err(|_| internal("gateway configuration lock is poisoned"))?
-            .profile();
+        let (mut profile, checkpoints) = {
+            let state = self.state.lock().await;
+            let profile = state
+                .config
+                .lock()
+                .map_err(|_| internal("gateway configuration lock is poisoned"))?
+                .profile();
+            (profile, Arc::clone(&state.checkpoints))
+        };
+        profile.run_stats = gateway_run_stats(&checkpoints).await.map_err(internal)?;
+        profile.recent_runs = checkpoints
+            .recent_executions(RECENT_RUN_LIMIT)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(run_summary)
+            .collect();
         Ok(profile)
     }
 
@@ -602,6 +631,7 @@ impl HostHandle {
             sequence: 0,
             replay: VecDeque::with_capacity(REPLAY_CAPACITY),
             artifacts: VecDeque::with_capacity(ARTIFACT_CAPACITY),
+            widgets: BTreeMap::new(),
             commands: receiver,
             events: events.clone(),
             gateway_events,
@@ -635,6 +665,21 @@ impl HostHandle {
         self.send(HostCommand::Snapshot {
             last_sequence,
             replay_epoch,
+            reply,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    pub(crate) async fn history_page(
+        &self,
+        before_sequence: Option<u64>,
+        max_batches: usize,
+    ) -> std::result::Result<SessionHistoryPage, Rejection> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(HostCommand::HistoryPage {
+            before_sequence,
+            max_batches,
             reply,
         })
         .await?;
@@ -877,6 +922,13 @@ impl HostState {
                         .await,
                 );
             }
+            HostCommand::HistoryPage {
+                before_sequence,
+                max_batches,
+                reply,
+            } => {
+                let _ = reply.send(self.history_page_value(before_sequence, max_batches).await);
+            }
             HostCommand::RenameSession {
                 session_id,
                 title,
@@ -984,6 +1036,60 @@ impl HostState {
         Ok(HostSnapshot {
             ready: self.ready().await.map_err(internal)?,
             replay,
+        })
+    }
+
+    async fn history_page_value(
+        &self,
+        before_sequence: Option<u64>,
+        max_batches: usize,
+    ) -> std::result::Result<SessionHistoryPage, Rejection> {
+        let page = self
+            .checkpoints
+            .transcript_page(
+                &self.running.session_id,
+                TranscriptPageRequest {
+                    before_sequence,
+                    max_batches,
+                },
+            )
+            .await
+            .map_err(internal)?;
+        let next_before_sequence = page.next_before_sequence;
+        let mut items = page.into_positioned_items_chronological();
+        let Some(oldest_sequence) = items.first().map(|(target, _)| target.checkpoint_sequence)
+        else {
+            return Ok(SessionHistoryPage {
+                events: Vec::new(),
+                next_before_sequence,
+            });
+        };
+        let prefix = self
+            .checkpoints
+            .transcript_page(
+                &self.running.session_id,
+                TranscriptPageRequest {
+                    before_sequence: Some(oldest_sequence),
+                    max_batches: 1,
+                },
+            )
+            .await
+            .map_err(internal)?
+            .into_positioned_items_chronological();
+        let prefix_events = replay_events(&prefix, &self.running.session_id).len();
+        let mut context = prefix;
+        context.append(&mut items);
+        let events = replay_events(&context, &self.running.session_id)
+            .into_iter()
+            .skip(prefix_events)
+            .map(|event| RenderedEvent {
+                blocks: self.running.frontend.render(&event),
+                event,
+            })
+            .collect();
+        Ok(SessionHistoryPage {
+            events,
+            next_before_sequence,
         })
     }
 
@@ -1306,6 +1412,7 @@ impl HostState {
         );
         let previous = std::mem::replace(&mut self.running, replacement);
         self.suppress_history_broadcast = suppress_history_broadcast;
+        self.widgets.clear();
         shutdown_agent(previous).await;
         if suppress_history_broadcast {
             self.record_replacement_startup().map_err(internal)?;
@@ -1403,6 +1510,7 @@ impl HostState {
                 self.store.save(&gateway)?;
             }
         }
+        update_widgets(&mut self.widgets, &event.msg);
         let blocks = self.running.frontend.render(&event.msg);
         self.record_artifacts(&blocks);
         let history = render_history(&self.running.frontend, &event.msg);
@@ -1509,6 +1617,16 @@ impl HostState {
     }
 
     async fn ready(&self) -> Result<SessionReadyPayload> {
+        let checkpoint = self
+            .checkpoints
+            .load(&self.running.session_id)
+            .await?
+            .ok_or_else(|| Error::Config("the running session has no checkpoint".into()))?;
+        let mut run_stats = completed_run_stats(&checkpoint.execution_stats);
+        run_stats.active = checkpoint
+            .active_execution
+            .as_ref()
+            .map(|active| active_run_summary(&checkpoint.session_id, active));
         Ok(SessionReadyPayload {
             replay_epoch: self.replay_epoch.clone(),
             latest_sequence: self.sequence,
@@ -1516,7 +1634,16 @@ impl HostState {
             git: git_status(&self.running.gateway_sandbox).await,
             session: self.running.session.clone(),
             contributions: self.running.frontend.contributions().to_vec(),
+            widgets: self
+                .widgets
+                .iter()
+                .map(|((capability, _), item)| SessionWidget {
+                    capability: capability.clone(),
+                    item: item.clone(),
+                })
+                .collect(),
             tool_count: self.running.tool_count,
+            run_stats,
             config: self.spec.agent.clone(),
         })
     }
@@ -1725,6 +1852,128 @@ fn fail_active_cron(
         .map(|_| ())
 }
 
+async fn gateway_run_stats(checkpoints: &Arc<dyn CheckpointStore>) -> Result<RunStats> {
+    let mut cursor = None;
+    let mut totals = RunStats::default();
+    loop {
+        let page = checkpoints
+            .list_sessions_page(SessionPageRequest {
+                cursor,
+                limit: EXECUTION_PAGE_SIZE,
+            })
+            .await?;
+        for session in page.sessions {
+            add_execution_stats(&mut totals, &session.execution_stats)?;
+        }
+        let Some(next) = page.next_cursor else {
+            return Ok(totals);
+        };
+        cursor = Some(next);
+    }
+}
+
+fn add_execution_stats(total: &mut RunStats, stats: &ExecutionStats) -> Result<()> {
+    let (
+        Some(run_count),
+        Some(failed_run_count),
+        Some(aborted_run_count),
+        Some(model_calls),
+        Some(tool_calls),
+        Some(failed_tool_calls),
+        Some(elapsed_ms),
+    ) = (
+        total.run_count.checked_add(stats.run_count),
+        total.failed_run_count.checked_add(stats.failed_run_count),
+        total.aborted_run_count.checked_add(stats.aborted_run_count),
+        total.model_calls.checked_add(stats.model_calls),
+        total.tool_calls.checked_add(stats.tool_calls),
+        total.failed_tool_calls.checked_add(stats.failed_tool_calls),
+        total.elapsed_ms.checked_add(stats.elapsed_ms),
+    )
+    else {
+        return Err(Error::Config(
+            "gateway execution statistics exceed the supported range".into(),
+        ));
+    };
+    let mut usage = total.usage.clone();
+    if usage.checked_add(&stats.usage).is_none() {
+        return Err(Error::Config(
+            "gateway execution statistics exceed the supported range".into(),
+        ));
+    }
+    *total = RunStats {
+        run_count,
+        failed_run_count,
+        aborted_run_count,
+        model_calls,
+        tool_calls,
+        failed_tool_calls,
+        elapsed_ms,
+        usage,
+        active: None,
+    };
+    Ok(())
+}
+
+fn completed_run_stats(stats: &ExecutionStats) -> RunStats {
+    RunStats {
+        run_count: stats.run_count,
+        failed_run_count: stats.failed_run_count,
+        aborted_run_count: stats.aborted_run_count,
+        model_calls: stats.model_calls,
+        tool_calls: stats.tool_calls,
+        failed_tool_calls: stats.failed_tool_calls,
+        elapsed_ms: stats.elapsed_ms,
+        usage: stats.usage.clone(),
+        active: None,
+    }
+}
+
+fn run_summary(record: ExecutionRecord) -> RunSummary {
+    RunSummary {
+        session_id: record.session_id,
+        submission_id: record.submission_id,
+        turn_id: record.turn_id,
+        started_at_ms: record.started_at_ms,
+        finished_at_ms: Some(record.finished_at_ms),
+        elapsed_ms: record.elapsed_ms,
+        outcome: Some(session_outcome(record.outcome)),
+        model_calls: record.model_calls,
+        tool_calls: record.tool_calls,
+        failed_tool_calls: record.failed_tool_calls,
+        usage: record.usage,
+    }
+}
+
+fn active_run_summary(session_id: &str, active: &ActiveExecution) -> RunSummary {
+    let elapsed_ms = Utc::now()
+        .timestamp_millis()
+        .checked_sub(active.started_at_ms)
+        .and_then(|elapsed| u64::try_from(elapsed).ok())
+        .unwrap_or_default();
+    RunSummary {
+        session_id: session_id.into(),
+        submission_id: active.submission_id.clone(),
+        turn_id: active.turn_id.clone(),
+        started_at_ms: active.started_at_ms,
+        finished_at_ms: None,
+        elapsed_ms,
+        outcome: None,
+        model_calls: active.model_calls,
+        tool_calls: active.tool_calls,
+        failed_tool_calls: active.failed_tool_calls,
+        usage: active.usage.clone(),
+    }
+}
+
+const fn session_outcome(outcome: ExecutionOutcome) -> SessionOutcome {
+    match outcome {
+        ExecutionOutcome::Completed => SessionOutcome::Completed,
+        ExecutionOutcome::Aborted => SessionOutcome::Aborted,
+        ExecutionOutcome::Failed => SessionOutcome::Failed,
+    }
+}
+
 async fn gateway_ready(state: &GatewayState) -> std::result::Result<ReadyPayload, Rejection> {
     let config = state
         .config
@@ -1733,6 +1982,8 @@ async fn gateway_ready(state: &GatewayState) -> std::result::Result<ReadyPayload
         .clone();
     let models =
         configured_model_choices(&config, &state.store, &state.credentials).map_err(internal)?;
+    let model_providers =
+        configured_model_providers(&config, &state.store, &state.credentials).map_err(internal)?;
     let middleware_features = crate::middleware_manifest::features(&models);
     Ok(ReadyPayload {
         sessions: session_catalog(&state.checkpoints, &state.activities)
@@ -1741,6 +1992,7 @@ async fn gateway_ready(state: &GatewayState) -> std::result::Result<ReadyPayload
         providers: provider_statuses(&config, &state.store, &state.credentials)
             .map_err(internal)?,
         models,
+        model_providers,
         default_config: config.default_agent,
         middleware_features,
         max_active_sessions: MAX_ACTIVE_SESSIONS,
@@ -1840,7 +2092,7 @@ async fn hide_checkpoint(checkpoints: &Arc<dyn CheckpointStore>, session_id: &st
         .sequence
         .checked_add(1)
         .ok_or_else(|| Error::Config("checkpoint sequence overflow".into()))?;
-    checkpoints.save(&checkpoint, &[]).await?;
+    checkpoints.save(&checkpoint, &[], None).await?;
     Ok(())
 }
 
@@ -1924,6 +2176,18 @@ fn reset_replay_for_restart(
 ) -> bool {
     replay.clear();
     previous_session == next_session
+}
+
+fn update_widgets(widgets: &mut SessionWidgets, event: &EventMsg) {
+    match event {
+        EventMsg::Frontend(FrontendEvent::Widget { capability, item }) => {
+            widgets.insert((capability.clone(), item.id.clone()), item.clone());
+        }
+        EventMsg::Frontend(FrontendEvent::RemoveWidget { capability, id }) => {
+            widgets.remove(&(capability.clone(), id.clone()));
+        }
+        _ => {}
+    }
 }
 
 fn upsert_artifact(
@@ -2051,6 +2315,7 @@ fn invalid_cron(error: impl std::fmt::Display) -> Rejection {
 #[cfg(test)]
 mod tests {
     use horus::backend::checkpoint::Checkpoint;
+    use horus::backend::model::user_message;
     use horus::protocol::{TokenCountEvent, TokenUsageInfo};
 
     use super::*;
@@ -2083,6 +2348,143 @@ mod tests {
             (startup, live, baseline),
             (None, Some(usage(30)), usage(130))
         );
+    }
+
+    #[test]
+    fn widget_snapshot_is_namespaced_updated_and_removed() {
+        let widget = |text: &str| horus::protocol::FrontendWidget {
+            id: "status".into(),
+            slot: horus::protocol::FrontendSlot::Header,
+            text: text.into(),
+            tone: horus::protocol::FrontendTone::Neutral,
+            symbol: None,
+            icon_only: false,
+            progress: None,
+            content: None,
+            action: None,
+        };
+        let mut widgets = SessionWidgets::new();
+        update_widgets(
+            &mut widgets,
+            &EventMsg::Frontend(FrontendEvent::Widget {
+                capability: "tasks".into(),
+                item: widget("one"),
+            }),
+        );
+        update_widgets(
+            &mut widgets,
+            &EventMsg::Frontend(FrontendEvent::Widget {
+                capability: "subagents".into(),
+                item: widget("two"),
+            }),
+        );
+        update_widgets(
+            &mut widgets,
+            &EventMsg::Frontend(FrontendEvent::Widget {
+                capability: "tasks".into(),
+                item: widget("updated"),
+            }),
+        );
+        update_widgets(
+            &mut widgets,
+            &EventMsg::Frontend(FrontendEvent::RemoveWidget {
+                capability: "subagents".into(),
+                id: "status".into(),
+            }),
+        );
+
+        assert_eq!(
+            widgets
+                .into_iter()
+                .map(|((capability, id), item)| (capability, id, item.text))
+                .collect::<Vec<_>>(),
+            vec![("tasks".into(), "status".into(), "updated".into())]
+        );
+    }
+
+    #[test]
+    fn completed_execution_stats_project_without_an_active_run() {
+        let stats = ExecutionStats {
+            run_count: 3,
+            failed_run_count: 1,
+            aborted_run_count: 1,
+            model_calls: 5,
+            tool_calls: 8,
+            failed_tool_calls: 2,
+            elapsed_ms: 900,
+            usage: TokenUsage {
+                total_tokens: 42,
+                ..TokenUsage::default()
+            },
+        };
+
+        let projected = completed_run_stats(&stats);
+
+        assert_eq!(
+            (
+                projected.run_count,
+                projected.failed_run_count,
+                projected.aborted_run_count,
+                projected.model_calls,
+                projected.tool_calls,
+                projected.failed_tool_calls,
+                projected.elapsed_ms,
+                projected.usage.total_tokens,
+                projected.active,
+            ),
+            (3, 1, 1, 5, 8, 2, 900, 42, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_history_pages_are_chronological_and_cursor_driven() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let (store, config) =
+            ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+        let host = gateway
+            .create_session(&workspace)
+            .await
+            .expect("create session");
+        let checkpoints = Arc::clone(&gateway.state.lock().await.checkpoints);
+        let mut checkpoint = checkpoints
+            .load(host.session_id())
+            .await
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        let user = user_message("first");
+        checkpoint.sequence += 1;
+        checkpoint.context.push(user.clone());
+        checkpoints
+            .save(&checkpoint, &[user], None)
+            .await
+            .expect("save user message");
+        let assistant = serde_json::json!({"role": "assistant", "content": "second"});
+        checkpoint.sequence += 1;
+        checkpoint.context.push(assistant.clone());
+        checkpoints
+            .save(&checkpoint, &[assistant], None)
+            .await
+            .expect("save assistant message");
+
+        let newest = host.history_page(None, 1).await.expect("newest page");
+        let oldest = host
+            .history_page(newest.next_before_sequence, 1)
+            .await
+            .expect("oldest page");
+
+        assert!(matches!(
+            (&oldest.events[..], &newest.events[..]),
+            ([RenderedEvent { event: EventMsg::UserMessage(user), .. }],
+             [RenderedEvent { event: EventMsg::AgentMessage(agent), .. }])
+                if user.message == "first" && agent.message == "second"
+        ));
     }
 
     #[test]
@@ -2274,13 +2676,16 @@ mod tests {
         let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
         let mut gateway_updates = gateway.subscribe();
         let ready = gateway
-            .register_provider(ProviderConfig {
-                provider: "openai_socket".into(),
-                model: "gpt-5.6-sol".into(),
-                base_url: None,
-                reasoning_effort: Some("medium".into()),
-                web_search: horus::backend::model::provider::HostedWebSearch::Off,
-            })
+            .register_provider(
+                ProviderConfig {
+                    provider: "openai_socket".into(),
+                    model: "gpt-5.6-sol".into(),
+                    base_url: None,
+                    reasoning_effort: Some("medium".into()),
+                    web_search: horus::backend::model::provider::HostedWebSearch::Off,
+                },
+                Vec::new(),
+            )
             .await
             .expect("register OpenAI");
         let broadcast = gateway_updates

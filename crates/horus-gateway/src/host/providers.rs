@@ -197,6 +197,7 @@ impl GatewayHost {
     pub(crate) async fn register_provider(
         &self,
         selection: ProviderConfig,
+        model_ids: Vec<String>,
     ) -> std::result::Result<ReadyPayload, Rejection> {
         let state = self.state.lock().await;
         if !credential_is_configured(&selection, &state.store, &state.credentials)
@@ -213,7 +214,7 @@ impl GatewayHost {
                 .lock()
                 .map_err(|_| internal("gateway configuration lock is poisoned"))?;
             let next = current
-                .registering_provider(selection)
+                .registering_provider(selection, model_ids)
                 .map_err(invalid_config)?;
             state.store.save(&next).map_err(internal)?;
             *current = next;
@@ -340,13 +341,16 @@ mod tests {
         let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
         let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
         gateway
-            .register_provider(ProviderConfig {
-                provider: "kimi".into(),
-                model: "kimi-k3".into(),
-                base_url: None,
-                reasoning_effort: Some("max".into()),
-                web_search: horus::backend::model::provider::HostedWebSearch::Off,
-            })
+            .register_provider(
+                ProviderConfig {
+                    provider: "kimi".into(),
+                    model: "kimi-k3".into(),
+                    base_url: None,
+                    reasoning_effort: Some("max".into()),
+                    web_search: horus::backend::model::provider::HostedWebSearch::Off,
+                },
+                Vec::new(),
+            )
             .await
             .expect("register Kimi");
         let first = gateway

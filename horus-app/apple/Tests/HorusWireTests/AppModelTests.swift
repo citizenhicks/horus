@@ -59,12 +59,31 @@ final class AppModelTests: XCTestCase {
         )
     }
 
+    private func providerStatus(for config: ProviderConfig) -> ProviderStatus {
+        ProviderStatus(
+            provider: config.provider,
+            label: "OpenAI",
+            symbol: "sparkle",
+            description: "Test provider",
+            configured: true,
+            selection: config,
+            auth: .apiKey,
+            defaultBaseUrl: config.baseUrl,
+            defaultApiKeyEnv: "OPENAI_API_KEY",
+            models: [],
+            modelIds: [],
+            modelIdsConfigurable: false,
+            webSearch: [config.webSearch]
+        )
+    }
+
     private func ready(defaultConfig: VersionedAgentConfig) -> ReadyPayload {
         ReadyPayload(
             sessions: [session(state: .idle)],
             providers: [],
             defaultConfig: defaultConfig,
             models: [],
+            modelProviders: [:],
             middlewareFeatures: [],
             maxActiveSessions: 4
         )
@@ -72,7 +91,10 @@ final class AppModelTests: XCTestCase {
 
     private func sessionReady(
         latestSequence: UInt64,
-        replayEpoch: String = "epoch-1"
+        replayEpoch: String = "epoch-1",
+        contributions: [FrontendContribution] = [],
+        widgets: [SessionWidget] = [],
+        runStats: RunStats = RunStats()
     ) -> SessionReadyPayload {
         SessionReadyPayload(
             replayEpoch: replayEpoch,
@@ -96,8 +118,10 @@ final class AppModelTests: XCTestCase {
                     modelContextWindow: 200_000
                 )
             ),
-            contributions: [],
+            contributions: contributions,
+            widgets: widgets,
             toolCount: 0,
+            runStats: runStats,
             config: VersionedAgentConfig(revision: 1, config: composition())
         )
     }
@@ -133,6 +157,7 @@ final class AppModelTests: XCTestCase {
         outcome: SessionOutcome? = nil,
         message: String? = nil,
         turnID: String? = nil,
+        executionStats: ExecutionStats = ExecutionStats(),
         createdAt: Int64 = 100,
         updatedAt: Int64 = 100
     ) -> SessionRecord {
@@ -151,6 +176,7 @@ final class AppModelTests: XCTestCase {
             sequence: 1,
             catalogVisible: true,
             firstUserMessage: "Review",
+            executionStats: executionStats,
             title: nil,
             pinned: false,
             activity: SessionActivity(
@@ -175,6 +201,53 @@ final class AppModelTests: XCTestCase {
         // `session(state:)` starts a running turn at 100, not at the chat's creation time.
         model.sessions = [session(state: .running, createdAt: 20, updatedAt: 160)]
         XCTAssertEqual(model.sessionElapsed(at: Date(timeIntervalSince1970: 200)), 100)
+    }
+
+    func testLiveRunStatsStartImmediatelyAndTrackToolCalls() throws {
+        let model = try model()
+        model.selectedSessionID = "chat-1"
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: "input-1", msg: .object([
+                "type": .string("task_started"),
+                "turnId": .string("turn-1")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        let active = try XCTUnwrap(model.runStats.active)
+        XCTAssertEqual(model.sessionRunCount, 1)
+        XCTAssertGreaterThan(
+            model.sessionElapsed(at: Date(timeIntervalSince1970: TimeInterval(active.startedAtMs) / 1_000 + 2)),
+            1.9
+        )
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("tool_call_begin")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("tool_call_end"),
+                "isError": .bool(true)
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        XCTAssertEqual(model.sessionToolCalls, 1)
+        XCTAssertEqual(model.sessionFailedToolCalls, 1)
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("task_complete")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        XCTAssertNil(model.runStats.active)
     }
 
     func testAppLockAuthenticatesBeforePersistingAndRelocks() async throws {
@@ -650,6 +723,62 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(suggestions.matches.first?.replacement, "$planning")
     }
 
+    func testSessionSnapshotKeepsStaticWidgetsAndUpsertsDynamicWidgets() throws {
+        let model = try model()
+        model.selectedSessionID = "chat-1"
+        let staticStatus = FrontendWidget(
+            id: "status",
+            slot: .composerFooter,
+            text: "Queued",
+            tone: "neutral",
+            symbol: "task",
+            iconOnly: false,
+            progress: nil,
+            content: nil,
+            action: nil
+        )
+        let navigation = FrontendWidget(
+            id: "tasks",
+            slot: .navigation,
+            text: "Tasks",
+            tone: "neutral",
+            symbol: "task",
+            iconOnly: false,
+            progress: nil,
+            content: nil,
+            action: nil
+        )
+        let dynamicStatus = FrontendWidget(
+            id: "status",
+            slot: .composerFooter,
+            text: "Running",
+            tone: "warning",
+            symbol: "task",
+            iconOnly: false,
+            progress: nil,
+            content: nil,
+            action: nil
+        )
+        let contribution = FrontendContribution(
+            capability: "tasks",
+            count: 1,
+            commands: [],
+            widgets: [staticStatus, navigation],
+            references: [],
+            activeInput: nil
+        )
+
+        model.handle(.sessionChanged(sessionReady(
+            latestSequence: 1,
+            contributions: [contribution],
+            widgets: [SessionWidget(capability: "tasks", item: dynamicStatus)]
+        )))
+
+        XCTAssertEqual(model.mountedWidgets.count, 2)
+        XCTAssertEqual(model.composerFooterWidgets.first?.widget.text, "Running")
+        XCTAssertEqual(model.navigationWidgets.first?.widget.text, "Tasks")
+    }
+
     func testMessageActionSubmitsTheClickedHistoryTarget() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
@@ -928,10 +1057,13 @@ final class AppModelTests: XCTestCase {
                     )],
                     defaultReasoning: "high"
                 )],
+                modelIds: [],
+                modelIdsConfigurable: false,
                 webSearch: [.off, .cached, .live]
             )],
             defaultConfig: nil,
             models: [],
+            modelProviders: [:],
             middlewareFeatures: [],
             maxActiveSessions: 4
         ))
@@ -944,10 +1076,11 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(20))
 
         let requests = await recorder.requests()
-        guard case .registerProvider(_, let provider) = try XCTUnwrap(requests.first) else {
+        guard case .registerProvider(_, let provider, let modelIDs) = try XCTUnwrap(requests.first) else {
             return XCTFail("Expected first-provider registration")
         }
         XCTAssertEqual(provider, model.providerDraft)
+        XCTAssertTrue(modelIDs.isEmpty)
 
         let defaultConfig = VersionedAgentConfig(revision: 1, config: composition())
         model.applyGatewayCatalog(ready(defaultConfig: defaultConfig))
@@ -1004,6 +1137,8 @@ final class AppModelTests: XCTestCase {
                     defaultReasoning: nil
                 )
             ],
+            modelIds: [],
+            modelIdsConfigurable: false,
             webSearch: [.off]
         )]
 
@@ -1017,6 +1152,75 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.agentDraft?.provider.model, "kimi-k2.7-code")
         XCTAssertNil(model.agentDraft?.provider.reasoningEffort)
+    }
+
+    func testConfigurableProviderCanonicalizesAndSavesMultipleModelIDs() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let selection = ProviderConfig(
+            provider: "responses",
+            model: "old-model",
+            baseUrl: "http://localhost:8080/v1",
+            reasoningEffort: nil,
+            webSearch: .off
+        )
+        model.agentDraft = composition()
+        model.providerStatuses = [ProviderStatus(
+            provider: selection.provider,
+            label: "Local and Other",
+            symbol: "storage",
+            description: "OpenAI-compatible endpoint",
+            configured: true,
+            selection: selection,
+            auth: .apiKey,
+            defaultBaseUrl: "http://localhost:8080/v1",
+            defaultApiKeyEnv: nil,
+            models: [],
+            modelIds: ["old-model"],
+            modelIdsConfigurable: true,
+            webSearch: [.off]
+        )]
+        model.selectProvider(selection.provider)
+        model.updateProviderModelIDs(" model-a, model-b, , model-a ")
+
+        XCTAssertEqual(model.providerModelIDs, ["model-a", "model-b"])
+        model.saveProviderAsDefault()
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        let request = try XCTUnwrap(requests.first)
+        guard case .registerProvider(_, let config, let modelIDs) = request else {
+            return XCTFail("Expected provider registration")
+        }
+        XCTAssertEqual(modelIDs, ["model-a", "model-b"])
+        XCTAssertEqual(config.model, "model-a")
+    }
+
+    func testDefaultModelSelectionUsesGatewayProviderIdentity() throws {
+        let model = try model()
+        let target = ProviderConfig(
+            provider: "kimi",
+            model: "kimi-k3",
+            baseUrl: nil,
+            reasoningEffort: "max",
+            webSearch: .off
+        )
+        let choice = ModelChoice(
+            route: "opaque-route",
+            group: "Kimi · K3",
+            model: target.model,
+            reasoningEffort: target.reasoningEffort,
+            contextWindow: 1_048_576
+        )
+        model.agentDraft = composition()
+        model.modelChoices = [choice]
+        model.modelProviders = [choice.route: target.provider]
+        model.providerStatuses = [providerStatus(for: target)]
+
+        model.selectAgentDraftModel(choice.route)
+
+        XCTAssertEqual(model.agentDraft?.provider, target)
+        XCTAssertEqual(model.agentDraftModelRoute, choice.route)
     }
 
     func testMiddlewareSettingsSetAndClearWithoutCapabilityLogic() {
@@ -1059,6 +1263,7 @@ final class AppModelTests: XCTestCase {
             providers: [],
             defaultConfig: VersionedAgentConfig(revision: 8, config: gatewayDefault),
             models: [],
+            modelProviders: [:],
             middlewareFeatures: [],
             maxActiveSessions: 4
         ))
@@ -1108,6 +1313,7 @@ final class AppModelTests: XCTestCase {
         model.selectedSessionID = "chat-1"
         model.agentSnapshot = VersionedAgentConfig(revision: 3, config: composition())
         model.agentDraft = draft
+        model.providerStatuses = [providerStatus(for: draft.provider)]
 
         model.changeProviderForCurrentChat()
         try await Task.sleep(for: .milliseconds(20))
@@ -1115,7 +1321,7 @@ final class AppModelTests: XCTestCase {
         let registrationRequests = await recorder.requests()
         let registration = try XCTUnwrap(
             registrationRequests.lazy.compactMap { request -> String? in
-                guard case .registerProvider(let requestID, _) = request else { return nil }
+                guard case .registerProvider(let requestID, _, _) = request else { return nil }
                 return requestID
             }.first
         )
@@ -1154,6 +1360,7 @@ final class AppModelTests: XCTestCase {
         model.selectedSessionID = "chat-1"
         model.agentSnapshot = VersionedAgentConfig(revision: 3, config: composition())
         model.agentDraft = draft
+        model.providerStatuses = [providerStatus(for: draft.provider)]
 
         model.saveProviderAsDefault()
         try await Task.sleep(for: .milliseconds(20))
@@ -1161,7 +1368,7 @@ final class AppModelTests: XCTestCase {
         let registrationRequests = await recorder.requests()
         let registration = try XCTUnwrap(
             registrationRequests.lazy.compactMap { request -> String? in
-                guard case .registerProvider(let requestID, _) = request else { return nil }
+                guard case .registerProvider(let requestID, _, _) = request else { return nil }
                 return requestID
             }.first
         )

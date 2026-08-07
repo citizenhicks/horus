@@ -328,11 +328,11 @@ final class AppModel {
     var toast: AppToast?
     var activeTurnID: String?
     var activeOperation: String?
-    var steeringQueued = false
     var contextTokens = 0
     var modelContextWindow: Int64?
     var pendingApproval: PendingApproval?
     var modelChoices: [ModelChoice] = []
+    var modelProviders: [String: String] = [:]
     var middlewareFeatures: [MiddlewareFeature] = []
     var selectedModelRoute = ""
     var contributions: [FrontendContribution] = []
@@ -345,6 +345,7 @@ final class AppModel {
     var selectedArtifactID: String?
     var showsInspector = false
     var profile: ProfileSnapshot?
+    var runStats = RunStats()
     var currentUsage = TokenUsage()
     var lastUsage = TokenUsage()
     var cronTasks: [CronTask] = []
@@ -365,6 +366,7 @@ final class AppModel {
     var applyState: ApplyState = .idle
     var providerStatuses: [ProviderStatus] = []
     var providerAPIKey = ""
+    var providerModelIDsText = ""
     var providerActionState: ProviderActionState = .idle
     var pairingCodeInfo: PairingCodeInfo?
 
@@ -416,7 +418,6 @@ final class AppModel {
     @ObservationIgnored private var sessionOpenCursor: UInt64?
     @ObservationIgnored private var replayRequestID: String?
     @ObservationIgnored private var replaySnapshotSequence: UInt64?
-    @ObservationIgnored private var steeringSubmissionID: String?
     @ObservationIgnored private var previewSelections: [String: FrontendPickerOption] = [:]
     @ObservationIgnored private var appIsInBackground = true
 
@@ -527,14 +528,28 @@ final class AppModel {
         Int((contextFillFraction * 100).rounded())
     }
 
-    /// How long the current turn has been running. Zero once the turn ends: the gateway only
-    /// advertises `startedAt` while a turn is in flight.
+    /// Completed execution time plus the live turn, when one is running.
     func sessionElapsed(at date: Date) -> TimeInterval {
+        let completed = TimeInterval(runStats.elapsedMs) / 1_000
+        if let active = runStats.active {
+            let live = max(
+                TimeInterval(active.elapsedMs) / 1_000,
+                date.timeIntervalSince1970 - TimeInterval(active.startedAtMs) / 1_000
+            )
+            return completed + max(0, live)
+        }
         guard let session = sessions.first(where: { $0.sessionId == selectedSessionID }),
-              session.activity.state != .idle,
-              let startedAt = session.activity.startedAt
-        else { return 0 }
-        return max(0, date.timeIntervalSince1970 - TimeInterval(startedAt))
+              session.activity.state != .idle
+        else { return completed }
+        guard let startedAt = session.activity.startedAt else { return completed }
+        return completed + max(0, date.timeIntervalSince1970 - TimeInterval(startedAt))
+    }
+
+    var sessionRunCount: UInt64 { runStats.runCount + (runStats.active == nil ? 0 : 1) }
+    var sessionModelCalls: UInt64 { runStats.modelCalls + (runStats.active?.modelCalls ?? 0) }
+    var sessionToolCalls: UInt64 { runStats.toolCalls + (runStats.active?.toolCalls ?? 0) }
+    var sessionFailedToolCalls: UInt64 {
+        runStats.failedToolCalls + (runStats.active?.failedToolCalls ?? 0)
     }
 
     func showToast(_ message: String, tone: ToastTone = .info) {
@@ -955,8 +970,6 @@ final class AppModel {
         let op: AgentOperation
         if let activeTurnID, let activeOperation {
             op = .activeInput(operation: activeOperation, turnID: activeTurnID, text: text)
-            steeringQueued = true
-            steeringSubmissionID = id
         } else {
             op = .userInput(text: text)
         }
@@ -964,11 +977,12 @@ final class AppModel {
         composer = ""
         transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: op))) { [weak self] _ in
             self?.restoreDraft(id: id)
-            if self?.steeringSubmissionID == id {
-                self?.steeringSubmissionID = nil
-                self?.steeringQueued = false
-            }
         }
+    }
+
+    func refreshProfile() {
+        guard connectionState.isReady else { return }
+        transmit(.getProfile(requestID: requestID("profile")))
     }
 
     func submitWidget(_ mounted: MountedWidget) {
@@ -1024,6 +1038,30 @@ final class AppModel {
             sessionID: sessionID,
             submission: Submission(id: requestID("model"), op: .setModel(route: route))
         ))
+    }
+
+    var agentDraftModelRoute: String? {
+        guard let provider = agentDraft?.provider else { return nil }
+        return modelChoices.first { choice in
+            choice.model == provider.model
+                && choice.reasoningEffort == provider.reasoningEffort
+                && providerStatus(for: choice)?.provider == provider.provider
+        }?.route
+    }
+
+    func selectAgentDraftModel(_ route: String) {
+        guard let choice = modelChoices.first(where: { $0.route == route }),
+              let status = providerStatus(for: choice),
+              var provider = status.selection
+        else { return }
+        provider.model = choice.model
+        provider.reasoningEffort = choice.reasoningEffort
+        agentDraft?.provider = provider
+    }
+
+    private func providerStatus(for choice: ModelChoice) -> ProviderStatus? {
+        guard let provider = modelProviders[choice.route] else { return nil }
+        return providerStatuses.first { $0.provider == provider }
     }
 
     func interrupt() {
@@ -1155,13 +1193,31 @@ final class AppModel {
         let selectedModel = status.models.first
         providerDraft = status.selection ?? ProviderConfig(
             provider: status.provider,
-            model: selectedModel?.id ?? "",
+            model: selectedModel?.id ?? status.modelIds.first ?? "",
             baseUrl: status.defaultBaseUrl,
             reasoningEffort: selectedModel?.defaultReasoning,
             webSearch: webSearch
         )
+        providerModelIDsText = status.modelIds.joined(separator: ", ")
         providerAPIKey = ""
         providerActionState = .idle
+    }
+
+    var providerModelIDs: [String] {
+        providerModelIDsText
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .reduce(into: []) { values, value in
+                if !values.contains(value) { values.append(value) }
+            }
+    }
+
+    func updateProviderModelIDs(_ value: String) {
+        providerModelIDsText = value
+        guard let first = providerModelIDs.first else { return }
+        providerDraft?.model = first
+        providerDraft?.reasoningEffort = nil
     }
 
     func selectProviderModel(_ modelID: String) {
@@ -1211,12 +1267,20 @@ final class AppModel {
 
     private func registerProvider(for target: ConfigurationTarget) {
         if case .session = target, selectedSessionID == nil { return }
-        guard let config = providerDraft else { return }
+        guard var config = providerDraft,
+              let status = providerStatuses.first(where: { $0.provider == config.provider })
+        else { return }
+        let modelIDs = status.modelIdsConfigurable ? providerModelIDs : status.modelIds
+        if status.modelIdsConfigurable {
+            guard let first = modelIDs.first else { return }
+            config.model = first
+            config.reasoningEffort = nil
+        }
         let id = requestID("provider")
         providerRegistrationRequestID = id
         providerRegistrationTarget = target
         applyState = .applying
-        transmit(.registerProvider(requestID: id, config: config)) { [weak self] message in
+        transmit(.registerProvider(requestID: id, config: config, modelIds: modelIDs)) { [weak self] message in
             guard self?.providerRegistrationRequestID == id else { return }
             self?.providerRegistrationRequestID = nil
             self?.providerRegistrationTarget = nil
@@ -1481,6 +1545,8 @@ final class AppModel {
         case .sessionReplayComplete(let requestID, let sessionID):
             guard requestID == replayRequestID, sessionID == selectedSessionID else { break }
             finishSessionReplay()
+        case .sessionHistory:
+            break
         case .sessionChanged(let payload):
             guard payload.session.sessionId == selectedSessionID,
                   payload.config.revision >= (agentSnapshot?.revision ?? 0)
@@ -1638,7 +1704,7 @@ final class AppModel {
         applyGatewayCatalog(payload)
         if sessionRequestID == nil { connectionState = .ready }
         applySessions(payload.sessions)
-        transmit(.getProfile(requestID: requestID("profile")))
+        refreshProfile()
         guard sessionRequestID == nil else { return }
         if let sessionToRestoreID {
             if let session = sessions.first(where: { $0.sessionId == sessionToRestoreID }) {
@@ -1683,6 +1749,7 @@ final class AppModel {
         let previousDefault = defaultAgentSnapshot
         providerStatuses = payload.providers
         modelChoices = payload.models
+        modelProviders = payload.modelProviders
         middlewareFeatures = payload.middlewareFeatures
         defaultAgentSnapshot = payload.defaultConfig
         if agentSnapshot == nil {
@@ -1745,8 +1812,14 @@ final class AppModel {
         contributions = payload.contributions
         toolCount = payload.toolCount
         mountedWidgets = payload.contributions.flatMap { contribution in
-            contribution.widgets.map { MountedWidget(capability: contribution.capability, widget: $0) }
+            contribution.widgets.map {
+                MountedWidget(capability: contribution.capability, widget: $0)
+            }
         }
+        for widget in payload.widgets {
+            upsertWidget(MountedWidget(capability: widget.capability, widget: widget.item))
+        }
+        runStats = payload.runStats
         activeOperation = payload.contributions.compactMap(\.activeInput?.operation).first
         agentDraft = refreshedAgentDraft(
             currentDraft: agentDraft,
@@ -1772,6 +1845,10 @@ final class AppModel {
                 sessionID: session.sessionId
             )
         }
+        if let selected = sessions.first(where: { $0.sessionId == selectedSessionID }) {
+            applyExecutionStats(selected.executionStats)
+            if selected.activity.state == .idle { runStats.active = nil }
+        }
         let visible = Set(sessions.map(\.sessionId))
         unreadSessionIDs.formIntersection(visible)
         guard let selectedSessionID,
@@ -1783,6 +1860,17 @@ final class AppModel {
         } else {
             clearSelectedSession()
         }
+    }
+
+    private func applyExecutionStats(_ stats: ExecutionStats) {
+        runStats.runCount = stats.runCount
+        runStats.failedRunCount = stats.failedRunCount
+        runStats.abortedRunCount = stats.abortedRunCount
+        runStats.modelCalls = stats.modelCalls
+        runStats.toolCalls = stats.toolCalls
+        runStats.failedToolCalls = stats.failedToolCalls
+        runStats.elapsedMs = stats.elapsedMs
+        runStats.usage = stats.usage
     }
 
     private func applyActivityTransition(
@@ -1988,10 +2076,6 @@ final class AppModel {
                 previewSelections.removeValue(forKey: submissionID)
             } else if type == "user_message" {
                 pendingDrafts.removeValue(forKey: submissionID)
-                if submissionID == steeringSubmissionID {
-                    steeringSubmissionID = nil
-                    steeringQueued = false
-                }
             }
         }
 
@@ -2041,15 +2125,31 @@ final class AppModel {
             }
         case "task_started":
             activeTurnID = event.msg["turnId"]?.stringValue
+            if replayRequestID == nil,
+               let turnID = activeTurnID,
+               runStats.active?.turnId != turnID {
+                runStats.active = RunSummary(
+                    sessionId: selectedSessionID ?? "",
+                    submissionId: event.submissionId ?? "",
+                    turnId: turnID,
+                    startedAtMs: Int64(Date.now.timeIntervalSince1970 * 1_000),
+                    finishedAtMs: nil,
+                    elapsedMs: 0,
+                    outcome: nil,
+                    modelCalls: 0,
+                    toolCalls: 0,
+                    failedToolCalls: 0,
+                    usage: TokenUsage()
+                )
+            }
             if let window = event.msg["modelContextWindow"]?.intValue {
                 modelContextWindow = Int64(window)
             }
         case "task_complete":
             finishPendingTranscriptEntries()
             activeTurnID = nil
+            if replayRequestID == nil { runStats.active = nil }
             refreshGitDiff()
-            steeringQueued = false
-            steeringSubmissionID = nil
             pendingApproval = nil
             approvalRequestID = nil
         case "web_search_begin":
@@ -2062,9 +2162,8 @@ final class AppModel {
         case "turn_aborted":
             finishPendingTranscriptEntries()
             activeTurnID = nil
+            if replayRequestID == nil { runStats.active = nil }
             refreshGitDiff()
-            steeringQueued = false
-            steeringSubmissionID = nil
             pendingApproval = nil
             approvalRequestID = nil
             appendText(
@@ -2077,6 +2176,12 @@ final class AppModel {
         case "error":
             let message = event.msg["message"]?.stringValue ?? "Agent error"
             appendText(message, kind: .error, tone: "error")
+        case "tool_call_begin":
+            if replayRequestID == nil { runStats.active?.toolCalls += 1 }
+        case "tool_call_end":
+            if replayRequestID == nil, event.msg["isError"]?.boolValue == true {
+                runStats.active?.failedToolCalls += 1
+            }
         case "model_changed":
             selectedModelRoute = event.msg["route"]?.stringValue ?? selectedModelRoute
             if let window = event.msg["modelContextWindow"]?.intValue {
@@ -2117,12 +2222,7 @@ final class AppModel {
                   let item = event["item"],
                   let widget = try? FrontendWidget(json: item)
             else { return }
-            let mounted = MountedWidget(capability: capability, widget: widget)
-            if let index = mountedWidgets.firstIndex(where: { $0.id == mounted.id }) {
-                mountedWidgets[index] = mounted
-            } else {
-                mountedWidgets.append(mounted)
-            }
+            upsertWidget(MountedWidget(capability: capability, widget: widget))
         case "remove_widget":
             guard let capability = event["capability"]?.stringValue,
                   let id = event["id"]?.stringValue
@@ -2137,6 +2237,14 @@ final class AppModel {
             pendingPicker = FrontendPickerPrompt(title: title, options: options)
         default:
             break
+        }
+    }
+
+    private func upsertWidget(_ mounted: MountedWidget) {
+        if let index = mountedWidgets.firstIndex(where: { $0.id == mounted.id }) {
+            mountedWidgets[index] = mounted
+        } else {
+            mountedWidgets.append(mounted)
         }
     }
 
@@ -2449,12 +2557,14 @@ final class AppModel {
             unreadSessionIDs.removeAll()
             profile = nil
             modelChoices = []
+            modelProviders = [:]
             middlewareFeatures = []
             providerStatuses = []
             defaultAgentSnapshot = nil
             setupProviderDraft = nil
         }
         providerAPIKey = ""
+        providerModelIDsText = ""
         providerActionState = .idle
         credentialRequestID = nil
         providerLoginRequestID = nil
@@ -2494,8 +2604,7 @@ final class AppModel {
         replayPresentedTranscript = nil
         activeTurnID = nil
         activeOperation = nil
-        steeringQueued = false
-        steeringSubmissionID = nil
+        runStats = RunStats()
         contextTokens = 0
         modelContextWindow = nil
         pendingApproval = nil

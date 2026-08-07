@@ -42,6 +42,7 @@ const MAX_CONNECTIONS: usize = 32;
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(72 * 60 * 60);
 const SCHEDULER_TICK: Duration = Duration::from_secs(15);
 const MAX_DIRECTORY_ENTRIES: usize = 512;
+const MAX_HISTORY_BATCHES: usize = 100;
 const WEBSOCKET_BRIDGE_BYTES: usize = 16 * 1024;
 
 const _: () = assert!(MAX_FRAME_BYTES < 1 << 24);
@@ -820,6 +821,29 @@ async fn handle_message(
             }
             Err(rejection) => write_rejection(writer, request_id, rejection).await,
         },
+        ClientMessage::GetSessionHistory {
+            request_id,
+            session_id,
+            before_sequence,
+            max_batches,
+        } => {
+            let host = match require_selected(selected, &session_id) {
+                Ok(host) => host,
+                Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+            };
+            if let Err(rejection) = validate_history_page_size(max_batches) {
+                return write_rejection(writer, request_id, rejection).await;
+            }
+            write_session_history(
+                writer,
+                host,
+                request_id,
+                session_id,
+                before_sequence,
+                max_batches,
+            )
+            .await
+        }
         ClientMessage::RenameSession {
             request_id,
             session_id,
@@ -1012,21 +1036,23 @@ async fn handle_message(
                 Err(rejection) => write_rejection(writer, request_id, rejection).await,
             }
         }
-        ClientMessage::RegisterProvider { request_id, config } => {
-            match gateway.register_provider(config).await {
-                Ok(payload) => {
-                    write_frame(
-                        writer,
-                        &ServerFrame::new(ServerMessage::GatewayConfigured {
-                            request_id,
-                            payload,
-                        }),
-                    )
-                    .await
-                }
-                Err(rejection) => write_rejection(writer, request_id, rejection).await,
+        ClientMessage::RegisterProvider {
+            request_id,
+            config,
+            model_ids,
+        } => match gateway.register_provider(config, model_ids).await {
+            Ok(payload) => {
+                write_frame(
+                    writer,
+                    &ServerFrame::new(ServerMessage::GatewayConfigured {
+                        request_id,
+                        payload,
+                    }),
+                )
+                .await
             }
-        }
+            Err(rejection) => write_rejection(writer, request_id, rejection).await,
+        },
         ClientMessage::CreatePairingCode { request_id } => match auth.create_pairing_code() {
             Ok(grant) => {
                 write_frame(
@@ -1162,6 +1188,69 @@ async fn handle_message(
             Err(error) => write_rejection(writer, request_id, cron_rejection(error)).await,
         },
     }
+}
+
+fn validate_history_page_size(max_batches: usize) -> std::result::Result<(), Rejection> {
+    if (1..=MAX_HISTORY_BATCHES).contains(&max_batches) {
+        return Ok(());
+    }
+    Err(Rejection {
+        code: "invalid_history_page",
+        message: format!("history page size must be between 1 and {MAX_HISTORY_BATCHES} batches"),
+        fatal: false,
+    })
+}
+
+async fn write_session_history(
+    writer: &mut (impl AsyncWrite + Unpin),
+    host: &HostHandle,
+    request_id: String,
+    session_id: String,
+    before_sequence: Option<u64>,
+    max_batches: usize,
+) -> Result<()> {
+    let mut lower = 1;
+    let mut upper = max_batches;
+    let mut selected = None;
+    while lower <= upper {
+        let batches = lower + (upper - lower) / 2;
+        let page = match host.history_page(before_sequence, batches).await {
+            Ok(page) => page,
+            Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+        };
+        let frame = ServerFrame::new(ServerMessage::SessionHistory {
+            request_id: request_id.clone(),
+            session_id: session_id.clone(),
+            events: page.events,
+            next_before_sequence: page.next_before_sequence,
+        });
+        if encoded_frame_fits(&frame)? {
+            selected = Some(frame);
+            lower = batches + 1;
+        } else {
+            upper = batches.saturating_sub(1);
+        }
+    }
+    match selected {
+        Some(frame) => write_frame(writer, &frame).await,
+        None => {
+            write_rejection(
+                writer,
+                request_id,
+                Rejection {
+                    code: "history_batch_too_large",
+                    message: "the next durable history batch exceeds the gateway frame limit"
+                        .into(),
+                    fatal: false,
+                },
+            )
+            .await
+        }
+    }
+}
+
+fn encoded_frame_fits(frame: &ServerFrame) -> Result<bool> {
+    Ok(serde_json::to_vec(frame)?.len() <= MAX_FRAME_BYTES)
 }
 
 async fn write_client_inventory(
@@ -2168,6 +2257,35 @@ mod tests {
                 .iter()
                 .any(|entry| { entry.name == "daily.md" && !entry.is_directory })
         );
+    }
+
+    #[test]
+    fn history_page_size_rejects_values_outside_the_wire_bound() {
+        assert!([0, MAX_HISTORY_BATCHES + 1].into_iter().all(|limit| {
+            validate_history_page_size(limit)
+                .is_err_and(|rejection| rejection.code == "invalid_history_page")
+        }));
+    }
+
+    #[test]
+    fn history_frame_bound_rejects_one_oversized_batch() {
+        let frame = ServerFrame::new(ServerMessage::SessionHistory {
+            request_id: "history".into(),
+            session_id: "session".into(),
+            events: vec![crate::wire::RenderedEvent {
+                event: horus::protocol::EventMsg::AgentMessage(
+                    horus::protocol::AgentMessageEvent {
+                        message: "x".repeat(MAX_FRAME_BYTES),
+                        phase: None,
+                        message_target: None,
+                    },
+                ),
+                blocks: Vec::new(),
+            }],
+            next_before_sequence: None,
+        });
+
+        assert!(!encoded_frame_fits(&frame).expect("measure history frame"));
     }
 
     #[tokio::test]

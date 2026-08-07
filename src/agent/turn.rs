@@ -12,8 +12,11 @@ use super::input::ActiveTurnRouter;
 use super::input::Wait;
 use super::input::interruptible;
 use super::try_send_event;
+use super::unix_timestamp_ms;
 use crate::Error;
 use crate::Result;
+use crate::backend::checkpoint::ActiveExecution;
+use crate::backend::checkpoint::ExecutionOutcome;
 use crate::backend::model::ModelEventSink;
 use crate::backend::model::ModelRequest;
 use crate::backend::model::tool_complete_boundaries;
@@ -55,14 +58,25 @@ impl Runner {
         match wait {
             Wait::Ready(value) => Ok(Some(value)),
             Wait::Interrupted { submission_id } => {
-                self.abort(&submission_id, turn_id, "interrupted").await?;
+                self.abort(
+                    &submission_id,
+                    turn_id,
+                    "interrupted",
+                    ExecutionOutcome::Aborted,
+                )
+                .await?;
                 Ok(None)
             }
         }
     }
 
     pub(super) async fn fail_turn(&mut self, submission_id: &str, error: Error) -> Result<()> {
-        let Some(turn_id) = self.state.active_turn_id.clone() else {
+        let Some(turn_id) = self
+            .state
+            .active_execution
+            .as_ref()
+            .map(|execution| execution.turn_id.clone())
+        else {
             return Err(error);
         };
         let message = error.to_string();
@@ -73,7 +87,8 @@ impl Runner {
             }),
         )
         .await?;
-        self.abort(submission_id, &turn_id, &message).await
+        self.abort(submission_id, &turn_id, &message, ExecutionOutcome::Failed)
+            .await
     }
 
     pub(super) async fn start_turn(
@@ -83,7 +98,20 @@ impl Runner {
         message: String,
     ) -> Result<()> {
         let turn_id = Uuid::new_v4().to_string();
-        self.state.active_turn_id = Some(turn_id.clone());
+        if self.state.active_execution.is_some() {
+            return Err(Error::Checkpoint(
+                "cannot start a turn while another execution is active".into(),
+            ));
+        }
+        self.state.active_execution = Some(ActiveExecution {
+            submission_id: submission_id.clone(),
+            turn_id: turn_id.clone(),
+            started_at_ms: unix_timestamp_ms()?,
+            model_calls: 0,
+            tool_calls: 0,
+            failed_tool_calls: 0,
+            usage: crate::protocol::TokenUsage::default(),
+        });
         self.emit(
             &submission_id,
             EventMsg::TurnStarted(TurnStartedEvent {
@@ -169,11 +197,9 @@ impl Runner {
         };
         let usage_changed = !middleware_usage.is_empty();
         if let Some(last_usage) = middleware_usage.last().cloned() {
-            let mut total_usage = self.state.total_usage.clone();
             for usage in &middleware_usage {
-                checked_add_usage(&mut total_usage, usage)?;
+                self.record_usage(usage)?;
             }
-            self.state.total_usage = total_usage;
             self.state.last_usage = Some(last_usage);
         }
         checkpoint_changed |= usage_changed;
@@ -196,8 +222,13 @@ impl Runner {
             if usage_changed {
                 self.emit_usage(submission_id)?;
             }
-            self.abort(&interrupt_submission_id, turn_id, "interrupted")
-                .await?;
+            self.abort(
+                &interrupt_submission_id,
+                turn_id,
+                "interrupted",
+                ExecutionOutcome::Aborted,
+            )
+            .await?;
             return Ok(BeforeModel::Aborted);
         }
         if !queued_during_middleware.is_empty() {
@@ -239,8 +270,13 @@ impl Runner {
         let mut last_agent_message = None;
         for model_step in 0..MAX_MODEL_STEPS {
             if let Some(interrupt_submission_id) = self.drain_commands(commands, &turn_id).await? {
-                self.abort(&interrupt_submission_id, &turn_id, "interrupted")
-                    .await?;
+                self.abort(
+                    &interrupt_submission_id,
+                    &turn_id,
+                    "interrupted",
+                    ExecutionOutcome::Aborted,
+                )
+                .await?;
                 return Ok(());
             }
             let request_input = match self
@@ -268,6 +304,7 @@ impl Runner {
                 )
             });
             let tools = self.catalog.definitions();
+            self.record_model_call()?;
             let response = self.config.model.respond(
                 &self.config.provider,
                 ModelRequest {
@@ -298,6 +335,8 @@ impl Runner {
                 return Ok(());
             };
             let output = output?;
+            self.record_usage(&output.usage)?;
+            self.state.last_usage = Some(output.usage.clone());
             let mut after_model_events = Vec::new();
             let after_model = self.config.middleware.after_model(AfterModelContext {
                 provider: &self.config.provider,
@@ -332,7 +371,6 @@ impl Runner {
             for event in after_model_events {
                 self.emit(&submission_id, event).await?;
             }
-            checked_add_usage(&mut self.state.total_usage, &output.usage)?;
             let context_before = self.state.context.len();
             let batch_before = self.transcript_delta.len();
             let message_index = output.output.iter().rposition(has_visible_output_text);
@@ -344,24 +382,30 @@ impl Runner {
                     .is_ok()
             });
             self.state.pending_tools.clone_from(&output.tool_calls);
-            self.state.last_usage = Some(output.usage);
             let no_tools = output.tool_calls.is_empty();
             let complete = if no_tools && output.end_turn {
                 if let Some(interrupt_submission_id) =
                     self.drain_commands(commands, &turn_id).await?
                 {
-                    self.abort(&interrupt_submission_id, &turn_id, "interrupted")
-                        .await?;
+                    self.abort(
+                        &interrupt_submission_id,
+                        &turn_id,
+                        "interrupted",
+                        ExecutionOutcome::Aborted,
+                    )
+                    .await?;
                     return Ok(());
                 }
                 self.state.pending_input.is_empty()
             } else {
                 false
             };
-            if complete {
-                self.state.active_turn_id = None;
-            }
-            let checkpoint_sequence = self.save().await?;
+            let checkpoint_sequence = if complete {
+                self.finish_and_save_execution(ExecutionOutcome::Completed)
+                    .await?
+            } else {
+                self.save().await?
+            };
             self.emit_usage(&submission_id)?;
             if !output.text.is_empty() {
                 last_agent_message = Some(output.text.clone());
@@ -458,7 +502,7 @@ impl Runner {
                     results
                 }
             };
-            self.append_tool_results(results);
+            self.append_tool_results(results)?;
             self.state.pending_approval = None;
             self.save().await?;
         }
@@ -519,13 +563,13 @@ impl Runner {
         submission_id: &str,
         turn_id: &str,
         reason: &str,
+        outcome: ExecutionOutcome,
     ) -> Result<()> {
         self.finish_pending_tools(submission_id, turn_id, reason)
             .await?;
-        self.state.active_turn_id = None;
         self.state.pending_input.clear();
         self.state.pending_approval = None;
-        self.save().await?;
+        self.finish_and_save_execution(outcome).await?;
         self.emit_turn_ended(submission_id, turn_id).await?;
         self.emit(
             submission_id,
@@ -567,13 +611,4 @@ fn has_visible_output_text(item: &Value) -> bool {
                         .and_then(Value::as_str)
                         .is_some_and(|text| !text.is_empty())
             })
-}
-
-fn checked_add_usage(
-    total: &mut crate::protocol::TokenUsage,
-    usage: &crate::protocol::TokenUsage,
-) -> Result<()> {
-    total
-        .checked_add(usage)
-        .ok_or_else(|| Error::Provider("provider token usage exceeds the supported range".into()))
 }

@@ -9,7 +9,7 @@ use horus::backend::model::ModelChoice;
 use horus::backend::model::provider::HostedWebSearch;
 use horus::protocol::{
     Event, EventMsg, FrontendBlock, FrontendContribution, FrontendSettingValue, FrontendSymbol,
-    MiddlewareFeature, SessionConfiguredEvent, Submission, TokenUsage,
+    FrontendWidget, MiddlewareFeature, SessionConfiguredEvent, Submission, TokenUsage,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use crate::{Error, Result};
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 14;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
@@ -105,6 +105,12 @@ pub enum ClientMessage {
         last_sequence: Option<u64>,
         replay_epoch: Option<String>,
     },
+    GetSessionHistory {
+        request_id: String,
+        session_id: String,
+        before_sequence: Option<u64>,
+        max_batches: usize,
+    },
     RenameSession {
         request_id: String,
         session_id: String,
@@ -162,6 +168,7 @@ pub enum ClientMessage {
     RegisterProvider {
         request_id: String,
         config: ProviderConfig,
+        model_ids: Vec<String>,
     },
     CreatePairingCode {
         request_id: String,
@@ -259,6 +266,12 @@ pub enum ServerMessage {
     SessionReplayComplete {
         request_id: String,
         session_id: String,
+    },
+    SessionHistory {
+        request_id: String,
+        session_id: String,
+        events: Vec<RenderedEvent>,
+        next_before_sequence: Option<u64>,
     },
     SessionChanged {
         payload: SessionReadyPayload,
@@ -359,6 +372,7 @@ pub struct ReadyPayload {
     pub providers: Vec<ProviderStatus>,
     pub default_config: Option<VersionedAgentConfig>,
     pub models: Vec<ModelChoice>,
+    pub model_providers: BTreeMap<String, String>,
     pub middleware_features: Vec<MiddlewareFeature>,
     pub max_active_sessions: usize,
 }
@@ -372,8 +386,17 @@ pub struct SessionReadyPayload {
     pub git: Option<GitStatus>,
     pub session: SessionConfiguredEvent,
     pub contributions: Vec<FrontendContribution>,
+    pub widgets: Vec<SessionWidget>,
     pub tool_count: usize,
+    pub run_stats: RunStats,
     pub config: VersionedAgentConfig,
+}
+
+/// One currently mounted capability widget and its owning namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionWidget {
+    pub capability: String,
+    pub item: FrontendWidget,
 }
 
 /// One visible session with gateway-owned catalog presentation metadata.
@@ -495,6 +518,8 @@ pub struct ProviderStatus {
     pub description: String,
     pub configured: bool,
     pub selection: Option<ProviderConfig>,
+    pub model_ids: Vec<String>,
+    pub model_ids_configurable: bool,
     pub auth: ProviderAuthKind,
     pub default_base_url: Option<String>,
     pub default_api_key_env: Option<String>,
@@ -638,6 +663,38 @@ pub struct RenderedEvent {
 pub struct ProfileSnapshot {
     pub user_name: Option<String>,
     pub daily_usage: Vec<DailyUsage>,
+    pub run_stats: RunStats,
+    pub recent_runs: Vec<RunSummary>,
+}
+
+/// Completed execution totals plus the active run, when one exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunStats {
+    pub run_count: u64,
+    pub failed_run_count: u64,
+    pub aborted_run_count: u64,
+    pub model_calls: u64,
+    pub tool_calls: u64,
+    pub failed_tool_calls: u64,
+    pub elapsed_ms: u64,
+    pub usage: TokenUsage,
+    pub active: Option<RunSummary>,
+}
+
+/// Frontend-safe summary of one completed or active user turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSummary {
+    pub session_id: String,
+    pub submission_id: String,
+    pub turn_id: String,
+    pub started_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub elapsed_ms: u64,
+    pub outcome: Option<SessionOutcome>,
+    pub model_calls: u64,
+    pub tool_calls: u64,
+    pub failed_tool_calls: u64,
+    pub usage: TokenUsage,
 }
 
 /// Usage accrued during one Unix day.
@@ -1023,12 +1080,14 @@ mod tests {
                 reasoning_effort: Some("max".into()),
                 web_search: HostedWebSearch::Off,
             },
+            model_ids: Vec::new(),
         });
 
         let encoded = serde_json::to_value(frame).expect("encode provider registration");
 
         assert_eq!(encoded["type"], "register_provider");
         assert_eq!(encoded["config"]["provider"], "kimi");
+        assert_eq!(encoded["model_ids"], serde_json::json!([]));
         assert!(encoded.get("session_id").is_none());
     }
 
@@ -1218,6 +1277,7 @@ mod tests {
                 sequence: 3,
                 catalog_visible: true,
                 first_user_message: Some("hello".into()),
+                execution_stats: horus::backend::checkpoint::ExecutionStats::default(),
                 created_at: 1,
                 updated_at: 2,
             },
@@ -1252,6 +1312,23 @@ mod tests {
             "sequence": 3,
             "catalog_visible": true,
             "first_user_message": null,
+            "execution_stats": {
+                "run_count": 0,
+                "failed_run_count": 0,
+                "aborted_run_count": 0,
+                "model_calls": 0,
+                "tool_calls": 0,
+                "failed_tool_calls": 0,
+                "elapsed_ms": 0,
+                "usage": {
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 0
+                }
+            },
             "created_at": 1,
             "updated_at": 2,
             "title": null,
@@ -1294,6 +1371,7 @@ mod tests {
                     config: AgentComposition::default(),
                 }),
                 models: Vec::new(),
+                model_providers: BTreeMap::new(),
                 middleware_features: Vec::new(),
                 max_active_sessions: 32,
             },
@@ -1356,7 +1434,26 @@ mod tests {
                     "references": [],
                     "active_input": null
                 }],
+                "widgets": [],
                 "tool_count": 3,
+                "run_stats": {
+                    "run_count": 0,
+                    "failed_run_count": 0,
+                    "aborted_run_count": 0,
+                    "model_calls": 0,
+                    "tool_calls": 0,
+                    "failed_tool_calls": 0,
+                    "elapsed_ms": 0,
+                    "usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 0
+                    },
+                    "active": null
+                },
                 "config": {
                     "revision": 1,
                     "config": {
@@ -1413,6 +1510,46 @@ mod tests {
         assert_eq!(encoded["type"], "session_replay_complete");
         assert_eq!(encoded["request_id"], "request-open");
         assert_eq!(encoded["session_id"], "session-a");
+    }
+
+    #[test]
+    fn session_history_page_has_a_correlated_cursor() {
+        let request = serde_json::to_value(ClientFrame::new(ClientMessage::GetSessionHistory {
+            request_id: "request-history".into(),
+            session_id: "session-a".into(),
+            before_sequence: Some(9),
+            max_batches: 20,
+        }))
+        .expect("encode history request");
+        let response = serde_json::to_value(ServerFrame::new(ServerMessage::SessionHistory {
+            request_id: "request-history".into(),
+            session_id: "session-a".into(),
+            events: vec![RenderedEvent {
+                event: EventMsg::ContextCompacted,
+                blocks: Vec::new(),
+            }],
+            next_before_sequence: Some(4),
+        }))
+        .expect("encode history response");
+
+        assert_eq!(
+            (
+                request["type"].as_str(),
+                request["before_sequence"].as_u64(),
+                request["max_batches"].as_u64(),
+                response["type"].as_str(),
+                response["next_before_sequence"].as_u64(),
+                response["events"][0]["event"]["type"].as_str(),
+            ),
+            (
+                Some("get_session_history"),
+                Some(9),
+                Some(20),
+                Some("session_history"),
+                Some(4),
+                Some("context_compacted"),
+            )
+        );
     }
 
     #[tokio::test]

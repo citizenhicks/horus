@@ -29,7 +29,9 @@ use horus::middleware::tools::Tools;
 use horus::middleware::{Middleware, MiddlewareStack};
 use horus::protocol::SessionContext;
 
-use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig, local_user_name};
+use crate::config::{
+    ChatSpec, ConfigStore, ConfiguredProvider, CredentialStore, GatewayConfig, local_user_name,
+};
 use crate::cron::CronStore;
 use crate::middleware_manifest::{BuiltinMiddleware, MIDDLEWARE};
 use crate::sandbox::GatewaySandbox;
@@ -195,6 +197,17 @@ pub(crate) fn configured_model_choices(
         .collect())
 }
 
+pub(crate) fn configured_model_providers(
+    gateway: &GatewayConfig,
+    store: &ConfigStore,
+    credentials: &CredentialStore,
+) -> Result<BTreeMap<String, String>> {
+    Ok(configured_model_routes(gateway, store, credentials)?
+        .into_iter()
+        .map(|route| (route.choice.route, route.provider.provider))
+        .collect())
+}
+
 pub(crate) fn configured_provider_for_route(
     gateway: &GatewayConfig,
     store: &ConfigStore,
@@ -214,9 +227,9 @@ pub(crate) fn configured_provider_for_route(
 }
 
 pub(crate) fn configured_route_exists(gateway: &GatewayConfig, route: &str) -> Result<bool> {
-    for selection in gateway.configured_providers.values() {
-        let definition = provider(&selection.provider)?;
-        if catalog_routes(definition, selection)
+    for configured in gateway.configured_providers.values() {
+        let definition = provider(&configured.selection.provider)?;
+        if catalog_routes(definition, configured, &configured.selection)
             .iter()
             .any(|candidate| candidate.choice.route == route)
         {
@@ -239,11 +252,15 @@ fn configured_model_routes(
     let mut definitions = providers().iter().collect::<Vec<_>>();
     definitions.sort_by_key(|definition| Some(definition.id()) != default_provider);
     for definition in definitions {
-        let Some(selection) = gateway.configured_providers.get(definition.id()) else {
+        let Some(configured) = gateway.configured_providers.get(definition.id()) else {
             continue;
         };
-        if credential_is_configured(selection, store, credentials)? {
-            routes.extend(catalog_routes(definition, selection));
+        if credential_is_configured(&configured.selection, store, credentials)? {
+            routes.extend(catalog_routes(
+                definition,
+                configured,
+                &configured.selection,
+            ));
         }
     }
     Ok(routes)
@@ -251,6 +268,7 @@ fn configured_model_routes(
 
 fn catalog_routes(
     definition: &ProviderDefinition,
+    configured: &ConfiguredProvider,
     selection: &ProviderConfig,
 ) -> Vec<CatalogRoute> {
     let mut models = definition
@@ -258,11 +276,12 @@ fn catalog_routes(
         .iter()
         .map(|preset| (preset.id, Some(preset)))
         .collect::<Vec<_>>();
-    if models.iter().all(|(model, _)| *model != selection.model) {
-        models.insert(0, (selection.model.as_str(), None));
-    } else {
-        models.sort_by_key(|(model, _)| *model != selection.model);
+    for model in &configured.model_ids {
+        if models.iter().all(|(candidate, _)| *candidate != model) {
+            models.push((model, None));
+        }
     }
+    models.sort_by_key(|(model, _)| *model != selection.model);
 
     let mut routes = Vec::new();
     for (model, preset) in models {
@@ -315,7 +334,7 @@ struct CatalogRoute {
 fn provider_status(
     definition: &ProviderDefinition,
     configured: bool,
-    selection: Option<ProviderConfig>,
+    configured_provider: Option<ConfiguredProvider>,
 ) -> ProviderStatus {
     let (auth, default_api_key_env) = match definition.auth() {
         ProviderAuth::ApiKey(default_env) => (
@@ -324,6 +343,10 @@ fn provider_status(
         ),
         ProviderAuth::Browser(_) => (ProviderAuthKind::DeviceCode, None),
     };
+    let (selection, model_ids) = configured_provider.map_or_else(
+        || (None, Vec::new()),
+        |configured| (Some(configured.selection), configured.model_ids),
+    );
     ProviderStatus {
         provider: definition.id().into(),
         label: definition.label().into(),
@@ -331,6 +354,8 @@ fn provider_status(
         description: definition.description().into(),
         configured,
         selection,
+        model_ids,
+        model_ids_configurable: definition.models().is_empty(),
         auth,
         default_base_url: definition.default_base_url().map(str::to_string),
         default_api_key_env,
@@ -384,13 +409,17 @@ fn build_models(
     credentials: &CredentialStore,
 ) -> Result<(Arc<ModelRouter>, i64)> {
     let definition = provider(&selection.provider)?;
+    let configured = gateway
+        .configured_providers
+        .get(&selection.provider)
+        .ok_or_else(|| Error::Config("active provider is not in the configured catalog".into()))?;
     let effort = selection.reasoning_effort.as_deref().or_else(|| {
         definition
             .model(&selection.model)
             .and_then(|model| model.default_reasoning)
     });
     let selected_route = route_id(&selection.provider, &selection.model, effort);
-    let mut catalog = catalog_routes(definition, selection);
+    let mut catalog = catalog_routes(definition, configured, selection);
     catalog.extend(
         configured_model_routes(gateway, store, credentials)?
             .into_iter()
@@ -700,11 +729,18 @@ mod tests {
 
         let custom = provider_status(provider("responses").expect("provider"), false, None);
         assert!(custom.models.is_empty());
+        assert!(custom.model_ids_configurable);
+        assert!(custom.model_ids.is_empty());
         assert_eq!(
             custom.default_base_url.as_deref(),
             Some("https://api.openai.com/v1")
         );
         assert_eq!(custom.default_api_key_env, None);
+
+        let openrouter = provider_status(provider("openrouter").expect("provider"), false, None);
+        assert!(openrouter.models.is_empty());
+        assert!(openrouter.model_ids_configurable);
+        assert_eq!(openrouter.default_base_url, None);
     }
 
     #[test]
@@ -739,9 +775,15 @@ mod tests {
             reasoning_effort: Some("provider-defined".into()),
             web_search: HostedWebSearch::Off,
         };
+        let alternate_model = "vendor/model::alternate".to_string();
         let config = config
-            .registering_provider(kimi)
-            .and_then(|config| config.registering_provider(custom.clone()))
+            .registering_provider(kimi, Vec::new())
+            .and_then(|config| {
+                config.registering_provider(
+                    custom.clone(),
+                    vec![custom.model.clone(), alternate_model.clone()],
+                )
+            })
             .expect("register providers");
 
         let choices = configured_model_choices(&config, &store, &credentials).expect("catalog");
@@ -752,6 +794,8 @@ mod tests {
         let resolved =
             configured_provider_for_route(&config, &store, &credentials, &custom_route.route)
                 .expect("resolve custom route");
+        let model_providers =
+            configured_model_providers(&config, &store, &credentials).expect("provider IDs");
 
         assert!(
             choices
@@ -759,6 +803,8 @@ mod tests {
                 .is_some_and(|choice| choice.route.starts_with("kimi::"))
         );
         assert_eq!(resolved, custom);
+        assert_eq!(model_providers[&custom_route.route], "responses");
+        assert!(choices.iter().any(|choice| choice.model == alternate_model));
         assert_eq!(
             custom_route.group,
             format!(
@@ -855,7 +901,7 @@ mod tests {
             serde_json::json!({"identity": "preserved"}),
         );
         checkpoints
-            .save(&checkpoint, &[])
+            .save(&checkpoint, &[], None)
             .await
             .expect("seed checkpoint");
         let mut composition = original.agent.config.clone();

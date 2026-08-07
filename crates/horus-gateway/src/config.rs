@@ -1,6 +1,6 @@
 //! Validated gateway configuration and owner-only persistence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -23,7 +23,7 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 10;
+const CONFIG_VERSION: u32 = 11;
 const CHAT_SPEC_VERSION: u32 = 5;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
@@ -31,6 +31,9 @@ const CLOUDFLARE_TOKEN_FILE: &str = "cloudflare-token";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_API_KEY_BYTES: usize = 16 * 1024;
+const MAX_PROVIDER_MODEL_IDS: usize = 64;
+const MAX_MODEL_ID_BYTES: usize = 1024;
+const MAX_PROVIDER_MODEL_IDS_BYTES: usize = 16 * 1024;
 const MAX_CLOUDFLARE_TOKEN_BYTES: usize = 16 * 1024;
 const SECONDS_PER_DAY: u64 = 86_400;
 const USAGE_HISTORY_DAYS: u64 = 52 * 7;
@@ -69,8 +72,16 @@ pub struct GatewayConfig {
     pub tls: Option<TlsConfig>,
     pub cloudflare: Option<CloudflareConfig>,
     pub default_agent: Option<VersionedAgentConfig>,
-    pub configured_providers: BTreeMap<String, ProviderConfig>,
+    pub(crate) configured_providers: BTreeMap<String, ConfiguredProvider>,
     usage: UsageHistory,
+}
+
+/// One durable provider selection and its gateway model catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConfiguredProvider {
+    pub(crate) selection: ProviderConfig,
+    pub(crate) model_ids: Vec<String>,
 }
 
 /// Durable runtime recipe copied into one chat checkpoint.
@@ -154,11 +165,19 @@ impl GatewayConfig {
     }
 
     /// Registers one configured provider and establishes the first as the new-chat default.
-    pub(crate) fn registering_provider(&self, selection: ProviderConfig) -> Result<Self> {
-        validate_provider_config(&selection)?;
+    pub(crate) fn registering_provider(
+        &self,
+        selection: ProviderConfig,
+        model_ids: Vec<String>,
+    ) -> Result<Self> {
+        let configured = ConfiguredProvider {
+            selection: selection.clone(),
+            model_ids,
+        };
+        validate_configured_provider(&configured)?;
         let mut next = self.clone();
         next.configured_providers
-            .insert(selection.provider.clone(), selection.clone());
+            .insert(selection.provider.clone(), configured);
         if self.default_agent.is_none() {
             let config = AgentComposition {
                 provider: selection,
@@ -190,12 +209,17 @@ impl GatewayConfig {
             )));
         }
         validate_agent_composition(&composition)?;
-        if !self
+        let Some(configured) = self
             .configured_providers
-            .contains_key(&composition.provider.provider)
-        {
+            .get(&composition.provider.provider)
+        else {
             return Err(Error::Config(
                 "the gateway default must use a configured provider entry".into(),
+            ));
+        };
+        if !configured_provider_contains_model(configured, &composition.provider.model)? {
+            return Err(Error::Config(
+                "the gateway default must use a model in the configured provider catalog".into(),
             ));
         }
         let mut next = self.clone();
@@ -229,6 +253,8 @@ impl GatewayConfig {
                     usage: usage.clone(),
                 })
                 .collect(),
+            run_stats: crate::wire::RunStats::default(),
+            recent_runs: Vec::new(),
         }
     }
 
@@ -268,14 +294,14 @@ impl GatewayConfig {
                 "the gateway default must exist exactly when a provider is configured".into(),
             ));
         }
-        for (provider_id, selection) in &self.configured_providers {
-            if provider_id != &selection.provider {
+        for (provider_id, configured) in &self.configured_providers {
+            if provider_id != &configured.selection.provider {
                 return Err(Error::Config(format!(
                     "configured provider key `{provider_id}` does not match `{}`",
-                    selection.provider
+                    configured.selection.provider
                 )));
             }
-            validate_provider_config(selection)?;
+            validate_configured_provider(configured)?;
         }
         if let Some(default) = &self.default_agent {
             if default.revision == 0 {
@@ -284,12 +310,18 @@ impl GatewayConfig {
                 ));
             }
             validate_agent_composition(&default.config)?;
-            if !self
+            let Some(configured) = self
                 .configured_providers
-                .contains_key(&default.config.provider.provider)
-            {
+                .get(&default.config.provider.provider)
+            else {
                 return Err(Error::Config(
                     "the gateway default must reference a configured provider".into(),
+                ));
+            };
+            if !configured_provider_contains_model(configured, &default.config.provider.model)? {
+                return Err(Error::Config(
+                    "the gateway default must reference a model in the configured provider catalog"
+                        .into(),
                 ));
             }
             for (middleware, setting, route) in
@@ -808,6 +840,69 @@ fn validate_provider_config(config: &ProviderConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_configured_provider(configured: &ConfiguredProvider) -> Result<()> {
+    validate_provider_config(&configured.selection)?;
+    let definition = provider(&configured.selection.provider)?;
+    if definition.models().is_empty() {
+        validate_model_ids(&configured.model_ids)?;
+    } else if !configured.model_ids.is_empty() {
+        return Err(Error::Config(format!(
+            "provider `{}` uses its advertised model catalog",
+            configured.selection.provider
+        )));
+    }
+    if !configured_provider_contains_model(configured, &configured.selection.model)? {
+        return Err(Error::Config(format!(
+            "provider `{}` selection is not in its configured model catalog",
+            configured.selection.provider
+        )));
+    }
+    Ok(())
+}
+
+fn validate_model_ids(model_ids: &[String]) -> Result<()> {
+    if model_ids.is_empty() || model_ids.len() > MAX_PROVIDER_MODEL_IDS {
+        return Err(Error::Config(format!(
+            "model IDs must contain 1–{MAX_PROVIDER_MODEL_IDS} entries"
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    let mut bytes = 0_usize;
+    for model_id in model_ids {
+        if model_id.is_empty() || model_id.len() > MAX_MODEL_ID_BYTES || model_id != model_id.trim()
+        {
+            return Err(Error::Config(format!(
+                "each model ID must be canonical and 1–{MAX_MODEL_ID_BYTES} bytes"
+            )));
+        }
+        if !seen.insert(model_id.as_str()) {
+            return Err(Error::Config(format!("duplicate model ID `{model_id}`")));
+        }
+        bytes = bytes
+            .checked_add(model_id.len())
+            .ok_or_else(|| Error::Config("model ID catalog is too large".into()))?;
+    }
+    if bytes > MAX_PROVIDER_MODEL_IDS_BYTES {
+        return Err(Error::Config(format!(
+            "model IDs are limited to {MAX_PROVIDER_MODEL_IDS_BYTES} bytes in total"
+        )));
+    }
+    Ok(())
+}
+
+fn configured_provider_contains_model(
+    configured: &ConfiguredProvider,
+    model: &str,
+) -> Result<bool> {
+    let definition = provider(&configured.selection.provider)?;
+    Ok(definition.model(model).is_some()
+        || definition.models().is_empty()
+            && configured
+                .model_ids
+                .iter()
+                .any(|candidate| candidate == model))
+}
+
 fn valid_hostname_label(label: &str) -> bool {
     (1..=63).contains(&label.len())
         && label
@@ -1081,22 +1176,22 @@ mod tests {
     }
 
     #[test]
-    fn gateway_config_rejects_v9_without_migration() {
+    fn gateway_config_rejects_v10_without_migration() {
         let root = tempfile::tempdir().expect("temporary directory");
         let state = root.path().join("state");
         ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
         let path = state.join(CONFIG_FILE);
         let contents = fs::read_to_string(&path)
             .expect("read gateway config")
-            .replacen("version = 10", "version = 9", 1);
-        fs::write(&path, contents).expect("write v9 config");
+            .replacen("version = 11", "version = 10", 1);
+        fs::write(&path, contents).expect("write v10 config");
 
-        let error = ConfigStore::open(state).expect_err("v9 must be rejected");
+        let error = ConfigStore::open(state).expect_err("v10 must be rejected");
 
         assert!(
             error
                 .to_string()
-                .contains("unsupported gateway config version 9")
+                .contains("unsupported gateway config version 10")
         );
     }
 
@@ -1107,7 +1202,7 @@ mod tests {
         let (store, config) =
             ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize state");
         let mut config = config
-            .registering_provider(AgentComposition::default().provider)
+            .registering_provider(AgentComposition::default().provider, Vec::new())
             .expect("register provider");
         let usage = TokenUsage {
             input_tokens: 7,
@@ -1126,7 +1221,7 @@ mod tests {
         let contents = fs::read_to_string(state.join(CONFIG_FILE)).expect("read config");
         let (_, restored) = ConfigStore::open(state).expect("open config");
 
-        assert!(contents.starts_with("version = 10"));
+        assert!(contents.starts_with("version = 11"));
         assert!(contents.contains("[default_agent.config.middleware.settings.context_offloading]"));
         assert!(contents.contains("[default_agent.config.middleware.settings.sessions]"));
         assert_eq!(restored, config);
@@ -1143,7 +1238,7 @@ mod tests {
             web_search: horus::backend::model::provider::HostedWebSearch::Off,
         };
         let first = config
-            .registering_provider(kimi.clone())
+            .registering_provider(kimi.clone(), Vec::new())
             .expect("register Kimi");
         let openrouter = ProviderConfig {
             provider: "openrouter".into(),
@@ -1153,11 +1248,18 @@ mod tests {
             web_search: horus::backend::model::provider::HostedWebSearch::Off,
         };
         let second = first
-            .registering_provider(openrouter.clone())
+            .registering_provider(
+                openrouter.clone(),
+                vec![openrouter.model.clone(), "anthropic/claude-opus-4.1".into()],
+            )
             .expect("register OpenRouter");
 
-        assert_eq!(second.configured_providers["kimi"], kimi);
-        assert_eq!(second.configured_providers["openrouter"], openrouter);
+        assert_eq!(second.configured_providers["kimi"].selection, kimi);
+        assert_eq!(
+            second.configured_providers["openrouter"].selection,
+            openrouter
+        );
+        assert_eq!(second.configured_providers["openrouter"].model_ids.len(), 2);
         assert_eq!(
             second
                 .default_agent
@@ -1173,9 +1275,9 @@ mod tests {
         updated.model = "kimi-k2.7-code".into();
         updated.reasoning_effort = None;
         let third = second
-            .registering_provider(updated.clone())
+            .registering_provider(updated.clone(), Vec::new())
             .expect("update registered provider");
-        assert_eq!(third.configured_providers["kimi"], updated);
+        assert_eq!(third.configured_providers["kimi"].selection, updated);
         let default = third.default_agent.expect("preserved default");
         assert_eq!(default.revision, 1);
         assert_eq!(default.config.provider, kimi);
@@ -1192,10 +1294,13 @@ mod tests {
         };
         let config = GatewayConfig::new(DEFAULT_LISTEN, None)
             .expect("gateway config")
-            .registering_provider(selection.clone())
+            .registering_provider(selection.clone(), vec![selection.model.clone()])
             .expect("register custom provider");
 
-        assert_eq!(config.configured_providers["responses"], selection);
+        assert_eq!(
+            config.configured_providers["responses"].selection,
+            selection
+        );
         assert_eq!(
             config
                 .default_agent
@@ -1207,10 +1312,39 @@ mod tests {
     }
 
     #[test]
+    fn custom_provider_registration_validates_its_model_catalog() {
+        let selection = ProviderConfig {
+            provider: "openrouter".into(),
+            model: "anthropic/claude-sonnet-4".into(),
+            base_url: None,
+            reasoning_effort: None,
+            web_search: horus::backend::model::provider::HostedWebSearch::Off,
+        };
+        let config = GatewayConfig::new(DEFAULT_LISTEN, None).expect("gateway config");
+
+        let missing = config
+            .registering_provider(selection.clone(), Vec::new())
+            .expect_err("custom catalog must not be empty");
+        let duplicate = config
+            .registering_provider(
+                selection.clone(),
+                vec![selection.model.clone(), selection.model.clone()],
+            )
+            .expect_err("custom catalog IDs must be unique");
+        let padded = config
+            .registering_provider(selection, vec![" anthropic/claude-sonnet-4".into()])
+            .expect_err("custom catalog IDs must be canonical");
+
+        assert!(missing.to_string().contains("1–64 entries"));
+        assert!(duplicate.to_string().contains("duplicate model ID"));
+        assert!(padded.to_string().contains("must be canonical"));
+    }
+
+    #[test]
     fn saving_defaults_is_revisioned_and_does_not_change_existing_chat_specs() {
         let registered = GatewayConfig::new(DEFAULT_LISTEN, None)
             .expect("gateway config")
-            .registering_provider(AgentComposition::default().provider)
+            .registering_provider(AgentComposition::default().provider, Vec::new())
             .expect("register provider");
         let workspace = tempfile::tempdir().expect("workspace");
         let state = tempfile::tempdir().expect("state");

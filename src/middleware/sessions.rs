@@ -571,6 +571,7 @@ mod tests {
             sequence: 0,
             catalog_visible: true,
             first_user_message: None,
+            execution_stats: Default::default(),
             created_at: 0,
             updated_at: 0,
         };
@@ -593,6 +594,7 @@ mod tests {
                 sequence: 0,
                 catalog_visible: true,
                 first_user_message: None,
+                execution_stats: Default::default(),
                 created_at: 0,
                 updated_at: 0,
             },
@@ -619,6 +621,7 @@ mod tests {
             sequence: 1,
             catalog_visible: true,
             first_user_message: Some(format!("Work in {workspace}")),
+            execution_stats: Default::default(),
             created_at: 0,
             updated_at: 0,
         };
@@ -654,6 +657,7 @@ mod tests {
             sequence: 0,
             catalog_visible,
             first_user_message: None,
+            execution_stats: Default::default(),
             created_at: 0,
             updated_at: 0,
         };
@@ -695,6 +699,7 @@ mod tests {
                 sequence: 1,
                 catalog_visible: true,
                 first_user_message: Some("Update dependencies".into()),
+                execution_stats: Default::default(),
                 created_at: 42,
                 updated_at: 42,
             },

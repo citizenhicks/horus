@@ -29,7 +29,7 @@ use super::theme::{Role, current};
 
 const MAX_API_KEY_BYTES: usize = 16 * 1024;
 const MAX_ENDPOINT_BYTES: usize = 4 * 1024;
-const MAX_MODEL_BYTES: usize = 1024;
+const MAX_MODEL_IDS_BYTES: usize = 16 * 1024;
 const MIN_INLINE_DESCRIPTION_WIDTH: usize = 20;
 
 const CHANGE_CHAT_LABEL: &str = "Change for this chat only";
@@ -435,7 +435,7 @@ impl SetupState {
     }
 
     fn handle_models_key(&mut self, key: KeyEvent) -> Flow {
-        let custom_row = self.definition().models.is_empty().then_some(0);
+        let custom_row = self.definition().model_ids_configurable.then_some(0);
         match key.code {
             KeyCode::Esc => {
                 self.page = Page::Authentication;
@@ -627,7 +627,9 @@ impl SetupState {
     fn paste(&mut self, text: &str) {
         if self.page == Page::Authentication && self.authentication_is_editable() {
             self.push_text(text.trim());
-        } else if self.page == Page::Models && self.definition().models.is_empty() && self.row == 0
+        } else if self.page == Page::Models
+            && self.definition().model_ids_configurable
+            && self.row == 0
         {
             self.model = 0;
             self.push_text(text.trim());
@@ -638,7 +640,7 @@ impl SetupState {
         let custom = self.page == Page::Models;
         let endpoint = self.page == Page::Authentication && self.endpoint_focused;
         let (target, limit) = if custom {
-            (&mut self.custom_model, MAX_MODEL_BYTES)
+            (&mut self.custom_model, MAX_MODEL_IDS_BYTES)
         } else if endpoint {
             (&mut self.endpoint, MAX_ENDPOINT_BYTES)
         } else {
@@ -671,7 +673,7 @@ impl SetupState {
         }
         .unwrap_or_default()
         .into();
-        self.model = if definition.models.is_empty() {
+        self.model = if definition.model_ids_configurable {
             0
         } else if same_provider {
             definition
@@ -682,8 +684,12 @@ impl SetupState {
         } else {
             0
         };
-        self.custom_model = if same_provider && definition.models.is_empty() {
-            current.model.clone()
+        self.custom_model = if definition.model_ids_configurable {
+            let mut model_ids = definition.model_ids.clone();
+            if same_provider && !model_ids.contains(&current.model) {
+                model_ids.insert(0, current.model.clone());
+            }
+            model_ids.join(", ")
         } else {
             String::new()
         };
@@ -721,11 +727,25 @@ impl SetupState {
         self.error = None;
     }
 
-    fn selected_model(&self) -> &str {
-        self.definition()
-            .models
-            .get(self.model)
-            .map_or_else(|| self.custom_model.trim(), |model| model.id.as_str())
+    fn configured_model_ids(&self) -> Result<Vec<String>> {
+        if !self.definition().model_ids_configurable {
+            return Ok(Vec::new());
+        }
+        let model_ids = self
+            .custom_model
+            .split(',')
+            .map(str::trim)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if model_ids.iter().any(String::is_empty) {
+            return Err(Error::Config(
+                "Enter one or more model IDs separated by commas".into(),
+            ));
+        }
+        if model_ids.iter().collect::<BTreeSet<_>>().len() != model_ids.len() {
+            return Err(Error::Config("Model IDs must be unique".into()));
+        }
+        Ok(model_ids)
     }
 
     fn selected_base_url(&self) -> Option<String> {
@@ -802,7 +822,11 @@ impl SetupState {
             return Ok(config);
         }
         let definition = self.definition();
-        let model = self.selected_model();
+        let model_ids = self.configured_model_ids()?;
+        let model = definition.models.get(self.model).map_or_else(
+            || model_ids.first().map_or("", String::as_str),
+            |model| model.id.as_str(),
+        );
         let reasoning_effort = if let Some(model) = definition.models.get(self.model) {
             self.reasoning
                 .checked_sub(1)
@@ -871,6 +895,8 @@ fn validated_providers(statuses: &[ProviderStatus]) -> Result<Vec<ProviderEntry>
             if status.label.trim().is_empty()
                 || status.description.trim().is_empty()
                 || status.web_search.first() != Some(&HostedWebSearch::Off)
+                || status.model_ids_configurable != status.models.is_empty()
+                || !status.model_ids_configurable && !status.model_ids.is_empty()
             {
                 return Err(Error::Config(format!(
                     "gateway advertised an incomplete manifest for `{}`",
@@ -897,8 +923,15 @@ fn validate_active_provider(status: &ProviderStatus, config: &ProviderConfig) ->
             status.provider
         )));
     }
-    if status.models.is_empty() {
-        return Ok(());
+    if status.model_ids_configurable {
+        return if status.model_ids.iter().any(|model| model == &config.model) {
+            Ok(())
+        } else {
+            Err(Error::Config(format!(
+                "gateway active provider `{}` has unconfigured model `{}`",
+                status.provider, config.model
+            )))
+        };
     }
     let model = status
         .models
@@ -1028,8 +1061,16 @@ async fn apply(
             "Updating the gateway model catalog…",
         );
         draw(terminal, state)?;
-        *gateway =
-            register_provider(terminal, state, sender, events, config.provider.clone()).await?;
+        let model_ids = state.configured_model_ids()?;
+        *gateway = register_provider(
+            terminal,
+            state,
+            sender,
+            events,
+            config.provider.clone(),
+            model_ids,
+        )
+        .await?;
     }
     match state.target {
         ApplyTarget::Session => {
@@ -1087,8 +1128,16 @@ async fn apply_gateway(
             "Updating the gateway model catalog…",
         );
         draw(terminal, state)?;
-        *gateway =
-            register_provider(terminal, state, sender, events, config.provider.clone()).await?;
+        let model_ids = state.configured_model_ids()?;
+        *gateway = register_provider(
+            terminal,
+            state,
+            sender,
+            events,
+            config.provider.clone(),
+            model_ids,
+        )
+        .await?;
     }
     let default = gateway
         .default_config
@@ -1113,12 +1162,14 @@ async fn register_provider(
     sender: &GatewaySender,
     events: &mut GatewayEvents,
     config: ProviderConfig,
+    model_ids: Vec<String>,
 ) -> Result<ReadyPayload> {
     let request_id = Uuid::new_v4().to_string();
     sender
         .send(ClientMessage::RegisterProvider {
             request_id: request_id.clone(),
             config,
+            model_ids,
         })
         .await
         .map_err(gateway_error)?;
@@ -1708,7 +1759,14 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState, width: u16) {
             }
         }
         Page::Models => {
-            lines.push(Line::styled("  Model", theme.style(Role::Muted)));
+            lines.push(Line::styled(
+                if state.definition().model_ids_configurable {
+                    "  Model IDs"
+                } else {
+                    "  Model"
+                },
+                theme.style(Role::Muted),
+            ));
             for (index, model) in state.definition().models.iter().enumerate() {
                 choice(
                     lines,
@@ -1718,12 +1776,12 @@ fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState, width: u16) {
                     if state.model == index { "●" } else { "○" },
                 );
             }
-            if state.definition().models.is_empty() {
+            if state.definition().model_ids_configurable {
                 choice(
                     lines,
-                    "Custom model",
+                    "Model IDs",
                     if state.custom_model.is_empty() {
-                        "Type or paste an exact model ID"
+                        "Comma-separated; the first model is selected"
                     } else {
                         &state.custom_model
                     },
@@ -2236,6 +2294,12 @@ mod tests {
             ),
             _ => panic!("unknown fixture provider"),
         };
+        let model_ids_configurable = models.is_empty();
+        let model_ids = if model_ids_configurable {
+            vec![AgentComposition::default().provider.model]
+        } else {
+            Vec::new()
+        };
         ProviderStatus {
             provider: provider.into(),
             label: provider.into(),
@@ -2243,6 +2307,8 @@ mod tests {
             description: format!("{provider} provider"),
             configured,
             selection: None,
+            model_ids,
+            model_ids_configurable,
             auth,
             default_base_url,
             default_api_key_env,
@@ -2385,7 +2451,12 @@ mod tests {
         state.authentication_succeeded();
         assert_eq!(state.page, Page::Models);
         state.row = 0;
-        state.paste("custom-model");
+        state.custom_model.clear();
+        state.paste("custom-model, alternate-model");
+        assert_eq!(
+            state.configured_model_ids().expect("model IDs"),
+            ["custom-model", "alternate-model"]
+        );
         state.row = state.models_action_start();
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),

@@ -597,6 +597,7 @@ mod tests {
     use super::*;
     use crate::BoxFuture;
     use crate::backend::checkpoint::Checkpoint;
+    use crate::backend::checkpoint::ExecutionRecord;
 
     struct FailOnceStore {
         fail_next_save: AtomicBool,
@@ -649,6 +650,7 @@ mod tests {
             &'a self,
             _checkpoint: &'a Checkpoint,
             _transcript_delta: &'a [Value],
+            _execution: Option<&'a ExecutionRecord>,
         ) -> BoxFuture<'a, Result<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -691,6 +693,7 @@ mod tests {
             &'a self,
             _checkpoint: &'a Checkpoint,
             _transcript_delta: &'a [Value],
+            _execution: Option<&'a ExecutionRecord>,
         ) -> BoxFuture<'a, Result<()>> {
             Box::pin(async { Ok(()) })
         }

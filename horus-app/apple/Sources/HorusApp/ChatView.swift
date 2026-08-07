@@ -897,9 +897,6 @@ private struct ComposerActivityView: View {
                 ForEach(model.composerFooterWidgets) { widget in
                     FrontendWidgetView(widget: widget)
                 }
-                if model.steeringQueued {
-                    HorusBadge(text: "Steering queued", tone: "warning")
-                }
                 if totals.added > 0 || totals.removed > 0 {
                     Button(action: model.showInspector) {
                         HStack(spacing: 6) {
@@ -933,35 +930,54 @@ private struct ComposerActivityView: View {
 
 }
 
-/// Context fill stays compact in the bubble; cache hit and turn duration live in the popover.
+/// Context fill and elapsed execution time stay visible; deeper run totals live in the popover.
 private struct SessionStatsBadge: View {
     @Environment(AppModel.self) private var model
     @State private var showsDetail = false
 
     var body: some View {
         if model.selectedSessionID != nil {
-            Button { showsDetail = true } label: {
-                HorusBadge(
-                    text: "\(model.contextFillPercent)%",
-                    progress: model.contextFillFraction,
-                    interactive: true
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                let elapsed = model.sessionElapsed(at: timeline.date)
+                Button { showsDetail = true } label: {
+                    HorusBadge(
+                        text: "\(model.contextFillPercent)% · \(formatDuration(elapsed))",
+                        progress: model.contextFillFraction,
+                        interactive: true
+                    )
+                    .frame(
+                        minWidth: HorusStyle.iconButtonSize,
+                        minHeight: HorusStyle.iconButtonSize
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.horusPlain)
+                .accessibilityLabel("Session observability")
+                .accessibilityValue(
+                    "\(model.contextFillPercent) percent context, \(formatDuration(elapsed)) elapsed"
                 )
-                .frame(
-                    minWidth: HorusStyle.iconButtonSize,
-                    minHeight: HorusStyle.iconButtonSize
-                )
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.horusPlain)
-            .accessibilityLabel("Context usage")
-            .accessibilityValue("\(model.contextFillPercent) percent")
-            .popover(isPresented: $showsDetail) {
-                BadgePopover(title: "Session") {
-                    BadgeStat(label: "Context", value: "\(model.contextTokens.formatted()) · \(model.contextFillPercent)%")
-                    BadgeStat(label: "Cache hit", value: cacheHit(model.lastUsage))
-                    TimelineView(.periodic(from: .now, by: 1)) { timeline in
-                        let elapsed = model.sessionElapsed(at: timeline.date)
+                .popover(isPresented: $showsDetail) {
+                    BadgePopover(title: "Session") {
+                        BadgeStat(
+                            label: "Context",
+                            value: "\(model.contextTokens.formatted()) · \(model.contextFillPercent)%"
+                        )
                         BadgeStat(label: "Elapsed", value: formatDuration(elapsed))
+                        BadgeStat(label: "Runs", value: model.sessionRunCount.formatted())
+                        BadgeStat(label: "Model calls", value: model.sessionModelCalls.formatted())
+                        BadgeStat(label: "Tool calls", value: model.sessionToolCalls.formatted())
+                        BadgeStat(
+                            label: "Tool failures",
+                            value: model.sessionFailedToolCalls.formatted()
+                        )
+                        BadgeStat(
+                            label: "Run tokens",
+                            value: (
+                                model.runStats.usage.totalTokens
+                                    + (model.runStats.active?.usage.totalTokens ?? 0)
+                            ).formatted()
+                        )
+                        BadgeStat(label: "Cache hit", value: cacheHit(model.lastUsage))
                     }
                 }
             }
@@ -1036,8 +1052,14 @@ private struct ComposerOptionsView: View {
     private var approvalMenu: some View {
         Menu {
             ForEach(approvalOptions) { option in
-                Button(option.label) {
+                Button {
                     model.setApprovalPolicyForCurrentChat(option.value)
+                } label: {
+                    HorusPlatformMenuLabel(
+                        title: option.label,
+                        glyph: option.value == approvalValue ? .check : .handPalm,
+                        systemImage: option.value == approvalValue ? "checkmark" : "hand.raised"
+                    )
                 }
             }
         } label: {
@@ -1064,12 +1086,20 @@ private struct ComposerOptionsView: View {
     @ViewBuilder
     private var modelMenuContent: some View {
         ForEach(distinctModels, id: \.route) { choice in
-            Button("\(choice.group) · \(choice.model)") {
+            Button {
                 let effort = currentChoice?.reasoningEffort
                 let target = model.modelChoices.first {
                     $0.group == choice.group && $0.model == choice.model && $0.reasoningEffort == effort
                 } ?? choice
                 model.selectModel(target.route)
+            } label: {
+                let selected = choice.group == currentChoice?.group
+                    && choice.model == currentChoice?.model
+                HorusPlatformMenuLabel(
+                    title: "\(choice.group) · \(choice.model)",
+                    glyph: selected ? .check : .sparkle,
+                    systemImage: selected ? "checkmark" : "sparkles"
+                )
             }
         }
     }
@@ -1077,8 +1107,15 @@ private struct ComposerOptionsView: View {
     @ViewBuilder
     private var reasoningMenuContent: some View {
         ForEach(reasoningChoices, id: \.route) { choice in
-            Button(choice.reasoningEffort?.capitalized ?? "Default") {
+            Button {
                 model.selectModel(choice.route)
+            } label: {
+                let selected = choice.route == model.selectedModelRoute
+                HorusPlatformMenuLabel(
+                    title: choice.reasoningEffort?.capitalized ?? "Default",
+                    glyph: selected ? .check : .brain,
+                    systemImage: selected ? "checkmark" : "brain.head.profile"
+                )
             }
         }
     }
@@ -1091,7 +1128,7 @@ private struct ComposerOptionsView: View {
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
                 .help("Stop")
         } else {
-            Button("Send", glyph: .arrowUp) { model.sendMessage() }
+            Button("Send", glyph: .arrowUp02) { model.sendMessage() }
                 .labelStyle(.iconOnly)
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
                 // `sendMessage()` also needs a session: a gateway with no chats left the button
@@ -1226,7 +1263,6 @@ private struct ApprovalView: View {
 struct FrontendWidgetView: View {
     @Environment(AppModel.self) private var model
     @State private var showsDetail = false
-    @State private var selectedOption: FrontendPickerOption?
     let widget: MountedWidget
 
     var body: some View {
@@ -1241,17 +1277,9 @@ struct FrontendWidgetView: View {
             }
             .buttonStyle(.horusPlain)
             .accessibilityLabel(accessibilityTitle)
-            #if os(iOS)
-            .sheet(isPresented: $showsDetail, onDismiss: submitSelectedOption) {
-                WidgetContentPopover(content: content, select: select)
-                    .presentationDetents([.medium, .large])
-                    .presentationDragIndicator(.visible)
-            }
-            #else
             .popover(isPresented: $showsDetail) {
                 WidgetContentPopover(content: content, select: select)
             }
-            #endif
         } else if widget.widget.action != nil {
             Button(action: submit) {
                 badge
@@ -1289,18 +1317,8 @@ struct FrontendWidgetView: View {
     private func submit() { model.submitWidget(widget) }
 
     private func select(_ option: FrontendPickerOption) {
-        #if os(iOS)
-        selectedOption = option
-        #else
         model.submitPickerOption(option)
-        #endif
         showsDetail = false
-    }
-
-    private func submitSelectedOption() {
-        guard let selectedOption else { return }
-        self.selectedOption = nil
-        model.submitPickerOption(selectedOption)
     }
 }
 
@@ -1363,12 +1381,19 @@ private struct FrontendActionListRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
+            if let statusGlyph {
+                HorusIcon(statusGlyph, size: 15, foreground: statusColor)
+                    .frame(width: 20, height: HorusStyle.iconButtonSize)
+            }
             Text(item.text)
                 .font(HorusStyle.bodyFont)
+                .foregroundStyle(item.state == .completed ? palette.muted : .primary)
+                .strikethrough(item.state == .completed, color: palette.muted)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
-            #if os(iOS)
+            if !item.actions.isEmpty {
+                #if os(iOS)
             Menu {
                 ForEach(item.actions) { action in
                     Button(role: action.tone == "error" ? .destructive : nil) {
@@ -1413,10 +1438,12 @@ private struct FrontendActionListRow: View {
                 }
             }
             .fixedSize()
-            #endif
+                #endif
+            }
         }
         .padding(.vertical, 4)
         .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(statusLabel): \(item.text)")
         .alert(
             pendingAction?.action.label ?? "",
             isPresented: isPresentingAction,
@@ -1471,6 +1498,32 @@ private struct FrontendActionListRow: View {
     private func actionColor(_ action: FrontendActionListAction) -> Color {
         action.tone == "neutral" ? palette.accent : palette.tone(action.tone)
     }
+
+    private var statusGlyph: HorusGlyph? {
+        switch item.state {
+        case .plain: nil
+        case .pending: .clock
+        case .inProgress: .arrowClockwise
+        case .completed: .checkCircle
+        }
+    }
+
+    private var statusColor: Color {
+        switch item.state {
+        case .plain, .pending: palette.muted
+        case .inProgress: palette.accent
+        case .completed: palette.signal
+        }
+    }
+
+    private var statusLabel: String {
+        switch item.state {
+        case .plain: "Item"
+        case .pending: "Pending"
+        case .inProgress: "In progress"
+        case .completed: "Completed"
+        }
+    }
 }
 
 private struct PendingAction {
@@ -1489,25 +1542,27 @@ private struct FrontendPickerOptionLabel: View {
     let option: FrontendPickerOption
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        HStack(spacing: 8) {
             Text(option.label)
                 .font(HorusStyle.controlFont.weight(.semibold))
                 .foregroundStyle(palette.accent)
+                .lineLimit(1)
             if !option.description.isEmpty {
                 Text(option.description)
-                    .font(HorusStyle.bodyFont)
-                    .foregroundStyle(.primary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(palette.muted)
+                    .lineLimit(1)
             }
+            Spacer(minLength: 4)
             if !option.detail.isEmpty {
                 Text(option.detail)
-                    .font(.footnote)
+                    .font(HorusStyle.metadataFont)
                     .foregroundStyle(palette.muted)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(1)
             }
+            HorusIcon(.caretRight, size: 12, foreground: palette.muted)
         }
         .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
-        .padding(.vertical, 4)
         .contentShape(Rectangle())
     }
 }

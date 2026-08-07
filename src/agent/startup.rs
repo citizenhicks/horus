@@ -10,10 +10,13 @@ use super::COMMAND_QUEUE_CAPACITY;
 use super::EVENT_QUEUE_CAPACITY;
 use super::Runner;
 use super::try_send_event;
+use super::unix_timestamp_ms;
 use crate::Error;
 use crate::Result;
 use crate::backend::checkpoint::CHECKPOINT_VERSION;
 use crate::backend::checkpoint::Checkpoint;
+use crate::backend::checkpoint::ExecutionOutcome;
+use crate::backend::checkpoint::ExecutionRecord;
 use crate::backend::checkpoint::TranscriptPageRequest;
 use crate::backend::model::user_message;
 use crate::middleware::FrontendExtensions;
@@ -28,6 +31,7 @@ use crate::protocol::SessionHistoryEvent;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::ToolCallEndEvent;
+use crate::protocol::UserMessageEvent;
 use crate::protocol::replay_events;
 
 /// Validates capabilities, restores a checkpoint, and starts the agent loop.
@@ -84,7 +88,11 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             .into_positioned_items_chronological();
         replay_events(&transcript, &config.session_id)
     };
-    if let Some(turn_id) = &state.active_turn_id {
+    if let Some(turn_id) = state
+        .active_execution
+        .as_ref()
+        .map(|execution| &execution.turn_id)
+    {
         for pending in &state.pending_tools {
             if let Some(call) = replay.iter_mut().rev().find_map(|event| match event {
                 EventMsg::ToolCallBegin(call) if call.call_id == pending.call_id => Some(call),
@@ -95,6 +103,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         }
     }
     let mut recovery_delta = Vec::new();
+    let mut recovery_execution: Option<ExecutionRecord> = None;
     let route = if config.model_route_configured {
         config.provider.clone()
     } else {
@@ -161,10 +170,13 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             .as_ref()
             .is_none_or(|pending| pending.decision_received);
     if uncertain_tools {
+        let recovered_tool_calls = u64::try_from(state.pending_tools.len())
+            .map_err(|_| Error::Checkpoint("recovered tool-call count is unsupported".into()))?;
         let recovered_turn = state
-            .active_turn_id
-            .clone()
-            .unwrap_or_else(|| "recovered".into());
+            .active_execution
+            .as_ref()
+            .map(|execution| execution.turn_id.clone())
+            .ok_or_else(|| Error::Checkpoint("pending tools have no active execution".into()))?;
         for call in std::mem::take(&mut state.pending_tools) {
             let output = "execution interrupted; result unknown after restart";
             let item = crate::backend::model::tool_output(&call.call_id, output, true);
@@ -182,23 +194,49 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             let item = user_message(&message);
             state.context.push(item.clone());
             recovery_delta.push(item);
+            replay.push(EventMsg::UserMessage(UserMessageEvent {
+                message,
+                message_target: None,
+            }));
         }
         state.pending_approval = None;
-        state.active_turn_id = None;
+        let active = state
+            .active_execution
+            .as_mut()
+            .ok_or_else(|| Error::Checkpoint("recovery lost its active execution".into()))?;
+        active.tool_calls = active
+            .tool_calls
+            .checked_add(recovered_tool_calls)
+            .ok_or_else(|| Error::Checkpoint("execution tool-call count overflow".into()))?;
+        active.failed_tool_calls = active
+            .failed_tool_calls
+            .checked_add(recovered_tool_calls)
+            .ok_or_else(|| Error::Checkpoint("execution failed-tool count overflow".into()))?;
+        recovery_execution =
+            Some(state.finish_execution(ExecutionOutcome::Aborted, unix_timestamp_ms()?)?);
         state_changed = true;
-    } else if state.pending_approval.is_none() && state.active_turn_id.take().is_some() {
+    } else if state.pending_approval.is_none() && state.active_execution.is_some() {
         for message in std::mem::take(&mut state.pending_input) {
             let item = user_message(&message);
             state.context.push(item.clone());
             recovery_delta.push(item);
+            replay.push(EventMsg::UserMessage(UserMessageEvent {
+                message,
+                message_target: None,
+            }));
         }
+        recovery_execution =
+            Some(state.finish_execution(ExecutionOutcome::Aborted, unix_timestamp_ms()?)?);
         state_changed = true;
     }
     if is_new || state_changed {
         if !is_new {
             state.sequence += 1;
         }
-        config.checkpoints.save(&state, &recovery_delta).await?;
+        config
+            .checkpoints
+            .save(&state, &recovery_delta, recovery_execution.as_ref())
+            .await?;
     }
     if !replay.is_empty() {
         try_send_event(

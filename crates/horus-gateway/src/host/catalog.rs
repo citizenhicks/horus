@@ -149,11 +149,14 @@ mod tests {
         let mut parent = Checkpoint::empty("parent");
         parent.session_context.workspace_id = Some("workspace".into());
         parent.sequence = 1;
-        checkpoints.save(&parent, &[]).await.expect("save parent");
+        checkpoints
+            .save(&parent, &[], None)
+            .await
+            .expect("save parent");
         let mut empty_root = Checkpoint::empty("empty-root");
         empty_root.session_context.workspace_id = Some("workspace".into());
         checkpoints
-            .save(&empty_root, &[])
+            .save(&empty_root, &[], None)
             .await
             .expect("save empty root");
         let mut child = Checkpoint::empty("child");
@@ -197,7 +200,10 @@ mod tests {
             } else {
                 format!("chat {index}")
             });
-            checkpoints.save(&checkpoint, &[]).await.expect("save chat");
+            checkpoints
+                .save(&checkpoint, &[], None)
+                .await
+                .expect("save chat");
         }
 
         let sessions = session_catalog(&checkpoints, &activities())
@@ -229,7 +235,7 @@ mod tests {
                 .expect("checkpoints"),
         );
         checkpoints
-            .save(&Checkpoint::empty("active"), &[])
+            .save(&Checkpoint::empty("active"), &[], None)
             .await
             .expect("save session");
         let activities = activities();

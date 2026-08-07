@@ -13,6 +13,8 @@ use crate::Error;
 use crate::Result;
 use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::CheckpointStore;
+use crate::backend::checkpoint::ExecutionOutcome;
+use crate::backend::checkpoint::ExecutionPageRequest;
 use crate::backend::checkpoint::sqlite::SqliteCheckpoint;
 use crate::backend::model::Model;
 use crate::backend::model::ModelEventSink;
@@ -559,14 +561,86 @@ async fn completed_before_model_effects_are_settled_when_a_later_hook_fails() {
         .await
         .expect("load checkpoint")
         .expect("saved checkpoint");
+    let execution = checkpoints
+        .execution_page(
+            "settled-hooks",
+            ExecutionPageRequest {
+                before_sequence: None,
+                limit: 1,
+            },
+        )
+        .await
+        .expect("execution page")
+        .executions
+        .pop()
+        .expect("failed execution");
 
     assert!(saw_effect);
     assert_eq!(saved.total_usage.total_tokens, 1);
+    assert_eq!(
+        (
+            execution.outcome,
+            execution.model_calls,
+            execution.usage.total_tokens,
+            saved.execution_stats.failed_run_count,
+        ),
+        (ExecutionOutcome::Failed, 0, 1, 1)
+    );
     assert!(
         saved
             .context
             .iter()
             .any(|item| internal_message_kind(item) == Some("settled"))
+    );
+}
+
+#[tokio::test]
+async fn provider_failure_records_one_failed_execution() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let mut agent = create_agent(config(
+        workspace.path(),
+        checkpoint_store,
+        "provider-failure",
+    ))
+    .await
+    .expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "fail".into(),
+        })
+        .expect("submit input");
+    while !matches!(
+        agent.next_event().await.expect("agent event").msg,
+        EventMsg::TurnAborted(_)
+    ) {}
+
+    let execution = checkpoints
+        .execution_page(
+            "provider-failure",
+            ExecutionPageRequest {
+                before_sequence: None,
+                limit: 1,
+            },
+        )
+        .await
+        .expect("execution page")
+        .executions
+        .pop()
+        .expect("failed execution");
+
+    assert_eq!(
+        (
+            execution.outcome,
+            execution.model_calls,
+            execution.tool_calls
+        ),
+        (ExecutionOutcome::Failed, 1, 0)
     );
 }
 
@@ -627,6 +701,19 @@ async fn automatic_approval_uses_an_isolated_toolless_review_and_counts_usage() 
         .await
         .expect("load checkpoint")
         .expect("saved checkpoint");
+    let execution = checkpoints
+        .execution_page(
+            "auto-review",
+            ExecutionPageRequest {
+                before_sequence: None,
+                limit: 1,
+            },
+        )
+        .await
+        .expect("execution page")
+        .executions
+        .pop()
+        .expect("completed execution");
 
     assert_eq!(
         model
@@ -639,6 +726,17 @@ async fn automatic_approval_uses_an_isolated_toolless_review_and_counts_usage() 
     assert_eq!(saved.total_usage.total_tokens, 9);
     assert_eq!(saved.last_usage, Some(scripted_usage()));
     assert_eq!(usage_totals, [1, 8, 9]);
+    assert_eq!(
+        (
+            execution.outcome,
+            execution.model_calls,
+            execution.tool_calls,
+            execution.failed_tool_calls,
+            execution.usage.total_tokens,
+            saved.execution_stats.run_count,
+        ),
+        (ExecutionOutcome::Completed, 3, 1, 0, 9, 1)
+    );
 }
 
 #[tokio::test]
@@ -868,7 +966,7 @@ async fn stale_save_does_not_leapfrog_winning_checkpoint() {
     winner.sequence += 1;
     winner.context.push(serde_json::json!({"winner": true}));
     checkpoints
-        .save(&winner, &winner.context)
+        .save(&winner, &winner.context, None)
         .await
         .expect("save competing checkpoint");
 
@@ -1035,7 +1133,7 @@ async fn resume_request_carries_the_target_session_context() {
     target.session_context.clone_from(&target_context);
     target.model_route = Some("foreign-workspace-route".into());
     checkpoints
-        .save(&target, &[])
+        .save(&target, &[], None)
         .await
         .expect("save target session");
     let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints;
@@ -1079,7 +1177,15 @@ async fn restart_closes_uncertain_tool_calls_without_replaying_them() {
         arguments: serde_json::json!({"path": "note.txt", "content": "hello"}),
     };
     let mut target = Checkpoint::empty("target");
-    target.active_turn_id = Some("turn-1".into());
+    target.active_execution = Some(crate::backend::checkpoint::ActiveExecution {
+        submission_id: "submission-1".into(),
+        turn_id: "turn-1".into(),
+        started_at_ms: 1,
+        model_calls: 0,
+        tool_calls: 0,
+        failed_tool_calls: 0,
+        usage: TokenUsage::default(),
+    });
     target.context.push(serde_json::json!({
         "type": "function_call",
         "call_id": call.call_id.clone(),
@@ -1087,8 +1193,9 @@ async fn restart_closes_uncertain_tool_calls_without_replaying_them() {
         "arguments": call.arguments.to_string()
     }));
     target.pending_tools.push(call);
+    target.pending_input.push("steer after restart".into());
     checkpoints
-        .save(&target, &target.context)
+        .save(&target, &target.context, None)
         .await
         .expect("save target");
     let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
@@ -1114,12 +1221,14 @@ async fn restart_closes_uncertain_tool_calls_without_replaying_them() {
                 output,
                 is_error: true,
                 ..
-            })
+            }),
+            EventMsg::UserMessage(user)
         ] if begin.turn_id == "turn-1"
             && begin.call_id == "call-1"
             && turn_id == &begin.turn_id
             && call_id == &begin.call_id
             && output == "execution interrupted; result unknown after restart"
+            && user.message == "steer after restart"
     ));
 
     let recovered = checkpoints
@@ -1127,13 +1236,35 @@ async fn restart_closes_uncertain_tool_calls_without_replaying_them() {
         .await
         .expect("load checkpoint")
         .expect("recovered checkpoint");
-    assert!(recovered.active_turn_id.is_none());
+    let execution = checkpoints
+        .execution_page(
+            "target",
+            ExecutionPageRequest {
+                before_sequence: None,
+                limit: 1,
+            },
+        )
+        .await
+        .expect("execution page")
+        .executions
+        .pop()
+        .expect("recovered execution");
+    assert!(recovered.active_execution.is_none());
     assert!(recovered.pending_tools.is_empty());
     assert_eq!(
-        recovered.context.last().and_then(|item| {
+        recovered.context.iter().find_map(|item| {
             item.get(TOOL_ERROR_FIELD)
                 .and_then(serde_json::Value::as_bool)
         }),
         Some(true)
+    );
+    assert_eq!(
+        (
+            execution.outcome,
+            execution.tool_calls,
+            execution.failed_tool_calls,
+            recovered.execution_stats.aborted_run_count,
+        ),
+        (ExecutionOutcome::Aborted, 1, 1, 1)
     );
 }

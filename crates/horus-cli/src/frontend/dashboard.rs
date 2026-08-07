@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use horus::protocol::{
-    EventMsg, FrontendActionListItem, FrontendBlock, FrontendEvent, FrontendSlot, FrontendTone,
-    FrontendWidget, FrontendWidgetContent, MAX_USER_INPUT_BYTES, Op, Submission,
+    EventMsg, FrontendActionListItem, FrontendBlock, FrontendEvent, FrontendListItemState,
+    FrontendSlot, FrontendTone, FrontendWidget, FrontendWidgetContent, MAX_USER_INPUT_BYTES, Op,
+    Submission,
 };
 use horus::{Error, Result};
 use horus_gateway::client::{Endpoint, GatewayClient, GatewayEvents, GatewaySender};
@@ -94,6 +95,7 @@ struct ActionInput {
 
 impl CapabilityOverlay {
     fn from_session(payload: SessionReadyPayload) -> Self {
+        let session_id = payload.session.session_id;
         let widgets = payload
             .contributions
             .into_iter()
@@ -105,7 +107,7 @@ impl CapabilityOverlay {
             })
             .collect();
         let mut overlay = Self {
-            session_id: payload.session.session_id,
+            session_id,
             widgets,
             widget_list: ListState::default(),
             open: None,
@@ -113,6 +115,12 @@ impl CapabilityOverlay {
             action_index: 0,
             input: None,
         };
+        for widget in payload.widgets {
+            overlay.apply(FrontendEvent::Widget {
+                capability: widget.capability,
+                item: widget.item,
+            });
+        }
         overlay.sync_selection();
         overlay
     }
@@ -1222,6 +1230,15 @@ fn render_action_list(
         .iter()
         .enumerate()
         .map(|(item_index, item)| {
+            let (marker, note_style) = match item.state {
+                FrontendListItemState::Plain => ("", theme.style(Role::Text)),
+                FrontendListItemState::Pending => ("○ ", theme.style(Role::Muted)),
+                FrontendListItemState::InProgress => ("◉ ", theme.style(Role::AccentStrong)),
+                FrontendListItemState::Completed => (
+                    "✓ ",
+                    theme.style(Role::Muted).add_modifier(Modifier::CROSSED_OUT),
+                ),
+            };
             let actions_width = item
                 .actions
                 .iter()
@@ -1229,14 +1246,17 @@ fn render_action_list(
                 .sum::<usize>()
                 .saturating_add(item.actions.len().saturating_sub(1) * 2);
             let note_width = width.saturating_sub(actions_width.saturating_add(1));
-            let note = truncate_terminal_width(&terminal_text(&item.text), note_width);
+            let note = truncate_terminal_width(
+                &format!("{marker}{}", terminal_text(&item.text)),
+                note_width,
+            );
             let used = Line::from(note.as_str())
                 .width()
                 .saturating_add(actions_width);
             let padding = width.saturating_sub(used).max(1);
             let mut spans = vec![Span::styled(
                 format!(" {note}{}", " ".repeat(padding)),
-                theme.style(Role::Text),
+                note_style,
             )];
             for (action_index, action) in item.actions.iter().enumerate() {
                 if action_index > 0 {
@@ -1557,18 +1577,38 @@ fn render_usage(frame: &mut ratatui::Frame<'_>, area: Rect, profile: Option<&Pro
             let total = profile.daily_usage.iter().fold(0_i64, |total, entry| {
                 total.saturating_add(entry.usage.total_tokens)
             });
+            let stats = &profile.run_stats;
             vec![
                 Line::from(format!(" Today      {} tokens", number(today.total_tokens))),
                 Line::from(format!(
-                    " Input/out  {} / {}",
-                    number(today.input_tokens),
-                    number(today.output_tokens)
+                    " Runs       {} · {} failed · {} aborted",
+                    number(stats.run_count),
+                    number(stats.failed_run_count),
+                    number(stats.aborted_run_count)
                 )),
+                Line::from(format!(
+                    " Calls      {} model · {} tool · {} failed",
+                    number(stats.model_calls),
+                    number(stats.tool_calls),
+                    number(stats.failed_tool_calls)
+                )),
+                Line::from(format!(" Run time   {}", elapsed_ms(stats.elapsed_ms))),
                 Line::from(format!(" 364 days   {} tokens", number(total))),
             ]
         },
     );
     frame.render_widget(Paragraph::new(lines).block(panel("Usage", false)), area);
+}
+
+fn elapsed_ms(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {:02}m", seconds / 3_600, seconds / 60 % 60)
+    }
 }
 
 fn empty(message: &str) -> Vec<Line<'static>> {
@@ -1603,7 +1643,7 @@ fn current_unix_day() -> Option<u64> {
         .map(|duration| duration.as_secs() / 86_400)
 }
 
-fn number(value: i64) -> String {
+fn number(value: impl ToString) -> String {
     let digits = value.to_string();
     let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, character) in digits.chars().enumerate() {
@@ -1624,8 +1664,8 @@ mod tests {
     use horus::backend::checkpoint::SessionSummary;
     use horus::protocol::{
         FrontendAction, FrontendActionListItem, FrontendBlock, FrontendBlockFormat, FrontendEvent,
-        FrontendPickerOption, FrontendSlot, FrontendSymbol, FrontendTone, FrontendWidget,
-        FrontendWidgetContent, Op, SessionContext,
+        FrontendListItemState, FrontendPickerOption, FrontendSlot, FrontendSymbol, FrontendTone,
+        FrontendWidget, FrontendWidgetContent, Op, SessionContext,
     };
     use horus_gateway::wire::{SessionActivity, SessionActivityState, SessionRecord};
     use ratatui::Terminal;
@@ -1830,6 +1870,7 @@ mod tests {
                 sequence: 0,
                 catalog_visible: true,
                 first_user_message: None,
+                execution_stats: Default::default(),
                 created_at: 0,
                 updated_at: 0,
             },
@@ -1863,6 +1904,7 @@ mod tests {
             items: vec![FrontendActionListItem {
                 id: "note-1".into(),
                 text: "Remember this".into(),
+                state: FrontendListItemState::Plain,
                 actions: vec![
                     FrontendAction {
                         id: "edit".into(),

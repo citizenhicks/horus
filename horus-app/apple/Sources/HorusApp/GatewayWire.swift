@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 12
+let gatewayProtocolVersion = 14
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 
@@ -411,6 +411,12 @@ enum GatewayRequest: Encodable, Sendable {
         lastSequence: UInt64?,
         replayEpoch: String?
     )
+    case getSessionHistory(
+        requestID: String,
+        sessionID: String,
+        beforeSequence: UInt64?,
+        maxBatches: Int
+    )
     case renameSession(requestID: String, sessionID: String, title: String)
     case setSessionPinned(requestID: String, sessionID: String, pinned: Bool)
     case deleteSession(requestID: String, sessionID: String)
@@ -436,7 +442,7 @@ enum GatewayRequest: Encodable, Sendable {
         baseURL: String,
         apiKey: String
     )
-    case registerProvider(requestID: String, config: ProviderConfig)
+    case registerProvider(requestID: String, config: ProviderConfig, modelIds: [String])
     case createPairingCode(requestID: String)
     case startProviderLogin(requestID: String, provider: String)
     case getProfile(requestID: String)
@@ -481,6 +487,12 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(sessionID, forKey: "sessionId")
             try container.encode(lastSequence, forKey: "lastSequence")
             try container.encode(replayEpoch, forKey: "replayEpoch")
+        case .getSessionHistory(let requestID, let sessionID, let beforeSequence, let maxBatches):
+            try container.encode("get_session_history", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
+            try container.encode(beforeSequence, forKey: "beforeSequence")
+            try container.encode(maxBatches, forKey: "maxBatches")
         case .renameSession(let requestID, let sessionID, let title):
             try container.encode("rename_session", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -535,10 +547,11 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(provider, forKey: "provider")
             try container.encode(baseURL, forKey: "baseUrl")
             try container.encode(apiKey, forKey: "apiKey")
-        case .registerProvider(let requestID, let config):
+        case .registerProvider(let requestID, let config, let modelIds):
             try container.encode("register_provider", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(config, forKey: "config")
+            try container.encode(modelIds, forKey: "modelIds")
         case .createPairingCode(let requestID):
             try container.encode("create_pairing_code", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -593,6 +606,12 @@ enum GatewayEnvelope: Decodable, Sendable {
     case ready(ReadyPayload)
     case sessionOpened(requestID: String, payload: SessionReadyPayload)
     case sessionReplayComplete(requestID: String, sessionID: String)
+    case sessionHistory(
+        requestID: String,
+        sessionID: String,
+        events: [RenderedEventRecord],
+        nextBeforeSequence: UInt64?
+    )
     case sessionChanged(SessionReadyPayload)
     case gatewayConfigured(requestID: String, payload: ReadyPayload)
     case accepted(requestID: String)
@@ -651,6 +670,16 @@ enum GatewayEnvelope: Decodable, Sendable {
             self = .sessionReplayComplete(
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 sessionID: try container.decode(String.self, forKey: "sessionId")
+            )
+        case "session_history":
+            self = .sessionHistory(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
+                events: try container.decode([RenderedEventRecord].self, forKey: "events"),
+                nextBeforeSequence: try container.decodeIfPresent(
+                    UInt64.self,
+                    forKey: "nextBeforeSequence"
+                )
             )
         case "session_changed":
             self = .sessionChanged(
@@ -771,6 +800,7 @@ struct ReadyPayload: Decodable, Sendable {
     let providers: [ProviderStatus]
     let defaultConfig: VersionedAgentConfig?
     let models: [ModelChoice]
+    let modelProviders: [String: String]
     let middlewareFeatures: [MiddlewareFeature]
     let maxActiveSessions: Int
 }
@@ -782,8 +812,15 @@ struct SessionReadyPayload: Decodable, Sendable {
     let git: GitStatus?
     let session: SessionConfigured
     let contributions: [FrontendContribution]
+    let widgets: [SessionWidget]
     let toolCount: Int
+    let runStats: RunStats
     let config: VersionedAgentConfig
+}
+
+struct SessionWidget: Decodable, Sendable {
+    let capability: String
+    let item: FrontendWidget
 }
 
 struct WorkspaceInfo: Identifiable, Codable, Hashable, Sendable {
@@ -842,6 +879,7 @@ struct SessionRecord: Identifiable, Codable, Hashable, Sendable {
     let sequence: UInt64
     let catalogVisible: Bool
     let firstUserMessage: String?
+    let executionStats: ExecutionStats
     let title: String?
     let pinned: Bool
     let activity: SessionActivity
@@ -951,6 +989,7 @@ enum FrontendWidgetContent: Sendable {
 struct FrontendActionListItem: Identifiable, Sendable {
     let id: String
     let text: String
+    let state: FrontendListItemState
     let actions: [FrontendActionListAction]
 
     init(json: JSONValue) throws {
@@ -958,6 +997,7 @@ struct FrontendActionListItem: Identifiable, Sendable {
               !id.isEmpty,
               let text = json["text"]?.stringValue,
               !text.isEmpty,
+              let state = json["state"]?.stringValue.flatMap(FrontendListItemState.init(rawValue:)),
               let values = json["actions"]?.arrayValue
         else {
             throw GatewayWireError.invalidFrame("frontend action list item is missing a required field")
@@ -968,8 +1008,16 @@ struct FrontendActionListItem: Identifiable, Sendable {
         }
         self.id = id
         self.text = text
+        self.state = state
         self.actions = actions
     }
+}
+
+enum FrontendListItemState: String, Equatable, Sendable {
+    case plain
+    case pending
+    case inProgress = "in_progress"
+    case completed
 }
 
 struct FrontendActionListAction: Identifiable, Sendable {
@@ -1655,6 +1703,8 @@ struct ProviderStatus: Identifiable, Codable, Equatable, Sendable {
     let defaultBaseUrl: String?
     let defaultApiKeyEnv: String?
     let models: [ProviderModel]
+    let modelIds: [String]
+    let modelIdsConfigurable: Bool
     let webSearch: [HostedWebSearch]
 }
 
@@ -1703,7 +1753,7 @@ struct ReasoningChoice: Identifiable, Codable, Equatable, Sendable {
     let description: String
 }
 
-struct TokenUsage: Codable, Equatable, Sendable {
+struct TokenUsage: Codable, Hashable, Sendable {
     var inputTokens = 0
     var cachedInputTokens = 0
     var cacheWriteInputTokens = 0
@@ -1715,6 +1765,47 @@ struct TokenUsage: Codable, Equatable, Sendable {
 struct ProfileSnapshot: Codable, Equatable, Sendable {
     let userName: String?
     let dailyUsage: [DailyUsage]
+    let runStats: RunStats
+    let recentRuns: [RunSummary]
+}
+
+struct ExecutionStats: Codable, Hashable, Sendable {
+    var runCount: UInt64 = 0
+    var failedRunCount: UInt64 = 0
+    var abortedRunCount: UInt64 = 0
+    var modelCalls: UInt64 = 0
+    var toolCalls: UInt64 = 0
+    var failedToolCalls: UInt64 = 0
+    var elapsedMs: UInt64 = 0
+    var usage = TokenUsage()
+}
+
+struct RunStats: Codable, Equatable, Sendable {
+    var runCount: UInt64 = 0
+    var failedRunCount: UInt64 = 0
+    var abortedRunCount: UInt64 = 0
+    var modelCalls: UInt64 = 0
+    var toolCalls: UInt64 = 0
+    var failedToolCalls: UInt64 = 0
+    var elapsedMs: UInt64 = 0
+    var usage = TokenUsage()
+    var active: RunSummary? = nil
+}
+
+struct RunSummary: Identifiable, Codable, Equatable, Sendable {
+    var id: String { "\(sessionId):\(turnId)" }
+
+    let sessionId: String
+    let submissionId: String
+    let turnId: String
+    let startedAtMs: Int64
+    let finishedAtMs: Int64?
+    let elapsedMs: UInt64
+    let outcome: SessionOutcome?
+    let modelCalls: UInt64
+    var toolCalls: UInt64
+    var failedToolCalls: UInt64
+    let usage: TokenUsage
 }
 
 struct DailyUsage: Codable, Equatable, Sendable {

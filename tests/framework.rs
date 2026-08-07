@@ -14,6 +14,7 @@ use horus::agent::AgentConfig;
 use horus::agent::create_agent;
 use horus::backend::checkpoint::Checkpoint;
 use horus::backend::checkpoint::CheckpointStore;
+use horus::backend::checkpoint::ExecutionRecord;
 use horus::backend::checkpoint::SessionPageRequest;
 use horus::backend::checkpoint::TranscriptPageRequest;
 use horus::backend::checkpoint::sqlite::SqliteCheckpoint;
@@ -817,7 +818,7 @@ async fn sqlite_persists_latest_checkpoint_transcript_and_fork_lineage() {
     let store = SqliteCheckpoint::new(&path).expect("open checkpoint database");
     let empty = Checkpoint::empty("session");
     store
-        .save(&empty, &[])
+        .save(&empty, &[], None)
         .await
         .expect("save empty checkpoint");
     let first_user = horus::backend::model::user_message("parent question");
@@ -830,19 +831,22 @@ async fn sqlite_persists_latest_checkpoint_transcript_and_fork_lineage() {
     first.first_user_message = Some("parent question".into());
     first.context.push(first_user.clone());
     store
-        .save(&first, std::slice::from_ref(&first_user))
+        .save(&first, std::slice::from_ref(&first_user), None)
         .await
         .expect("save first message");
     let mut state_only = first.clone();
     state_only.sequence = 2;
     state_only.total_usage.input_tokens = 1;
     state_only.catalog_visible = false;
-    store.save(&state_only, &[]).await.expect("save state only");
+    store
+        .save(&state_only, &[], None)
+        .await
+        .expect("save state only");
     let mut grown = state_only.clone();
     grown.sequence = 3;
     grown.context.push(assistant.clone());
     store
-        .save(&grown, std::slice::from_ref(&assistant))
+        .save(&grown, std::slice::from_ref(&assistant), None)
         .await
         .expect("grow context");
     let compacted_item = serde_json::json!({
@@ -854,7 +858,7 @@ async fn sqlite_persists_latest_checkpoint_transcript_and_fork_lineage() {
     compacted.sequence = 4;
     compacted.context = vec![compacted_item.clone(), post_compaction.clone()];
     store
-        .save(&compacted, std::slice::from_ref(&post_compaction))
+        .save(&compacted, std::slice::from_ref(&post_compaction), None)
         .await
         .expect("replace context and append transcript");
     let branch_user = horus::backend::model::user_message("branch question");
@@ -870,7 +874,7 @@ async fn sqlite_persists_latest_checkpoint_transcript_and_fork_lineage() {
     branch_latest.first_user_message = Some("branch question".into());
     branch_latest.context.push(branch_user.clone());
     store
-        .save(&branch_latest, std::slice::from_ref(&branch_user))
+        .save(&branch_latest, std::slice::from_ref(&branch_user), None)
         .await
         .expect("append branch message");
     drop(store);
@@ -1100,6 +1104,7 @@ impl CheckpointStore for MemoryCheckpoints {
         &'a self,
         checkpoint: &'a Checkpoint,
         _transcript_delta: &'a [Value],
+        _execution: Option<&'a ExecutionRecord>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.sessions

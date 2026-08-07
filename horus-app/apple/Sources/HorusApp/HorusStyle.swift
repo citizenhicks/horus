@@ -42,6 +42,7 @@ struct HorusGlyph: Hashable {
     static let arrowClockwise = Self("hi.arrowClockwise")
     static let arrowDown = Self("hi.arrowDown")
     static let arrowUp = Self("hi.arrowUp")
+    static let arrowUp02 = Self("hi.arrowUp")
     static let brain = Self("hi.brain")
     static let calendarDots = Self("hi.calendarDots")
     static let caretDown = Self("hi.caretDown")
@@ -281,6 +282,7 @@ enum HorusSymbol {
         "search": Artwork(glyph: .magnifyingGlass, systemImage: "magnifyingglass"),
         "sparkle": Artwork(glyph: .sparkle, systemImage: "sparkles"),
         "storage": Artwork(glyph: .hardDrives, systemImage: "externaldrive.connected.to.line.below"),
+        "task": Artwork(glyph: .checkCircle, systemImage: "checklist"),
     ]
 
     private static func artwork(for symbol: String) -> Artwork {

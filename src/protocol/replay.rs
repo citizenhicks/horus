@@ -26,21 +26,20 @@ pub(crate) fn is_internal_message(message: &Value) -> bool {
     internal_message_kind(message).is_some()
 }
 
-pub(crate) fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Vec<EventMsg> {
+/// Reconstructs frontend-neutral events from positioned durable transcript items.
+#[must_use]
+pub fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Vec<EventMsg> {
     let mut events = Vec::new();
     let mut tools = BTreeMap::new();
-    let mut turn = 0;
-    let mut item = 0;
     let complete = tool_complete_boundaries(context.iter().map(|(_, value)| value));
     for (index, (target, value)) in context.iter().enumerate() {
         let message_target = complete
             .binary_search(&(index + 1))
             .is_ok()
             .then_some(*target);
-        let turn_id = format!("history-{turn}");
+        let item_id = replay_id(target);
         if let Some(text) = message_text(value, "user") {
             if !is_internal_message(value) {
-                turn += 1;
                 events.push(EventMsg::UserMessage(UserMessageEvent {
                     message: text,
                     message_target,
@@ -49,13 +48,7 @@ pub(crate) fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Ve
             continue;
         }
         if value.get("role").and_then(Value::as_str) == Some("assistant") {
-            push_reasoning(
-                &mut events,
-                reasoning_text(value),
-                session_id,
-                &turn_id,
-                item,
-            );
+            push_reasoning(&mut events, reasoning_text(value), session_id, &item_id);
             if let Some(message) = message_text(value, "assistant") {
                 events.push(EventMsg::AgentMessage(AgentMessageEvent {
                     message,
@@ -63,19 +56,11 @@ pub(crate) fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Ve
                     message_target,
                 }));
             }
-            item += 1;
             continue;
         }
         match value.get("type").and_then(Value::as_str) {
             Some("reasoning") => {
-                push_reasoning(
-                    &mut events,
-                    reasoning_text(value),
-                    session_id,
-                    &turn_id,
-                    item,
-                );
-                item += 1;
+                push_reasoning(&mut events, reasoning_text(value), session_id, &item_id);
             }
             Some("function_call") => {
                 let call_id = string(value, "call_id");
@@ -83,9 +68,9 @@ pub(crate) fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Ve
                 if call_id.is_empty() || name.is_empty() {
                     continue;
                 }
-                tools.insert(call_id.clone(), name.clone());
+                tools.insert(call_id.clone(), (name.clone(), item_id.clone()));
                 events.push(EventMsg::ToolCallBegin(ToolCallBeginEvent {
-                    turn_id,
+                    turn_id: item_id,
                     call_id,
                     name,
                     arguments: arguments(value.get("arguments")),
@@ -94,12 +79,13 @@ pub(crate) fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Ve
             Some("function_call_output") => {
                 let call_id = string(value, "call_id");
                 let output = value_text(value.get("output"));
+                let (name, turn_id) = tools
+                    .get(&call_id)
+                    .cloned()
+                    .unwrap_or_else(|| ("tool".into(), item_id));
                 events.push(EventMsg::ToolCallEnd(ToolCallEndEvent {
                     turn_id,
-                    name: tools
-                        .get(&call_id)
-                        .cloned()
-                        .unwrap_or_else(|| "tool".into()),
+                    name,
                     call_id,
                     is_error: value
                         .get(TOOL_ERROR_FIELD)
@@ -118,8 +104,7 @@ fn push_reasoning(
     events: &mut Vec<EventMsg>,
     reasoning: Option<String>,
     session_id: &str,
-    turn_id: &str,
-    item: usize,
+    item_id: &str,
 ) {
     let Some(delta) = reasoning.filter(|reasoning| !reasoning.trim().is_empty()) else {
         return;
@@ -127,11 +112,18 @@ fn push_reasoning(
     events.push(EventMsg::AgentReasoningContentDelta(
         AgentReasoningContentDeltaEvent {
             thread_id: session_id.into(),
-            turn_id: turn_id.into(),
-            item_id: format!("history-{item}"),
+            turn_id: item_id.into(),
+            item_id: item_id.into(),
             delta,
         },
     ));
+}
+
+fn replay_id(target: &MessageTarget) -> String {
+    format!(
+        "history-{}-{}",
+        target.checkpoint_sequence, target.batch_item_count
+    )
 }
 
 fn message_text(value: &Value, role: &str) -> Option<String> {
@@ -221,7 +213,10 @@ mod tests {
         assert!(matches!(&replayed[0], EventMsg::UserMessage(event) if event.message == "hello"));
         assert!(matches!(
             &replayed[1],
-            EventMsg::AgentReasoningContentDelta(event) if event.delta == "neutral"
+            EventMsg::AgentReasoningContentDelta(event)
+                if event.delta == "neutral"
+                    && event.turn_id == "history-4-2"
+                    && event.item_id == "history-4-2"
         ));
         assert!(matches!(
             &replayed[2],
@@ -234,6 +229,43 @@ mod tests {
                     checkpoint_sequence: 4,
                     batch_item_count: 1,
                 })
+        ));
+    }
+
+    #[test]
+    fn replay_keeps_tool_identity_stable_across_durable_batches() {
+        let history = vec![
+            (
+                MessageTarget {
+                    checkpoint_sequence: 7,
+                    batch_item_count: 1,
+                },
+                serde_json::json!({
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "read_file",
+                    "arguments": "{}"
+                }),
+            ),
+            (
+                MessageTarget {
+                    checkpoint_sequence: 9,
+                    batch_item_count: 1,
+                },
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "done"
+                }),
+            ),
+        ];
+
+        let replayed = events(&history, "session");
+
+        assert!(matches!(
+            replayed.as_slice(),
+            [EventMsg::ToolCallBegin(begin), EventMsg::ToolCallEnd(end)]
+                if begin.turn_id == "history-7-1" && end.turn_id == begin.turn_id
         ));
     }
 }

@@ -17,7 +17,88 @@ use crate::protocol::TokenUsage;
 
 pub mod sqlite;
 
-pub(crate) const CHECKPOINT_VERSION: u32 = 3;
+pub(crate) const CHECKPOINT_VERSION: u32 = 4;
+
+/// Mutable counters for the user turn currently running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveExecution {
+    pub submission_id: String,
+    pub turn_id: String,
+    pub started_at_ms: i64,
+    pub model_calls: u64,
+    pub tool_calls: u64,
+    pub failed_tool_calls: u64,
+    pub usage: TokenUsage,
+}
+
+/// Terminal outcome of one user turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionOutcome {
+    Completed,
+    Aborted,
+    Failed,
+}
+
+/// Durable observability record for one completed user turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionRecord {
+    pub session_id: String,
+    pub submission_id: String,
+    pub turn_id: String,
+    pub started_at_ms: i64,
+    pub finished_at_ms: i64,
+    pub elapsed_ms: u64,
+    pub outcome: ExecutionOutcome,
+    pub model_calls: u64,
+    pub tool_calls: u64,
+    pub failed_tool_calls: u64,
+    pub usage: TokenUsage,
+}
+
+/// Aggregate execution metrics for one durable session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionStats {
+    pub run_count: u64,
+    pub failed_run_count: u64,
+    pub aborted_run_count: u64,
+    pub model_calls: u64,
+    pub tool_calls: u64,
+    pub failed_tool_calls: u64,
+    pub elapsed_ms: u64,
+    pub usage: TokenUsage,
+}
+
+impl ExecutionStats {
+    pub(crate) fn checked_record(&mut self, record: &ExecutionRecord) -> Option<()> {
+        let run_count = self.run_count.checked_add(1)?;
+        let failed_run_count = self
+            .failed_run_count
+            .checked_add(u64::from(record.outcome == ExecutionOutcome::Failed))?;
+        let aborted_run_count = self
+            .aborted_run_count
+            .checked_add(u64::from(record.outcome == ExecutionOutcome::Aborted))?;
+        let model_calls = self.model_calls.checked_add(record.model_calls)?;
+        let tool_calls = self.tool_calls.checked_add(record.tool_calls)?;
+        let failed_tool_calls = self
+            .failed_tool_calls
+            .checked_add(record.failed_tool_calls)?;
+        let elapsed_ms = self.elapsed_ms.checked_add(record.elapsed_ms)?;
+        let mut usage = self.usage.clone();
+        usage.checked_add(&record.usage)?;
+        *self = Self {
+            run_count,
+            failed_run_count,
+            aborted_run_count,
+            model_calls,
+            tool_calls,
+            failed_tool_calls,
+            elapsed_ms,
+            usage,
+        };
+        Some(())
+    }
+}
 
 /// A tool batch waiting for a frontend decision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,7 +129,8 @@ pub struct Checkpoint {
     pub total_usage: TokenUsage,
     pub last_usage: Option<TokenUsage>,
     pub pending_input: Vec<String>,
-    pub active_turn_id: Option<String>,
+    pub active_execution: Option<ActiveExecution>,
+    pub execution_stats: ExecutionStats,
     pub pending_tools: Vec<ToolCall>,
     pub pending_approval: Option<PendingApproval>,
 }
@@ -70,10 +152,45 @@ impl Checkpoint {
             total_usage: TokenUsage::default(),
             last_usage: None,
             pending_input: Vec::new(),
-            active_turn_id: None,
+            active_execution: None,
+            execution_stats: ExecutionStats::default(),
             pending_tools: Vec::new(),
             pending_approval: None,
         }
+    }
+
+    pub(crate) fn finish_execution(
+        &mut self,
+        outcome: ExecutionOutcome,
+        finished_at_ms: i64,
+    ) -> Result<ExecutionRecord> {
+        let active = self
+            .active_execution
+            .as_ref()
+            .ok_or_else(|| Error::Checkpoint("turn ended without an active execution".into()))?;
+        let finished_at_ms = finished_at_ms.max(active.started_at_ms);
+        let elapsed_ms = u64::try_from(finished_at_ms - active.started_at_ms)
+            .map_err(|_| Error::Checkpoint("execution elapsed time is unsupported".into()))?;
+        let record = ExecutionRecord {
+            session_id: self.session_id.clone(),
+            submission_id: active.submission_id.clone(),
+            turn_id: active.turn_id.clone(),
+            started_at_ms: active.started_at_ms,
+            finished_at_ms,
+            elapsed_ms,
+            outcome,
+            model_calls: active.model_calls,
+            tool_calls: active.tool_calls,
+            failed_tool_calls: active.failed_tool_calls,
+            usage: active.usage.clone(),
+        };
+        let mut stats = self.execution_stats.clone();
+        stats.checked_record(&record).ok_or_else(|| {
+            Error::Checkpoint("execution statistics exceed the supported range".into())
+        })?;
+        self.active_execution = None;
+        self.execution_stats = stats;
+        Ok(record)
     }
 }
 
@@ -87,6 +204,7 @@ pub struct SessionSummary {
     pub sequence: u64,
     pub catalog_visible: bool,
     pub first_user_message: Option<String>,
+    pub execution_stats: ExecutionStats,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -117,7 +235,22 @@ pub struct SessionPage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptBatch {
     pub sequence: u64,
+    pub created_at: i64,
     pub items: Vec<Value>,
+}
+
+/// Bounds one newest-first execution-journal query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionPageRequest {
+    pub before_sequence: Option<u64>,
+    pub limit: usize,
+}
+
+/// One newest-first page of terminal user-turn records.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionPage {
+    pub executions: Vec<ExecutionRecord>,
+    pub next_before_sequence: Option<u64>,
 }
 
 /// Bounds one newest-first transcript query.
@@ -165,11 +298,12 @@ pub trait CheckpointStore: Send + Sync {
     /// Loads the latest checkpoint for a session.
     fn load<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<Option<Checkpoint>>>;
 
-    /// Atomically replaces the checkpoint and appends new transcript items.
+    /// Atomically replaces the checkpoint, appends transcript items, and records a finished turn.
     fn save<'a>(
         &'a self,
         checkpoint: &'a Checkpoint,
         transcript_delta: &'a [Value],
+        execution: Option<&'a ExecutionRecord>,
     ) -> BoxFuture<'a, Result<()>>;
 
     /// Lists one page of the most recently updated sessions, newest first.
@@ -209,10 +343,33 @@ pub trait CheckpointStore: Send + Sync {
             Ok(TranscriptPage {
                 batches: vec![TranscriptBatch {
                     sequence: checkpoint.sequence,
+                    created_at: 0,
                     items: checkpoint.context,
                 }],
                 next_before_sequence: None,
             })
+        })
+    }
+
+    /// Loads one newest-first page of terminal user-turn records.
+    fn execution_page<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _request: ExecutionPageRequest,
+    ) -> BoxFuture<'a, Result<ExecutionPage>> {
+        Box::pin(async {
+            Err(Error::Checkpoint(
+                "this checkpoint backend has no execution journal".into(),
+            ))
+        })
+    }
+
+    /// Loads the most recently started terminal user turns across all sessions.
+    fn recent_executions(&self, _limit: usize) -> BoxFuture<'_, Result<Vec<ExecutionRecord>>> {
+        Box::pin(async {
+            Err(Error::Checkpoint(
+                "this checkpoint backend has no execution journal".into(),
+            ))
         })
     }
 

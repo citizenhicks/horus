@@ -4,9 +4,10 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 
+pub use self::replay::events as replay_events;
 pub(crate) use self::replay::{
-    INTERNAL_MESSAGE_FIELD, REPLAY_REASONING_FIELD, TOOL_ERROR_FIELD, events as replay_events,
-    internal_message_kind, is_internal_message,
+    INTERNAL_MESSAGE_FIELD, REPLAY_REASONING_FIELD, TOOL_ERROR_FIELD, internal_message_kind,
+    is_internal_message,
 };
 
 mod replay;
@@ -407,12 +408,23 @@ pub struct FrontendPickerOption {
     pub op: Op,
 }
 
-/// One primary value with compact trailing actions.
+/// One compact status row with optional trailing actions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrontendActionListItem {
     pub id: String,
     pub text: String,
+    pub state: FrontendListItemState,
     pub actions: Vec<FrontendAction>,
+}
+
+/// Semantic state for one compact list row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendListItemState {
+    Plain,
+    Pending,
+    InProgress,
+    Completed,
 }
 
 /// One labeled, icon-forward action attached to a list item.
@@ -491,6 +503,7 @@ pub enum FrontendSymbol {
     Search,
     Sparkle,
     Storage,
+    Task,
     Custom(String),
 }
 
@@ -513,6 +526,7 @@ impl FrontendSymbol {
             Self::Search => "search",
             Self::Sparkle => "sparkle",
             Self::Storage => "storage",
+            Self::Task => "task",
             Self::Custom(name) => name,
         }
     }
@@ -536,6 +550,7 @@ impl FrontendSymbol {
             "search" => Self::Search,
             "sparkle" => Self::Sparkle,
             "storage" => Self::Storage,
+            "task" => Self::Task,
             other => Self::Custom(other.to_owned()),
         }
     }
@@ -1042,6 +1057,7 @@ mod tests {
             FrontendSymbol::Search,
             FrontendSymbol::Sparkle,
             FrontendSymbol::Storage,
+            FrontendSymbol::Task,
         ] {
             let json = serde_json::to_string(&symbol).expect("symbol serializes");
             assert_eq!(json, format!("\"{}\"", symbol.as_str()));

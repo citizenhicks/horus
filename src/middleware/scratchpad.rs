@@ -21,8 +21,8 @@ use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::model::{ToolDefinition, internal_user_message};
 use crate::protocol::{
     EventMsg, FrontendAction, FrontendActionListItem, FrontendBlock, FrontendCommand,
-    FrontendContribution, FrontendEvent, FrontendSlot, FrontendSymbol, FrontendTone,
-    FrontendWidget, FrontendWidgetContent, Op, internal_message_kind,
+    FrontendContribution, FrontendEvent, FrontendListItemState, FrontendSlot, FrontendSymbol,
+    FrontendTone, FrontendWidget, FrontendWidgetContent, Op, internal_message_kind,
 };
 use crate::{BoxFuture, Error, Result};
 
@@ -722,6 +722,7 @@ fn action_list_item(scope: Scope, entry: &Entry, already_global: bool) -> Fronte
     FrontendActionListItem {
         id: entry.id.clone(),
         text: entry.note.clone(),
+        state: FrontendListItemState::Plain,
         actions,
     }
 }

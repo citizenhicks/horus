@@ -719,9 +719,9 @@ fn validate_action_list(title: &str, items: &[FrontendActionListItem]) -> Result
     }
     let mut item_ids = BTreeSet::new();
     for item in items {
-        if item.id.trim().is_empty() || item.text.trim().is_empty() || item.actions.is_empty() {
+        if item.id.trim().is_empty() || item.text.trim().is_empty() {
             return Err(Error::Config(
-                "frontend action list item requires an ID, text, and action".into(),
+                "frontend action list item requires an ID and text".into(),
             ));
         }
         if !item_ids.insert(&item.id) {
@@ -928,11 +928,15 @@ mod tests {
         let item = FrontendActionListItem {
             id: "item".into(),
             text: "One note".into(),
+            state: crate::protocol::FrontendListItemState::Plain,
             actions: vec![action.clone()],
         };
 
         assert!(validate_action_list("", std::slice::from_ref(&item)).is_err());
         assert!(validate_action_list("Notes", &[item.clone(), item.clone()]).is_err());
+        let mut status = item.clone();
+        status.actions.clear();
+        assert!(validate_action_list("Tasks", &[status]).is_ok());
         let mut duplicate_action = item;
         duplicate_action.actions.push(action);
         assert!(validate_action_list("Notes", &[duplicate_action]).is_err());

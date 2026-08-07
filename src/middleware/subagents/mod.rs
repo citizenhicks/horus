@@ -1091,7 +1091,10 @@ mod tests {
             "gateway.chat".into(),
             serde_json::json!({"workspace": "/srv/project"}),
         );
-        checkpoints.save(&parent, &[]).await.expect("save parent");
+        checkpoints
+            .save(&parent, &[], None)
+            .await
+            .expect("save parent");
         let launched = Arc::new(std::sync::Mutex::new(None));
         let launcher: SubagentLauncher = Arc::new({
             let launched = Arc::clone(&launched);

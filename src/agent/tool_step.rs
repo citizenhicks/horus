@@ -14,6 +14,7 @@ use super::input::Wait;
 use super::input::interruptible;
 use crate::Error;
 use crate::Result;
+use crate::backend::checkpoint::ExecutionOutcome;
 use crate::backend::checkpoint::PendingApproval;
 use crate::backend::model::ModelRequest;
 use crate::backend::model::ToolCall;
@@ -147,6 +148,7 @@ impl Runner {
         let instructions = reviewer_instructions(reviewer);
         let input = [user_message(&payload)];
         let route = reviewer.selected_route(&self.config.provider).to_string();
+        self.record_model_call()?;
         let response = self.config.model.respond(
             &route,
             ModelRequest {
@@ -180,11 +182,8 @@ impl Runner {
             return Ok(Some(false));
         };
         let usage = output.usage().clone();
-        let mut total_usage = self.state.total_usage.clone();
-        total_usage.checked_add(&usage).ok_or_else(|| {
-            Error::Provider("provider token usage exceeds the supported range".into())
-        })?;
-        self.state.total_usage = total_usage;
+        self.record_usage(&usage)?;
+        self.state.last_usage = Some(usage);
         self.save().await?;
         self.emit_usage(submission_id)?;
         let approved = output.tool_calls().is_empty()
@@ -226,7 +225,7 @@ impl Runner {
         let Some(results) = self.resolve_pending(commands, &pending).await? else {
             return Ok(());
         };
-        self.append_tool_results(results);
+        self.append_tool_results(results)?;
         self.state.pending_approval = None;
         self.save().await?;
         self.continue_turn(commands, pending.submission_id, pending.turn_id)
@@ -314,12 +313,13 @@ impl Runner {
                 Ok(Some(order_results(&pending.calls, results)))
             }
             ReviewDecision::Abort => {
-                self.append_tool_results(denied_results(&pending.calls, "approval aborted"));
+                self.append_tool_results(denied_results(&pending.calls, "approval aborted"))?;
                 self.state.pending_approval = None;
                 self.abort(
                     &approval.submission_id,
                     &pending.turn_id,
                     "approval aborted",
+                    ExecutionOutcome::Aborted,
                 )
                 .await?;
                 Ok(None)
@@ -411,7 +411,14 @@ impl Runner {
         Ok(Wait::Ready(results))
     }
 
-    pub(super) fn append_tool_results(&mut self, results: Vec<ToolResult>) {
+    pub(super) fn append_tool_results(&mut self, results: Vec<ToolResult>) -> Result<()> {
+        let tool_calls = u64::try_from(results.len())
+            .map_err(|_| Error::Checkpoint("execution tool-call count is unsupported".into()))?;
+        let failed_tool_calls = u64::try_from(
+            results.iter().filter(|result| result.is_error).count(),
+        )
+        .map_err(|_| Error::Checkpoint("execution failed-tool count is unsupported".into()))?;
+        self.record_tools(tool_calls, failed_tool_calls)?;
         let completed = results
             .iter()
             .map(|result| result.call_id.as_str())
@@ -426,6 +433,7 @@ impl Runner {
                 result.is_error,
             ));
         }
+        Ok(())
     }
 
     pub(super) async fn finish_pending_tools(
@@ -452,8 +460,7 @@ impl Runner {
             )
             .await?;
         }
-        self.append_tool_results(results);
-        Ok(())
+        self.append_tool_results(results)
     }
 
     async fn wait_for_approval(

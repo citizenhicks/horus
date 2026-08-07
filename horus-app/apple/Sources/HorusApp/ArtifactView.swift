@@ -348,12 +348,14 @@ struct PreviewTranscriptSheet: View {
                 }
                 .scrollIndicators(.hidden)
             }
+            #if os(macOS)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Close", glyph: .x, action: dismiss.callAsFunction)
                         .labelStyle(.iconOnly)
                 }
             }
+            #endif
         }
         #if os(macOS)
         .frame(minWidth: 560, minHeight: 520)

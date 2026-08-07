@@ -23,13 +23,49 @@ struct AgentSettingsView: View {
                         .accessibilityLabel("System prompt")
                 }
 
+                Section("Default AI model") {
+                    LabeledContent {
+                        Menu {
+                            ForEach(model.modelChoices) { choice in
+                                Button {
+                                    model.selectAgentDraftModel(choice.route)
+                                } label: {
+                                    HorusPlatformMenuLabel(
+                                        title: "\(choice.group) · \(choice.model) · \(choice.reasoningEffort?.capitalized ?? "Default")",
+                                        glyph: choice.route == model.agentDraftModelRoute ? .check : .sparkle,
+                                        systemImage: choice.route == model.agentDraftModelRoute
+                                            ? "checkmark"
+                                            : "sparkles"
+                                    )
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Text(defaultModelLabel)
+                                HorusIcon(.caretUpDown, size: 12)
+                            }
+                            .foregroundStyle(palette.accent)
+                        }
+                        .menuIndicator(.hidden)
+                        .buttonStyle(.horusPlain)
+                        .disabled(model.modelChoices.isEmpty)
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text("Model")
+                            SettingsInfoButton(
+                                title: "Default AI model",
+                                detail: "Sets the provider, model, and reasoning used for new chats when this draft is saved as the gateway default."
+                            )
+                        }
+                    }
+                }
+
                 Section("Capabilities") {
                     ForEach(model.middlewareFeatures, id: \.id) { feature in
                         capabilityToggle(feature)
                         ForEach(feature.settings) { setting in
                             middlewareSetting(feature, setting)
                                 .padding(.leading, 12)
-                                .disabled(!middlewareEnabled(feature))
                         }
                     }
                 }
@@ -144,15 +180,11 @@ struct AgentSettingsView: View {
     }
 
     private func capabilityToggle(_ feature: MiddlewareFeature) -> some View {
-        Toggle(isOn: middleware(feature)) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(feature.label)
-                Text(feature.description)
-                    .font(HorusStyle.bodyFont)
-                    .foregroundStyle(palette.muted)
-            }
+        HStack(spacing: 5) {
+            Toggle(feature.label, isOn: middleware(feature))
+                .disabled(feature.required)
+            SettingsInfoButton(title: feature.label, detail: feature.description)
         }
-        .disabled(feature.required)
     }
 
     @ViewBuilder
@@ -169,7 +201,7 @@ struct AgentSettingsView: View {
                 maximum: maximum
             )
             let increment = Swift.max(Int(clamping: step), 1)
-            VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
                 if let maximum {
                     Stepper(
                         value: value,
@@ -178,12 +210,14 @@ struct AgentSettingsView: View {
                     ) {
                         Text("\(setting.label): \(value.wrappedValue.formatted())")
                     }
+                    .disabled(!middlewareEnabled(feature))
                 } else {
                     Stepper(value: value, step: increment) {
                         Text("\(setting.label): \(value.wrappedValue.formatted())")
                     }
+                    .disabled(!middlewareEnabled(feature))
                 }
-                SettingsCaption(setting.description)
+                SettingsInfoButton(title: setting.label, detail: setting.description)
             }
             .sensoryFeedback(.selection, trigger: value.wrappedValue)
         case .select(let options, let unsetLabel):
@@ -194,37 +228,38 @@ struct AgentSettingsView: View {
             let selectedLabel = selection.wrappedValue.flatMap { selected in
                 options.first { $0.value == selected }?.label ?? selected
             } ?? unsetLabel ?? "Select"
-            VStack(alignment: .leading, spacing: 3) {
-                LabeledContent {
-                    Menu {
-                        Picker(setting.label, selection: selection) {
-                            if let unsetLabel {
-                                Text(unsetLabel).tag(String?.none)
-                            }
-                            ForEach(options) { option in
-                                Text(option.label).tag(Optional(option.value))
-                            }
+            LabeledContent {
+                Menu {
+                    Picker(setting.label, selection: selection) {
+                        if let unsetLabel {
+                            Text(unsetLabel).tag(String?.none)
                         }
-                        .labelsHidden()
-                    } label: {
-                        HStack(spacing: 5) {
-                            Text(selectedLabel)
-                            HorusIcon(.caretUpDown)
-                                .font(.caption2)
-                                .accessibilityHidden(true)
+                        ForEach(options) { option in
+                            Text(option.label).tag(Optional(option.value))
                         }
-                        .foregroundStyle(palette.accent)
                     }
-                    .menuIndicator(.hidden)
-                    .buttonStyle(.horusPlain)
-                    .accessibilityLabel(setting.label)
-                    .accessibilityValue(selectedLabel)
+                    .labelsHidden()
                 } label: {
-                    Text(setting.label)
-                        .foregroundStyle(.primary)
-                        .accessibilityHidden(true)
+                    HStack(spacing: 5) {
+                        Text(selectedLabel)
+                        HorusIcon(.caretUpDown, size: 12)
+                            .accessibilityHidden(true)
+                    }
+                    .foregroundStyle(palette.accent)
                 }
-                SettingsCaption(selectedDescription ?? setting.description)
+                .menuIndicator(.hidden)
+                .buttonStyle(.horusPlain)
+                .disabled(!middlewareEnabled(feature))
+                .accessibilityLabel(setting.label)
+                .accessibilityValue(selectedLabel)
+            } label: {
+                HStack(spacing: 5) {
+                    Text(setting.label)
+                    SettingsInfoButton(
+                        title: setting.label,
+                        detail: selectedDescription ?? setting.description
+                    )
+                }
             }
             .sensoryFeedback(.selection, trigger: selection.wrappedValue)
         }
@@ -235,6 +270,13 @@ struct AgentSettingsView: View {
             get: { model.agentDraft?.systemPrompt ?? "" },
             set: { model.agentDraft?.systemPrompt = $0 }
         )
+    }
+
+    private var defaultModelLabel: String {
+        guard let route = model.agentDraftModelRoute,
+              let choice = model.modelChoices.first(where: { $0.route == route })
+        else { return "Select" }
+        return "\(choice.model) · \(choice.reasoningEffort?.capitalized ?? "Default")"
     }
 
     private func middleware(_ feature: MiddlewareFeature) -> Binding<Bool> {
@@ -339,7 +381,7 @@ struct ProvidersView: View {
     var body: some View {
         PageScaffold(
             title: "Providers",
-            detail: "Provider state belongs to the gateway. Credential material is write-only and is never returned here.",
+            detail: "",
             centersContentOnMac: model.providerDraft == nil
         ) {
             if model.providerDraft != nil {
@@ -360,21 +402,39 @@ struct ProvidersView: View {
                 // Model and reasoning are picked per chat in the composer; this page only
                 // manages what the gateway itself has configured.
                 Section("Provider") {
-                    Picker("Provider", selection: providerID) {
-                        ForEach(model.providerStatuses) { status in
-                            Text(status.label).tag(status.provider)
+                    LabeledContent {
+                        Picker("Provider", selection: providerID) {
+                            ForEach(model.providerStatuses) { status in
+                                Text(status.label).tag(status.provider)
+                            }
+                        }
+                        .labelsHidden()
+                        .settingsPickerStyle()
+                        .sensoryFeedback(.selection, trigger: providerID.wrappedValue)
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text("Provider")
+                            SettingsInfoButton(
+                                title: selectedStatus?.label ?? "Provider",
+                                detail: selectedStatus?.description
+                                    ?? "Selects the model service configured on this gateway."
+                            )
                         }
                     }
-                    .settingsPickerStyle()
-                    .sensoryFeedback(.selection, trigger: providerID.wrappedValue)
 
                     if let status = selectedStatus {
-                        SettingsCaption(status.description)
-
-                        if status.models.isEmpty {
-                            LabeledContent("Model ID") {
-                                TextField("Exact model ID", text: providerModelID)
+                        if status.modelIdsConfigurable {
+                            LabeledContent {
+                                TextField("model-a, model-b", text: providerModelIDs)
                                     .settingsField()
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Text("Model ID(s)")
+                                    SettingsInfoButton(
+                                        title: "Model ID(s)",
+                                        detail: "Enter one or more exact provider model IDs separated by commas. Whitespace and empty entries are ignored."
+                                    )
+                                }
                             }
                         }
 
@@ -445,8 +505,19 @@ struct ProvidersView: View {
 
             if status.auth == .apiKey {
                 @Bindable var model = model
-                SecureField("New API key · write only", text: $model.providerAPIKey)
-                    .textContentType(.password)
+                LabeledContent {
+                    SecureField("New API key", text: $model.providerAPIKey)
+                        .textContentType(.password)
+                        .settingsField()
+                } label: {
+                    HStack(spacing: 5) {
+                        Text("API key")
+                        SettingsInfoButton(
+                            title: "API key",
+                            detail: "Sent once to the gateway and never returned to this app."
+                        )
+                    }
+                }
                 HorusActionRow {
                     Button("Send key to gateway", glyph: .key) {
                         model.saveProviderCredential(provider: status.provider)
@@ -534,10 +605,10 @@ struct ProvidersView: View {
         )
     }
 
-    private var providerModelID: Binding<String> {
+    private var providerModelIDs: Binding<String> {
         Binding(
-            get: { model.providerDraft?.model ?? "" },
-            set: { model.selectProviderModel($0) }
+            get: { model.providerModelIDsText },
+            set: { model.updateProviderModelIDs($0) }
         )
     }
 
@@ -564,10 +635,12 @@ struct ProvidersView: View {
         guard let provider = model.providerDraft,
               let status = selectedStatus,
               status.configured,
-              status.webSearch.contains(provider.webSearch),
-              !provider.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+              status.webSearch.contains(provider.webSearch)
         else { return false }
-        guard !status.models.isEmpty else { return true }
+        if status.modelIdsConfigurable { return !model.providerModelIDs.isEmpty }
+        guard !provider.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !status.models.isEmpty
+        else { return false }
         guard let providerModel = selectedProviderModel else { return false }
         return provider.reasoningEffort == nil
             || providerModel.reasoning.contains { $0.id == provider.reasoningEffort }
@@ -714,10 +787,18 @@ struct ProfileView: View {
         let usage = model.profile?.dailyUsage ?? []
         PageScaffold(
             title: "Settings",
-            detail: "Token activity reported by the selected gateway."
+            detail: ""
         ) {
             Section("Usage") {
                 ProfileUsageSection(days: usage)
+            }
+            if let stats = model.profile?.runStats {
+                Section("Runs") {
+                    ProfileRunStatsSection(stats: stats)
+                }
+            }
+            Section("Recent runs") {
+                ProfileRecentRuns(runs: model.profile?.recentRuns ?? [])
             }
             Section("Appearance") {
                 AppearanceSettings()
@@ -726,6 +807,7 @@ struct ProfileView: View {
                 AppLockSettings()
             }
         }
+        .task(id: model.connectionState.isReady) { model.refreshProfile() }
     }
 }
 
@@ -773,6 +855,120 @@ private struct UsageMetric: View {
                 .monospacedDigit()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ProfileRunStatsSection: View {
+    let stats: RunStats
+
+    var body: some View {
+        VStack(spacing: 16) {
+            HStack(spacing: 8) {
+                UsageMetric(label: "RUNS", value: compact(stats.runCount))
+                UsageMetric(label: "FAILED", value: compact(stats.failedRunCount))
+                UsageMetric(label: "ABORTED", value: compact(stats.abortedRunCount))
+                UsageMetric(label: "ELAPSED", value: formatMilliseconds(stats.elapsedMs))
+            }
+            HStack(spacing: 8) {
+                UsageMetric(label: "MODEL CALLS", value: compact(stats.modelCalls))
+                UsageMetric(label: "TOOL CALLS", value: compact(stats.toolCalls))
+                UsageMetric(label: "TOOL ERRORS", value: compact(stats.failedToolCalls))
+                UsageMetric(label: "RUN TOKENS", value: compact(stats.usage.totalTokens))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ProfileRecentRuns: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+    let runs: [RunSummary]
+
+    var body: some View {
+        if runs.isEmpty {
+            Text("No completed runs yet.")
+                .font(HorusStyle.bodyFont)
+                .foregroundStyle(palette.muted)
+        } else {
+            ForEach(runs) { run in
+                Button {
+                    model.openSession(run.sessionId)
+                    model.destination = .chat
+                } label: {
+                    HStack(spacing: 10) {
+                        HorusIcon(runGlyph(run), foreground: runColor(run))
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 6) {
+                                Text(runTitle(run))
+                                    .font(HorusStyle.controlFont)
+                                    .lineLimit(1)
+                                Text(runDate(run), format: .dateTime.month(.abbreviated).day().hour().minute())
+                                    .font(HorusStyle.metadataFont)
+                                    .foregroundStyle(palette.muted)
+                            }
+                            Text(runDetail(run))
+                                .font(HorusStyle.metadataFont)
+                                .foregroundStyle(palette.muted)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 4)
+                        HorusIcon(.caretRight, size: 12, foreground: palette.muted)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.horusPlain)
+                .accessibilityLabel("\(runOutcome(run)), \(runTitle(run))")
+                .accessibilityValue(runDetail(run))
+                .accessibilityHint("Opens the chat for this run")
+            }
+        }
+    }
+
+    private func runTitle(_ run: RunSummary) -> String {
+        guard let session = model.sessions.first(where: { $0.sessionId == run.sessionId }),
+              let title = (session.title ?? session.firstUserMessage)?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              ),
+              !title.isEmpty
+        else { return "Run \(run.turnId.prefix(8))" }
+        return title
+    }
+
+    private func runDetail(_ run: RunSummary) -> String {
+        "\(formatMilliseconds(run.elapsedMs)) · \(run.modelCalls) model · \(run.toolCalls) tools · \(compact(run.usage.totalTokens)) tokens"
+    }
+
+    private func runDate(_ run: RunSummary) -> Date {
+        Date(timeIntervalSince1970: TimeInterval(run.startedAtMs) / 1_000)
+    }
+
+    private func runOutcome(_ run: RunSummary) -> String {
+        switch run.outcome {
+        case .completed: "Completed"
+        case .aborted: "Aborted"
+        case .failed: "Failed"
+        case nil: "Running"
+        }
+    }
+
+    private func runGlyph(_ run: RunSummary) -> HorusGlyph {
+        switch run.outcome {
+        case .completed: .checkCircle
+        case .aborted: .stopFill
+        case .failed: .xCircle
+        case nil: .arrowClockwise
+        }
+    }
+
+    private func runColor(_ run: RunSummary) -> Color {
+        switch run.outcome {
+        case .completed: palette.signal
+        case .aborted: palette.warning
+        case .failed: palette.danger
+        case nil: palette.accent
+        }
     }
 }
 
@@ -871,22 +1067,27 @@ private struct AppLockSettings: View {
     @Environment(\.horusPalette) private var palette
 
     var body: some View {
-        Toggle(model.appLockAuthenticationMethod.settingTitle, isOn: Binding(
-            get: { model.appLockEnabled },
-            set: { enabled in
-                Task { await model.setAppLockEnabled(enabled) }
-            }
-        ))
-        .toggleStyle(.switch)
-        .disabled(
-            model.isAppLockAuthenticating
-                || !model.appLockEnabled && !model.appLockAuthenticationMethod.isAvailable
-        )
+        HStack(spacing: 5) {
+            Toggle(model.appLockAuthenticationMethod.settingTitle, isOn: Binding(
+                get: { model.appLockEnabled },
+                set: { enabled in
+                    Task { await model.setAppLockEnabled(enabled) }
+                }
+            ))
+            .toggleStyle(.switch)
+            .disabled(
+                model.isAppLockAuthenticating
+                    || !model.appLockEnabled && !model.appLockAuthenticationMethod.isAvailable
+            )
+            SettingsInfoButton(
+                title: model.appLockAuthenticationMethod.settingTitle,
+                detail: description
+            )
+        }
         .onAppear { model.refreshAppLockAuthenticationMethod() }
         if model.isAppLockAuthenticating {
             ProgressView("Authenticating")
         }
-        SettingsCaption(description)
         if let error = model.appLockError {
             Text(error)
                 .foregroundStyle(palette.danger)
@@ -903,6 +1104,49 @@ private struct AppLockSettings: View {
         #else
         return "Set up Face ID or Touch ID in Settings before enabling app lock."
         #endif
+    }
+}
+
+/// A compact HugeIcons disclosure for setting guidance that should not permanently occupy a row.
+private struct SettingsInfoButton: View {
+    @Environment(\.horusPalette) private var palette
+    @State private var showsDetail = false
+    let title: String
+    let detail: String
+
+    var body: some View {
+        Button {
+            showsDetail = true
+        } label: {
+            HorusIcon(.info, size: 15, foreground: palette.muted)
+                .frame(
+                    minWidth: HorusStyle.iconButtonSize,
+                    minHeight: HorusStyle.iconButtonSize
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.horusPlain)
+        .accessibilityLabel("About \(title)")
+        .accessibilityHint("Shows setting guidance")
+        .help("About \(title)")
+        .sensoryFeedback(.selection, trigger: showsDetail)
+        .popover(
+            isPresented: $showsDetail,
+            attachmentAnchor: .rect(.bounds),
+            arrowEdge: .top
+        ) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(title)
+                    .font(HorusStyle.controlFont.weight(.semibold))
+                Text(detail)
+                    .font(HorusStyle.bodyFont)
+                    .foregroundStyle(palette.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(16)
+            .frame(width: 280, alignment: .leading)
+            .presentationCompactAdaptation(.popover)
+        }
     }
 }
 
@@ -1216,6 +1460,17 @@ private struct StatusBanner: View {
 
 private func compact(_ value: Int) -> String {
     value.formatted(.number.notation(.compactName).precision(.fractionLength(0 ... 1)))
+}
+
+private func compact(_ value: UInt64) -> String {
+    value.formatted(.number.notation(.compactName).precision(.fractionLength(0 ... 1)))
+}
+
+private func formatMilliseconds(_ milliseconds: UInt64) -> String {
+    let seconds = Int(clamping: milliseconds / 1_000)
+    return Duration.seconds(seconds).formatted(
+        .time(pattern: .minuteSecond(padMinuteToLength: 1))
+    )
 }
 
 func cacheHit(_ usage: TokenUsage) -> String {

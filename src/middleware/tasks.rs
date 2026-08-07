@@ -11,8 +11,9 @@ use super::{Middleware, MiddlewareCommandContext, MiddlewareCommandOutput, Runti
 use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::model::ToolDefinition;
 use crate::protocol::{
-    EventMsg, FrontendBlock, FrontendCommand, FrontendContribution, FrontendEvent,
-    FrontendProgress, FrontendSlot, FrontendTone, FrontendWidget, FrontendWidgetContent,
+    EventMsg, FrontendActionListItem, FrontendBlock, FrontendCommand, FrontendContribution,
+    FrontendEvent, FrontendListItemState, FrontendProgress, FrontendSlot, FrontendSymbol,
+    FrontendTone, FrontendWidget, FrontendWidgetContent,
 };
 use crate::{BoxFuture, Error, Result};
 
@@ -227,29 +228,34 @@ fn widget_event(todos: &[Todo]) -> FrontendEvent {
         item: FrontendWidget {
             id: "status".into(),
             slot: FrontendSlot::ComposerFooter,
-            text: "tasks".into(),
+            text: format!("{completed}/{}", todos.len()),
             tone: if completed == todos.len() {
                 FrontendTone::Success
             } else {
                 FrontendTone::Neutral
             },
-            symbol: None,
+            symbol: Some(FrontendSymbol::Task),
             icon_only: false,
             progress: Some(FrontendProgress {
                 completed,
                 total: todos.len(),
             }),
-            content: Some(FrontendWidgetContent::Blocks {
+            content: Some(FrontendWidgetContent::ActionList {
                 title: "Tasks".into(),
-                blocks: vec![FrontendBlock {
-                    id: None,
-                    group: None,
-                    append: false,
-                    pending: false,
-                    text: format_todos(todos),
-                    format: crate::protocol::FrontendBlockFormat::PlainText,
-                    tone: FrontendTone::Neutral,
-                }],
+                items: todos
+                    .iter()
+                    .enumerate()
+                    .map(|(index, todo)| FrontendActionListItem {
+                        id: index.to_string(),
+                        text: todo.content.clone(),
+                        state: match todo.status {
+                            TodoStatus::Pending => FrontendListItemState::Pending,
+                            TodoStatus::InProgress => FrontendListItemState::InProgress,
+                            TodoStatus::Completed => FrontendListItemState::Completed,
+                        },
+                        actions: Vec::new(),
+                    })
+                    .collect(),
             }),
             action: None,
         },
@@ -353,16 +359,18 @@ mod tests {
         assert!(matches!(
             frontend_events.lock().expect("frontend events").last(),
             Some(FrontendEvent::Widget { item, .. })
-                if item.text == "tasks"
+                if item.text == "1/2"
                     && item.progress == Some(FrontendProgress { completed: 1, total: 2 })
                     && item.action.is_none()
                     && matches!(
                         &item.content,
-                        Some(FrontendWidgetContent::Blocks { title, blocks })
+                        Some(FrontendWidgetContent::ActionList { title, items })
                             if title == "Tasks"
-                                && blocks.len() == 1
-                                && blocks[0].text
-                                    == "[x] inspect seams\n[~] Implement tasks"
+                                && items.len() == 2
+                                && items[0].text == "inspect seams"
+                                && items[0].state == FrontendListItemState::Completed
+                                && items[1].state == FrontendListItemState::InProgress
+                                && items.iter().all(|item| item.actions.is_empty())
                     )
         ));
     }
