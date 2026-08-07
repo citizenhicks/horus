@@ -577,13 +577,23 @@ impl Tool for ApplyPatch {
                 )));
             }
             let content = context.sandbox.read(&arguments.path).await?;
-            let patch = diffy::Patch::from_str(&arguments.patch)
-                .map_err(|error| Error::Tool(format!("invalid unified diff: {error}")))?;
+            let patch = diffy::Patch::from_str(&arguments.patch).map_err(|error| {
+                malformed_patch_error(&content, &arguments.patch, &error.to_string())
+            })?;
+            if patch.hunks().is_empty() {
+                return Err(malformed_patch_error(
+                    &content,
+                    &arguments.patch,
+                    "no hunk headers were found",
+                ));
+            }
             validate_patch_complexity(&content, &patch)?;
             let updated = diffy::apply(&content, &patch)
-                .map_err(|error| Error::Tool(format!("patch does not apply: {error}")))?;
+                .map_err(|error| unmatched_patch_error(&content, &patch, &error))?;
             if updated == content {
-                return Err(Error::Tool("patch must change the file".into()));
+                return Err(Error::Tool(
+                    "Patch rejected: patch applies but makes no changes.".into(),
+                ));
             }
             let mut options = DiffOptions::new();
             options
@@ -601,6 +611,76 @@ impl Tool for ApplyPatch {
             })
         })
     }
+}
+
+fn malformed_patch_error(content: &str, input: &str, reason: &str) -> Error {
+    let received = input
+        .lines()
+        .find(|line| line.trim_start().starts_with("@@"))
+        .unwrap_or("<missing>");
+    let received = capped(received, MAX_TOOL_UI_BYTES);
+    Error::Tool(format!(
+        "Patch rejected: malformed unified diff.\n\
+         Reason: {reason}.\n\
+         Expected hunk header format: @@ -start[,count] +start[,count] @@\n\
+         Received: {}\n\
+         Actual file has {} lines.",
+        received.escape_debug(),
+        content.lines().count()
+    ))
+}
+
+fn unmatched_patch_error(
+    content: &str,
+    patch: &Patch<'_, str>,
+    error: &diffy::ApplyError,
+) -> Error {
+    let message = error.to_string();
+    let Some(hunk_number) = message
+        .strip_prefix("error applying hunk #")
+        .and_then(|number| number.parse::<usize>().ok())
+        .filter(|number| *number > 0 && *number <= patch.hunks().len())
+    else {
+        return Error::Tool(format!(
+            "Patch rejected: a hunk did not match the file.\nReason: {message}."
+        ));
+    };
+    let rejection = if patch.hunks().len() == 1 {
+        "Patch rejected: no hunks matched the file.".into()
+    } else {
+        format!("Patch rejected: hunk #{hunk_number} did not match the file.")
+    };
+    let Some(hunk) = patch.hunks().get(hunk_number - 1) else {
+        return Error::Tool(format!(
+            "Patch rejected: a hunk did not match the file.\nReason: {message}."
+        ));
+    };
+    let Some((heading, context)) = hunk.lines().iter().find_map(|line| match line {
+        Line::Context(value) if !value.trim().is_empty() => {
+            Some(("Failed hunk starts with context:", *value))
+        }
+        Line::Delete(value) if !value.trim().is_empty() => {
+            Some(("Failed hunk starts with deletion:", *value))
+        }
+        Line::Insert(_) => None,
+        Line::Context(_) | Line::Delete(_) => None,
+    }) else {
+        return Error::Tool(format!(
+            "{rejection}\nThe failed hunk has no usable context lines."
+        ));
+    };
+    let nearest = content
+        .split_inclusive('\n')
+        .enumerate()
+        .filter(|(_, line)| *line == context)
+        .map(|(index, _)| index + 1)
+        .min_by_key(|line| line.abs_diff(hunk.new_range().start()));
+    let location = nearest.map_or_else(
+        || "No matching context line was found.".into(),
+        |line| format!("The nearest match is at line {line}."),
+    );
+    let context = capped(context.trim_end_matches(['\r', '\n']), MAX_TOOL_UI_BYTES);
+    Error::Tool(format!("{rejection}\n{heading}\n{context:?}\n{location}"))
 }
 
 fn validate_patch_complexity(content: &str, patch: &Patch<'_, str>) -> Result<()> {

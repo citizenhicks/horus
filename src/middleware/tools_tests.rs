@@ -161,6 +161,35 @@ fn only_wholly_interruptible_batches_stop_for_active_input() {
     assert!(!catalog.interrupts_on_active_input(&[]));
 }
 
+async fn rejected_patch(content: &str, patch: &str) -> String {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("note.txt"), content).expect("write fixture");
+    let context = ToolContext {
+        sandbox: Arc::new(Sandbox::new(
+            Arc::new(
+                crate::backend::sandbox::local::LocalSandbox::new(workspace.path())
+                    .expect("local sandbox"),
+            ),
+            crate::backend::sandbox::ApprovalPolicy::Ask,
+        )),
+        permissions: SandboxPermissions::restore(
+            "session",
+            crate::backend::sandbox::NetworkAccess::Denied,
+            ["patch".into()],
+        )
+        .for_call("patch"),
+    };
+
+    ApplyPatch
+        .call(
+            context,
+            serde_json::json!({"path": "note.txt", "patch": patch}),
+        )
+        .await
+        .expect_err("patch rejection")
+        .to_string()
+}
+
 #[tokio::test]
 async fn apply_patch_returns_a_unified_diff_after_writing() {
     let workspace = tempfile::tempdir().expect("workspace");
@@ -234,8 +263,66 @@ async fn apply_patch_returns_a_unified_diff_after_writing() {
     .expect("no-op result");
     assert!(no_op.is_error);
     assert_eq!(
+        no_op.output,
+        "tool error: Patch rejected: patch applies but makes no changes."
+    );
+    assert_eq!(
         std::fs::read_to_string(workspace.path().join("note.txt")).expect("read unchanged file"),
         "first\nnew\nlast\n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_reports_failed_context_and_nearest_line() {
+    let context = "Project Prometheus is a cloud-hosted modeling workspace.";
+    let content = format!("{}{context}\nactual next line\n", "padding\n".repeat(437));
+    let error = rejected_patch(
+        &content,
+        &format!(
+            "--- ignored\n+++ ignored\n@@ -432,2 +432,2 @@\n {context}\n-expected next line\n+replacement\n"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        error,
+        "tool error: Patch rejected: no hunks matched the file.\n\
+         Failed hunk starts with context:\n\
+         \"Project Prometheus is a cloud-hosted modeling workspace.\"\n\
+         The nearest match is at line 438."
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_reports_malformed_hunk_header_counts() {
+    let content = "line\n".repeat(441);
+    let error = rejected_patch(
+        &content,
+        "--- ignored\n+++ ignored\n@@ -432,3 +432,4 @@\n line\n-old\n+new\n",
+    )
+    .await;
+
+    assert_eq!(
+        error,
+        "tool error: Patch rejected: malformed unified diff.\n\
+         Reason: error parsing patch: Hunk header does not match hunk.\n\
+         Expected hunk header format: @@ -start[,count] +start[,count] @@\n\
+         Received: @@ -432,3 +432,4 @@\n\
+         Actual file has 441 lines."
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_input_without_hunks_as_malformed() {
+    let error = rejected_patch("line\n", "@@-1 +1@@\n-old\n+new\n").await;
+
+    assert_eq!(
+        error,
+        "tool error: Patch rejected: malformed unified diff.\n\
+         Reason: no hunk headers were found.\n\
+         Expected hunk header format: @@ -start[,count] +start[,count] @@\n\
+         Received: @@-1 +1@@\n\
+         Actual file has 1 lines."
     );
 }
 
