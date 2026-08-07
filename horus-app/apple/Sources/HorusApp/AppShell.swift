@@ -318,6 +318,13 @@ private struct AppToastView: View {
         .padding(.vertical, 10)
         .horusGlass(in: HorusStyle.cardShape)
         .shadow(color: .black.opacity(0.20), radius: 18, y: 8)
+        .gesture(
+            DragGesture(minimumDistance: 20)
+                .onEnded { value in
+                    guard value.predictedEndTranslation.height < -40 else { return }
+                    dismiss()
+                }
+        )
     }
 }
 
