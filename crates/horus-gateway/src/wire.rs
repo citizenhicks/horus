@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use futures_util::{Sink, SinkExt as _, Stream, StreamExt as _};
 use horus::backend::checkpoint::SessionSummary;
@@ -47,6 +48,7 @@ mod base64_bytes {
 pub const PROTOCOL_VERSION: u16 = 17;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Cancellation-safe reader for length-prefixed gateway frames.
 pub struct FrameReader<R> {
@@ -994,7 +996,20 @@ pub(crate) async fn framed_to_websocket(
 ) -> Result<()> {
     loop {
         let mut prefix = [0_u8; 4];
-        if reader.read(&mut prefix[..1]).await? == 0 {
+        let first =
+            match tokio::time::timeout(WEBSOCKET_KEEPALIVE_INTERVAL, reader.read(&mut prefix[..1]))
+                .await
+            {
+                Ok(read) => read?,
+                Err(_) => {
+                    outgoing
+                        .send(Message::Ping(Vec::new().into()))
+                        .await
+                        .map_err(websocket_error)?;
+                    continue;
+                }
+            };
+        if first == 0 {
             return outgoing.close().await.map_err(websocket_error);
         }
         reader.read_exact(&mut prefix[1..]).await?;
@@ -1082,6 +1097,32 @@ mod tests {
             .expect_err("text message must fail");
 
         assert!(error.to_string().contains("must be binary"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_framed_websocket_sends_a_ping() {
+        use tokio_tungstenite::WebSocketStream;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (server_socket, client_socket) = duplex(1024);
+        let (server, mut client) = tokio::join!(
+            WebSocketStream::from_raw_socket(server_socket, Role::Server, None),
+            WebSocketStream::from_raw_socket(client_socket, Role::Client, None),
+        );
+        let (outgoing, _incoming) = server.split();
+        let (_framed_writer, framed_reader) = duplex(64);
+        let bridge = tokio::spawn(framed_to_websocket(framed_reader, outgoing));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(WEBSOCKET_KEEPALIVE_INTERVAL).await;
+        let message = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("WebSocket keepalive timeout")
+            .expect("WebSocket closed before keepalive")
+            .expect("read WebSocket keepalive");
+
+        assert!(matches!(message, Message::Ping(payload) if payload.is_empty()));
+        bridge.abort();
     }
 
     #[test]
