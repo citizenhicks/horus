@@ -250,6 +250,67 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.runStats.active)
     }
 
+    func testStreamDeltasStayBatchedUntilTheCanonicalMessage() async throws {
+        let model = try model()
+
+        for _ in 0..<100 {
+            model.reduce(
+                event: AgentEventRecord(submissionId: nil, msg: .object([
+                    "type": .string("agent_message_content_delta"),
+                    "itemId": .string("answer-1"),
+                    "delta": .string("x")
+                ])),
+                blocks: [],
+                preview: nil
+            )
+        }
+        XCTAssertTrue(model.transcript.isEmpty)
+
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(model.transcript.map(\.text), [String(repeating: "x", count: 100)])
+        XCTAssertTrue(try XCTUnwrap(model.transcript.first).pending)
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("agent_message"),
+                "message": .string("Canonical **Markdown**")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+
+        XCTAssertEqual(model.transcript.map(\.text), ["Canonical **Markdown**"])
+        XCTAssertFalse(try XCTUnwrap(model.transcript.first).pending)
+    }
+
+    func testTaskCompleteFlushesPendingReasoning() throws {
+        let model = try model()
+
+        for delta in ["think", "ing"] {
+            model.reduce(
+                event: AgentEventRecord(submissionId: nil, msg: .object([
+                    "type": .string("agent_reasoning_content_delta"),
+                    "itemId": .string("reasoning-1"),
+                    "delta": .string(delta)
+                ])),
+                blocks: [],
+                preview: nil
+            )
+        }
+        XCTAssertTrue(model.transcript.isEmpty)
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("task_complete")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+
+        XCTAssertEqual(model.transcript.map(\.text), ["thinking"])
+        XCTAssertFalse(try XCTUnwrap(model.transcript.first).pending)
+    }
+
     func testAppLockAuthenticatesBeforePersistingAndRelocks() async throws {
         let suiteName = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

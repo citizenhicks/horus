@@ -388,6 +388,9 @@ final class AppModel {
     @ObservationIgnored private let requestSender:
         @MainActor @Sendable (GatewayRequest) async throws -> Void
     @ObservationIgnored private var eventTask: Task<Void, Never>?
+    @ObservationIgnored private var deltaFlushTask: Task<Void, Never>?
+    @ObservationIgnored private var bufferedDeltas:
+        [(id: String, delta: String, kind: TranscriptEntry.Kind)] = []
     @ObservationIgnored private var connectionGeneration = UUID()
     @ObservationIgnored private var reconnectsOnActivation = false
     @ObservationIgnored private var pendingPairingAccount: GatewayAccount?
@@ -468,6 +471,7 @@ final class AppModel {
 
     deinit {
         eventTask?.cancel()
+        deltaFlushTask?.cancel()
         pairingCodeExpiryTask?.cancel()
         toastDismissTask?.cancel()
     }
@@ -831,6 +835,7 @@ final class AppModel {
     }
 
     func restoreSession(_ sessionID: String) {
+        flushStreamDeltas()
         guard sessionID == selectedSessionID,
               let sequence = latestSequence,
               let epoch = currentReplayEpoch
@@ -1668,6 +1673,7 @@ final class AppModel {
     }
 
     private func finishSessionReplay() {
+        flushStreamDeltas()
         if let replaySnapshotSequence { latestSequence = replaySnapshotSequence }
         replayRequestID = nil
         replaySnapshotSequence = nil
@@ -2056,6 +2062,11 @@ final class AppModel {
         preview: RenderedPreview?
     ) {
         let type = event.msg["type"]?.stringValue ?? "unknown"
+        // Anything that is not a delta may read or finalize the streams the buffer feeds,
+        // so buffered text must land first to keep transcript order exact.
+        if type != "agent_message_content_delta", type != "agent_reasoning_content_delta" {
+            flushStreamDeltas()
+        }
         if type == "session_history" {
             transcript = []
             currentUsage = TokenUsage()
@@ -2395,20 +2406,45 @@ final class AppModel {
         ))
     }
 
+    // Deltas arrive several times per frame, and every application re-lays-out the whole
+    // growing message. Batching to ~20 flushes a second keeps the text pipeline off the
+    // critical path; ordering against non-delta events is preserved by the flush in `reduce`.
     private func appendStream(id: String, delta: String, kind: TranscriptEntry.Kind) {
         guard !delta.isEmpty else { return }
-        if let index = transcript.lastIndex(where: { $0.id == id }) {
-            transcript[index].text.append(delta)
+        if let last = bufferedDeltas.indices.last, bufferedDeltas[last].id == id {
+            bufferedDeltas[last].delta += delta
         } else {
-            transcript.append(TranscriptEntry(
-                id: id,
-                text: delta,
-                kind: kind,
-                format: "plain_text",
-                tone: "neutral",
-                pending: true
-            ))
+            bufferedDeltas.append((id: id, delta: delta, kind: kind))
         }
+        guard deltaFlushTask == nil else { return }
+        deltaFlushTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(50))
+            } catch {
+                return
+            }
+            self?.flushStreamDeltas()
+        }
+    }
+
+    private func flushStreamDeltas() {
+        deltaFlushTask?.cancel()
+        deltaFlushTask = nil
+        for buffered in bufferedDeltas {
+            if let index = transcript.lastIndex(where: { $0.id == buffered.id }) {
+                transcript[index].text.append(buffered.delta)
+            } else {
+                transcript.append(TranscriptEntry(
+                    id: buffered.id,
+                    text: buffered.delta,
+                    kind: buffered.kind,
+                    format: "plain_text",
+                    tone: "neutral",
+                    pending: true
+                ))
+            }
+        }
+        bufferedDeltas.removeAll()
     }
 
     private func completeStream(
@@ -2517,6 +2553,7 @@ final class AppModel {
         preservingDrafts: Bool,
         preservingSession: Bool = false
     ) -> UUID {
+        if preservingSession { flushStreamDeltas() }
         connectionGeneration = UUID()
         eventTask?.cancel()
         eventTask = nil
@@ -2601,6 +2638,9 @@ final class AppModel {
         cronError = nil
         cronRequestIDs.removeAll()
         transcript = []
+        deltaFlushTask?.cancel()
+        deltaFlushTask = nil
+        bufferedDeltas.removeAll()
         replayRequestID = nil
         replaySnapshotSequence = nil
         replayPresentedTranscript = nil

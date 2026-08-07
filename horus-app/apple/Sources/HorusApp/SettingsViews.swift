@@ -808,14 +808,14 @@ struct ProfileView: View {
                     ProfileRunStatsSection(stats: stats)
                 }
             }
-            Section("Recent runs") {
-                ProfileRecentRuns(groups: model.profile?.recentRunGroups ?? [])
-            }
             Section("Appearance") {
                 AppearanceSettings()
             }
             Section("Security") {
                 AppLockSettings()
+            }
+            Section("Recent runs") {
+                ProfileRecentRuns(groups: model.profile?.recentRunGroups ?? [])
             }
         }
         .task(id: model.connectionState.isReady) { model.refreshProfile() }
@@ -894,6 +894,7 @@ private struct ProfileRunStatsSection: View {
 private struct ProfileRecentRuns: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
+    @State private var collapsedGroupIDs: Set<String> = []
     let groups: [SessionRunGroup]
 
     var body: some View {
@@ -902,50 +903,78 @@ private struct ProfileRecentRuns: View {
                 .font(HorusStyle.bodyFont)
                 .foregroundStyle(palette.muted)
         } else {
-            ForEach(groups) { group in
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(group.title)
-                        .font(HorusStyle.controlFont)
-                        .lineLimit(1)
-                        .padding(.bottom, 2)
-                    ForEach(group.runs) { run in
-                        Button {
-                            model.openSession(group.sessionId)
-                            model.destination = .chat
-                        } label: {
-                            HStack(spacing: 10) {
-                                HorusIcon(runGlyph(run), foreground: runColor(run))
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack(spacing: 6) {
-                                        Text(run.sessionId == group.sessionId ? "Run" : "Sub-run")
-                                            .font(HorusStyle.metadataFont.weight(.semibold))
-                                        Text(
-                                            runDate(run),
-                                            format: .dateTime.month(.abbreviated).day().hour().minute()
-                                        )
-                                        .font(HorusStyle.metadataFont)
-                                        .foregroundStyle(palette.muted)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(groups) { group in
+                        DisclosureGroup(isExpanded: expansion(for: group.id)) {
+                            ForEach(group.runs) { run in
+                                Button {
+                                    model.openSession(group.sessionId)
+                                    model.destination = .chat
+                                } label: {
+                                    HStack(spacing: 10) {
+                                        HorusIcon(runGlyph(run), foreground: runColor(run))
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            HStack(spacing: 6) {
+                                                Text(run.sessionId == group.sessionId ? "Run" : "Sub-run")
+                                                    .font(HorusStyle.metadataFont.weight(.semibold))
+                                                Text(
+                                                    runDate(run),
+                                                    format: .dateTime.month(.abbreviated).day().hour().minute()
+                                                )
+                                                .font(HorusStyle.metadataFont)
+                                                .foregroundStyle(palette.muted)
+                                            }
+                                            Text(runDetail(run))
+                                                .font(HorusStyle.metadataFont)
+                                                .foregroundStyle(palette.muted)
+                                                .lineLimit(1)
+                                        }
+                                        Spacer(minLength: 4)
+                                        HorusIcon(.caretRight, size: 12, foreground: palette.muted)
                                     }
-                                    Text(runDetail(run))
-                                        .font(HorusStyle.metadataFont)
-                                        .foregroundStyle(palette.muted)
-                                        .lineLimit(1)
+                                    .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize)
+                                    .contentShape(Rectangle())
                                 }
-                                Spacer(minLength: 4)
-                                HorusIcon(.caretRight, size: 12, foreground: palette.muted)
+                                .buttonStyle(.horusPlain)
+                                .accessibilityLabel("\(runOutcome(run)), \(group.title)")
+                                .accessibilityValue(runDetail(run))
+                                .accessibilityHint("Opens the chat for this run")
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Text(group.title)
+                                    .font(HorusStyle.controlFont)
+                                    .lineLimit(1)
+                                Text(group.runs.count, format: .number)
+                                    .font(HorusStyle.metadataFont)
+                                    .foregroundStyle(palette.muted)
                             }
                             .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize)
-                            .contentShape(Rectangle())
                         }
-                        .buttonStyle(.horusPlain)
-                        .accessibilityLabel("\(runOutcome(run)), \(group.title)")
-                        .accessibilityValue(runDetail(run))
-                        .accessibilityHint("Opens the chat for this run")
+                        .tint(palette.accent)
                     }
                 }
-                .padding(.vertical, 4)
             }
+            .frame(height: CGFloat(min(visibleRowCount, 20)) * HorusStyle.iconButtonSize)
+            .scrollBounceBehavior(.basedOnSize)
         }
+    }
+
+    private var visibleRowCount: Int {
+        groups.reduce(0) { count, group in
+            count + 1 + (collapsedGroupIDs.contains(group.id) ? 0 : group.runs.count)
+        }
+    }
+
+    private func expansion(for groupID: String) -> Binding<Bool> {
+        Binding(
+            get: { !collapsedGroupIDs.contains(groupID) },
+            set: { expanded in
+                if expanded { collapsedGroupIDs.remove(groupID) }
+                else { collapsedGroupIDs.insert(groupID) }
+            }
+        )
     }
 
     private func runDetail(_ run: RunSummary) -> String {

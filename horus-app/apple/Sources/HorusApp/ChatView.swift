@@ -458,10 +458,10 @@ private struct TranscriptRow: View {
                     .background(palette.accentSoft, in: HorusStyle.cardShape)
             }
         case .assistant:
-            MarkdownText(entry.text, parsesMarkdown: !entry.pending)
+            MarkdownText(entry.text, streaming: entry.pending)
                 .frame(maxWidth: .infinity, alignment: .leading)
         case .reasoning:
-            MarkdownText(entry.text, parsesMarkdown: !entry.pending)
+            MarkdownText(entry.text, streaming: entry.pending)
                 .foregroundStyle(palette.muted)
             .padding(.leading, 14)
             .overlay(alignment: .leading) {
@@ -668,31 +668,51 @@ private struct EventCard: View {
 
 private struct MarkdownText: View {
     let text: String
-    let parsesMarkdown: Bool
+    let streaming: Bool
 
-    init(_ text: String, parsesMarkdown: Bool) {
+    init(_ text: String, streaming: Bool) {
         self.text = text
-        self.parsesMarkdown = parsesMarkdown
+        self.streaming = streaming
     }
 
     var body: some View {
-        if parsesMarkdown {
-            MarkdownView(text.replacingOccurrences(
-                of: #"\\dots\b"#,
-                with: #"\\ldots"#,
-                options: .regularExpression
-            ))
-                #if os(iOS)
-                .markdownFontGroup(HorusMarkdownFonts())
-                #endif
-                .markdownMathRenderingEnabled()
-                .markdownTableStyle(.github)
-                .markdownBlockQuoteStyle(.github)
-                .markdownCodeBlockStyle(.default(lightTheme: "xcode", darkTheme: "dark"))
-                .textSelection(.enabled)
+        Group {
+            if streaming {
+                StreamingMarkdown(text: normalizedText)
+            } else {
+                MarkdownView(normalizedText)
+            }
+        }
+            #if os(iOS)
+            .markdownFontGroup(HorusMarkdownFonts())
+            #endif
+            .markdownMathRenderingEnabled()
+            .markdownTableStyle(.github)
+            .markdownBlockQuoteStyle(.github)
+            .markdownCodeBlockStyle(.default(lightTheme: "xcode", darkTheme: "dark"))
+            .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            Text(text).textSelection(.enabled)
+    }
+
+    private var normalizedText: String {
+        text.replacingOccurrences(
+            of: #"\\dots\b"#,
+            with: #"\\ldots"#,
+            options: .regularExpression
+        )
+    }
+}
+
+private struct StreamingMarkdown: View {
+    @State private var source = StreamingMarkdownSource()
+    let text: String
+
+    var body: some View {
+        StreamingMarkdownReader(source) { parseResult in
+            MarkdownView(parseResult)
+        }
+        .onChange(of: text, initial: true) { _, text in
+            source.text = text
         }
     }
 }
