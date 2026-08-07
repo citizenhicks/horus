@@ -207,7 +207,9 @@ private struct TranscriptView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
+            // ponytail: chat rows have wildly different heights, so exact layout avoids the
+            // blank gaps produced by LazyVStack estimates. Paginate before making this lazy again.
+            VStack(alignment: .leading, spacing: 0) {
                 ForEach(rows, id: \.entry.id) { row in
                     TranscriptRow(entry: row.entry)
                         .id(row.entry.id)

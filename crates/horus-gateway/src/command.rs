@@ -762,6 +762,7 @@ async fn start_background_gateway(
         .arg("__serve")
         .arg("--state-dir")
         .arg(&state_dir)
+        .current_dir(&state_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log.reopen()?));
