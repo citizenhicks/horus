@@ -439,12 +439,11 @@ private struct ChatOptionsMenu: View {
                 }
                 Button(action: model.showInspector) {
                     HorusPlatformMenuLabel(
-                        title: "Open code diff",
+                        title: "Open viewer",
                         glyph: .fileMagnifyingGlass,
                         systemImage: "doc.text.magnifyingglass"
                     )
                 }
-                .disabled(model.gitDiff.isEmpty)
                 if let path = model.workspace?.path {
                     Button { copyToPasteboard(path) } label: {
                         HorusPlatformMenuLabel(
@@ -1136,6 +1135,7 @@ private struct ComposerSurface: View {
             )
             .textFieldStyle(.plain)
             .lineLimit(1...)
+            .scrollDismissesKeyboard(.interactively)
             .font(HorusStyle.bodyFont)
             .accessibilityLabel("Message")
             #if os(iOS)
