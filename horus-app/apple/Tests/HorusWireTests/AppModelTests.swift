@@ -89,6 +89,18 @@ final class AppModelTests: XCTestCase {
         )
     }
 
+    private func fileAttachmentContribution() -> FrontendContribution {
+        FrontendContribution(
+            capability: "files",
+            acceptsFileAttachments: true,
+            count: nil,
+            commands: [],
+            widgets: [],
+            references: [],
+            activeInput: nil
+        )
+    }
+
     private func sessionReady(
         latestSequence: UInt64,
         replayEpoch: String = "epoch-1",
@@ -765,7 +777,7 @@ final class AppModelTests: XCTestCase {
             model: "gpt-5.6-sol",
             reasoningEffort: "high",
             contextWindow: 200_000,
-            supportsAttachmentInput: true
+            supportsImageInput: true
         )
         model.modelChoices = [capableChoice]
         let attachmentContribution = FrontendContribution(
@@ -876,11 +888,12 @@ final class AppModelTests: XCTestCase {
             model: "text-only",
             reasoningEffort: nil,
             contextWindow: 200_000,
-            supportsAttachmentInput: false
+            supportsImageInput: false
         )]
+        XCTAssertTrue(model.canImportAttachments)
         XCTAssertFalse(model.canSendComposer)
         model.sendMessage()
-        XCTAssertEqual(model.toast?.message, "The selected model does not accept attachments.")
+        XCTAssertEqual(model.toast?.message, "The selected model does not accept image attachments.")
         model.modelChoices = [capableChoice]
 
         model.sendMessage()
@@ -914,6 +927,145 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.transcript.last?.attachments, [attachment])
     }
 
+    func testNonImageAttachmentSubmitsWithoutImageModelSupport() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.selectedModelRoute = "text-only"
+        model.modelChoices = [ModelChoice(
+            route: "text-only",
+            group: "OpenAI",
+            model: "text-only",
+            reasoningEffort: nil,
+            contextWindow: 200_000,
+            supportsImageInput: false
+        )]
+        model.contributions = [fileAttachmentContribution()]
+        let attachment = AttachmentRecord(
+            id: "file-1",
+            name: "notes.txt",
+            size: 3,
+            mediaType: "text/plain"
+        )
+        model.composerAttachments = [ComposerAttachment(
+            id: UUID(),
+            name: attachment.name,
+            size: attachment.size,
+            mediaType: attachment.mediaType,
+            state: .uploaded(attachment)
+        )]
+
+        XCTAssertTrue(model.canImportAttachments)
+        XCTAssertTrue(model.canSendComposer)
+        model.sendMessage()
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        let submission = try XCTUnwrap(requests.compactMap { request -> Submission? in
+            guard case .submit(_, let submission) = request else { return nil }
+            return submission
+        }.last)
+        guard case .userInput(_, let attachments) = submission.op else {
+            return XCTFail("Expected attachment submission")
+        }
+        XCTAssertEqual(attachments, [attachment])
+    }
+
+    func testAttachmentUploadRejectsKnownResponseWithWrongPhase() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.contributions = [fileAttachmentContribution()]
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("bin")
+        try Data([1, 2, 3]).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        await model.importAttachments([fileURL])
+        try await Task.sleep(for: .milliseconds(20))
+        let requests = await recorder.requests()
+        guard let begin = requests.last(where: {
+            if case .beginAttachmentUpload = $0 { return true }
+            return false
+        }), case .beginAttachmentUpload(let beginID, _, _, _, _) = begin
+        else { return XCTFail("Expected attachment upload start") }
+
+        model.handle(.attachmentChunkAccepted(
+            requestID: beginID,
+            sessionID: "chat-1",
+            uploadID: "upload-1",
+            nextOffset: 0
+        ))
+
+        let item = try XCTUnwrap(model.composerAttachments.first)
+        guard case .failed(let message) = item.state else {
+            return XCTFail("Expected invalid upload to fail")
+        }
+        XCTAssertEqual(message, "The gateway returned an invalid upload.")
+    }
+
+    func testAttachmentUploadRejectsUnexpectedAcknowledgedOffset() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.contributions = [fileAttachmentContribution()]
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("bin")
+        try Data([1, 2, 3]).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        await model.importAttachments([fileURL])
+        try await Task.sleep(for: .milliseconds(20))
+        let initialRequests = await recorder.requests()
+        guard let begin = initialRequests.last(where: {
+            if case .beginAttachmentUpload = $0 { return true }
+            return false
+        }), case .beginAttachmentUpload(let beginID, _, _, _, _) = begin
+        else { return XCTFail("Expected attachment upload start") }
+        model.handle(.attachmentUploadStarted(
+            requestID: beginID,
+            sessionID: "chat-1",
+            uploadID: "upload-1",
+            maxChunkBytes: 2
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+        let afterStart = await recorder.requests()
+        guard let chunk = afterStart.last(where: {
+            if case .appendAttachmentChunk = $0 { return true }
+            return false
+        }), case .appendAttachmentChunk(let chunkID, _, _, _, _) = chunk
+        else { return XCTFail("Expected attachment chunk") }
+
+        model.handle(.attachmentChunkAccepted(
+            requestID: chunkID,
+            sessionID: "chat-1",
+            uploadID: "upload-1",
+            nextOffset: 1
+        ))
+
+        let item = try XCTUnwrap(model.composerAttachments.first)
+        guard case .failed(let message) = item.state else {
+            return XCTFail("Expected invalid offset to fail")
+        }
+        XCTAssertEqual(message, "The gateway returned an invalid upload offset.")
+        let finalRequests = await recorder.requests()
+        XCTAssertEqual(finalRequests.filter {
+            if case .appendAttachmentChunk = $0 { return true }
+            return false
+        }.count, 1)
+    }
+
     func testAttachmentMessageLimitIncludesUploadedFiles() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
@@ -928,7 +1080,7 @@ final class AppModelTests: XCTestCase {
             model: "gpt-5.6-sol",
             reasoningEffort: "high",
             contextWindow: 200_000,
-            supportsAttachmentInput: true
+            supportsImageInput: true
         )]
         model.contributions = [FrontendContribution(
             capability: "files",
@@ -1616,7 +1768,7 @@ final class AppModelTests: XCTestCase {
             model: target.model,
             reasoningEffort: target.reasoningEffort,
             contextWindow: 1_048_576,
-            supportsAttachmentInput: true
+            supportsImageInput: true
         )
         let original = composition()
         model.agentSnapshot = VersionedAgentConfig(revision: 1, config: original)

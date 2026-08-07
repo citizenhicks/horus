@@ -1,12 +1,13 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::time::Duration;
 
+use crate::sandbox::GatewaySandbox;
 use crate::wire::WorkspaceFileRecord;
 
 use super::Rejection;
 
 pub(super) const MAX_WORKSPACE_READ_BYTES: usize = 256 * 1024;
-const MAX_WORKSPACE_FILES: usize = 10_000;
+const MAX_WORKSPACE_FILES: usize = 20_000;
 const MAX_WORKSPACE_DIRECTORIES: usize = 10_000;
 const MAX_WORKSPACE_PATH_BYTES: usize = 1024 * 1024;
 const FILE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -17,15 +18,16 @@ pub(crate) struct WorkspaceRead {
 }
 
 pub(super) async fn list(
+    sandbox: &GatewaySandbox,
     workspace: &Path,
 ) -> std::result::Result<Vec<WorkspaceFileRecord>, Rejection> {
-    tokio::time::timeout(FILE_TIMEOUT, list_inner(workspace))
+    tokio::time::timeout(FILE_TIMEOUT, list_inner(sandbox, workspace))
         .await
         .map_err(|_| timeout())?
 }
 
 pub(super) async fn read(
-    workspace: &Path,
+    sandbox: &GatewaySandbox,
     path: &str,
     offset: u64,
     max_bytes: usize,
@@ -35,35 +37,86 @@ pub(super) async fn read(
             "workspace read size must be 1–{MAX_WORKSPACE_READ_BYTES} bytes"
         )));
     }
-    let relative = validate_relative(path)?;
-    let (canonical, size) = resolve_regular(workspace, relative).await?;
-    if offset > size {
-        return Err(invalid("workspace file offset exceeds its size"));
-    }
-    let mut file = tokio::fs::File::open(canonical)
+    validate_relative(path)?;
+    let (data, next_offset) = sandbox
+        .read_workspace_range(path, offset, max_bytes)
         .await
         .map_err(error_rejection)?;
-    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
-    file.seek(std::io::SeekFrom::Start(offset))
-        .await
-        .map_err(error_rejection)?;
-    let length = usize::try_from(size.saturating_sub(offset).min(max_bytes as u64))
-        .map_err(|_| invalid("workspace file range is unsupported"))?;
-    let mut data = vec![0; length];
-    file.read_exact(&mut data).await.map_err(error_rejection)?;
-    let end = offset.saturating_add(length as u64);
-    Ok(WorkspaceRead {
-        data,
-        next_offset: (end < size).then_some(end),
-    })
+    Ok(WorkspaceRead { data, next_offset })
 }
 
-async fn list_inner(workspace: &Path) -> std::result::Result<Vec<WorkspaceFileRecord>, Rejection> {
+async fn list_inner(
+    sandbox: &GatewaySandbox,
+    workspace: &Path,
+) -> std::result::Result<Vec<WorkspaceFileRecord>, Rejection> {
+    let output = sandbox
+        .execute_git(&[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ])
+        .await
+        .map_err(error_rejection)?;
+    if output.exit_code == 0 {
+        let workspace = workspace.to_path_buf();
+        return tokio::task::spawn_blocking(move || {
+            git_workspace_files(&workspace, &output.stdout)
+        })
+        .await
+        .map_err(error_rejection)?;
+    }
+    if !output.stderr.contains("not a git repository") {
+        return Err(error_rejection(format!(
+            "listing Git workspace files failed: {}",
+            output.stderr.trim()
+        )));
+    }
     let workspace = workspace.to_path_buf();
     let mut files = tokio::task::spawn_blocking(move || walk_workspace(&workspace))
         .await
         .map_err(error_rejection)??;
     files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+fn git_workspace_files(
+    workspace: &Path,
+    output: &str,
+) -> std::result::Result<Vec<WorkspaceFileRecord>, Rejection> {
+    if !output.is_empty() && !output.ends_with('\0') {
+        return Err(invalid(
+            "Git workspace file output is truncated or malformed",
+        ));
+    }
+    let mut files = Vec::new();
+    let mut path_bytes = 0_usize;
+    for path in output.split_terminator('\0') {
+        let relative = validate_relative(path)?;
+        let metadata = match std::fs::symlink_metadata(workspace.join(relative)) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error_rejection(error)),
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        path_bytes = path_bytes.saturating_add(path.len());
+        if path_bytes > MAX_WORKSPACE_PATH_BYTES {
+            return Err(limit());
+        }
+        files.push(WorkspaceFileRecord {
+            path: path.into(),
+            size: metadata.len(),
+        });
+        if files.len() > MAX_WORKSPACE_FILES {
+            return Err(limit());
+        }
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files.dedup_by(|left, right| left.path == right.path);
     Ok(files)
 }
 
@@ -143,39 +196,6 @@ fn validate_relative(path: &str) -> std::result::Result<&Path, Rejection> {
     Ok(relative)
 }
 
-async fn resolve_regular(
-    workspace: &Path,
-    relative: &Path,
-) -> std::result::Result<(PathBuf, u64), Rejection> {
-    let candidate = workspace.join(relative);
-    let metadata = match tokio::fs::symlink_metadata(&candidate).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Rejection {
-                code: "workspace_file_missing",
-                message: "workspace file no longer exists".into(),
-                fatal: false,
-            });
-        }
-        Err(error) => return Err(error_rejection(error)),
-    };
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(invalid("workspace path is not a regular file"));
-    }
-    let root = tokio::fs::canonicalize(workspace)
-        .await
-        .map_err(error_rejection)?;
-    let canonical = tokio::fs::canonicalize(candidate)
-        .await
-        .map_err(error_rejection)?;
-    if !canonical.starts_with(&root) {
-        return Err(invalid(
-            "workspace file resolves outside the selected workspace",
-        ));
-    }
-    Ok((canonical, metadata.len()))
-}
-
 fn invalid(message: impl Into<String>) -> Rejection {
     Rejection {
         code: "invalid_workspace_file",
@@ -212,11 +232,19 @@ fn limit() -> Rejection {
 mod tests {
     use super::*;
 
+    fn sandbox(workspace: &Path) -> (tempfile::TempDir, GatewaySandbox) {
+        let state = tempfile::tempdir().expect("state");
+        let sandbox = GatewaySandbox::new(workspace, state.path(), None, Duration::from_secs(5))
+            .expect("gateway sandbox");
+        (state, sandbox)
+    }
+
     #[tokio::test]
     async fn read_rejects_parent_traversal() {
         let workspace = tempfile::tempdir().expect("workspace");
+        let (_state, sandbox) = sandbox(workspace.path());
 
-        let result = read(workspace.path(), "../outside", 0, 16).await;
+        let result = read(&sandbox, "../outside", 0, 16).await;
 
         assert!(matches!(
             result,
@@ -228,19 +256,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_includes_ignored_files_but_excludes_git_internals() {
+    async fn git_catalog_excludes_ignored_directories_and_git_internals() {
         let workspace = tempfile::tempdir().expect("workspace");
-        std::fs::create_dir(workspace.path().join(".git")).expect("git directory");
-        std::fs::write(workspace.path().join(".git/config"), b"secret").expect("git config");
-        std::fs::write(workspace.path().join(".gitignore"), b"ignored.txt\n")
-            .expect("ignore rules");
-        std::fs::write(workspace.path().join("ignored.txt"), b"included").expect("ignored file");
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(workspace.path())
+            .status()
+            .expect("initialize Git repository");
+        assert!(status.success());
+        std::fs::write(workspace.path().join(".gitignore"), b"ignored/\n").expect("ignore rules");
+        std::fs::create_dir(workspace.path().join("ignored")).expect("ignored directory");
+        std::fs::write(workspace.path().join("ignored/generated.txt"), b"ignored")
+            .expect("ignored file");
+        std::fs::write(workspace.path().join("included.txt"), b"included").expect("included file");
+        let (_state, sandbox) = sandbox(workspace.path());
 
-        let files = list(workspace.path()).await.expect("workspace files");
+        let files = list(&sandbox, workspace.path())
+            .await
+            .expect("workspace files");
 
         assert!(files.iter().any(|file| file.path == ".gitignore"));
-        assert!(files.iter().any(|file| file.path == "ignored.txt"));
+        assert!(files.iter().any(|file| file.path == "included.txt"));
+        assert!(files.iter().all(|file| !file.path.starts_with("ignored/")));
         assert!(files.iter().all(|file| !file.path.starts_with(".git/")));
-        assert!(read(workspace.path(), ".git/config", 0, 16).await.is_err());
+        assert!(read(&sandbox, ".git/config", 0, 16).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn non_git_catalog_falls_back_to_the_bounded_walk() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(workspace.path().join("nested")).expect("nested directory");
+        std::fs::write(workspace.path().join("nested/file.txt"), b"included")
+            .expect("included file");
+        let (_state, sandbox) = sandbox(workspace.path());
+
+        let files = list(&sandbox, workspace.path())
+            .await
+            .expect("workspace files");
+
+        assert!(files.iter().any(|file| file.path == "nested/file.txt"));
+    }
+
+    #[test]
+    fn git_catalog_rejects_non_terminated_output() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("file.txt"), b"file").expect("file");
+
+        assert!(git_workspace_files(workspace.path(), "file.txt").is_err());
     }
 }

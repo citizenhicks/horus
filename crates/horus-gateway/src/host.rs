@@ -122,6 +122,7 @@ struct HostState {
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     scratchpad: ScratchpadStore,
+    attachments: AttachmentStore,
     accepts_file_attachments: Arc<AtomicBool>,
     catalog_lock: Arc<Mutex<()>>,
     activities: SessionActivities,
@@ -330,6 +331,7 @@ impl GatewayHost {
             Arc::clone(&state.cron),
             Arc::clone(&state.checkpoints),
             state.scratchpad.clone(),
+            state.attachments.clone(),
             Arc::clone(&state.catalog_lock),
             Arc::clone(&state.activities),
             self.events.clone(),
@@ -384,6 +386,7 @@ impl GatewayHost {
             Arc::clone(&state.cron),
             Arc::clone(&state.checkpoints),
             state.scratchpad.clone(),
+            state.attachments.clone(),
             Arc::clone(&state.catalog_lock),
             Arc::clone(&state.activities),
             self.events.clone(),
@@ -482,6 +485,7 @@ impl GatewayHost {
             Arc::clone(&state.cron),
             Arc::clone(&state.checkpoints),
             state.scratchpad.clone(),
+            state.attachments.clone(),
             Arc::clone(&state.catalog_lock),
             Arc::clone(&state.activities),
             self.events.clone(),
@@ -610,6 +614,7 @@ impl HostHandle {
         cron: Arc<CronStore>,
         checkpoints: Arc<dyn CheckpointStore>,
         scratchpad: ScratchpadStore,
+        attachments: AttachmentStore,
         catalog_lock: Arc<Mutex<()>>,
         activities: SessionActivities,
         gateway_events: broadcast::Sender<ServerFrame>,
@@ -628,6 +633,7 @@ impl HostHandle {
             Arc::clone(&cron),
             Arc::clone(&checkpoints),
             scratchpad.clone(),
+            attachments.clone(),
             session_id.clone(),
             origin_label,
             false,
@@ -651,6 +657,7 @@ impl HostHandle {
             cron,
             checkpoints,
             scratchpad,
+            attachments,
             accepts_file_attachments: Arc::clone(&accepts_file_attachments),
             catalog_lock,
             activities,
@@ -1064,7 +1071,9 @@ impl HostState {
                 );
             }
             HostCommand::WorkspaceFiles { reply } => {
-                let _ = reply.send(list_workspace_files(&self.spec.workspace).await);
+                let _ = reply.send(
+                    list_workspace_files(&self.running.gateway_sandbox, &self.spec.workspace).await,
+                );
             }
             HostCommand::ReadWorkspaceFile {
                 path,
@@ -1073,7 +1082,8 @@ impl HostState {
                 reply,
             } => {
                 let _ = reply.send(
-                    read_workspace_file(&self.spec.workspace, &path, offset, max_bytes).await,
+                    read_workspace_file(&self.running.gateway_sandbox, &path, offset, max_bytes)
+                        .await,
                 );
             }
             HostCommand::SwitchGitBranch { branch, reply } => {
@@ -1412,6 +1422,7 @@ impl HostState {
             Arc::clone(&self.cron),
             Arc::clone(&self.checkpoints),
             self.scratchpad.clone(),
+            self.attachments.clone(),
             session_id,
             "horus-gateway",
             true,
@@ -1493,6 +1504,7 @@ impl HostState {
             Arc::clone(&self.cron),
             Arc::clone(&self.checkpoints),
             self.scratchpad.clone(),
+            self.attachments.clone(),
             self.running.session_id.clone(),
             origin_label,
             false,
@@ -2192,6 +2204,7 @@ async fn start_agent(
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     scratchpad: ScratchpadStore,
+    attachments: AttachmentStore,
     session_id: String,
     origin_label: &str,
     override_saved_model_route: bool,
@@ -2208,6 +2221,7 @@ async fn start_agent(
         cron,
         checkpoints,
         scratchpad,
+        attachments,
         Some(session_id),
         origin_label,
         override_saved_model_route,

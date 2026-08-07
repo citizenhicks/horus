@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 16
+let gatewayProtocolVersion = 17
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 let maximumAttachmentReferences = 16
@@ -1139,7 +1139,7 @@ enum SessionOutcome: String, Codable, Hashable, Sendable {
 
 struct ModelChoice: Identifiable, Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
-        case route, group, model, reasoningEffort, contextWindow, supportsAttachmentInput
+        case route, group, model, reasoningEffort, contextWindow, supportsImageInput
     }
 
     var id: String { route }
@@ -1149,7 +1149,7 @@ struct ModelChoice: Identifiable, Codable, Hashable, Sendable {
     let model: String
     let reasoningEffort: String?
     let contextWindow: Int64?
-    let supportsAttachmentInput: Bool
+    let supportsImageInput: Bool
 
     init(
         route: String,
@@ -1157,14 +1157,14 @@ struct ModelChoice: Identifiable, Codable, Hashable, Sendable {
         model: String,
         reasoningEffort: String?,
         contextWindow: Int64?,
-        supportsAttachmentInput: Bool
+        supportsImageInput: Bool
     ) {
         self.route = route
         self.group = group
         self.model = model
         self.reasoningEffort = reasoningEffort
         self.contextWindow = contextWindow
-        self.supportsAttachmentInput = supportsAttachmentInput
+        self.supportsImageInput = supportsImageInput
     }
 
     init(from decoder: Decoder) throws {
@@ -1175,9 +1175,9 @@ struct ModelChoice: Identifiable, Codable, Hashable, Sendable {
             model: try container.decode(String.self, forKey: .model),
             reasoningEffort: try container.decodeIfPresent(String.self, forKey: .reasoningEffort),
             contextWindow: try container.decodeIfPresent(Int64.self, forKey: .contextWindow),
-            supportsAttachmentInput: try container.decode(
+            supportsImageInput: try container.decode(
                 Bool.self,
-                forKey: .supportsAttachmentInput
+                forKey: .supportsImageInput
             )
         )
     }

@@ -292,7 +292,7 @@ mod tests {
             model: "model".into(),
             reasoning_effort: Some("high".into()),
             context_window: Some(200_000),
-            supports_attachment_input: true,
+            supports_image_input: true,
         }];
         let subagents = features(&models)
             .into_iter()

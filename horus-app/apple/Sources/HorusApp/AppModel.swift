@@ -103,8 +103,14 @@ private struct PendingComposerDraft {
 
 private enum AttachmentUploadRequest {
     case begin(localID: UUID)
-    case append(localID: UUID)
+    case append(localID: UUID, expectedNextOffset: Int64)
     case finish(localID: UUID)
+
+    var localID: UUID {
+        switch self {
+        case .begin(let localID), .append(let localID, _), .finish(let localID): localID
+        }
+    }
 }
 
 private struct ActiveAttachmentUpload {
@@ -637,23 +643,26 @@ final class AppModel {
         contributions.contains { $0.acceptsFileAttachments }
     }
 
-    var selectedRouteSupportsAttachmentInput: Bool {
+    var selectedRouteSupportsImageInput: Bool {
         modelChoices.first(where: { $0.route == selectedModelRoute })?
-            .supportsAttachmentInput == true
+            .supportsImageInput == true
     }
 
     var canSubmitAttachments: Bool {
-        attachmentsEnabled && selectedRouteSupportsAttachmentInput
+        attachmentsEnabled
+            && (selectedRouteSupportsImageInput || !uploadedComposerAttachments.contains {
+                $0.mediaType.hasPrefix("image/")
+            })
     }
 
     var attachmentSubmissionUnavailableMessage: String {
         attachmentsEnabled
-            ? "The selected model does not accept attachments."
+            ? "The selected model does not accept image attachments."
             : "File attachments are not enabled for this chat."
     }
 
     var canImportAttachments: Bool {
-        canSubmitAttachments
+        attachmentsEnabled
             && connectionState.isReady
             && selectedSessionID != nil
             && activeTurnID == nil
@@ -661,12 +670,16 @@ final class AppModel {
 
     var canSendComposer: Bool {
         let hasText = !composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let uploaded = composerAttachments.compactMap { item -> AttachmentRecord? in
+        let uploaded = uploadedComposerAttachments
+        guard uploaded.isEmpty || canSubmitAttachments else { return false }
+        return hasText || !uploaded.isEmpty
+    }
+
+    private var uploadedComposerAttachments: [AttachmentRecord] {
+        composerAttachments.compactMap { item in
             guard case .uploaded(let attachment) = item.state else { return nil }
             return attachment
         }
-        guard uploaded.isEmpty || canSubmitAttachments else { return false }
-        return hasText || !uploaded.isEmpty
     }
 
     var composerHasUnfinishedAttachments: Bool {
@@ -1337,10 +1350,7 @@ final class AppModel {
     func sendMessage() {
         guard let sessionID = selectedSessionID else { return }
         let text = composer.trimmingCharacters(in: .whitespacesAndNewlines)
-        let attachments = composerAttachments.compactMap { item -> AttachmentRecord? in
-            guard case .uploaded(let attachment) = item.state else { return nil }
-            return attachment
-        }
+        let attachments = uploadedComposerAttachments
         guard attachments.count <= maximumAttachmentReferences else { return }
         guard !text.isEmpty || !attachments.isEmpty else { return }
         guard attachments.isEmpty || canSubmitAttachments else {
@@ -1453,6 +1463,10 @@ final class AppModel {
         provider.reasoningEffort = choice.reasoningEffort
         draft.provider = provider
         agentDraft = draft
+    }
+
+    func providerSymbol(for choice: ModelChoice) -> String? {
+        providerStatus(for: choice)?.symbol
     }
 
     private func providerStatus(for choice: ModelChoice) -> ProviderStatus? {
@@ -3073,13 +3087,16 @@ final class AppModel {
         uploadID: String,
         maxChunkBytes: Int
     ) {
-        guard case .begin(let localID) = attachmentUploadRequests.removeValue(forKey: requestID)
-        else { return }
+        guard let request = attachmentUploadRequests[requestID] else { return }
+        guard case .begin(let localID) = request else {
+            return failAttachment(request.localID, message: "The gateway returned an invalid upload.")
+        }
         guard sessionID == selectedSessionID,
               !uploadID.isEmpty,
               maxChunkBytes > 0,
               maxChunkBytes <= maximumGatewayFrameBytes
         else { return failAttachment(localID, message: "The gateway returned an invalid upload.") }
+        attachmentUploadRequests.removeValue(forKey: requestID)
         activeAttachmentUpload = ActiveAttachmentUpload(
             localID: localID,
             sessionID: sessionID,
@@ -3095,8 +3112,10 @@ final class AppModel {
         uploadID: String,
         nextOffset: Int64
     ) {
-        guard case .append(let localID) = attachmentUploadRequests.removeValue(forKey: requestID)
-        else { return }
+        guard let request = attachmentUploadRequests[requestID] else { return }
+        guard case .append(let localID, let expectedNextOffset) = request else {
+            return failAttachment(request.localID, message: "The gateway returned an invalid upload.")
+        }
         guard let upload = activeAttachmentUpload,
               upload.localID == localID,
               upload.sessionID == sessionID,
@@ -3104,6 +3123,10 @@ final class AppModel {
         else {
             return failAttachment(localID, message: "The gateway returned an invalid upload.")
         }
+        guard nextOffset == expectedNextOffset else {
+            return failAttachment(localID, message: "The gateway returned an invalid upload offset.")
+        }
+        attachmentUploadRequests.removeValue(forKey: requestID)
         sendNextAttachmentChunk(localID: localID, offset: nextOffset)
     }
 
@@ -3133,7 +3156,10 @@ final class AppModel {
 
         let end = min(start + upload.maxChunkBytes, data.count)
         let id = requestID("attachment-chunk")
-        attachmentUploadRequests[id] = .append(localID: localID)
+        attachmentUploadRequests[id] = .append(
+            localID: localID,
+            expectedNextOffset: Int64(end)
+        )
         transmit(.appendAttachmentChunk(
             requestID: id,
             sessionID: upload.sessionID,
@@ -3150,8 +3176,10 @@ final class AppModel {
         sessionID: String,
         attachment: AttachmentRecord
     ) {
-        guard case .finish(let localID) = attachmentUploadRequests.removeValue(forKey: requestID)
-        else { return }
+        guard let request = attachmentUploadRequests[requestID] else { return }
+        guard case .finish(let localID) = request else {
+            return failAttachment(request.localID, message: "The gateway returned an invalid attachment.")
+        }
         guard sessionID == selectedSessionID,
               activeAttachmentUpload?.localID == localID,
               activeAttachmentUpload?.sessionID == sessionID,
@@ -3162,6 +3190,7 @@ final class AppModel {
         else {
             return failAttachment(localID, message: "The gateway returned an invalid attachment.")
         }
+        attachmentUploadRequests.removeValue(forKey: requestID)
         composerAttachments[index].state = .uploaded(attachment)
         attachmentData[localID] = nil
         activeAttachmentUpload = nil
@@ -3178,10 +3207,7 @@ final class AppModel {
         guard let request = attachmentUploadRequests.removeValue(forKey: requestID) else {
             return false
         }
-        let localID = switch request {
-        case .begin(let localID), .append(let localID), .finish(let localID): localID
-        }
-        failAttachment(localID, message: message, showsToast: showsToast)
+        failAttachment(request.localID, message: message, showsToast: showsToast)
         return true
     }
 
@@ -3191,9 +3217,7 @@ final class AppModel {
         showsToast: Bool = true
     ) {
         attachmentUploadRequests = attachmentUploadRequests.filter { _, request in
-            switch request {
-            case .begin(let id), .append(let id), .finish(let id): id != localID
-            }
+            request.localID != localID
         }
         if activeAttachmentUpload?.localID == localID { activeAttachmentUpload = nil }
         if let index = composerAttachments.firstIndex(where: { $0.id == localID }) {

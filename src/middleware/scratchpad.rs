@@ -403,7 +403,10 @@ impl Middleware for Scratchpad {
         })
     }
 
-    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn decorate_model_request<'a>(
+        &'a self,
+        context: &'a mut ModelContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let snapshot = self.store.snapshot(context.session_id).await?;
             if let Some(input) = refreshed_input(context.request_input(), &snapshot) {

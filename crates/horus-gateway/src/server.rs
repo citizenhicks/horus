@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
+use horus::agent::validate_submission;
 use horus::middleware::attachments::{AttachmentStore, MAX_UPLOAD_CHUNK_BYTES, PendingAttachment};
 use horus::protocol::Op;
 use rustls::ServerConfig;
@@ -915,6 +916,18 @@ async fn handle_message(
                 Ok(host) => host,
                 Err(rejection) => return write_rejection(writer, request_id, rejection).await,
             };
+            if let Err(error) = validate_submission(&submission) {
+                return write_rejection(
+                    writer,
+                    request_id,
+                    Rejection {
+                        code: "invalid_submission",
+                        message: error.to_string(),
+                        fatal: false,
+                    },
+                )
+                .await;
+            }
             if let Op::UserInput {
                 attachments: references,
                 ..
@@ -984,10 +997,11 @@ async fn handle_message(
             offset,
             data,
         } => {
+            let key = (session_id.clone(), upload_id.clone());
             if let Err(rejection) = require_attachments_enabled(selected, &session_id) {
+                uploads.remove(&key);
                 return write_rejection(writer, request_id, rejection).await;
             }
-            let key = (session_id.clone(), upload_id.clone());
             let Some(upload) = uploads.get_mut(&key) else {
                 return write_rejection(
                     writer,
@@ -996,7 +1010,8 @@ async fn handle_message(
                 )
                 .await;
             };
-            match upload.append(offset, &data).await {
+            let result = upload.append(offset, &data).await;
+            match result {
                 Ok(next_offset) => {
                     write_frame(
                         writer,
@@ -1010,6 +1025,7 @@ async fn handle_message(
                     .await
                 }
                 Err(error) => {
+                    uploads.remove(&key);
                     write_rejection(writer, request_id, attachment_rejection(error)).await
                 }
             }
@@ -1019,10 +1035,12 @@ async fn handle_message(
             session_id,
             upload_id,
         } => {
+            let key = (session_id.clone(), upload_id);
             if let Err(rejection) = require_attachments_enabled(selected, &session_id) {
+                uploads.remove(&key);
                 return write_rejection(writer, request_id, rejection).await;
             }
-            let Some(upload) = uploads.remove(&(session_id.clone(), upload_id)) else {
+            let Some(upload) = uploads.remove(&key) else {
                 return write_rejection(
                     writer,
                     request_id,
@@ -1773,7 +1791,7 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use futures_util::SinkExt as _;
-    use horus::protocol::{EventMsg, Op, Submission};
+    use horus::protocol::{AttachmentReference, EventMsg, Op, Submission};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::protocol::Message;
@@ -2244,6 +2262,183 @@ mod tests {
                     panic!("attachment configuration rejected ({code}): {message}")
                 }
                 _ => {}
+            }
+        }
+
+        let missing = AttachmentReference {
+            id: Uuid::new_v4().to_string(),
+            name: "missing.txt".into(),
+            size: 1,
+            media_type: "text/plain".into(),
+        };
+        sender
+            .send(ClientMessage::Submit {
+                session_id: session_id.clone(),
+                submission: Submission {
+                    id: "invalid-duplicate-attachments".into(),
+                    op: Op::UserInput {
+                        text: "invalid".into(),
+                        attachments: vec![missing.clone(), missing],
+                    },
+                },
+            })
+            .await
+            .expect("submit invalid attachment references");
+        loop {
+            if let ServerMessage::Rejected {
+                request_id,
+                code,
+                message,
+                ..
+            } = next_gateway_message(&mut events).await
+                && request_id == "invalid-duplicate-attachments"
+            {
+                assert_eq!(code, "invalid_submission");
+                assert!(message.contains("unique"));
+                break;
+            }
+        }
+
+        let other_session_id = create_chat(&sender, &mut events, &workspace).await;
+        for finish in [false, true] {
+            open_chat(&sender, &mut events, &session_id).await;
+            let begin_id = format!("begin-unselected-{finish}");
+            sender
+                .send(ClientMessage::BeginAttachmentUpload {
+                    request_id: begin_id.clone(),
+                    session_id: session_id.clone(),
+                    name: format!("unselected-{finish}.bin"),
+                    size: 1,
+                    media_type: "application/octet-stream".into(),
+                })
+                .await
+                .expect("begin upload before switching chat");
+            let upload_id = loop {
+                if let ServerMessage::AttachmentUploadStarted {
+                    request_id,
+                    upload_id,
+                    ..
+                } = next_gateway_message(&mut events).await
+                    && request_id == begin_id
+                {
+                    break upload_id;
+                }
+            };
+
+            open_chat(&sender, &mut events, &other_session_id).await;
+            let rejection_id = format!("reject-unselected-{finish}");
+            let request = if finish {
+                ClientMessage::FinishAttachmentUpload {
+                    request_id: rejection_id.clone(),
+                    session_id: session_id.clone(),
+                    upload_id: upload_id.clone(),
+                }
+            } else {
+                ClientMessage::AppendAttachmentChunk {
+                    request_id: rejection_id.clone(),
+                    session_id: session_id.clone(),
+                    upload_id: upload_id.clone(),
+                    offset: 0,
+                    data: vec![0],
+                }
+            };
+            sender
+                .send(request)
+                .await
+                .expect("reject upload for unselected chat");
+            loop {
+                if let ServerMessage::Rejected {
+                    request_id, code, ..
+                } = next_gateway_message(&mut events).await
+                    && request_id == rejection_id
+                {
+                    assert_eq!(code, "session_not_selected");
+                    break;
+                }
+            }
+
+            open_chat(&sender, &mut events, &session_id).await;
+            let retry_id = format!("retry-terminated-{finish}");
+            sender
+                .send(ClientMessage::FinishAttachmentUpload {
+                    request_id: retry_id.clone(),
+                    session_id: session_id.clone(),
+                    upload_id,
+                })
+                .await
+                .expect("retry terminated upload");
+            loop {
+                if let ServerMessage::Rejected {
+                    request_id,
+                    message,
+                    ..
+                } = next_gateway_message(&mut events).await
+                    && request_id == retry_id
+                {
+                    assert!(message.contains("not active"));
+                    break;
+                }
+            }
+        }
+
+        sender
+            .send(ClientMessage::BeginAttachmentUpload {
+                request_id: "begin-doomed-upload".into(),
+                session_id: session_id.clone(),
+                name: "doomed.bin".into(),
+                size: 1,
+                media_type: "application/octet-stream".into(),
+            })
+            .await
+            .expect("begin doomed upload");
+        let doomed_upload_id = loop {
+            if let ServerMessage::AttachmentUploadStarted {
+                request_id,
+                upload_id,
+                ..
+            } = next_gateway_message(&mut events).await
+                && request_id == "begin-doomed-upload"
+            {
+                break upload_id;
+            }
+        };
+        sender
+            .send(ClientMessage::AppendAttachmentChunk {
+                request_id: "reject-doomed-chunk".into(),
+                session_id: session_id.clone(),
+                upload_id: doomed_upload_id.clone(),
+                offset: 1,
+                data: vec![0],
+            })
+            .await
+            .expect("append invalid chunk");
+        loop {
+            if matches!(
+                next_gateway_message(&mut events).await,
+                ServerMessage::Rejected { request_id, .. }
+                    if request_id == "reject-doomed-chunk"
+            ) {
+                break;
+            }
+        }
+        sender
+            .send(ClientMessage::FinishAttachmentUpload {
+                request_id: "finish-doomed-upload".into(),
+                session_id: session_id.clone(),
+                upload_id: doomed_upload_id,
+            })
+            .await
+            .expect("finish terminated upload");
+        loop {
+            if let ServerMessage::Rejected {
+                request_id,
+                message,
+                ..
+            } = next_gateway_message(&mut events).await
+                && request_id == "finish-doomed-upload"
+            {
+                assert!(message.contains("not active"));
+                break;
             }
         }
 

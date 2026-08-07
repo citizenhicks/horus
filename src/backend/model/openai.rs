@@ -293,7 +293,7 @@ impl Model for OpenAi {
         }
     }
 
-    fn supports_attachment_input(&self) -> bool {
+    fn supports_image_input(&self) -> bool {
         self.image_input
     }
 
@@ -420,6 +420,7 @@ pub(super) const fn generic_provider() -> ProviderDefinition {
         SEARCH,
         build_generic,
     )
+    .with_image_input()
     .with_base_url(DEFAULT_BASE_URL)
 }
 

@@ -91,8 +91,10 @@ private struct WorkspaceFileList: View {
                 .buttonStyle(.horusPlain)
                 .disabled(model.isLoadingAttachmentPreview)
                 .accessibilityLabel("Open workspace file \(file.path)")
+                .inspectorFileListRow()
             }
             .listStyle(.plain)
+            .scrollContentBackground(.hidden)
         }
     }
 }
@@ -124,9 +126,28 @@ private struct UploadedFileList: View {
                 .buttonStyle(.horusPlain)
                 .disabled(model.isLoadingAttachmentPreview)
                 .accessibilityLabel("Open uploaded file \(attachment.name)")
+                .inspectorFileListRow()
             }
             .listStyle(.plain)
+            .scrollContentBackground(.hidden)
         }
+    }
+}
+
+private struct InspectorFileListRow: ViewModifier {
+    @Environment(\.horusPalette) private var palette
+
+    func body(content: Content) -> some View {
+        content
+            .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 12))
+            .listRowBackground(Color.clear)
+            .listRowSeparatorTint(palette.line)
+    }
+}
+
+extension View {
+    fileprivate func inspectorFileListRow() -> some View {
+        modifier(InspectorFileListRow())
     }
 }
 

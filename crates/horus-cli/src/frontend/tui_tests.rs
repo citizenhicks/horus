@@ -30,7 +30,7 @@ fn catalog(workspace: &std::path::Path) -> UiCatalog {
             model: "kimi-k3".into(),
             reasoning_effort: Some("high".into()),
             context_window: Some(1_048_576),
-            supports_attachment_input: true,
+            supports_image_input: true,
         }],
         workspace,
     )

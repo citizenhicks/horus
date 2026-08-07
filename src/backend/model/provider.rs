@@ -211,6 +211,7 @@ pub struct ProviderDefinition {
     auth: ProviderAuth,
     models: &'static [ModelPreset],
     web_search: &'static [HostedWebSearch],
+    supports_image_input: bool,
     default_base_url: Option<&'static str>,
     builder: ProviderBuilder,
 }
@@ -238,9 +239,17 @@ impl ProviderDefinition {
             auth,
             models,
             web_search,
+            supports_image_input: false,
             default_base_url: None,
             builder,
         }
+    }
+
+    /// Marks a provider whose model transport accepts native image input.
+    #[must_use]
+    pub(crate) const fn with_image_input(mut self) -> Self {
+        self.supports_image_input = true;
+        self
     }
 
     pub(crate) const fn with_base_url(mut self, default_base_url: &'static str) -> Self {
@@ -281,6 +290,12 @@ impl ProviderDefinition {
     #[must_use]
     pub const fn web_search(&self) -> &'static [HostedWebSearch] {
         self.web_search
+    }
+
+    /// Reports image capability before provider credentials are resolved.
+    #[must_use]
+    pub const fn supports_image_input(&self) -> bool {
+        self.supports_image_input
     }
 
     #[must_use]
@@ -472,6 +487,25 @@ mod tests {
                         .is_none_or(|default| reasoning_ids.contains(default))
                 );
             }
+        }
+    }
+
+    #[test]
+    fn provider_manifests_advertise_image_input_explicitly() {
+        assert!(
+            !provider("deepseek")
+                .expect("deepseek")
+                .supports_image_input()
+        );
+        for id in [
+            "openai_socket",
+            "openai_codex",
+            "kimi",
+            "openrouter",
+            "anthropic",
+            "responses",
+        ] {
+            assert!(provider(id).expect("image provider").supports_image_input());
         }
     }
 }

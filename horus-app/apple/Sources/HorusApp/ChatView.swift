@@ -925,8 +925,9 @@ private struct AttachmentRecordLabel: View {
             HorusIcon(.caretRight, size: 12, foreground: palette.muted)
         }
         .frame(maxWidth: 320, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 12)
         .background(palette.panel.opacity(0.72), in: HorusStyle.controlShape)
+        .overlay(HorusStyle.controlShape.stroke(palette.line, lineWidth: HorusStyle.borderWidth))
         .contentShape(Rectangle())
     }
 }
@@ -1213,15 +1214,16 @@ private struct ComposerSurface: View {
                 return .handled
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 12)
+            .padding(.top, 12)
+            .padding(.bottom, 4)
             #if os(iOS)
             ComposerOptionsView(dictation: dictation, selection: $selection)
-                .padding(.horizontal, 16)
-                .padding(.bottom, 12)
+                .padding(.horizontal, HorusStyle.iconRowPadding)
+                .padding(.bottom, HorusStyle.iconRowPadding)
             #else
             ComposerOptionsView()
-                .padding(.horizontal, 16)
-                .padding(.bottom, 12)
+                .padding(.horizontal, HorusStyle.iconRowPadding)
+                .padding(.bottom, HorusStyle.iconRowPadding)
             #endif
         }
         .horusGlass(in: HorusStyle.cardShape, interactive: true)
@@ -1488,19 +1490,21 @@ private struct ComposerOptionsView: View {
     @State private var isFileImporterPresented = false
 
     var body: some View {
-        HStack(spacing: 8) {
+        // The icon buttons already pad their own glyphs, so they need no spacing between
+        // them: 44pt centres are the native rhythm, and anything more reads as drift.
+        HStack(spacing: 0) {
             if model.attachmentsEnabled {
                 Button("Add files", glyph: .plus) {
                     isFileImporterPresented = true
                 }
                 .labelStyle(.iconOnly)
-                .buttonStyle(HorusIconButtonStyle())
+                .buttonStyle(HorusIconButtonStyle(bare: true))
                 .disabled(!model.canImportAttachments)
-                .help(addFilesHelp)
+                .help("Add files")
             }
-            modelMenu
             approvalMenu
-            Spacer()
+            Spacer(minLength: 8)
+            modelMenu
             actionButtons
         }
         .fileImporter(
@@ -1516,7 +1520,11 @@ private struct ComposerOptionsView: View {
             Section("Model") { modelMenuContent }
             Section("Reasoning") { reasoningMenuContent }
         } label: {
-            HorusMenuLabel(text: modelLabel)
+            HorusMenuLabel(
+                text: currentChoice?.model ?? "Model",
+                glyph: providerGlyph,
+                detail: currentChoice?.reasoningEffort?.capitalized
+            )
                 .frame(minHeight: HorusStyle.iconButtonSize)
                 .contentShape(Rectangle())
         }
@@ -1624,14 +1632,14 @@ private struct ComposerOptionsView: View {
             }
         }
         .labelStyle(.iconOnly)
-        .buttonStyle(HorusIconButtonStyle(prominent: dictation.isRecording))
+        .buttonStyle(HorusIconButtonStyle(prominent: dictation.isRecording, bare: true))
         .disabled(!canToggleDictation)
         .help(dictationLabel)
         .accessibilityLabel(dictationLabel)
         .accessibilityValue(dictationValue)
         #endif
 
-        if model.activeTurnID != nil && !model.canSendComposer {
+        if model.activeTurnID != nil && !canSend {
             Button("Stop", glyph: .stopFill) { model.interrupt() }
                 .labelStyle(.iconOnly)
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
@@ -1654,12 +1662,6 @@ private struct ComposerOptionsView: View {
         case .failure(let error):
             model.showToast(error.localizedDescription, tone: .error)
         }
-    }
-
-    private var addFilesHelp: String {
-        model.selectedRouteSupportsAttachmentInput
-            ? "Add files"
-            : "The selected model does not accept attachments"
     }
 
     private var currentChoice: ModelChoice? {
@@ -1717,6 +1719,12 @@ private struct ComposerOptionsView: View {
     private var modelLabel: String {
         guard let currentChoice else { return "Model" }
         return "\(currentChoice.model) · \(currentChoice.reasoningEffort?.capitalized ?? "Default")"
+    }
+
+    private var providerGlyph: HorusGlyph? {
+        currentChoice
+            .flatMap { model.providerSymbol(for: $0) }
+            .flatMap { HorusSymbol.knownGlyph(for: $0) }
     }
 
     private var canSend: Bool {
@@ -1833,8 +1841,9 @@ private struct ComposerAttachmentRow: View {
             .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
             .disabled(isUploading)
         }
-        .padding(.leading, 10)
+        .padding(.leading, 12)
         .background(palette.panel.opacity(0.72), in: HorusStyle.controlShape)
+        .overlay(HorusStyle.controlShape.stroke(palette.line, lineWidth: HorusStyle.borderWidth))
         .accessibilityElement(children: .contain)
     }
 

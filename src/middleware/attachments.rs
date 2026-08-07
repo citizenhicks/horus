@@ -1,7 +1,8 @@
 //! Protected uploaded files and session-bound model access.
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use base64::Engine as _;
 use serde::Deserialize;
@@ -9,7 +10,7 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tempfile::TempPath;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
 use super::manifest::MiddlewareManifest;
@@ -58,6 +59,21 @@ pub struct AttachmentStore {
     root: Arc<PathBuf>,
     // ponytail: uploads are small and infrequent; one lock makes quota checks and commits atomic.
     commits: Arc<Mutex<()>>,
+    reservations: Arc<StdMutex<BTreeMap<String, ReservationTotals>>>,
+    initialized: Arc<OnceCell<()>>,
+}
+
+#[derive(Default)]
+struct ReservationTotals {
+    files: usize,
+    bytes: u64,
+}
+
+struct AttachmentReservation {
+    reservations: Arc<StdMutex<BTreeMap<String, ReservationTotals>>>,
+    session_id: String,
+    size: u64,
+    active: bool,
 }
 
 impl AttachmentStore {
@@ -67,6 +83,8 @@ impl AttachmentStore {
         Self {
             root: Arc::new(state_dir.join("uploads")),
             commits: Arc::new(Mutex::new(())),
+            reservations: Arc::new(StdMutex::new(BTreeMap::new())),
+            initialized: Arc::new(OnceCell::new()),
         }
     }
 
@@ -86,21 +104,26 @@ impl AttachmentStore {
                 "attachment size must be 1–{MAX_FILE_BYTES} bytes"
             )));
         }
-        ensure_private_dir(&self.root).await?;
+        self.ensure_initialized().await?;
+        let _commit = self.commits.lock().await;
         let session_dir = self.session_dir(session_id);
         ensure_private_dir(&session_dir).await?;
+        let existing = list_completed(&session_dir).await?;
+        let reservation = self.reserve(session_id, size, &existing)?;
+        let attachment = AttachmentReference {
+            id: Uuid::new_v4().to_string(),
+            name,
+            size,
+            media_type,
+        };
         let temporary = tempfile::NamedTempFile::new_in(&session_dir)?;
         set_private_file(temporary.path()).await?;
         let (file, path) = temporary.into_parts();
         Ok(PendingAttachment {
             store: self.clone(),
             session_id: session_id.into(),
-            attachment: AttachmentReference {
-                id: Uuid::new_v4().to_string(),
-                name,
-                size,
-                media_type,
-            },
+            attachment,
+            reservation,
             written: 0,
             file: Some(tokio::fs::File::from_std(file)),
             path: Some(path),
@@ -110,6 +133,7 @@ impl AttachmentStore {
     /// Lists completed regular files for one session.
     pub async fn list(&self, session_id: &str) -> Result<Vec<AttachmentReference>> {
         validate_session_id(session_id)?;
+        self.ensure_initialized().await?;
         list_completed(&self.session_dir(session_id)).await
     }
 
@@ -182,6 +206,7 @@ impl AttachmentStore {
     ) -> Result<(AttachmentReference, PathBuf)> {
         validate_session_id(session_id)?;
         validate_attachment_id(attachment_id)?;
+        self.ensure_initialized().await?;
         let directory = self.session_dir(session_id).join(attachment_id);
         require_directory(&directory).await?;
         let metadata = load_metadata(&directory.join(METADATA_FILE)).await?;
@@ -205,6 +230,120 @@ impl AttachmentStore {
         self.root
             .join(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest))
     }
+
+    async fn ensure_initialized(&self) -> Result<()> {
+        self.initialized
+            .get_or_try_init(|| async {
+                ensure_private_dir(&self.root).await?;
+                cleanup_stale_uploads(&self.root).await
+            })
+            .await
+            .map(|_| ())
+    }
+
+    fn reserve(
+        &self,
+        session_id: &str,
+        size: u64,
+        completed: &[AttachmentReference],
+    ) -> Result<AttachmentReservation> {
+        let completed_bytes = completed.iter().try_fold(0_u64, |total, item| {
+            total
+                .checked_add(item.size)
+                .ok_or_else(|| Error::Tool("attachment quota overflow".into()))
+        })?;
+        let mut reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| Error::Tool("attachment reservation state is unavailable".into()))?;
+        let pending_files = reservations
+            .get(session_id)
+            .map_or(0, |pending| pending.files);
+        let pending_bytes = reservations
+            .get(session_id)
+            .map_or(0, |pending| pending.bytes);
+        if completed.len().saturating_add(pending_files) >= MAX_SESSION_FILES {
+            return Err(Error::Tool(format!(
+                "session cannot contain more than {MAX_SESSION_FILES} attachments"
+            )));
+        }
+        let reserved_bytes = completed_bytes
+            .checked_add(pending_bytes)
+            .and_then(|total| total.checked_add(size))
+            .ok_or_else(|| Error::Tool("attachment quota overflow".into()))?;
+        if reserved_bytes > MAX_SESSION_BYTES {
+            return Err(Error::Tool(format!(
+                "session attachments exceed {MAX_SESSION_BYTES} bytes"
+            )));
+        }
+        let pending = reservations.entry(session_id.into()).or_default();
+        pending.files += 1;
+        pending.bytes += size;
+        Ok(AttachmentReservation {
+            reservations: Arc::clone(&self.reservations),
+            session_id: session_id.into(),
+            size,
+            active: true,
+        })
+    }
+
+    fn validate_reserved_capacity(
+        &self,
+        session_id: &str,
+        completed: &[AttachmentReference],
+    ) -> Result<()> {
+        let completed_bytes = completed.iter().try_fold(0_u64, |total, item| {
+            total
+                .checked_add(item.size)
+                .ok_or_else(|| Error::Tool("attachment quota overflow".into()))
+        })?;
+        let reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| Error::Tool("attachment reservation state is unavailable".into()))?;
+        let pending = reservations.get(session_id);
+        let pending_files = pending.map_or(0, |pending| pending.files);
+        let pending_bytes = pending.map_or(0, |pending| pending.bytes);
+        if completed.len().saturating_add(pending_files) > MAX_SESSION_FILES
+            || completed_bytes
+                .checked_add(pending_bytes)
+                .is_none_or(|bytes| bytes > MAX_SESSION_BYTES)
+        {
+            return Err(Error::Tool(
+                "attachment reservation exceeds session quota".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AttachmentReservation {
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut reservations = self
+            .reservations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove = if let Some(pending) = reservations.get_mut(&self.session_id) {
+            pending.files = pending.files.saturating_sub(1);
+            pending.bytes = pending.bytes.saturating_sub(self.size);
+            pending.files == 0
+        } else {
+            false
+        };
+        if remove {
+            reservations.remove(&self.session_id);
+        }
+        self.active = false;
+    }
+}
+
+impl Drop for AttachmentReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// An incomplete upload owned by one authenticated gateway connection.
@@ -212,6 +351,7 @@ pub struct PendingAttachment {
     store: AttachmentStore,
     session_id: String,
     attachment: AttachmentReference,
+    reservation: AttachmentReservation,
     written: u64,
     file: Option<tokio::fs::File>,
     path: Option<TempPath>,
@@ -270,20 +410,8 @@ impl PendingAttachment {
 
         let _guard = self.store.commits.lock().await;
         let existing = list_completed(&self.store.session_dir(&self.session_id)).await?;
-        if existing.len() >= MAX_SESSION_FILES {
-            return Err(Error::Tool(format!(
-                "session cannot contain more than {MAX_SESSION_FILES} attachments"
-            )));
-        }
-        let total = existing
-            .iter()
-            .try_fold(0_u64, |total, item| total.checked_add(item.size))
-            .ok_or_else(|| Error::Tool("attachment quota overflow".into()))?;
-        if total.saturating_add(self.attachment.size) > MAX_SESSION_BYTES {
-            return Err(Error::Tool(format!(
-                "session attachments exceed {MAX_SESSION_BYTES} bytes"
-            )));
-        }
+        self.store
+            .validate_reserved_capacity(&self.session_id, &existing)?;
 
         let directory = self
             .store
@@ -313,6 +441,7 @@ impl PendingAttachment {
             return Err(Error::Tool("attachment ID already exists".into()));
         }
         tokio::fs::rename(&staging, &directory).await?;
+        self.reservation.release();
         Ok(self.attachment.clone())
     }
 }
@@ -372,63 +501,96 @@ impl Middleware for Attachments {
         )
     }
 
-    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn decorate_model_request<'a>(
+        &'a self,
+        context: &'a mut ModelContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let attachment_messages = referenced_attachments(context.request_input())?;
             if attachment_messages.is_empty() {
                 return Ok(());
             }
             let mut input = context.request_input().to_vec();
-            if !context.model.supports_attachment_input(context.provider)? {
-                if latest_user_has_attachments(context.request_input(), &attachment_messages) {
-                    return Err(Error::Provider(
-                        "the selected model does not support attachments".into(),
-                    ));
-                }
-                // Keep historical markers durable for a future compatible route while
-                // allowing this incompatible route to continue with a text-only turn.
-                return Ok(());
-            }
+            let supports_image_input = context.model.supports_image_input(context.provider)?;
+            let latest_user = context.request_input().iter().rposition(|item| {
+                item.get("role").and_then(Value::as_str) == Some("user")
+                    && item.get(INTERNAL_MESSAGE_FIELD).is_none()
+            });
             let mut direct_image_bytes = 0_usize;
             let mut available = Vec::new();
             let mut unavailable = Vec::new();
-            for (message_index, attachments) in attachment_messages {
+            for (message_index, attachments) in attachment_messages.into_iter().rev() {
+                let current = Some(message_index) == latest_user;
                 for reference in attachments {
-                    match self.store.verify(context.session_id, &reference).await {
-                        Ok(()) => available.push(reference.clone()),
-                        Err(error) if is_missing_attachment(&error) => {
+                    if let Err(error) = self.store.verify(context.session_id, &reference).await {
+                        if current {
+                            return Err(error);
+                        }
+                        unavailable.push(reference);
+                        continue;
+                    }
+                    if !reference.media_type.starts_with("image/") {
+                        available.push(reference);
+                        continue;
+                    }
+                    if !supports_image_input {
+                        if current {
+                            return Err(Error::Provider(
+                                "the selected model does not support image input".into(),
+                            ));
+                        }
+                        unavailable.push(reference);
+                        continue;
+                    }
+                    let Some(next_image_bytes) = usize::try_from(reference.size)
+                        .ok()
+                        .and_then(|size| direct_image_bytes.checked_add(size))
+                        .filter(|size| *size <= MAX_DIRECT_IMAGE_BYTES)
+                    else {
+                        if current {
+                            return Err(Error::Provider(
+                                "image attachments exceed the 8 MiB model-input limit".into(),
+                            ));
+                        }
+                        unavailable.push(reference);
+                        continue;
+                    };
+                    let bytes = match self.store.read_all(context.session_id, &reference).await {
+                        Ok((_, bytes)) => bytes,
+                        Err(error) if current => return Err(error),
+                        Err(_) => {
                             unavailable.push(reference);
                             continue;
                         }
-                        Err(error) => return Err(error),
-                    }
-                    if !reference.media_type.starts_with("image/") {
-                        continue;
-                    }
-                    let (_, bytes) = self.store.read_all(context.session_id, &reference).await?;
-                    direct_image_bytes = direct_image_bytes
-                        .checked_add(bytes.len())
-                        .ok_or_else(|| Error::Provider("image attachment size overflow".into()))?;
-                    if direct_image_bytes > MAX_DIRECT_IMAGE_BYTES {
-                        return Err(Error::Provider(
-                            "image attachments exceed the 8 MiB model-input limit".into(),
-                        ));
-                    }
-                    let media_type = raster_media_type(&bytes)?;
+                    };
+                    let media_type = match raster_media_type(&bytes) {
+                        Ok(media_type) => media_type,
+                        Err(error) if current => return Err(error),
+                        Err(_) => {
+                            unavailable.push(reference);
+                            continue;
+                        }
+                    };
                     let content = input
                         .get_mut(message_index)
                         .and_then(|item| item.get_mut("content"))
-                        .and_then(Value::as_array_mut)
-                        .ok_or_else(|| {
-                            Error::Checkpoint(
+                        .and_then(Value::as_array_mut);
+                    let Some(content) = content else {
+                        if current {
+                            return Err(Error::Checkpoint(
                                 "attachment-bearing user message has invalid content".into(),
-                            )
-                        })?;
+                            ));
+                        }
+                        unavailable.push(reference);
+                        continue;
+                    };
                     content.push(serde_json::json!({
                         "type": "input_image",
                         "media_type": media_type,
                         "data": base64::engine::general_purpose::STANDARD.encode(bytes)
                     }));
+                    direct_image_bytes = next_image_bytes;
+                    available.push(reference);
                 }
             }
             input.push(internal_user_message(
@@ -439,10 +601,6 @@ impl Middleware for Attachments {
             Ok(())
         })
     }
-}
-
-fn is_missing_attachment(error: &Error) -> bool {
-    matches!(error, Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn raster_media_type(bytes: &[u8]) -> Result<&'static str> {
@@ -684,19 +842,6 @@ fn referenced_attachments(input: &[Value]) -> Result<Vec<(usize, Vec<AttachmentR
     Ok(messages)
 }
 
-fn latest_user_has_attachments(
-    input: &[Value],
-    attachment_messages: &[(usize, Vec<AttachmentReference>)],
-) -> bool {
-    let latest_user_index = input.iter().rposition(|item| {
-        item.get("role").and_then(Value::as_str) == Some("user")
-            && item.get(INTERNAL_MESSAGE_FIELD).is_none()
-    });
-    attachment_messages
-        .last()
-        .is_some_and(|(index, _)| Some(*index) == latest_user_index)
-}
-
 fn render_attachment_context(
     available: &[AttachmentReference],
     unavailable: &[AttachmentReference],
@@ -718,6 +863,38 @@ fn render_attachment_context(
         }
     }
     output
+}
+
+async fn cleanup_stale_uploads(root: &Path) -> Result<()> {
+    let mut sessions = tokio::fs::read_dir(root).await?;
+    while let Some(session) = sessions.next_entry().await? {
+        let session_type = session.file_type().await?;
+        if !session_type.is_dir() || session_type.is_symlink() {
+            continue;
+        }
+        let mut entries = tokio::fs::read_dir(session.path()).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if file_type.is_file() && name.starts_with(".tmp") {
+                tokio::fs::remove_file(entry.path()).await?;
+                continue;
+            }
+            let staging_id = name
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix("-partial"));
+            if file_type.is_dir()
+                && !file_type.is_symlink()
+                && staging_id.is_some_and(|id| Uuid::parse_str(id).is_ok())
+            {
+                tokio::fs::remove_dir_all(entry.path()).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn list_completed(session_dir: &Path) -> Result<Vec<AttachmentReference>> {
@@ -971,6 +1148,70 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn pending_uploads_reserve_session_quota_and_release_on_drop() {
+        let state = tempfile::tempdir().expect("state");
+        let store = AttachmentStore::new(state.path());
+        let session_id = Uuid::new_v4().to_string();
+        let mut pending = Vec::new();
+        for index in 0..(MAX_SESSION_BYTES / MAX_FILE_BYTES) {
+            pending.push(
+                store
+                    .begin_upload(
+                        &session_id,
+                        format!("{index}.bin"),
+                        MAX_FILE_BYTES,
+                        "application/octet-stream".into(),
+                    )
+                    .await
+                    .expect("reserve upload"),
+            );
+        }
+
+        assert!(
+            store
+                .begin_upload(
+                    &session_id,
+                    "overflow.bin".into(),
+                    1,
+                    "application/octet-stream".into(),
+                )
+                .await
+                .is_err()
+        );
+
+        drop(pending.pop());
+        assert!(
+            store
+                .begin_upload(
+                    &session_id,
+                    "replacement.bin".into(),
+                    MAX_FILE_BYTES,
+                    "application/octet-stream".into(),
+                )
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn first_store_access_removes_crash_leftovers() {
+        let state = tempfile::tempdir().expect("state");
+        let store = AttachmentStore::new(state.path());
+        let session_id = Uuid::new_v4().to_string();
+        let session = store.session_dir(&session_id);
+        std::fs::create_dir_all(&session).expect("session directory");
+        let temporary = session.join(".tmp-upload");
+        std::fs::write(&temporary, b"partial").expect("temporary upload");
+        let staging = session.join(format!(".{}-partial", Uuid::new_v4()));
+        std::fs::create_dir(&staging).expect("staging directory");
+        std::fs::write(staging.join("partial.bin"), b"partial").expect("staged upload");
+
+        assert!(store.list(&session_id).await.expect("list").is_empty());
+        assert!(!temporary.exists());
+        assert!(!staging.exists());
+    }
+
     #[test]
     fn utf8_reader_stops_before_a_split_scalar() {
         let mut bytes = vec![b'a'; MAX_TOOL_READ_BYTES - 1];
@@ -1028,13 +1269,5 @@ mod tests {
             referenced_attachments(&input).expect("markers"),
             vec![(0, vec![attachment])]
         );
-        assert!(!latest_user_has_attachments(
-            &input,
-            &referenced_attachments(&input).expect("markers")
-        ));
-        assert!(latest_user_has_attachments(
-            &input[..2],
-            &referenced_attachments(&input[..2]).expect("markers")
-        ));
     }
 }

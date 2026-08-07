@@ -78,6 +78,15 @@ impl GatewaySandbox {
             .await
     }
 
+    pub(crate) async fn read_workspace_range(
+        &self,
+        path: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, Option<u64>)> {
+        self.delegate.read_range(path, offset, max_bytes).await
+    }
+
     pub(crate) async fn switch_git_branch(&self, branch: &str) -> Result<CommandOutput> {
         let mut arguments = GIT_ARGUMENTS.to_vec();
         arguments.extend_from_slice(&[

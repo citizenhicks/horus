@@ -236,7 +236,7 @@ pub struct ModelChoice {
     pub model: String,
     pub reasoning_effort: Option<String>,
     pub context_window: Option<i64>,
-    pub supports_attachment_input: bool,
+    pub supports_image_input: bool,
 }
 
 /// A model provider Adapter used by the agent loop.
@@ -246,9 +246,9 @@ pub trait Model: Send + Sync {
         ModelInfo::default()
     }
 
-    /// Reports whether this provider accepts attachment-bearing user turns.
-    fn supports_attachment_input(&self) -> bool {
-        true
+    /// Reports whether this provider accepts native image input.
+    fn supports_image_input(&self) -> bool {
+        false
     }
 
     /// Produces one streamed response.
@@ -358,7 +358,7 @@ impl ModelRouter {
             .iter_mut()
             .find(|current| current.choice.route == choice.route)
             .ok_or_else(|| Error::Unknown(format!("model route `{}`", choice.route)))?;
-        choice.supports_attachment_input = current.provider.supports_attachment_input();
+        choice.supports_image_input = current.provider.supports_image_input();
         current.choice = choice;
         Ok(())
     }
@@ -384,9 +384,9 @@ impl ModelRouter {
         Ok(self.provider(provider)?.compaction_endpoint())
     }
 
-    /// Reports whether one route accepts attachment-bearing user turns.
-    pub fn supports_attachment_input(&self, provider: &str) -> Result<bool> {
-        Ok(self.provider(provider)?.supports_attachment_input())
+    /// Reports whether one route accepts native image input.
+    pub fn supports_image_input(&self, provider: &str) -> Result<bool> {
+        Ok(self.provider(provider)?.supports_image_input())
     }
 
     /// Compacts context through the selected provider.
@@ -418,7 +418,7 @@ fn inferred_choice(route: &str, provider: &dyn Model) -> ModelChoice {
         model: info.model,
         reasoning_effort: info.reasoning_effort,
         context_window: None,
-        supports_attachment_input: provider.supports_attachment_input(),
+        supports_image_input: provider.supports_image_input(),
     }
 }
 
@@ -624,6 +624,34 @@ pub fn tool_output(call_id: &str, output: &str, is_error: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DefaultCapabilities;
+
+    impl Model for DefaultCapabilities {
+        fn respond<'a>(
+            &'a self,
+            _request: ModelRequest<'a>,
+            _events: ModelEventSink,
+        ) -> BoxFuture<'a, Result<ModelOutput>> {
+            Box::pin(async { Err(Error::Provider("response was not expected".into())) })
+        }
+    }
+
+    #[test]
+    fn image_input_requires_explicit_provider_support() {
+        let model: Arc<dyn Model> = Arc::new(DefaultCapabilities);
+        let router = ModelRouter::new("text-only", Arc::clone(&model));
+
+        assert!(!model.supports_image_input());
+        assert!(!router.supports_image_input("text-only").expect("route"));
+        assert!(
+            !router
+                .choices()
+                .next()
+                .expect("choice")
+                .supports_image_input
+        );
+    }
 
     #[test]
     fn normalized_output_derives_text_and_validates_tool_calls() {

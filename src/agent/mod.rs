@@ -200,7 +200,8 @@ impl AgentSender {
     }
 }
 
-fn validate_submission(submission: &Submission) -> Result<()> {
+/// Validates one submission before callers perform more expensive boundary work.
+pub fn validate_submission(submission: &Submission) -> Result<()> {
     validate_identifier("submission ID", &submission.id, MAX_IDENTIFIER_BYTES)?;
     match &submission.op {
         Op::UserInput { text, attachments } => validate_user_input(text, attachments),

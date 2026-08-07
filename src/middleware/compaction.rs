@@ -22,6 +22,7 @@ use crate::protocol::EventMsg;
 use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendTone;
 use crate::protocol::internal_message_kind;
+use crate::protocol::is_internal_message;
 
 const KEEP_RECENT_TOKENS: usize = 20_000;
 const MAX_SUMMARY_TOOL_RESULT_CHARS: usize = 2_000;
@@ -137,12 +138,52 @@ impl Middleware for Compaction {
                     "compaction returned an empty context".into(),
                 ));
             }
-            context.replace_input(output.output);
+            let active_turn = active_turn(context.input());
+            let mut compacted = output.output;
+            preserve_active_turn(&mut compacted, active_turn);
+            context.replace_input(compacted);
             context.usage.push(output.usage);
             context.events.push(EventMsg::ContextCompacted);
             Ok(())
         })
     }
+}
+
+fn active_turn(input: &[Value]) -> &[Value] {
+    input
+        .iter()
+        .rposition(|item| {
+            item.get("role").and_then(Value::as_str) == Some("user") && !is_internal_message(item)
+        })
+        .map_or(&[], |index| &input[index..])
+}
+
+fn preserve_active_turn(compacted: &mut Vec<Value>, active_turn: &[Value]) {
+    if active_turn.is_empty() || compacted.ends_with(active_turn) {
+        return;
+    }
+    if let Some(start) = compacted.len().checked_sub(active_turn.len())
+        && compacted[start..]
+            .iter()
+            .zip(active_turn)
+            .all(|(left, right)| equal_without_private_fields(left, right))
+    {
+        compacted.truncate(start);
+    }
+    compacted.extend_from_slice(active_turn);
+}
+
+fn equal_without_private_fields(left: &Value, right: &Value) -> bool {
+    if left == right {
+        return true;
+    }
+    let (Some(mut left), Some(mut right)) = (left.as_object().cloned(), right.as_object().cloned())
+    else {
+        return false;
+    };
+    left.retain(|field, _| !field.starts_with('_'));
+    right.retain(|field, _| !field.starts_with('_'));
+    left == right
 }
 
 async fn summarize(context: &ModelContext<'_>) -> Result<CompactOutput> {
@@ -375,5 +416,23 @@ mod tests {
                 .trigger_tokens(128_000),
             4_000
         );
+    }
+
+    #[test]
+    fn compaction_restores_private_fields_on_the_active_turn_without_duplication() {
+        let active = serde_json::json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": "inspect"}],
+            "_horus_attachments": [{"id": "attachment"}]
+        });
+        let mut compacted = vec![
+            serde_json::json!({"type": "compaction", "encrypted_content": "opaque"}),
+            user_message("inspect"),
+        ];
+
+        preserve_active_turn(&mut compacted, std::slice::from_ref(&active));
+
+        assert_eq!(compacted.len(), 2);
+        assert_eq!(compacted[1], active);
     }
 }

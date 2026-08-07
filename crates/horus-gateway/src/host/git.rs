@@ -255,7 +255,7 @@ fn append_diff(target: &mut Vec<u8>, patch: &[u8]) {
 }
 
 /// A diff too large to send is still worth reading, so it is cut at the last whole line rather
-/// than rejected. The sandbox already truncates each Git invocation at the same budget.
+/// than rejected. The sandbox permits a larger shared read-only output budget.
 fn truncate_diff(diff: &mut Vec<u8>) {
     if diff.len() <= MAX_GIT_DIFF_BYTES {
         return;

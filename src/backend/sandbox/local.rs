@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 #[cfg(target_os = "linux")]
 use std::fs::File;
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, Write as _};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::Component;
@@ -38,7 +38,7 @@ use crate::Result;
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 40_000;
 /// Read-only inspection feeds a UI rather than a model context, so it keeps a larger budget.
-const MAX_READ_ONLY_OUTPUT_BYTES: usize = 400_000;
+const MAX_READ_ONLY_OUTPUT_BYTES: usize = 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const PROTECTED_METADATA: [&str; 3] = [".git", ".agents", ".codex"];
 const GIT_METADATA: &str = ".git";
@@ -260,6 +260,29 @@ impl LocalSandbox {
             WorkspaceAccess::ReadOnly,
         )
         .await
+    }
+
+    /// Reads one bounded binary range through the sandbox's pinned workspace root.
+    pub async fn read_range(
+        &self,
+        path: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, Option<u64>)> {
+        if max_bytes == 0 || max_bytes > MAX_FILE_BYTES {
+            return Err(Error::Sandbox(format!(
+                "file read size must be 1–{MAX_FILE_BYTES} bytes"
+            )));
+        }
+        validate_root(&self.root, &self.root_dir)?;
+        let root = self.root_dir.try_clone()?;
+        let relative = self.relative(path)?;
+        let requested = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            read_file_range(root, &relative, &requested, offset, max_bytes)
+        })
+        .await
+        .map_err(|error| Error::Sandbox(format!("file reader failed: {error}")))?
     }
 
     /// Runs Git argv with a writable workspace and Git metadata but no network access.
@@ -712,12 +735,7 @@ fn validate_git_metadata(root: &Path) -> Result<()> {
 }
 
 fn read_file(root: Dir, relative: &Path, requested: &str) -> Result<String> {
-    let file = root
-        .open(relative)
-        .map_err(|_| Error::Sandbox(requested.to_string()))?;
-    if !file.metadata()?.is_file() {
-        return Err(Error::Sandbox(requested.to_string()));
-    }
+    let file = open_regular_file(root, relative, requested)?;
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
@@ -725,6 +743,55 @@ fn read_file(root: Dir, relative: &Path, requested: &str) -> Result<String> {
         return Err(Error::Sandbox("file exceeds read limit".into()));
     }
     String::from_utf8(bytes).map_err(|_| Error::Sandbox(format!("{requested} is not valid UTF-8")))
+}
+
+fn read_file_range(
+    root: Dir,
+    relative: &Path,
+    requested: &str,
+    offset: u64,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, Option<u64>)> {
+    let mut file = open_regular_file(root, relative, requested)?;
+    let size = file.metadata()?.len();
+    if offset > size {
+        return Err(Error::Sandbox("file offset exceeds its size".into()));
+    }
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    let length = usize::try_from(size.saturating_sub(offset).min(max_bytes as u64))
+        .map_err(|_| Error::Sandbox("file range is unsupported".into()))?;
+    let mut data = vec![0; length];
+    file.read_exact(&mut data)?;
+    let end = offset.saturating_add(length as u64);
+    Ok((data, (end < size).then_some(end)))
+}
+
+fn open_regular_file(root: Dir, relative: &Path, requested: &str) -> Result<cap_std::fs::File> {
+    let name = relative
+        .file_name()
+        .ok_or_else(|| Error::Sandbox(requested.to_string()))?;
+    let parent = open_parent(root, relative.parent().unwrap_or(Path::new("")), requested)?;
+    let before = parent
+        .symlink_metadata(name)
+        .map_err(|_| Error::Sandbox(requested.to_string()))?;
+    if before.is_symlink() || !before.is_file() {
+        return Err(Error::Sandbox(requested.to_string()));
+    }
+    let file = parent
+        .open(name)
+        .map_err(|_| Error::Sandbox(requested.to_string()))?;
+    let opened = file.metadata()?;
+    let current = parent
+        .symlink_metadata(name)
+        .map_err(|_| Error::Sandbox(requested.to_string()))?;
+    if !opened.is_file()
+        || current.is_symlink()
+        || !same_cap_file(&before, &opened)
+        || !same_cap_file(&opened, &current)
+    {
+        return Err(Error::Sandbox(requested.to_string()));
+    }
+    Ok(file)
 }
 
 fn atomic_write(root: Dir, relative: &Path, content: &[u8], requested: &str) -> Result<()> {
@@ -1517,6 +1584,48 @@ sleep 30"#;
 
     fn local_sandbox(workspace: &Path) -> LocalSandbox {
         LocalSandbox::new(workspace).expect("sandbox")
+    }
+
+    #[tokio::test]
+    async fn binary_range_reads_from_the_same_opened_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(workspace.path().join("nested")).expect("nested directory");
+        std::fs::write(workspace.path().join("nested/data.bin"), b"\0abcdef").expect("binary file");
+        let sandbox = local_sandbox(workspace.path());
+
+        let (data, next_offset) = sandbox
+            .read_range("nested/data.bin", 1, 3)
+            .await
+            .expect("range");
+
+        assert_eq!(data, b"abc");
+        assert_eq!(next_offset, Some(4));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_range_rejects_symlinked_files_and_parents() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret"), b"secret").expect("outside file");
+        symlink(
+            outside.path().join("secret"),
+            workspace.path().join("file-link"),
+        )
+        .expect("file symlink");
+        symlink(outside.path(), workspace.path().join("directory-link"))
+            .expect("directory symlink");
+        let sandbox = local_sandbox(workspace.path());
+
+        assert!(sandbox.read_range("file-link", 0, 16).await.is_err());
+        assert!(
+            sandbox
+                .read_range("directory-link/secret", 0, 16)
+                .await
+                .is_err()
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

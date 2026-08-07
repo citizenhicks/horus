@@ -35,6 +35,9 @@ use horus::backend::sandbox::local::LocalSandbox;
 use horus::middleware::Middleware;
 use horus::middleware::MiddlewareStack;
 use horus::middleware::RuntimeContext;
+use horus::middleware::attachments::AttachmentStore;
+use horus::middleware::attachments::Attachments;
+use horus::middleware::attachments::MAX_UPLOAD_CHUNK_BYTES;
 use horus::middleware::compaction::Compaction;
 use horus::middleware::skills::Skills;
 use horus::middleware::steering::Steering;
@@ -42,6 +45,7 @@ use horus::middleware::subagents::SubagentLaunch;
 use horus::middleware::subagents::SubagentLauncher;
 use horus::middleware::subagents::Subagents;
 use horus::middleware::tools::Tools;
+use horus::protocol::AttachmentReference;
 use horus::protocol::EventMsg;
 use horus::protocol::MessageTarget;
 use horus::protocol::ModelEvent;
@@ -380,7 +384,7 @@ async fn async_subagent_uses_configured_model_reasoning_and_durable_fork() {
             model: "root".into(),
             reasoning_effort: None,
             context_window: None,
-            supports_attachment_input: true,
+            supports_image_input: true,
         },
         ModelChoice {
             route: "child".into(),
@@ -388,7 +392,7 @@ async fn async_subagent_uses_configured_model_reasoning_and_durable_fork() {
             model: "child".into(),
             reasoning_effort: Some("low".into()),
             context_window: None,
-            supports_attachment_input: true,
+            supports_image_input: true,
         },
         ModelChoice {
             route: "child-high".into(),
@@ -396,7 +400,7 @@ async fn async_subagent_uses_configured_model_reasoning_and_durable_fork() {
             model: "child".into(),
             reasoning_effort: Some("high".into()),
             context_window: None,
-            supports_attachment_input: true,
+            supports_image_input: true,
         },
     ] {
         routes
@@ -596,7 +600,7 @@ async fn compaction_uses_the_context_window_of_a_new_model_route() {
                 model: route.into(),
                 reasoning_effort: None,
                 context_window: Some(context_window),
-                supports_attachment_input: true,
+                supports_image_input: true,
             })
             .expect("route metadata");
     }
@@ -764,6 +768,189 @@ async fn compaction_falls_back_to_a_model_summary_and_keeps_recent_context() {
             .expect("compact requests")
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn attachment_hydration_runs_after_native_compaction_replaces_context() {
+    let workspace = TempDir::new().expect("create workspace");
+    let session_id = "attachment-compaction";
+    let store = AttachmentStore::new(workspace.path());
+    let attachment = upload_attachment(
+        &store,
+        session_id,
+        "photo.png",
+        "image/png",
+        b"\x89PNG\r\n\x1a\n",
+    )
+    .await;
+    let model = Arc::new(
+        ScriptedModel::with_compaction(
+            vec![
+                text_response_with_usage("draft", usage(2_000)),
+                text_response("done"),
+            ],
+            vec![
+                CompactOutput::from_output(
+                    vec![serde_json::json!({
+                        "type": "compaction",
+                        "encrypted_content": "opaque"
+                    })],
+                    usage(10),
+                )
+                .expect("compaction output"),
+            ],
+        )
+        .with_image_input(),
+    );
+    let config = test_config(
+        workspace.path(),
+        Arc::clone(&model),
+        vec![
+            Arc::new(Attachments::new(store)),
+            Arc::new(Compaction::new(1_000).expect("compaction")),
+        ],
+    )
+    .session_id(session_id);
+    let mut agent = create_agent(config).await.expect("create agent");
+
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "first".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit first turn");
+    assert_eq!(final_message(&mut agent).await, "draft");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "inspect".into(),
+            attachments: vec![attachment.clone()],
+        })
+        .expect("submit attachment turn");
+    assert_eq!(final_message(&mut agent).await, "done");
+
+    assert_eq!(
+        model
+            .compact_requests
+            .lock()
+            .expect("compact requests")
+            .len(),
+        1
+    );
+    let requests = model.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(request_image_count(&requests[1].input), 1);
+    let final_input = serde_json::to_string(&requests[1].input).expect("serialize final input");
+    assert!(final_input.contains("opaque"));
+    assert!(final_input.contains(&attachment.id));
+}
+
+#[tokio::test]
+async fn text_attachments_do_not_require_image_input_support() {
+    let workspace = TempDir::new().expect("create workspace");
+    let session_id = "text-attachment";
+    let store = AttachmentStore::new(workspace.path());
+    let attachment =
+        upload_attachment(&store, session_id, "notes.txt", "text/plain", b"hello").await;
+    let model = Arc::new(ScriptedModel::new(vec![text_response("done")]));
+    let config = test_config(
+        workspace.path(),
+        Arc::clone(&model),
+        vec![Arc::new(Attachments::new(store))],
+    )
+    .session_id(session_id);
+    let mut agent = create_agent(config).await.expect("create agent");
+
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "read it".into(),
+            attachments: vec![attachment.clone()],
+        })
+        .expect("submit attachment turn");
+
+    assert_eq!(final_message(&mut agent).await, "done");
+    let requests = model.requests.lock().expect("requests");
+    assert_eq!(request_image_count(&requests[0].input), 0);
+    let input = serde_json::to_string(&requests[0].input).expect("serialize request");
+    assert!(input.contains("User-attached files available"));
+    assert!(input.contains(&attachment.id));
+}
+
+#[tokio::test]
+async fn over_budget_current_image_fails_but_does_not_poison_later_turns() {
+    let workspace = TempDir::new().expect("create workspace");
+    let session_id = "oversized-attachment";
+    let store = AttachmentStore::new(workspace.path());
+    let mut oversized_bytes = vec![0_u8; 8 * 1024 * 1024 + 1];
+    oversized_bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    let oversized = upload_attachment(
+        &store,
+        session_id,
+        "oversized.png",
+        "image/png",
+        &oversized_bytes,
+    )
+    .await;
+    let current = upload_attachment(
+        &store,
+        session_id,
+        "current.png",
+        "image/png",
+        b"\x89PNG\r\n\x1a\n",
+    )
+    .await;
+    let model = Arc::new(
+        ScriptedModel::new(vec![
+            text_response("text recovered"),
+            text_response("image recovered"),
+        ])
+        .with_image_input(),
+    );
+    let config = test_config(
+        workspace.path(),
+        Arc::clone(&model),
+        vec![Arc::new(Attachments::new(store))],
+    )
+    .session_id(session_id);
+    let mut agent = create_agent(config).await.expect("create agent");
+
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "too large".into(),
+            attachments: vec![oversized.clone()],
+        })
+        .expect("submit oversized image");
+    assert!(failed_turn(&mut agent).await.contains("8 MiB"));
+    assert!(model.requests.lock().expect("requests").is_empty());
+
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "continue without it".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit recovery turn");
+    assert_eq!(final_message(&mut agent).await, "text recovered");
+
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "use this smaller image".into(),
+            attachments: vec![current.clone()],
+        })
+        .expect("submit current image");
+    assert_eq!(final_message(&mut agent).await, "image recovered");
+
+    let requests = model.requests.lock().expect("requests");
+    assert_eq!(request_image_count(&requests[0].input), 0);
+    assert_eq!(request_image_count(&requests[1].input), 1);
+    let recovery = serde_json::to_string(&requests[1].input).expect("serialize recovery input");
+    assert!(recovery.contains(&oversized.id));
+    assert!(recovery.contains(&current.id));
+    assert!(recovery.contains("Unavailable file references"));
 }
 
 #[tokio::test]
@@ -982,6 +1169,7 @@ struct ScriptedModel {
     requests: Mutex<Vec<RecordedRequest>>,
     compact_requests: Mutex<Vec<RecordedRequest>>,
     compaction_endpoint: bool,
+    image_input: bool,
 }
 
 struct RecordedRequest {
@@ -1015,11 +1203,21 @@ impl ScriptedModel {
             requests: Mutex::new(Vec::new()),
             compact_requests: Mutex::new(Vec::new()),
             compaction_endpoint,
+            image_input: false,
         }
+    }
+
+    fn with_image_input(mut self) -> Self {
+        self.image_input = true;
+        self
     }
 }
 
 impl Model for ScriptedModel {
+    fn supports_image_input(&self) -> bool {
+        self.image_input
+    }
+
     fn respond<'a>(
         &'a self,
         request: ModelRequest<'a>,
@@ -1076,6 +1274,10 @@ struct GatedModel {
 }
 
 impl Model for GatedModel {
+    fn supports_image_input(&self) -> bool {
+        self.inner.supports_image_input()
+    }
+
     fn respond<'a>(
         &'a self,
         request: ModelRequest<'a>,
@@ -1205,6 +1407,54 @@ async fn final_message(agent: &mut horus::agent::Agent) -> String {
         }
     }
     panic!("agent disconnected")
+}
+
+async fn failed_turn(agent: &mut horus::agent::Agent) -> String {
+    let mut message = None;
+    while let Some(event) = agent.next_event().await {
+        match event.msg {
+            EventMsg::Error(error) => message = Some(error.message),
+            EventMsg::TurnAborted(_) => return message.expect("failed turn error"),
+            EventMsg::TurnComplete(_) => panic!("turn unexpectedly completed"),
+            _ => {}
+        }
+    }
+    panic!("agent disconnected")
+}
+
+async fn upload_attachment(
+    store: &AttachmentStore,
+    session_id: &str,
+    name: &str,
+    media_type: &str,
+    bytes: &[u8],
+) -> AttachmentReference {
+    let mut pending = store
+        .begin_upload(
+            session_id,
+            name.into(),
+            u64::try_from(bytes.len()).expect("attachment size"),
+            media_type.into(),
+        )
+        .await
+        .expect("begin attachment upload");
+    let mut offset = 0_u64;
+    for chunk in bytes.chunks(MAX_UPLOAD_CHUNK_BYTES) {
+        offset = pending
+            .append(offset, chunk)
+            .await
+            .expect("append attachment chunk");
+    }
+    pending.finish().await.expect("finish attachment upload")
+}
+
+fn request_image_count(input: &[Value]) -> usize {
+    input
+        .iter()
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
+        .count()
 }
 
 fn tool_response(call_id: &str, name: &str, arguments: Value) -> ModelOutput {

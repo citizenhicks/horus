@@ -26,6 +26,11 @@ enum HorusStyle {
     static let iconButtonSize: CGFloat = 32
     #endif
     static let borderWidth: CGFloat = 0.75
+    /// Empty space an icon button keeps around its glyph to reach a full tap target.
+    static let iconButtonInset = (iconButtonSize - iconSize) / 2
+    /// Outer padding for a row of icon buttons: they carry `iconButtonInset` of their own,
+    /// so matching the margin of neighbouring text means subtracting it here.
+    static let iconRowPadding = cardPadding + 4 - iconButtonInset
 }
 
 /// One HugeIcons glyph, vendored into the asset catalog under `hi.<name>`.
@@ -264,6 +269,12 @@ enum HorusSymbol {
         artwork(for: symbol).glyph
     }
 
+    /// Nil where `glyph(for:)` would return the placeholder. Beside a label the placeholder
+    /// reads as a broken glyph rather than a neutral one, so a caller can drop it instead.
+    static func knownGlyph(for symbol: String) -> HorusGlyph? {
+        vocabulary[symbol]?.glyph
+    }
+
     static func systemImage(for symbol: String) -> String {
         artwork(for: symbol).systemImage
     }
@@ -459,17 +470,30 @@ struct HorusBadge: View {
     private var foreground: Color { palette.tone(tone) }
 }
 
+/// A menu's current value: the provider's mark, the value itself, and a muted qualifier.
+/// No container — the icon buttons it sits beside carry none either, and the hierarchy
+/// between the three parts is what separates it from the row.
 struct HorusMenuLabel: View {
+    @Environment(\.horusPalette) private var palette
     let text: String
     var glyph: HorusGlyph?
+    var detail: String?
 
     var body: some View {
         HStack(spacing: 6) {
-            if let glyph { HorusIcon(glyph) }
-            Text(text).lineLimit(1)
-            HorusIcon(.caretUpDown, size: 13)
+            if let glyph { HorusIcon(glyph, size: 14, foreground: palette.accent) }
+            Text(text)
+                .font(HorusStyle.controlFont)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if let detail {
+                Text(detail)
+                    .font(HorusStyle.badgeFont)
+                    .foregroundStyle(palette.muted)
+                    .lineLimit(1)
+            }
+            HorusIcon(.caretUpDown, size: 11, foreground: palette.muted)
         }
-        .font(HorusStyle.controlFont)
         .frame(height: HorusStyle.controlHeight)
         .contentShape(Rectangle())
     }
@@ -525,9 +549,17 @@ extension PrimitiveButtonStyle where Self == HorusFeedbackButtonStyle<GlassPromi
 
 struct HorusIconButtonStyle: ButtonStyle {
     var prominent = false
+    /// Draws only the glyph — no glass circle behind it — while keeping the full
+    /// 44pt hit target. `prominent` then tints the glyph instead of the fill.
+    var bare = false
 
     func makeBody(configuration: Configuration) -> some View {
-        IconButton(label: configuration.label, isPressed: configuration.isPressed, prominent: prominent)
+        IconButton(
+            label: configuration.label,
+            isPressed: configuration.isPressed,
+            prominent: prominent,
+            bare: bare
+        )
     }
 
     private struct IconButton: View {
@@ -538,25 +570,33 @@ struct HorusIconButtonStyle: ButtonStyle {
         let label: ButtonStyleConfiguration.Label
         let isPressed: Bool
         let prominent: Bool
+        let bare: Bool
 
         var body: some View {
-            label
+            let base = label
                 .font(HorusStyle.controlFont)
                 .foregroundStyle(foreground)
                 .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                 // A glass effect adds no hit area, so without this the tap target is the
                 // 16pt glyph, not the 44pt circle: unusable by touch, fine with a cursor.
                 .contentShape(Circle())
-                .horusGlass(in: Circle(), interactive: isEnabled, prominent: prominent && isEnabled)
-                .opacity(isPressed ? 0.72 : 1)
-                #if os(iOS)
-                .sensoryFeedback(.impact(weight: .light), trigger: isPressed) { _, pressed in pressed }
-                #endif
+            Group {
+                if bare {
+                    base
+                } else {
+                    base.horusGlass(in: Circle(), interactive: isEnabled, prominent: prominent && isEnabled)
+                }
+            }
+            .opacity(isPressed ? 0.72 : 1)
+            #if os(iOS)
+            .sensoryFeedback(.impact(weight: .light), trigger: isPressed) { _, pressed in pressed }
+            #endif
         }
 
         private var foreground: Color {
             guard isEnabled else { return palette.muted }
-            return prominent ? palette.onAccent : .primary
+            if prominent { return bare ? palette.accent : palette.onAccent }
+            return .primary
         }
     }
 }

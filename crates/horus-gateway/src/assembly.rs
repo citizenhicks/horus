@@ -64,6 +64,7 @@ pub(crate) async fn assemble(
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     scratchpad: ScratchpadStore,
+    attachments: AttachmentStore,
     session_id: Option<String>,
     origin_label: &str,
     override_saved_model_route: bool,
@@ -113,7 +114,7 @@ pub(crate) async fn assemble(
         &chat.workspace,
         cron,
         scratchpad,
-        AttachmentStore::new(store.state_dir()),
+        attachments,
     )?;
     let mut metadata = match session_id.as_deref() {
         Some(session_id) => checkpoints
@@ -324,7 +325,7 @@ fn catalog_routes(
                     context_window: Some(
                         preset.map_or(DEFAULT_CONTEXT_WINDOW, |preset| preset.context_window),
                     ),
-                    supports_attachment_input: true,
+                    supports_image_input: definition.supports_image_input(),
                 },
                 provider,
             });
@@ -567,7 +568,7 @@ fn build_route(
         http: http.clone(),
     })?;
     let mut choice = route.choice;
-    choice.supports_attachment_input = model.supports_attachment_input();
+    choice.supports_image_input = model.supports_image_input();
     let id = choice.route.clone();
     Ok(RouteValue { choice, id, model })
 }
@@ -584,11 +585,16 @@ struct RouteValue {
 
 struct UnavailableModel {
     info: ModelInfo,
+    supports_image_input: bool,
 }
 
 impl Model for UnavailableModel {
     fn info(&self) -> ModelInfo {
         self.info.clone()
+    }
+
+    fn supports_image_input(&self) -> bool {
+        self.supports_image_input
     }
 
     fn respond<'a>(
@@ -620,6 +626,7 @@ fn unavailable_models(selection: &ProviderConfig) -> Result<(Arc<ModelRouter>, i
             model: selection.model.clone(),
             reasoning_effort: effort.clone(),
         },
+        supports_image_input: definition.supports_image_input(),
     });
     let mut router = ModelRouter::new(&route, model);
     router.configure_choice(ModelChoice {
@@ -628,7 +635,7 @@ fn unavailable_models(selection: &ProviderConfig) -> Result<(Arc<ModelRouter>, i
         model: selection.model.clone(),
         reasoning_effort: effort,
         context_window: Some(context_window),
-        supports_attachment_input: true,
+        supports_image_input: definition.supports_image_input(),
     })?;
     Ok((Arc::new(router), context_window))
 }
@@ -935,6 +942,7 @@ mod tests {
             cron,
             Arc::clone(&checkpoints),
             ScratchpadStore::new(Arc::clone(&checkpoints)),
+            AttachmentStore::new(store.state_dir()),
             Some("chat".into()),
             "test",
             true,

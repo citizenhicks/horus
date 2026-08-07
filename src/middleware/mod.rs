@@ -342,8 +342,16 @@ pub trait Middleware: Send + Sync {
         Ok(())
     }
 
-    /// Adjusts the next model request.
+    /// Mutates durable context before the next model request is assembled.
     fn before_model<'a>(&'a self, _context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Applies request-only context after every durable transform has completed.
+    fn decorate_model_request<'a>(
+        &'a self,
+        _context: &'a mut ModelContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -568,6 +576,9 @@ impl MiddlewareStack {
     pub(crate) async fn before_model(&self, mut context: ModelContext<'_>) -> Result<()> {
         for entry in &self.entries {
             entry.before_model(&mut context).await?;
+        }
+        for entry in &self.entries {
+            entry.decorate_model_request(&mut context).await?;
         }
         Ok(())
     }

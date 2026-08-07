@@ -150,6 +150,10 @@ impl Model for Kimi {
         }
     }
 
+    fn supports_image_input(&self) -> bool {
+        true
+    }
+
     fn respond<'a>(
         &'a self,
         request: ModelRequest<'a>,
@@ -556,6 +560,7 @@ pub(super) const fn provider() -> ProviderDefinition {
         SEARCH,
         build_provider,
     )
+    .with_image_input()
 }
 
 fn build_provider(config: ProviderBuildConfig) -> Result<Arc<dyn Model>> {

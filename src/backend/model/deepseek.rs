@@ -100,6 +100,6 @@ mod tests {
         assert_eq!(definition.models(), MODELS);
         assert_eq!(definition.web_search(), SEARCH);
         assert_eq!(model.info().reasoning_effort.as_deref(), Some("high"));
-        assert!(!model.supports_attachment_input());
+        assert!(!model.supports_image_input());
     }
 }

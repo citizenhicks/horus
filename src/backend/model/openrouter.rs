@@ -26,6 +26,7 @@ pub(super) const fn provider() -> ProviderDefinition {
         SEARCH,
         build_provider,
     )
+    .with_image_input()
 }
 
 fn build_provider(config: ProviderBuildConfig) -> Result<Arc<dyn Model>> {
