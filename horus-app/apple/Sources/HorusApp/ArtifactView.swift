@@ -79,7 +79,7 @@ private struct WorkspaceFileList: View {
 
     var body: some View {
         content
-            .searchable(text: $query, prompt: "Search files")
+            .searchable(text: $query, placement: .toolbar, prompt: "Search files")
             .task(id: model.workspaceFiles) { tree = FileTreeNode.tree(from: model.workspaceFiles) }
     }
 
@@ -92,12 +92,15 @@ private struct WorkspaceFileList: View {
         } else if !query.isEmpty {
             searchResults
         } else {
-            List(tree, children: \.children) { node in
-                if node.isFolder {
-                    FileTreeRow(node: node).inspectorFileListRow()
-                } else {
-                    fileButton(path: node.id, label: FileTreeRow(node: node))
+            List {
+                OutlineGroup(tree, children: \.children) { node in
+                    if node.isFolder {
+                        FileTreeRow(node: node)
+                    } else {
+                        fileButton(path: node.id, label: FileTreeRow(node: node))
+                    }
                 }
+                .inspectorFileListRow()
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
@@ -123,6 +126,7 @@ private struct WorkspaceFileList: View {
                         size: Int64(clamping: file.size)
                     )
                 )
+                .inspectorFileListRow()
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
@@ -139,7 +143,6 @@ private struct WorkspaceFileList: View {
         .buttonStyle(.horusPlain)
         .disabled(model.isLoadingAttachmentPreview)
         .accessibilityLabel("Open workspace file \(path)")
-        .inspectorFileListRow()
     }
 }
 

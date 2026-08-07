@@ -951,7 +951,7 @@ private struct AttachmentCard<Trailing: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(spacing: 0) {
             HorusIcon(.fileText, size: 26, foreground: palette.accent)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             Text(name)
@@ -964,7 +964,7 @@ private struct AttachmentCard<Trailing: View>: View {
                 .lineLimit(1)
         }
         .padding(10)
-        .frame(width: 136, height: 112, alignment: .leading)
+        .frame(width: 136, height: 112)
         .background(palette.raised, in: HorusStyle.tileShape)
         .overlay(alignment: .topTrailing) { trailing.padding(4) }
         .contentShape(HorusStyle.tileShape)
