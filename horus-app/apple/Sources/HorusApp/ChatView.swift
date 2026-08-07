@@ -6,7 +6,9 @@ import UniformTypeIdentifiers
 import AppKit
 #elseif os(iOS)
 @preconcurrency import AVFoundation
+import CoreTransferable
 import Observation
+import PhotosUI
 import Speech
 import UIKit
 #endif
@@ -529,7 +531,6 @@ private struct TranscriptRowLayout {
 
 private struct TranscriptView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.horusPalette) private var palette
     let bottomInset: CGFloat
     @Binding var isAtBottom: Bool
     let scrollToBottomRequest: Int
@@ -560,7 +561,10 @@ private struct TranscriptView: View {
             .frame(maxWidth: .infinity)
             .padding(contentPadding)
         }
-        .background(palette.canvas)
+        // The keyboard insets this scroll view, so a plain canvas background stops at the
+        // keyboard's top edge and the rounded corners expose black. Every other page paints
+        // its backdrop the same way, which is why only the chat showed the cut.
+        .background(HorusBackdrop())
         .id(model.selectedSessionID)
         .scrollPosition($position)
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
@@ -947,27 +951,23 @@ private struct AttachmentCard<Trailing: View>: View {
     }
 
     var body: some View {
-        HStack(spacing: 10) {
-            HorusIcon(.fileText, size: 17, foreground: palette.accent)
-                .frame(width: 34, height: 34)
-                .background(palette.accent.opacity(0.16), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            VStack(alignment: .leading, spacing: 1) {
-                Text(name)
-                    .font(HorusStyle.badgeFont)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                detail
-                    .font(HorusStyle.badgeFont)
-                    .foregroundStyle(detailColor)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 0)
-            trailing
+        VStack(alignment: .leading, spacing: 0) {
+            HorusIcon(.fileText, size: 26, foreground: palette.accent)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Text(name)
+                .font(HorusStyle.badgeFont)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            detail
+                .font(HorusStyle.badgeFont)
+                .foregroundStyle(detailColor)
+                .lineLimit(1)
         }
-        .padding(8)
-        .frame(maxWidth: 280, alignment: .leading)
-        .background(palette.accentSoft, in: HorusStyle.cardShape)
-        .contentShape(HorusStyle.cardShape)
+        .padding(10)
+        .frame(width: 136, height: 112, alignment: .leading)
+        .background(palette.raised, in: HorusStyle.tileShape)
+        .overlay(alignment: .topTrailing) { trailing.padding(4) }
+        .contentShape(HorusStyle.tileShape)
     }
 }
 
@@ -1532,6 +1532,30 @@ private struct BadgeStat: View {
     }
 }
 
+#if os(iOS)
+private struct ImportedPhotoFile: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(importedContentType: .image) { received in
+            let directory = URL.temporaryDirectory.appending(
+                path: UUID().uuidString,
+                directoryHint: .isDirectory
+            )
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let url = directory.appending(path: received.file.lastPathComponent)
+                try FileManager.default.copyItem(at: received.file, to: url)
+                return Self(url: url)
+            } catch {
+                try? FileManager.default.removeItem(at: directory)
+                throw error
+            }
+        }
+    }
+}
+#endif
+
 private struct ComposerOptionsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
@@ -1540,20 +1564,16 @@ private struct ComposerOptionsView: View {
     @Binding var selection: TextSelection?
     #endif
     @State private var isFileImporterPresented = false
+    #if os(iOS)
+    @State private var isPhotoPickerPresented = false
+    @State private var photoSelection: [PhotosPickerItem] = []
+    #endif
 
     var body: some View {
         // The icon buttons already pad their own glyphs, so they need no spacing between
         // them: 44pt centres are the native rhythm, and anything more reads as drift.
         HStack(spacing: 0) {
-            if model.attachmentsEnabled {
-                Button("Add files", glyph: .plus) {
-                    isFileImporterPresented = true
-                }
-                .labelStyle(.iconOnly)
-                .buttonStyle(HorusIconButtonStyle(bare: true))
-                .disabled(!model.canImportAttachments)
-                .help("Add files")
-            }
+            if model.attachmentsEnabled { addAttachmentControl }
             approvalMenu
             Spacer(minLength: 8)
             modelMenu
@@ -1565,6 +1585,52 @@ private struct ComposerOptionsView: View {
             allowsMultipleSelection: true,
             onCompletion: importFiles
         )
+        #if os(iOS)
+        // The picker runs out of process, so this needs no photo library permission.
+        .photosPicker(
+            isPresented: $isPhotoPickerPresented,
+            selection: $photoSelection,
+            maxSelectionCount: 16,
+            matching: .images
+        )
+        .onChange(of: photoSelection) { _, items in
+            guard !items.isEmpty else { return }
+            photoSelection = []
+            Task { await importPhotos(items) }
+        }
+        #endif
+    }
+
+    /// The photo library and the file browser are separate pickers, so the plus offers both
+    /// rather than assuming every attachment lives in Files.
+    @ViewBuilder
+    private var addAttachmentControl: some View {
+        #if os(iOS)
+        Menu {
+            Button { isPhotoPickerPresented = true } label: {
+                HorusPlatformMenuLabel(title: "Photos", glyph: .image01, systemImage: "photo")
+            }
+            Button { isFileImporterPresented = true } label: {
+                HorusPlatformMenuLabel(title: "Files", glyph: .fileText, systemImage: "folder")
+            }
+        } label: {
+            HorusLabel(title: "Add attachment", glyph: .plus)
+                .labelStyle(.iconOnly)
+                .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.horusPlain)
+        .disabled(!model.canImportAttachments)
+        .accessibilityLabel("Add attachment")
+        #else
+        Button("Add files", glyph: .plus) {
+            isFileImporterPresented = true
+        }
+        .labelStyle(.iconOnly)
+        .buttonStyle(HorusIconButtonStyle(bare: true))
+        .disabled(!model.canImportAttachments)
+        .help("Add files")
+        #endif
     }
 
     private var modelMenu: some View {
@@ -1716,6 +1782,25 @@ private struct ComposerOptionsView: View {
         }
     }
 
+    #if os(iOS)
+    /// Keep the filename supplied by Photos while taking the same import path and limits as Files.
+    private func importPhotos(_ items: [PhotosPickerItem]) async {
+        var urls: [URL] = []
+        for item in items {
+            guard let photo = try? await item.loadTransferable(type: ImportedPhotoFile.self) else {
+                continue
+            }
+            urls.append(photo.url)
+        }
+        guard !urls.isEmpty else {
+            if !items.isEmpty { model.showToast("Could not read the selected photos.", tone: .error) }
+            return
+        }
+        await model.importAttachments(urls)
+        for url in urls { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+    }
+    #endif
+
     private var currentChoice: ModelChoice? {
         model.modelChoices.first { $0.route == model.selectedModelRoute }
     }
@@ -1858,9 +1943,16 @@ private struct ComposerAttachmentsView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            ForEach(model.composerAttachments) { attachment in
-                ComposerAttachmentRow(attachment: attachment)
+            // Tiles are too tall to stack: a few files would push the text field off screen.
+            ScrollView(.horizontal) {
+                HStack(spacing: 8) {
+                    ForEach(model.composerAttachments) { attachment in
+                        ComposerAttachmentRow(attachment: attachment)
+                    }
+                }
             }
+            .scrollIndicators(.hidden)
+            .scrollBounceBehavior(.basedOnSize)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -1873,14 +1965,18 @@ private struct ComposerAttachmentRow: View {
 
     var body: some View {
         AttachmentCard(name: attachment.name, detail: status, detailColor: statusColor) {
-            stateControl
-            Button("Remove attachment", glyph: .x) {
-                model.removeComposerAttachment(attachment.id)
+            // A tile has no room for a row of controls, so the state sits in the corner and
+            // the glyph keeps saying which file this is.
+            HStack(spacing: 2) {
+                stateControl
+                Button("Remove attachment", glyph: .x) {
+                    model.removeComposerAttachment(attachment.id)
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.horusPlain)
+                .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                .disabled(isUploading)
             }
-            .labelStyle(.iconOnly)
-            .buttonStyle(.horusPlain)
-            .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
-            .disabled(isUploading)
         }
         .accessibilityElement(children: .contain)
     }
@@ -1889,10 +1985,9 @@ private struct ComposerAttachmentRow: View {
     private var stateControl: some View {
         switch attachment.state {
         case .queued, .uploading:
-            ProgressView().controlSize(.small)
+            ProgressView().controlSize(.small).frame(width: 26, height: 26)
         case .uploaded:
-            HorusIcon(.checkCircle, foreground: palette.signal)
-                .accessibilityLabel("Uploaded")
+            EmptyView()
         case .failed:
             Button("Retry upload", glyph: .arrowClockwise) {
                 model.retryComposerAttachment(attachment.id)

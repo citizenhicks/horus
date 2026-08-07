@@ -14,8 +14,11 @@ enum HorusStyle {
     #endif
     static let cardRadius: CGFloat = 22
     static let controlRadius: CGFloat = 9
+    /// Between a control and a card: the radius a card keeps when it shrinks to a tile.
+    static let tileRadius: CGFloat = 14
     static let cardShape = RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
     static let controlShape = RoundedRectangle(cornerRadius: controlRadius, style: .continuous)
+    static let tileShape = RoundedRectangle(cornerRadius: tileRadius, style: .continuous)
     static let cardPadding: CGFloat = 14
     static let controlHeight: CGFloat = 30
     static let badgeHeight: CGFloat = 26
@@ -77,6 +80,7 @@ struct HorusGlyph: Hashable {
     static let gear = Self("hi.gear")
     static let gitBranch = Self("hi.gitBranch")
     static let hardDrives = Self("hi.hardDrives")
+    static let image01 = Self("hi.image01")
     static let info = Self("hi.info")
     static let key = Self("hi.key")
     static let link = Self("hi.link")
