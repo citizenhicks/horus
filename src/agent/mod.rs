@@ -48,6 +48,7 @@ const EVENT_QUEUE_CAPACITY: usize = 256;
 const MAX_DEFERRED_SUBMISSIONS: usize = 64;
 const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
 const MAX_OPERATION_BYTES: usize = 256;
+const MAX_ATTACHMENT_REFERENCES: usize = 16;
 const MAX_COMMAND_ARGUMENT_BYTES: usize = 64 * 1024;
 const DEFAULT_INITIAL_REPLAY_BATCHES: usize = 100;
 
@@ -202,7 +203,7 @@ impl AgentSender {
 fn validate_submission(submission: &Submission) -> Result<()> {
     validate_identifier("submission ID", &submission.id, MAX_IDENTIFIER_BYTES)?;
     match &submission.op {
-        Op::UserInput { text } => validate_user_input(text),
+        Op::UserInput { text, attachments } => validate_user_input(text, attachments),
         Op::ActiveInput {
             operation,
             turn_id,
@@ -210,7 +211,7 @@ fn validate_submission(submission: &Submission) -> Result<()> {
         } => {
             validate_identifier("active operation", operation, MAX_OPERATION_BYTES)?;
             validate_identifier("turn ID", turn_id, MAX_IDENTIFIER_BYTES)?;
-            validate_user_input(text)
+            validate_user_input(text, &[])
         }
         Op::Interrupt { turn_id } => validate_identifier("turn ID", turn_id, MAX_IDENTIFIER_BYTES),
         Op::ExecApproval { id, .. } => validate_identifier("approval ID", id, MAX_IDENTIFIER_BYTES),
@@ -250,12 +251,36 @@ fn validate_submission(submission: &Submission) -> Result<()> {
     }
 }
 
-fn validate_user_input(text: &str) -> Result<()> {
-    if text.trim().is_empty() {
+fn validate_user_input(
+    text: &str,
+    attachments: &[crate::protocol::AttachmentReference],
+) -> Result<()> {
+    if text.trim().is_empty() && attachments.is_empty() {
         return Err(Error::Config("user input cannot be empty".into()));
     }
     if text.len() > crate::protocol::MAX_USER_INPUT_BYTES {
         return Err(Error::Config("user input exceeds size limit".into()));
+    }
+    if attachments.len() > MAX_ATTACHMENT_REFERENCES {
+        return Err(Error::Config(format!(
+            "user input cannot reference more than {MAX_ATTACHMENT_REFERENCES} attachments"
+        )));
+    }
+    let mut attachment_ids = std::collections::BTreeSet::new();
+    for attachment in attachments {
+        if !attachment_ids.insert(&attachment.id) {
+            return Err(Error::Config(
+                "attachment IDs must be unique per message".into(),
+            ));
+        }
+        if Uuid::parse_str(&attachment.id).is_err() {
+            return Err(Error::Config("attachment ID must be a UUID".into()));
+        }
+        validate_identifier("attachment name", &attachment.name, 255)?;
+        validate_identifier("attachment media type", &attachment.media_type, 127)?;
+        if attachment.size == 0 {
+            return Err(Error::Config("attachment size must be positive".into()));
+        }
     }
     Ok(())
 }
@@ -371,9 +396,9 @@ impl Runner {
                 }
             };
             match submission.op {
-                Op::UserInput { text } => {
+                Op::UserInput { text, attachments } => {
                     if let Err(error) = self
-                        .start_turn(&mut commands, submission.id.clone(), text)
+                        .start_turn(&mut commands, submission.id.clone(), text, attachments)
                         .await
                     {
                         self.fail_turn(&submission.id, error).await?;

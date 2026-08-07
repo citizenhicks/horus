@@ -6,14 +6,24 @@ use serde::Serialize;
 
 pub use self::replay::events as replay_events;
 pub(crate) use self::replay::{
-    INTERNAL_MESSAGE_FIELD, REPLAY_REASONING_FIELD, TOOL_ERROR_FIELD, internal_message_kind,
-    is_internal_message,
+    ATTACHMENTS_FIELD, INTERNAL_MESSAGE_FIELD, REPLAY_REASONING_FIELD, TOOL_ERROR_FIELD,
+    internal_message_kind, is_internal_message, strip_attachment_references,
 };
 
 mod replay;
 
 /// Maximum total UTF-8 bytes accepted in one user-input submission.
 pub const MAX_USER_INPUT_BYTES: usize = 1024 * 1024;
+
+/// One immutable file uploaded for a user turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentReference {
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+    pub media_type: String,
+}
 
 /// A command submitted by a frontend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +67,10 @@ pub struct SessionContext {
 #[non_exhaustive]
 pub enum Op {
     /// Start a user turn.
-    UserInput { text: String },
+    UserInput {
+        text: String,
+        attachments: Vec<AttachmentReference>,
+    },
     /// Submit capability-owned input while a turn is active.
     ActiveInput {
         operation: String,
@@ -235,6 +248,8 @@ pub struct FrontendCommand {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrontendContribution {
     pub capability: String,
+    /// Whether the composed runtime installs session-bound file attachment endpoints.
+    pub accepts_file_attachments: bool,
     /// Optional capability-owned item count for generic summaries.
     pub count: Option<usize>,
     pub commands: Vec<FrontendCommand>,
@@ -638,6 +653,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserMessageEvent {
     pub message: String,
+    pub attachments: Vec<AttachmentReference>,
     #[serde(deserialize_with = "required_option")]
     pub message_target: Option<MessageTarget>,
 }
@@ -975,6 +991,7 @@ mod tests {
             id: "input-1".into(),
             op: Op::UserInput {
                 text: "hello".into(),
+                attachments: Vec::new(),
             },
         };
 
@@ -984,7 +1001,8 @@ mod tests {
                 "id": "input-1",
                 "op": {
                     "type": "user_input",
-                    "text": "hello"
+                    "text": "hello",
+                    "attachments": []
                 }
             })
         );

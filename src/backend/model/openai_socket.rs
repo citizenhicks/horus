@@ -194,7 +194,7 @@ impl OpenAiSocket {
                 previous_response_id.as_deref(),
                 self.reasoning_effort.as_deref(),
                 &self.hosted_tools,
-            );
+            )?;
             let exchange = timeout(EXCHANGE_TIMEOUT, exchange(&mut socket, &body, &events))
                 .await
                 .map_err(|_| Error::Provider("WebSocket response timed out".into()))??;
@@ -346,12 +346,12 @@ fn response_body(
     previous_response_id: Option<&str>,
     reasoning_effort: Option<&str>,
     hosted_tools: &[Value],
-) -> Value {
+) -> Result<Value> {
     let mut body = serde_json::json!({
         "type": "response.create",
         "model": model,
         "instructions": request.instructions,
-        "input": wire_input(input),
+        "input": wire_input(input, true)?,
         "tools": wire_tools(request.tools, hosted_tools, request.allow_hosted_tools),
         "tool_choice": "auto",
         "parallel_tool_calls": true,
@@ -364,7 +364,7 @@ fn response_body(
     if let Some(effort) = reasoning_effort {
         body["reasoning"] = serde_json::json!({"effort": effort, "summary": "auto"});
     }
-    body
+    Ok(body)
 }
 
 fn continuation_input<'a>(

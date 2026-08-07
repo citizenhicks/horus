@@ -153,6 +153,7 @@ fn sender_rejects_oversized_input_before_queueing() {
         sender
             .submit(Op::UserInput {
                 text: "x".repeat(MAX_USER_INPUT_BYTES + 1),
+                attachments: Vec::new(),
             })
             .is_err()
     );
@@ -165,12 +166,14 @@ fn sender_reports_a_full_live_queue_as_busy() {
     sender
         .submit(Op::UserInput {
             text: "first".into(),
+            attachments: Vec::new(),
         })
         .expect("fill queue");
 
     let error = sender
         .submit(Op::UserInput {
             text: "second".into(),
+            attachments: Vec::new(),
         })
         .expect_err("queue should be full");
 
@@ -487,6 +490,7 @@ async fn request_only_input_reaches_the_model_without_entering_the_checkpoint() 
         .sender()
         .submit(Op::UserInput {
             text: "hello".into(),
+            attachments: Vec::new(),
         })
         .expect("submit input");
     loop {
@@ -546,6 +550,7 @@ async fn completed_before_model_effects_are_settled_when_a_later_hook_fails() {
         .sender()
         .submit(Op::UserInput {
             text: "hello".into(),
+            attachments: Vec::new(),
         })
         .expect("submit input");
     let mut saw_effect = false;
@@ -613,6 +618,7 @@ async fn provider_failure_records_one_failed_execution() {
         .sender()
         .submit(Op::UserInput {
             text: "fail".into(),
+            attachments: Vec::new(),
         })
         .expect("submit input");
     while !matches!(
@@ -680,6 +686,7 @@ async fn automatic_approval_uses_an_isolated_toolless_review_and_counts_usage() 
         .sender()
         .submit(Op::UserInput {
             text: "do it".into(),
+            attachments: Vec::new(),
         })
         .expect("submit input");
     let mut usage_totals = Vec::new();
@@ -767,6 +774,7 @@ async fn malformed_automatic_review_durably_asks_without_dropping_network_access
         .sender()
         .submit(Op::UserInput {
             text: "do it".into(),
+            attachments: Vec::new(),
         })
         .expect("submit input");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -974,6 +982,7 @@ async fn stale_save_does_not_leapfrog_winning_checkpoint() {
     sender
         .submit(Op::UserInput {
             text: "lose the checkpoint race".into(),
+            attachments: Vec::new(),
         })
         .expect("submit turn");
     drop(sender);

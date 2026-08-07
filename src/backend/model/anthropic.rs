@@ -14,6 +14,7 @@ use super::ModelRequest;
 use super::REPLAY_REASONING_FIELD;
 use super::TOOL_ERROR_FIELD;
 use super::ToolDefinition;
+use super::image_input;
 use super::provider::HostedWebSearch;
 use super::provider::ModelPreset;
 use super::provider::ProviderAuth;
@@ -528,24 +529,37 @@ fn translate_messages(input: &[Value]) -> Result<Vec<Value>> {
                     );
                     push_message(&mut messages, role, content.clone());
                 } else {
-                    let blocks = item
+                    let mut blocks = Vec::new();
+                    for part in item
                         .get("content")
                         .and_then(Value::as_array)
                         .into_iter()
                         .flatten()
-                        .filter(|part| {
-                            matches!(
-                                part.get("type").and_then(Value::as_str),
-                                Some("input_text" | "output_text")
-                            )
-                        })
-                        .map(|part| {
-                            serde_json::json!({
-                                "type": "text",
-                                "text": part.get("text").and_then(Value::as_str).unwrap_or_default()
-                            })
-                        })
-                        .collect::<Vec<_>>();
+                    {
+                        match part.get("type").and_then(Value::as_str) {
+                            Some("input_text" | "output_text") => {
+                                blocks.push(serde_json::json!({
+                                    "type": "text",
+                                    "text": part.get("text").and_then(Value::as_str).unwrap_or_default()
+                                }));
+                            }
+                            Some("input_image") => {
+                                let Some((media_type, data)) = image_input(part, "Anthropic")?
+                                else {
+                                    continue;
+                                };
+                                blocks.push(serde_json::json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": data
+                                    }
+                                }));
+                            }
+                            None | Some(_) => {}
+                        }
+                    }
                     push_message(&mut messages, role, blocks);
                 }
             }

@@ -1,6 +1,7 @@
 import Foundation
 import LocalAuthentication
 import Observation
+import UniformTypeIdentifiers
 
 enum AppDestination: Equatable {
     case chat
@@ -80,12 +81,120 @@ struct AppToast: Identifiable {
     let tone: ToastTone
 }
 
+enum ComposerAttachmentState: Equatable {
+    case queued
+    case uploading
+    case uploaded(AttachmentRecord)
+    case failed(String)
+}
+
+struct ComposerAttachment: Identifiable, Equatable {
+    let id: UUID
+    let name: String
+    let size: Int64
+    let mediaType: String
+    var state: ComposerAttachmentState
+}
+
+private struct PendingComposerDraft {
+    let text: String
+    let attachments: [AttachmentRecord]
+}
+
+private enum AttachmentUploadRequest {
+    case begin(localID: UUID)
+    case append(localID: UUID)
+    case finish(localID: UUID)
+}
+
+private struct ActiveAttachmentUpload {
+    let localID: UUID
+    let sessionID: String
+    let uploadID: String
+    let maxChunkBytes: Int
+}
+
+private struct AttachmentPreviewDownload {
+    let generation: UUID
+    let attachment: AttachmentRecord
+    let sessionID: String
+    var data: Data
+    var requestID: String
+}
+
+private struct WorkspaceFilePreviewDownload {
+    let generation: UUID
+    let file: WorkspaceFileRecord
+    let sessionID: String
+    var data: Data
+    var requestID: String
+}
+
+private struct ImportedAttachmentData: Sendable {
+    let name: String
+    let mediaType: String
+    let data: Data
+}
+
+private struct AttachmentPreviewFile: Sendable {
+    let directory: URL
+    let url: URL
+}
+
+private enum AttachmentImportError: LocalizedError {
+    case notAFile
+    case tooLarge
+    case totalTooLarge
+    case changedWhileReading
+
+    var errorDescription: String? {
+        switch self {
+        case .notAFile: "Choose a regular file."
+        case .tooLarge: "Attachments are limited to 25 MiB each."
+        case .totalTooLarge: "Attachments in one message are limited to 100 MiB total."
+        case .changedWhileReading: "The file changed while Horus was reading it. Try again."
+        }
+    }
+}
+
 enum ThemePreference: String, CaseIterable, Identifiable {
     case system
     case dark
     case light
 
     var id: Self { self }
+}
+
+enum InspectorPage {
+    case changes
+    case uploads
+}
+
+enum WorkspaceViewerScope: String, CaseIterable, Identifiable {
+    case staged
+    case unstaged
+    case committed
+    case all
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .staged: "Staged"
+        case .unstaged: "Unstaged"
+        case .committed: "Committed"
+        case .all: "All"
+        }
+    }
+
+    var gitScope: GitDiffScope? {
+        switch self {
+        case .staged: .staged
+        case .unstaged: .unstaged
+        case .committed: .committed
+        case .all: nil
+        }
+    }
 }
 
 enum AppLockAuthenticationMethod: Equatable {
@@ -190,6 +299,9 @@ struct AppLockAuthenticator {
 }
 
 private let appLockEnabledKey = "app-lock-enabled"
+private let maximumAttachmentBytes = 25 * 1024 * 1024
+private let maximumComposerAttachmentBytes: Int64 = 100 * 1024 * 1024
+private let maximumPreviewBytes = 25 * 1024 * 1024
 
 @Observable
 final class TranscriptEntry: Identifiable {
@@ -209,6 +321,7 @@ final class TranscriptEntry: Identifiable {
     var tone: String
     var pending: Bool
     var messageTarget: MessageTarget?
+    var attachments: [AttachmentRecord]
 
     init(
         id: String,
@@ -218,7 +331,8 @@ final class TranscriptEntry: Identifiable {
         format: String,
         tone: String = "neutral",
         pending: Bool,
-        messageTarget: MessageTarget? = nil
+        messageTarget: MessageTarget? = nil,
+        attachments: [AttachmentRecord] = []
     ) {
         self.id = id
         self.text = text
@@ -228,6 +342,7 @@ final class TranscriptEntry: Identifiable {
         self.tone = tone
         self.pending = pending
         self.messageTarget = messageTarget
+        self.attachments = attachments
     }
 }
 
@@ -325,6 +440,11 @@ final class AppModel {
         replayPresentedTranscript ?? transcript
     }
     var composer = ""
+    var composerAttachments: [ComposerAttachment] = []
+    var uploadedAttachments: [AttachmentRecord] = []
+    private(set) var isLoadingAttachments = false
+    var previewURL: URL?
+    private(set) var isLoadingAttachmentPreview = false
     var toast: AppToast?
     var activeTurnID: String?
     var activeOperation: String?
@@ -344,6 +464,11 @@ final class AppModel {
     var presentedPreview: TranscriptPreview?
     var selectedArtifactID: String?
     var showsInspector = false
+    var inspectorPage: InspectorPage = .changes
+    var workspaceViewerScope: WorkspaceViewerScope = .unstaged
+    var workspaceFiles: [WorkspaceFileRecord] = []
+    private(set) var isLoadingGitDiff = false
+    private(set) var isLoadingWorkspaceFiles = false
     var profile: ProfileSnapshot?
     var runStats = RunStats()
     var currentUsage = TokenUsage()
@@ -394,7 +519,7 @@ final class AppModel {
     @ObservationIgnored private var connectionGeneration = UUID()
     @ObservationIgnored private var reconnectsOnActivation = false
     @ObservationIgnored private var pendingPairingAccount: GatewayAccount?
-    @ObservationIgnored private var pendingDrafts: [String: String] = [:]
+    @ObservationIgnored private var pendingDrafts: [String: PendingComposerDraft] = [:]
     @ObservationIgnored private var sessionRequestID: String?
     @ObservationIgnored private var sessionOpeningID: String?
     @ObservationIgnored private var pendingCachedTranscript: CachedTranscript?
@@ -406,6 +531,17 @@ final class AppModel {
     @ObservationIgnored private var approvalRequestID: String?
     @ObservationIgnored private var directoryRequestID: String?
     @ObservationIgnored private var gitDiffRequestID: String?
+    @ObservationIgnored private var workspaceFilesRequestID: String?
+    @ObservationIgnored private var attachmentListRequestID: String?
+    @ObservationIgnored private var attachmentUploadRequests: [String: AttachmentUploadRequest] = [:]
+    @ObservationIgnored private var attachmentData: [UUID: Data] = [:]
+    @ObservationIgnored private var attachmentImportReservations = 0
+    @ObservationIgnored private var attachmentImportGeneration = UUID()
+    @ObservationIgnored private var activeAttachmentUpload: ActiveAttachmentUpload?
+    @ObservationIgnored private var attachmentPreviewDownload: AttachmentPreviewDownload?
+    @ObservationIgnored private var workspaceFilePreviewDownload: WorkspaceFilePreviewDownload?
+    @ObservationIgnored private var attachmentPreviewGeneration = UUID()
+    @ObservationIgnored private var previewTemporaryDirectory: URL?
     private var gitBranchRequestID: String?
     @ObservationIgnored private var credentialRequestID: String?
     @ObservationIgnored private var pairingCodeRequestID: String?
@@ -488,6 +624,7 @@ final class AppModel {
             && sessionRequestID == nil
             && sessionMutationRequestID == nil
             && gitBranchRequestID == nil
+            && attachmentUploadRequests.isEmpty
             && applyState != .applying
             && applyState != .restarting
     }
@@ -495,6 +632,51 @@ final class AppModel {
     var canCreateSession: Bool { canOpenSession }
 
     var isSwitchingGitBranch: Bool { gitBranchRequestID != nil }
+
+    var attachmentsEnabled: Bool {
+        contributions.contains { $0.acceptsFileAttachments }
+    }
+
+    var selectedRouteSupportsAttachmentInput: Bool {
+        modelChoices.first(where: { $0.route == selectedModelRoute })?
+            .supportsAttachmentInput == true
+    }
+
+    var canSubmitAttachments: Bool {
+        attachmentsEnabled && selectedRouteSupportsAttachmentInput
+    }
+
+    var attachmentSubmissionUnavailableMessage: String {
+        attachmentsEnabled
+            ? "The selected model does not accept attachments."
+            : "File attachments are not enabled for this chat."
+    }
+
+    var canImportAttachments: Bool {
+        canSubmitAttachments
+            && connectionState.isReady
+            && selectedSessionID != nil
+            && activeTurnID == nil
+    }
+
+    var canSendComposer: Bool {
+        let hasText = !composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let uploaded = composerAttachments.compactMap { item -> AttachmentRecord? in
+            guard case .uploaded(let attachment) = item.state else { return nil }
+            return attachment
+        }
+        guard uploaded.isEmpty || canSubmitAttachments else { return false }
+        return hasText || !uploaded.isEmpty
+    }
+
+    var composerHasUnfinishedAttachments: Bool {
+        composerAttachments.contains { item in
+            switch item.state {
+            case .uploaded: false
+            case .queued, .uploading, .failed: true
+            }
+        }
+    }
 
     var runningSessionIDs: Set<String> {
         Set(sessions.lazy.filter { $0.activity.state != .idle }.map(\.sessionId))
@@ -873,6 +1055,10 @@ final class AppModel {
         cachedTranscript: CachedTranscript? = nil,
         presentedTranscript: [TranscriptEntry]? = nil
     ) {
+        if sessionID != selectedSessionID {
+            discardComposerAttachments()
+            discardAttachmentPreview()
+        }
         sessionToRestoreID = nil
         sessionOpeningID = sessionID
         sessionOpenCursor = lastSequence
@@ -944,9 +1130,38 @@ final class AppModel {
 
     func refreshGitDiff() {
         guard connectionState.isReady, let sessionID = selectedSessionID else { return }
+        guard let scope = workspaceViewerScope.gitScope else {
+            refreshWorkspaceFiles()
+            return
+        }
         let id = requestID("git-diff")
         gitDiffRequestID = id
-        transmit(.getGitDiff(requestID: id, sessionID: sessionID))
+        isLoadingGitDiff = true
+        transmit(.getGitDiff(requestID: id, sessionID: sessionID, scope: scope)) { [weak self] _ in
+            guard self?.gitDiffRequestID == id else { return }
+            self?.gitDiffRequestID = nil
+            self?.isLoadingGitDiff = false
+        }
+    }
+
+    func selectWorkspaceViewerScope(_ scope: WorkspaceViewerScope) {
+        guard workspaceViewerScope != scope else { return }
+        workspaceViewerScope = scope
+        gitDiff = ""
+        workspaceFiles = []
+        refreshGitDiff()
+    }
+
+    private func refreshWorkspaceFiles() {
+        guard connectionState.isReady, let sessionID = selectedSessionID else { return }
+        let id = requestID("workspace-files")
+        workspaceFilesRequestID = id
+        isLoadingWorkspaceFiles = true
+        transmit(.listWorkspaceFiles(requestID: id, sessionID: sessionID)) { [weak self] _ in
+            guard self?.workspaceFilesRequestID == id else { return }
+            self?.workspaceFilesRequestID = nil
+            self?.isLoadingWorkspaceFiles = false
+        }
     }
 
     func switchGitBranch(to branch: String) {
@@ -963,12 +1178,185 @@ final class AppModel {
         }
     }
 
+    func importAttachments(_ urls: [URL]) async {
+        guard canImportAttachments, let sessionID = selectedSessionID else { return }
+        let generation = attachmentImportGeneration
+        let available = max(
+            0,
+            maximumAttachmentReferences - composerAttachments.count - attachmentImportReservations
+        )
+        let selectedURLs = Array(urls.prefix(available))
+        if urls.count > selectedURLs.count {
+            showToast("You can attach up to 16 files to a message.", tone: .warning)
+        }
+        guard !selectedURLs.isEmpty else { return }
+
+        var reservedCount = selectedURLs.count
+        attachmentImportReservations += reservedCount
+        defer { attachmentImportReservations -= reservedCount }
+        for url in selectedURLs {
+            guard generation == attachmentImportGeneration else { return }
+            do {
+                let imported = try await Self.loadImportedAttachment(url)
+                attachmentImportReservations -= 1
+                reservedCount -= 1
+                guard generation == attachmentImportGeneration,
+                      sessionID == selectedSessionID,
+                      canImportAttachments
+                else { return }
+                let currentBytes = composerAttachments.reduce(Int64(0)) { total, attachment in
+                    let (sum, overflow) = total.addingReportingOverflow(attachment.size)
+                    return overflow || attachment.size < 0 ? .max : sum
+                }
+                if currentBytes > maximumComposerAttachmentBytes - Int64(imported.data.count) {
+                    showToast(AttachmentImportError.totalTooLarge.localizedDescription, tone: .error)
+                    continue
+                }
+                let id = UUID()
+                attachmentData[id] = imported.data
+                composerAttachments.append(ComposerAttachment(
+                    id: id,
+                    name: imported.name,
+                    size: Int64(imported.data.count),
+                    mediaType: imported.mediaType,
+                    state: .queued
+                ))
+            } catch {
+                attachmentImportReservations -= 1
+                reservedCount -= 1
+                guard generation == attachmentImportGeneration else { return }
+                showToast(error.localizedDescription, tone: .error)
+            }
+        }
+        startNextAttachmentUpload()
+    }
+
+    func removeComposerAttachment(_ id: UUID) {
+        guard activeAttachmentUpload?.localID != id else { return }
+        attachmentData[id] = nil
+        composerAttachments.removeAll { $0.id == id }
+    }
+
+    func retryComposerAttachment(_ id: UUID) {
+        guard attachmentData[id] != nil,
+              let index = composerAttachments.firstIndex(where: { $0.id == id }),
+              case .failed = composerAttachments[index].state
+        else { return }
+        composerAttachments[index].state = .queued
+        startNextAttachmentUpload()
+    }
+
+    func refreshAttachments() {
+        guard connectionState.isReady, let sessionID = selectedSessionID else { return }
+        let id = requestID("attachments")
+        attachmentListRequestID = id
+        isLoadingAttachments = true
+        transmit(.listAttachments(requestID: id, sessionID: sessionID)) { [weak self] _ in
+            guard self?.attachmentListRequestID == id else { return }
+            self?.attachmentListRequestID = nil
+            self?.isLoadingAttachments = false
+        }
+    }
+
+    func previewAttachment(_ attachment: AttachmentRecord) {
+        guard let sessionID = selectedSessionID else { return }
+        guard attachment.size <= Int64(maximumPreviewBytes) else {
+            showToast("Quick Look previews are limited to 25 MiB.", tone: .warning)
+            return
+        }
+        discardAttachmentPreview()
+        let id = requestID("attachment-read")
+        let generation = UUID()
+        attachmentPreviewGeneration = generation
+        attachmentPreviewDownload = AttachmentPreviewDownload(
+            generation: generation,
+            attachment: attachment,
+            sessionID: sessionID,
+            data: Data(),
+            requestID: id
+        )
+        isLoadingAttachmentPreview = true
+        transmit(.readAttachment(
+            requestID: id,
+            sessionID: sessionID,
+            attachmentID: attachment.id,
+            offset: 0,
+            maxBytes: 256 * 1024
+        )) { [weak self] message in
+            guard self?.attachmentPreviewDownload?.requestID == id else { return }
+            self?.attachmentPreviewDownload = nil
+            self?.isLoadingAttachmentPreview = false
+            self?.showToast(message, tone: .error)
+        }
+    }
+
+    func previewWorkspaceFile(_ file: WorkspaceFileRecord) {
+        guard let sessionID = selectedSessionID else { return }
+        guard file.size <= UInt64(maximumPreviewBytes) else {
+            showToast("Quick Look previews are limited to 25 MiB.", tone: .warning)
+            return
+        }
+        discardAttachmentPreview()
+        let id = requestID("workspace-file-read")
+        let generation = UUID()
+        attachmentPreviewGeneration = generation
+        workspaceFilePreviewDownload = WorkspaceFilePreviewDownload(
+            generation: generation,
+            file: file,
+            sessionID: sessionID,
+            data: Data(),
+            requestID: id
+        )
+        isLoadingAttachmentPreview = true
+        transmit(.readWorkspaceFile(
+            requestID: id,
+            sessionID: sessionID,
+            path: file.path,
+            offset: 0,
+            maxBytes: 256 * 1024
+        )) { [weak self] message in
+            guard self?.workspaceFilePreviewDownload?.requestID == id else { return }
+            self?.workspaceFilePreviewDownload = nil
+            self?.isLoadingAttachmentPreview = false
+            self?.showToast(message, tone: .error)
+        }
+    }
+
+    func discardAttachmentPreview() {
+        attachmentPreviewGeneration = UUID()
+        attachmentPreviewDownload = nil
+        workspaceFilePreviewDownload = nil
+        isLoadingAttachmentPreview = false
+        if let previewTemporaryDirectory {
+            try? FileManager.default.removeItem(at: previewTemporaryDirectory)
+        }
+        previewTemporaryDirectory = nil
+        previewURL = nil
+    }
+
     func sendMessage() {
         guard let sessionID = selectedSessionID else { return }
         let text = composer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        let attachments = composerAttachments.compactMap { item -> AttachmentRecord? in
+            guard case .uploaded(let attachment) = item.state else { return nil }
+            return attachment
+        }
+        guard attachments.count <= maximumAttachmentReferences else { return }
+        guard !text.isEmpty || !attachments.isEmpty else { return }
+        guard attachments.isEmpty || canSubmitAttachments else {
+            showToast(attachmentSubmissionUnavailableMessage, tone: .warning)
+            return
+        }
+        guard !composerHasUnfinishedAttachments else {
+            showToast("Wait for attachments to finish uploading.", tone: .warning)
+            return
+        }
         guard text.utf8.count <= maximumComposerBytes else {
             showToast("Messages are limited to 1 MiB.", tone: .error)
+            return
+        }
+        if activeTurnID != nil, !attachments.isEmpty {
+            showToast("Attachments can be sent with a new turn.", tone: .warning)
             return
         }
         let id = requestID("input")
@@ -976,10 +1364,11 @@ final class AppModel {
         if let activeTurnID, let activeOperation {
             op = .activeInput(operation: activeOperation, turnID: activeTurnID, text: text)
         } else {
-            op = .userInput(text: text)
+            op = .userInput(text: text, attachments: attachments)
         }
-        pendingDrafts[id] = text
+        pendingDrafts[id] = PendingComposerDraft(text: text, attachments: attachments)
         composer = ""
+        composerAttachments = []
         transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: op))) { [weak self] _ in
             self?.restoreDraft(id: id)
         }
@@ -1103,13 +1492,21 @@ final class AppModel {
 
     func selectArtifact(_ id: String) {
         selectedArtifactID = id
+        inspectorPage = .changes
         showsInspector = true
         refreshGitDiff()
     }
 
     func showInspector() {
+        inspectorPage = .changes
         showsInspector = true
         refreshGitDiff()
+    }
+
+    func showUploadedFiles() {
+        inspectorPage = .uploads
+        showsInspector = true
+        refreshAttachments()
     }
 
     func toggleInspector() {
@@ -1630,10 +2027,79 @@ final class AppModel {
             if selectedArtifactID == nil || !self.artifacts.contains(where: { $0.id == selectedArtifactID }) {
                 selectedArtifactID = self.artifacts.first?.id
             }
-        case .gitDiff(let requestID, let sessionID, let diff):
-            guard requestID == gitDiffRequestID, sessionID == selectedSessionID else { break }
+        case .gitDiff(let requestID, let sessionID, let scope, let diff):
+            guard requestID == gitDiffRequestID,
+                  sessionID == selectedSessionID,
+                  scope == workspaceViewerScope.gitScope
+            else { break }
             gitDiffRequestID = nil
+            isLoadingGitDiff = false
             gitDiff = diff
+        case .workspaceFiles(let requestID, let sessionID, let files):
+            guard requestID == workspaceFilesRequestID,
+                  sessionID == selectedSessionID,
+                  workspaceViewerScope == .all
+            else { break }
+            workspaceFilesRequestID = nil
+            isLoadingWorkspaceFiles = false
+            workspaceFiles = files
+        case .workspaceFileChunk(
+            let requestID,
+            let sessionID,
+            let path,
+            let offset,
+            let data,
+            let nextOffset
+        ):
+            handleWorkspaceFileChunk(
+                requestID: requestID,
+                sessionID: sessionID,
+                path: path,
+                offset: offset,
+                data: data,
+                nextOffset: nextOffset
+            )
+        case .attachmentUploadStarted(let requestID, let sessionID, let uploadID, let maxChunkBytes):
+            handleAttachmentUploadStarted(
+                requestID: requestID,
+                sessionID: sessionID,
+                uploadID: uploadID,
+                maxChunkBytes: maxChunkBytes
+            )
+        case .attachmentChunkAccepted(let requestID, let sessionID, let uploadID, let nextOffset):
+            handleAttachmentChunkAccepted(
+                requestID: requestID,
+                sessionID: sessionID,
+                uploadID: uploadID,
+                nextOffset: nextOffset
+            )
+        case .attachmentUploaded(let requestID, let sessionID, let attachment):
+            handleAttachmentUploaded(
+                requestID: requestID,
+                sessionID: sessionID,
+                attachment: attachment
+            )
+        case .attachments(let requestID, let sessionID, let attachments):
+            guard requestID == attachmentListRequestID, sessionID == selectedSessionID else { break }
+            attachmentListRequestID = nil
+            isLoadingAttachments = false
+            uploadedAttachments = attachments
+        case .attachmentChunk(
+            let requestID,
+            let sessionID,
+            let attachmentID,
+            let offset,
+            let data,
+            let nextOffset
+        ):
+            handleAttachmentChunk(
+                requestID: requestID,
+                sessionID: sessionID,
+                attachmentID: attachmentID,
+                offset: offset,
+                data: data,
+                nextOffset: nextOffset
+            )
         case .directories(let requestID, let listing):
             guard requestID == directoryRequestID else { break }
             directoryRequestID = nil
@@ -1923,6 +2389,7 @@ final class AppModel {
         guard selectedSessionID != nil else { return }
         refreshArtifacts()
         refreshGitDiff()
+        refreshAttachments()
         refreshCron()
     }
 
@@ -1983,6 +2450,19 @@ final class AppModel {
             requestSessionOpen(sessionID, lastSequence: nil, replayEpoch: nil)
             return
         }
+        failAttachmentRequest(rejection.requestId, message: rejection.message, showsToast: false)
+        if rejection.requestId == attachmentListRequestID {
+            attachmentListRequestID = nil
+            isLoadingAttachments = false
+        }
+        if rejection.requestId == attachmentPreviewDownload?.requestID {
+            attachmentPreviewDownload = nil
+            isLoadingAttachmentPreview = false
+        }
+        if rejection.requestId == workspaceFilePreviewDownload?.requestID {
+            workspaceFilePreviewDownload = nil
+            isLoadingAttachmentPreview = false
+        }
         if pendingDrafts[rejection.requestId] != nil {
             restoreDraft(id: rejection.requestId)
         }
@@ -2020,6 +2500,11 @@ final class AppModel {
         }
         if rejection.requestId == gitDiffRequestID {
             gitDiffRequestID = nil
+            isLoadingGitDiff = false
+        }
+        if rejection.requestId == workspaceFilesRequestID {
+            workspaceFilesRequestID = nil
+            isLoadingWorkspaceFiles = false
         }
         if rejection.requestId == gitBranchRequestID {
             gitBranchRequestID = nil
@@ -2104,10 +2589,14 @@ final class AppModel {
 
         switch type {
         case "user_message":
+            let attachments = event.msg["attachments"]?.arrayValue?.compactMap {
+                try? AttachmentRecord(json: $0)
+            } ?? []
             appendText(
                 event.msg["message"]?.stringValue,
                 kind: .user,
-                messageTarget: messageTarget(from: event.msg)
+                messageTarget: messageTarget(from: event.msg),
+                attachments: attachments
             )
         case "agent_message_content_delta":
             let phase = event.msg["phase"]?.stringValue
@@ -2392,9 +2881,11 @@ final class AppModel {
         _ text: String?,
         kind: TranscriptEntry.Kind,
         tone: String = "neutral",
-        messageTarget: MessageTarget? = nil
+        messageTarget: MessageTarget? = nil,
+        attachments: [AttachmentRecord] = []
     ) {
-        guard let text, !text.isEmpty else { return }
+        let text = text ?? ""
+        guard !text.isEmpty || !attachments.isEmpty else { return }
         transcript.append(TranscriptEntry(
             id: UUID().uuidString,
             text: text,
@@ -2402,7 +2893,8 @@ final class AppModel {
             format: "plain_text",
             tone: tone,
             pending: false,
-            messageTarget: messageTarget
+            messageTarget: messageTarget,
+            attachments: attachments
         ))
     }
 
@@ -2516,6 +3008,393 @@ final class AppModel {
         )
     }
 
+    private nonisolated static func loadImportedAttachment(
+        _ url: URL
+    ) async throws -> ImportedAttachmentData {
+        try await Task.detached(priority: .userInitiated) {
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+
+            let values = try url.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .fileSizeKey,
+                .contentTypeKey,
+            ])
+            guard values.isRegularFile == true else { throw AttachmentImportError.notAFile }
+            if let size = values.fileSize, size > maximumAttachmentBytes {
+                throw AttachmentImportError.tooLarge
+            }
+            let data = try Data(contentsOf: url)
+            guard data.count <= maximumAttachmentBytes else { throw AttachmentImportError.tooLarge }
+            if let size = values.fileSize, size != data.count {
+                throw AttachmentImportError.changedWhileReading
+            }
+            let mediaType = values.contentType?.preferredMIMEType
+                ?? UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+                ?? "application/octet-stream"
+            return ImportedAttachmentData(
+                name: url.lastPathComponent,
+                mediaType: mediaType,
+                data: data
+            )
+        }.value
+    }
+
+    private func startNextAttachmentUpload() {
+        guard connectionState.isReady,
+              activeAttachmentUpload == nil,
+              attachmentUploadRequests.isEmpty,
+              let sessionID = selectedSessionID,
+              let index = composerAttachments.firstIndex(where: {
+                  if case .queued = $0.state { return true }
+                  return false
+              }),
+              attachmentData[composerAttachments[index].id] != nil
+        else { return }
+
+        let item = composerAttachments[index]
+        composerAttachments[index].state = .uploading
+        let id = requestID("attachment-begin")
+        attachmentUploadRequests[id] = .begin(localID: item.id)
+        transmit(.beginAttachmentUpload(
+            requestID: id,
+            sessionID: sessionID,
+            name: item.name,
+            size: item.size,
+            mediaType: item.mediaType
+        )) { [weak self] message in
+            self?.failAttachmentRequest(id, message: message, showsToast: false)
+        }
+    }
+
+    private func handleAttachmentUploadStarted(
+        requestID: String,
+        sessionID: String,
+        uploadID: String,
+        maxChunkBytes: Int
+    ) {
+        guard case .begin(let localID) = attachmentUploadRequests.removeValue(forKey: requestID)
+        else { return }
+        guard sessionID == selectedSessionID,
+              !uploadID.isEmpty,
+              maxChunkBytes > 0,
+              maxChunkBytes <= maximumGatewayFrameBytes
+        else { return failAttachment(localID, message: "The gateway returned an invalid upload.") }
+        activeAttachmentUpload = ActiveAttachmentUpload(
+            localID: localID,
+            sessionID: sessionID,
+            uploadID: uploadID,
+            maxChunkBytes: min(maxChunkBytes, 256 * 1024)
+        )
+        sendNextAttachmentChunk(localID: localID, offset: 0)
+    }
+
+    private func handleAttachmentChunkAccepted(
+        requestID: String,
+        sessionID: String,
+        uploadID: String,
+        nextOffset: Int64
+    ) {
+        guard case .append(let localID) = attachmentUploadRequests.removeValue(forKey: requestID)
+        else { return }
+        guard let upload = activeAttachmentUpload,
+              upload.localID == localID,
+              upload.sessionID == sessionID,
+              upload.uploadID == uploadID
+        else {
+            return failAttachment(localID, message: "The gateway returned an invalid upload.")
+        }
+        sendNextAttachmentChunk(localID: localID, offset: nextOffset)
+    }
+
+    private func sendNextAttachmentChunk(localID: UUID, offset: Int64) {
+        guard let upload = activeAttachmentUpload,
+              upload.localID == localID,
+              let data = attachmentData[localID],
+              offset >= 0,
+              let start = Int(exactly: offset),
+              start <= data.count
+        else {
+            failAttachment(localID, message: "The gateway returned an invalid upload offset.")
+            return
+        }
+        guard start < data.count else {
+            let id = requestID("attachment-finish")
+            attachmentUploadRequests[id] = .finish(localID: localID)
+            transmit(.finishAttachmentUpload(
+                requestID: id,
+                sessionID: upload.sessionID,
+                uploadID: upload.uploadID
+            )) { [weak self] message in
+                self?.failAttachmentRequest(id, message: message, showsToast: false)
+            }
+            return
+        }
+
+        let end = min(start + upload.maxChunkBytes, data.count)
+        let id = requestID("attachment-chunk")
+        attachmentUploadRequests[id] = .append(localID: localID)
+        transmit(.appendAttachmentChunk(
+            requestID: id,
+            sessionID: upload.sessionID,
+            uploadID: upload.uploadID,
+            offset: offset,
+            data: Data(data[start..<end])
+        )) { [weak self] message in
+            self?.failAttachmentRequest(id, message: message, showsToast: false)
+        }
+    }
+
+    private func handleAttachmentUploaded(
+        requestID: String,
+        sessionID: String,
+        attachment: AttachmentRecord
+    ) {
+        guard case .finish(let localID) = attachmentUploadRequests.removeValue(forKey: requestID)
+        else { return }
+        guard sessionID == selectedSessionID,
+              activeAttachmentUpload?.localID == localID,
+              activeAttachmentUpload?.sessionID == sessionID,
+              let index = composerAttachments.firstIndex(where: { $0.id == localID }),
+              composerAttachments[index].name == attachment.name,
+              composerAttachments[index].size == attachment.size,
+              composerAttachments[index].mediaType == attachment.mediaType
+        else {
+            return failAttachment(localID, message: "The gateway returned an invalid attachment.")
+        }
+        composerAttachments[index].state = .uploaded(attachment)
+        attachmentData[localID] = nil
+        activeAttachmentUpload = nil
+        upsertUploadedAttachment(attachment)
+        startNextAttachmentUpload()
+    }
+
+    @discardableResult
+    private func failAttachmentRequest(
+        _ requestID: String,
+        message: String,
+        showsToast: Bool = true
+    ) -> Bool {
+        guard let request = attachmentUploadRequests.removeValue(forKey: requestID) else {
+            return false
+        }
+        let localID = switch request {
+        case .begin(let localID), .append(let localID), .finish(let localID): localID
+        }
+        failAttachment(localID, message: message, showsToast: showsToast)
+        return true
+    }
+
+    private func failAttachment(
+        _ localID: UUID,
+        message: String,
+        showsToast: Bool = true
+    ) {
+        attachmentUploadRequests = attachmentUploadRequests.filter { _, request in
+            switch request {
+            case .begin(let id), .append(let id), .finish(let id): id != localID
+            }
+        }
+        if activeAttachmentUpload?.localID == localID { activeAttachmentUpload = nil }
+        if let index = composerAttachments.firstIndex(where: { $0.id == localID }) {
+            composerAttachments[index].state = .failed(message)
+        }
+        if showsToast { showToast(message, tone: .error) }
+        startNextAttachmentUpload()
+    }
+
+    private func upsertUploadedAttachment(_ attachment: AttachmentRecord) {
+        if let index = uploadedAttachments.firstIndex(where: { $0.id == attachment.id }) {
+            uploadedAttachments[index] = attachment
+        } else {
+            uploadedAttachments.append(attachment)
+        }
+    }
+
+    private func discardComposerAttachments() {
+        attachmentImportGeneration = UUID()
+        composerAttachments.removeAll()
+        attachmentData.removeAll()
+    }
+
+    private func discardPendingComposerAttachments() {
+        attachmentImportGeneration = UUID()
+        composerAttachments.removeAll { item in
+            if case .uploaded = item.state { return false }
+            return true
+        }
+        attachmentData.removeAll()
+    }
+
+    private func handleAttachmentChunk(
+        requestID: String,
+        sessionID: String,
+        attachmentID: String,
+        offset: Int64,
+        data: Data,
+        nextOffset: Int64?
+    ) {
+        guard var download = attachmentPreviewDownload else { return }
+        guard download.requestID == requestID,
+              download.sessionID == sessionID,
+              download.attachment.id == attachmentID,
+              offset == Int64(download.data.count),
+              data.count <= 256 * 1024,
+              Int64(download.data.count + data.count) <= download.attachment.size
+        else {
+            attachmentPreviewDownload = nil
+            isLoadingAttachmentPreview = false
+            showToast("The gateway returned an invalid attachment.", tone: .error)
+            return
+        }
+        download.data.append(data)
+        if let nextOffset {
+            guard nextOffset == Int64(download.data.count), nextOffset > offset else {
+                attachmentPreviewDownload = nil
+                isLoadingAttachmentPreview = false
+                showToast("The gateway returned an invalid attachment offset.", tone: .error)
+                return
+            }
+            let id = self.requestID("attachment-read")
+            download.requestID = id
+            attachmentPreviewDownload = download
+            transmit(.readAttachment(
+                requestID: id,
+                sessionID: sessionID,
+                attachmentID: attachmentID,
+                offset: nextOffset,
+                maxBytes: 256 * 1024
+            )) { [weak self] message in
+                guard self?.attachmentPreviewDownload?.requestID == id else { return }
+                self?.attachmentPreviewDownload = nil
+                self?.isLoadingAttachmentPreview = false
+                self?.showToast(message, tone: .error)
+            }
+            return
+        }
+
+        guard Int64(download.data.count) == download.attachment.size else {
+            attachmentPreviewDownload = nil
+            isLoadingAttachmentPreview = false
+            showToast("The downloaded attachment is incomplete.", tone: .error)
+            return
+        }
+        attachmentPreviewDownload = nil
+        finishFilePreview(
+            download.data,
+            name: download.attachment.name,
+            generation: download.generation
+        )
+    }
+
+    private func handleWorkspaceFileChunk(
+        requestID: String,
+        sessionID: String,
+        path: String,
+        offset: UInt64,
+        data: Data,
+        nextOffset: UInt64?
+    ) {
+        guard var download = workspaceFilePreviewDownload else { return }
+        guard download.requestID == requestID,
+              download.sessionID == sessionID,
+              download.file.path == path,
+              offset == UInt64(download.data.count),
+              data.count <= 256 * 1024,
+              offset <= download.file.size,
+              UInt64(data.count) <= download.file.size - offset
+        else {
+            workspaceFilePreviewDownload = nil
+            isLoadingAttachmentPreview = false
+            showToast("The gateway returned an invalid workspace file.", tone: .error)
+            return
+        }
+        download.data.append(data)
+        if let nextOffset {
+            guard nextOffset == UInt64(download.data.count), nextOffset > offset else {
+                workspaceFilePreviewDownload = nil
+                isLoadingAttachmentPreview = false
+                showToast("The gateway returned an invalid workspace file offset.", tone: .error)
+                return
+            }
+            let id = self.requestID("workspace-file-read")
+            download.requestID = id
+            workspaceFilePreviewDownload = download
+            transmit(.readWorkspaceFile(
+                requestID: id,
+                sessionID: sessionID,
+                path: path,
+                offset: nextOffset,
+                maxBytes: 256 * 1024
+            )) { [weak self] message in
+                guard self?.workspaceFilePreviewDownload?.requestID == id else { return }
+                self?.workspaceFilePreviewDownload = nil
+                self?.isLoadingAttachmentPreview = false
+                self?.showToast(message, tone: .error)
+            }
+            return
+        }
+
+        guard UInt64(download.data.count) == download.file.size else {
+            workspaceFilePreviewDownload = nil
+            isLoadingAttachmentPreview = false
+            showToast("The downloaded workspace file is incomplete.", tone: .error)
+            return
+        }
+        workspaceFilePreviewDownload = nil
+        finishFilePreview(
+            download.data,
+            name: URL(fileURLWithPath: download.file.path).lastPathComponent,
+            generation: download.generation
+        )
+    }
+
+    private func finishFilePreview(_ data: Data, name: String, generation: UUID) {
+        Task { [weak self] in
+            do {
+                let file = try await Self.writeAttachmentPreview(data, name: name)
+                guard let self, self.attachmentPreviewGeneration == generation else {
+                    try? FileManager.default.removeItem(at: file.directory)
+                    return
+                }
+                if let current = self.previewTemporaryDirectory {
+                    try? FileManager.default.removeItem(at: current)
+                }
+                self.previewTemporaryDirectory = file.directory
+                self.previewURL = file.url
+                self.isLoadingAttachmentPreview = false
+            } catch {
+                guard let self, self.attachmentPreviewGeneration == generation else { return }
+                self.isLoadingAttachmentPreview = false
+                self.showToast(error.localizedDescription, tone: .error)
+            }
+        }
+    }
+
+    private nonisolated static func writeAttachmentPreview(
+        _ data: Data,
+        name: String
+    ) async throws -> AttachmentPreviewFile {
+        try await Task.detached(priority: .userInitiated) {
+            let directory = URL.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let candidateExtension = URL(fileURLWithPath: name).pathExtension
+            let safeExtension = candidateExtension.utf8.count <= 16
+                && candidateExtension.unicodeScalars.allSatisfy(CharacterSet.alphanumerics.contains)
+                ? candidateExtension
+                : ""
+            let url = safeExtension.isEmpty
+                ? directory.appending(path: "attachment")
+                : directory.appending(path: "attachment").appendingPathExtension(safeExtension)
+            #if os(iOS)
+            try data.write(to: url, options: [.atomic, .completeFileProtection])
+            #else
+            try data.write(to: url, options: .atomic)
+            #endif
+            return AttachmentPreviewFile(directory: directory, url: url)
+        }.value
+    }
+
     private func widgets(in slot: FrontendSlot) -> [MountedWidget] {
         mountedWidgets.filter { $0.widget.slot == slot }
     }
@@ -2529,21 +3408,50 @@ final class AppModel {
         restoreDraft(draft)
     }
 
-    private func restoreDraft(_ draft: String) {
-        composer = composer.isEmpty ? draft : "\(draft)\n\n\(composer)"
+    private func restoreDraft(_ draft: PendingComposerDraft) {
+        if !draft.text.isEmpty {
+            composer = composer.isEmpty ? draft.text : "\(draft.text)\n\n\(composer)"
+        }
+        let currentIDs = Set(composerAttachments.compactMap { item -> String? in
+            guard case .uploaded(let attachment) = item.state else { return nil }
+            return attachment.id
+        })
+        let available = max(0, maximumAttachmentReferences - composerAttachments.count)
+        composerAttachments.insert(contentsOf: draft.attachments
+            .filter { !currentIDs.contains($0.id) }
+            .prefix(available)
+            .map { attachment in
+                ComposerAttachment(
+                    id: UUID(),
+                    name: attachment.name,
+                    size: attachment.size,
+                    mediaType: attachment.mediaType,
+                    state: .uploaded(attachment)
+                )
+            }, at: 0)
     }
 
     private func restorePendingDrafts() {
         let drafts = pendingDrafts.keys.sorted().compactMap { pendingDrafts[$0] }
         pendingDrafts.removeAll()
         guard !drafts.isEmpty else { return }
-        restoreDraft(drafts.joined(separator: "\n\n"))
+        for draft in drafts.reversed() { restoreDraft(draft) }
     }
 
     private func connectionEnded(generation: UUID, message: String) {
         guard connectionGeneration == generation else { return }
-        restorePendingDrafts()
         connectionState = .failed(message)
+        attachmentUploadRequests.removeAll()
+        activeAttachmentUpload = nil
+        attachmentListRequestID = nil
+        isLoadingAttachments = false
+        gitDiffRequestID = nil
+        isLoadingGitDiff = false
+        workspaceFilesRequestID = nil
+        isLoadingWorkspaceFiles = false
+        discardPendingComposerAttachments()
+        discardAttachmentPreview()
+        restorePendingDrafts()
         if pendingPairingAccount != nil { pairingError = message }
         showToast(message, tone: .error)
     }
@@ -2566,10 +3474,11 @@ final class AppModel {
         replaySnapshotSequence = nil
         if !preservingSession { replayPresentedTranscript = nil }
         if preservingDrafts {
-            restorePendingDrafts()
+            discardPendingComposerAttachments()
         } else {
             pendingDrafts.removeAll()
             composer = ""
+            discardComposerAttachments()
         }
         pendingPairingAccount = nil
         connectionState = .disconnected
@@ -2590,6 +3499,17 @@ final class AppModel {
         directoryError = nil
         directoryRequestID = nil
         isLoadingDirectories = false
+        if preservingSession {
+            gitDiffRequestID = nil
+            isLoadingGitDiff = false
+            workspaceFilesRequestID = nil
+            isLoadingWorkspaceFiles = false
+            attachmentListRequestID = nil
+            isLoadingAttachments = false
+            attachmentUploadRequests.removeAll()
+            activeAttachmentUpload = nil
+            discardAttachmentPreview()
+        }
         if !preservingSession {
             sessions = []
             selectedSessionID = nil
@@ -2616,6 +3536,7 @@ final class AppModel {
         pairingCode = ""
         pairingError = nil
         if !preservingSession { resetSessionState() }
+        if preservingDrafts { restorePendingDrafts() }
         return connectionGeneration
     }
 
@@ -2624,7 +3545,20 @@ final class AppModel {
         gitStatus = nil
         gitDiff = ""
         gitDiffRequestID = nil
+        isLoadingGitDiff = false
+        workspaceFiles = []
+        workspaceFilesRequestID = nil
+        isLoadingWorkspaceFiles = false
+        workspaceViewerScope = .unstaged
+        inspectorPage = .changes
         gitBranchRequestID = nil
+        discardComposerAttachments()
+        uploadedAttachments = []
+        attachmentListRequestID = nil
+        isLoadingAttachments = false
+        attachmentUploadRequests.removeAll()
+        activeAttachmentUpload = nil
+        discardAttachmentPreview()
         selectedModelRoute = ""
         contributions = []
         toolCount = 0

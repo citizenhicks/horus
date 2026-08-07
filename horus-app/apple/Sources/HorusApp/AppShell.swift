@@ -1,5 +1,6 @@
 import SwiftUI
 import Accessibility
+import QuickLook
 
 private let debugStartsOnDetail: Bool = {
     #if DEBUG
@@ -58,6 +59,10 @@ struct AppShell: View {
                     }
                 AppToastOverlay().zIndex(10)
             }
+        }
+        .quickLookPreview($model.previewURL)
+        .onChange(of: model.previewURL) { oldValue, newValue in
+            if oldValue != nil, newValue == nil { model.discardAttachmentPreview() }
         }
         .preferredColorScheme(preferredColorScheme)
         .onChange(of: chatIsVisible, initial: true) { _, visible in

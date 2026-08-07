@@ -8,8 +8,9 @@ use horus::backend::checkpoint::SessionSummary;
 use horus::backend::model::ModelChoice;
 use horus::backend::model::provider::HostedWebSearch;
 use horus::protocol::{
-    Event, EventMsg, FrontendBlock, FrontendContribution, FrontendSettingValue, FrontendSymbol,
-    FrontendWidget, MiddlewareFeature, SessionConfiguredEvent, Submission, TokenUsage,
+    AttachmentReference, Event, EventMsg, FrontendBlock, FrontendContribution,
+    FrontendSettingValue, FrontendSymbol, FrontendWidget, MiddlewareFeature,
+    SessionConfiguredEvent, Submission, TokenUsage,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
@@ -20,8 +21,30 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::{Error, Result};
 
+mod base64_bytes {
+    use base64::Engine as _;
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    pub(super) fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
@@ -129,6 +152,37 @@ pub enum ClientMessage {
         session_id: String,
         submission: Submission,
     },
+    BeginAttachmentUpload {
+        request_id: String,
+        session_id: String,
+        name: String,
+        size: u64,
+        media_type: String,
+    },
+    AppendAttachmentChunk {
+        request_id: String,
+        session_id: String,
+        upload_id: String,
+        offset: u64,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    },
+    FinishAttachmentUpload {
+        request_id: String,
+        session_id: String,
+        upload_id: String,
+    },
+    ListAttachments {
+        request_id: String,
+        session_id: String,
+    },
+    ReadAttachment {
+        request_id: String,
+        session_id: String,
+        attachment_id: String,
+        offset: u64,
+        max_bytes: usize,
+    },
     ConfigureSession {
         request_id: String,
         session_id: String,
@@ -143,6 +197,7 @@ pub enum ClientMessage {
     GetGitDiff {
         request_id: String,
         session_id: String,
+        scope: GitDiffScope,
     },
     SwitchGitBranch {
         request_id: String,
@@ -153,6 +208,17 @@ pub enum ClientMessage {
         request_id: String,
         path: PathBuf,
         include_files: bool,
+    },
+    ListWorkspaceFiles {
+        request_id: String,
+        session_id: String,
+    },
+    ReadWorkspaceFile {
+        request_id: String,
+        session_id: String,
+        path: String,
+        offset: u64,
+        max_bytes: usize,
     },
     SetProviderCredential {
         request_id: String,
@@ -283,6 +349,37 @@ pub enum ServerMessage {
     Accepted {
         request_id: String,
     },
+    AttachmentUploadStarted {
+        request_id: String,
+        session_id: String,
+        upload_id: String,
+        max_chunk_bytes: usize,
+    },
+    AttachmentChunkAccepted {
+        request_id: String,
+        session_id: String,
+        upload_id: String,
+        next_offset: u64,
+    },
+    AttachmentUploaded {
+        request_id: String,
+        session_id: String,
+        attachment: AttachmentReference,
+    },
+    Attachments {
+        request_id: String,
+        session_id: String,
+        attachments: Vec<AttachmentReference>,
+    },
+    AttachmentChunk {
+        request_id: String,
+        session_id: String,
+        attachment_id: String,
+        offset: u64,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        next_offset: Option<u64>,
+    },
     Rejected {
         request_id: String,
         code: String,
@@ -342,11 +439,26 @@ pub enum ServerMessage {
     GitDiff {
         request_id: String,
         session_id: String,
+        scope: GitDiffScope,
         diff: String,
     },
     Directories {
         request_id: String,
         listing: DirectoryListing,
+    },
+    WorkspaceFiles {
+        request_id: String,
+        session_id: String,
+        files: Vec<WorkspaceFileRecord>,
+    },
+    WorkspaceFileChunk {
+        request_id: String,
+        session_id: String,
+        path: String,
+        offset: u64,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        next_offset: Option<u64>,
     },
     CronTasks {
         request_id: String,
@@ -462,6 +574,22 @@ pub struct WorkspaceInfo {
 pub struct GitStatus {
     pub current_branch: String,
     pub branches: Vec<String>,
+}
+
+/// One explicit Git patch selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitDiffScope {
+    Staged,
+    Unstaged,
+    Committed,
+}
+
+/// One regular file confined to the selected chat workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceFileRecord {
+    pub path: String,
+    pub size: u64,
 }
 
 /// One bounded folder listing from the gateway host.
@@ -926,6 +1054,24 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[test]
+    fn attachment_bytes_use_standard_base64_and_round_trip() {
+        let expected = ClientFrame::new(ClientMessage::AppendAttachmentChunk {
+            request_id: "request-upload".into(),
+            session_id: "session-a".into(),
+            upload_id: "upload-a".into(),
+            offset: 0,
+            data: vec![0, 0xff],
+        });
+
+        let encoded = serde_json::to_value(&expected).expect("encode upload chunk");
+        let decoded: ClientFrame =
+            serde_json::from_value(encoded.clone()).expect("decode upload chunk");
+
+        assert_eq!(encoded["data"], "AP8=");
+        assert_eq!(decoded, expected);
+    }
+
     #[tokio::test]
     async fn websocket_bridge_rejects_text_messages() {
         let incoming = futures_util::stream::iter([Ok(Message::Text("{}".into()))]);
@@ -1216,11 +1362,13 @@ mod tests {
         let request = serde_json::to_value(ClientFrame::new(ClientMessage::GetGitDiff {
             request_id: "request-diff".into(),
             session_id: "session-a".into(),
+            scope: GitDiffScope::Unstaged,
         }))
         .expect("encode Git diff request");
         let response = serde_json::to_value(ServerFrame::new(ServerMessage::GitDiff {
             request_id: "request-diff".into(),
             session_id: "session-a".into(),
+            scope: GitDiffScope::Unstaged,
             diff: "diff --git a/file b/file\n".into(),
         }))
         .expect("encode Git diff response");
@@ -1420,6 +1568,7 @@ mod tests {
                 },
                 "contributions": [{
                     "capability": "subagents",
+                    "accepts_file_attachments": false,
                     "commands": [],
                     "widgets": [{
                         "id": "subagents",

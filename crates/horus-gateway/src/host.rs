@@ -1,11 +1,13 @@
 //! Per-chat agent ownership, event sequencing, replay, and authenticated operations.
 
 mod catalog;
+mod files;
 mod git;
 mod providers;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use chrono::Utc;
@@ -17,6 +19,7 @@ use horus::backend::checkpoint::{
 };
 use horus::backend::model::provider::provider;
 use horus::middleware::FrontendExtensions;
+use horus::middleware::attachments::AttachmentStore;
 use horus::middleware::scratchpad::ScratchpadStore;
 use horus::protocol::{
     Event, EventMsg, FrontendBlock, FrontendBlockFormat, FrontendEvent, Op, ReviewDecision,
@@ -33,10 +36,10 @@ use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig, usage
 use crate::cron::{ActiveCronRun, BeginRun, CronStore};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{
-    AgentComposition, ArtifactKind, ArtifactRecord, CronRunStatus, ProfileSnapshot, ProviderConfig,
-    ReadyPayload, RenderedEvent, RenderedPreview, RunStats, RunSummary, ServerFrame, ServerMessage,
-    SessionActivity, SessionActivityState, SessionOutcome, SessionReadyPayload, SessionRecord,
-    SessionRunGroup, SessionWidget, VersionedAgentConfig,
+    AgentComposition, ArtifactKind, ArtifactRecord, CronRunStatus, GitDiffScope, ProfileSnapshot,
+    ProviderConfig, ReadyPayload, RenderedEvent, RenderedPreview, RunStats, RunSummary,
+    ServerFrame, ServerMessage, SessionActivity, SessionActivityState, SessionOutcome,
+    SessionReadyPayload, SessionRecord, SessionRunGroup, SessionWidget, VersionedAgentConfig,
 };
 use crate::{Error, Result};
 
@@ -44,6 +47,7 @@ use self::catalog::{
     SessionCatalogMetadata, load_session_metadata, save_session_metadata, session_catalog,
     validate_session_title,
 };
+use self::files::{WorkspaceRead, list as list_workspace_files, read as read_workspace_file};
 use self::git::{
     diff as workspace_git_diff, status as git_status, switch_branch as switch_workspace_branch,
 };
@@ -68,6 +72,7 @@ struct HostInner {
     session_id: Arc<str>,
     commands: mpsc::Sender<HostCommand>,
     events: broadcast::Sender<ServerFrame>,
+    accepts_file_attachments: Arc<AtomicBool>,
 }
 
 /// Machine-wide chat registry. A session has at most one resident agent owner.
@@ -84,6 +89,7 @@ struct GatewayState {
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     scratchpad: ScratchpadStore,
+    attachments: AttachmentStore,
     // ponytail: one lock is enough for at most 32 tiny catalog writes.
     catalog_lock: Arc<Mutex<()>>,
     activities: SessionActivities,
@@ -116,6 +122,7 @@ struct HostState {
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     scratchpad: ScratchpadStore,
+    accepts_file_attachments: Arc<AtomicBool>,
     catalog_lock: Arc<Mutex<()>>,
     activities: SessionActivities,
     running: RunningAgent,
@@ -195,7 +202,18 @@ enum HostCommand {
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
     GitDiff {
+        scope: GitDiffScope,
         reply: oneshot::Sender<std::result::Result<String, Rejection>>,
+    },
+    WorkspaceFiles {
+        reply:
+            oneshot::Sender<std::result::Result<Vec<crate::wire::WorkspaceFileRecord>, Rejection>>,
+    },
+    ReadWorkspaceFile {
+        path: String,
+        offset: u64,
+        max_bytes: usize,
+        reply: oneshot::Sender<std::result::Result<WorkspaceRead, Rejection>>,
     },
     SwitchGitBranch {
         branch: String,
@@ -237,6 +255,7 @@ impl GatewayHost {
         let checkpoints: Arc<dyn CheckpointStore> =
             Arc::new(SqliteCheckpoint::new(store.checkpoints_path())?);
         let scratchpad = ScratchpadStore::new(Arc::clone(&checkpoints));
+        let attachments = AttachmentStore::new(store.state_dir());
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Self {
             state: Arc::new(Mutex::new(GatewayState {
@@ -246,6 +265,7 @@ impl GatewayHost {
                 cron,
                 checkpoints,
                 scratchpad,
+                attachments,
                 catalog_lock: Arc::new(Mutex::new(())),
                 activities: Arc::new(StdMutex::new(HashMap::new())),
                 provider_login: Arc::new(StdMutex::new(None)),
@@ -257,6 +277,10 @@ impl GatewayHost {
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<ServerFrame> {
         self.events.subscribe()
+    }
+
+    pub(crate) async fn attachment_store(&self) -> AttachmentStore {
+        self.state.lock().await.attachments.clone()
     }
 
     pub(crate) async fn ready(&self) -> std::result::Result<ReadyPayload, Rejection> {
@@ -609,6 +633,9 @@ impl HostHandle {
             false,
         )
         .await?;
+        let accepts_file_attachments = Arc::new(AtomicBool::new(runtime_accepts_attachments(
+            &running.frontend,
+        )));
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
         activities
@@ -624,6 +651,7 @@ impl HostHandle {
             cron,
             checkpoints,
             scratchpad,
+            accepts_file_attachments: Arc::clone(&accepts_file_attachments),
             catalog_lock,
             activities,
             running,
@@ -651,6 +679,7 @@ impl HostHandle {
                 session_id: session_id.into(),
                 commands,
                 events,
+                accepts_file_attachments,
             }),
         })
     }
@@ -662,6 +691,11 @@ impl HostHandle {
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<ServerFrame> {
         self.inner.events.subscribe()
+    }
+
+    #[must_use]
+    pub(crate) fn accepts_file_attachments(&self) -> bool {
+        self.inner.accepts_file_attachments.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn snapshot(
@@ -768,9 +802,37 @@ impl HostHandle {
         receive(receiver).await
     }
 
-    pub(crate) async fn git_diff(&self) -> std::result::Result<String, Rejection> {
+    pub(crate) async fn git_diff(
+        &self,
+        scope: GitDiffScope,
+    ) -> std::result::Result<String, Rejection> {
         let (reply, receiver) = oneshot::channel();
-        self.send(HostCommand::GitDiff { reply }).await?;
+        self.send(HostCommand::GitDiff { scope, reply }).await?;
+        receiver.await.map_err(|_| stopped())?
+    }
+
+    pub(crate) async fn workspace_files(
+        &self,
+    ) -> std::result::Result<Vec<crate::wire::WorkspaceFileRecord>, Rejection> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(HostCommand::WorkspaceFiles { reply }).await?;
+        receiver.await.map_err(|_| stopped())?
+    }
+
+    pub(crate) async fn read_workspace_file(
+        &self,
+        path: String,
+        offset: u64,
+        max_bytes: usize,
+    ) -> std::result::Result<WorkspaceRead, Rejection> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(HostCommand::ReadWorkspaceFile {
+            path,
+            offset,
+            max_bytes,
+            reply,
+        })
+        .await?;
         receiver.await.map_err(|_| stopped())?
     }
 
@@ -995,9 +1057,23 @@ impl HostState {
                 let result = self.configure(expected_revision, config).await;
                 let _ = reply.send(result);
             }
-            HostCommand::GitDiff { reply } => {
+            HostCommand::GitDiff { scope, reply } => {
                 let _ = reply.send(
-                    workspace_git_diff(&self.running.gateway_sandbox, &self.spec.workspace).await,
+                    workspace_git_diff(&self.running.gateway_sandbox, &self.spec.workspace, scope)
+                        .await,
+                );
+            }
+            HostCommand::WorkspaceFiles { reply } => {
+                let _ = reply.send(list_workspace_files(&self.spec.workspace).await);
+            }
+            HostCommand::ReadWorkspaceFile {
+                path,
+                offset,
+                max_bytes,
+                reply,
+            } => {
+                let _ = reply.send(
+                    read_workspace_file(&self.spec.workspace, &path, offset, max_bytes).await,
                 );
             }
             HostCommand::SwitchGitBranch { branch, reply } => {
@@ -1224,7 +1300,10 @@ impl HostState {
         });
         let submission = Submission {
             id: submission_id,
-            op: Op::UserInput { text: input },
+            op: Op::UserInput {
+                text: input,
+                attachments: Vec::new(),
+            },
         };
         if let Err(rejection) = self.submit(submission, true) {
             let active = self.active_cron.take().expect("active cron was just set");
@@ -1281,7 +1360,10 @@ impl HostState {
             .map_err(invalid_cron)?;
         let submission = Submission {
             id: Uuid::new_v4().to_string(),
-            op: Op::UserInput { text: input },
+            op: Op::UserInput {
+                text: input,
+                attachments: Vec::new(),
+            },
         };
         if let Err(rejection) = self.submit(submission, false) {
             self.cron.cancel_setup(&self.running.session_id);
@@ -1342,6 +1424,10 @@ impl HostState {
             &replacement.session_id,
         );
         let previous = std::mem::replace(&mut self.running, replacement);
+        self.accepts_file_attachments.store(
+            runtime_accepts_attachments(&self.running.frontend),
+            Ordering::Relaxed,
+        );
         self.suppress_history_broadcast = suppress_history_broadcast;
         self.spec = next;
         shutdown_agent(previous).await;
@@ -1419,6 +1505,10 @@ impl HostState {
             &replacement.session_id,
         );
         let previous = std::mem::replace(&mut self.running, replacement);
+        self.accepts_file_attachments.store(
+            runtime_accepts_attachments(&self.running.frontend),
+            Ordering::Relaxed,
+        );
         self.suppress_history_broadcast = suppress_history_broadcast;
         self.widgets.clear();
         shutdown_agent(previous).await;
@@ -2138,6 +2228,13 @@ async fn start_agent(
         subagent_template,
         tool_count,
     })
+}
+
+fn runtime_accepts_attachments(frontend: &FrontendExtensions) -> bool {
+    frontend
+        .contributions()
+        .iter()
+        .any(|contribution| contribution.accepts_file_attachments)
 }
 
 async fn shutdown_agent(agent: RunningAgent) {
@@ -2994,6 +3091,7 @@ mod tests {
                         session_id: id.into(),
                         commands,
                         events,
+                        accepts_file_attachments: Arc::new(AtomicBool::new(false)),
                     }),
                 },
             );
@@ -3103,6 +3201,7 @@ mod tests {
             events: vec![
                 EventMsg::UserMessage(horus::protocol::UserMessageEvent {
                     message: "inspect".into(),
+                    attachments: Vec::new(),
                     message_target: None,
                 }),
                 EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent {

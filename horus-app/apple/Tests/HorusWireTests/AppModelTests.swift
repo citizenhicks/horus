@@ -751,10 +751,297 @@ final class AppModelTests: XCTestCase {
         })
     }
 
+    func testAttachmentUploadUsesAcknowledgedChunksAndSendsNativeReferences() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.selectedModelRoute = "openai"
+        let capableChoice = ModelChoice(
+            route: "openai",
+            group: "OpenAI",
+            model: "gpt-5.6-sol",
+            reasoningEffort: "high",
+            contextWindow: 200_000,
+            supportsAttachmentInput: true
+        )
+        model.modelChoices = [capableChoice]
+        let attachmentContribution = FrontendContribution(
+            capability: "files",
+            acceptsFileAttachments: true,
+            count: nil,
+            commands: [],
+            widgets: [],
+            references: [],
+            activeInput: nil
+        )
+        model.contributions = [attachmentContribution]
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("scan.png")
+        try Data([1, 2, 3]).write(to: fileURL)
+
+        await model.importAttachments([fileURL])
+        try await Task.sleep(for: .milliseconds(20))
+
+        let initialRequests = await recorder.requests()
+        guard let begin = initialRequests.first(where: {
+            if case .beginAttachmentUpload = $0 { return true }
+            return false
+        }), case .beginAttachmentUpload(let beginID, let sessionID, let name, let size, _) = begin
+        else { return XCTFail("Expected attachment upload start") }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(name, "scan.png")
+        XCTAssertEqual(size, 3)
+
+        model.handle(.attachmentUploadStarted(
+            requestID: beginID,
+            sessionID: "chat-1",
+            uploadID: "upload-1",
+            maxChunkBytes: 2
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+        let afterStart = await recorder.requests()
+        let firstChunk = try XCTUnwrap(afterStart.last(where: {
+            if case .appendAttachmentChunk = $0 { return true }
+            return false
+        }))
+        guard case .appendAttachmentChunk(let firstID, _, _, let firstOffset, let firstData) = firstChunk else {
+            return XCTFail("Expected first attachment chunk")
+        }
+        XCTAssertEqual(firstOffset, 0)
+        XCTAssertEqual(firstData, Data([1, 2]))
+
+        model.handle(.attachmentChunkAccepted(
+            requestID: firstID,
+            sessionID: "chat-1",
+            uploadID: "upload-1",
+            nextOffset: 2
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+        let afterFirstChunk = await recorder.requests()
+        let secondChunk = try XCTUnwrap(afterFirstChunk.last(where: {
+            if case .appendAttachmentChunk = $0 { return true }
+            return false
+        }))
+        guard case .appendAttachmentChunk(let secondID, _, _, let secondOffset, let secondData) = secondChunk else {
+            return XCTFail("Expected second attachment chunk")
+        }
+        XCTAssertEqual(secondOffset, 2)
+        XCTAssertEqual(secondData, Data([3]))
+
+        model.handle(.attachmentChunkAccepted(
+            requestID: secondID,
+            sessionID: "chat-1",
+            uploadID: "upload-1",
+            nextOffset: 3
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+        let afterSecondChunk = await recorder.requests()
+        let finish = try XCTUnwrap(afterSecondChunk.last(where: {
+            if case .finishAttachmentUpload = $0 { return true }
+            return false
+        }))
+        guard case .finishAttachmentUpload(let finishID, _, _) = finish else {
+            return XCTFail("Expected attachment upload finish")
+        }
+        let attachment = AttachmentRecord(
+            id: "file-1",
+            name: "scan.png",
+            size: 3,
+            mediaType: "image/png"
+        )
+        model.handle(.attachmentUploaded(
+            requestID: finishID,
+            sessionID: "chat-1",
+            attachment: attachment
+        ))
+        XCTAssertEqual(model.uploadedAttachments, [attachment])
+        XCTAssertTrue(model.canSendComposer)
+
+        model.contributions = []
+        XCTAssertFalse(model.canSendComposer)
+        model.sendMessage()
+        XCTAssertEqual(model.toast?.message, "File attachments are not enabled for this chat.")
+        model.contributions = [attachmentContribution]
+
+        model.modelChoices = [ModelChoice(
+            route: "openai",
+            group: "OpenAI",
+            model: "text-only",
+            reasoningEffort: nil,
+            contextWindow: 200_000,
+            supportsAttachmentInput: false
+        )]
+        XCTAssertFalse(model.canSendComposer)
+        model.sendMessage()
+        XCTAssertEqual(model.toast?.message, "The selected model does not accept attachments.")
+        model.modelChoices = [capableChoice]
+
+        model.sendMessage()
+        try await Task.sleep(for: .milliseconds(20))
+        let afterSend = await recorder.requests()
+        let submit = try XCTUnwrap(afterSend.last(where: {
+            if case .submit = $0 { return true }
+            return false
+        }))
+        guard case .submit(_, let submission) = submit,
+              case .userInput(let text, let attachments) = submission.op
+        else { return XCTFail("Expected attachment submission") }
+        XCTAssertEqual(text, "")
+        XCTAssertEqual(attachments, [attachment])
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("user_message"),
+                "message": .string(""),
+                "attachments": .array([.object([
+                    "id": .string("file-1"),
+                    "name": .string("scan.png"),
+                    "size": .number(3),
+                    "mediaType": .string("image/png")
+                ])]),
+                "messageTarget": .null
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        XCTAssertEqual(model.transcript.last?.attachments, [attachment])
+    }
+
+    func testAttachmentMessageLimitIncludesUploadedFiles() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.selectedModelRoute = "openai"
+        model.modelChoices = [ModelChoice(
+            route: "openai",
+            group: "OpenAI",
+            model: "gpt-5.6-sol",
+            reasoningEffort: "high",
+            contextWindow: 200_000,
+            supportsAttachmentInput: true
+        )]
+        model.contributions = [FrontendContribution(
+            capability: "files",
+            acceptsFileAttachments: true,
+            count: nil,
+            commands: [],
+            widgets: [],
+            references: [],
+            activeInput: nil
+        )]
+        let fileSize: Int64 = 25 * 1024 * 1024
+        model.composerAttachments = (0..<4).map { index in
+            let attachment = AttachmentRecord(
+                id: "file-\(index)",
+                name: "file-\(index).bin",
+                size: fileSize,
+                mediaType: "application/octet-stream"
+            )
+            return ComposerAttachment(
+                id: UUID(),
+                name: attachment.name,
+                size: attachment.size,
+                mediaType: attachment.mediaType,
+                state: .uploaded(attachment)
+            )
+        }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("extra.bin")
+        try Data([1]).write(to: fileURL)
+
+        await model.importAttachments([fileURL])
+
+        XCTAssertEqual(model.composerAttachments.count, 4)
+        let requests = await recorder.requests()
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertEqual(model.toast?.message, "Attachments in one message are limited to 100 MiB total.")
+    }
+
+    func testInspectorScopesUseGitDiffAndWorkspaceFileEndpoints() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+
+        model.refreshGitDiff()
+        try await Task.sleep(for: .milliseconds(20))
+        let diffRequests = await recorder.requests()
+        guard let diffRequest = diffRequests.last(where: {
+            if case .getGitDiff = $0 { return true }
+            return false
+        }), case .getGitDiff(let diffID, let sessionID, let scope) = diffRequest
+        else { return XCTFail("Expected a scoped Git diff request") }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(scope, .unstaged)
+        model.handle(.gitDiff(
+            requestID: diffID,
+            sessionID: "chat-1",
+            scope: .unstaged,
+            diff: "diff --git a/App.swift b/App.swift"
+        ))
+        XCTAssertFalse(model.gitDiff.isEmpty)
+
+        model.selectWorkspaceViewerScope(.all)
+        try await Task.sleep(for: .milliseconds(20))
+        let listRequests = await recorder.requests()
+        guard let listRequest = listRequests.last(where: {
+            if case .listWorkspaceFiles = $0 { return true }
+            return false
+        }), case .listWorkspaceFiles(let listID, let listSessionID) = listRequest
+        else { return XCTFail("Expected workspace file list request") }
+        XCTAssertEqual(listSessionID, "chat-1")
+        let file = WorkspaceFileRecord(path: "Sources/App.swift", size: 3)
+        model.handle(.workspaceFiles(
+            requestID: listID,
+            sessionID: "chat-1",
+            files: [file]
+        ))
+        XCTAssertEqual(model.workspaceFiles, [file])
+
+        model.previewWorkspaceFile(file)
+        try await Task.sleep(for: .milliseconds(20))
+        let readRequests = await recorder.requests()
+        guard let readRequest = readRequests.last(where: {
+            if case .readWorkspaceFile = $0 { return true }
+            return false
+        }), case .readWorkspaceFile(let readID, _, let path, let offset, _) = readRequest
+        else { return XCTFail("Expected workspace file read request") }
+        XCTAssertEqual(path, file.path)
+        XCTAssertEqual(offset, 0)
+        model.handle(.workspaceFileChunk(
+            requestID: readID,
+            sessionID: "chat-1",
+            path: file.path,
+            offset: 0,
+            data: Data([1, 2, 3]),
+            nextOffset: nil
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertNotNil(model.previewURL)
+        model.discardAttachmentPreview()
+    }
+
     func testContributionCatalogReferencesAndWidgetsAreGeneric() throws {
         let model = try model()
         model.contributions = [FrontendContribution(
             capability: "tasks",
+            acceptsFileAttachments: false,
             count: 3,
             commands: [],
             widgets: [
@@ -878,6 +1165,7 @@ final class AppModelTests: XCTestCase {
         )
         let contribution = FrontendContribution(
             capability: "tasks",
+            acceptsFileAttachments: false,
             count: 1,
             commands: [],
             widgets: [staticStatus, navigation],
@@ -1327,7 +1615,8 @@ final class AppModelTests: XCTestCase {
             group: "Kimi · K3",
             model: target.model,
             reasoningEffort: target.reasoningEffort,
-            contextWindow: 1_048_576
+            contextWindow: 1_048_576,
+            supportsAttachmentInput: true
         )
         let original = composition()
         model.agentSnapshot = VersionedAgentConfig(revision: 1, config: original)

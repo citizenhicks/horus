@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
+use horus::middleware::attachments::{AttachmentStore, MAX_UPLOAD_CHUNK_BYTES, PendingAttachment};
+use horus::protocol::Op;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -43,6 +45,7 @@ const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(72 * 60 * 60);
 const SCHEDULER_TICK: Duration = Duration::from_secs(15);
 const MAX_DIRECTORY_ENTRIES: usize = 512;
 const MAX_HISTORY_BATCHES: usize = 100;
+const MAX_PENDING_UPLOADS: usize = 8;
 const WEBSOCKET_BRIDGE_BYTES: usize = 16 * 1024;
 
 const _: () = assert!(MAX_FRAME_BYTES < 1 << 24);
@@ -618,6 +621,8 @@ where
     )
     .await?;
     let mut selected: Option<SelectedChat> = None;
+    let attachments = host.attachment_store().await;
+    let mut uploads: BTreeMap<(String, String), PendingAttachment> = BTreeMap::new();
 
     loop {
         let incoming = tokio::select! {
@@ -701,7 +706,11 @@ where
             &host,
             &cron,
             &client,
-            &mut selected,
+            ConnectionSessionState {
+                selected: &mut selected,
+                attachments: &attachments,
+                uploads: &mut uploads,
+            },
             &mut writer,
         )
         .await?;
@@ -720,6 +729,12 @@ struct AuthenticatedClient<'a> {
     revocations: &'a broadcast::Sender<String>,
 }
 
+struct ConnectionSessionState<'a> {
+    selected: &'a mut Option<SelectedChat>,
+    attachments: &'a AttachmentStore,
+    uploads: &'a mut BTreeMap<(String, String), PendingAttachment>,
+}
+
 async fn selected_broadcast(
     selected: &mut Option<SelectedChat>,
 ) -> std::result::Result<ServerFrame, broadcast::error::RecvError> {
@@ -735,9 +750,14 @@ async fn handle_message(
     gateway: &GatewayHost,
     cron: &CronStore,
     client: &AuthenticatedClient<'_>,
-    selected: &mut Option<SelectedChat>,
+    connection: ConnectionSessionState<'_>,
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
+    let ConnectionSessionState {
+        selected,
+        attachments,
+        uploads,
+    } = connection;
     match message {
         ClientMessage::Pair { .. } | ClientMessage::Authenticate { .. } => {
             write_server_error(
@@ -895,7 +915,194 @@ async fn handle_message(
                 Ok(host) => host,
                 Err(rejection) => return write_rejection(writer, request_id, rejection).await,
             };
+            if let Op::UserInput {
+                attachments: references,
+                ..
+            } = &submission.op
+                && !references.is_empty()
+            {
+                if !host.accepts_file_attachments() {
+                    return write_rejection(writer, request_id, attachments_disabled_rejection())
+                        .await;
+                }
+                for reference in references {
+                    if let Err(error) = attachments.verify(&session_id, reference).await {
+                        return write_rejection(writer, request_id, attachment_rejection(error))
+                            .await;
+                    }
+                }
+            }
             write_result(writer, request_id, host.submit(submission).await).await
+        }
+        ClientMessage::BeginAttachmentUpload {
+            request_id,
+            session_id,
+            name,
+            size,
+            media_type,
+        } => {
+            if let Err(rejection) = require_attachments_enabled(selected, &session_id) {
+                return write_rejection(writer, request_id, rejection).await;
+            }
+            if uploads.len() >= MAX_PENDING_UPLOADS {
+                return write_rejection(
+                    writer,
+                    request_id,
+                    attachment_rejection(format!(
+                        "a connection cannot hold more than {MAX_PENDING_UPLOADS} pending uploads"
+                    )),
+                )
+                .await;
+            }
+            match attachments
+                .begin_upload(&session_id, name, size, media_type)
+                .await
+            {
+                Ok(upload) => {
+                    let upload_id = upload.id().to_string();
+                    uploads.insert((session_id.clone(), upload_id.clone()), upload);
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::AttachmentUploadStarted {
+                            request_id,
+                            session_id,
+                            upload_id,
+                            max_chunk_bytes: MAX_UPLOAD_CHUNK_BYTES,
+                        }),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    write_rejection(writer, request_id, attachment_rejection(error)).await
+                }
+            }
+        }
+        ClientMessage::AppendAttachmentChunk {
+            request_id,
+            session_id,
+            upload_id,
+            offset,
+            data,
+        } => {
+            if let Err(rejection) = require_attachments_enabled(selected, &session_id) {
+                return write_rejection(writer, request_id, rejection).await;
+            }
+            let key = (session_id.clone(), upload_id.clone());
+            let Some(upload) = uploads.get_mut(&key) else {
+                return write_rejection(
+                    writer,
+                    request_id,
+                    attachment_rejection("attachment upload is not active"),
+                )
+                .await;
+            };
+            match upload.append(offset, &data).await {
+                Ok(next_offset) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::AttachmentChunkAccepted {
+                            request_id,
+                            session_id,
+                            upload_id,
+                            next_offset,
+                        }),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    write_rejection(writer, request_id, attachment_rejection(error)).await
+                }
+            }
+        }
+        ClientMessage::FinishAttachmentUpload {
+            request_id,
+            session_id,
+            upload_id,
+        } => {
+            if let Err(rejection) = require_attachments_enabled(selected, &session_id) {
+                return write_rejection(writer, request_id, rejection).await;
+            }
+            let Some(upload) = uploads.remove(&(session_id.clone(), upload_id)) else {
+                return write_rejection(
+                    writer,
+                    request_id,
+                    attachment_rejection("attachment upload is not active"),
+                )
+                .await;
+            };
+            match upload.finish().await {
+                Ok(attachment) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::AttachmentUploaded {
+                            request_id,
+                            session_id,
+                            attachment,
+                        }),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    write_rejection(writer, request_id, attachment_rejection(error)).await
+                }
+            }
+        }
+        ClientMessage::ListAttachments {
+            request_id,
+            session_id,
+        } => {
+            if let Err(rejection) = require_selected(selected, &session_id) {
+                return write_rejection(writer, request_id, rejection).await;
+            }
+            match attachments.list(&session_id).await {
+                Ok(items) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::Attachments {
+                            request_id,
+                            session_id,
+                            attachments: items,
+                        }),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    write_rejection(writer, request_id, attachment_rejection(error)).await
+                }
+            }
+        }
+        ClientMessage::ReadAttachment {
+            request_id,
+            session_id,
+            attachment_id,
+            offset,
+            max_bytes,
+        } => {
+            if let Err(rejection) = require_selected(selected, &session_id) {
+                return write_rejection(writer, request_id, rejection).await;
+            }
+            match attachments
+                .read_chunk(&session_id, &attachment_id, offset, max_bytes)
+                .await
+            {
+                Ok(chunk) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::AttachmentChunk {
+                            request_id,
+                            session_id,
+                            attachment_id,
+                            offset: chunk.offset,
+                            data: chunk.data,
+                            next_offset: chunk.next_offset,
+                        }),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    write_rejection(writer, request_id, attachment_rejection(error)).await
+                }
+            }
         }
         ClientMessage::ConfigureSession {
             request_id,
@@ -937,15 +1144,17 @@ async fn handle_message(
         ClientMessage::GetGitDiff {
             request_id,
             session_id,
+            scope,
         } => match require_selected(selected, &session_id) {
             Err(rejection) => write_rejection(writer, request_id, rejection).await,
-            Ok(host) => match host.git_diff().await {
+            Ok(host) => match host.git_diff(scope).await {
                 Ok(diff) => {
                     write_frame(
                         writer,
                         &ServerFrame::new(ServerMessage::GitDiff {
                             request_id,
                             session_id,
+                            scope,
                             diff,
                         }),
                     )
@@ -964,6 +1173,61 @@ async fn handle_message(
                 Err(rejection) => return write_rejection(writer, request_id, rejection).await,
             };
             write_result(writer, request_id, host.switch_git_branch(branch).await).await
+        }
+        ClientMessage::ListWorkspaceFiles {
+            request_id,
+            session_id,
+        } => {
+            let host = match require_selected(selected, &session_id) {
+                Ok(host) => host,
+                Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+            };
+            match host.workspace_files().await {
+                Ok(files) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::WorkspaceFiles {
+                            request_id,
+                            session_id,
+                            files,
+                        }),
+                    )
+                    .await
+                }
+                Err(rejection) => write_rejection(writer, request_id, rejection).await,
+            }
+        }
+        ClientMessage::ReadWorkspaceFile {
+            request_id,
+            session_id,
+            path,
+            offset,
+            max_bytes,
+        } => {
+            let host = match require_selected(selected, &session_id) {
+                Ok(host) => host,
+                Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+            };
+            match host
+                .read_workspace_file(path.clone(), offset, max_bytes)
+                .await
+            {
+                Ok(chunk) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::WorkspaceFileChunk {
+                            request_id,
+                            session_id,
+                            path,
+                            offset,
+                            data: chunk.data,
+                            next_offset: chunk.next_offset,
+                        }),
+                    )
+                    .await
+                }
+                Err(rejection) => write_rejection(writer, request_id, rejection).await,
+            }
         }
         ClientMessage::ListDirectories {
             request_id,
@@ -1327,6 +1591,25 @@ fn require_selected<'a>(
     Ok(host)
 }
 
+fn require_attachments_enabled<'a>(
+    selected: &'a Option<SelectedChat>,
+    session_id: &str,
+) -> std::result::Result<&'a HostHandle, Rejection> {
+    let host = require_selected(selected, session_id)?;
+    if !host.accepts_file_attachments() {
+        return Err(attachments_disabled_rejection());
+    }
+    Ok(host)
+}
+
+fn attachments_disabled_rejection() -> Rejection {
+    Rejection {
+        code: "attachments_disabled",
+        message: "enable the optional attachments middleware for this chat first".into(),
+        fatal: false,
+    }
+}
+
 fn require_any_selected(
     selected: &Option<SelectedChat>,
 ) -> std::result::Result<&HostHandle, Rejection> {
@@ -1395,6 +1678,14 @@ fn internal_rejection(message: String) -> Rejection {
     Rejection {
         code: "gateway_error",
         message,
+        fatal: false,
+    }
+}
+
+fn attachment_rejection(error: impl std::fmt::Display) -> Rejection {
+    Rejection {
+        code: "attachment_rejected",
+        message: error.to_string(),
         fatal: false,
     }
 }
@@ -1482,7 +1773,7 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use futures_util::SinkExt as _;
-    use horus::protocol::{Op, Submission};
+    use horus::protocol::{EventMsg, Op, Submission};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::protocol::Message;
@@ -1713,15 +2004,22 @@ mod tests {
 
     async fn wait_gateway_ready(events: &mut GatewayEvents) {
         loop {
-            let frame = events
-                .next()
-                .await
-                .expect("gateway frame")
-                .expect("gateway open");
-            if matches!(frame.message, ServerMessage::Ready { .. }) {
+            if matches!(
+                next_gateway_message(events).await,
+                ServerMessage::Ready { .. }
+            ) {
                 return;
             }
         }
+    }
+
+    async fn next_gateway_message(events: &mut GatewayEvents) -> ServerMessage {
+        tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("gateway response timeout")
+            .expect("gateway frame")
+            .expect("gateway open")
+            .message
     }
 
     async fn create_chat(
@@ -1738,15 +2036,10 @@ mod tests {
             .await
             .expect("create chat");
         loop {
-            let frame = events
-                .next()
-                .await
-                .expect("chat frame")
-                .expect("gateway open");
             if let ServerMessage::SessionOpened {
                 request_id: actual,
                 payload,
-            } = frame.message
+            } = next_gateway_message(events).await
                 && actual == request_id
             {
                 return payload.session.session_id;
@@ -1897,6 +2190,222 @@ mod tests {
             .expect("inactivity shutdown timeout")
             .expect("gateway task")
             .expect("gateway shutdown");
+    }
+
+    #[tokio::test]
+    async fn paired_client_uploads_lists_reads_and_submits_an_attachment() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let (server, grant) = GatewayServer::bootstrap(
+            root.path().join("state"),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .expect("bootstrap gateway");
+        let listen = server.config.listen;
+        let (shutdown, signal) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(server.serve_until(async move {
+            let _ = signal.await;
+        }));
+        let endpoint = format!("tcp://{listen}")
+            .parse::<Endpoint>()
+            .expect("endpoint");
+        let (connection, _) =
+            GatewayClient::pair(&endpoint, grant.code, "attachment test", ClientKind::Ios)
+                .await
+                .expect("pair frontend");
+        let (sender, mut events) = connection.into_parts();
+        wait_gateway_ready(&mut events).await;
+        let session_id = create_chat(&sender, &mut events, &workspace).await;
+
+        let mut config = crate::wire::AgentComposition::default();
+        config.middleware.set_enabled("attachments", true);
+        sender
+            .send(ClientMessage::ConfigureSession {
+                request_id: "configure-attachments".into(),
+                session_id: session_id.clone(),
+                expected_revision: 1,
+                config,
+            })
+            .await
+            .expect("enable attachments");
+        loop {
+            match next_gateway_message(&mut events).await {
+                ServerMessage::Accepted { request_id } if request_id == "configure-attachments" => {
+                    break;
+                }
+                ServerMessage::Rejected {
+                    request_id,
+                    code,
+                    message,
+                    ..
+                } if request_id == "configure-attachments" => {
+                    panic!("attachment configuration rejected ({code}): {message}")
+                }
+                _ => {}
+            }
+        }
+
+        let image = b"\x89PNG\r\n\x1a\npayload";
+        sender
+            .send(ClientMessage::BeginAttachmentUpload {
+                request_id: "begin-upload".into(),
+                session_id: session_id.clone(),
+                name: "image.png".into(),
+                size: image.len() as u64,
+                media_type: "image/png".into(),
+            })
+            .await
+            .expect("begin upload");
+        let upload_id = loop {
+            if let ServerMessage::AttachmentUploadStarted {
+                request_id,
+                upload_id,
+                ..
+            } = next_gateway_message(&mut events).await
+                && request_id == "begin-upload"
+            {
+                break upload_id;
+            }
+        };
+
+        for (request_id, offset, data) in [
+            ("upload-chunk-1", 0_u64, image[..8].to_vec()),
+            ("upload-chunk-2", 8_u64, image[8..].to_vec()),
+        ] {
+            sender
+                .send(ClientMessage::AppendAttachmentChunk {
+                    request_id: request_id.into(),
+                    session_id: session_id.clone(),
+                    upload_id: upload_id.clone(),
+                    offset,
+                    data,
+                })
+                .await
+                .expect("append upload chunk");
+            loop {
+                if matches!(
+                    next_gateway_message(&mut events).await,
+                    ServerMessage::AttachmentChunkAccepted { request_id: actual, .. }
+                        if actual == request_id
+                ) {
+                    break;
+                }
+            }
+        }
+
+        sender
+            .send(ClientMessage::FinishAttachmentUpload {
+                request_id: "finish-upload".into(),
+                session_id: session_id.clone(),
+                upload_id,
+            })
+            .await
+            .expect("finish upload");
+        let attachment = loop {
+            if let ServerMessage::AttachmentUploaded {
+                request_id,
+                attachment,
+                ..
+            } = next_gateway_message(&mut events).await
+                && request_id == "finish-upload"
+            {
+                break attachment;
+            }
+        };
+
+        sender
+            .send(ClientMessage::ListAttachments {
+                request_id: "list-attachments".into(),
+                session_id: session_id.clone(),
+            })
+            .await
+            .expect("list attachments");
+        loop {
+            if let ServerMessage::Attachments {
+                request_id,
+                attachments,
+                ..
+            } = next_gateway_message(&mut events).await
+                && request_id == "list-attachments"
+            {
+                assert_eq!(attachments, std::slice::from_ref(&attachment));
+                break;
+            }
+        }
+
+        sender
+            .send(ClientMessage::ReadAttachment {
+                request_id: "read-attachment".into(),
+                session_id: session_id.clone(),
+                attachment_id: attachment.id.clone(),
+                offset: 0,
+                max_bytes: image.len(),
+            })
+            .await
+            .expect("read attachment");
+        loop {
+            if let ServerMessage::AttachmentChunk {
+                request_id,
+                data,
+                next_offset,
+                ..
+            } = next_gateway_message(&mut events).await
+                && request_id == "read-attachment"
+            {
+                assert_eq!(data, image);
+                assert_eq!(next_offset, None);
+                break;
+            }
+        }
+
+        let submission_id = "submit-attachment".to_string();
+        sender
+            .send(ClientMessage::Submit {
+                session_id: session_id.clone(),
+                submission: Submission {
+                    id: submission_id.clone(),
+                    op: Op::UserInput {
+                        text: "describe the image".into(),
+                        attachments: vec![attachment.clone()],
+                    },
+                },
+            })
+            .await
+            .expect("submit attachment");
+        let mut saw_user_message = false;
+        let model_error = loop {
+            let ServerMessage::AgentEvent {
+                session_id: actual_session,
+                event,
+                ..
+            } = next_gateway_message(&mut events).await
+            else {
+                continue;
+            };
+            if actual_session != session_id
+                || event.submission_id.as_deref() != Some(&submission_id)
+            {
+                continue;
+            }
+            match event.msg {
+                EventMsg::UserMessage(message) => {
+                    assert_eq!(message.attachments, std::slice::from_ref(&attachment));
+                    saw_user_message = true;
+                }
+                EventMsg::Error(error) => break error.message,
+                _ => {}
+            }
+        };
+
+        assert!(saw_user_message);
+        assert!(
+            model_error.contains("selected provider is not configured"),
+            "valid image must reach the model after attachment middleware: {model_error}"
+        );
+        shutdown.send(()).expect("stop gateway");
+        serving.await.expect("gateway task").expect("gateway stop");
     }
 
     #[tokio::test]
@@ -2092,6 +2601,7 @@ mod tests {
                     id: first_submission.clone(),
                     op: Op::UserInput {
                         text: "hello".into(),
+                        attachments: Vec::new(),
                     },
                 },
             })
@@ -2123,6 +2633,7 @@ mod tests {
                     id: shared_submission.clone(),
                     op: Op::UserInput {
                         text: "shared".into(),
+                        attachments: Vec::new(),
                     },
                 },
             })

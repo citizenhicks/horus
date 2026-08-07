@@ -720,6 +720,7 @@ mod tests {
                 model: "kimi-k3".into(),
                 reasoning_effort: Some("high".into()),
                 context_window: Some(1_048_576),
+                supports_attachment_input: true,
             },
             ModelChoice {
                 route: "kimi-low".into(),
@@ -727,6 +728,7 @@ mod tests {
                 model: "kimi-k3".into(),
                 reasoning_effort: Some("low".into()),
                 context_window: Some(1_048_576),
+                supports_attachment_input: true,
             },
         ]
     }
@@ -734,6 +736,7 @@ mod tests {
     fn contribution(command: &str) -> FrontendContribution {
         FrontendContribution {
             capability: "test".into(),
+            accepts_file_attachments: false,
             count: None,
             commands: vec![FrontendCommand {
                 name: command.into(),

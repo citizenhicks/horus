@@ -282,6 +282,7 @@ impl Middleware for Scratchpad {
     fn frontend(&self) -> FrontendContribution {
         FrontendContribution {
             capability: self.name().into(),
+            accepts_file_attachments: false,
             count: None,
             commands: vec![FrontendCommand {
                 name: "scratchpad".into(),

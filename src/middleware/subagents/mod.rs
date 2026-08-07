@@ -37,7 +37,7 @@ use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendEvent;
 use crate::protocol::FrontendTone;
 use crate::protocol::Op;
-use crate::protocol::{internal_message_kind, is_internal_message};
+use crate::protocol::{internal_message_kind, is_internal_message, strip_attachment_references};
 
 use self::runtime::Followup;
 use self::runtime::MAX_MESSAGE_BYTES;
@@ -400,6 +400,7 @@ impl Middleware for Subagents {
     fn frontend(&self) -> FrontendContribution {
         FrontendContribution {
             capability: self.name().into(),
+            accepts_file_attachments: false,
             count: None,
             commands: vec![FrontendCommand {
                 name: "subagents".into(),
@@ -623,7 +624,14 @@ impl Tool for SpawnAgent {
                 if let Err(error) = shared
                     .attach(&scope.root_session_id, &path, sender.clone())
                     .await
-                    .and_then(|()| sender.submit(Op::UserInput { text: message }).map(|_| ()))
+                    .and_then(|()| {
+                        sender
+                            .submit(Op::UserInput {
+                                text: message,
+                                attachments: Vec::new(),
+                            })
+                            .map(|_| ())
+                    })
                 {
                     return Err(cleanup_error(
                         error,
@@ -753,7 +761,14 @@ impl Tool for FollowupTask {
                 if let Err(error) = shared
                     .attach(&scope.root_session_id, &arguments.target, sender.clone())
                     .await
-                    .and_then(|()| sender.submit(Op::UserInput { text: message }).map(|_| ()))
+                    .and_then(|()| {
+                        sender
+                            .submit(Op::UserInput {
+                                text: message,
+                                attachments: Vec::new(),
+                            })
+                            .map(|_| ())
+                    })
                 {
                     return Err(cleanup_error(
                         error,
@@ -942,7 +957,7 @@ impl Tool for WaitAgent {
 }
 
 fn fork_context(context: &[Value], turns: ForkTurns) -> Vec<Value> {
-    match turns {
+    let mut fork = match turns {
         ForkTurns::None => Vec::new(),
         ForkTurns::All => context.to_vec(),
         ForkTurns::Last(turns) => {
@@ -958,7 +973,9 @@ fn fork_context(context: &[Value], turns: ForkTurns) -> Vec<Value> {
                 .map_or(0, |(index, _)| index);
             context[start..].to_vec()
         }
-    }
+    };
+    strip_attachment_references(&mut fork);
+    fork
 }
 
 fn parse_fork_turns(value: Option<&str>) -> Result<ForkTurns> {
@@ -1158,6 +1175,24 @@ mod tests {
                 if matches!(*primary, Error::Tool(_))
                     && matches!(*rollback, Error::Checkpoint(_))
         ));
+    }
+
+    #[test]
+    fn forked_context_drops_session_owned_attachment_references() {
+        let context = vec![serde_json::json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": "inspect"}],
+            "_horus_attachments": [{
+                "id": "378b8581-e96c-4413-a138-93e74561cb87",
+                "name": "photo.png",
+                "size": 1,
+                "media_type": "image/png"
+            }]
+        })];
+
+        let fork = fork_context(&context, ForkTurns::All);
+
+        assert!(fork[0].get("_horus_attachments").is_none());
     }
 
     #[tokio::test]

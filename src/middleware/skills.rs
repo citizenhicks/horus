@@ -217,6 +217,7 @@ impl Middleware for Skills {
     fn frontend(&self) -> FrontendContribution {
         FrontendContribution {
             capability: self.name().into(),
+            accepts_file_attachments: false,
             count: Some(self.skills.len()),
             commands: Vec::new(),
             widgets: vec![FrontendWidget {

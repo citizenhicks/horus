@@ -11,6 +11,7 @@ struct CachedTranscript: Codable {
         let tone: String
         let pending: Bool
         let messageTarget: MessageTarget?
+        let attachments: [AttachmentRecord]
 
         init(_ entry: TranscriptEntry) {
             id = entry.id
@@ -21,6 +22,7 @@ struct CachedTranscript: Codable {
             tone = entry.tone
             pending = entry.pending
             messageTarget = entry.messageTarget
+            attachments = entry.attachments
         }
 
         var transcriptEntry: TranscriptEntry {
@@ -32,7 +34,8 @@ struct CachedTranscript: Codable {
                 format: format,
                 tone: tone,
                 pending: pending,
-                messageTarget: messageTarget
+                messageTarget: messageTarget,
+                attachments: attachments
             )
         }
     }
@@ -292,7 +295,12 @@ final class GatewayStore {
                   consume(entry.text),
                   consume(entry.group),
                   consume(entry.format),
-                  consume(entry.tone)
+                  consume(entry.tone),
+                  entry.attachments.allSatisfy({ attachment in
+                      consume(attachment.id)
+                          && consume(attachment.name)
+                          && consume(attachment.mediaType)
+                  })
             else { return false }
         }
         return true

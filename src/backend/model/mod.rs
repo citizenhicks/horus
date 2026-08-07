@@ -25,7 +25,7 @@ pub mod openrouter;
 pub mod provider;
 mod transport;
 
-use crate::protocol::INTERNAL_MESSAGE_FIELD;
+use crate::protocol::{ATTACHMENTS_FIELD, AttachmentReference, INTERNAL_MESSAGE_FIELD};
 pub(crate) use crate::protocol::{REPLAY_REASONING_FIELD, TOOL_ERROR_FIELD};
 const MAX_MODEL_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 128;
@@ -236,6 +236,7 @@ pub struct ModelChoice {
     pub model: String,
     pub reasoning_effort: Option<String>,
     pub context_window: Option<i64>,
+    pub supports_attachment_input: bool,
 }
 
 /// A model provider Adapter used by the agent loop.
@@ -243,6 +244,11 @@ pub trait Model: Send + Sync {
     /// Returns stable display metadata without exposing credentials.
     fn info(&self) -> ModelInfo {
         ModelInfo::default()
+    }
+
+    /// Reports whether this provider accepts attachment-bearing user turns.
+    fn supports_attachment_input(&self) -> bool {
+        true
     }
 
     /// Produces one streamed response.
@@ -336,7 +342,7 @@ impl ModelRouter {
     }
 
     /// Replaces display metadata for one registered route.
-    pub fn configure_choice(&mut self, choice: ModelChoice) -> Result<()> {
+    pub fn configure_choice(&mut self, mut choice: ModelChoice) -> Result<()> {
         if choice.group.trim().is_empty() || choice.model.trim().is_empty() {
             return Err(Error::Config(
                 "model choice group and model cannot be empty".into(),
@@ -352,6 +358,7 @@ impl ModelRouter {
             .iter_mut()
             .find(|current| current.choice.route == choice.route)
             .ok_or_else(|| Error::Unknown(format!("model route `{}`", choice.route)))?;
+        choice.supports_attachment_input = current.provider.supports_attachment_input();
         current.choice = choice;
         Ok(())
     }
@@ -375,6 +382,11 @@ impl ModelRouter {
     /// Reports whether one route has a native compaction endpoint.
     pub fn compaction_endpoint(&self, provider: &str) -> Result<bool> {
         Ok(self.provider(provider)?.compaction_endpoint())
+    }
+
+    /// Reports whether one route accepts attachment-bearing user turns.
+    pub fn supports_attachment_input(&self, provider: &str) -> Result<bool> {
+        Ok(self.provider(provider)?.supports_attachment_input())
     }
 
     /// Compacts context through the selected provider.
@@ -406,7 +418,51 @@ fn inferred_choice(route: &str, provider: &dyn Model) -> ModelChoice {
         model: info.model,
         reasoning_effort: info.reasoning_effort,
         context_window: None,
+        supports_attachment_input: provider.supports_attachment_input(),
     }
+}
+
+pub(crate) fn image_input<'a>(
+    part: &'a Value,
+    provider: &str,
+) -> Result<Option<(&'a str, &'a str)>> {
+    if part.get("type").and_then(Value::as_str) != Some("input_image") {
+        return Ok(None);
+    }
+    let media_type = part
+        .get("media_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            Error::Provider(format!("{provider} image input omitted media_type").into())
+        })?;
+    let data = part
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|data| !data.is_empty())
+        .ok_or_else(|| Error::Provider(format!("{provider} image input omitted data").into()))?;
+    let Some(subtype) = media_type.strip_prefix("image/") else {
+        return Err(Error::Provider(
+            format!("{provider} image input requires an image media type").into(),
+        ));
+    };
+    if subtype.is_empty()
+        || !subtype.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-'
+                )
+        })
+    {
+        return Err(Error::Provider(
+            format!("{provider} image input has an invalid media type").into(),
+        ));
+    }
+    Ok(Some((media_type, data)))
+}
+
+pub(crate) fn image_data_url(media_type: &str, data: &str) -> String {
+    format!("data:{media_type};base64,{data}")
 }
 
 fn validate_usage(usage: &TokenUsage) -> Result<()> {
@@ -534,6 +590,17 @@ pub fn user_message(text: &str) -> Value {
         "role": "user",
         "content": [{"type": "input_text", "text": text}]
     })
+}
+
+/// Creates a durable user message carrying opaque uploaded-file references.
+#[must_use]
+pub fn user_message_with_attachments(text: &str, attachments: &[AttachmentReference]) -> Value {
+    let mut message = user_message(text);
+    if !attachments.is_empty() {
+        message[ATTACHMENTS_FIELD] =
+            serde_json::to_value(attachments).unwrap_or_else(|_| Value::Array(Vec::new()));
+    }
+    message
 }
 
 pub(crate) fn internal_user_message(kind: &str, text: &str) -> Value {

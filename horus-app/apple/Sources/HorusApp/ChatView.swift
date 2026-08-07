@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import MarkdownView
+import UniformTypeIdentifiers
 #if os(macOS)
 import AppKit
 #elseif os(iOS)
@@ -444,6 +445,15 @@ private struct ChatOptionsMenu: View {
                         systemImage: "doc.text.magnifyingglass"
                     )
                 }
+                .disabled(model.selectedSessionID == nil || !model.connectionState.isReady)
+                Button(action: model.showUploadedFiles) {
+                    HorusPlatformMenuLabel(
+                        title: "Uploaded files…",
+                        glyph: .fileText,
+                        systemImage: "paperclip"
+                    )
+                }
+                .disabled(model.selectedSessionID == nil || !model.connectionState.isReady)
                 if let path = model.workspace?.path {
                     Button { copyToPasteboard(path) } label: {
                         HorusPlatformMenuLabel(
@@ -782,8 +792,7 @@ private struct TranscriptRow: View {
         case .user:
             HStack {
                 Spacer(minLength: 42)
-                Text(entry.text)
-                    .textSelection(.enabled)
+                UserMessageContent(entry: entry)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
                     .background(palette.accentSoft, in: HorusStyle.cardShape)
@@ -871,6 +880,54 @@ private struct TranscriptRow: View {
 
     private var frameAlignment: Alignment {
         entry.kind == .user ? .trailing : .leading
+    }
+}
+
+private struct UserMessageContent: View {
+    @Environment(AppModel.self) private var model
+    let entry: TranscriptEntry
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            ForEach(entry.attachments) { attachment in
+                Button {
+                    model.previewAttachment(attachment)
+                } label: {
+                    AttachmentRecordLabel(attachment: attachment)
+                }
+                .buttonStyle(.horusPlain)
+                .disabled(model.isLoadingAttachmentPreview)
+                .accessibilityLabel("Open attachment \(attachment.name)")
+            }
+            if !entry.text.isEmpty {
+                Text(entry.text).textSelection(.enabled)
+            }
+        }
+    }
+}
+
+private struct AttachmentRecordLabel: View {
+    @Environment(\.horusPalette) private var palette
+    let attachment: AttachmentRecord
+
+    var body: some View {
+        HStack(spacing: 10) {
+            HorusIcon(.fileText, foreground: palette.accent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(attachment.name)
+                    .font(HorusStyle.metadataFont.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(attachment.size, format: .byteCount(style: .file))
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(palette.muted)
+            }
+            HorusIcon(.caretRight, size: 12, foreground: palette.muted)
+        }
+        .frame(maxWidth: 320, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
+        .padding(.horizontal, 10)
+        .background(palette.panel.opacity(0.72), in: HorusStyle.controlShape)
+        .contentShape(Rectangle())
     }
 }
 
@@ -1126,6 +1183,11 @@ private struct ComposerSurface: View {
                     .padding(.top, 10)
                 }
                 .scrollIndicators(.hidden)
+            }
+            if !model.composerAttachments.isEmpty {
+                ComposerAttachmentsView()
+                    .padding(.horizontal, 12)
+                    .padding(.top, 10)
             }
             TextField(
                 "Ask Horus to inspect, explain, or change something…",
@@ -1423,14 +1485,30 @@ private struct ComposerOptionsView: View {
     let dictation: ComposerDictation
     @Binding var selection: TextSelection?
     #endif
+    @State private var isFileImporterPresented = false
 
     var body: some View {
         HStack(spacing: 8) {
+            if model.attachmentsEnabled {
+                Button("Add files", glyph: .plus) {
+                    isFileImporterPresented = true
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(HorusIconButtonStyle())
+                .disabled(!model.canImportAttachments)
+                .help(addFilesHelp)
+            }
             modelMenu
             approvalMenu
             Spacer()
             actionButtons
         }
+        .fileImporter(
+            isPresented: $isFileImporterPresented,
+            allowedContentTypes: [.data],
+            allowsMultipleSelection: true,
+            onCompletion: importFiles
+        )
     }
 
     private var modelMenu: some View {
@@ -1553,7 +1631,7 @@ private struct ComposerOptionsView: View {
         .accessibilityValue(dictationValue)
         #endif
 
-        if model.activeTurnID != nil && !hasComposerText {
+        if model.activeTurnID != nil && !model.canSendComposer {
             Button("Stop", glyph: .stopFill) { model.interrupt() }
                 .labelStyle(.iconOnly)
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
@@ -1567,6 +1645,21 @@ private struct ComposerOptionsView: View {
                 .disabled(!canSend)
                 .help(model.activeTurnID == nil ? "Send" : "Send steering message")
         }
+    }
+
+    private func importFiles(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            Task { await model.importAttachments(urls) }
+        case .failure(let error):
+            model.showToast(error.localizedDescription, tone: .error)
+        }
+    }
+
+    private var addFilesHelp: String {
+        model.selectedRouteSupportsAttachmentInput
+            ? "Add files"
+            : "The selected model does not accept attachments"
     }
 
     private var currentChoice: ModelChoice? {
@@ -1626,14 +1719,12 @@ private struct ComposerOptionsView: View {
         return "\(currentChoice.model) · \(currentChoice.reasoningEffort?.capitalized ?? "Default")"
     }
 
-    private var hasComposerText: Bool {
-        !model.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
     private var canSend: Bool {
         guard model.connectionState.isReady,
-              hasComposerText,
-              model.selectedSessionID != nil
+              model.canSendComposer,
+              !model.composerHasUnfinishedAttachments,
+              model.selectedSessionID != nil,
+              model.activeTurnID == nil || model.composerAttachments.isEmpty
         else { return false }
         #if os(iOS)
         return !dictation.isActive
@@ -1694,6 +1785,95 @@ private struct ComposerOptionsView: View {
     }
     #endif
 
+}
+
+private struct ComposerAttachmentsView: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(spacing: 6) {
+            if !model.canSubmitAttachments {
+                Text(model.attachmentSubmissionUnavailableMessage)
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            ForEach(model.composerAttachments) { attachment in
+                ComposerAttachmentRow(attachment: attachment)
+            }
+        }
+    }
+}
+
+private struct ComposerAttachmentRow: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+    let attachment: ComposerAttachment
+
+    var body: some View {
+        HStack(spacing: 10) {
+            HorusIcon(.fileText, foreground: palette.accent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(attachment.name)
+                    .font(HorusStyle.metadataFont.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                status
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(statusColor)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            stateControl
+            Button("Remove attachment", glyph: .x) {
+                model.removeComposerAttachment(attachment.id)
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.horusPlain)
+            .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+            .disabled(isUploading)
+        }
+        .padding(.leading, 10)
+        .background(palette.panel.opacity(0.72), in: HorusStyle.controlShape)
+        .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private var stateControl: some View {
+        switch attachment.state {
+        case .queued, .uploading:
+            ProgressView().controlSize(.small)
+        case .uploaded:
+            HorusIcon(.checkCircle, foreground: palette.signal)
+                .accessibilityLabel("Uploaded")
+        case .failed:
+            Button("Retry upload", glyph: .arrowClockwise) {
+                model.retryComposerAttachment(attachment.id)
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.horusPlain)
+            .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+        }
+    }
+
+    private var status: Text {
+        switch attachment.state {
+        case .queued: Text("Waiting to upload")
+        case .uploading: Text("Uploading")
+        case .uploaded: Text(attachment.size, format: .byteCount(style: .file))
+        case .failed(let message): Text(message)
+        }
+    }
+
+    private var statusColor: Color {
+        if case .failed = attachment.state { return palette.danger }
+        return palette.muted
+    }
+
+    private var isUploading: Bool {
+        if case .uploading = attachment.state { return true }
+        return false
+    }
 }
 
 private struct ApprovalView: View {

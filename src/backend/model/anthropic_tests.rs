@@ -63,6 +63,30 @@ fn responses_history_translates_to_anthropic_tool_messages() {
 }
 
 #[test]
+fn neutral_image_becomes_anthropic_base64_source() {
+    let messages = translate_messages(&[serde_json::json!({
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "Describe it."},
+            {"type": "input_image", "media_type": "image/webp", "data": "aGVsbG8="}
+        ]
+    })])
+    .expect("translate image");
+
+    assert_eq!(
+        messages[0]["content"][1],
+        serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/webp",
+                "data": "aGVsbG8="
+            }
+        })
+    );
+}
+
+#[test]
 fn stream_normalizes_deltas_tools_usage_and_errors() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink_seen = Arc::clone(&seen);

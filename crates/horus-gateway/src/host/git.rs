@@ -4,7 +4,7 @@ use std::time::Duration;
 use horus::backend::sandbox::CommandOutput;
 
 use crate::sandbox::GatewaySandbox;
-use crate::wire::GitStatus;
+use crate::wire::{GitDiffScope, GitStatus};
 
 use super::Rejection;
 
@@ -77,8 +77,9 @@ async fn switch_branch_inner(
 pub(super) async fn diff(
     sandbox: &GatewaySandbox,
     workspace: &Path,
+    scope: GitDiffScope,
 ) -> std::result::Result<String, Rejection> {
-    tokio::time::timeout(GIT_TIMEOUT, diff_inner(sandbox, workspace))
+    tokio::time::timeout(GIT_TIMEOUT, diff_inner(sandbox, workspace, scope))
         .await
         .map_err(|_| timeout())?
 }
@@ -86,6 +87,7 @@ pub(super) async fn diff(
 async fn diff_inner(
     sandbox: &GatewaySandbox,
     workspace: &Path,
+    scope: GitDiffScope,
 ) -> std::result::Result<String, Rejection> {
     let repository = output(sandbox, &["rev-parse", "--is-inside-work-tree"]).await?;
     if repository.exit_code != 0 {
@@ -101,25 +103,8 @@ async fn diff_inner(
         return Ok(String::new());
     }
 
-    let head = output(sandbox, &["rev-parse", "--verify", "--quiet", "HEAD"]).await?;
-    let mut diff = if head.exit_code == 0 {
-        successful_output(
-            output(
-                sandbox,
-                &[
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-color",
-                    "--no-textconv",
-                    "HEAD",
-                    "--",
-                ],
-            )
-            .await?,
-            "git diff failed",
-        )?
-    } else {
-        let staged = successful_output(
+    let mut diff = match scope {
+        GitDiffScope::Staged => successful_output(
             output(
                 sandbox,
                 &[
@@ -133,21 +118,53 @@ async fn diff_inner(
             )
             .await?,
             "staged git diff failed",
-        )?;
-        let unstaged = successful_output(
+        )?,
+        GitDiffScope::Unstaged => successful_output(
             output(
                 sandbox,
                 &["diff", "--no-ext-diff", "--no-color", "--no-textconv", "--"],
             )
             .await?,
             "unstaged git diff failed",
-        )?;
-        let mut diff = Vec::new();
-        append_diff(&mut diff, &staged);
-        append_diff(&mut diff, &unstaged);
-        diff
+        )?,
+        GitDiffScope::Committed => {
+            let head = output(sandbox, &["rev-parse", "--verify", "--quiet", "HEAD"]).await?;
+            if head.exit_code != 0 {
+                Vec::new()
+            } else {
+                successful_output(
+                    output(
+                        sandbox,
+                        &[
+                            "show",
+                            "--format=",
+                            "--no-ext-diff",
+                            "--no-color",
+                            "--no-textconv",
+                            "HEAD",
+                            "--",
+                        ],
+                    )
+                    .await?,
+                    "committed git diff failed",
+                )?
+            }
+        }
     };
 
+    if scope == GitDiffScope::Unstaged {
+        append_untracked(sandbox, workspace, &mut diff).await?;
+    }
+
+    truncate_diff(&mut diff);
+    Ok(String::from_utf8_lossy(&diff).into_owned())
+}
+
+async fn append_untracked(
+    sandbox: &GatewaySandbox,
+    workspace: &Path,
+    diff: &mut Vec<u8>,
+) -> std::result::Result<(), Rejection> {
     let untracked = successful_output(
         output(
             sandbox,
@@ -178,12 +195,10 @@ async fn diff_inner(
         }
         let patch = untracked_diff(sandbox, path).await?;
         if !is_binary_diff(&patch) {
-            append_diff(&mut diff, &patch);
+            append_diff(diff, &patch);
         }
     }
-
-    truncate_diff(&mut diff);
-    Ok(String::from_utf8_lossy(&diff).into_owned())
+    Ok(())
 }
 
 async fn output(
@@ -441,7 +456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_diff_includes_staged_unstaged_and_untracked_text() {
+    async fn workspace_diff_keeps_staged_and_unstaged_scopes_separate() {
         let workspace = tempfile::tempdir().expect("workspace");
         let (_state, sandbox) = test_sandbox(workspace.path());
         run_git(workspace.path(), &["init", "--quiet"]);
@@ -467,21 +482,22 @@ mod tests {
         std::fs::write(workspace.path().join("ignored.txt"), "ignored\n").expect("ignored file");
         std::fs::write(workspace.path().join("binary.bin"), [0, 1, 2]).expect("binary file");
 
-        let diff = diff(&sandbox, workspace.path())
+        let staged = diff(&sandbox, workspace.path(), GitDiffScope::Staged)
             .await
-            .expect("workspace diff");
+            .expect("staged diff");
+        let unstaged = diff(&sandbox, workspace.path(), GitDiffScope::Unstaged)
+            .await
+            .expect("unstaged diff");
 
         assert!(
-            diff.contains("diff --git a/staged.txt b/staged.txt")
-                && diff.contains("+staged change")
-                && diff.contains("diff --git a/unstaged.txt b/unstaged.txt")
-                && diff.contains("+unstaged change")
-                && diff.contains("diff --git a/new.txt b/new.txt")
-                && diff.contains("--- /dev/null")
-                && diff.contains("+untracked content")
-                && !diff.contains("ignored.txt")
-                && !diff.contains("binary.bin"),
-            "unexpected diff:\n{diff}"
+            staged.contains("+staged change")
+                && !staged.contains("a/unstaged.txt")
+                && unstaged.contains("+unstaged change")
+                && unstaged.contains("+untracked content")
+                && !unstaged.contains("a/staged.txt")
+                && !unstaged.contains("ignored.txt")
+                && !unstaged.contains("binary.bin"),
+            "unexpected scoped diffs:\nstaged:\n{staged}\nunstaged:\n{unstaged}"
         );
     }
 
@@ -490,11 +506,24 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let (_state, sandbox) = test_sandbox(workspace.path());
 
-        let diff = diff(&sandbox, workspace.path())
+        let diff = diff(&sandbox, workspace.path(), GitDiffScope::Staged)
             .await
             .expect("non-Git workspace");
 
         assert!(diff.is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_scope_returns_the_head_patch() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        initialize_repository(workspace.path(), "main");
+        let (_state, sandbox) = test_sandbox(workspace.path());
+
+        let diff = diff(&sandbox, workspace.path(), GitDiffScope::Committed)
+            .await
+            .expect("committed diff");
+
+        assert!(diff.contains("diff --git a/tracked.txt b/tracked.txt"));
     }
 
     #[tokio::test]
@@ -508,7 +537,7 @@ mod tests {
         )
         .expect("large untracked file");
 
-        let diff = diff(&sandbox, workspace.path())
+        let diff = diff(&sandbox, workspace.path(), GitDiffScope::Unstaged)
             .await
             .expect("oversized diff");
 

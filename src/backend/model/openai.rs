@@ -14,6 +14,8 @@ use super::ModelInfo;
 use super::ModelOutput;
 use super::ModelRequest;
 use super::ToolDefinition;
+use super::image_data_url;
+use super::image_input;
 use super::openai_auth::ApiKeyAuthorization;
 use super::openai_auth::OpenAiAuthorization;
 use super::provider::HostedWebSearch;
@@ -51,6 +53,7 @@ pub struct OpenAi {
     reasoning_effort: Option<String>,
     hosted_tools: Vec<Value>,
     compaction_endpoint: bool,
+    image_input: bool,
 }
 
 impl OpenAi {
@@ -101,6 +104,7 @@ impl OpenAi {
             reasoning_effort: None,
             hosted_tools: Vec::new(),
             compaction_endpoint: false,
+            image_input: true,
         })
     }
 
@@ -143,6 +147,13 @@ impl OpenAi {
         self
     }
 
+    /// Disables image input for a Responses-compatible endpoint that rejects it.
+    #[must_use]
+    pub(super) fn without_image_input(mut self) -> Self {
+        self.image_input = false;
+        self
+    }
+
     async fn send_response(
         &self,
         request: ModelRequest<'_>,
@@ -151,7 +162,7 @@ impl OpenAi {
         let mut body = serde_json::json!({
             "model": self.model,
             "instructions": request.instructions,
-            "input": wire_input(request.input),
+            "input": wire_input(request.input, self.image_input)?,
             "tools": wire_tools(request.tools, &self.hosted_tools, request.allow_hosted_tools),
             "tool_choice": "auto",
             "parallel_tool_calls": true,
@@ -229,7 +240,7 @@ impl OpenAi {
                 "OpenAI-compatible provider has no compaction endpoint".into(),
             ));
         }
-        let body = self.compact_body(request);
+        let body = self.compact_body(request)?;
         let request = self
             .client
             .post(format!("{}/responses/compact", self.base_url))
@@ -263,14 +274,14 @@ impl OpenAi {
         Ok(request)
     }
 
-    fn compact_body(&self, request: CompactRequest<'_>) -> Value {
-        serde_json::json!({
+    fn compact_body(&self, request: CompactRequest<'_>) -> Result<Value> {
+        Ok(serde_json::json!({
             "model": self.model,
             "instructions": request.instructions,
-            "input": wire_input(request.input),
+            "input": wire_input(request.input, self.image_input)?,
             "tools": wire_tools(request.tools, &self.hosted_tools, true),
             "parallel_tool_calls": true
-        })
+        }))
     }
 }
 
@@ -280,6 +291,10 @@ impl Model for OpenAi {
             model: self.model.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
         }
+    }
+
+    fn supports_attachment_input(&self) -> bool {
+        self.image_input
     }
 
     fn respond<'a>(
@@ -299,14 +314,34 @@ impl Model for OpenAi {
     }
 }
 
-pub(super) fn wire_input(input: &[Value]) -> Vec<Value> {
+pub(super) fn wire_input(input: &[Value], allow_images: bool) -> Result<Vec<Value>> {
     let mut input = input.to_vec();
     for item in &mut input {
         if let Some(fields) = item.as_object_mut() {
             fields.retain(|name, _| !name.starts_with('_'));
         }
+        let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in content {
+            if part.get("type").and_then(Value::as_str) != Some("input_image") {
+                continue;
+            }
+            if !allow_images {
+                return Err(Error::Provider(
+                    "this model provider does not support image attachments".into(),
+                ));
+            }
+            let Some((media_type, data)) = image_input(part, "Responses")? else {
+                continue;
+            };
+            *part = serde_json::json!({
+                "type": "input_image",
+                "image_url": image_data_url(media_type, data)
+            });
+        }
     }
-    input
+    Ok(input)
 }
 
 pub(super) fn collect_stream_output(

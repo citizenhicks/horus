@@ -30,6 +30,7 @@ fn catalog(workspace: &std::path::Path) -> UiCatalog {
             model: "kimi-k3".into(),
             reasoning_effort: Some("high".into()),
             context_window: Some(1_048_576),
+            supports_attachment_input: true,
         }],
         workspace,
     )
@@ -123,6 +124,7 @@ fn composer_queues_a_new_turn_without_steering_middleware() {
         working.submit_input(&catalog),
         UiAction::Submit(Op::UserInput {
             text: "next task".into(),
+            attachments: Vec::new(),
         })
     );
 }
@@ -540,6 +542,7 @@ fn snapshot_preview_scrolls_with_the_mouse_wheel() {
                 .map(|index| RenderedEvent {
                     event: EventMsg::UserMessage(horus::protocol::UserMessageEvent {
                         message: format!("subagent row {index}"),
+                        attachments: Vec::new(),
                         message_target: None,
                     }),
                     blocks: Vec::new(),

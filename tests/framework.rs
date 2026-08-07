@@ -76,6 +76,7 @@ async fn loop_executes_tool_and_returns_result_to_model() {
         .sender()
         .submit(Op::UserInput {
             text: "read note.txt".into(),
+            attachments: Vec::new(),
         })
         .expect("submit turn");
 
@@ -112,6 +113,7 @@ async fn middleware_prompt_is_composed_once_per_agent() {
             .sender()
             .submit(Op::UserInput {
                 text: message.into(),
+                attachments: Vec::new(),
             })
             .expect("submit turn");
         final_message(&mut agent).await;
@@ -139,6 +141,7 @@ async fn live_messages_expose_their_durable_transcript_boundaries() {
         .sender()
         .submit(Op::UserInput {
             text: "question".into(),
+            attachments: Vec::new(),
         })
         .expect("submit turn");
 
@@ -191,6 +194,7 @@ async fn approval_allows_an_explicitly_approved_write() {
     sender
         .submit(Op::UserInput {
             text: "write the result".into(),
+            attachments: Vec::new(),
         })
         .expect("submit turn");
 
@@ -240,6 +244,7 @@ async fn approval_denial_prevents_command_execution() {
     sender
         .submit(Op::UserInput {
             text: "run a command".into(),
+            attachments: Vec::new(),
         })
         .expect("submit turn");
 
@@ -309,6 +314,7 @@ async fn external_skill_resources_are_loaded_lazily() {
         .sender()
         .submit(Op::UserInput {
             text: "review this".into(),
+            attachments: Vec::new(),
         })
         .expect("submit turn");
     final_message(&mut agent).await;
@@ -374,6 +380,7 @@ async fn async_subagent_uses_configured_model_reasoning_and_durable_fork() {
             model: "root".into(),
             reasoning_effort: None,
             context_window: None,
+            supports_attachment_input: true,
         },
         ModelChoice {
             route: "child".into(),
@@ -381,6 +388,7 @@ async fn async_subagent_uses_configured_model_reasoning_and_durable_fork() {
             model: "child".into(),
             reasoning_effort: Some("low".into()),
             context_window: None,
+            supports_attachment_input: true,
         },
         ModelChoice {
             route: "child-high".into(),
@@ -388,6 +396,7 @@ async fn async_subagent_uses_configured_model_reasoning_and_durable_fork() {
             model: "child".into(),
             reasoning_effort: Some("high".into()),
             context_window: None,
+            supports_attachment_input: true,
         },
     ] {
         routes
@@ -442,6 +451,7 @@ async fn async_subagent_uses_configured_model_reasoning_and_durable_fork() {
         .sender()
         .submit(Op::UserInput {
             text: "delegate cheaply".into(),
+            attachments: Vec::new(),
         })
         .expect("submit turn");
 
@@ -506,6 +516,7 @@ async fn steering_is_injected_before_native_compaction() {
     sender
         .submit(Op::UserInput {
             text: "start".into(),
+            attachments: Vec::new(),
         })
         .expect("submit turn");
 
@@ -585,6 +596,7 @@ async fn compaction_uses_the_context_window_of_a_new_model_route() {
                 model: route.into(),
                 reasoning_effort: None,
                 context_window: Some(context_window),
+                supports_attachment_input: true,
             })
             .expect("route metadata");
     }
@@ -600,6 +612,7 @@ async fn compaction_uses_the_context_window_of_a_new_model_route() {
         .sender()
         .submit(Op::UserInput {
             text: "first".into(),
+            attachments: Vec::new(),
         })
         .expect("submit first turn");
     assert_eq!(final_message(&mut agent).await, "draft");
@@ -613,6 +626,7 @@ async fn compaction_uses_the_context_window_of_a_new_model_route() {
         .sender()
         .submit(Op::UserInput {
             text: "second".into(),
+            attachments: Vec::new(),
         })
         .expect("submit second turn");
 
@@ -651,6 +665,7 @@ async fn interrupt_only_aborts_its_target_turn() {
     sender
         .submit(Op::UserInput {
             text: "start".into(),
+            attachments: Vec::new(),
         })
         .expect("submit turn");
 
@@ -723,6 +738,7 @@ async fn compaction_falls_back_to_a_model_summary_and_keeps_recent_context() {
         .sender()
         .submit(Op::UserInput {
             text: "x".repeat(82_000),
+            attachments: Vec::new(),
         })
         .expect("submit first turn");
     assert_eq!(final_message(&mut agent).await, "draft");
@@ -730,6 +746,7 @@ async fn compaction_falls_back_to_a_model_summary_and_keeps_recent_context() {
         .sender()
         .submit(Op::UserInput {
             text: "continue".into(),
+            attachments: Vec::new(),
         })
         .expect("submit second turn");
     assert_eq!(final_message(&mut agent).await, "done");

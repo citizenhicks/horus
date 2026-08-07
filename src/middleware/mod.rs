@@ -30,6 +30,7 @@ use crate::protocol::TokenUsage;
 use crate::protocol::ToolCallBeginEvent;
 use crate::protocol::ToolCallEndEvent;
 
+pub mod attachments;
 pub mod compaction;
 pub mod context_offloading;
 pub mod cron;
@@ -865,6 +866,7 @@ mod tests {
         fn frontend(&self) -> FrontendContribution {
             FrontendContribution {
                 capability: self.name().into(),
+                accepts_file_attachments: false,
                 count: None,
                 commands: Vec::new(),
                 widgets: Vec::new(),
@@ -894,6 +896,7 @@ mod tests {
     fn frontend_surfaces_require_generic_content() {
         let contribution = FrontendContribution {
             capability: "example".into(),
+            accepts_file_attachments: false,
             count: None,
             commands: Vec::new(),
             widgets: vec![crate::protocol::FrontendWidget {
@@ -963,6 +966,7 @@ mod tests {
         chat_menu.slot = FrontendSlot::ChatMenu;
         let contribution = FrontendContribution {
             capability: "example".into(),
+            accepts_file_attachments: false,
             count: None,
             commands: Vec::new(),
             widgets: vec![navigation, chat_menu],

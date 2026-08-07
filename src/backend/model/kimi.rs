@@ -19,6 +19,7 @@ use super::transport::streaming_client;
 use super::transport::take_sse_frame;
 use super::usage_i64;
 use super::{Model, ModelEventSink, ModelInfo, ModelOutput, ModelRequest, ToolDefinition};
+use super::{image_data_url, image_input};
 use crate::protocol::FrontendSymbol;
 use crate::protocol::ModelEvent;
 use crate::protocol::TokenUsage;
@@ -330,7 +331,7 @@ fn push_history_message(messages: &mut Vec<Value>, item: &Value) -> Result<()> {
     };
     let mut message = serde_json::json!({
         "role": role,
-        "content": content_text(item.get("content"))
+        "content": wire_content(item.get("content"))?
     });
     if role == "assistant"
         && let Some(reasoning) = item.get(REPLAY_REASONING_FIELD).and_then(Value::as_str)
@@ -409,6 +410,38 @@ fn content_text(content: Option<&Value>) -> String {
         Some(value) => value.to_string(),
         None => String::new(),
     }
+}
+
+fn wire_content(content: Option<&Value>) -> Result<Value> {
+    let Some(Value::Array(parts)) = content else {
+        return Ok(Value::String(content_text(content)));
+    };
+    if !parts
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
+    {
+        return Ok(Value::String(content_text(content)));
+    }
+    let mut output = Vec::new();
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text" | "text") => output.push(serde_json::json!({
+                "type": "text",
+                "text": part.get("text").and_then(Value::as_str).unwrap_or_default()
+            })),
+            Some("input_image") => {
+                let Some((media_type, data)) = image_input(part, "Kimi")? else {
+                    continue;
+                };
+                output.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {"url": image_data_url(media_type, data)}
+                }));
+            }
+            None | Some(_) => {}
+        }
+    }
+    Ok(Value::Array(output))
 }
 
 fn argument_text(arguments: Option<&Value>) -> Result<String> {

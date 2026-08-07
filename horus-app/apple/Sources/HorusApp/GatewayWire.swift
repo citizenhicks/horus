@@ -3,9 +3,10 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 15
+let gatewayProtocolVersion = 16
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
+let maximumAttachmentReferences = 16
 
 enum GatewayWireError: LocalizedError, Equatable {
     case invalidEndpoint(String)
@@ -189,6 +190,49 @@ struct Submission: Encodable, Sendable {
     let op: AgentOperation
 }
 
+struct AttachmentRecord: Identifiable, Codable, Hashable, Sendable {
+    private enum CodingKeys: String, CodingKey { case id, name, size, mediaType }
+
+    let id: String
+    let name: String
+    let size: Int64
+    let mediaType: String
+
+    init(id: String, name: String, size: Int64, mediaType: String) {
+        self.id = id
+        self.name = name
+        self.size = size
+        self.mediaType = mediaType
+    }
+
+    init(json: JSONValue) throws {
+        guard let id = json["id"]?.stringValue,
+              !id.isEmpty,
+              let name = json["name"]?.stringValue,
+              !name.isEmpty,
+              let size = json["size"]?.intValue,
+              size >= 0,
+              let mediaType = json["mediaType"]?.stringValue,
+              !mediaType.isEmpty
+        else {
+            throw GatewayWireError.invalidFrame("attachment is missing a required field")
+        }
+        self.init(id: id, name: name, size: Int64(size), mediaType: mediaType)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let id = try container.decode(String.self, forKey: .id)
+        let name = try container.decode(String.self, forKey: .name)
+        let size = try container.decode(Int64.self, forKey: .size)
+        let mediaType = try container.decode(String.self, forKey: .mediaType)
+        guard !id.isEmpty, !name.isEmpty, size >= 0, !mediaType.isEmpty else {
+            throw GatewayWireError.invalidFrame("attachment is missing a required field")
+        }
+        self.init(id: id, name: name, size: size, mediaType: mediaType)
+    }
+}
+
 struct MessageTarget: Codable, Hashable, Sendable {
     let checkpointSequence: UInt64
     let batchItemCount: Int
@@ -212,7 +256,7 @@ struct MessageTarget: Codable, Hashable, Sendable {
 }
 
 enum AgentOperation: Codable, Sendable {
-    case userInput(text: String)
+    case userInput(text: String, attachments: [AttachmentRecord])
     case activeInput(operation: String, turnID: String, text: String)
     case interrupt(turnID: String)
     case execApproval(id: String, decision: ReviewDecision)
@@ -242,7 +286,15 @@ enum AgentOperation: Codable, Sendable {
         }
         switch type {
         case "user_input":
-            self = .userInput(text: try required("text"))
+            guard let values = value["attachments"]?.arrayValue,
+                  values.count <= maximumAttachmentReferences
+            else {
+                throw GatewayWireError.invalidFrame("user_input has invalid attachments")
+            }
+            self = .userInput(
+                text: try required("text"),
+                attachments: try values.map(AttachmentRecord.init(json:))
+            )
         case "active_input":
             self = .activeInput(
                 operation: try required("operation"),
@@ -297,9 +349,13 @@ enum AgentOperation: Codable, Sendable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: DynamicCodingKey.self)
         switch self {
-        case .userInput(let text):
+        case .userInput(let text, let attachments):
+            guard attachments.count <= maximumAttachmentReferences else {
+                throw GatewayWireError.invalidFrame("user_input has too many attachments")
+            }
             try container.encode("user_input", forKey: "type")
             try container.encode(text, forKey: "text")
+            try container.encode(attachments, forKey: "attachments")
         case .activeInput(let operation, let turnID, let text):
             try container.encode("active_input", forKey: "type")
             try container.encode(operation, forKey: "operation")
@@ -432,7 +488,38 @@ enum GatewayRequest: Encodable, Sendable {
         expectedRevision: UInt64,
         config: AgentComposition
     )
-    case getGitDiff(requestID: String, sessionID: String)
+    case getGitDiff(requestID: String, sessionID: String, scope: GitDiffScope)
+    case listWorkspaceFiles(requestID: String, sessionID: String)
+    case readWorkspaceFile(
+        requestID: String,
+        sessionID: String,
+        path: String,
+        offset: UInt64,
+        maxBytes: Int
+    )
+    case beginAttachmentUpload(
+        requestID: String,
+        sessionID: String,
+        name: String,
+        size: Int64,
+        mediaType: String
+    )
+    case appendAttachmentChunk(
+        requestID: String,
+        sessionID: String,
+        uploadID: String,
+        offset: Int64,
+        data: Data
+    )
+    case finishAttachmentUpload(requestID: String, sessionID: String, uploadID: String)
+    case listAttachments(requestID: String, sessionID: String)
+    case readAttachment(
+        requestID: String,
+        sessionID: String,
+        attachmentID: String,
+        offset: Int64,
+        maxBytes: Int
+    )
     case switchGitBranch(requestID: String, sessionID: String, branch: String)
     case listDirectories(requestID: String, path: String, includeFiles: Bool)
     case setProviderCredential(requestID: String, provider: String, apiKey: String)
@@ -522,10 +609,52 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(requestID, forKey: "requestId")
             try container.encode(expectedRevision, forKey: "expectedRevision")
             try container.encode(config, forKey: "config")
-        case .getGitDiff(let requestID, let sessionID):
+        case .getGitDiff(let requestID, let sessionID, let scope):
             try container.encode("get_git_diff", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
+            try container.encode(scope, forKey: "scope")
+        case .listWorkspaceFiles(let requestID, let sessionID):
+            try container.encode("list_workspace_files", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
+        case .readWorkspaceFile(let requestID, let sessionID, let path, let offset, let maxBytes):
+            try container.encode("read_workspace_file", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
+            try container.encode(path, forKey: "path")
+            try container.encode(offset, forKey: "offset")
+            try container.encode(maxBytes, forKey: "maxBytes")
+        case .beginAttachmentUpload(let requestID, let sessionID, let name, let size, let mediaType):
+            try container.encode("begin_attachment_upload", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
+            try container.encode(name, forKey: "name")
+            try container.encode(size, forKey: "size")
+            try container.encode(mediaType, forKey: "mediaType")
+        case .appendAttachmentChunk(let requestID, let sessionID, let uploadID, let offset, let data):
+            try container.encode("append_attachment_chunk", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
+            try container.encode(uploadID, forKey: "uploadId")
+            try container.encode(offset, forKey: "offset")
+            try container.encode(data, forKey: "data")
+        case .finishAttachmentUpload(let requestID, let sessionID, let uploadID):
+            try container.encode("finish_attachment_upload", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
+            try container.encode(uploadID, forKey: "uploadId")
+        case .listAttachments(let requestID, let sessionID):
+            try container.encode("list_attachments", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
+        case .readAttachment(let requestID, let sessionID, let attachmentID, let offset, let maxBytes):
+            try container.encode("read_attachment", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
+            try container.encode(attachmentID, forKey: "attachmentId")
+            try container.encode(offset, forKey: "offset")
+            try container.encode(maxBytes, forKey: "maxBytes")
         case .switchGitBranch(let requestID, let sessionID, let branch):
             try container.encode("switch_git_branch", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -638,7 +767,42 @@ enum GatewayEnvelope: Decodable, Sendable {
     case providerLoginFinished(requestID: String, loginID: String, provider: String)
     case profile(requestID: String, profile: ProfileSnapshot)
     case artifacts(requestID: String, sessionID: String, artifacts: [ArtifactRecord])
-    case gitDiff(requestID: String, sessionID: String, diff: String)
+    case gitDiff(requestID: String, sessionID: String, scope: GitDiffScope, diff: String)
+    case workspaceFiles(requestID: String, sessionID: String, files: [WorkspaceFileRecord])
+    case workspaceFileChunk(
+        requestID: String,
+        sessionID: String,
+        path: String,
+        offset: UInt64,
+        data: Data,
+        nextOffset: UInt64?
+    )
+    case attachmentUploadStarted(
+        requestID: String,
+        sessionID: String,
+        uploadID: String,
+        maxChunkBytes: Int
+    )
+    case attachmentChunkAccepted(
+        requestID: String,
+        sessionID: String,
+        uploadID: String,
+        nextOffset: Int64
+    )
+    case attachmentUploaded(
+        requestID: String,
+        sessionID: String,
+        attachment: AttachmentRecord
+    )
+    case attachments(requestID: String, sessionID: String, attachments: [AttachmentRecord])
+    case attachmentChunk(
+        requestID: String,
+        sessionID: String,
+        attachmentID: String,
+        offset: Int64,
+        data: Data,
+        nextOffset: Int64?
+    )
     case directories(requestID: String, listing: DirectoryListing)
     case cronTasks(requestID: String, sessionID: String, tasks: [CronTask])
     case cronHistory(requestID: String, sessionID: String, runs: [CronRun])
@@ -755,7 +919,58 @@ enum GatewayEnvelope: Decodable, Sendable {
             self = .gitDiff(
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 sessionID: try container.decode(String.self, forKey: "sessionId"),
+                scope: try container.decode(GitDiffScope.self, forKey: "scope"),
                 diff: try container.decode(String.self, forKey: "diff")
+            )
+        case "workspace_files":
+            self = .workspaceFiles(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
+                files: try container.decode([WorkspaceFileRecord].self, forKey: "files")
+            )
+        case "workspace_file_chunk":
+            self = .workspaceFileChunk(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
+                path: try container.decode(String.self, forKey: "path"),
+                offset: try container.decode(UInt64.self, forKey: "offset"),
+                data: try container.decode(Data.self, forKey: "data"),
+                nextOffset: try container.decodeIfPresent(UInt64.self, forKey: "nextOffset")
+            )
+        case "attachment_upload_started":
+            self = .attachmentUploadStarted(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
+                uploadID: try container.decode(String.self, forKey: "uploadId"),
+                maxChunkBytes: try container.decode(Int.self, forKey: "maxChunkBytes")
+            )
+        case "attachment_chunk_accepted":
+            self = .attachmentChunkAccepted(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
+                uploadID: try container.decode(String.self, forKey: "uploadId"),
+                nextOffset: try container.decode(Int64.self, forKey: "nextOffset")
+            )
+        case "attachment_uploaded":
+            self = .attachmentUploaded(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
+                attachment: try container.decode(AttachmentRecord.self, forKey: "attachment")
+            )
+        case "attachments":
+            self = .attachments(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
+                attachments: try container.decode([AttachmentRecord].self, forKey: "attachments")
+            )
+        case "attachment_chunk":
+            self = .attachmentChunk(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
+                attachmentID: try container.decode(String.self, forKey: "attachmentId"),
+                offset: try container.decode(Int64.self, forKey: "offset"),
+                data: try container.decode(Data.self, forKey: "data"),
+                nextOffset: try container.decodeIfPresent(Int64.self, forKey: "nextOffset")
             )
         case "directories":
             self = .directories(
@@ -821,6 +1036,21 @@ struct SessionReadyPayload: Decodable, Sendable {
 struct SessionWidget: Decodable, Sendable {
     let capability: String
     let item: FrontendWidget
+}
+
+enum GitDiffScope: String, Codable, CaseIterable, Identifiable, Sendable {
+    case staged
+    case unstaged
+    case committed
+
+    var id: Self { self }
+}
+
+struct WorkspaceFileRecord: Identifiable, Codable, Hashable, Sendable {
+    var id: String { path }
+
+    let path: String
+    let size: UInt64
 }
 
 struct WorkspaceInfo: Identifiable, Codable, Hashable, Sendable {
@@ -908,6 +1138,10 @@ enum SessionOutcome: String, Codable, Hashable, Sendable {
 }
 
 struct ModelChoice: Identifiable, Codable, Hashable, Sendable {
+    private enum CodingKeys: String, CodingKey {
+        case route, group, model, reasoningEffort, contextWindow, supportsAttachmentInput
+    }
+
     var id: String { route }
 
     let route: String
@@ -915,10 +1149,43 @@ struct ModelChoice: Identifiable, Codable, Hashable, Sendable {
     let model: String
     let reasoningEffort: String?
     let contextWindow: Int64?
+    let supportsAttachmentInput: Bool
+
+    init(
+        route: String,
+        group: String,
+        model: String,
+        reasoningEffort: String?,
+        contextWindow: Int64?,
+        supportsAttachmentInput: Bool
+    ) {
+        self.route = route
+        self.group = group
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.contextWindow = contextWindow
+        self.supportsAttachmentInput = supportsAttachmentInput
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            route: try container.decode(String.self, forKey: .route),
+            group: try container.decode(String.self, forKey: .group),
+            model: try container.decode(String.self, forKey: .model),
+            reasoningEffort: try container.decodeIfPresent(String.self, forKey: .reasoningEffort),
+            contextWindow: try container.decodeIfPresent(Int64.self, forKey: .contextWindow),
+            supportsAttachmentInput: try container.decode(
+                Bool.self,
+                forKey: .supportsAttachmentInput
+            )
+        )
+    }
 }
 
 struct FrontendContribution: Decodable, Sendable {
     let capability: String
+    let acceptsFileAttachments: Bool
     let count: Int?
     let commands: [FrontendCommand]
     let widgets: [FrontendWidget]
@@ -929,6 +1196,7 @@ struct FrontendContribution: Decodable, Sendable {
 extension FrontendContribution {
     private enum CodingKeys: String, CodingKey {
         case capability
+        case acceptsFileAttachments
         case count
         case commands
         case widgets
@@ -948,6 +1216,10 @@ extension FrontendContribution {
             )
         }
         capability = try container.decode(String.self, forKey: .capability)
+        acceptsFileAttachments = try container.decode(
+            Bool.self,
+            forKey: .acceptsFileAttachments
+        )
         count = try container.decodeIfPresent(Int.self, forKey: .count)
         commands = try container.decode([FrontendCommand].self, forKey: .commands)
         widgets = try container.decode([FrontendWidget].self, forKey: .widgets)
@@ -1416,11 +1688,21 @@ extension AgentEventRecord {
             }
         }
 
+        func validateAttachments() throws {
+            guard let attachments = msg["attachments"]?.arrayValue,
+                  attachments.count <= maximumAttachmentReferences
+            else {
+                throw GatewayWireError.invalidFrame("\(type) has invalid attachments")
+            }
+            try attachments.forEach { _ = try AttachmentRecord(json: $0) }
+        }
+
         switch type {
         case "error", "warning":
             try requireString("message")
         case "user_message":
             try requireString("message")
+            try validateAttachments()
             try validateMessageTarget()
         case "session_configured":
             try requireString("sessionId")

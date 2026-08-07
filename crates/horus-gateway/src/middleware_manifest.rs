@@ -12,6 +12,7 @@ use crate::{Error, Result};
 #[derive(Clone, Copy)]
 pub(crate) enum BuiltinMiddleware {
     Sandbox,
+    Attachments,
     Tools,
     Instructions,
     Cron,
@@ -30,10 +31,14 @@ pub(crate) struct MiddlewareRegistration {
     pub(crate) manifest: &'static MiddlewareManifest,
 }
 
-pub(crate) const MIDDLEWARE: [MiddlewareRegistration; 12] = [
+pub(crate) const MIDDLEWARE: [MiddlewareRegistration; 13] = [
     MiddlewareRegistration {
         kind: BuiltinMiddleware::Sandbox,
         manifest: &horus::backend::sandbox::MANIFEST,
+    },
+    MiddlewareRegistration {
+        kind: BuiltinMiddleware::Attachments,
+        manifest: &horus::middleware::attachments::MANIFEST,
     },
     MiddlewareRegistration {
         kind: BuiltinMiddleware::Tools,
@@ -287,6 +292,7 @@ mod tests {
             model: "model".into(),
             reasoning_effort: Some("high".into()),
             context_window: Some(200_000),
+            supports_attachment_input: true,
         }];
         let subagents = features(&models)
             .into_iter()

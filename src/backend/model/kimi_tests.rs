@@ -101,6 +101,26 @@ fn responses_history_becomes_kimi_messages_and_tools() {
 }
 
 #[test]
+fn neutral_image_becomes_kimi_image_url() {
+    let content = wire_content(Some(&json!([
+        {"type": "input_text", "text": "Describe it."},
+        {"type": "input_image", "media_type": "image/jpeg", "data": "aGVsbG8="}
+    ])))
+    .expect("wire image");
+
+    assert_eq!(
+        content,
+        json!([
+            {"type": "text", "text": "Describe it."},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,aGVsbG8="}
+            }
+        ])
+    );
+}
+
+#[test]
 fn stream_normalizes_deltas_tools_usage_and_errors() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink_seen = Arc::clone(&seen);

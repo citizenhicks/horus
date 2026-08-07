@@ -164,6 +164,7 @@ impl Middleware for Steering {
                 let message_target = context.push_input(item);
                 context.events.push(EventMsg::UserMessage(UserMessageEvent {
                     message: message.clone(),
+                    attachments: Vec::new(),
                     message_target: Some(message_target),
                 }));
             }

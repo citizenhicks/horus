@@ -16,7 +16,10 @@ pub async fn run(
             session_id: session_id.clone(),
             submission: Submission {
                 id: submission_id.clone(),
-                op: Op::UserInput { text: task },
+                op: Op::UserInput {
+                    text: task,
+                    attachments: Vec::new(),
+                },
             },
         })
         .await

@@ -20,7 +20,7 @@ use crate::backend::checkpoint::ExecutionOutcome;
 use crate::backend::model::ModelEventSink;
 use crate::backend::model::ModelRequest;
 use crate::backend::model::tool_complete_boundaries;
-use crate::backend::model::user_message;
+use crate::backend::model::user_message_with_attachments;
 use crate::backend::sandbox::SandboxAuthorization;
 use crate::middleware::AfterModelContext;
 use crate::middleware::ModelContext;
@@ -96,6 +96,7 @@ impl Runner {
         commands: &mut mpsc::Receiver<Submission>,
         submission_id: String,
         message: String,
+        attachments: Vec<crate::protocol::AttachmentReference>,
     ) -> Result<()> {
         let turn_id = Uuid::new_v4().to_string();
         if self.state.active_execution.is_some() {
@@ -123,13 +124,14 @@ impl Runner {
         if self.state.first_user_message.is_none() && !message.trim().is_empty() {
             self.state.first_user_message = Some(message.clone());
         }
-        self.push_context(user_message(&message));
+        self.push_context(user_message_with_attachments(&message, &attachments));
         let batch_item_count = self.transcript_delta.len();
         let checkpoint_sequence = self.save().await?;
         self.emit(
             &submission_id,
             EventMsg::UserMessage(UserMessageEvent {
                 message: message.clone(),
+                attachments,
                 message_target: Some(MessageTarget {
                     checkpoint_sequence,
                     batch_item_count,

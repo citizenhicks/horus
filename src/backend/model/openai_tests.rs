@@ -22,7 +22,7 @@ fn responses_input_strips_only_top_level_provider_metadata() {
     })];
 
     assert_eq!(
-        wire_input(&input),
+        wire_input(&input, true).expect("wire input"),
         vec![serde_json::json!({
             "type": "function_call",
             "arguments": {"_keep": true}
@@ -37,6 +37,32 @@ fn responses_input_strips_only_top_level_provider_metadata() {
     }))
     .expect("decode response");
     assert_eq!(decoded.output()[0][REPLAY_REASONING_FIELD], "Plan.");
+}
+
+#[test]
+fn responses_converts_neutral_images_and_rejects_them_when_disabled() {
+    let input = [serde_json::json!({
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "What is this?"},
+            {"type": "input_image", "media_type": "image/png", "data": "aGVsbG8="}
+        ]
+    })];
+
+    let wired = wire_input(&input, true).expect("wire image");
+    assert_eq!(
+        wired[0]["content"][1],
+        serde_json::json!({
+            "type": "input_image",
+            "image_url": "data:image/png;base64,aGVsbG8="
+        })
+    );
+    assert!(
+        wire_input(&input, false)
+            .expect_err("disabled image input")
+            .to_string()
+            .contains("does not support image attachments")
+    );
 }
 
 #[test]
@@ -141,7 +167,8 @@ fn compaction_shape_is_provider_neutral_and_opt_in() {
             instructions: "compact",
             input: &input,
             tools: &tools,
-        });
+        })
+        .expect("compact body");
 
     assert_eq!(body["instructions"], "compact");
     assert_eq!(body["input"][0].get("_private"), None);

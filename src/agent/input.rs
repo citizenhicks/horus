@@ -75,13 +75,13 @@ impl ActiveTurnRouter<'_> {
     pub async fn route(&mut self, submission: Submission) -> Result<ActiveRoute> {
         let Submission { id, op } = submission;
         match op {
-            Op::UserInput { text } => {
+            Op::UserInput { text, attachments } => {
                 defer_submission(
                     self.deferred,
                     self.events,
                     Submission {
                         id,
-                        op: Op::UserInput { text },
+                        op: Op::UserInput { text, attachments },
                     },
                 )
                 .await?;

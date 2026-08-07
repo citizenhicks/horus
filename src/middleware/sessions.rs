@@ -27,6 +27,7 @@ use crate::protocol::FrontendWidget;
 use crate::protocol::MessageTarget;
 use crate::protocol::Op;
 use crate::protocol::replay_events;
+use crate::protocol::strip_attachment_references;
 
 /// Default number of chats loaded per catalog page.
 pub const DEFAULT_PAGE_SIZE: usize = 100;
@@ -84,6 +85,7 @@ impl Middleware for Sessions {
     fn frontend(&self) -> FrontendContribution {
         FrontendContribution {
             capability: self.name().into(),
+            accepts_file_attachments: false,
             count: None,
             commands: vec![
                 FrontendCommand {
@@ -293,6 +295,7 @@ fn compact_message(message: &str) -> String {
 fn manual_fork_checkpoint(parent: &Checkpoint, context: Vec<serde_json::Value>) -> Checkpoint {
     let mut checkpoint = Checkpoint::empty(Uuid::new_v4().to_string());
     checkpoint.context = context;
+    strip_attachment_references(&mut checkpoint.context);
     checkpoint
         .first_user_message
         .clone_from(&parent.first_user_message);
@@ -716,7 +719,16 @@ mod tests {
     #[test]
     fn manual_fork_keeps_context_workspace_and_metadata_but_clears_origin() {
         let mut parent = Checkpoint::empty("parent");
-        parent.context = vec![serde_json::json!({"role": "user", "content": "Hello"})];
+        parent.context = vec![serde_json::json!({
+            "role": "user",
+            "content": "Hello",
+            "_horus_attachments": [{
+                "id": "378b8581-e96c-4413-a138-93e74561cb87",
+                "name": "photo.png",
+                "size": 1,
+                "media_type": "image/png"
+            }]
+        })];
         parent.first_user_message = Some("Hello".into());
         parent.metadata.insert(
             "gateway.chat".into(),
@@ -731,7 +743,7 @@ mod tests {
 
         let fork = manual_fork_checkpoint(&parent, parent.context.clone());
 
-        assert_eq!(fork.context, parent.context);
+        assert!(fork.context[0].get("_horus_attachments").is_none());
         assert_eq!(fork.first_user_message, parent.first_user_message);
         assert_eq!(fork.metadata, parent.metadata);
         assert_eq!(

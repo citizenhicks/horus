@@ -15,6 +15,7 @@ use horus::backend::model::{
 use horus::backend::sandbox::{
     ApprovalPolicy, ApprovalReviewerConfig, ApprovalStrictness, Sandbox, SandboxBackend,
 };
+use horus::middleware::attachments::{AttachmentStore, Attachments};
 use horus::middleware::compaction::Compaction;
 use horus::middleware::context_offloading::ContextOffloading;
 use horus::middleware::cron::Cron;
@@ -112,6 +113,7 @@ pub(crate) async fn assemble(
         &chat.workspace,
         cron,
         scratchpad,
+        AttachmentStore::new(store.state_dir()),
     )?;
     let mut metadata = match session_id.as_deref() {
         Some(session_id) => checkpoints
@@ -191,10 +193,14 @@ pub(crate) fn configured_model_choices(
     store: &ConfigStore,
     credentials: &CredentialStore,
 ) -> Result<Vec<ModelChoice>> {
-    Ok(configured_model_routes(gateway, store, credentials)?
-        .into_iter()
-        .map(|route| route.choice)
-        .collect())
+    Ok(instantiate_routes(
+        configured_model_routes(gateway, store, credentials)?,
+        store,
+        credentials,
+    )?
+    .into_iter()
+    .map(|route| route.choice)
+    .collect())
 }
 
 pub(crate) fn configured_model_providers(
@@ -318,6 +324,7 @@ fn catalog_routes(
                     context_window: Some(
                         preset.map_or(DEFAULT_CONTEXT_WINDOW, |preset| preset.context_window),
                     ),
+                    supports_attachment_input: true,
                 },
                 provider,
             });
@@ -431,6 +438,29 @@ fn build_models(
             "active model route is not in the configured gateway catalog".into(),
         ));
     }
+    let routes = instantiate_routes(catalog, store, credentials)?;
+    let first = routes
+        .first()
+        .ok_or_else(|| Error::Config("provider has no model routes".into()))?;
+    let context_window = first
+        .choice
+        .context_window
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let mut router = ModelRouter::new(&first.id, Arc::clone(&first.model));
+    for route in routes.iter().skip(1) {
+        router.register(&route.id, Arc::clone(&route.model))?;
+    }
+    for route in routes {
+        router.configure_choice(route.choice)?;
+    }
+    Ok((Arc::new(router), context_window))
+}
+
+fn instantiate_routes(
+    catalog: Vec<CatalogRoute>,
+    store: &ConfigStore,
+    credentials: &CredentialStore,
+) -> Result<Vec<RouteValue>> {
     let http = streaming_client()?;
     let mut provider_credentials = BTreeMap::<String, ProviderCredential>::new();
     let mut routes = Vec::with_capacity(catalog.len());
@@ -457,21 +487,7 @@ fn build_models(
         };
         routes.push(build_route(route, definition, credential, base_url, &http)?);
     }
-    let first = routes
-        .first()
-        .ok_or_else(|| Error::Config("provider has no model routes".into()))?;
-    let context_window = first
-        .choice
-        .context_window
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-    let mut router = ModelRouter::new(&first.id, Arc::clone(&first.model));
-    for route in routes.iter().skip(1) {
-        router.register(&route.id, Arc::clone(&route.model))?;
-    }
-    for route in routes {
-        router.configure_choice(route.choice)?;
-    }
-    Ok((Arc::new(router), context_window))
+    Ok(routes)
 }
 
 fn resolve_credential(
@@ -550,12 +566,10 @@ fn build_route(
         web_search: route.provider.web_search,
         http: http.clone(),
     })?;
-    let id = route.choice.route.clone();
-    Ok(RouteValue {
-        choice: route.choice,
-        id,
-        model,
-    })
+    let mut choice = route.choice;
+    choice.supports_attachment_input = model.supports_attachment_input();
+    let id = choice.route.clone();
+    Ok(RouteValue { choice, id, model })
 }
 
 fn route_id(provider: &str, model: &str, effort: Option<&str>) -> String {
@@ -614,6 +628,7 @@ fn unavailable_models(selection: &ProviderConfig) -> Result<(Arc<ModelRouter>, i
         model: selection.model.clone(),
         reasoning_effort: effort,
         context_window: Some(context_window),
+        supports_attachment_input: true,
     })?;
     Ok((Arc::new(router), context_window))
 }
@@ -623,6 +638,7 @@ fn build_middleware(
     workspace: &std::path::Path,
     cron: Arc<CronStore>,
     scratchpad: ScratchpadStore,
+    attachments: AttachmentStore,
 ) -> Result<(MiddlewareStack, Option<Arc<OnceLock<AgentConfig>>>)> {
     let mut entries: Vec<Arc<dyn Middleware>> = Vec::new();
     let mut subagent_template = None;
@@ -632,6 +648,7 @@ fn build_middleware(
     {
         let middleware: Arc<dyn Middleware> = match feature.kind {
             BuiltinMiddleware::Sandbox => continue,
+            BuiltinMiddleware::Attachments => Arc::new(Attachments::new(attachments.clone())),
             BuiltinMiddleware::Tools => Arc::new(Tools::coding()),
             BuiltinMiddleware::Instructions => Arc::new(Instructions::discover(workspace)?),
             BuiltinMiddleware::Cron => {

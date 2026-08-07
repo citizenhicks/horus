@@ -15,8 +15,17 @@ use crate::protocol::ToolCallEndEvent;
 use crate::protocol::UserMessageEvent;
 
 pub(crate) const INTERNAL_MESSAGE_FIELD: &str = "_horus_internal";
+pub(crate) const ATTACHMENTS_FIELD: &str = "_horus_attachments";
 pub(crate) const REPLAY_REASONING_FIELD: &str = "_horus_reasoning";
 pub(crate) const TOOL_ERROR_FIELD: &str = "_horus_is_error";
+
+pub(crate) fn strip_attachment_references(items: &mut [Value]) {
+    for item in items {
+        if let Some(object) = item.as_object_mut() {
+            object.remove(ATTACHMENTS_FIELD);
+        }
+    }
+}
 
 pub(crate) fn internal_message_kind(message: &Value) -> Option<&str> {
     message.get(INTERNAL_MESSAGE_FIELD)?.as_str()
@@ -38,10 +47,13 @@ pub fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Vec<Event
             .is_ok()
             .then_some(*target);
         let item_id = replay_id(target);
-        if let Some(text) = message_text(value, "user") {
-            if !is_internal_message(value) {
+        if value.get("role").and_then(Value::as_str) == Some("user") {
+            let attachments = attachment_references(value);
+            let message = message_text(value, "user").unwrap_or_default();
+            if !is_internal_message(value) && (!message.is_empty() || !attachments.is_empty()) {
                 events.push(EventMsg::UserMessage(UserMessageEvent {
-                    message: text,
+                    message,
+                    attachments,
                     message_target,
                 }));
             }
@@ -98,6 +110,15 @@ pub fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Vec<Event
         }
     }
     events
+}
+
+fn attachment_references(value: &Value) -> Vec<crate::protocol::AttachmentReference> {
+    value
+        .get(ATTACHMENTS_FIELD)
+        .cloned()
+        .map(serde_json::from_value)
+        .and_then(std::result::Result::ok)
+        .unwrap_or_default()
 }
 
 fn push_reasoning(
@@ -229,6 +250,36 @@ mod tests {
                     checkpoint_sequence: 4,
                     batch_item_count: 1,
                 })
+        ));
+    }
+
+    #[test]
+    fn replay_preserves_attachment_only_user_messages() {
+        let item = serde_json::json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": ""}],
+            "_horus_attachments": [{
+                "id": "3d46beff-7e84-46ea-859a-e66b4614a79b",
+                "name": "photo.png",
+                "size": 4,
+                "media_type": "image/png"
+            }]
+        });
+        let events = events(
+            &[(
+                MessageTarget {
+                    checkpoint_sequence: 1,
+                    batch_item_count: 1,
+                },
+                item,
+            )],
+            "session",
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [EventMsg::UserMessage(message)] if message.message.is_empty()
+                && message.attachments[0].name == "photo.png"
         ));
     }
 

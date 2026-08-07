@@ -196,6 +196,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             recovery_delta.push(item);
             replay.push(EventMsg::UserMessage(UserMessageEvent {
                 message,
+                attachments: Vec::new(),
                 message_target: None,
             }));
         }
@@ -222,6 +223,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             recovery_delta.push(item);
             replay.push(EventMsg::UserMessage(UserMessageEvent {
                 message,
+                attachments: Vec::new(),
                 message_target: None,
             }));
         }

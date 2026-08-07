@@ -59,7 +59,8 @@ pub(super) const fn provider() -> ProviderDefinition {
 
 fn build_provider(config: ProviderBuildConfig) -> Result<Arc<dyn Model>> {
     let api_key = config.credential.into_api_key("deepseek")?;
-    let provider = OpenAi::with_client(api_key, BASE_URL, config.model, config.http)?;
+    let provider =
+        OpenAi::with_client(api_key, BASE_URL, config.model, config.http)?.without_image_input();
     let provider = match config.reasoning_effort {
         Some(effort) => provider.with_reasoning_effort(effort)?,
         None => provider,
@@ -99,5 +100,6 @@ mod tests {
         assert_eq!(definition.models(), MODELS);
         assert_eq!(definition.web_search(), SEARCH);
         assert_eq!(model.info().reasoning_effort.as_deref(), Some("high"));
+        assert!(!model.supports_attachment_input());
     }
 }

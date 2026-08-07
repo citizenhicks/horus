@@ -1,12 +1,20 @@
 import SwiftUI
 
 struct ArtifactView: View {
+    @Environment(AppModel.self) private var model
+
     var body: some View {
         VStack(spacing: 0) {
-            Text("Diff")
+            Text(model.inspectorPage == .changes ? "Files" : "Uploaded files")
                 .font(HorusStyle.controlFont)
                 .frame(maxWidth: .infinity, minHeight: 44, alignment: .center)
                 .accessibilityAddTraits(.isHeader)
+            if model.inspectorPage == .changes {
+                WorkspaceScopePicker()
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 10)
+            }
+            Divider()
             ArtifactContent()
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
@@ -17,15 +25,149 @@ struct ArtifactView: View {
 private struct ArtifactContent: View {
     @Environment(AppModel.self) private var model
 
+    @ViewBuilder
     var body: some View {
-        if model.gitDiff.isEmpty {
+        switch model.inspectorPage {
+        case .changes:
+            if model.workspaceViewerScope == .all {
+                WorkspaceFileList()
+            } else if model.isLoadingGitDiff {
+                InspectorLoadingView(title: "Loading changes")
+            } else if model.gitDiff.isEmpty {
+                HorusUnavailable(
+                    title: "No \(model.workspaceViewerScope.title.lowercased()) changes",
+                    glyph: .fileMagnifyingGlass
+                )
+            } else {
+                UnifiedDiffView(document: UnifiedDiffDocument(model.gitDiff))
+            }
+        case .uploads:
+            UploadedFileList()
+        }
+    }
+}
+
+private struct WorkspaceScopePicker: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Picker(
+            "File scope",
+            selection: Binding(
+                get: { model.workspaceViewerScope },
+                set: { scope in model.selectWorkspaceViewerScope(scope) }
+            )
+        ) {
+            ForEach(WorkspaceViewerScope.allCases) { scope in
+                Text(scope.title).tag(scope)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .accessibilityLabel("File scope")
+    }
+}
+
+private struct WorkspaceFileList: View {
+    @Environment(AppModel.self) private var model
+
+    @ViewBuilder
+    var body: some View {
+        if model.isLoadingWorkspaceFiles {
+            InspectorLoadingView(title: "Loading workspace files")
+        } else if model.workspaceFiles.isEmpty {
+            HorusUnavailable(title: "No workspace files", glyph: .fileMagnifyingGlass)
+        } else {
+            List(model.workspaceFiles) { file in
+                Button {
+                    model.previewWorkspaceFile(file)
+                } label: {
+                    InspectorFileRow(
+                        name: URL(fileURLWithPath: file.path).lastPathComponent,
+                        detail: file.path,
+                        size: Int64(clamping: file.size)
+                    )
+                }
+                .buttonStyle(.horusPlain)
+                .disabled(model.isLoadingAttachmentPreview)
+                .accessibilityLabel("Open workspace file \(file.path)")
+            }
+            .listStyle(.plain)
+        }
+    }
+}
+
+private struct UploadedFileList: View {
+    @Environment(AppModel.self) private var model
+
+    @ViewBuilder
+    var body: some View {
+        if model.isLoadingAttachments {
+            InspectorLoadingView(title: "Loading uploaded files")
+        } else if model.uploadedAttachments.isEmpty {
             HorusUnavailable(
-                title: "No code changes",
-                glyph: .fileMagnifyingGlass
+                title: "No uploaded files",
+                glyph: .fileText,
+                detail: "Use the Plus button in the composer to add files."
             )
         } else {
-            UnifiedDiffView(document: UnifiedDiffDocument(model.gitDiff))
+            List(model.uploadedAttachments) { attachment in
+                Button {
+                    model.previewAttachment(attachment)
+                } label: {
+                    InspectorFileRow(
+                        name: attachment.name,
+                        detail: attachment.mediaType,
+                        size: attachment.size
+                    )
+                }
+                .buttonStyle(.horusPlain)
+                .disabled(model.isLoadingAttachmentPreview)
+                .accessibilityLabel("Open uploaded file \(attachment.name)")
+            }
+            .listStyle(.plain)
         }
+    }
+}
+
+private struct InspectorFileRow: View {
+    @Environment(\.horusPalette) private var palette
+    let name: String
+    let detail: String
+    let size: Int64
+
+    var body: some View {
+        HStack(spacing: 10) {
+            HorusIcon(.fileText, foreground: palette.accent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(name)
+                    .font(HorusStyle.metadataFont.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(detail)
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(palette.muted)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 8)
+            Text(size, format: .byteCount(style: .file))
+                .font(HorusStyle.metadataFont)
+                .foregroundStyle(palette.muted)
+            HorusIcon(.caretRight, size: 12, foreground: palette.muted)
+        }
+        .frame(minHeight: HorusStyle.iconButtonSize)
+        .contentShape(Rectangle())
+    }
+}
+
+private struct InspectorLoadingView: View {
+    let title: String
+
+    var body: some View {
+        ProgressView(title)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .accessibilityLabel(title)
     }
 }
 

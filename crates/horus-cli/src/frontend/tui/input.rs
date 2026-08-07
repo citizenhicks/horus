@@ -584,7 +584,10 @@ impl TuiState {
             .clone()
             .zip(catalog.active_input())
             .map_or_else(
-                || Op::UserInput { text: line.into() },
+                || Op::UserInput {
+                    text: line.into(),
+                    attachments: Vec::new(),
+                },
                 |(turn_id, active)| Op::ActiveInput {
                     operation: active.operation.clone(),
                     turn_id,
