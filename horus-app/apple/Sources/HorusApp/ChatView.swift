@@ -1,9 +1,333 @@
+import Foundation
 import SwiftUI
 import MarkdownView
 #if os(macOS)
 import AppKit
 #elseif os(iOS)
+@preconcurrency import AVFoundation
+import Observation
+import Speech
 import UIKit
+#endif
+
+#if os(iOS)
+@MainActor
+@Observable
+private final class ComposerDictation {
+    enum State: Equatable {
+        case idle
+        case preparing
+        case recording
+        case stopping
+    }
+
+    private(set) var state = State.idle
+
+    @ObservationIgnored private var audioEngine: AVAudioEngine?
+    @ObservationIgnored private var audioContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
+    @ObservationIgnored private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
+    @ObservationIgnored private var analyzer: SpeechAnalyzer?
+    @ObservationIgnored private var feedTask: Task<Void, Never>?
+    @ObservationIgnored private var recognitionTask: Task<Void, Never>?
+    @ObservationIgnored private var workerFailure: ComposerDictationError?
+    @ObservationIgnored private var hasAudioTap = false
+    @ObservationIgnored private var generation = 0
+    @ObservationIgnored private var baseText = ""
+    @ObservationIgnored private var separator = ""
+    @ObservationIgnored private var finalizedText = ""
+    @ObservationIgnored private var volatileText = ""
+    @ObservationIgnored private var updateText: ((String) -> Void)?
+    @ObservationIgnored private var reportError: ((String) -> Void)?
+
+    var isActive: Bool { state != .idle }
+    var isRecording: Bool { state == .recording }
+    var isTransitioning: Bool { state == .preparing || state == .stopping }
+    var canToggle: Bool { state == .idle || state == .recording }
+
+    func start(
+        existingText: String,
+        updateText: @escaping (String) -> Void,
+        reportError: @escaping (String) -> Void
+    ) async throws {
+        guard state == .idle else { return }
+        state = .preparing
+        generation += 1
+        let currentGeneration = generation
+        baseText = existingText
+        separator = existingText.isEmpty || existingText.last?.isWhitespace == true ? "" : " "
+        finalizedText = ""
+        volatileText = ""
+        self.updateText = updateText
+        self.reportError = reportError
+        workerFailure = nil
+
+        do {
+            guard await AVAudioApplication.requestRecordPermission() else {
+                throw ComposerDictationError.microphoneDenied
+            }
+            try checkGeneration(currentGeneration)
+
+            guard let locale = await DictationTranscriber.supportedLocale(
+                equivalentTo: Locale.current
+            ) else {
+                throw ComposerDictationError.unsupportedLanguage
+            }
+            try checkGeneration(currentGeneration)
+
+            let transcriber = DictationTranscriber(
+                locale: locale,
+                preset: .progressiveShortDictation
+            )
+            if let installation = try await AssetInventory.assetInstallationRequest(
+                supporting: [transcriber]
+            ) {
+                try await installation.downloadAndInstall()
+            }
+            try checkGeneration(currentGeneration)
+
+            guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
+                compatibleWith: [transcriber]
+            ) else {
+                throw ComposerDictationError.audioUnavailable
+            }
+            try checkGeneration(currentGeneration)
+
+            let analyzer = SpeechAnalyzer(modules: [transcriber])
+            let (inputStream, inputContinuation) = AsyncStream<AnalyzerInput>.makeStream()
+            self.analyzer = analyzer
+            self.inputContinuation = inputContinuation
+            let recognition = Task { [weak self] in
+                do {
+                    for try await result in transcriber.results {
+                        guard !Task.isCancelled, let self else { return }
+                        self.consume(result)
+                    }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    await self?.workerFailed(.transcriptionFailed)
+                }
+            }
+            recognitionTask = recognition
+            try await analyzer.start(inputSequence: inputStream)
+            try checkGeneration(currentGeneration)
+
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playAndRecord, mode: .spokenAudio)
+            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+
+            let engine = AVAudioEngine()
+            let inputNode = engine.inputNode
+            let inputFormat = inputNode.outputFormat(forBus: 0)
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+                throw ComposerDictationError.audioUnavailable
+            }
+
+            let (audioStream, audioContinuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+            self.audioContinuation = audioContinuation
+            inputNode.installTap(
+                onBus: 0,
+                bufferSize: 4_096,
+                format: inputFormat
+            ) { buffer, _ in
+                audioContinuation.yield(buffer)
+            }
+            hasAudioTap = true
+            audioEngine = engine
+            let feed = Task.detached(priority: .userInitiated) { [weak self] in
+                let converter = ComposerAudioBufferConverter()
+                defer { inputContinuation.finish() }
+                do {
+                    for await buffer in audioStream {
+                        try Task.checkCancellation()
+                        let converted = try converter.convert(buffer, to: analyzerFormat)
+                        inputContinuation.yield(AnalyzerInput(buffer: converted))
+                    }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    await self?.workerFailed(.conversionFailed)
+                }
+            }
+            feedTask = feed
+            engine.prepare()
+            try engine.start()
+            try checkGeneration(currentGeneration)
+            state = .recording
+        } catch {
+            let workerFailure = workerFailure
+            await cancel()
+            throw workerFailure ?? error
+        }
+    }
+
+    func stop() async throws {
+        guard state != .idle else { return }
+        guard state == .recording else {
+            await cancel()
+            return
+        }
+        state = .stopping
+        generation += 1
+        audioEngine?.stop()
+        removeAudioTap()
+        audioContinuation?.finish()
+
+        do {
+            await feedTask?.value
+            try checkWorkerFailure()
+            inputContinuation?.finish()
+            try await analyzer?.finalizeAndFinishThroughEndOfInput()
+            await recognitionTask?.value
+            try checkWorkerFailure()
+            finish()
+        } catch {
+            await cancel()
+            throw error
+        }
+    }
+
+    func cancel() async {
+        guard state != .idle else { return }
+        state = .stopping
+        generation += 1
+        updateText?(renderedText(includeVolatile: false))
+        updateText = nil
+        audioEngine?.stop()
+        removeAudioTap()
+        audioContinuation?.finish()
+        feedTask?.cancel()
+        inputContinuation?.finish()
+        await analyzer?.cancelAndFinishNow()
+        recognitionTask?.cancel()
+        finish()
+    }
+
+    private func consume(_ result: DictationTranscriber.Result) {
+        let text = String(result.text.characters)
+        if result.isFinal {
+            finalizedText += text
+            volatileText = ""
+        } else {
+            volatileText = text
+        }
+        updateText?(renderedText(includeVolatile: true))
+    }
+
+    private func workerFailed(_ failure: ComposerDictationError) async {
+        guard state != .idle else { return }
+        workerFailure = failure
+        guard state != .stopping else { return }
+        let reportError = reportError
+        let wasPreparing = state == .preparing
+        await cancel()
+        if !wasPreparing {
+            reportError?(failure.localizedDescription)
+        }
+    }
+
+    private func renderedText(includeVolatile: Bool) -> String {
+        let transcript = finalizedText + (includeVolatile ? volatileText : "")
+        return transcript.isEmpty ? baseText : baseText + separator + transcript
+    }
+
+    private func checkGeneration(_ expected: Int) throws {
+        guard generation == expected else { throw CancellationError() }
+    }
+
+    private func checkWorkerFailure() throws {
+        if let workerFailure {
+            throw workerFailure
+        }
+    }
+
+    private func removeAudioTap() {
+        guard hasAudioTap else { return }
+        audioEngine?.inputNode.removeTap(onBus: 0)
+        hasAudioTap = false
+    }
+
+    private func finish() {
+        try? AVAudioSession.sharedInstance().setActive(
+            false,
+            options: .notifyOthersOnDeactivation
+        )
+        audioEngine = nil
+        audioContinuation = nil
+        inputContinuation = nil
+        analyzer = nil
+        feedTask = nil
+        recognitionTask = nil
+        hasAudioTap = false
+        updateText = nil
+        reportError = nil
+        state = .idle
+    }
+}
+
+private enum ComposerDictationError: LocalizedError {
+    case microphoneDenied
+    case unsupportedLanguage
+    case audioUnavailable
+    case conversionFailed
+    case transcriptionFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .microphoneDenied:
+            "Microphone access is required to dictate a message."
+        case .unsupportedLanguage:
+            "Dictation is not available for the current language."
+        case .audioUnavailable:
+            "The microphone is not available for dictation."
+        case .conversionFailed:
+            "Horus could not process the microphone audio."
+        case .transcriptionFailed:
+            "Dictation stopped unexpectedly. Please try again."
+        }
+    }
+}
+
+private final class ComposerAudioBufferConverter {
+    private var converter: AVAudioConverter?
+
+    func convert(_ buffer: AVAudioPCMBuffer, to format: AVAudioFormat) throws -> AVAudioPCMBuffer {
+        guard buffer.format != format else { return buffer }
+        if converter?.inputFormat != buffer.format || converter?.outputFormat != format {
+            converter = AVAudioConverter(from: buffer.format, to: format)
+            converter?.primeMethod = .none
+        }
+        guard let converter else { throw ComposerDictationError.conversionFailed }
+
+        let ratio = converter.outputFormat.sampleRate / converter.inputFormat.sampleRate
+        let capacity = max(
+            1,
+            AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up))
+        )
+        guard let converted = AVAudioPCMBuffer(
+            pcmFormat: converter.outputFormat,
+            frameCapacity: capacity
+        ) else {
+            throw ComposerDictationError.conversionFailed
+        }
+
+        var conversionError: NSError?
+        // AVAudioConverter invokes this block synchronously; neither local escapes the call.
+        nonisolated(unsafe) let input = buffer
+        nonisolated(unsafe) var suppliedInput = false
+        let status = converter.convert(to: converted, error: &conversionError) { _, status in
+            guard !suppliedInput else {
+                status.pointee = .noDataNow
+                return nil
+            }
+            suppliedInput = true
+            status.pointee = .haveData
+            return input
+        }
+        guard status != .error else { throw ComposerDictationError.conversionFailed }
+        return converted
+    }
+}
 #endif
 
 extension MountedWidget {
@@ -50,6 +374,7 @@ struct ChatView: View {
             }
         }
         .navigationTitle(model.displayedTranscript.isEmpty ? "Hello" : model.currentSessionTitle)
+        .navigationSubtitle(workspaceName)
         #if os(iOS)
         .toolbarTitleDisplayMode(.inline)
         #endif
@@ -72,6 +397,11 @@ struct ChatView: View {
         .accessibilityLabel("Toggle artifact inspector")
         .tint(.primary)
         .help(model.showsInspector ? "Hide inspector" : "Show inspector")
+    }
+
+    private var workspaceName: String {
+        guard let path = model.workspace?.path else { return "" }
+        return path.split { $0 == "/" || $0 == "\\" }.last.map(String.init) ?? path
     }
 }
 
@@ -767,6 +1097,10 @@ private struct ComposerStack: View {
 
 private struct ComposerSurface: View {
     @Environment(AppModel.self) private var model
+    #if os(iOS)
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var dictation = ComposerDictation()
+    #endif
     @State private var selection: TextSelection?
 
     var body: some View {
@@ -804,6 +1138,9 @@ private struct ComposerSurface: View {
             .lineLimit(1...)
             .font(HorusStyle.bodyFont)
             .accessibilityLabel("Message")
+            #if os(iOS)
+            .disabled(dictation.isActive)
+            #endif
             .onSubmit(submit)
             .onKeyPress(.return, phases: .down) { keyPress in
                 if keyPress.modifiers.contains(.shift) {
@@ -815,20 +1152,57 @@ private struct ComposerSurface: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
+            #if os(iOS)
+            ComposerOptionsView(dictation: dictation, selection: $selection)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 12)
+            #else
             ComposerOptionsView()
                 .padding(.horizontal, 16)
                 .padding(.bottom, 12)
+            #endif
         }
-        .horusGlass(in: HorusStyle.cardShape)
+        .horusGlass(in: HorusStyle.cardShape, interactive: true)
         .shadow(color: .black.opacity(0.18), radius: 12, y: 6)
+        #if os(iOS)
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            Task { await dictation.cancel() }
+        }
+        .onChange(of: model.selectedSessionID) { _, _ in
+            Task { await dictation.cancel() }
+        }
+        .onChange(of: model.connectionState.isReady) { _, isReady in
+            guard !isReady else { return }
+            Task { await dictation.cancel() }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)
+        ) { notification in
+            guard let rawValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey]
+                as? UInt,
+                  AVAudioSession.InterruptionType(rawValue: rawValue) == .began
+            else { return }
+            Task { await dictation.cancel() }
+        }
+        .onDisappear {
+            Task { await dictation.cancel() }
+        }
+        #endif
     }
 
     private func submit() {
+        #if os(iOS)
+        guard !dictation.isActive else { return }
+        #endif
         selection = nil
         model.sendMessage()
     }
 
     private var referenceSuggestions: ReferenceSuggestions? {
+        #if os(iOS)
+        guard !dictation.isActive else { return nil }
+        #endif
         let cursor: String.Index
         if let selection, case .selection(let range) = selection.indices, range.isEmpty {
             cursor = range.lowerBound
@@ -1045,6 +1419,10 @@ private struct BadgeStat: View {
 private struct ComposerOptionsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
+    #if os(iOS)
+    let dictation: ComposerDictation
+    @Binding var selection: TextSelection?
+    #endif
 
     var body: some View {
         HStack(spacing: 8) {
@@ -1158,6 +1536,23 @@ private struct ComposerOptionsView: View {
 
     @ViewBuilder
     private var actionButtons: some View {
+        #if os(iOS)
+        Button(action: toggleDictation) {
+            if dictation.isTransitioning {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                HorusLabel(title: dictationLabel, glyph: .mic01)
+            }
+        }
+        .labelStyle(.iconOnly)
+        .buttonStyle(HorusIconButtonStyle(prominent: dictation.isRecording))
+        .disabled(!canToggleDictation)
+        .help(dictationLabel)
+        .accessibilityLabel(dictationLabel)
+        .accessibilityValue(dictationValue)
+        #endif
+
         if model.activeTurnID != nil && !hasComposerText {
             Button("Stop", glyph: .stopFill) { model.interrupt() }
                 .labelStyle(.iconOnly)
@@ -1169,11 +1564,7 @@ private struct ComposerOptionsView: View {
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
                 // `sendMessage()` also needs a session: a gateway with no chats left the button
                 // enabled and the tap silent.
-                .disabled(
-                    !model.connectionState.isReady
-                        || !hasComposerText
-                        || model.selectedSessionID == nil
-                )
+                .disabled(!canSend)
                 .help(model.activeTurnID == nil ? "Send" : "Send steering message")
         }
     }
@@ -1217,10 +1608,11 @@ private struct ComposerOptionsView: View {
 
     private var approvalGlyph: HorusGlyph {
         switch approvalValue {
-        case "allow": .shieldCheck
-        case "allow_network": .plugsConnected
-        case "auto_approve": .sealCheck
-        default: .handPalm
+        case "ask": .shieldCheck
+        case "allow": .shield02
+        case "allow_network": .shieldAlert
+        case "auto_approve": .aiSecurity02
+        default: .shieldCheck
         }
     }
 
@@ -1238,6 +1630,70 @@ private struct ComposerOptionsView: View {
         !model.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private var canSend: Bool {
+        guard model.connectionState.isReady,
+              hasComposerText,
+              model.selectedSessionID != nil
+        else { return false }
+        #if os(iOS)
+        return !dictation.isActive
+        #else
+        return true
+        #endif
+    }
+
+    #if os(iOS)
+    private var canToggleDictation: Bool {
+        dictation.isRecording
+            || dictation.canToggle
+                && model.connectionState.isReady
+                && model.selectedSessionID != nil
+    }
+
+    private var dictationLabel: String {
+        switch dictation.state {
+        case .idle: "Start dictation"
+        case .preparing: "Preparing dictation"
+        case .recording: "Stop dictation"
+        case .stopping: "Finishing dictation"
+        }
+    }
+
+    private var dictationValue: String {
+        switch dictation.state {
+        case .idle: "Not listening"
+        case .preparing: "Preparing speech recognition"
+        case .recording: "Listening"
+        case .stopping: "Finishing transcription"
+        }
+    }
+
+    private func toggleDictation() {
+        Task {
+            do {
+                if dictation.isRecording {
+                    try await dictation.stop()
+                } else {
+                    let sessionID = model.selectedSessionID
+                    try await dictation.start(
+                        existingText: model.composer,
+                        updateText: { text in
+                            guard model.selectedSessionID == sessionID else { return }
+                            selection = nil
+                            model.composer = text
+                        },
+                        reportError: { model.showToast($0, tone: .error) }
+                    )
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                model.showToast(error.localizedDescription, tone: .error)
+            }
+        }
+    }
+    #endif
+
 }
 
 private struct ApprovalView: View {
@@ -1249,7 +1705,7 @@ private struct ApprovalView: View {
         VStack(alignment: .leading, spacing: 12) {
             HorusLabel(
                 title: "Approval required",
-                glyph: .handPalm,
+                glyph: .shieldCheck,
                 iconColor: palette.warning
             )
                 .font(.headline)
