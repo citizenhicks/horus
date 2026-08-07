@@ -40,6 +40,7 @@ use crate::wire::{
     ProviderConfig, ReadyPayload, RenderedEvent, RenderedPreview, RunStats, RunSummary,
     ServerFrame, ServerMessage, SessionActivity, SessionActivityState, SessionOutcome,
     SessionReadyPayload, SessionRecord, SessionRunGroup, SessionWidget, VersionedAgentConfig,
+    WorkspaceFileScope,
 };
 use crate::{Error, Result};
 
@@ -207,6 +208,7 @@ enum HostCommand {
         reply: oneshot::Sender<std::result::Result<String, Rejection>>,
     },
     WorkspaceFiles {
+        scope: WorkspaceFileScope,
         reply:
             oneshot::Sender<std::result::Result<Vec<crate::wire::WorkspaceFileRecord>, Rejection>>,
     },
@@ -820,9 +822,11 @@ impl HostHandle {
 
     pub(crate) async fn workspace_files(
         &self,
+        scope: WorkspaceFileScope,
     ) -> std::result::Result<Vec<crate::wire::WorkspaceFileRecord>, Rejection> {
         let (reply, receiver) = oneshot::channel();
-        self.send(HostCommand::WorkspaceFiles { reply }).await?;
+        self.send(HostCommand::WorkspaceFiles { scope, reply })
+            .await?;
         receiver.await.map_err(|_| stopped())?
     }
 
@@ -1070,9 +1074,14 @@ impl HostState {
                         .await,
                 );
             }
-            HostCommand::WorkspaceFiles { reply } => {
+            HostCommand::WorkspaceFiles { scope, reply } => {
                 let _ = reply.send(
-                    list_workspace_files(&self.running.gateway_sandbox, &self.spec.workspace).await,
+                    list_workspace_files(
+                        &self.running.gateway_sandbox,
+                        &self.spec.workspace,
+                        scope,
+                    )
+                    .await,
                 );
             }
             HostCommand::ReadWorkspaceFile {

@@ -45,7 +45,7 @@ mod base64_bytes {
 }
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 17;
+pub const PROTOCOL_VERSION: u16 = 18;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -214,6 +214,7 @@ pub enum ClientMessage {
     ListWorkspaceFiles {
         request_id: String,
         session_id: String,
+        scope: WorkspaceFileScope,
     },
     ReadWorkspaceFile {
         request_id: String,
@@ -585,6 +586,14 @@ pub enum GitDiffScope {
     Staged,
     Unstaged,
     Committed,
+}
+
+/// Which openable files to include in a workspace catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceFileScope {
+    Modified,
+    All,
 }
 
 /// One regular file confined to the selected chat workspace.
@@ -1421,6 +1430,18 @@ mod tests {
         assert_eq!(response["request_id"], "request-diff");
         assert_eq!(response["session_id"], "session-a");
         assert_eq!(response["diff"], "diff --git a/file b/file\n");
+    }
+
+    #[test]
+    fn workspace_file_query_carries_its_scope() {
+        let request = serde_json::to_value(ClientFrame::new(ClientMessage::ListWorkspaceFiles {
+            request_id: "request-files".into(),
+            session_id: "session-a".into(),
+            scope: WorkspaceFileScope::Modified,
+        }))
+        .expect("encode workspace file request");
+
+        assert_eq!(request["scope"], "modified");
     }
 
     #[test]

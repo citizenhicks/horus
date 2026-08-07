@@ -1195,12 +1195,13 @@ async fn handle_message(
         ClientMessage::ListWorkspaceFiles {
             request_id,
             session_id,
+            scope,
         } => {
             let host = match require_selected(selected, &session_id) {
                 Ok(host) => host,
                 Err(rejection) => return write_rejection(writer, request_id, rejection).await,
             };
-            match host.workspace_files().await {
+            match host.workspace_files(scope).await {
                 Ok(files) => {
                     write_frame(
                         writer,

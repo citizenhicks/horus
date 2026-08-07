@@ -147,6 +147,12 @@ private struct AttachmentPreviewFile: Sendable {
     let url: URL
 }
 
+struct TextFilePreview: Identifiable {
+    let id: UUID
+    let name: String
+    let contents: String
+}
+
 private enum AttachmentImportError: LocalizedError {
     case notAFile
     case tooLarge
@@ -174,33 +180,6 @@ enum ThemePreference: String, CaseIterable, Identifiable {
 enum InspectorPage {
     case changes
     case uploads
-}
-
-enum WorkspaceViewerScope: String, CaseIterable, Identifiable {
-    case staged
-    case unstaged
-    case committed
-    case all
-
-    var id: Self { self }
-
-    var title: String {
-        switch self {
-        case .staged: "Staged"
-        case .unstaged: "Unstaged"
-        case .committed: "Committed"
-        case .all: "All"
-        }
-    }
-
-    var gitScope: GitDiffScope? {
-        switch self {
-        case .staged: .staged
-        case .unstaged: .unstaged
-        case .committed: .committed
-        case .all: nil
-        }
-    }
 }
 
 /// One entry in the workspace file tree. `children` is nil for a file, which is how
@@ -354,6 +333,7 @@ private let appLockEnabledKey = "app-lock-enabled"
 private let maximumAttachmentBytes = 25 * 1024 * 1024
 private let maximumComposerAttachmentBytes: Int64 = 100 * 1024 * 1024
 private let maximumPreviewBytes = 25 * 1024 * 1024
+private let maximumHighlightedPreviewBytes = 1024 * 1024
 
 @Observable
 final class TranscriptEntry: Identifiable {
@@ -496,6 +476,7 @@ final class AppModel {
     var uploadedAttachments: [AttachmentRecord] = []
     private(set) var isLoadingAttachments = false
     var previewURL: URL?
+    var textFilePreview: TextFilePreview?
     private(set) var isLoadingAttachmentPreview = false
     var toast: AppToast?
     var activeTurnID: String?
@@ -514,10 +495,9 @@ final class AppModel {
     var artifacts: [ArtifactRecord] = []
     var previews: [TranscriptPreview] = []
     var presentedPreview: TranscriptPreview?
-    var selectedArtifactID: String?
     var showsInspector = false
     var inspectorPage: InspectorPage = .changes
-    var workspaceViewerScope: WorkspaceViewerScope = .unstaged
+    var workspaceFileScope: WorkspaceFileScope = .modified
     var workspaceFiles: [WorkspaceFileRecord] = []
     private(set) var isLoadingGitDiff = false
     private(set) var isLoadingWorkspaceFiles = false
@@ -1187,28 +1167,31 @@ final class AppModel {
         }
     }
 
-    func refreshGitDiff() {
+    private func refreshWorkspaceChanges() {
+        refreshGitDiff()
+        guard showsInspector, inspectorPage == .changes else { return }
+        refreshWorkspaceFiles()
+    }
+
+    private func refreshGitDiff() {
         guard connectionState.isReady, let sessionID = selectedSessionID else { return }
-        guard let scope = workspaceViewerScope.gitScope else {
-            refreshWorkspaceFiles()
-            return
-        }
         let id = requestID("git-diff")
         gitDiffRequestID = id
         isLoadingGitDiff = true
-        transmit(.getGitDiff(requestID: id, sessionID: sessionID, scope: scope)) { [weak self] _ in
+        transmit(.getGitDiff(requestID: id, sessionID: sessionID, scope: .unstaged)) { [weak self] _ in
             guard self?.gitDiffRequestID == id else { return }
             self?.gitDiffRequestID = nil
             self?.isLoadingGitDiff = false
         }
     }
 
-    func selectWorkspaceViewerScope(_ scope: WorkspaceViewerScope) {
-        guard workspaceViewerScope != scope else { return }
-        workspaceViewerScope = scope
-        gitDiff = ""
+    func selectWorkspaceFileScope(_ scope: WorkspaceFileScope) {
+        guard workspaceFileScope != scope else { return }
+        workspaceFileScope = scope
         workspaceFiles = []
-        refreshGitDiff()
+        workspaceFilesRequestID = nil
+        isLoadingWorkspaceFiles = false
+        refreshWorkspaceFiles()
     }
 
     private func refreshWorkspaceFiles() {
@@ -1216,7 +1199,11 @@ final class AppModel {
         let id = requestID("workspace-files")
         workspaceFilesRequestID = id
         isLoadingWorkspaceFiles = true
-        transmit(.listWorkspaceFiles(requestID: id, sessionID: sessionID)) { [weak self] _ in
+        transmit(.listWorkspaceFiles(
+            requestID: id,
+            sessionID: sessionID,
+            scope: workspaceFileScope
+        )) { [weak self] _ in
             guard self?.workspaceFilesRequestID == id else { return }
             self?.workspaceFilesRequestID = nil
             self?.isLoadingWorkspaceFiles = false
@@ -1391,6 +1378,7 @@ final class AppModel {
         }
         previewTemporaryDirectory = nil
         previewURL = nil
+        textFilePreview = nil
     }
 
     func sendMessage() {
@@ -1550,17 +1538,10 @@ final class AppModel {
         }
     }
 
-    func selectArtifact(_ id: String) {
-        selectedArtifactID = id
-        inspectorPage = .changes
-        showsInspector = true
-        refreshGitDiff()
-    }
-
     func showInspector() {
         inspectorPage = .changes
         showsInspector = true
-        refreshGitDiff()
+        refreshWorkspaceChanges()
     }
 
     func showUploadedFiles() {
@@ -1865,6 +1846,7 @@ final class AppModel {
     func appDidEnterBackground() {
         appIsInBackground = true
         guard appLockEnabled else { return }
+        discardAttachmentPreview()
         isAppLocked = true
         appLockError = nil
     }
@@ -2084,21 +2066,17 @@ final class AppModel {
         case .artifacts(_, let sessionID, let artifacts):
             guard sessionID == selectedSessionID else { break }
             self.artifacts = artifacts
-            if selectedArtifactID == nil || !self.artifacts.contains(where: { $0.id == selectedArtifactID }) {
-                selectedArtifactID = self.artifacts.first?.id
-            }
         case .gitDiff(let requestID, let sessionID, let scope, let diff):
             guard requestID == gitDiffRequestID,
                   sessionID == selectedSessionID,
-                  scope == workspaceViewerScope.gitScope
+                  scope == .unstaged
             else { break }
             gitDiffRequestID = nil
             isLoadingGitDiff = false
             gitDiff = diff
         case .workspaceFiles(let requestID, let sessionID, let files):
             guard requestID == workspaceFilesRequestID,
-                  sessionID == selectedSessionID,
-                  workspaceViewerScope == .all
+                  sessionID == selectedSessionID
             else { break }
             workspaceFilesRequestID = nil
             isLoadingWorkspaceFiles = false
@@ -2205,6 +2183,7 @@ final class AppModel {
         replaySnapshotSequence = nil
         replayPresentedTranscript = nil
         connectionState = .ready
+        requestSessionData()
         cacheSelectedTranscript()
     }
 
@@ -2366,7 +2345,6 @@ final class AppModel {
             applyState = .applied
             showToast("Agent configuration applied.", tone: .success)
         }
-        if opened { requestSessionData() }
     }
 
     func applySessions(_ records: [SessionRecord]) {
@@ -2448,7 +2426,7 @@ final class AppModel {
     private func requestSessionData() {
         guard selectedSessionID != nil else { return }
         refreshArtifacts()
-        refreshGitDiff()
+        refreshWorkspaceChanges()
         refreshAttachments()
         refreshCron()
     }
@@ -2486,7 +2464,7 @@ final class AppModel {
         if requestID == gitBranchRequestID {
             gitBranchRequestID = nil
             showToast("Git branch changed.", tone: .success)
-            refreshGitDiff()
+            refreshWorkspaceChanges()
         }
         if cronRequestIDs.remove(requestID) != nil {
             cronTaskDraft = ""
@@ -2711,7 +2689,7 @@ final class AppModel {
             finishPendingTranscriptEntries()
             activeTurnID = nil
             if replayRequestID == nil { runStats.active = nil }
-            refreshGitDiff()
+            refreshWorkspaceChanges()
             pendingApproval = nil
             approvalRequestID = nil
         case "web_search_begin":
@@ -2725,7 +2703,7 @@ final class AppModel {
             finishPendingTranscriptEntries()
             activeTurnID = nil
             if replayRequestID == nil { runStats.active = nil }
-            refreshGitDiff()
+            refreshWorkspaceChanges()
             pendingApproval = nil
             approvalRequestID = nil
             appendText(
@@ -2843,7 +2821,7 @@ final class AppModel {
         }
         if block.format == "unified_diff", !block.pending {
             refreshArtifacts()
-            refreshGitDiff()
+            refreshWorkspaceChanges()
         }
     }
 
@@ -3421,9 +3399,16 @@ final class AppModel {
 
     private func finishFilePreview(_ data: Data, name: String, generation: UUID) {
         Task { [weak self] in
+            let contents = await Self.utf8Text(in: data)
+            guard let self, self.attachmentPreviewGeneration == generation else { return }
+            if let contents {
+                self.textFilePreview = TextFilePreview(id: generation, name: name, contents: contents)
+                self.isLoadingAttachmentPreview = false
+                return
+            }
             do {
                 let file = try await Self.writeAttachmentPreview(data, name: name)
-                guard let self, self.attachmentPreviewGeneration == generation else {
+                guard self.attachmentPreviewGeneration == generation else {
                     try? FileManager.default.removeItem(at: file.directory)
                     return
                 }
@@ -3434,11 +3419,23 @@ final class AppModel {
                 self.previewURL = file.url
                 self.isLoadingAttachmentPreview = false
             } catch {
-                guard let self, self.attachmentPreviewGeneration == generation else { return }
+                guard self.attachmentPreviewGeneration == generation else { return }
                 self.isLoadingAttachmentPreview = false
                 self.showToast(error.localizedDescription, tone: .error)
             }
         }
+    }
+
+    private nonisolated static func utf8Text(in data: Data) async -> String? {
+        guard data.count <= maximumHighlightedPreviewBytes else { return nil }
+        return await Task.detached(priority: .userInitiated) {
+            guard let text = String(data: data, encoding: .utf8) else { return nil }
+            let allowedControls: Set<Unicode.Scalar> = ["\t", "\n", "\r"]
+            guard !text.unicodeScalars.contains(where: {
+                CharacterSet.controlCharacters.contains($0) && !allowedControls.contains($0)
+            }) else { return nil }
+            return text
+        }.value
     }
 
     private nonisolated static func writeAttachmentPreview(
@@ -3619,7 +3616,7 @@ final class AppModel {
         workspaceFiles = []
         workspaceFilesRequestID = nil
         isLoadingWorkspaceFiles = false
-        workspaceViewerScope = .unstaged
+        workspaceFileScope = .modified
         inspectorPage = .changes
         gitBranchRequestID = nil
         discardComposerAttachments()
@@ -3661,7 +3658,6 @@ final class AppModel {
         previews = []
         presentedPreview = nil
         previewSelections.removeAll()
-        selectedArtifactID = nil
         showsInspector = false
         currentUsage = TokenUsage()
         lastUsage = TokenUsage()

@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 17
+let gatewayProtocolVersion = 18
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 let maximumAttachmentReferences = 16
@@ -489,7 +489,7 @@ enum GatewayRequest: Encodable, Sendable {
         config: AgentComposition
     )
     case getGitDiff(requestID: String, sessionID: String, scope: GitDiffScope)
-    case listWorkspaceFiles(requestID: String, sessionID: String)
+    case listWorkspaceFiles(requestID: String, sessionID: String, scope: WorkspaceFileScope)
     case readWorkspaceFile(
         requestID: String,
         sessionID: String,
@@ -614,10 +614,11 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
             try container.encode(scope, forKey: "scope")
-        case .listWorkspaceFiles(let requestID, let sessionID):
+        case .listWorkspaceFiles(let requestID, let sessionID, let scope):
             try container.encode("list_workspace_files", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
+            try container.encode(scope, forKey: "scope")
         case .readWorkspaceFile(let requestID, let sessionID, let path, let offset, let maxBytes):
             try container.encode("read_workspace_file", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -1042,6 +1043,13 @@ enum GitDiffScope: String, Codable, CaseIterable, Identifiable, Sendable {
     case staged
     case unstaged
     case committed
+
+    var id: Self { self }
+}
+
+enum WorkspaceFileScope: String, Codable, CaseIterable, Identifiable, Sendable {
+    case modified
+    case all
 
     var id: Self { self }
 }

@@ -810,11 +810,11 @@ private struct TranscriptRow: View {
             }
         case .event, .error:
             if entry.format == "unified_diff" {
-                Button { model.selectArtifact(entry.id) } label: {
+                Button(action: model.showInspector) {
                     EventCard(entry: entry)
                 }
                 .buttonStyle(.horusPlain)
-                .accessibilityHint("Opens the code diff")
+                .accessibilityHint("Opens modified files")
             } else {
                 EventCard(entry: entry)
             }
@@ -1428,7 +1428,7 @@ private struct ComposerActivityView: View {
                     .buttonStyle(.horusPlain)
                     .accessibilityLabel("Code changes")
                     .accessibilityValue("\(totals.added) additions, \(totals.removed) deletions")
-                    .accessibilityHint("Opens the latest code diff")
+                    .accessibilityHint("Opens modified files")
                 }
 
                 SessionStatsBadge()

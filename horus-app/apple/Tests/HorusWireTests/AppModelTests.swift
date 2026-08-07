@@ -364,8 +364,10 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(relaunched.isAppLocked)
         await relaunched.appDidBecomeActive()
         XCTAssertFalse(relaunched.isAppLocked)
+        relaunched.textFilePreview = TextFilePreview(id: UUID(), name: "secret.swift", contents: "secret")
         relaunched.appDidEnterBackground()
         XCTAssertTrue(relaunched.isAppLocked)
+        XCTAssertNil(relaunched.textFilePreview)
         XCTAssertTrue(results.isEmpty)
     }
 
@@ -1123,7 +1125,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.toast?.message, "Attachments in one message are limited to 100 MiB total.")
     }
 
-    func testInspectorScopesUseGitDiffAndWorkspaceFileEndpoints() async throws {
+    func testInspectorRequestsModifiedThenAllWorkspaceFiles() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
             await recorder.record(request)
@@ -1131,40 +1133,48 @@ final class AppModelTests: XCTestCase {
         model.connectionState = .ready
         model.selectedSessionID = "chat-1"
 
-        model.refreshGitDiff()
+        model.showInspector()
         try await Task.sleep(for: .milliseconds(20))
-        let diffRequests = await recorder.requests()
-        guard let diffRequest = diffRequests.last(where: {
-            if case .getGitDiff = $0 { return true }
-            return false
-        }), case .getGitDiff(let diffID, let sessionID, let scope) = diffRequest
-        else { return XCTFail("Expected a scoped Git diff request") }
-        XCTAssertEqual(sessionID, "chat-1")
-        XCTAssertEqual(scope, .unstaged)
-        model.handle(.gitDiff(
-            requestID: diffID,
-            sessionID: "chat-1",
-            scope: .unstaged,
-            diff: "diff --git a/App.swift b/App.swift"
-        ))
-        XCTAssertFalse(model.gitDiff.isEmpty)
-
-        model.selectWorkspaceViewerScope(.all)
-        try await Task.sleep(for: .milliseconds(20))
-        let listRequests = await recorder.requests()
-        guard let listRequest = listRequests.last(where: {
+        let modifiedRequests = await recorder.requests()
+        guard let modifiedRequest = modifiedRequests.last(where: {
             if case .listWorkspaceFiles = $0 { return true }
             return false
-        }), case .listWorkspaceFiles(let listID, let listSessionID) = listRequest
-        else { return XCTFail("Expected workspace file list request") }
-        XCTAssertEqual(listSessionID, "chat-1")
-        let file = WorkspaceFileRecord(path: "Sources/App.swift", size: 3)
+        }), case .listWorkspaceFiles(let modifiedID, let sessionID, let modifiedScope) = modifiedRequest
+        else { return XCTFail("Expected modified workspace files") }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(modifiedScope, .modified)
+
+        model.connectionState = .loading
+        model.selectWorkspaceFileScope(.all)
         model.handle(.workspaceFiles(
-            requestID: listID,
+            requestID: modifiedID,
             sessionID: "chat-1",
-            files: [file]
+            files: [WorkspaceFileRecord(path: "stale.txt", size: 1)]
         ))
-        XCTAssertEqual(model.workspaceFiles, [file])
+        XCTAssertTrue(model.workspaceFiles.isEmpty)
+
+        model.connectionState = .ready
+        model.showInspector()
+        try await Task.sleep(for: .milliseconds(20))
+        let allRequests = await recorder.requests()
+        guard let allRequest = allRequests.last(where: {
+            if case .listWorkspaceFiles = $0 { return true }
+            return false
+        }), case .listWorkspaceFiles(_, _, let allScope) = allRequest
+        else { return XCTFail("Expected all workspace files") }
+        XCTAssertEqual(allScope, .all)
+    }
+
+    func testWorkspaceSourceFileUsesTextPreview() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        let contents = "let answer = 42\n"
+        let data = Data(contents.utf8)
+        let file = WorkspaceFileRecord(path: "Sources/App.swift", size: UInt64(data.count))
 
         model.previewWorkspaceFile(file)
         try await Task.sleep(for: .milliseconds(20))
@@ -1181,11 +1191,45 @@ final class AppModelTests: XCTestCase {
             sessionID: "chat-1",
             path: file.path,
             offset: 0,
-            data: Data([1, 2, 3]),
+            data: data,
             nextOffset: nil
         ))
         try await Task.sleep(for: .milliseconds(20))
+
+        XCTAssertEqual(model.textFilePreview?.contents, contents)
+        XCTAssertNil(model.previewURL)
+        model.discardAttachmentPreview()
+    }
+
+    func testWorkspaceBinaryFileUsesQuickLookPreview() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        let file = WorkspaceFileRecord(path: "image.bin", size: 3)
+
+        model.previewWorkspaceFile(file)
+        try await Task.sleep(for: .milliseconds(20))
+        let requests = await recorder.requests()
+        guard let request = requests.last(where: {
+            if case .readWorkspaceFile = $0 { return true }
+            return false
+        }), case .readWorkspaceFile(let requestID, _, _, _, _) = request
+        else { return XCTFail("Expected workspace file read request") }
+        model.handle(.workspaceFileChunk(
+            requestID: requestID,
+            sessionID: "chat-1",
+            path: file.path,
+            offset: 0,
+            data: Data([0, 1, 2]),
+            nextOffset: nil
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+
         XCTAssertNotNil(model.previewURL)
+        XCTAssertNil(model.textFilePreview)
         model.discardAttachmentPreview()
     }
 
@@ -2077,6 +2121,7 @@ final class AppModelTests: XCTestCase {
             return XCTFail("Expected an uncached session open")
         }
         model.handle(.sessionOpened(requestID: requestID, payload: sessionReady(latestSequence: 2)))
+        model.showInspector()
         model.handle(.agentEvent(
             sessionID: "chat-1",
             sequence: 1,
@@ -2106,6 +2151,12 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.displayedTranscript.isEmpty)
         model.handle(.sessionReplayComplete(requestID: requestID, sessionID: "chat-1"))
         XCTAssertEqual(model.displayedTranscript.map(\.text), ["Hello"])
+        try await Task.sleep(for: .milliseconds(20))
+        let refreshed = await recorder.requests()
+        XCTAssertTrue(refreshed.contains { request in
+            guard case .listWorkspaceFiles(_, "chat-1", .modified) = request else { return false }
+            return true
+        })
     }
 
     func testCachedTranscriptSuppliesTheOpenCursorAndRestoresOnce() async throws {
