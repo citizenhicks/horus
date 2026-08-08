@@ -256,9 +256,9 @@ private struct AppToastOverlay: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        Group {
+        ZStack {
             if let toast = model.toast {
-                AppToastView(toast: toast, dismiss: model.dismissToast)
+                AppToastView(toast: toast, dismiss: dismiss)
                     .transition(
                         reduceMotion
                             ? .opacity
@@ -270,10 +270,15 @@ private struct AppToastOverlay: View {
         .padding(.horizontal, 16)
         .padding(.top, 12)
         .allowsHitTesting(model.toast != nil)
-        .animation(
-            reduceMotion ? .easeOut(duration: 0.12) : .smooth(duration: 0.28),
-            value: model.toast?.id
-        )
+        .animation(toastAnimation, value: model.toast?.id)
+    }
+
+    private var toastAnimation: Animation {
+        reduceMotion ? .easeOut(duration: 0.12) : .smooth(duration: 0.28)
+    }
+
+    private func dismiss() {
+        withAnimation(toastAnimation) { model.dismissToast() }
     }
 }
 
@@ -315,7 +320,7 @@ private struct AppToastView: View {
         .padding(.leading, 16)
         .padding(.trailing, 6)
         .padding(.vertical, 10)
-        .horusGlass(in: HorusStyle.cardShape)
+        .horusGlass(in: HorusStyle.cardShape, interactive: true)
         .shadow(color: .black.opacity(0.20), radius: 18, y: 8)
         .gesture(
             DragGesture(minimumDistance: 20)
