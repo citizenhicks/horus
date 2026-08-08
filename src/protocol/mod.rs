@@ -15,6 +15,9 @@ mod replay;
 /// Maximum total UTF-8 bytes accepted in one user-input submission.
 pub const MAX_USER_INPUT_BYTES: usize = 1024 * 1024;
 
+/// Maximum UTF-8 bytes accepted in capability command input or queued active input.
+pub const MAX_CAPABILITY_INPUT_BYTES: usize = 64 * 1024;
+
 /// One immutable file uploaded for a user turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -91,8 +94,7 @@ pub enum Op {
         arguments: String,
         /// Optional caller-editable text kept separate from routing arguments.
         ///
-        /// When an operation is embedded in a [`FrontendAction`], a present value is the initial
-        /// text a frontend edits before submitting the same operation.
+        /// When embedded in a frontend action, a present value is its caller-editable text.
         #[serde(deserialize_with = "required_option")]
         input: Option<String>,
         #[serde(deserialize_with = "required_option")]
@@ -373,6 +375,8 @@ pub enum FrontendSlot {
     ComposerHeader,
     ComposerFooter,
     MessageActions,
+    /// A transient capability-owned item after the live transcript.
+    TranscriptTail,
     /// A capability destination mounted by the frontend shell.
     Navigation,
     /// A capability action mounted in the current chat's menu.
@@ -961,6 +965,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(FrontendSlot::ChatMenu).expect("chat menu slot"),
             json!("chat_menu")
+        );
+        assert_eq!(
+            serde_json::to_value(FrontendSlot::TranscriptTail).expect("transcript tail slot"),
+            json!("transcript_tail")
         );
     }
 

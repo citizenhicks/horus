@@ -101,10 +101,22 @@ private struct PendingComposerDraft {
     let attachments: [AttachmentRecord]
 }
 
+private struct PendingWidgetEdit {
+    let owner: ComposerDraftOwner
+    var recovery: ComposerEditRecovery
+}
+
 private struct ComposerDraftOwner: Equatable, Sendable {
     let accountID: UUID
     let sessionID: String
 }
+
+private struct ReplayUserMessage {
+    let sequence: UInt64
+    let text: String
+}
+
+private let maximumObservedReplaySubmissions = 1_024
 
 private enum AttachmentUploadRequest {
     case begin(localID: UUID)
@@ -435,12 +447,6 @@ struct MountedReference: Identifiable, Sendable {
     var label: String { "\(reference.trigger)\(reference.value)" }
 }
 
-struct MiddlewareContributionCount: Identifiable, Equatable, Sendable {
-    let id: String
-    let label: String
-    let value: Int
-}
-
 private enum ConfigurationTarget {
     case session
     case defaultAgent
@@ -528,6 +534,7 @@ final class AppModel {
     var composer = "" {
         didSet { scheduleComposerDraftSave() }
     }
+    private(set) var composerFocusRequest = 0
     var composerAttachments: [ComposerAttachment] = []
     var uploadedAttachments: [AttachmentRecord] = []
     private(set) var isLoadingAttachments = false
@@ -548,7 +555,6 @@ final class AppModel {
     var contributions: [FrontendContribution] = [] {
         didSet { contributionsRevision &+= 1 }
     }
-    var toolCount = 0
     var mountedWidgets: [MountedWidget] = []
     var pendingPicker: FrontendPickerPrompt?
     var previews: [TranscriptPreview] = []
@@ -585,6 +591,7 @@ final class AppModel {
     var providerStatuses: [ProviderStatus] = []
     var providerAPIKey = ""
     var providerModelIDsText = ""
+    var providerReasoningEffortsText = ""
     var providerActionState: ProviderActionState = .idle
     var pairingCodeInfo: PairingCodeInfo?
 
@@ -619,6 +626,13 @@ final class AppModel {
     @ObservationIgnored private var reconnectsOnActivation = false
     @ObservationIgnored private var pendingPairingAccount: GatewayAccount?
     @ObservationIgnored private var pendingDrafts: [String: PendingComposerDraft] = [:]
+    private var pendingWidgetEdit: PendingWidgetEdit?
+    private var stashedComposerDraft: String?
+    private var isLoadingComposerEditRecovery = false
+    @ObservationIgnored private var composerEditRecoveryGeneration = UUID()
+    @ObservationIgnored private var replayCompletionSubmissionIDs: Set<String> = []
+    @ObservationIgnored private var replayUserMessages: [ReplayUserMessage] = []
+    @ObservationIgnored private var completedComposerEditReplay = false
     @ObservationIgnored private var composerDraftOwner: ComposerDraftOwner?
     @ObservationIgnored private var composerDraftGeneration = UUID()
     @ObservationIgnored private var composerDraftSaveTask: Task<Void, Never>?
@@ -752,6 +766,8 @@ final class AppModel {
             && sessionMutationRequestID == nil
             && gitBranchRequestID == nil
             && attachmentUploadRequests.isEmpty
+            && pendingWidgetEdit == nil
+            && !isLoadingComposerEditRecovery
             && applyState != .applying
             && applyState != .restarting
     }
@@ -787,9 +803,22 @@ final class AppModel {
             && connectionState.isReady
             && selectedSessionID != nil
             && activeTurnID == nil
+            && pendingWidgetEdit == nil
     }
 
     var canSendComposer: Bool {
+        guard connectionState.isReady,
+              let sessionID = selectedSessionID,
+              sessionRequestID == nil,
+              !isLoadingComposerDraft,
+              !isLoadingComposerEditRecovery
+        else { return false }
+        if let pending = pendingWidgetEdit {
+            guard let accountID = selectedAccountID,
+                  pending.owner == ComposerDraftOwner(accountID: accountID, sessionID: sessionID),
+                  pending.recovery.phase == .editing
+            else { return false }
+        }
         let hasText = !composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let uploaded = uploadedComposerAttachments
         guard uploaded.isEmpty || canSubmitAttachments else { return false }
@@ -906,21 +935,6 @@ final class AppModel {
         }
     }
 
-    var middlewareContributionCounts: [MiddlewareContributionCount] {
-        contributions.compactMap { contribution in
-            guard let value = contribution.count,
-                  let feature = middlewareFeatures.first(where: {
-                      $0.id == contribution.capability
-                  })
-            else { return nil }
-            return MiddlewareContributionCount(
-                id: contribution.capability,
-                label: feature.label,
-                value: value
-            )
-        }
-    }
-
     var currentSessionTitle: String {
         selectedSessionID.map(sessionTitle) ?? "New conversation"
     }
@@ -935,6 +949,7 @@ final class AppModel {
     }
 
     var headerWidgets: [MountedWidget] { widgets(in: .header) }
+    var transcriptTailWidgets: [MountedWidget] { widgets(in: .transcriptTail) }
     var composerHeaderWidgets: [MountedWidget] { widgets(in: .composerHeader) }
     var composerFooterWidgets: [MountedWidget] { widgets(in: .composerFooter) }
     var messageActionWidgets: [MountedWidget] {
@@ -1345,6 +1360,9 @@ final class AppModel {
         cachedTranscript: CachedTranscript? = nil,
         presentedTranscript: [TranscriptEntry]? = nil
     ) {
+        replayCompletionSubmissionIDs.removeAll(keepingCapacity: true)
+        replayUserMessages.removeAll(keepingCapacity: true)
+        completedComposerEditReplay = false
         if sessionID != selectedSessionID {
             discardComposerAttachments()
             discardAttachmentPreview()
@@ -1642,7 +1660,10 @@ final class AppModel {
     }
 
     func sendMessage() {
-        guard let sessionID = selectedSessionID else { return }
+        guard connectionState.isReady,
+              sessionRequestID == nil,
+              let sessionID = selectedSessionID
+        else { return }
         let text = composer.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = uploadedComposerAttachments
         guard attachments.count <= maximumAttachmentReferences else { return }
@@ -1651,6 +1672,7 @@ final class AppModel {
             showToast(attachmentSubmissionUnavailableMessage, tone: .warning)
             return
         }
+        guard canSendComposer else { return }
         guard !composerHasUnfinishedAttachments else {
             showToast("Wait for attachments to finish uploading.", tone: .warning)
             return
@@ -1664,6 +1686,11 @@ final class AppModel {
             return
         }
         let id = requestID("input")
+        if pendingWidgetEdit?.recovery.phase == .editing {
+            submitComposerEdit(sessionID: sessionID, requestID: id, text: text)
+            return
+        }
+        let stashedText = stashedComposerDraft
         let op: AgentOperation
         if let activeTurnID, let activeOperation {
             op = .activeInput(operation: activeOperation, turnID: activeTurnID, text: text)
@@ -1674,14 +1701,118 @@ final class AppModel {
         composerDraftSaveTask?.cancel()
         composerDraftSaveTask = nil
         if let owner = composerDraftOwner {
-            enqueueComposerDraftSave(text, owner: owner)
+            enqueueComposerDraftSave(stashedText ?? text, owner: owner)
         }
+        stashedComposerDraft = nil
         suppressesComposerDraftSave = true
         composer = ""
         suppressesComposerDraftSave = false
         composerAttachments = []
         transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: op))) { [weak self] _ in
             self?.restoreDraft(id: id)
+        }
+        if let stashedText, !stashedText.isEmpty {
+            composer = stashedText
+        }
+    }
+
+    func editWidgetInputInComposer(_ mounted: MountedWidget) {
+        guard connectionState.isReady,
+              !isLoadingComposerDraft,
+              !isLoadingComposerEditRecovery,
+              let sessionID = selectedSessionID,
+              let accountID = selectedAccountID,
+              let operation = mounted.widget.action,
+              let input = operation.capabilityInput
+        else { return }
+        guard composerAttachments.isEmpty else {
+            showToast("Finish the attachment draft before editing a queued message.", tone: .warning)
+            return
+        }
+        guard pendingWidgetEdit == nil, stashedComposerDraft == nil else { return }
+        flushComposerDraft()
+        let requestID = requestID("edit")
+        let owner = ComposerDraftOwner(accountID: accountID, sessionID: sessionID)
+        let recovery = ComposerEditRecovery(
+            capability: mounted.capability,
+            widgetID: mounted.widget.id,
+            originalInput: input,
+            displacedDraft: composer,
+            editedInput: input,
+            requestID: requestID,
+            submissionBaselineSequence: nil,
+            phase: .removingQueuedInput
+        )
+        pendingWidgetEdit = PendingWidgetEdit(owner: owner, recovery: recovery)
+        enqueueComposerEditRecoverySave(recovery, owner: owner) { [weak self] result in
+            guard let self,
+                  self.pendingWidgetEdit?.owner == owner,
+                  self.pendingWidgetEdit?.recovery.requestID == requestID
+            else { return }
+            if case .failure(let error) = result {
+                self.pendingWidgetEdit = nil
+                self.showToast(error.localizedDescription, tone: .error)
+                return
+            }
+            guard self.connectionState.isReady, self.selectedSessionID == sessionID else { return }
+            guard self.selectedAccountID == accountID else { return }
+            self.transmit(.submit(
+                sessionID: sessionID,
+                submission: Submission(id: requestID, op: operation)
+            ))
+        }
+    }
+
+    private func submitComposerEdit(sessionID: String, requestID: String, text: String) {
+        guard var pending = pendingWidgetEdit,
+              let accountID = selectedAccountID,
+              pending.owner == ComposerDraftOwner(accountID: accountID, sessionID: sessionID),
+              pending.recovery.phase == .editing
+        else { return }
+        let operation: AgentOperation
+        if let activeTurnID, let activeOperation {
+            operation = .activeInput(operation: activeOperation, turnID: activeTurnID, text: text)
+        } else {
+            operation = .userInput(text: text, attachments: [])
+        }
+        pending.recovery.editedInput = text
+        pending.recovery.requestID = requestID
+        pending.recovery.submissionBaselineSequence = latestSequence
+        pending.recovery.phase = .submitting
+        pendingWidgetEdit = pending
+        composerDraftSaveTask?.cancel()
+        composerDraftSaveTask = nil
+        enqueueComposerEditRecoverySave(pending.recovery, owner: pending.owner) { [weak self] result in
+            guard let self,
+                  self.pendingWidgetEdit?.owner == pending.owner,
+                  self.pendingWidgetEdit?.recovery.requestID == requestID,
+                  self.pendingWidgetEdit?.recovery.phase == .submitting
+            else { return }
+            if case .failure(let error) = result {
+                self.restoreComposerEditMode(requestID: requestID)
+                self.showToast(error.localizedDescription, tone: .error)
+                return
+            }
+            guard self.connectionState.isReady, self.selectedSessionID == sessionID else {
+                self.restoreComposerEditMode(requestID: requestID)
+                return
+            }
+            guard self.selectedAccountID == pending.owner.accountID else {
+                self.restoreComposerEditMode(requestID: requestID)
+                return
+            }
+            self.stashedComposerDraft = nil
+            self.suppressesComposerDraftSave = true
+            self.composer = pending.recovery.displacedDraft
+            self.suppressesComposerDraftSave = false
+            self.transmit(
+                .submit(
+                    sessionID: sessionID,
+                    submission: Submission(id: requestID, op: operation)
+                )
+            ) { [weak self] _ in
+                self?.restoreComposerEditMode(requestID: requestID)
+            }
         }
     }
 
@@ -1923,12 +2054,21 @@ final class AppModel {
             webSearch: webSearch
         )
         providerModelIDsText = status.modelIds.joined(separator: ", ")
+        providerReasoningEffortsText = status.reasoningEfforts.joined(separator: ", ")
         providerAPIKey = ""
         providerActionState = .idle
     }
 
     var providerModelIDs: [String] {
-        providerModelIDsText
+        commaSeparatedValues(providerModelIDsText)
+    }
+
+    var providerReasoningEfforts: [String] {
+        commaSeparatedValues(providerReasoningEffortsText)
+    }
+
+    private func commaSeparatedValues(_ text: String) -> [String] {
+        text
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -1941,7 +2081,12 @@ final class AppModel {
         providerModelIDsText = value
         guard let first = providerModelIDs.first else { return }
         providerDraft?.model = first
-        providerDraft?.reasoningEffort = nil
+        providerDraft?.reasoningEffort = providerReasoningEfforts.first
+    }
+
+    func updateProviderReasoningEfforts(_ value: String) {
+        providerReasoningEffortsText = value
+        providerDraft?.reasoningEffort = providerReasoningEfforts.first
     }
 
     func selectProviderModel(_ modelID: String) {
@@ -1995,16 +2140,24 @@ final class AppModel {
               let status = providerStatuses.first(where: { $0.provider == config.provider })
         else { return }
         let modelIDs = status.modelIdsConfigurable ? providerModelIDs : status.modelIds
+        let reasoningEfforts = status.modelIdsConfigurable
+            ? providerReasoningEfforts
+            : status.reasoningEfforts
         if status.modelIdsConfigurable {
             guard let first = modelIDs.first else { return }
             config.model = first
-            config.reasoningEffort = nil
+            config.reasoningEffort = reasoningEfforts.first
         }
         let id = requestID("provider")
         providerRegistrationRequestID = id
         providerRegistrationTarget = target
         applyState = .applying
-        transmit(.registerProvider(requestID: id, config: config, modelIds: modelIDs)) { [weak self] message in
+        transmit(.registerProvider(
+            requestID: id,
+            config: config,
+            modelIds: modelIDs,
+            reasoningEfforts: reasoningEfforts
+        )) { [weak self] message in
             guard self?.providerRegistrationRequestID == id else { return }
             self?.providerRegistrationRequestID = nil
             self?.providerRegistrationTarget = nil
@@ -2471,6 +2624,7 @@ final class AppModel {
 
     private func applyAgentEvent(_ buffered: BufferedAgentEvent) {
         guard latestSequence.map({ buffered.sequence > $0 }) ?? true else { return }
+        observeReplayCompletion(buffered)
         latestSequence = buffered.sequence
         reduce(
             event: buffered.event,
@@ -2487,6 +2641,8 @@ final class AppModel {
         replaySnapshotSequence = nil
         replayPresentedTranscript = nil
         connectionState = .ready
+        completedComposerEditReplay = true
+        reconcileComposerEditRecovery()
         requestSessionData()
         cacheSelectedTranscript()
     }
@@ -2504,7 +2660,8 @@ final class AppModel {
               let currentReplayEpoch,
               let latestSequence,
               activeTurnID == nil,
-              pendingApproval == nil
+              pendingApproval == nil,
+              pendingWidgetEdit == nil
         else { return }
         let snapshot = CachedTranscript(
             replayEpoch: currentReplayEpoch,
@@ -2645,7 +2802,6 @@ final class AppModel {
         selectedModelRoute = payload.session.model.route
         modelContextWindow = payload.session.model.modelContextWindow
         contributions = payload.contributions
-        toolCount = payload.toolCount
         mountedWidgets = payload.contributions.flatMap { contribution in
             contribution.widgets.map {
                 MountedWidget(capability: contribution.capability, widget: $0)
@@ -2663,6 +2819,14 @@ final class AppModel {
         )
         agentSnapshot = payload.config
         if !opened { connectionState = .ready }
+        if let accountID = selectedAccountID {
+            prepareComposerEditRecovery(
+                for: ComposerDraftOwner(
+                    accountID: accountID,
+                    sessionID: payload.session.sessionId
+                )
+            )
+        }
         if applyState == .restarting {
             applyState = .applied
             showToast("Agent configuration applied.", tone: .success)
@@ -2785,7 +2949,9 @@ final class AppModel {
         if requestID == sessionMutationRequestID {
             if let sessionID = pendingDeletedSessionID, let accountID = selectedAccountID {
                 let owner = ComposerDraftOwner(accountID: accountID, sessionID: sessionID)
+                invalidateComposerEditRecovery(for: owner)
                 enqueueComposerDraftSave("", owner: owner)
+                enqueueComposerEditRecoveryRemoval(owner: owner)
                 if composerDraftOwner == owner { discardComposerDraft() }
             }
             pendingDeletedSessionID = nil
@@ -2847,6 +3013,7 @@ final class AppModel {
         if pendingDrafts[rejection.requestId] != nil {
             restoreDraft(id: rejection.requestId)
         }
+        rejectComposerEdit(requestID: rejection.requestId)
         if rejection.requestId == configRequestID
             || rejection.requestId == defaultConfigRequestID {
             switch rejection.code {
@@ -2958,8 +3125,14 @@ final class AppModel {
             if type == "warning" || type == "error" {
                 if let draft = pendingDrafts.removeValue(forKey: submissionID) { restoreDraft(draft) }
                 previewSelections.removeValue(forKey: submissionID)
+                rejectComposerEdit(requestID: submissionID)
             } else {
                 pendingDrafts.removeValue(forKey: submissionID)
+                if type == "user_message"
+                    || (type == "frontend"
+                        && event.msg["frontendType"]?.stringValue == "widget") {
+                    completeSubmittedComposerEdit(requestID: submissionID)
+                }
                 flushComposerDraft()
             }
         }
@@ -3095,13 +3268,13 @@ final class AppModel {
                 modelContextWindow = Int64(window)
             }
         case "frontend":
-            applyFrontendEvent(event.msg)
+            applyFrontendEvent(event.msg, submissionID: event.submissionId)
         default:
             break
         }
     }
 
-    private func applyFrontendEvent(_ event: JSONValue) {
+    private func applyFrontendEvent(_ event: JSONValue, submissionID: String?) {
         switch event["frontendType"]?.stringValue {
         case "render":
             guard let block = renderedBlock(from: event) else { return }
@@ -3112,11 +3285,21 @@ final class AppModel {
                   let widget = try? FrontendWidget(json: item)
             else { return }
             upsertWidget(MountedWidget(capability: capability, widget: widget))
+            acknowledgeWidgetEdit(
+                submissionID: submissionID,
+                capability: capability,
+                widgetID: widget.id
+            )
         case "remove_widget":
             guard let capability = event["capability"]?.stringValue,
                   let id = event["id"]?.stringValue
             else { return }
             mountedWidgets.removeAll { $0.capability == capability && $0.widget.id == id }
+            acknowledgeWidgetEdit(
+                submissionID: submissionID,
+                capability: capability,
+                widgetID: id
+            )
         case "picker":
             guard let title = event["title"]?.stringValue else { return }
             let options = event["options"]?.arrayValue?.compactMap {
@@ -3127,6 +3310,28 @@ final class AppModel {
         default:
             break
         }
+    }
+
+    private func acknowledgeWidgetEdit(
+        submissionID: String?,
+        capability: String,
+        widgetID: String
+    ) {
+        guard var pending = pendingWidgetEdit,
+              pending.recovery.phase == .removingQueuedInput,
+              pending.recovery.requestID == submissionID,
+              pending.recovery.capability == capability,
+              pending.recovery.widgetID == widgetID
+        else { return }
+        pending.recovery.phase = .editing
+        pendingWidgetEdit = pending
+        flushComposerDraft()
+        stashedComposerDraft = pending.recovery.displacedDraft
+        suppressesComposerDraftSave = true
+        composer = pending.recovery.editedInput
+        suppressesComposerDraftSave = false
+        composerFocusRequest &+= 1
+        enqueueComposerEditRecoverySave(pending.recovery, owner: pending.owner)
     }
 
     private func upsertWidget(_ mounted: MountedWidget) {
@@ -3973,9 +4178,34 @@ final class AppModel {
     private func scheduleComposerDraftSave() {
         guard !suppressesComposerDraftSave,
               !isLoadingComposerDraft,
+              !isLoadingComposerEditRecovery,
               let owner = composerDraftOwner
         else { return }
         composerDraftSaveTask?.cancel()
+        if var pending = pendingWidgetEdit,
+           pending.owner == owner,
+           pending.recovery.phase == .editing {
+            guard composer.utf8.count <= maximumComposerBytes else { return }
+            pending.recovery.editedInput = composer
+            pendingWidgetEdit = pending
+            let recovery = pending.recovery
+            composerDraftSaveTask = Task { [weak self] in
+                do {
+                    try await Task.sleep(for: .milliseconds(400))
+                } catch {
+                    return
+                }
+                guard let self,
+                      self.pendingWidgetEdit?.owner == owner,
+                      self.pendingWidgetEdit?.recovery.phase == .editing,
+                      self.pendingWidgetEdit?.recovery.editedInput == recovery.editedInput
+                else { return }
+                self.composerDraftSaveTask = nil
+                self.enqueueComposerEditRecoverySave(recovery, owner: owner)
+            }
+            return
+        }
+        guard stashedComposerDraft == nil else { return }
         let text = composer
         composerDraftSaveTask = Task { [weak self] in
             do {
@@ -3992,7 +4222,7 @@ final class AppModel {
     private func flushComposerDraft() {
         composerDraftSaveTask?.cancel()
         composerDraftSaveTask = nil
-        guard let owner = composerDraftOwner else { return }
+        guard stashedComposerDraft == nil, let owner = composerDraftOwner else { return }
         enqueueComposerDraftSave(composer, owner: owner)
     }
 
@@ -4009,12 +4239,235 @@ final class AppModel {
         }
     }
 
+    private func enqueueComposerEditRecoverySave(
+        _ recovery: ComposerEditRecovery,
+        owner: ComposerDraftOwner,
+        completion: ((Result<Void, Error>) -> Void)? = nil
+    ) {
+        let previous = composerDraftIOTask
+        let store = store
+        composerDraftIOTask = Task {
+            await previous?.value
+            do {
+                try await store.saveComposerEditRecovery(
+                    recovery,
+                    accountID: owner.accountID,
+                    sessionID: owner.sessionID
+                )
+                completion?(.success(()))
+            } catch {
+                completion?(.failure(error))
+            }
+        }
+    }
+
+    private func enqueueComposerEditRecoveryRemoval(owner: ComposerDraftOwner) {
+        let previous = composerDraftIOTask
+        let store = store
+        composerDraftIOTask = Task {
+            await previous?.value
+            try? await store.removeComposerEditRecovery(
+                accountID: owner.accountID,
+                sessionID: owner.sessionID
+            )
+        }
+    }
+
+    private func prepareComposerEditRecovery(for owner: ComposerDraftOwner) {
+        guard composerDraftOwner == owner else { return }
+        if pendingWidgetEdit?.owner == owner {
+            if replayRequestID == nil { reconcileComposerEditRecovery() }
+            return
+        }
+        let generation = UUID()
+        composerEditRecoveryGeneration = generation
+        isLoadingComposerEditRecovery = true
+        let previous = composerDraftIOTask
+        let store = store
+        composerDraftIOTask = Task { [weak self] in
+            await previous?.value
+            let recovery = await store.loadComposerEditRecovery(
+                accountID: owner.accountID,
+                sessionID: owner.sessionID
+            )
+            guard let self,
+                  self.composerEditRecoveryGeneration == generation,
+                  self.composerDraftOwner == owner
+            else { return }
+            self.isLoadingComposerEditRecovery = false
+            self.pendingWidgetEdit = recovery.map {
+                PendingWidgetEdit(owner: owner, recovery: $0)
+            }
+            if self.replayRequestID == nil { self.reconcileComposerEditRecovery() }
+        }
+    }
+
+    private func observeReplayCompletion(_ buffered: BufferedAgentEvent) {
+        guard replayRequestID != nil else { return }
+        let type = buffered.event.msg["type"]?.stringValue
+        if let submissionID = buffered.event.submissionId,
+           type == "user_message"
+               || (type == "frontend"
+                   && buffered.event.msg["frontendType"]?.stringValue == "widget"),
+           replayCompletionSubmissionIDs.count < maximumObservedReplaySubmissions
+               || replayCompletionSubmissionIDs.contains(submissionID) {
+            replayCompletionSubmissionIDs.insert(submissionID)
+        }
+
+        var messages: [ReplayUserMessage] = []
+        if type == "user_message", let text = buffered.event.msg["message"]?.stringValue {
+            let sequence = messageTarget(from: buffered.event.msg)?.checkpointSequence
+                ?? buffered.sequence
+            messages.append(ReplayUserMessage(sequence: sequence, text: text))
+        }
+        if type == "session_history" {
+            messages.append(contentsOf: (buffered.history ?? []).compactMap { rendered in
+                guard rendered.event["type"]?.stringValue == "user_message",
+                      let text = rendered.event["message"]?.stringValue,
+                      let sequence = messageTarget(from: rendered.event)?.checkpointSequence
+                else { return nil }
+                return ReplayUserMessage(sequence: sequence, text: text)
+            })
+        }
+        guard !messages.isEmpty else { return }
+        replayUserMessages.append(contentsOf: messages.suffix(maximumObservedReplaySubmissions))
+        if replayUserMessages.count > maximumObservedReplaySubmissions {
+            replayUserMessages.removeFirst(
+                replayUserMessages.count - maximumObservedReplaySubmissions
+            )
+        }
+    }
+
+    private func reconcileComposerEditRecovery() {
+        guard replayRequestID == nil,
+              !isLoadingComposerEditRecovery
+        else { return }
+        defer {
+            replayCompletionSubmissionIDs.removeAll(keepingCapacity: true)
+            replayUserMessages.removeAll(keepingCapacity: true)
+            completedComposerEditReplay = false
+        }
+        guard let pending = pendingWidgetEdit,
+              pending.owner == composerDraftOwner
+        else { return }
+        let matchingWidgetInput = mountedWidgets.first(where: {
+            $0.capability == pending.recovery.capability
+                && $0.widget.id == pending.recovery.widgetID
+        })?.widget.action?.capabilityInput
+        let renderedEditedInput: Bool = if let baseline = pending.recovery.submissionBaselineSequence {
+            transcript.contains {
+                $0.kind == .user
+                    && $0.text == pending.recovery.editedInput
+                    && ($0.messageTarget?.checkpointSequence ?? 0) > baseline
+            } || replayUserMessages.contains {
+                $0.sequence > baseline && $0.text == pending.recovery.editedInput
+            }
+        } else {
+            false
+        }
+        switch pending.recovery.phase {
+        case .removingQueuedInput where matchingWidgetInput == pending.recovery.originalInput:
+            completeComposerEditRecovery(pending)
+        case .submitting where matchingWidgetInput == pending.recovery.editedInput
+            || replayCompletionSubmissionIDs.contains(pending.recovery.requestID)
+            || renderedEditedInput:
+            completeComposerEditRecovery(pending)
+        case .removingQueuedInput, .editing:
+            restoreComposerEditMode(pending)
+        case .submitting where completedComposerEditReplay:
+            restoreComposerEditMode(pending)
+        case .submitting:
+            break
+        case .completed:
+            completeComposerEditRecovery(pending)
+        }
+    }
+
+    private func restoreComposerEditMode(requestID: String) {
+        guard let pending = pendingWidgetEdit,
+              pending.recovery.requestID == requestID,
+              pending.recovery.phase == .submitting
+        else { return }
+        restoreComposerEditMode(pending)
+    }
+
+    private func restoreComposerEditMode(_ current: PendingWidgetEdit) {
+        var pending = current
+        pending.recovery.phase = .editing
+        pendingWidgetEdit = pending
+        stashedComposerDraft = pending.recovery.displacedDraft
+        suppressesComposerDraftSave = true
+        composer = pending.recovery.editedInput
+        suppressesComposerDraftSave = false
+        composerFocusRequest &+= 1
+        enqueueComposerEditRecoverySave(pending.recovery, owner: pending.owner)
+    }
+
+    private func rejectComposerEdit(requestID: String) {
+        guard let pending = pendingWidgetEdit,
+              pending.recovery.requestID == requestID
+        else { return }
+        switch pending.recovery.phase {
+        case .removingQueuedInput:
+            completeComposerEditRecovery(pending)
+        case .submitting:
+            restoreComposerEditMode(pending)
+        case .editing, .completed:
+            break
+        }
+    }
+
+    private func completeSubmittedComposerEdit(requestID: String) {
+        guard let pending = pendingWidgetEdit,
+              pending.recovery.requestID == requestID,
+              pending.recovery.phase == .submitting
+        else { return }
+        completeComposerEditRecovery(pending)
+    }
+
+    private func completeComposerEditRecovery(_ current: PendingWidgetEdit) {
+        guard let pending = pendingWidgetEdit,
+              pending.owner == current.owner,
+              pending.recovery.requestID == current.recovery.requestID
+        else { return }
+        var completed = pending
+        completed.recovery.phase = .completed
+        pendingWidgetEdit = completed
+        enqueueComposerEditRecoverySave(completed.recovery, owner: completed.owner) { [weak self] result in
+            guard let self,
+                  self.pendingWidgetEdit?.owner == completed.owner,
+                  self.pendingWidgetEdit?.recovery.requestID == completed.recovery.requestID,
+                  self.pendingWidgetEdit?.recovery.phase == .completed
+            else { return }
+            switch result {
+            case .success:
+                self.pendingWidgetEdit = nil
+                self.stashedComposerDraft = nil
+                self.cacheSelectedTranscript()
+            case .failure(let error):
+                self.showToast(error.localizedDescription, tone: .error)
+            }
+        }
+    }
+
     private func changeComposerDraftOwner(to owner: ComposerDraftOwner?) {
         guard owner != composerDraftOwner else { return }
         composerDraftSaveTask?.cancel()
         composerDraftSaveTask = nil
         let previousOwner = composerDraftOwner
-        let previousText = composer
+        if var pending = pendingWidgetEdit,
+           pending.owner == previousOwner,
+           pending.recovery.phase == .editing,
+           composer.utf8.count <= maximumComposerBytes {
+            pending.recovery.editedInput = composer
+            pendingWidgetEdit = pending
+            enqueueComposerEditRecoverySave(pending.recovery, owner: pending.owner)
+        }
+        let previousText = pendingWidgetEdit?.recovery.displacedDraft ?? composer
+        pendingWidgetEdit = nil
+        stashedComposerDraft = nil
+        composerEditRecoveryGeneration = UUID()
+        isLoadingComposerEditRecovery = false
         let previousIO = composerDraftIOTask
         let generation = UUID()
         composerDraftGeneration = generation
@@ -4057,12 +4510,25 @@ final class AppModel {
     private func discardComposerDraft() {
         composerDraftSaveTask?.cancel()
         composerDraftSaveTask = nil
+        invalidateComposerEditRecovery()
         composerDraftGeneration = UUID()
         composerDraftOwner = nil
         isLoadingComposerDraft = false
         suppressesComposerDraftSave = true
         composer = ""
         suppressesComposerDraftSave = false
+    }
+
+    private func invalidateComposerEditRecovery(for owner: ComposerDraftOwner? = nil) {
+        if let owner {
+            guard pendingWidgetEdit?.owner == owner || composerDraftOwner == owner else { return }
+        }
+        composerDraftSaveTask?.cancel()
+        composerDraftSaveTask = nil
+        pendingWidgetEdit = nil
+        stashedComposerDraft = nil
+        composerEditRecoveryGeneration = UUID()
+        isLoadingComposerEditRecovery = false
     }
 
     private func restoreDraft(id: String) {
@@ -4234,6 +4700,7 @@ final class AppModel {
         }
         providerAPIKey = ""
         providerModelIDsText = ""
+        providerReasoningEffortsText = ""
         providerActionState = .idle
         credentialRequestID = nil
         providerLoginRequestID = nil
@@ -4271,7 +4738,6 @@ final class AppModel {
         discardAttachmentPreview()
         selectedModelRoute = ""
         contributions = []
-        toolCount = 0
         agentSnapshot = nil
         agentDraft = defaultAgentSnapshot?.config
         applyState = .idle
@@ -4288,6 +4754,9 @@ final class AppModel {
         replayRequestID = nil
         replaySnapshotSequence = nil
         replayPresentedTranscript = nil
+        replayCompletionSubmissionIDs.removeAll(keepingCapacity: true)
+        replayUserMessages.removeAll(keepingCapacity: true)
+        completedComposerEditReplay = false
         historyRequestID = nil
         isLoadingEarlierHistory = false
         nextHistoryBeforeSequence = nil

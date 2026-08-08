@@ -11,7 +11,6 @@ use super::Runner;
 use super::input::ActiveRoute;
 use super::input::ActiveTurnRouter;
 use super::input::Wait;
-use super::input::interruptible;
 use crate::Error;
 use crate::Result;
 use crate::backend::checkpoint::ExecutionOutcome;
@@ -26,6 +25,7 @@ use crate::backend::sandbox::ApprovalStrictness;
 use crate::backend::sandbox::SandboxApprovalRequest;
 use crate::backend::sandbox::SandboxPermissions;
 use crate::backend::sandbox::SandboxReview;
+use crate::middleware::QueuedInputBaseline;
 use crate::middleware::tools::ToolResult;
 use crate::middleware::tools::execute_batch;
 use crate::protocol::ApprovalCall;
@@ -149,10 +149,12 @@ impl Runner {
         let input = [user_message(&payload)];
         let route = reviewer.selected_route(&self.config.provider).to_string();
         self.record_model_call()?;
-        let response = self.config.model.respond(
+        let model = Arc::clone(&self.config.model);
+        let review_session_id = self.review_session_id.clone();
+        let response = model.respond(
             &route,
             ModelRequest {
-                session_id: &self.review_session_id,
+                session_id: &review_session_id,
                 instructions: &instructions,
                 input: &input,
                 tools: &[],
@@ -161,20 +163,7 @@ impl Runner {
             },
             Arc::new(|_| Ok(())),
         );
-        let output = interruptible(
-            commands,
-            ActiveTurnRouter {
-                middleware: &self.config.middleware,
-                turn_id,
-                queued_input: &mut self.state.pending_input,
-                queued_before: 0,
-                deferred: &mut self.deferred,
-                events: &self.events,
-                expected_approval: None,
-            },
-            response,
-        )
-        .await?;
+        let output = self.wait_active(commands, turn_id, response).await?;
         let Some(output) = self.ready_or_aborted(output, turn_id).await? else {
             return Ok(None);
         };
@@ -367,7 +356,7 @@ impl Runner {
                         middleware: &self.config.middleware,
                         turn_id,
                         queued_input: &mut self.state.pending_input,
-                        queued_before: 0,
+                        queued_before: QueuedInputBaseline::default(),
                         deferred: &mut self.deferred,
                         events: &self.events,
                         expected_approval: None,
@@ -375,11 +364,17 @@ impl Runner {
                     .route(submission)
                     .await?
                     {
-                        ActiveRoute::Accepted if interrupt_on_active_input => {
-                            break Wait::Ready(interrupted_results(
-                                calls,
-                                "execution interrupted; result unknown after active input",
-                            ));
+                        ActiveRoute::Accepted(change) => {
+                            self.persist_active_change(change).await?;
+                            if interrupt_on_active_input {
+                                break Wait::Ready(interrupted_results(
+                                    calls,
+                                    "execution interrupted; result unknown after active input",
+                                ));
+                            }
+                        }
+                        ActiveRoute::Changed(change) => {
+                            self.persist_active_change(change).await?;
                         }
                         ActiveRoute::Interrupted { submission_id } => {
                             break Wait::Interrupted { submission_id };
@@ -473,7 +468,7 @@ impl Runner {
                 middleware: &self.config.middleware,
                 turn_id: &pending.turn_id,
                 queued_input: &mut self.state.pending_input,
-                queued_before: 0,
+                queued_before: QueuedInputBaseline::default(),
                 deferred: &mut self.deferred,
                 events: &self.events,
                 expected_approval: Some(&pending.request_id),
@@ -490,8 +485,8 @@ impl Runner {
                         decision,
                     }));
                 }
-                ActiveRoute::Accepted => {
-                    self.save().await?;
+                ActiveRoute::Accepted(change) | ActiveRoute::Changed(change) => {
+                    self.persist_active_change(change).await?;
                 }
                 ActiveRoute::Interrupted { submission_id } => {
                     return Ok(Wait::Interrupted { submission_id });

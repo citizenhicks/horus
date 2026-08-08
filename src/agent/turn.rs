@@ -7,15 +7,16 @@ use uuid::Uuid;
 use super::COMMAND_QUEUE_CAPACITY;
 use super::MAX_MODEL_STEPS;
 use super::Runner;
-use super::input::ActiveRoute;
 use super::input::ActiveTurnRouter;
 use super::input::Wait;
-use super::input::interruptible;
+use super::input::{ActiveChange, ActiveRoute};
 use super::try_send_event;
 use super::unix_timestamp_ms;
 use crate::Error;
 use crate::Result;
 use crate::backend::checkpoint::ActiveExecution;
+use crate::backend::checkpoint::Checkpoint;
+use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::checkpoint::ExecutionOutcome;
 use crate::backend::model::ModelEventSink;
 use crate::backend::model::ModelRequest;
@@ -24,6 +25,8 @@ use crate::backend::model::user_message_with_attachments;
 use crate::backend::sandbox::SandboxAuthorization;
 use crate::middleware::AfterModelContext;
 use crate::middleware::ModelContext;
+use crate::middleware::QueuedInputBaseline;
+use crate::middleware::QueuedInputQueue;
 use crate::middleware::TurnEndContext;
 use crate::protocol::AgentMessageEvent;
 use crate::protocol::AgentMessagePhase;
@@ -142,6 +145,29 @@ impl Runner {
         self.continue_turn(commands, submission_id, turn_id).await
     }
 
+    async fn publish_before_model_changes(
+        &self,
+        submission_id: &str,
+        mut middleware_events: Vec<EventMsg>,
+        active_changes: Vec<ActiveChange>,
+        usage_changed: bool,
+        target_sequence: Option<(u64, u64)>,
+    ) -> Result<()> {
+        if let Some((provisional, durable)) = target_sequence {
+            rebase_live_message_targets(&mut middleware_events, provisional, durable);
+        }
+        for event in middleware_events {
+            self.emit(submission_id, event).await?;
+        }
+        for change in active_changes {
+            change.publish(&self.events).await?;
+        }
+        if usage_changed {
+            self.emit_usage(submission_id)?;
+        }
+        Ok(())
+    }
+
     /// Runs `before_model` middleware with interruption routing, folds usage and
     /// events into state, and persists when anything changed.
     async fn before_model_phase(
@@ -153,45 +179,91 @@ impl Runner {
     ) -> Result<BeforeModel> {
         let mut middleware_events = Vec::new();
         let mut middleware_usage = Vec::new();
-        let mut queued_during_middleware = Vec::new();
-        let queued_before = self.state.pending_input.len();
+        let provisional_target_sequence = self.state.sequence + 1;
+        let queued_before = QueuedInputBaseline::from_items(&self.state.pending_input);
+        let had_queued_input = !self.state.pending_input.is_empty();
+        let mut durable_snapshot = self.state.clone();
+        let original_pending_count = durable_snapshot.pending_input.len();
+        let checkpoints = Arc::clone(&self.config.checkpoints);
+        let active_events = self.events.clone();
         let mut checkpoint_changed = false;
         let mut request_input = self.state.context.clone();
-        let before_model = self.config.middleware.before_model(ModelContext {
-            model: &self.config.model,
-            provider: &self.config.provider,
-            session_id: &self.config.session_id,
-            session_context: &self.config.session_context,
-            metadata: &self.config.metadata,
-            turn_id,
-            model_step,
-            context_window: self.config.context_window,
-            instructions: &self.system_prompt,
-            checkpoint_sequence: self.state.sequence,
-            request_input: &mut request_input,
-            durable_input: &mut self.state.context,
-            transcript_delta: &mut self.transcript_delta,
-            queued_input: &mut self.state.pending_input,
-            last_usage: self.state.last_usage.as_ref(),
-            tools: &self.catalog,
-            events: &mut middleware_events,
-            usage: &mut middleware_usage,
-            checkpoint_changed: &mut checkpoint_changed,
-        });
-        let control = interruptible(
-            commands,
-            ActiveTurnRouter {
-                middleware: &self.config.middleware,
+        let (control, mut queued_during_middleware, queue_changed, active_changes) = {
+            let mut queued_during_middleware = Vec::new();
+            let mut queue_changed = false;
+            let mut active_changes = Vec::new();
+            let before_model = self.config.middleware.before_model(ModelContext {
+                model: &self.config.model,
+                provider: &self.config.provider,
+                session_id: &self.config.session_id,
+                session_context: &self.config.session_context,
+                metadata: &self.config.metadata,
                 turn_id,
-                queued_input: &mut queued_during_middleware,
-                queued_before,
-                deferred: &mut self.deferred,
-                events: &self.events,
-                expected_approval: None,
-            },
-            before_model,
-        )
-        .await?;
+                model_step,
+                context_window: self.config.context_window,
+                instructions: &self.system_prompt,
+                checkpoint_sequence: self.state.sequence,
+                request_input: &mut request_input,
+                durable_input: &mut self.state.context,
+                transcript_delta: &mut self.transcript_delta,
+                queued_input: QueuedInputQueue::new(
+                    &mut self.state.pending_input,
+                    QueuedInputBaseline::default(),
+                ),
+                last_usage: self.state.last_usage.as_ref(),
+                tools: &self.catalog,
+                events: &mut middleware_events,
+                usage: &mut middleware_usage,
+                checkpoint_changed: &mut checkpoint_changed,
+            });
+            tokio::pin!(before_model);
+            let control = loop {
+                tokio::select! {
+                    output = &mut before_model => break Wait::Ready(output),
+                    submission = commands.recv() => {
+                        let Some(submission) = submission else {
+                            return Err(Error::Stopped("frontend disconnected".into()));
+                        };
+                        let route = (ActiveTurnRouter {
+                            middleware: &self.config.middleware,
+                            turn_id,
+                            queued_input: &mut queued_during_middleware,
+                            queued_before: queued_before.clone(),
+                            deferred: &mut self.deferred,
+                            events: &active_events,
+                            expected_approval: None,
+                        })
+                        .route(submission)
+                        .await?;
+                        match route {
+                            ActiveRoute::Accepted(change) | ActiveRoute::Changed(change) => {
+                                durable_snapshot.pending_input.truncate(original_pending_count);
+                                durable_snapshot
+                                    .pending_input
+                                    .extend(queued_during_middleware.iter().cloned());
+                                persist_queue_snapshot(&checkpoints, &mut durable_snapshot).await?;
+                                active_changes.push(change);
+                                queue_changed = true;
+                            }
+                            ActiveRoute::Interrupted { submission_id } => {
+                                break Wait::Interrupted { submission_id };
+                            }
+                            ActiveRoute::Continue | ActiveRoute::Approval { .. } => {}
+                        }
+                    }
+                }
+            };
+            (
+                control,
+                queued_during_middleware,
+                queue_changed,
+                active_changes,
+            )
+        };
+        self.state.sequence = durable_snapshot.sequence;
+        self.state
+            .pending_input
+            .append(&mut queued_during_middleware);
         let (hook_error, interrupted_by) = match control {
             Wait::Ready(Ok(())) => (None, None),
             Wait::Ready(Err(error)) => (Some(error), None),
@@ -204,26 +276,37 @@ impl Runner {
             }
             self.state.last_usage = Some(last_usage);
         }
-        checkpoint_changed |= usage_changed;
+        checkpoint_changed |= usage_changed || had_queued_input || queue_changed;
         if let Some(error) = hook_error {
-            if checkpoint_changed {
-                self.save().await?;
-            }
-            for event in middleware_events {
-                self.emit(submission_id, event).await?;
-            }
-            if usage_changed {
-                self.emit_usage(submission_id)?;
-            }
+            let durable_sequence = if checkpoint_changed {
+                Some(self.save().await?)
+            } else {
+                None
+            };
+            self.publish_before_model_changes(
+                submission_id,
+                middleware_events,
+                active_changes,
+                usage_changed,
+                durable_sequence.map(|sequence| (provisional_target_sequence, sequence)),
+            )
+            .await?;
             return Err(error);
         }
         if let Some(interrupt_submission_id) = interrupted_by {
-            for event in middleware_events {
-                self.emit(submission_id, event).await?;
-            }
-            if usage_changed {
-                self.emit_usage(submission_id)?;
-            }
+            let durable_sequence = if checkpoint_changed {
+                Some(self.save().await?)
+            } else {
+                None
+            };
+            self.publish_before_model_changes(
+                submission_id,
+                middleware_events,
+                active_changes,
+                usage_changed,
+                durable_sequence.map(|sequence| (provisional_target_sequence, sequence)),
+            )
+            .await?;
             self.abort(
                 &interrupt_submission_id,
                 turn_id,
@@ -233,17 +316,16 @@ impl Runner {
             .await?;
             return Ok(BeforeModel::Aborted);
         }
-        if !queued_during_middleware.is_empty() {
-            self.state
-                .pending_input
-                .append(&mut queued_during_middleware);
-            self.save().await?;
-            for event in middleware_events {
-                self.emit(submission_id, event).await?;
-            }
-            if usage_changed {
-                self.emit_usage(submission_id)?;
-            }
+        if queue_changed {
+            let durable_sequence = self.save().await?;
+            self.publish_before_model_changes(
+                submission_id,
+                middleware_events,
+                active_changes,
+                usage_changed,
+                Some((provisional_target_sequence, durable_sequence)),
+            )
+            .await?;
             return Ok(BeforeModel::Repeat);
         }
         if !self.state.pending_input.is_empty() {
@@ -251,15 +333,19 @@ impl Runner {
                 "queued active input was not consumed by its middleware".into(),
             ));
         }
-        if checkpoint_changed {
-            self.save().await?;
-        }
-        for event in middleware_events {
-            self.emit(submission_id, event).await?;
-        }
-        if usage_changed {
-            self.emit_usage(submission_id)?;
-        }
+        let durable_sequence = if checkpoint_changed {
+            Some(self.save().await?)
+        } else {
+            None
+        };
+        self.publish_before_model_changes(
+            submission_id,
+            middleware_events,
+            active_changes,
+            usage_changed,
+            durable_sequence.map(|sequence| (provisional_target_sequence, sequence)),
+        )
+        .await?;
         Ok(BeforeModel::Ready(request_input))
     }
 
@@ -307,11 +393,15 @@ impl Runner {
             });
             let tools = self.catalog.definitions();
             self.record_model_call()?;
-            let response = self.config.model.respond(
-                &self.config.provider,
+            let model = Arc::clone(&self.config.model);
+            let provider = self.config.provider.clone();
+            let model_session_id = self.state.session_id.clone();
+            let instructions = Arc::clone(&self.system_prompt);
+            let response = model.respond(
+                &provider,
                 ModelRequest {
-                    session_id: &self.state.session_id,
-                    instructions: &self.system_prompt,
+                    session_id: &model_session_id,
+                    instructions: &instructions,
                     input: &request_input,
                     tools: &tools,
                     allow_hosted_tools: true,
@@ -319,20 +409,7 @@ impl Runner {
                 },
                 stream,
             );
-            let output = interruptible(
-                commands,
-                ActiveTurnRouter {
-                    middleware: &self.config.middleware,
-                    turn_id: &turn_id,
-                    queued_input: &mut self.state.pending_input,
-                    queued_before: 0,
-                    deferred: &mut self.deferred,
-                    events: &self.events,
-                    expected_approval: None,
-                },
-                response,
-            )
-            .await?;
+            let output = self.wait_active(commands, &turn_id, response).await?;
             let Some(output) = self.ready_or_aborted(output, &turn_id).await? else {
                 return Ok(());
             };
@@ -340,11 +417,16 @@ impl Runner {
             self.record_usage(&output.usage)?;
             self.state.last_usage = Some(output.usage.clone());
             let mut after_model_events = Vec::new();
-            let after_model = self.config.middleware.after_model(AfterModelContext {
-                provider: &self.config.provider,
-                session_id: &self.config.session_id,
-                session_context: &self.config.session_context,
-                metadata: &self.config.metadata,
+            let middleware = self.config.middleware.clone();
+            let provider = self.config.provider.clone();
+            let session_id = self.config.session_id.clone();
+            let session_context = self.config.session_context.clone();
+            let metadata = self.config.metadata.clone();
+            let after_model = middleware.after_model(AfterModelContext {
+                provider: &provider,
+                session_id: &session_id,
+                session_context: &session_context,
+                metadata: &metadata,
                 turn_id: &turn_id,
                 model_step,
                 context_window: self.config.context_window,
@@ -352,20 +434,7 @@ impl Runner {
                 output: &output,
                 events: &mut after_model_events,
             });
-            let after_model = interruptible(
-                commands,
-                ActiveTurnRouter {
-                    middleware: &self.config.middleware,
-                    turn_id: &turn_id,
-                    queued_input: &mut self.state.pending_input,
-                    queued_before: 0,
-                    deferred: &mut self.deferred,
-                    events: &self.events,
-                    expected_approval: None,
-                },
-                after_model,
-            )
-            .await?;
+            let after_model = self.wait_active(commands, &turn_id, after_model).await?;
             let Some(after_model) = self.ready_or_aborted(after_model, &turn_id).await? else {
                 return Ok(());
             };
@@ -522,19 +591,25 @@ impl Runner {
             let Ok(submission) = commands.try_recv() else {
                 break;
             };
-            if let ActiveRoute::Interrupted { submission_id } = (ActiveTurnRouter {
+            let route = (ActiveTurnRouter {
                 middleware: &self.config.middleware,
                 turn_id,
                 queued_input: &mut self.state.pending_input,
-                queued_before: 0,
+                queued_before: QueuedInputBaseline::default(),
                 deferred: &mut self.deferred,
                 events: &self.events,
                 expected_approval: None,
             })
             .route(submission)
-            .await?
-            {
-                return Ok(Some(submission_id));
+            .await?;
+            match route {
+                ActiveRoute::Accepted(change) | ActiveRoute::Changed(change) => {
+                    self.persist_active_change(change).await?;
+                }
+                ActiveRoute::Interrupted { submission_id } => {
+                    return Ok(Some(submission_id));
+                }
+                ActiveRoute::Continue | ActiveRoute::Approval { .. } => {}
             }
         }
         Ok(None)
@@ -595,6 +670,31 @@ impl Runner {
         }
         Ok(())
     }
+}
+
+fn rebase_live_message_targets(events: &mut [EventMsg], provisional: u64, durable: u64) {
+    for target in events.iter_mut().filter_map(|event| match event {
+        EventMsg::UserMessage(message) => message.message_target.as_mut(),
+        EventMsg::AgentMessage(message) => message.message_target.as_mut(),
+        _ => None,
+    }) {
+        if target.checkpoint_sequence == provisional {
+            target.checkpoint_sequence = durable;
+        }
+    }
+}
+
+async fn persist_queue_snapshot(
+    checkpoints: &Arc<dyn CheckpointStore>,
+    checkpoint: &mut Checkpoint,
+) -> Result<()> {
+    let previous_sequence = checkpoint.sequence;
+    checkpoint.sequence += 1;
+    if let Err(error) = checkpoints.save(checkpoint, &[], None).await {
+        checkpoint.sequence = previous_sequence;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn has_visible_output_text(item: &Value) -> bool {

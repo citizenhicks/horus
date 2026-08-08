@@ -897,6 +897,7 @@ fn validated_providers(statuses: &[ProviderStatus]) -> Result<Vec<ProviderEntry>
                 || status.web_search.first() != Some(&HostedWebSearch::Off)
                 || status.model_ids_configurable != status.models.is_empty()
                 || !status.model_ids_configurable && !status.model_ids.is_empty()
+                || !status.model_ids_configurable && !status.reasoning_efforts.is_empty()
             {
                 return Err(Error::Config(format!(
                     "gateway advertised an incomplete manifest for `{}`",
@@ -924,14 +925,24 @@ fn validate_active_provider(status: &ProviderStatus, config: &ProviderConfig) ->
         )));
     }
     if status.model_ids_configurable {
-        return if status.model_ids.iter().any(|model| model == &config.model) {
-            Ok(())
-        } else {
-            Err(Error::Config(format!(
+        if !status.model_ids.iter().any(|model| model == &config.model) {
+            return Err(Error::Config(format!(
                 "gateway active provider `{}` has unconfigured model `{}`",
                 status.provider, config.model
-            )))
-        };
+            )));
+        }
+        if let Some(effort) = config.reasoning_effort.as_deref()
+            && !status
+                .reasoning_efforts
+                .iter()
+                .any(|choice| choice == effort)
+        {
+            return Err(Error::Config(format!(
+                "gateway active provider `{}` has unconfigured reasoning `{effort}`",
+                status.provider
+            )));
+        }
+        return Ok(());
     }
     let model = status
         .models
@@ -1061,16 +1072,8 @@ async fn apply(
             "Updating the gateway model catalog…",
         );
         draw(terminal, state)?;
-        let model_ids = state.configured_model_ids()?;
-        *gateway = register_provider(
-            terminal,
-            state,
-            sender,
-            events,
-            config.provider.clone(),
-            model_ids,
-        )
-        .await?;
+        *gateway =
+            register_provider(terminal, state, sender, events, config.provider.clone()).await?;
     }
     match state.target {
         ApplyTarget::Session => {
@@ -1128,16 +1131,8 @@ async fn apply_gateway(
             "Updating the gateway model catalog…",
         );
         draw(terminal, state)?;
-        let model_ids = state.configured_model_ids()?;
-        *gateway = register_provider(
-            terminal,
-            state,
-            sender,
-            events,
-            config.provider.clone(),
-            model_ids,
-        )
-        .await?;
+        *gateway =
+            register_provider(terminal, state, sender, events, config.provider.clone()).await?;
     }
     let default = gateway
         .default_config
@@ -1162,14 +1157,16 @@ async fn register_provider(
     sender: &GatewaySender,
     events: &mut GatewayEvents,
     config: ProviderConfig,
-    model_ids: Vec<String>,
 ) -> Result<ReadyPayload> {
+    let model_ids = state.configured_model_ids()?;
+    let reasoning_efforts = state.definition().reasoning_efforts.clone();
     let request_id = Uuid::new_v4().to_string();
     sender
         .send(ClientMessage::RegisterProvider {
             request_id: request_id.clone(),
             config,
             model_ids,
+            reasoning_efforts,
         })
         .await
         .map_err(gateway_error)?;
@@ -2300,6 +2297,11 @@ mod tests {
         } else {
             Vec::new()
         };
+        let reasoning_efforts = if model_ids_configurable {
+            vec!["medium".into()]
+        } else {
+            Vec::new()
+        };
         ProviderStatus {
             provider: provider.into(),
             label: provider.into(),
@@ -2308,6 +2310,7 @@ mod tests {
             configured,
             selection: None,
             model_ids,
+            reasoning_efforts,
             model_ids_configurable,
             auth,
             default_base_url,
@@ -2854,6 +2857,18 @@ mod tests {
             },
         );
         assert!(missing_reasoning.contains("unadvertised reasoning"));
+
+        let missing_custom_reasoning = reject(
+            status("responses", true),
+            ProviderConfig {
+                provider: "responses".into(),
+                model: AgentComposition::default().provider.model,
+                base_url: Some("https://api.openai.com/v1".into()),
+                reasoning_effort: Some("missing".into()),
+                web_search: HostedWebSearch::Off,
+            },
+        );
+        assert!(missing_custom_reasoning.contains("unconfigured reasoning"));
     }
 
     #[test]

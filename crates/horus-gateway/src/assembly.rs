@@ -31,7 +31,8 @@ use horus::middleware::{Middleware, MiddlewareStack};
 use horus::protocol::SessionContext;
 
 use crate::config::{
-    ChatSpec, ConfigStore, ConfiguredProvider, CredentialStore, GatewayConfig, local_user_name,
+    ChatSpec, ConfigStore, ConfiguredProvider, CredentialStore, GatewayConfig,
+    effective_reasoning_effort, local_user_name, model_route_id,
 };
 use crate::cron::CronStore;
 use crate::middleware_manifest::{BuiltinMiddleware, MIDDLEWARE};
@@ -73,7 +74,7 @@ pub(crate) async fn assemble(
         if credential_is_configured(&chat.agent.config.provider, store, &credentials)? {
             build_models(gateway, &chat.agent.config.provider, store, &credentials)?
         } else {
-            unavailable_models(&chat.agent.config.provider)?
+            unavailable_models(gateway, &chat.agent.config.provider)?
         };
     let gateway_sandbox = Arc::new(GatewaySandbox::new(
         &chat.workspace,
@@ -292,13 +293,13 @@ fn catalog_routes(
 
     let mut routes = Vec::new();
     for (model, preset) in models {
+        let catalog_default = preset
+            .and_then(|preset| preset.default_reasoning)
+            .or_else(|| configured.reasoning_efforts.first().map(String::as_str));
         let preferred = if model == selection.model {
-            selection
-                .reasoning_effort
-                .as_deref()
-                .or_else(|| preset.and_then(|preset| preset.default_reasoning))
+            effective_reasoning_effort(definition, configured, selection)
         } else {
-            preset.and_then(|preset| preset.default_reasoning)
+            catalog_default
         };
         let mut efforts = vec![preferred];
         for reasoning in preset.into_iter().flat_map(|preset| preset.reasoning) {
@@ -307,11 +308,19 @@ fn catalog_routes(
                 efforts.push(effort);
             }
         }
+        if preset.is_none() {
+            for reasoning in &configured.reasoning_efforts {
+                let effort = Some(reasoning.as_str());
+                if !efforts.contains(&effort) {
+                    efforts.push(effort);
+                }
+            }
+        }
         for effort in efforts {
             let mut provider = selection.clone();
             provider.model = model.into();
             provider.reasoning_effort = effort.map(str::to_string);
-            let route = route_id(definition.id(), model, effort);
+            let route = model_route_id(definition.id(), model, effort);
             routes.push(CatalogRoute {
                 choice: ModelChoice {
                     route,
@@ -351,9 +360,15 @@ fn provider_status(
         ),
         ProviderAuth::Browser(_) => (ProviderAuthKind::DeviceCode, None),
     };
-    let (selection, model_ids) = configured_provider.map_or_else(
-        || (None, Vec::new()),
-        |configured| (Some(configured.selection), configured.model_ids),
+    let (selection, model_ids, reasoning_efforts) = configured_provider.map_or_else(
+        || (None, Vec::new(), Vec::new()),
+        |configured| {
+            (
+                Some(configured.selection),
+                configured.model_ids,
+                configured.reasoning_efforts,
+            )
+        },
     );
     ProviderStatus {
         provider: definition.id().into(),
@@ -363,6 +378,7 @@ fn provider_status(
         configured,
         selection,
         model_ids,
+        reasoning_efforts,
         model_ids_configurable: definition.models().is_empty(),
         auth,
         default_base_url: definition.default_base_url().map(str::to_string),
@@ -416,17 +432,14 @@ fn build_models(
     store: &ConfigStore,
     credentials: &CredentialStore,
 ) -> Result<(Arc<ModelRouter>, i64)> {
+    gateway.validate_provider_selection(selection)?;
     let definition = provider(&selection.provider)?;
     let configured = gateway
         .configured_providers
         .get(&selection.provider)
         .ok_or_else(|| Error::Config("active provider is not in the configured catalog".into()))?;
-    let effort = selection.reasoning_effort.as_deref().or_else(|| {
-        definition
-            .model(&selection.model)
-            .and_then(|model| model.default_reasoning)
-    });
-    let selected_route = route_id(&selection.provider, &selection.model, effort);
+    let effort = effective_reasoning_effort(definition, configured, selection);
+    let selected_route = model_route_id(&selection.provider, &selection.model, effort);
     let mut catalog = catalog_routes(definition, configured, selection);
     catalog.extend(
         configured_model_routes(gateway, store, credentials)?
@@ -573,10 +586,6 @@ fn build_route(
     Ok(RouteValue { choice, id, model })
 }
 
-fn route_id(provider: &str, model: &str, effort: Option<&str>) -> String {
-    format!("{provider}::{model}::{}", effort.unwrap_or("default"))
-}
-
 struct RouteValue {
     id: String,
     choice: ModelChoice,
@@ -610,17 +619,26 @@ impl Model for UnavailableModel {
     }
 }
 
-fn unavailable_models(selection: &ProviderConfig) -> Result<(Arc<ModelRouter>, i64)> {
+fn unavailable_models(
+    gateway: &GatewayConfig,
+    selection: &ProviderConfig,
+) -> Result<(Arc<ModelRouter>, i64)> {
     let definition = provider(&selection.provider)?;
     let context_window = definition
         .model(&selection.model)
         .map_or(DEFAULT_CONTEXT_WINDOW, |preset| preset.context_window);
-    let effort = selection.reasoning_effort.clone().or_else(|| {
-        definition
-            .model(&selection.model)
-            .and_then(|preset| preset.default_reasoning.map(str::to_string))
-    });
-    let route = route_id(&selection.provider, &selection.model, effort.as_deref());
+    let effort = match gateway.configured_providers.get(&selection.provider) {
+        Some(configured) => {
+            gateway.validate_provider_selection(selection)?;
+            effective_reasoning_effort(definition, configured, selection).map(str::to_string)
+        }
+        None => selection.reasoning_effort.clone().or_else(|| {
+            definition
+                .model(&selection.model)
+                .and_then(|preset| preset.default_reasoning.map(str::to_string))
+        }),
+    };
+    let route = model_route_id(&selection.provider, &selection.model, effort.as_deref());
     let model: Arc<dyn Model> = Arc::new(UnavailableModel {
         info: ModelInfo {
             model: selection.model.clone(),
@@ -755,6 +773,7 @@ mod tests {
         assert!(custom.models.is_empty());
         assert!(custom.model_ids_configurable);
         assert!(custom.model_ids.is_empty());
+        assert!(custom.reasoning_efforts.is_empty());
         assert_eq!(
             custom.default_base_url.as_deref(),
             Some("https://api.openai.com/v1")
@@ -794,18 +813,19 @@ mod tests {
         };
         let custom = ProviderConfig {
             provider: "responses".into(),
-            model: "vendor/model::opaque".into(),
+            model: "vendor/model-opaque".into(),
             base_url: Some("https://example.com/v1".into()),
             reasoning_effort: Some("provider-defined".into()),
             web_search: HostedWebSearch::Off,
         };
-        let alternate_model = "vendor/model::alternate".to_string();
+        let alternate_model = "vendor/model-alternate".to_string();
         let config = config
-            .registering_provider(kimi, Vec::new())
+            .registering_provider(kimi, Vec::new(), Vec::new())
             .and_then(|config| {
                 config.registering_provider(
                     custom.clone(),
                     vec![custom.model.clone(), alternate_model.clone()],
+                    vec!["provider-defined".into(), "minimal".into()],
                 )
             })
             .expect("register providers");
@@ -829,6 +849,9 @@ mod tests {
         assert_eq!(resolved, custom);
         assert_eq!(model_providers[&custom_route.route], "responses");
         assert!(choices.iter().any(|choice| choice.model == alternate_model));
+        assert!(choices.iter().any(|choice| {
+            choice.model == alternate_model && choice.reasoning_effort.as_deref() == Some("minimal")
+        }));
         assert_eq!(
             custom_route.group,
             format!(
@@ -837,6 +860,49 @@ mod tests {
                 custom.model
             )
         );
+    }
+
+    #[test]
+    fn custom_selection_without_reasoning_uses_the_first_configured_effort() {
+        let root = tempfile::tempdir().expect("root");
+        let (store, config) = ConfigStore::initialize(
+            root.path().join("state"),
+            "127.0.0.1:8741".parse().expect("listen address"),
+            None,
+        )
+        .expect("config");
+        let credentials =
+            CredentialStore::open(store.credentials_path()).expect("credential store");
+        credentials
+            .set(
+                "responses",
+                "custom-secret",
+                Some("http://127.0.0.1:11434/v1"),
+            )
+            .expect("custom credential");
+        let selection = ProviderConfig {
+            provider: "responses".into(),
+            model: "local-model".into(),
+            base_url: Some("http://127.0.0.1:11434/v1".into()),
+            reasoning_effort: None,
+            web_search: HostedWebSearch::Off,
+        };
+        let config = config
+            .registering_provider(
+                selection.clone(),
+                vec![selection.model.clone()],
+                vec!["high".into(), "medium".into()],
+            )
+            .expect("register provider");
+
+        let choices = configured_model_choices(&config, &store, &credentials).expect("catalog");
+        let (router, _) =
+            build_models(&config, &selection, &store, &credentials).expect("build selected model");
+        let selected = router.choices().next().expect("selected route");
+
+        assert_eq!(choices[0].reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(selected.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(router.default_provider(), choices[0].route);
     }
 
     #[test]
@@ -903,6 +969,13 @@ mod tests {
             None,
         )
         .expect("config");
+        let gateway = gateway
+            .registering_provider(
+                crate::wire::AgentComposition::default().provider,
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("register provider");
         let credentials =
             Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
         let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
@@ -931,7 +1004,7 @@ mod tests {
         let mut composition = original.agent.config.clone();
         composition.middleware.set_enabled("tools", false);
         let updated = original
-            .replacing_agent(1, composition, store.state_dir(), None)
+            .replacing_agent(1, composition, &gateway, store.state_dir(), None)
             .expect("updated chat spec");
 
         let built = assemble(

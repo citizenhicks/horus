@@ -45,7 +45,7 @@ mod base64_bytes {
 }
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 19;
+pub const PROTOCOL_VERSION: u16 = 20;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -238,6 +238,7 @@ pub enum ClientMessage {
         request_id: String,
         config: ProviderConfig,
         model_ids: Vec<String>,
+        reasoning_efforts: Vec<String>,
     },
     CreatePairingCode {
         request_id: String,
@@ -660,6 +661,7 @@ pub struct ProviderStatus {
     pub configured: bool,
     pub selection: Option<ProviderConfig>,
     pub model_ids: Vec<String>,
+    pub reasoning_efforts: Vec<String>,
     pub model_ids_configurable: bool,
     pub auth: ProviderAuthKind,
     pub default_base_url: Option<String>,
@@ -1287,6 +1289,7 @@ mod tests {
                 web_search: HostedWebSearch::Off,
             },
             model_ids: Vec::new(),
+            reasoning_efforts: Vec::new(),
         });
 
         let encoded = serde_json::to_value(frame).expect("encode provider registration");
@@ -1294,7 +1297,33 @@ mod tests {
         assert_eq!(encoded["type"], "register_provider");
         assert_eq!(encoded["config"]["provider"], "kimi");
         assert_eq!(encoded["model_ids"], serde_json::json!([]));
+        assert_eq!(encoded["reasoning_efforts"], serde_json::json!([]));
         assert!(encoded.get("session_id").is_none());
+    }
+
+    #[test]
+    fn protocol_v20_requires_a_reasoning_catalog_when_registering_a_provider() {
+        let frame = serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "type": "register_provider",
+            "request_id": "request-provider",
+            "config": {
+                "provider": "openrouter",
+                "model": "openai/gpt-5",
+                "reasoning_effort": "high",
+                "web_search": "off"
+            },
+            "model_ids": ["openai/gpt-5"]
+        });
+
+        let error = serde_json::from_value::<ClientFrame>(frame)
+            .expect_err("v20 provider registration requires reasoning efforts");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing field `reasoning_efforts`")
+        );
     }
 
     #[test]
@@ -1795,9 +1824,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_version_rejects_a_future_protocol() {
-        let error = validate_version(PROTOCOL_VERSION + 1).expect_err("future version must fail");
-
-        assert!(matches!(error, Error::Protocol(_)), "{error}");
+    fn validate_version_requires_the_exact_protocol() {
+        for version in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+            let error = validate_version(version).expect_err("incompatible version must fail");
+            assert!(matches!(error, Error::Protocol(_)), "{error}");
+        }
     }
 }

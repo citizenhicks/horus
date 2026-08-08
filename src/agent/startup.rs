@@ -148,6 +148,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         model_route: config.provider.clone(),
         session_context: config.session_context.clone(),
         metadata: config.metadata.clone(),
+        queued_input: Default::default(),
         frontend: Arc::new(move |update| {
             try_send_event(
                 &middleware_events,
@@ -195,6 +196,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             }));
         }
         for message in std::mem::take(&mut state.pending_input) {
+            let message = message.into_text();
             let item = user_message(&message);
             state.context.push(item.clone());
             recovery_delta.push(item);
@@ -222,6 +224,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         state_changed = true;
     } else if state.pending_approval.is_none() && state.active_execution.is_some() {
         for message in std::mem::take(&mut state.pending_input) {
+            let message = message.into_text();
             let item = user_message(&message);
             state.context.push(item.clone());
             recovery_delta.push(item);
@@ -270,7 +273,10 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         )?;
     }
     let model_choices = config.model.choices().cloned().collect();
-    config.middleware.initialize(runtime).await?;
+    config
+        .middleware
+        .initialize(runtime, &state.pending_input)
+        .await?;
     let mut runner = Runner {
         config,
         system_prompt,

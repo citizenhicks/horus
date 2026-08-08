@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use horus::backend::model::provider::{ProviderAuth, default_provider, provider};
+use horus::backend::model::provider::{
+    ProviderAuth, ProviderDefinition, default_provider, provider,
+};
 use horus::protocol::TokenUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,7 +25,7 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 11;
+const CONFIG_VERSION: u32 = 12;
 const CHAT_SPEC_VERSION: u32 = 5;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
@@ -31,9 +33,10 @@ const CLOUDFLARE_TOKEN_FILE: &str = "cloudflare-token";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_API_KEY_BYTES: usize = 16 * 1024;
-const MAX_PROVIDER_MODEL_IDS: usize = 64;
-const MAX_MODEL_ID_BYTES: usize = 1024;
-const MAX_PROVIDER_MODEL_IDS_BYTES: usize = 16 * 1024;
+const MAX_PROVIDER_CATALOG_ENTRIES: usize = 64;
+const MAX_PROVIDER_CATALOG_ENTRY_BYTES: usize = 1024;
+const MAX_PROVIDER_CATALOG_BYTES: usize = 16 * 1024;
+const MAX_CUSTOM_MODEL_ROUTES: usize = 64;
 const MAX_CLOUDFLARE_TOKEN_BYTES: usize = 16 * 1024;
 const SECONDS_PER_DAY: u64 = 86_400;
 const USAGE_HISTORY_DAYS: u64 = 52 * 7;
@@ -76,12 +79,13 @@ pub struct GatewayConfig {
     usage: UsageHistory,
 }
 
-/// One durable provider selection and its gateway model catalog.
+/// One durable provider selection and its gateway model and reasoning catalogs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfiguredProvider {
     pub(crate) selection: ProviderConfig,
     pub(crate) model_ids: Vec<String>,
+    pub(crate) reasoning_efforts: Vec<String>,
 }
 
 /// Durable runtime recipe copied into one chat checkpoint.
@@ -169,12 +173,13 @@ impl GatewayConfig {
         &self,
         selection: ProviderConfig,
         model_ids: Vec<String>,
+        reasoning_efforts: Vec<String>,
     ) -> Result<Self> {
         let configured = ConfiguredProvider {
             selection: selection.clone(),
             model_ids,
+            reasoning_efforts,
         };
-        validate_configured_provider(&configured)?;
         let mut next = self.clone();
         next.configured_providers
             .insert(selection.provider.clone(), configured);
@@ -208,20 +213,6 @@ impl GatewayConfig {
                 current.revision
             )));
         }
-        validate_agent_composition(&composition)?;
-        let Some(configured) = self
-            .configured_providers
-            .get(&composition.provider.provider)
-        else {
-            return Err(Error::Config(
-                "the gateway default must use a configured provider entry".into(),
-            ));
-        };
-        if !configured_provider_contains_model(configured, &composition.provider.model)? {
-            return Err(Error::Config(
-                "the gateway default must use a model in the configured provider catalog".into(),
-            ));
-        }
         let mut next = self.clone();
         next.default_agent = Some(VersionedAgentConfig {
             revision: current
@@ -232,6 +223,17 @@ impl GatewayConfig {
         });
         next.validate()?;
         Ok(next)
+    }
+
+    pub(crate) fn validate_provider_selection(&self, selection: &ProviderConfig) -> Result<()> {
+        validate_provider_config(selection)?;
+        let configured = self
+            .configured_providers
+            .get(&selection.provider)
+            .ok_or_else(|| {
+                Error::Config("provider selection must use a configured provider entry".into())
+            })?;
+        validate_configured_provider_selection(configured, selection)
     }
 
     /// Records one live token-usage increment and reports whether daily usage changed.
@@ -303,6 +305,7 @@ impl GatewayConfig {
             }
             validate_configured_provider(configured)?;
         }
+        validate_custom_model_route_count(&self.configured_providers)?;
         if let Some(default) = &self.default_agent {
             if default.revision == 0 {
                 return Err(Error::Config(
@@ -310,20 +313,7 @@ impl GatewayConfig {
                 ));
             }
             validate_agent_composition(&default.config)?;
-            let Some(configured) = self
-                .configured_providers
-                .get(&default.config.provider.provider)
-            else {
-                return Err(Error::Config(
-                    "the gateway default must reference a configured provider".into(),
-                ));
-            };
-            if !configured_provider_contains_model(configured, &default.config.provider.model)? {
-                return Err(Error::Config(
-                    "the gateway default must reference a model in the configured provider catalog"
-                        .into(),
-                ));
-            }
+            self.validate_provider_selection(&default.config.provider)?;
             for (middleware, setting, route) in
                 crate::middleware_manifest::configured_model_routes(&default.config.middleware)
             {
@@ -389,6 +379,7 @@ impl ChatSpec {
         &self,
         expected_revision: u64,
         composition: AgentComposition,
+        gateway: &GatewayConfig,
         state_dir: &Path,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
@@ -408,6 +399,7 @@ impl ChatSpec {
             config: composition,
         };
         next.validate(state_dir, tls)?;
+        gateway.validate_provider_selection(&next.agent.config.provider)?;
         Ok(next)
     }
 
@@ -845,62 +837,159 @@ fn validate_configured_provider(configured: &ConfiguredProvider) -> Result<()> {
     let definition = provider(&configured.selection.provider)?;
     if definition.models().is_empty() {
         validate_model_ids(&configured.model_ids)?;
-    } else if !configured.model_ids.is_empty() {
+        validate_reasoning_efforts(&configured.reasoning_efforts)?;
+    } else if !configured.model_ids.is_empty() || !configured.reasoning_efforts.is_empty() {
         return Err(Error::Config(format!(
-            "provider `{}` uses its advertised model catalog",
+            "provider `{}` uses its advertised model and reasoning catalogs",
             configured.selection.provider
         )));
     }
-    if !configured_provider_contains_model(configured, &configured.selection.model)? {
+    validate_configured_provider_selection(configured, &configured.selection)
+}
+
+fn validate_configured_provider_selection(
+    configured: &ConfiguredProvider,
+    selection: &ProviderConfig,
+) -> Result<()> {
+    if selection.provider != configured.selection.provider {
+        return Err(Error::Config(
+            "provider selection does not match its configured provider entry".into(),
+        ));
+    }
+    let definition = provider(&selection.provider)?;
+    if !definition.models().is_empty() {
+        return Ok(());
+    }
+    if !configured.model_ids.contains(&selection.model) {
         return Err(Error::Config(format!(
-            "provider `{}` selection is not in its configured model catalog",
-            configured.selection.provider
+            "provider `{}` selection model is not in its configured model catalog",
+            selection.provider
+        )));
+    }
+    let effort = effective_reasoning_effort(definition, configured, selection);
+    if !effort.is_none_or(|effort| {
+        configured
+            .reasoning_efforts
+            .iter()
+            .any(|item| item == effort)
+    }) {
+        return Err(Error::Config(format!(
+            "provider `{}` selection reasoning effort is not in its configured reasoning catalog",
+            selection.provider
+        )));
+    }
+    Ok(())
+}
+
+fn validate_custom_model_route_count(
+    configured_providers: &BTreeMap<String, ConfiguredProvider>,
+) -> Result<()> {
+    let mut routes = BTreeSet::new();
+    for configured in configured_providers.values() {
+        if !provider(&configured.selection.provider)?
+            .models()
+            .is_empty()
+        {
+            continue;
+        }
+        for model in &configured.model_ids {
+            if configured.reasoning_efforts.is_empty() {
+                routes.insert(model_route_id(&configured.selection.provider, model, None));
+                continue;
+            }
+            for effort in &configured.reasoning_efforts {
+                if !routes.insert(model_route_id(
+                    &configured.selection.provider,
+                    model,
+                    Some(effort),
+                )) {
+                    return Err(Error::Config(
+                        "custom model and reasoning catalogs generate an ambiguous route".into(),
+                    ));
+                }
+            }
+        }
+    }
+    if routes.len() > MAX_CUSTOM_MODEL_ROUTES {
+        return Err(Error::Config(format!(
+            "custom provider catalogs may generate at most {MAX_CUSTOM_MODEL_ROUTES} model routes"
         )));
     }
     Ok(())
 }
 
 fn validate_model_ids(model_ids: &[String]) -> Result<()> {
-    if model_ids.is_empty() || model_ids.len() > MAX_PROVIDER_MODEL_IDS {
+    validate_catalog_entries(model_ids, "model IDs", "model ID")
+}
+
+fn validate_reasoning_efforts(reasoning_efforts: &[String]) -> Result<()> {
+    if reasoning_efforts.is_empty() {
+        return Ok(());
+    }
+    validate_catalog_entries(reasoning_efforts, "reasoning efforts", "reasoning effort")
+}
+
+fn validate_catalog_entries(
+    entries: &[String],
+    plural_name: &str,
+    singular_name: &str,
+) -> Result<()> {
+    if entries.is_empty() || entries.len() > MAX_PROVIDER_CATALOG_ENTRIES {
         return Err(Error::Config(format!(
-            "model IDs must contain 1–{MAX_PROVIDER_MODEL_IDS} entries"
+            "{plural_name} must contain 1–{MAX_PROVIDER_CATALOG_ENTRIES} entries"
         )));
     }
     let mut seen = BTreeSet::new();
     let mut bytes = 0_usize;
-    for model_id in model_ids {
-        if model_id.is_empty() || model_id.len() > MAX_MODEL_ID_BYTES || model_id != model_id.trim()
+    for entry in entries {
+        if entry.is_empty()
+            || entry.len() > MAX_PROVIDER_CATALOG_ENTRY_BYTES
+            || entry != entry.trim()
         {
             return Err(Error::Config(format!(
-                "each model ID must be canonical and 1–{MAX_MODEL_ID_BYTES} bytes"
+                "each {singular_name} must be canonical and 1–{MAX_PROVIDER_CATALOG_ENTRY_BYTES} bytes"
             )));
         }
-        if !seen.insert(model_id.as_str()) {
-            return Err(Error::Config(format!("duplicate model ID `{model_id}`")));
+        if entry.chars().any(char::is_control) {
+            return Err(Error::Config(format!(
+                "each {singular_name} must not contain control characters"
+            )));
+        }
+        if !seen.insert(entry.as_str()) {
+            return Err(Error::Config(format!(
+                "duplicate {singular_name} `{entry}`"
+            )));
         }
         bytes = bytes
-            .checked_add(model_id.len())
-            .ok_or_else(|| Error::Config("model ID catalog is too large".into()))?;
+            .checked_add(entry.len())
+            .ok_or_else(|| Error::Config(format!("{singular_name} catalog is too large")))?;
     }
-    if bytes > MAX_PROVIDER_MODEL_IDS_BYTES {
+    if bytes > MAX_PROVIDER_CATALOG_BYTES {
         return Err(Error::Config(format!(
-            "model IDs are limited to {MAX_PROVIDER_MODEL_IDS_BYTES} bytes in total"
+            "{plural_name} are limited to {MAX_PROVIDER_CATALOG_BYTES} bytes in total"
         )));
     }
     Ok(())
 }
 
-fn configured_provider_contains_model(
-    configured: &ConfiguredProvider,
-    model: &str,
-) -> Result<bool> {
-    let definition = provider(&configured.selection.provider)?;
-    Ok(definition.model(model).is_some()
-        || definition.models().is_empty()
-            && configured
-                .model_ids
-                .iter()
-                .any(|candidate| candidate == model))
+pub(crate) fn model_route_id(provider: &str, model: &str, effort: Option<&str>) -> String {
+    format!("{provider}::{model}::{}", effort.unwrap_or("default"))
+}
+
+pub(crate) fn effective_reasoning_effort<'a>(
+    definition: &ProviderDefinition,
+    configured: &'a ConfiguredProvider,
+    selection: &'a ProviderConfig,
+) -> Option<&'a str> {
+    selection
+        .reasoning_effort
+        .as_deref()
+        .or_else(|| {
+            definition
+                .model(&selection.model)
+                .and_then(|model| model.default_reasoning)
+        })
+        .or_else(|| configured.reasoning_efforts.first().map(String::as_str))
 }
 
 fn valid_hostname_label(label: &str) -> bool {
@@ -1176,22 +1265,22 @@ mod tests {
     }
 
     #[test]
-    fn gateway_config_rejects_v10_without_migration() {
+    fn gateway_config_rejects_v11_without_migration() {
         let root = tempfile::tempdir().expect("temporary directory");
         let state = root.path().join("state");
         ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
         let path = state.join(CONFIG_FILE);
         let contents = fs::read_to_string(&path)
             .expect("read gateway config")
-            .replacen("version = 11", "version = 10", 1);
-        fs::write(&path, contents).expect("write v10 config");
+            .replacen("version = 12", "version = 11", 1);
+        fs::write(&path, contents).expect("write v11 config");
 
-        let error = ConfigStore::open(state).expect_err("v10 must be rejected");
+        let error = ConfigStore::open(state).expect_err("v11 must be rejected");
 
         assert!(
             error
                 .to_string()
-                .contains("unsupported gateway config version 10")
+                .contains("unsupported gateway config version 11")
         );
     }
 
@@ -1202,7 +1291,7 @@ mod tests {
         let (store, config) =
             ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize state");
         let mut config = config
-            .registering_provider(AgentComposition::default().provider, Vec::new())
+            .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
             .expect("register provider");
         let usage = TokenUsage {
             input_tokens: 7,
@@ -1221,7 +1310,7 @@ mod tests {
         let contents = fs::read_to_string(state.join(CONFIG_FILE)).expect("read config");
         let (_, restored) = ConfigStore::open(state).expect("open config");
 
-        assert!(contents.starts_with("version = 11"));
+        assert!(contents.starts_with("version = 12"));
         assert!(contents.contains("[default_agent.config.middleware.settings.context_offloading]"));
         assert!(contents.contains("[default_agent.config.middleware.settings.sessions]"));
         assert_eq!(restored, config);
@@ -1238,7 +1327,7 @@ mod tests {
             web_search: horus::backend::model::provider::HostedWebSearch::Off,
         };
         let first = config
-            .registering_provider(kimi.clone(), Vec::new())
+            .registering_provider(kimi.clone(), Vec::new(), Vec::new())
             .expect("register Kimi");
         let openrouter = ProviderConfig {
             provider: "openrouter".into(),
@@ -1251,6 +1340,7 @@ mod tests {
             .registering_provider(
                 openrouter.clone(),
                 vec![openrouter.model.clone(), "anthropic/claude-opus-4.1".into()],
+                Vec::new(),
             )
             .expect("register OpenRouter");
 
@@ -1275,7 +1365,7 @@ mod tests {
         updated.model = "kimi-k2.7-code".into();
         updated.reasoning_effort = None;
         let third = second
-            .registering_provider(updated.clone(), Vec::new())
+            .registering_provider(updated.clone(), Vec::new(), Vec::new())
             .expect("update registered provider");
         assert_eq!(third.configured_providers["kimi"].selection, updated);
         let default = third.default_agent.expect("preserved default");
@@ -1287,19 +1377,27 @@ mod tests {
     fn configured_custom_provider_keeps_its_endpoint_and_model() {
         let selection = ProviderConfig {
             provider: "responses".into(),
-            model: "vendor/model::opaque".into(),
+            model: "vendor/model-opaque".into(),
             base_url: Some("https://example.com/v1".into()),
             reasoning_effort: Some("provider-defined".into()),
             web_search: horus::backend::model::provider::HostedWebSearch::Off,
         };
         let config = GatewayConfig::new(DEFAULT_LISTEN, None)
             .expect("gateway config")
-            .registering_provider(selection.clone(), vec![selection.model.clone()])
+            .registering_provider(
+                selection.clone(),
+                vec![selection.model.clone()],
+                vec!["provider-defined".into()],
+            )
             .expect("register custom provider");
 
         assert_eq!(
             config.configured_providers["responses"].selection,
             selection
+        );
+        assert_eq!(
+            config.configured_providers["responses"].reasoning_efforts,
+            ["provider-defined"]
         );
         assert_eq!(
             config
@@ -1323,28 +1421,257 @@ mod tests {
         let config = GatewayConfig::new(DEFAULT_LISTEN, None).expect("gateway config");
 
         let missing = config
-            .registering_provider(selection.clone(), Vec::new())
+            .registering_provider(selection.clone(), Vec::new(), Vec::new())
             .expect_err("custom catalog must not be empty");
         let duplicate = config
             .registering_provider(
                 selection.clone(),
                 vec![selection.model.clone(), selection.model.clone()],
+                Vec::new(),
             )
             .expect_err("custom catalog IDs must be unique");
         let padded = config
-            .registering_provider(selection, vec![" anthropic/claude-sonnet-4".into()])
+            .registering_provider(
+                selection.clone(),
+                vec![" anthropic/claude-sonnet-4".into()],
+                Vec::new(),
+            )
             .expect_err("custom catalog IDs must be canonical");
+        let duplicate_reasoning = config
+            .registering_provider(
+                selection.clone(),
+                vec![selection.model.clone()],
+                vec!["high".into(), "high".into()],
+            )
+            .expect_err("custom reasoning efforts must be unique");
+        let mut missing_reasoning = selection;
+        missing_reasoning.reasoning_effort = Some("high".into());
+        let missing_reasoning = config
+            .registering_provider(
+                missing_reasoning,
+                vec!["anthropic/claude-sonnet-4".into()],
+                vec!["medium".into()],
+            )
+            .expect_err("selected custom reasoning must be configured");
 
         assert!(missing.to_string().contains("1–64 entries"));
         assert!(duplicate.to_string().contains("duplicate model ID"));
         assert!(padded.to_string().contains("must be canonical"));
+        assert!(
+            duplicate_reasoning
+                .to_string()
+                .contains("duplicate reasoning effort")
+        );
+        assert!(
+            missing_reasoning
+                .to_string()
+                .contains("configured reasoning catalog")
+        );
+    }
+
+    #[test]
+    fn custom_provider_catalogs_accept_opaque_ids_but_reject_ambiguous_routes() {
+        let config = GatewayConfig::new(DEFAULT_LISTEN, None).expect("gateway config");
+        config
+            .registering_provider(
+                ProviderConfig {
+                    provider: "openrouter".into(),
+                    model: "vendor::model".into(),
+                    base_url: None,
+                    reasoning_effort: None,
+                    web_search: horus::backend::model::provider::HostedWebSearch::Off,
+                },
+                vec!["vendor::model".into()],
+                Vec::new(),
+            )
+            .expect("opaque model ID");
+        let collision = config
+            .registering_provider(
+                ProviderConfig {
+                    provider: "openrouter".into(),
+                    model: "vendor:".into(),
+                    base_url: None,
+                    reasoning_effort: Some("high".into()),
+                    web_search: horus::backend::model::provider::HostedWebSearch::Off,
+                },
+                vec!["vendor:".into(), "vendor".into()],
+                vec!["high".into(), ":high".into()],
+            )
+            .expect_err("distinct catalog pairs must not share a route");
+
+        assert!(collision.to_string().contains("ambiguous route"));
+    }
+
+    #[test]
+    fn custom_provider_catalogs_bound_the_total_generated_routes() {
+        let models = (0..8)
+            .map(|index| format!("vendor/model-{index}"))
+            .collect::<Vec<_>>();
+        let efforts = (0..8)
+            .map(|index| format!("effort-{index}"))
+            .collect::<Vec<_>>();
+        let config = GatewayConfig::new(DEFAULT_LISTEN, None)
+            .expect("gateway config")
+            .registering_provider(
+                ProviderConfig {
+                    provider: "openrouter".into(),
+                    model: models[0].clone(),
+                    base_url: None,
+                    reasoning_effort: Some(efforts[0].clone()),
+                    web_search: horus::backend::model::provider::HostedWebSearch::Off,
+                },
+                models,
+                efforts,
+            )
+            .expect("64 custom routes");
+
+        let error = config
+            .registering_provider(
+                ProviderConfig {
+                    provider: "responses".into(),
+                    model: "local-model".into(),
+                    base_url: Some("http://127.0.0.1:11434/v1".into()),
+                    reasoning_effort: None,
+                    web_search: horus::backend::model::provider::HostedWebSearch::Off,
+                },
+                vec!["local-model".into()],
+                Vec::new(),
+            )
+            .expect_err("65 total custom routes must fail");
+
+        assert!(error.to_string().contains("at most 64 model routes"));
+    }
+
+    #[test]
+    fn provider_registration_rejects_a_catalog_that_invalidates_the_current_default() {
+        let model = "vendor/model".to_string();
+        let config = GatewayConfig::new(DEFAULT_LISTEN, None)
+            .expect("gateway config")
+            .registering_provider(
+                ProviderConfig {
+                    provider: "openrouter".into(),
+                    model: model.clone(),
+                    base_url: None,
+                    reasoning_effort: Some("high".into()),
+                    web_search: horus::backend::model::provider::HostedWebSearch::Off,
+                },
+                vec![model.clone()],
+                vec!["high".into(), "medium".into()],
+            )
+            .expect("register provider");
+
+        let error = config
+            .registering_provider(
+                ProviderConfig {
+                    provider: "openrouter".into(),
+                    model: model.clone(),
+                    base_url: None,
+                    reasoning_effort: Some("medium".into()),
+                    web_search: horus::backend::model::provider::HostedWebSearch::Off,
+                },
+                vec![model],
+                vec!["medium".into()],
+            )
+            .expect_err("updated catalog must preserve current default membership");
+
+        assert!(
+            error
+                .to_string()
+                .contains("selection reasoning effort is not in its configured reasoning catalog")
+        );
+    }
+
+    #[test]
+    fn default_and_persisted_config_validate_custom_reasoning_membership() {
+        let model = "vendor/model".to_string();
+        let config = GatewayConfig::new(DEFAULT_LISTEN, None)
+            .expect("gateway config")
+            .registering_provider(
+                ProviderConfig {
+                    provider: "openrouter".into(),
+                    model: model.clone(),
+                    base_url: None,
+                    reasoning_effort: Some("high".into()),
+                    web_search: horus::backend::model::provider::HostedWebSearch::Off,
+                },
+                vec![model],
+                vec!["high".into(), "medium".into()],
+            )
+            .expect("register provider");
+        let mut replacement = config
+            .default_agent
+            .as_ref()
+            .expect("default")
+            .config
+            .clone();
+        replacement.provider.reasoning_effort = Some("low".into());
+
+        let replace_error = config
+            .replacing_default_agent(1, replacement)
+            .expect_err("default reasoning must be in the catalog");
+        let mut persisted = config;
+        persisted
+            .default_agent
+            .as_mut()
+            .expect("default")
+            .config
+            .provider
+            .reasoning_effort = Some("low".into());
+        let persisted_error = persisted
+            .validate()
+            .expect_err("persisted default reasoning must be in the catalog");
+
+        assert!(replace_error.to_string().contains("reasoning effort"));
+        assert!(persisted_error.to_string().contains("reasoning effort"));
+    }
+
+    #[test]
+    fn chat_replacement_rejects_out_of_catalog_model_and_reasoning() {
+        let model = "vendor/model".to_string();
+        let gateway = GatewayConfig::new(DEFAULT_LISTEN, None)
+            .expect("gateway config")
+            .registering_provider(
+                ProviderConfig {
+                    provider: "openrouter".into(),
+                    model: model.clone(),
+                    base_url: None,
+                    reasoning_effort: Some("high".into()),
+                    web_search: horus::backend::model::provider::HostedWebSearch::Off,
+                },
+                vec![model],
+                vec!["high".into(), "medium".into()],
+            )
+            .expect("register provider");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let chat = ChatSpec::new(
+            workspace.path(),
+            gateway.default_agent.clone().expect("default"),
+            state.path(),
+            None,
+        )
+        .expect("chat spec");
+        let mut invalid_model = chat.agent.config.clone();
+        invalid_model.provider.model = "vendor/unknown".into();
+        let mut invalid_reasoning = chat.agent.config.clone();
+        invalid_reasoning.provider.reasoning_effort = Some("low".into());
+
+        let model_error = chat
+            .replacing_agent(1, invalid_model, &gateway, state.path(), None)
+            .expect_err("chat model must be in the catalog");
+        let reasoning_error = chat
+            .replacing_agent(1, invalid_reasoning, &gateway, state.path(), None)
+            .expect_err("chat reasoning must be in the catalog");
+
+        assert!(model_error.to_string().contains("selection model"));
+        assert!(reasoning_error.to_string().contains("reasoning effort"));
     }
 
     #[test]
     fn saving_defaults_is_revisioned_and_does_not_change_existing_chat_specs() {
         let registered = GatewayConfig::new(DEFAULT_LISTEN, None)
             .expect("gateway config")
-            .registering_provider(AgentComposition::default().provider, Vec::new())
+            .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
             .expect("register provider");
         let workspace = tempfile::tempdir().expect("workspace");
         let state = tempfile::tempdir().expect("state");

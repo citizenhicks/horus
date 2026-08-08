@@ -1421,6 +1421,7 @@ impl HostState {
             .replacing_agent(
                 expected_revision,
                 composition,
+                &gateway,
                 self.store.state_dir(),
                 gateway.tls.as_ref(),
             )
@@ -2995,6 +2996,9 @@ mod tests {
         std::fs::create_dir(&second).expect("second workspace");
         let listen = "127.0.0.1:8741".parse().expect("listen address");
         let (store, config) = ConfigStore::initialize(state, listen, None).expect("config");
+        let config = config
+            .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
+            .expect("register provider");
         let credentials =
             Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
         let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
@@ -3089,6 +3093,7 @@ mod tests {
                     reasoning_effort: Some("medium".into()),
                     web_search: horus::backend::model::provider::HostedWebSearch::Off,
                 },
+                Vec::new(),
                 Vec::new(),
             )
             .await

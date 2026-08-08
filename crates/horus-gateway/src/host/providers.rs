@@ -198,6 +198,7 @@ impl GatewayHost {
         &self,
         selection: ProviderConfig,
         model_ids: Vec<String>,
+        reasoning_efforts: Vec<String>,
     ) -> std::result::Result<ReadyPayload, Rejection> {
         let state = self.state.lock().await;
         if !credential_is_configured(&selection, &state.store, &state.credentials)
@@ -214,7 +215,7 @@ impl GatewayHost {
                 .lock()
                 .map_err(|_| internal("gateway configuration lock is poisoned"))?;
             let next = current
-                .registering_provider(selection, model_ids)
+                .registering_provider(selection, model_ids, reasoning_efforts)
                 .map_err(invalid_config)?;
             state.store.save(&next).map_err(internal)?;
             *current = next;
@@ -349,6 +350,7 @@ mod tests {
                     reasoning_effort: Some("max".into()),
                     web_search: horus::backend::model::provider::HostedWebSearch::Off,
                 },
+                Vec::new(),
                 Vec::new(),
             )
             .await

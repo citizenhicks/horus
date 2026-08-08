@@ -49,7 +49,6 @@ const MAX_DEFERRED_SUBMISSIONS: usize = 64;
 const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
 const MAX_OPERATION_BYTES: usize = 256;
 const MAX_ATTACHMENT_REFERENCES: usize = 16;
-const MAX_COMMAND_ARGUMENT_BYTES: usize = 64 * 1024;
 const DEFAULT_INITIAL_REPLAY_BATCHES: usize = 100;
 
 /// Dependencies and policy for one agent session.
@@ -225,14 +224,14 @@ pub fn validate_submission(submission: &Submission) -> Result<()> {
         } => {
             validate_identifier("capability ID", capability, MAX_OPERATION_BYTES)?;
             validate_identifier("command", command, MAX_OPERATION_BYTES)?;
-            if arguments.len() > MAX_COMMAND_ARGUMENT_BYTES {
+            if arguments.len() > crate::protocol::MAX_CAPABILITY_INPUT_BYTES {
                 return Err(Error::Config(
                     "middleware command arguments exceed size limit".into(),
                 ));
             }
             if input
                 .as_ref()
-                .is_some_and(|input| input.len() > MAX_COMMAND_ARGUMENT_BYTES)
+                .is_some_and(|input| input.len() > crate::protocol::MAX_CAPABILITY_INPUT_BYTES)
             {
                 return Err(Error::Config(
                     "middleware command input exceeds size limit".into(),

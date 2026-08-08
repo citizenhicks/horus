@@ -238,7 +238,10 @@ struct ComposerOptionsView: View {
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
                 .help("Stop")
         } else {
-            Button("Send", glyph: .arrowUp02) { model.sendMessage() }
+            Button(
+                model.activeTurnID == nil ? "Send" : "Send steering message",
+                glyph: model.activeTurnID == nil ? .arrowUp02 : .arrowUpRight01
+            ) { model.sendMessage() }
                 .labelStyle(.iconOnly)
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
                 // `sendMessage()` also needs a session: a gateway with no chats left the button

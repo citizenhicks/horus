@@ -1157,6 +1157,7 @@ mod tests {
             model_route: "test".into(),
             session_context: Default::default(),
             metadata: Default::default(),
+            queued_input: crate::middleware::QueuedInputSnapshot::default(),
             frontend,
         }
     }

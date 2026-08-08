@@ -443,7 +443,20 @@ struct ProvidersView: View {
                                     Text("Model ID(s)")
                                     SettingsInfoButton(
                                         title: "Model ID(s)",
-                                        detail: "Enter one or more exact provider model IDs separated by commas. Whitespace and empty entries are ignored."
+                                        detail: "Enter one or more exact provider model IDs separated by commas. Whitespace, empty entries, and duplicates are ignored."
+                                    )
+                                }
+                            }
+
+                            LabeledContent {
+                                TextField("low, medium, high", text: providerReasoningEfforts)
+                                    .settingsField()
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Text("Reasoning effort(s)")
+                                    SettingsInfoButton(
+                                        title: "Reasoning effort(s)",
+                                        detail: "Enter the exact reasoning efforts supported by these models, separated by commas. Whitespace, empty entries, and duplicates are ignored. Leave empty to use the provider default."
                                     )
                                 }
                             }
@@ -623,6 +636,13 @@ struct ProvidersView: View {
         )
     }
 
+    private var providerReasoningEfforts: Binding<String> {
+        Binding(
+            get: { model.providerReasoningEffortsText },
+            set: { model.updateProviderReasoningEfforts($0) }
+        )
+    }
+
     private var providerWebSearch: Binding<HostedWebSearch> {
         Binding(
             get: { model.providerDraft?.webSearch ?? .off },
@@ -639,7 +659,10 @@ struct ProvidersView: View {
 
     private var hasDefaultChanges: Bool {
         guard let draft = model.providerDraft else { return false }
-        return model.defaultAgentSnapshot?.config.provider != draft
+        if model.defaultAgentSnapshot?.config.provider != draft { return true }
+        guard let status = selectedStatus, status.modelIdsConfigurable else { return false }
+        return model.providerModelIDs != status.modelIds
+            || model.providerReasoningEfforts != status.reasoningEfforts
     }
 
     private var providerConfigurationValid: Bool {

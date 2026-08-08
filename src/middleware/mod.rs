@@ -13,6 +13,8 @@ use crate::Error;
 use crate::Result;
 use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::CheckpointStore;
+use crate::backend::checkpoint::MAX_QUEUED_INPUTS;
+use crate::backend::checkpoint::QueuedInput as DurableQueuedInput;
 use crate::backend::model::ModelOutput;
 use crate::backend::model::ModelRouter;
 use crate::backend::sandbox::Sandbox;
@@ -51,6 +53,211 @@ const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 /// Sends middleware-owned UI updates without depending on a concrete frontend.
 pub type FrontendEventSink = Arc<dyn Fn(FrontendEvent) -> Result<()> + Send + Sync>;
 
+/// Read-only queued input owned by the middleware receiving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuedInputView<'a> {
+    id: &'a str,
+    text: &'a str,
+}
+
+impl<'a> QueuedInputView<'a> {
+    /// Returns the identity token required by a conditional queue mutation.
+    #[must_use]
+    pub fn id(&self) -> &'a str {
+        self.id
+    }
+
+    /// Returns the exact queued text.
+    #[must_use]
+    pub fn text(&self) -> &'a str {
+        self.text
+    }
+}
+
+/// One queued input removed by its owning middleware.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedInputValue {
+    id: String,
+    text: String,
+}
+
+impl QueuedInputValue {
+    /// Returns the exact queued text.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Consumes the item and returns its text.
+    #[must_use]
+    pub fn into_text(self) -> String {
+        self.text
+    }
+}
+
+/// Read-only startup snapshot containing only one middleware's queued input.
+#[derive(Clone, Default)]
+pub struct QueuedInputSnapshot {
+    items: Vec<QueuedInputValue>,
+}
+
+impl QueuedInputSnapshot {
+    /// Returns the newest queued item owned by this middleware.
+    #[must_use]
+    pub fn latest(&self) -> Option<QueuedInputView<'_>> {
+        self.items.last().map(|item| QueuedInputView {
+            id: &item.id,
+            text: item.text(),
+        })
+    }
+
+    fn for_owner(owner: &str, items: &[DurableQueuedInput]) -> Self {
+        Self {
+            items: items
+                .iter()
+                .filter(|item| item.owner() == owner)
+                .map(|item| QueuedInputValue {
+                    id: item.id().into(),
+                    text: item.text().into(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct QueuedInputBaseline {
+    ids_by_owner: BTreeMap<String, BTreeSet<String>>,
+    total_count: usize,
+}
+
+impl QueuedInputBaseline {
+    pub(crate) fn from_items(items: &[DurableQueuedInput]) -> Self {
+        let mut ids_by_owner: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for item in items {
+            ids_by_owner
+                .entry(item.owner().to_string())
+                .or_default()
+                .insert(item.id().to_string());
+        }
+        Self {
+            ids_by_owner,
+            total_count: items.len(),
+        }
+    }
+}
+
+/// Mutable scoped view of active input retained until the next model boundary.
+pub struct QueuedInputQueue<'a> {
+    items: &'a mut Vec<DurableQueuedInput>,
+    baseline: QueuedInputBaseline,
+    owner: Option<&'static str>,
+}
+
+impl<'a> QueuedInputQueue<'a> {
+    pub(crate) fn new(
+        items: &'a mut Vec<DurableQueuedInput>,
+        baseline: QueuedInputBaseline,
+    ) -> Self {
+        Self {
+            items,
+            baseline,
+            owner: None,
+        }
+    }
+
+    fn scope(&mut self, owner: &'static str) {
+        self.owner = Some(owner);
+    }
+
+    fn owner(&self) -> Result<&'static str> {
+        self.owner
+            .ok_or_else(|| Error::Config("queued input is not scoped to a middleware".into()))
+    }
+
+    /// Returns the total queue size, including input being drained concurrently.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        let Some(owner) = self.owner else {
+            return 0;
+        };
+        self.baseline
+            .ids_by_owner
+            .get(owner)
+            .map_or(0, BTreeSet::len)
+            .saturating_add(
+                self.items
+                    .iter()
+                    .filter(|item| item.owner() == owner)
+                    .count(),
+            )
+    }
+
+    /// Returns the newest input available to this context.
+    #[must_use]
+    pub fn latest(&self) -> Option<QueuedInputView<'_>> {
+        let owner = self.owner?;
+        self.items
+            .iter()
+            .rev()
+            .find(|item| item.owner() == owner)
+            .map(|item| QueuedInputView {
+                id: item.id(),
+                text: item.text(),
+            })
+    }
+
+    /// Appends one correlated active input, or returns `false` when it is full or duplicated.
+    pub fn enqueue(&mut self, id: &str, text: &str) -> Result<bool> {
+        let owner = self.owner()?;
+        let item = DurableQueuedInput::new(owner, id, text)?;
+        if self.baseline.total_count.saturating_add(self.items.len()) >= MAX_QUEUED_INPUTS {
+            return Ok(false);
+        }
+        if self
+            .baseline
+            .ids_by_owner
+            .get(owner)
+            .is_some_and(|ids| ids.contains(id))
+            || self
+                .items
+                .iter()
+                .any(|item| item.owner() == owner && item.id() == id)
+        {
+            return Ok(false);
+        }
+        self.items.push(item);
+        Ok(true)
+    }
+
+    /// Removes the newest item when its revision matches.
+    pub fn take_latest(&mut self, expected_id: &str) -> Result<Option<QueuedInputValue>> {
+        let owner = self.owner()?;
+        let Some(index) = self.items.iter().rposition(|item| item.owner() == owner) else {
+            return Ok(None);
+        };
+        if self.items[index].id() != expected_id {
+            return Ok(None);
+        }
+        let (id, text) = self.items.remove(index).into_id_and_text();
+        Ok(Some(QueuedInputValue { id, text }))
+    }
+
+    /// Removes and returns every item owned by this middleware.
+    pub fn drain(&mut self) -> Vec<QueuedInputValue> {
+        let Some(owner) = self.owner else {
+            return Vec::new();
+        };
+        self.items
+            .extract_if(.., |item| item.owner() == owner)
+            .map(|item| {
+                let (id, text) = item.into_id_and_text();
+                QueuedInputValue { id, text }
+            })
+            .collect()
+    }
+}
+
 /// Durable runtime identity exposed while middleware is initialized.
 #[derive(Clone)]
 pub struct RuntimeContext {
@@ -59,6 +266,7 @@ pub struct RuntimeContext {
     pub model_route: String,
     pub session_context: SessionContext,
     pub metadata: BTreeMap<String, Value>,
+    pub queued_input: QueuedInputSnapshot,
     pub frontend: FrontendEventSink,
 }
 
@@ -77,7 +285,7 @@ pub struct ModelContext<'a> {
     pub(crate) request_input: &'a mut Vec<Value>,
     pub(crate) durable_input: &'a mut Vec<Value>,
     pub(crate) transcript_delta: &'a mut Vec<Value>,
-    pub queued_input: &'a mut Vec<String>,
+    pub queued_input: QueuedInputQueue<'a>,
     pub last_usage: Option<&'a TokenUsage>,
     pub tools: &'a Catalog,
     pub events: &'a mut Vec<EventMsg>,
@@ -164,12 +372,24 @@ pub struct AfterModelContext<'a> {
 
 /// Mutable turn state exposed to the middleware owning an active operation.
 pub struct ActiveSubmissionContext<'a> {
+    pub submission_id: &'a str,
     pub operation: &'a str,
     pub active_turn_id: &'a str,
     pub target_turn_id: &'a str,
     pub text: &'a str,
-    pub queued_input: &'a mut Vec<String>,
-    pub queued_before: usize,
+    pub queued_input: QueuedInputQueue<'a>,
+    pub events: &'a mut Vec<EventMsg>,
+}
+
+/// Mutable turn state exposed to a capability command that can run immediately.
+pub struct ActiveCommandContext<'a> {
+    pub submission_id: &'a str,
+    pub active_turn_id: &'a str,
+    pub command: &'a str,
+    pub arguments: &'a str,
+    pub input: Option<&'a str>,
+    pub target: Option<MessageTarget>,
+    pub queued_input: QueuedInputQueue<'a>,
     pub events: &'a mut Vec<EventMsg>,
 }
 
@@ -335,6 +555,14 @@ pub trait Middleware: Send + Sync {
             "middleware `{}` declared but did not handle an active operation",
             self.name()
         )))
+    }
+
+    /// Handles a capability command synchronously while a turn is active.
+    fn active_command(
+        &self,
+        _context: &mut ActiveCommandContext<'_>,
+    ) -> Result<Option<ActiveSubmissionResult>> {
+        Ok(None)
     }
 
     /// Observes a turn ending and may clear capability-owned transient UI.
@@ -520,20 +748,43 @@ impl MiddlewareStack {
         &self,
         context: &mut ActiveSubmissionContext<'_>,
     ) -> Result<Option<ActiveSubmissionResult>> {
-        self.entries
+        let entry = self
+            .entries
             .iter()
-            .find(|entry| entry.active_operations().contains(&context.operation))
-            .map(|entry| entry.active_submission(context))
-            .transpose()
+            .find(|entry| entry.active_operations().contains(&context.operation));
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        context.queued_input.scope(entry.name());
+        entry.active_submission(context).map(Some)
     }
 
-    pub(crate) async fn initialize(&self, context: RuntimeContext) -> Result<()> {
+    pub(crate) fn active_command(
+        &self,
+        middleware: &str,
+        context: &mut ActiveCommandContext<'_>,
+    ) -> Result<Option<ActiveSubmissionResult>> {
+        let Some(entry) = self.entries.iter().find(|entry| entry.name() == middleware) else {
+            return Ok(None);
+        };
+        context.queued_input.scope(entry.name());
+        entry.active_command(context)
+    }
+
+    pub(crate) async fn initialize(
+        &self,
+        context: RuntimeContext,
+        queued_input: &[DurableQueuedInput],
+    ) -> Result<()> {
         let end = SessionEndContext {
             session_id: context.session_id.clone(),
             metadata: context.metadata.clone(),
         };
         for (index, entry) in self.entries.iter().enumerate() {
-            if let Err(error) = entry.initialize(context.clone()).await {
+            let mut scoped_context = context.clone();
+            scoped_context.queued_input =
+                QueuedInputSnapshot::for_owner(entry.name(), queued_input);
+            if let Err(error) = entry.initialize(scoped_context).await {
                 let mut rollback_error = None;
                 for initialized in self.entries[..index].iter().rev() {
                     if let Err(error) = initialized.shutdown(end.clone()).await
@@ -575,9 +826,11 @@ impl MiddlewareStack {
 
     pub(crate) async fn before_model(&self, mut context: ModelContext<'_>) -> Result<()> {
         for entry in &self.entries {
+            context.queued_input.scope(entry.name());
             entry.before_model(&mut context).await?;
         }
         for entry in &self.entries {
+            context.queued_input.scope(entry.name());
             entry.decorate_model_request(&mut context).await?;
         }
         Ok(())
@@ -788,6 +1041,137 @@ mod tests {
     use crate::protocol::FrontendSymbol;
     use crate::protocol::Op;
 
+    fn queued(owner: &str, id: &str, text: &str) -> DurableQueuedInput {
+        DurableQueuedInput::new(owner, id, text).expect("valid queued input")
+    }
+
+    fn scoped_queue<'a>(
+        items: &'a mut Vec<DurableQueuedInput>,
+        owner: &'static str,
+        baseline: QueuedInputBaseline,
+    ) -> QueuedInputQueue<'a> {
+        let mut queue = QueuedInputQueue::new(items, baseline);
+        queue.scope(owner);
+        queue
+    }
+
+    #[test]
+    fn queued_input_queue_cannot_observe_or_drain_another_owner() {
+        let mut items = vec![
+            queued("alpha", "one", "first"),
+            queued("beta", "one", "private"),
+        ];
+        let drained = {
+            let mut queue = scoped_queue(
+                &mut items,
+                "alpha",
+                QueuedInputBaseline::from_items(&[
+                    queued("alpha", "prior-one", "prior"),
+                    queued("alpha", "prior-two", "prior"),
+                    queued("beta", "prior-private", "prior"),
+                ]),
+            );
+            assert_eq!(queue.count(), 3);
+            assert_eq!(queue.latest().map(|item| item.id()), Some("one"));
+            queue.drain()
+        };
+
+        assert_eq!(drained[0].text(), "first");
+        assert_eq!(items, vec![queued("beta", "one", "private")]);
+    }
+
+    #[test]
+    fn queued_input_enqueue_rejects_duplicates_without_mutation() {
+        let mut items = vec![queued("alpha", "one", "first")];
+        let original = items.clone();
+        let inserted = scoped_queue(&mut items, "alpha", QueuedInputBaseline::default())
+            .enqueue("one", "replacement")
+            .expect("valid input");
+
+        assert!(!inserted);
+        assert_eq!(items, original);
+    }
+
+    #[test]
+    fn queued_input_enqueue_honors_the_in_flight_baseline() {
+        let baseline = QueuedInputBaseline::from_items(&[
+            queued("alpha", "one", "being consumed"),
+            queued("beta", "one", "another owner"),
+        ]);
+        let mut items = Vec::new();
+        let inserted = scoped_queue(&mut items, "alpha", baseline)
+            .enqueue("one", "duplicate")
+            .expect("valid input");
+
+        assert!(!inserted);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn queued_input_take_is_owner_scoped_and_rejects_stale_cas() {
+        let mut items = vec![
+            queued("alpha", "one", "first"),
+            queued("beta", "private", "other owner"),
+        ];
+        {
+            let mut queue = scoped_queue(&mut items, "alpha", QueuedInputBaseline::default());
+            assert!(
+                queue
+                    .take_latest("stale")
+                    .expect("stale comparison")
+                    .is_none()
+            );
+            let taken = queue
+                .take_latest("one")
+                .expect("valid comparison")
+                .expect("matching item");
+            assert_eq!(taken.text(), "first");
+            assert!(queue.take_latest("one").expect("already taken").is_none());
+        }
+
+        assert_eq!(items, vec![queued("beta", "private", "other owner")]);
+    }
+
+    #[test]
+    fn queued_input_invalid_mutations_are_atomic() {
+        let mut items = vec![queued("alpha", "one", "first")];
+        let original = items.clone();
+        {
+            let mut queue = scoped_queue(&mut items, "alpha", QueuedInputBaseline::default());
+            assert!(queue.enqueue("", "second").is_err());
+            assert!(queue.enqueue("two", "   ").is_err());
+            assert!(
+                queue
+                    .enqueue(
+                        "two",
+                        &"x".repeat(crate::protocol::MAX_CAPABILITY_INPUT_BYTES + 1),
+                    )
+                    .is_err()
+            );
+            assert!(queue.take_latest("").expect("stale comparison").is_none());
+        }
+
+        assert_eq!(items, original);
+    }
+
+    #[test]
+    fn queued_input_enqueue_enforces_the_core_item_bound() {
+        let baseline_items: Vec<_> = (0..MAX_QUEUED_INPUTS)
+            .map(|index| queued("alpha", &index.to_string(), "item"))
+            .collect();
+        let mut items = Vec::new();
+        let inserted = scoped_queue(
+            &mut items,
+            "alpha",
+            QueuedInputBaseline::from_items(&baseline_items),
+        )
+        .enqueue("overflow", "item")
+        .expect("valid input");
+
+        assert!(!inserted);
+        assert!(items.is_empty());
+    }
+
     struct UnrenderedTool;
 
     impl Tool for UnrenderedTool {
@@ -852,6 +1236,7 @@ mod tests {
             model_route: "model".into(),
             session_context: SessionContext::default(),
             metadata: BTreeMap::new(),
+            queued_input: QueuedInputSnapshot::default(),
             frontend: Arc::new(|_| Ok(())),
         };
         let stack = MiddlewareStack::new(vec![Arc::new(CatchAllRenderer), Arc::new(ToolOwner)])

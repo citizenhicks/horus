@@ -1323,7 +1323,11 @@ async fn handle_message(
             request_id,
             config,
             model_ids,
-        } => match gateway.register_provider(config, model_ids).await {
+            reasoning_efforts,
+        } => match gateway
+            .register_provider(config, model_ids, reasoning_efforts)
+            .await
+        {
             Ok(payload) => {
                 write_frame(
                     writer,
@@ -2216,12 +2220,22 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary directory");
         let workspace = root.path().join("workspace");
         fs::create_dir(&workspace).expect("workspace");
-        let (server, grant) = GatewayServer::bootstrap(
-            root.path().join("state"),
-            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        )
-        .await
-        .expect("bootstrap gateway");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let listen = listener.local_addr().expect("listen address");
+        let (store, config) = ConfigStore::initialize(root.path().join("state"), listen, None)
+            .expect("initialize gateway");
+        let config = config
+            .registering_provider(
+                crate::wire::AgentComposition::default().provider,
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("register provider");
+        store.save(&config).expect("save provider");
+        let (_, grant) = AuthStore::initialize(store.auth_path()).expect("initialize auth");
+        let server = GatewayServer::assemble(store, config, listener)
+            .await
+            .expect("assemble gateway");
         let listen = server.config.listen;
         let (shutdown, signal) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(server.serve_until(async move {

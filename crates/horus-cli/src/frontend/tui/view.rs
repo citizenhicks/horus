@@ -178,6 +178,29 @@ pub(super) fn live_transcript_lines(
             width,
         );
     }
+    for ((capability, _), item) in state
+        .widgets
+        .iter()
+        .filter(|(_, item)| item.slot == FrontendSlot::TranscriptTail)
+    {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(vec![
+            Span::styled("┊ ", current().style(Role::Muted)),
+            Span::styled(
+                format!("{} message", sentence_case(capability)),
+                current().style(Role::Muted).add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+        let style = current().style(tone_role(item.tone));
+        lines.extend(item.text.split('\n').map(|line| {
+            Line::from(vec![
+                Span::styled("┊ ", current().style(Role::Muted)),
+                Span::styled(line.to_owned(), style),
+            ])
+        }));
+    }
     if lines.is_empty() {
         let card = responsive_welcome_card(state, width);
         push_lines(
@@ -872,4 +895,12 @@ pub(super) fn bounded_terminal_text(value: &str, limit: usize) -> String {
 
 fn display_value(value: &str) -> String {
     terminal_text(value).chars().take(120).collect()
+}
+
+fn sentence_case(value: &str) -> String {
+    let mut value = terminal_text(value).replace(['_', '-'], " ");
+    if let Some(first) = value.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    value
 }

@@ -1,5 +1,6 @@
 //! Durable SQLite checkpoint storage.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -763,6 +764,24 @@ fn validate_checkpoint(checkpoint: &Checkpoint) -> Result<()> {
             return Err(Error::Checkpoint(
                 "active execution failed-tool count exceeds tool count".into(),
             ));
+        }
+    }
+    if checkpoint.pending_input.len() > super::MAX_QUEUED_INPUTS {
+        return Err(Error::Checkpoint(
+            "queued input exceeds the durable item limit".into(),
+        ));
+    }
+    let mut pending_ids = BTreeSet::new();
+    for input in &checkpoint.pending_input {
+        input
+            .validate()
+            .map_err(|message| Error::Checkpoint(message.into()))?;
+        if !pending_ids.insert((input.owner(), input.id())) {
+            return Err(Error::Checkpoint(format!(
+                "duplicate queued input `{}/{}`",
+                input.owner(),
+                input.id(),
+            )));
         }
     }
     Ok(())

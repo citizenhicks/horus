@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 19
+let gatewayProtocolVersion = 20
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 let maximumAttachmentReferences = 16
@@ -529,7 +529,12 @@ enum GatewayRequest: Encodable, Sendable {
         baseURL: String,
         apiKey: String
     )
-    case registerProvider(requestID: String, config: ProviderConfig, modelIds: [String])
+    case registerProvider(
+        requestID: String,
+        config: ProviderConfig,
+        modelIds: [String],
+        reasoningEfforts: [String]
+    )
     case createPairingCode(requestID: String)
     case startProviderLogin(requestID: String, provider: String)
     case getProfile(requestID: String)
@@ -676,11 +681,12 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(provider, forKey: "provider")
             try container.encode(baseURL, forKey: "baseUrl")
             try container.encode(apiKey, forKey: "apiKey")
-        case .registerProvider(let requestID, let config, let modelIds):
+        case .registerProvider(let requestID, let config, let modelIds, let reasoningEfforts):
             try container.encode("register_provider", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(config, forKey: "config")
             try container.encode(modelIds, forKey: "modelIds")
+            try container.encode(reasoningEfforts, forKey: "reasoningEfforts")
         case .createPairingCode(let requestID):
             try container.encode("create_pairing_code", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -1341,6 +1347,7 @@ struct FrontendActionListAction: Identifiable, Sendable {
 
 enum FrontendSlot: String, Decodable, Equatable, Sendable {
     case header
+    case transcriptTail = "transcript_tail"
     case composerHeader = "composer_header"
     case composerFooter = "composer_footer"
     case messageActions = "message_actions"
@@ -2024,6 +2031,7 @@ struct ProviderStatus: Identifiable, Codable, Equatable, Sendable {
     let defaultApiKeyEnv: String?
     let models: [ProviderModel]
     let modelIds: [String]
+    let reasoningEfforts: [String]
     let modelIdsConfigurable: Bool
     let webSearch: [HostedWebSearch]
 }

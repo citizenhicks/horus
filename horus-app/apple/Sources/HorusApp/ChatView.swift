@@ -263,6 +263,10 @@ private struct TranscriptView: View {
                         .id(row.entry.id)
                         .padding(.top, row.topSpacing)
                 }
+                ForEach(model.transcriptTailWidgets) { widget in
+                    QueuedMessageView(widget: widget)
+                        .padding(.top, rowSpacing)
+                }
                 Color.clear.frame(height: max(1, bottomInset))
             }
             .scrollTargetLayout()
@@ -345,163 +349,26 @@ private struct TranscriptView: View {
     }
 
     private var emptyState: some View {
-        AgentCard()
+        HorusComposingOrb()
+            .frame(width: 144, height: 144)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(.horizontal, 24)
             .padding(.bottom, bottomInset)
+            .accessibilityHidden(true)
     }
 }
 
 private struct TranscriptLoadingView: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.scenePhase) private var scenePhase
     let bottomInset: CGFloat
 
     var body: some View {
         ZStack {
             HorusBackdrop()
-            TimelineView(.animation(
-                minimumInterval: 1.0 / 30.0,
-                paused: reduceMotion || scenePhase != .active
-            )) { _ in
-                let seconds = ProcessInfo.processInfo.systemUptime
-                HorusComposingOrb(
-                    time: reduceMotion ? 0.6 : seconds * HorusComposingOrbRenderer.speed
-                )
-                    .frame(width: 112, height: 112)
-            }
-            .offset(y: -bottomInset / 2)
+            HorusComposingOrb()
+                .frame(width: 112, height: 112)
+                .offset(y: -bottomInset / 2)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Loading conversation")
-    }
-}
-
-private struct AgentCard: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.horusPalette) private var palette
-
-    var body: some View {
-        if let config = model.agentSnapshot?.config ?? model.defaultAgentSnapshot?.config {
-            HorusCard {
-                VStack(spacing: 16) {
-                    VStack(spacing: 10) {
-                        if let provider = selectedProvider(config) {
-                            HorusIcon(
-                                HorusSymbol.glyph(for: provider.symbol),
-                                size: 20,
-                                foreground: palette.accent
-                            )
-                                .frame(width: 40, height: 40)
-                                .background(palette.accentSoft.opacity(0.65), in: Circle())
-                        }
-                        VStack(spacing: 3) {
-                            Text(model.modelLabel(
-                                provider: config.provider.provider,
-                                modelID: config.provider.model
-                            ))
-                                .font(.headline)
-                            Text(modelDetail(config))
-                                .font(HorusStyle.bodyFont)
-                                .foregroundStyle(palette.muted)
-                        }
-                        .multilineTextAlignment(.center)
-                    }
-
-                    // ponytail: a plain row, not a grid. An adaptive grid pins its columns to the
-                    // card's full width, which reads as left-aligned for two or three metrics.
-                    HStack(alignment: .top, spacing: 20) {
-                        AgentCardMetric(label: "Tools", value: model.toolCount)
-                        ForEach(model.middlewareContributionCounts) { contribution in
-                            AgentCardMetric(label: contribution.label, value: contribution.value)
-                        }
-                    }
-                    .scrollableRow()
-
-                    VStack(spacing: 10) {
-                        AgentCardDetail(label: "Providers", value: configuredProviders)
-                        AgentCardDetail(label: "Capabilities", value: activeMiddleware(config))
-                    }
-                }
-                .frame(maxWidth: .infinity)
-            }
-            .frame(maxWidth: 580)
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel("Current agent configuration")
-        }
-    }
-
-    private var configuredProviders: String {
-        let labels = model.providerStatuses.filter(\.configured).map(\.label)
-        return labels.isEmpty ? "None configured" : labels.joined(separator: ", ")
-    }
-
-    private func selectedProvider(_ config: AgentComposition) -> ProviderStatus? {
-        model.providerStatuses.first { $0.provider == config.provider.provider }
-    }
-
-    private func modelDetail(_ config: AgentComposition) -> String {
-        let provider = model.providerStatuses.first { $0.provider == config.provider.provider }
-        let providerLabel = provider?.label ?? config.provider.provider
-        guard let reasoning = config.provider.reasoningEffort else {
-            return "\(providerLabel) · Provider-default reasoning"
-        }
-        let reasoningLabel = provider?.models
-            .first { $0.id == config.provider.model }?
-            .reasoning.first { $0.id == reasoning }?
-            .label ?? reasoning.capitalized
-        return "\(providerLabel) · \(reasoningLabel) reasoning"
-    }
-
-    private func activeMiddleware(_ config: AgentComposition) -> String {
-        let labels = model.middlewareFeatures.compactMap { feature in
-            (feature.required || config.middleware.enabled.contains(feature.id))
-                ? feature.label
-                : nil
-        }
-        return labels.isEmpty ? "Core only" : labels.joined(separator: ", ")
-    }
-
-}
-
-private struct AgentCardMetric: View {
-    @Environment(\.horusPalette) private var palette
-    let label: String
-    let value: Int
-
-    var body: some View {
-        VStack(spacing: 2) {
-            Text(value.formatted())
-                .font(.title3.weight(.semibold).monospacedDigit())
-            Text(label)
-                .font(HorusStyle.metadataFont)
-                .foregroundStyle(palette.muted)
-                .lineLimit(1)
-        }
-        .frame(minWidth: 88)
-        .padding(10)
-        .background(palette.raised.opacity(0.55), in: HorusStyle.controlShape)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(label): \(value)")
-    }
-}
-
-private struct AgentCardDetail: View {
-    @Environment(\.horusPalette) private var palette
-    let label: String
-    let value: String
-
-    var body: some View {
-        VStack(spacing: 2) {
-            Text(label)
-                .font(HorusStyle.metadataFont)
-                .foregroundStyle(palette.muted)
-            Text(value)
-                .font(HorusStyle.bodyFont)
-                .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity)
-        .accessibilityElement(children: .combine)
     }
 }
 
@@ -658,6 +525,65 @@ private struct UserMessageContent: View {
             }
         }
     }
+}
+
+private struct QueuedMessageView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+    let widget: MountedWidget
+
+    var body: some View {
+        HStack {
+            Spacer(minLength: 42)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(header)
+                    .font(HorusStyle.metadataFont.weight(.semibold))
+                    .foregroundStyle(palette.muted)
+                Text(widget.widget.text)
+                    .font(HorusStyle.bodyFont)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(palette.accentSoft.opacity(0.24), in: HorusStyle.cardShape)
+            .overlay {
+                HorusStyle.cardShape.stroke(
+                    palette.accent.opacity(0.42),
+                    style: StrokeStyle(lineWidth: 1.25, lineCap: .round, dash: [1, 4])
+                )
+            }
+            .contentShape(HorusStyle.cardShape)
+            .contextMenu {
+                if editAction != nil {
+                    Button("Edit", glyph: .pencilSimple) {
+                        model.editWidgetInputInComposer(widget)
+                    }
+                }
+                Button("Copy", glyph: .copy) { copyToPasteboard(widget.widget.text) }
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(header): \(widget.widget.text)")
+        .accessibilityValue(editAction == nil ? "Queued" : "Queued, editable until sent")
+        .accessibilityActions {
+            if editAction != nil {
+                Button("Edit queued message") { model.editWidgetInputInComposer(widget) }
+            }
+            Button("Copy queued message") { copyToPasteboard(widget.widget.text) }
+        }
+    }
+
+    private var header: String {
+        let label = model.middlewareFeatures.first { $0.id == widget.capability }?.label
+            ?? widget.capability.replacingOccurrences(of: "_", with: " ").capitalized
+        return "\(label) message"
+    }
+
+    private var editAction: AgentOperation? {
+        guard let action = widget.widget.action, action.capabilityInput != nil else { return nil }
+        return action
+    }
+
 }
 
 private struct AttachmentRecordLabel: View {
@@ -966,6 +892,7 @@ private struct ComposerSurface: View {
     @State private var dictation = ComposerDictation()
     #endif
     @State private var selection: TextSelection?
+    @FocusState private var isComposerFocused: Bool
     @State private var referenceSuggestions: ReferenceSuggestions?
 
     var body: some View {
@@ -977,12 +904,13 @@ private struct ComposerSurface: View {
                     .padding(.top, 10)
             }
             TextField(
-                "Ask Horus to inspect, explain, or change something…",
+                "You can just do things",
                 text: $model.composer,
                 selection: $selection,
                 axis: .vertical
             )
             .textFieldStyle(.plain)
+            .focused($isComposerFocused)
             .lineLimit(1...8)
             .scrollDismissesKeyboard(.interactively)
             .font(HorusStyle.bodyFont)
@@ -1042,6 +970,9 @@ private struct ComposerSurface: View {
             let result = await searchTask.value
             guard !Task.isCancelled else { return }
             referenceSuggestions = result
+        }
+        .onChange(of: model.composerFocusRequest) { _, _ in
+            isComposerFocused = true
         }
         #if os(iOS)
         .onChange(of: scenePhase) { _, phase in

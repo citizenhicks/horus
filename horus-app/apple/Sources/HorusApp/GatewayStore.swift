@@ -97,6 +97,33 @@ struct CachedTranscript: Codable, Sendable {
     }
 }
 
+struct ComposerEditRecovery: Codable, Equatable, Sendable {
+    enum Phase: String, Codable, Sendable {
+        case removingQueuedInput
+        case editing
+        case submitting
+        case completed
+    }
+
+    let capability: String
+    let widgetID: String
+    let originalInput: String
+    let displacedDraft: String
+    var editedInput: String
+    var requestID: String
+    var submissionBaselineSequence: UInt64?
+    var phase: Phase
+
+    fileprivate var fitsRecoveryBounds: Bool {
+        capability.utf8.count <= 256
+            && widgetID.utf8.count <= 1_024
+            && requestID.utf8.count <= 1_024
+            && originalInput.utf8.count <= maximumComposerBytes
+            && displacedDraft.utf8.count <= maximumComposerBytes
+            && editedInput.utf8.count <= maximumComposerBytes
+    }
+}
+
 private actor GatewayDiskStore {
     private let maximumCachedTranscriptsPerAccount = 20
     private let maximumCachedTranscriptBytes = 4 * 1024 * 1024
@@ -194,6 +221,51 @@ private actor GatewayDiskStore {
         try? data.write(to: url, options: protectedWriteOptions)
     }
 
+    func loadComposerEditRecovery(
+        accountID: UUID,
+        sessionID: String
+    ) -> ComposerEditRecovery? {
+        let url = editRecoveryURL(accountID: accountID, sessionID: sessionID)
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attributes[.size] as? NSNumber)?.intValue
+        else { return nil }
+        guard size <= maximumComposerBytes * 3 + 16_384,
+              let data = try? Data(contentsOf: url),
+              let recovery = try? decoder.decode(ComposerEditRecovery.self, from: data),
+              recovery.fitsRecoveryBounds
+        else {
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        return recovery.phase == .completed ? nil : recovery
+    }
+
+    func saveComposerEditRecovery(
+        _ recovery: ComposerEditRecovery,
+        accountID: UUID,
+        sessionID: String
+    ) throws {
+        guard recovery.fitsRecoveryBounds else { throw GatewayStore.StoreError.invalidEditRecovery }
+        let data = try encoder.encode(recovery)
+        guard data.count <= maximumComposerBytes * 3 + 16_384 else {
+            throw GatewayStore.StoreError.invalidEditRecovery
+        }
+        try FileManager.default.createDirectory(
+            at: accountDraftDirectory(accountID),
+            withIntermediateDirectories: true
+        )
+        try data.write(
+            to: editRecoveryURL(accountID: accountID, sessionID: sessionID),
+            options: protectedWriteOptions
+        )
+    }
+
+    func removeComposerEditRecovery(accountID: UUID, sessionID: String) throws {
+        let url = editRecoveryURL(accountID: accountID, sessionID: sessionID)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try FileManager.default.removeItem(at: url)
+    }
+
     func removeAccount(_ accountID: UUID) {
         try? FileManager.default.removeItem(at: accountTranscriptDirectory(accountID))
         try? FileManager.default.removeItem(at: accountDraftDirectory(accountID))
@@ -225,6 +297,12 @@ private actor GatewayDiskStore {
         accountDraftDirectory(accountID)
             .appendingPathComponent(filename(for: sessionID))
             .appendingPathExtension("txt")
+    }
+
+    private func editRecoveryURL(accountID: UUID, sessionID: String) -> URL {
+        accountDraftDirectory(accountID)
+            .appendingPathComponent(filename(for: sessionID))
+            .appendingPathExtension("edit.json")
     }
 
     private func filename(for sessionID: String) -> String {
@@ -413,6 +491,32 @@ final class GatewayStore {
         )
     }
 
+    func loadComposerEditRecovery(
+        accountID: UUID,
+        sessionID: String
+    ) async -> ComposerEditRecovery? {
+        await diskStore.loadComposerEditRecovery(accountID: accountID, sessionID: sessionID)
+    }
+
+    func saveComposerEditRecovery(
+        _ recovery: ComposerEditRecovery,
+        accountID: UUID,
+        sessionID: String
+    ) async throws {
+        try await diskStore.saveComposerEditRecovery(
+            recovery,
+            accountID: accountID,
+            sessionID: sessionID
+        )
+    }
+
+    func removeComposerEditRecovery(accountID: UUID, sessionID: String) async throws {
+        try await diskStore.removeComposerEditRecovery(
+            accountID: accountID,
+            sessionID: sessionID
+        )
+    }
+
     private func saveToken(_ token: String, accountID: UUID) throws {
         guard let data = token.data(using: .utf8) else { throw StoreError.invalidToken }
         let query: [CFString: Any] = [
@@ -442,6 +546,7 @@ extension GatewayStore {
         case invalidDisplayName
         case missingAccount
         case invalidToken
+        case invalidEditRecovery
         case missingToken
         case keychain(OSStatus)
 
@@ -450,6 +555,7 @@ extension GatewayStore {
             case .invalidDisplayName: "Use a gateway name between 1 and 128 characters."
             case .missingAccount: "This gateway is no longer saved."
             case .invalidToken: "The gateway token is invalid."
+            case .invalidEditRecovery: "The queued message edit is too large to save safely."
             case .missingToken: "This gateway needs to be paired again."
             case .keychain(let status):
                 SecCopyErrorMessageString(status, nil) as String?

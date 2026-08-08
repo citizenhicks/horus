@@ -458,6 +458,34 @@ fn capability_header_is_live_styled_and_transparent() {
 }
 
 #[test]
+fn transcript_tail_widget_renders_after_live_output() {
+    let mut state = state();
+    state.transcript.clear();
+    state.streaming = "working".into();
+    state.widgets.insert(
+        ("editable".into(), "latest".into()),
+        FrontendWidget {
+            id: "latest".into(),
+            slot: FrontendSlot::TranscriptTail,
+            text: "queued first line\nqueued second line".into(),
+            tone: FrontendTone::Neutral,
+            symbol: None,
+            icon_only: false,
+            progress: None,
+            content: None,
+            action: None,
+        },
+    );
+
+    let lines = view::live_transcript_lines(&mut state, 0, 80);
+
+    assert_eq!(
+        rendered_text(&lines),
+        "◉ working\n\n┊ Editable message\n┊ queued first line\n┊ queued second line"
+    );
+}
+
+#[test]
 fn sora_transcript_stays_styled_and_transparent_in_chat_and_preview() {
     let catalog = default_catalog();
     let mut state = state();

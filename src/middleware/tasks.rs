@@ -309,6 +309,7 @@ mod tests {
             model_route: "default".into(),
             session_context: SessionContext::default(),
             metadata: BTreeMap::new(),
+            queued_input: crate::middleware::QueuedInputSnapshot::default(),
             frontend: Arc::new(move |event| {
                 events.lock().expect("frontend events").push(event);
                 Ok(())

@@ -7,39 +7,50 @@ import SwiftUI
 /// geometry and timing stay here with the Apple drawing primitive; the MIT notice is in NOTICE.
 struct HorusComposingOrb: View {
     @Environment(\.colorScheme) private var colorScheme
-    let time: Double
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        Canvas { context, size in
-            let sourceSize = CGFloat(HorusComposingOrbRenderer.size)
-            let scale = min(size.width, size.height) / sourceSize
-            context.translateBy(
-                x: (size.width - sourceSize * scale) / 2,
-                y: (size.height - sourceSize * scale) / 2
-            )
-            context.scaleBy(x: scale, y: scale)
+        TimelineView(.animation(
+            minimumInterval: 1.0 / 30.0,
+            paused: reduceMotion || scenePhase != .active
+        )) { _ in
+            let seconds = ProcessInfo.processInfo.systemUptime
+            let time = reduceMotion || scenePhase != .active
+                ? 0.6
+                : seconds * HorusComposingOrbRenderer.speed
+            Canvas(rendersAsynchronously: true) { [colorScheme, time] context, size in
+                let sourceSize = CGFloat(HorusComposingOrbRenderer.size)
+                let scale = min(size.width, size.height) / sourceSize
+                context.translateBy(
+                    x: (size.width - sourceSize * scale) / 2,
+                    y: (size.height - sourceSize * scale) / 2
+                )
+                context.scaleBy(x: scale, y: scale)
 
-            for dot in HorusComposingOrbRenderer.dots(at: time) {
-                let white = min(1, max(0, dot.white))
-                let ink = colorScheme == .dark ? 1 - white : white
-                let radius = max(0.3, dot.radius)
-                let rect = CGRect(
-                    x: dot.x - radius,
-                    y: dot.y - radius,
-                    width: radius * 2,
-                    height: radius * 2
-                )
-                context.fill(
-                    Path(ellipseIn: rect),
-                    with: .color(
-                        Color(red: ink, green: ink, blue: ink)
-                            .opacity(dot.opacity)
+                for dot in HorusComposingOrbRenderer.dots(at: time) {
+                    let white = min(1, max(0, dot.white))
+                    let ink = colorScheme == .dark ? 1 - white : white
+                    let radius = max(0.3, dot.radius)
+                    let rect = CGRect(
+                        x: dot.x - radius,
+                        y: dot.y - radius,
+                        width: radius * 2,
+                        height: radius * 2
                     )
-                )
+                    context.fill(
+                        Path(ellipseIn: rect),
+                        with: .color(
+                            Color(red: ink, green: ink, blue: ink)
+                                .opacity(dot.opacity)
+                        )
+                    )
+                }
             }
         }
     }
 }
+
 enum HorusComposingOrbRenderer {
     struct Dot: Equatable {
         let x: Double

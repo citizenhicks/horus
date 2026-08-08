@@ -11,13 +11,17 @@ use crate::Error;
 use crate::Result;
 use crate::backend::model::ToolCall;
 use crate::backend::sandbox::NetworkAccess;
+use crate::protocol::MAX_CAPABILITY_INPUT_BYTES;
 use crate::protocol::MessageTarget;
 use crate::protocol::SessionContext;
 use crate::protocol::TokenUsage;
 
 pub mod sqlite;
 
-pub(crate) const CHECKPOINT_VERSION: u32 = 4;
+pub(crate) const CHECKPOINT_VERSION: u32 = 5;
+pub(crate) const MAX_QUEUED_INPUTS: usize = 1_024;
+const MAX_QUEUED_OWNER_BYTES: usize = 256;
+const MAX_QUEUED_ID_BYTES: usize = 4 * 1024;
 
 /// Mutable counters for the user turn currently running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +118,70 @@ pub struct PendingApproval {
     pub decision_received: bool,
 }
 
+/// One active-turn message waiting for its next model boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedInput {
+    owner: String,
+    id: String,
+    text: String,
+}
+
+impl QueuedInput {
+    pub(crate) fn new(owner: &str, id: &str, text: &str) -> Result<Self> {
+        validate_queued_input(owner, id, text).map_err(|message| Error::Config(message.into()))?;
+        Ok(Self {
+            owner: owner.into(),
+            id: id.into(),
+            text: text.into(),
+        })
+    }
+
+    pub(crate) fn validate(&self) -> std::result::Result<(), &'static str> {
+        validate_queued_input(&self.owner, &self.id, &self.text)
+    }
+
+    pub(crate) fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// Returns the submission that owns this queued input.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the exact queued text.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn into_text(self) -> String {
+        self.text
+    }
+
+    pub(crate) fn into_id_and_text(self) -> (String, String) {
+        (self.id, self.text)
+    }
+}
+
+fn validate_queued_input(
+    owner: &str,
+    id: &str,
+    text: &str,
+) -> std::result::Result<(), &'static str> {
+    if owner.trim().is_empty() || owner.len() > MAX_QUEUED_OWNER_BYTES {
+        return Err("queued input owner is invalid");
+    }
+    if id.trim().is_empty() || id.len() > MAX_QUEUED_ID_BYTES {
+        return Err("queued input ID is invalid");
+    }
+    if text.trim().is_empty() || text.len() > MAX_CAPABILITY_INPUT_BYTES {
+        return Err("queued input text is invalid");
+    }
+    Ok(())
+}
+
 /// Versioned state persisted at each durable loop boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -128,7 +196,7 @@ pub struct Checkpoint {
     pub context: Vec<Value>,
     pub total_usage: TokenUsage,
     pub last_usage: Option<TokenUsage>,
-    pub pending_input: Vec<String>,
+    pub pending_input: Vec<QueuedInput>,
     pub active_execution: Option<ActiveExecution>,
     pub execution_stats: ExecutionStats,
     pub pending_tools: Vec<ToolCall>,

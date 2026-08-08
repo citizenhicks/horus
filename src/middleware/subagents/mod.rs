@@ -1126,6 +1126,7 @@ mod tests {
             model_route: "test".into(),
             session_context: parent.session_context.clone(),
             metadata: parent.metadata.clone(),
+            queued_input: crate::middleware::QueuedInputSnapshot::default(),
             frontend: Arc::new(|_| Ok(())),
         };
         let scope = AgentScope::new(&runtime, launcher).expect("agent scope");

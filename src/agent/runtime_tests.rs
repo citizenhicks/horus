@@ -2,6 +2,9 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use super::AgentConfig;
 use super::AgentSender;
@@ -15,6 +18,8 @@ use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::checkpoint::ExecutionOutcome;
 use crate::backend::checkpoint::ExecutionPageRequest;
+use crate::backend::checkpoint::QueuedInput;
+use crate::backend::checkpoint::TranscriptPageRequest;
 use crate::backend::checkpoint::sqlite::SqliteCheckpoint;
 use crate::backend::model::Model;
 use crate::backend::model::ModelEventSink;
@@ -24,13 +29,17 @@ use crate::backend::model::ModelRouter;
 use crate::backend::model::TOOL_ERROR_FIELD;
 use crate::backend::model::ToolCall;
 use crate::backend::model::ToolDefinition;
+use crate::backend::model::user_message;
 use crate::backend::sandbox::ApprovalPolicy;
 use crate::backend::sandbox::Sandbox;
 use crate::backend::sandbox::local::LocalSandbox;
+use crate::middleware::ActiveSubmissionContext;
+use crate::middleware::ActiveSubmissionResult;
 use crate::middleware::Middleware;
 use crate::middleware::MiddlewareStack;
 use crate::middleware::ModelContext;
 use crate::middleware::RuntimeContext;
+use crate::middleware::steering::Steering;
 use crate::middleware::tools::ApprovalRequirement;
 use crate::middleware::tools::Catalog;
 use crate::middleware::tools::Tool;
@@ -39,6 +48,9 @@ use crate::middleware::tools::Tools;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::FrontendEvent;
+use crate::protocol::FrontendSlot;
+use crate::protocol::FrontendTone;
+use crate::protocol::FrontendWidget;
 use crate::protocol::MAX_USER_INPUT_BYTES;
 use crate::protocol::Op;
 use crate::protocol::SessionContext;
@@ -47,6 +59,7 @@ use crate::protocol::ToolCallEndEvent;
 use crate::protocol::WarningEvent;
 use crate::protocol::internal_message_kind;
 use serde_json::Value;
+use tokio::sync::Notify;
 
 struct TestModel;
 
@@ -65,6 +78,142 @@ struct FailingBeforeModel;
 struct ApprovalRequiredTestTool;
 
 struct SaturatingMiddleware;
+
+struct QueueingMiddleware;
+
+struct BlockingBeforeModelMiddleware {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    blocked: AtomicBool,
+}
+
+struct BlockingTailMiddleware {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    blocked: AtomicBool,
+}
+
+struct BlockingModel {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    calls: AtomicUsize,
+}
+
+const QUEUE_OPERATION: &str = "queue";
+const QUEUE_OPERATIONS: &[&str] = &[QUEUE_OPERATION];
+
+fn accept_queued_input(
+    context: &mut ActiveSubmissionContext<'_>,
+) -> Result<ActiveSubmissionResult> {
+    if !context
+        .queued_input
+        .enqueue(context.submission_id, context.text)?
+    {
+        return Ok(ActiveSubmissionResult::Rejected(
+            "active input could not be queued".into(),
+        ));
+    }
+    context
+        .events
+        .push(EventMsg::Frontend(FrontendEvent::Widget {
+            capability: "queueing".into(),
+            item: FrontendWidget {
+                id: "queued".into(),
+                slot: FrontendSlot::TranscriptTail,
+                text: context.text.into(),
+                tone: FrontendTone::Neutral,
+                symbol: None,
+                icon_only: false,
+                progress: None,
+                content: None,
+                action: None,
+            },
+        }));
+    Ok(ActiveSubmissionResult::Accepted)
+}
+
+fn consume_queued_input(context: &mut ModelContext<'_>) {
+    let queued = context.queued_input.drain();
+    if !queued.is_empty() {
+        context
+            .events
+            .push(EventMsg::Frontend(FrontendEvent::RemoveWidget {
+                capability: "queueing".into(),
+                id: "queued".into(),
+            }));
+    }
+    for item in queued {
+        context.push_input(crate::backend::model::user_message(item.text()));
+    }
+}
+
+impl Middleware for QueueingMiddleware {
+    fn name(&self) -> &'static str {
+        "queueing"
+    }
+
+    fn active_operations(&self) -> &'static [&'static str] {
+        QUEUE_OPERATIONS
+    }
+
+    fn active_submission(
+        &self,
+        context: &mut ActiveSubmissionContext<'_>,
+    ) -> Result<ActiveSubmissionResult> {
+        accept_queued_input(context)
+    }
+
+    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            consume_queued_input(context);
+            Ok(())
+        })
+    }
+}
+
+impl Middleware for BlockingBeforeModelMiddleware {
+    fn name(&self) -> &'static str {
+        "queueing"
+    }
+
+    fn active_operations(&self) -> &'static [&'static str] {
+        QUEUE_OPERATIONS
+    }
+
+    fn active_submission(
+        &self,
+        context: &mut ActiveSubmissionContext<'_>,
+    ) -> Result<ActiveSubmissionResult> {
+        accept_queued_input(context)
+    }
+
+    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if !self.blocked.swap(true, Ordering::SeqCst) {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            consume_queued_input(context);
+            Ok(())
+        })
+    }
+}
+
+impl Middleware for BlockingTailMiddleware {
+    fn name(&self) -> &'static str {
+        "blocking_tail"
+    }
+
+    fn before_model<'a>(&'a self, _context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if !self.blocked.swap(true, Ordering::SeqCst) {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        })
+    }
+}
 
 impl Middleware for SaturatingMiddleware {
     fn name(&self) -> &'static str {
@@ -217,6 +366,302 @@ fn event_queue_saturation_returns_an_error_without_reordering_queued_events() {
     );
 }
 
+#[tokio::test]
+async fn active_input_is_durable_before_a_blocked_model_completes() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let model = Arc::new(BlockingModel {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        calls: AtomicUsize::new(0),
+    });
+    let mut agent = create_agent(
+        AgentConfig::new(
+            Arc::new(ModelRouter::new("blocking", model)),
+            Arc::new(Sandbox::new(
+                Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+                ApprovalPolicy::Ask,
+            )),
+            checkpoint_store,
+            MiddlewareStack::new(vec![Arc::new(QueueingMiddleware)]).expect("middleware"),
+            "test prompt",
+        )
+        .session_id("blocked-model"),
+    )
+    .await
+    .expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "start".into(),
+            attachments: Vec::new(),
+        })
+        .expect("start turn");
+    let turn_id = loop {
+        let event = agent.next_event().await.expect("turn event");
+        if let EventMsg::TurnStarted(started) = event.msg {
+            break started.turn_id;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .expect("model started");
+
+    let queued_submission = agent
+        .sender()
+        .submit(Op::ActiveInput {
+            operation: QUEUE_OPERATION.into(),
+            turn_id,
+            text: "persist me".into(),
+        })
+        .expect("queue active input");
+    loop {
+        let event = agent.next_event().await.expect("queue event");
+        if event.submission_id.as_deref() == Some(queued_submission.as_str()) {
+            break;
+        }
+    }
+    let saved = checkpoints
+        .load("blocked-model")
+        .await
+        .expect("load checkpoint")
+        .expect("saved checkpoint");
+    release.notify_one();
+
+    assert!(saved.pending_input.iter().any(|item| {
+        item.owner() == "queueing" && item.id() == queued_submission && item.text() == "persist me"
+    }));
+}
+
+#[tokio::test]
+async fn active_input_is_durable_while_before_model_is_blocked() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let middleware = BlockingBeforeModelMiddleware {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        blocked: AtomicBool::new(false),
+    };
+    let mut agent = create_agent(
+        AgentConfig::new(
+            Arc::new(ModelRouter::new("test", Arc::new(TestModel))),
+            Arc::new(Sandbox::new(
+                Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+                ApprovalPolicy::Ask,
+            )),
+            checkpoint_store,
+            MiddlewareStack::new(vec![Arc::new(middleware)]).expect("middleware"),
+            "test prompt",
+        )
+        .session_id("blocked-before-model"),
+    )
+    .await
+    .expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "start".into(),
+            attachments: Vec::new(),
+        })
+        .expect("start turn");
+    let turn_id = loop {
+        let event = agent.next_event().await.expect("turn event");
+        if let EventMsg::TurnStarted(started) = event.msg {
+            break started.turn_id;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .expect("before-model hook started");
+
+    let queued_submission = agent
+        .sender()
+        .submit(Op::ActiveInput {
+            operation: QUEUE_OPERATION.into(),
+            turn_id,
+            text: "survive the hook".into(),
+        })
+        .expect("queue active input");
+    let saved = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let saved = checkpoints
+                .load("blocked-before-model")
+                .await
+                .expect("load checkpoint")
+                .expect("saved checkpoint");
+            if saved
+                .pending_input
+                .iter()
+                .any(|item| item.id() == queued_submission)
+            {
+                break saved;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("active input persisted while hook was blocked");
+    release.notify_one();
+    loop {
+        let event = agent.next_event().await.expect("queue event");
+        if event.submission_id.as_deref() == Some(queued_submission.as_str()) {
+            break;
+        }
+    }
+
+    assert!(saved.pending_input.iter().any(|item| {
+        item.owner() == "queueing"
+            && item.id() == queued_submission
+            && item.text() == "survive the hook"
+    }));
+}
+
+#[tokio::test]
+async fn before_model_events_and_targets_precede_active_changes_during_the_hook() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let mut checkpoint = Checkpoint::empty("ordered-hook-events");
+    checkpoint
+        .pending_input
+        .push(QueuedInput::new("steering", "old", "old input").expect("queued input"));
+    checkpoints
+        .save(&checkpoint, &checkpoint.context, None)
+        .await
+        .expect("seed checkpoint");
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let middleware = MiddlewareStack::new(vec![
+        Arc::new(Steering::default()),
+        Arc::new(BlockingTailMiddleware {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            blocked: AtomicBool::new(false),
+        }),
+    ])
+    .expect("middleware");
+    let mut agent = create_agent(
+        AgentConfig::new(
+            Arc::new(ModelRouter::new("test", Arc::new(TestModel))),
+            Arc::new(Sandbox::new(
+                Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+                ApprovalPolicy::Ask,
+            )),
+            checkpoints.clone(),
+            middleware,
+            "test prompt",
+        )
+        .session_id("ordered-hook-events"),
+    )
+    .await
+    .expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "start".into(),
+            attachments: Vec::new(),
+        })
+        .expect("start turn");
+    let turn_id = loop {
+        let event = agent.next_event().await.expect("turn event");
+        if let EventMsg::TurnStarted(started) = event.msg {
+            break started.turn_id;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .expect("tail hook started");
+
+    let queued_submission = agent
+        .sender()
+        .submit(Op::ActiveInput {
+            operation: "steer".into(),
+            turn_id,
+            text: "new input".into(),
+        })
+        .expect("queue active input");
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let saved = checkpoints
+                .load("ordered-hook-events")
+                .await
+                .expect("load checkpoint")
+                .expect("saved checkpoint");
+            if saved
+                .pending_input
+                .iter()
+                .any(|item| item.id() == queued_submission)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("new input persisted");
+    release.notify_one();
+
+    let (order, live_target) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let mut order = Vec::new();
+        let mut live_target = None;
+        while order.len() < 2 || live_target.is_none() {
+            let event = agent.next_event().await.expect("frontend event");
+            match event.msg {
+                EventMsg::Frontend(FrontendEvent::RemoveWidget { capability, id })
+                    if capability == "steering" && id == "queued" =>
+                {
+                    order.push("remove")
+                }
+                EventMsg::Frontend(FrontendEvent::Widget { capability, item })
+                    if capability == "steering"
+                        && item.id == "queued"
+                        && event.submission_id.as_deref() == Some(&queued_submission) =>
+                {
+                    order.push("widget")
+                }
+                EventMsg::UserMessage(message) if message.message == "old input" => {
+                    live_target = message.message_target;
+                }
+                _ => {}
+            }
+        }
+        (order, live_target.expect("live message target"))
+    })
+    .await
+    .expect("ordered frontend events");
+    let replay_target = checkpoints
+        .transcript_page(
+            "ordered-hook-events",
+            TranscriptPageRequest {
+                before_sequence: None,
+                max_batches: 100,
+            },
+        )
+        .await
+        .expect("load transcript")
+        .into_positioned_items_chronological()
+        .into_iter()
+        .find_map(|(target, item)| (item == user_message("old input")).then_some(target))
+        .expect("replayed message target");
+
+    assert_eq!(order, ["remove", "widget"]);
+    assert_eq!(live_target, replay_target);
+}
+
 impl Model for TestModel {
     fn respond<'a>(
         &'a self,
@@ -248,6 +693,23 @@ impl Model for ScriptedModel {
             .pop_front()
             .ok_or_else(|| Error::Provider("scripted output exhausted".into()));
         Box::pin(async move { output })
+    }
+}
+
+impl Model for BlockingModel {
+    fn respond<'a>(
+        &'a self,
+        _request: ModelRequest,
+        _events: ModelEventSink,
+    ) -> BoxFuture<'a, Result<ModelOutput>> {
+        let should_wait = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        Box::pin(async move {
+            if should_wait {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            Ok(scripted_message("done"))
+        })
     }
 }
 
@@ -1202,7 +1664,9 @@ async fn restart_closes_uncertain_tool_calls_without_replaying_them() {
         "arguments": call.arguments.to_string()
     }));
     target.pending_tools.push(call);
-    target.pending_input.push("steer after restart".into());
+    target
+        .pending_input
+        .push(QueuedInput::new("editable", "message-1", "queued after restart").expect("queue"));
     checkpoints
         .save(&target, &target.context, None)
         .await
@@ -1237,7 +1701,7 @@ async fn restart_closes_uncertain_tool_calls_without_replaying_them() {
             && turn_id == &begin.turn_id
             && call_id == &begin.call_id
             && output == "execution interrupted; result unknown after restart"
-            && user.message == "steer after restart"
+            && user.message == "queued after restart"
     ));
 
     let recovered = checkpoints

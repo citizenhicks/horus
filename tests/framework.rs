@@ -558,7 +558,7 @@ async fn steering_is_injected_before_native_compaction() {
     assert_eq!(
         steered_target,
         Some(MessageTarget {
-            checkpoint_sequence: 3,
+            checkpoint_sequence: 4,
             batch_item_count: 1,
         })
     );

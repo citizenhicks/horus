@@ -107,6 +107,7 @@ final class AppModelTests: XCTestCase {
             defaultApiKeyEnv: "OPENAI_API_KEY",
             models: models,
             modelIds: [],
+            reasoningEfforts: [],
             modelIdsConfigurable: false,
             webSearch: [config.webSearch]
         )
@@ -135,6 +136,65 @@ final class AppModelTests: XCTestCase {
             references: [],
             activeInput: nil
         )
+    }
+
+    private func editableWidget(
+        input: String = "Original input",
+        capability: String = "notes",
+        id: String = "queued"
+    ) -> MountedWidget {
+        MountedWidget(
+            capability: capability,
+            widget: FrontendWidget(
+                id: id,
+                slot: .transcriptTail,
+                text: input,
+                tone: "neutral",
+                symbol: nil,
+                iconOnly: false,
+                progress: nil,
+                content: nil,
+                action: .capabilityCommand(
+                    capability: capability,
+                    command: "edit",
+                    arguments: "item-1",
+                    input: input,
+                    target: nil
+                )
+            )
+        )
+    }
+
+    @discardableResult
+    private func beginComposerEdit(
+        in model: AppModel,
+        recorder: GatewayRequestRecorder,
+        account: GatewayAccount,
+        sessionID: String = "chat-1"
+    ) async throws -> Submission {
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+        model.selectedSessionID = sessionID
+        model.composer = "Displaced draft"
+        model.editWidgetInputInComposer(editableWidget())
+        try await Task.sleep(for: .milliseconds(30))
+        let submissions = await recorder.requests().compactMap { request -> Submission? in
+            guard case .submit(_, let submission) = request else { return nil }
+            return submission
+        }
+        let submission = try XCTUnwrap(submissions.last)
+        model.reduce(
+            event: AgentEventRecord(submissionId: submission.id, msg: .object([
+                "type": .string("frontend"),
+                "frontendType": .string("remove_widget"),
+                "capability": .string("notes"),
+                "id": .string("queued")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        return submission
     }
 
     private func sessionReady(
@@ -454,6 +514,7 @@ final class AppModelTests: XCTestCase {
         let model = try model(requestSender: { request in
             await recorder.record(request)
         })
+        model.connectionState = .ready
         model.selectedSessionID = "chat-1"
         model.activeTurnID = "turn-1"
         model.activeOperation = "steer"
@@ -469,9 +530,26 @@ final class AppModelTests: XCTestCase {
         model.reduce(
             event: AgentEventRecord(submissionId: first.id, msg: .object([
                 "type": .string("frontend"),
-                "frontendType": .string("remove_widget"),
+                "frontendType": .string("widget"),
                 "capability": .string("steering"),
-                "id": .string("queued")
+                "item": .object([
+                    "id": .string("queued"),
+                    "slot": .string("transcript_tail"),
+                    "text": .string("Use the smaller patch"),
+                    "tone": .string("neutral"),
+                    "symbol": .null,
+                    "iconOnly": .bool(false),
+                    "progress": .null,
+                    "content": .null,
+                    "action": .object([
+                        "type": .string("capability_command"),
+                        "capability": .string("steering"),
+                        "command": .string("edit"),
+                        "arguments": .string(first.id),
+                        "input": .string("Use the smaller patch"),
+                        "target": .null
+                    ])
+                ])
             ])),
             blocks: [],
             preview: nil
@@ -484,7 +562,13 @@ final class AppModelTests: XCTestCase {
         )))
 
         XCTAssertEqual(model.composer, "")
+        XCTAssertEqual(model.transcriptTailWidgets.first?.widget.text, "Use the smaller patch")
+        XCTAssertEqual(
+            model.transcriptTailWidgets.first?.widget.action?.capabilityInput,
+            "Use the smaller patch"
+        )
 
+        model.connectionState = .ready
         model.composer = "Retry this steering"
         model.sendMessage()
         try await Task.sleep(for: .milliseconds(20))
@@ -503,6 +587,512 @@ final class AppModelTests: XCTestCase {
         )
 
         XCTAssertEqual(model.composer, "Retry this steering")
+    }
+
+    func testQueuedWidgetEditIsTakenBeforeTheComposerResubmitsFreshActiveInput() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        let target = MessageTarget(checkpointSequence: 12, batchItemCount: 3)
+        let queued = MountedWidget(
+            capability: "notes",
+            widget: FrontendWidget(
+                id: "queued",
+                slot: .transcriptTail,
+                text: "Queued note",
+                tone: "neutral",
+                symbol: nil,
+                iconOnly: false,
+                progress: nil,
+                content: nil,
+                action: .capabilityCommand(
+                    capability: "notes",
+                    command: "edit",
+                    arguments: "note-1",
+                    input: "Original input",
+                    target: target
+                )
+            )
+        )
+        let sibling = MountedWidget(
+            capability: "notes",
+            widget: FrontendWidget(
+                id: "sibling",
+                slot: .transcriptTail,
+                text: "Another queued note",
+                tone: "neutral",
+                symbol: nil,
+                iconOnly: false,
+                progress: nil,
+                content: nil,
+                action: nil
+            )
+        )
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.activeTurnID = "turn-1"
+        model.activeOperation = "steer"
+        model.mountedWidgets = [queued, sibling]
+        model.composer = "Keep this draft"
+        let focusRequest = model.composerFocusRequest
+
+        model.editWidgetInputInComposer(queued)
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        guard case .submit(let sessionID, let editSubmission) = try XCTUnwrap(requests.first),
+              case .capabilityCommand(
+                  let capability,
+                  let command,
+                  let arguments,
+                  let input,
+                  let submittedTarget
+              ) = editSubmission.op
+        else { return XCTFail("Expected the queued capability operation") }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(capability, "notes")
+        XCTAssertEqual(command, "edit")
+        XCTAssertEqual(arguments, "note-1")
+        XCTAssertEqual(input, "Original input")
+        XCTAssertEqual(submittedTarget, target)
+
+        model.handle(.accepted(requestID: editSubmission.id))
+        XCTAssertEqual(model.composer, "Keep this draft")
+        XCTAssertFalse(model.canSendComposer)
+        XCTAssertEqual(model.composerFocusRequest, focusRequest)
+        XCTAssertEqual(model.transcriptTailWidgets.map(\.id), [queued.id, sibling.id])
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: editSubmission.id, msg: .object([
+                "type": .string("frontend"),
+                "frontendType": .string("remove_widget"),
+                "capability": .string("notes"),
+                "id": .string("queued")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        XCTAssertEqual(model.composer, "Original input")
+        XCTAssertTrue(model.canSendComposer)
+        XCTAssertEqual(model.composerFocusRequest, focusRequest + 1)
+        XCTAssertEqual(model.transcriptTailWidgets.map(\.id), [sibling.id])
+
+        model.composer = "Edited input"
+        model.sendMessage()
+        try await Task.sleep(for: .milliseconds(20))
+
+        let submissions = await recorder.requests().compactMap { request -> Submission? in
+            guard case .submit(_, let submission) = request else { return nil }
+            return submission
+        }
+        let editedSubmission = try XCTUnwrap(submissions.last)
+        guard case .activeInput(let operation, let turnID, let text) = editedSubmission.op
+        else { return XCTFail("Expected fresh active input") }
+        XCTAssertEqual(operation, "steer")
+        XCTAssertEqual(turnID, "turn-1")
+        XCTAssertEqual(text, "Edited input")
+        XCTAssertEqual(model.composer, "Keep this draft")
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: editedSubmission.id, msg: .object([
+                "type": .string("task_started"),
+                "turnId": .string("turn-1")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        XCTAssertFalse(model.canSendComposer)
+        model.handle(.rejected(GatewayRejection(
+            requestId: editedSubmission.id,
+            code: "queue_full",
+            message: "Try again",
+            fatal: false
+        )))
+        XCTAssertEqual(model.composer, "Edited input")
+        XCTAssertTrue(model.canSendComposer)
+    }
+
+    func testComposerEditRecoveryRestoresEditedTextAndDisplacedDraftAfterRelaunch() async throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store = GatewayStore(
+            defaults: defaults,
+            transcriptDirectory: root.appendingPathComponent("Transcripts"),
+            draftDirectory: root.appendingPathComponent("Drafts")
+        )
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        await store.saveComposerDraft(
+            "Displaced draft",
+            accountID: account.id,
+            sessionID: "chat-1"
+        )
+        try await store.saveComposerEditRecovery(
+            ComposerEditRecovery(
+                capability: "notes",
+                widgetID: "queued",
+                originalInput: "Original input",
+                displacedDraft: "Displaced draft",
+                editedInput: "Edited after relaunch",
+                requestID: "removed-input",
+                submissionBaselineSequence: nil,
+                phase: .editing
+            ),
+            accountID: account.id,
+            sessionID: "chat-1"
+        )
+        let recorder = GatewayRequestRecorder()
+        let model = AppModel(
+            client: GatewayClient(),
+            store: store,
+            settingsDefaults: defaults,
+            requestSender: { request in await recorder.record(request) }
+        )
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+        model.openSession("chat-1")
+        try await Task.sleep(for: .milliseconds(30))
+        let openRequests = await recorder.requests()
+        let openRequest = try XCTUnwrap(openRequests.last)
+        guard case .openSession(let openID, _, _, _) = openRequest else {
+            return XCTFail("Expected session open")
+        }
+        model.handle(.sessionOpened(
+            requestID: openID,
+            payload: sessionReady(latestSequence: 0, sessionID: "chat-1")
+        ))
+        model.handle(.sessionReplayComplete(requestID: openID, sessionID: "chat-1"))
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(model.composer, "Edited after relaunch")
+        XCTAssertTrue(model.canSendComposer)
+
+        model.sendMessage()
+        try await Task.sleep(for: .milliseconds(50))
+        let submissions = await recorder.requests().compactMap { request -> Submission? in
+            guard case .submit(_, let submission) = request else { return nil }
+            return submission
+        }
+        guard case .userInput(let text, _) = try XCTUnwrap(submissions.last).op else {
+            return XCTFail("Expected recovered user input")
+        }
+        XCTAssertEqual(text, "Edited after relaunch")
+        XCTAssertEqual(model.composer, "Displaced draft")
+    }
+
+    func testComposerEditRecoveryRecognizesSubmissionReplayedBeforeItsDiskLoad() async throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store = GatewayStore(
+            defaults: defaults,
+            transcriptDirectory: root.appendingPathComponent("Transcripts"),
+            draftDirectory: root.appendingPathComponent("Drafts")
+        )
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        await store.saveComposerDraft(
+            "Displaced draft",
+            accountID: account.id,
+            sessionID: "chat-1"
+        )
+        try await store.saveComposerEditRecovery(
+            ComposerEditRecovery(
+                capability: "notes",
+                widgetID: "queued",
+                originalInput: "Original input",
+                displacedDraft: "Displaced draft",
+                editedInput: "Edited input",
+                requestID: "submitted-edit",
+                submissionBaselineSequence: 10,
+                phase: .submitting
+            ),
+            accountID: account.id,
+            sessionID: "chat-1"
+        )
+        let recorder = GatewayRequestRecorder()
+        let model = AppModel(
+            client: GatewayClient(),
+            store: store,
+            settingsDefaults: defaults,
+            requestSender: { request in await recorder.record(request) }
+        )
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+        model.openSession("chat-1")
+        try await Task.sleep(for: .milliseconds(30))
+        let openRequests = await recorder.requests()
+        guard case .openSession(let openID, _, _, _) = try XCTUnwrap(openRequests.last) else {
+            return XCTFail("Expected session open")
+        }
+
+        model.handle(.sessionOpened(
+            requestID: openID,
+            payload: sessionReady(latestSequence: 11, sessionID: "chat-1")
+        ))
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            sequence: 11,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("session_history"),
+                "events": .array([])
+            ])),
+            blocks: [],
+            history: [RenderedEventRecord(event: .object([
+                "type": .string("user_message"),
+                "message": .string("Edited input"),
+                "attachments": .array([]),
+                "messageTarget": .object([
+                    "checkpointSequence": .number(11),
+                    "batchItemCount": .number(1)
+                ])
+            ]), blocks: [])],
+            preview: nil
+        ))
+        model.handle(.sessionReplayComplete(requestID: openID, sessionID: "chat-1"))
+        try await Task.sleep(for: .milliseconds(150))
+
+        XCTAssertEqual(model.composer, "Displaced draft")
+        XCTAssertEqual(model.transcript.filter { $0.kind == .user }.map(\.text), ["Edited input"])
+        XCTAssertTrue(model.canSendComposer)
+        let replayedRecovery = await store.loadComposerEditRecovery(
+            accountID: account.id,
+            sessionID: "chat-1"
+        )
+        XCTAssertNil(replayedRecovery)
+    }
+
+    func testCompletedComposerEditTombstoneIsIgnoredAndOverwrittenByTheNextEdit() async throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store = GatewayStore(
+            defaults: defaults,
+            transcriptDirectory: root.appendingPathComponent("Transcripts"),
+            draftDirectory: root.appendingPathComponent("Drafts")
+        )
+        let accountID = UUID()
+        let completed = ComposerEditRecovery(
+            capability: "notes",
+            widgetID: "queued",
+            originalInput: "Original",
+            displacedDraft: "Draft",
+            editedInput: "Edited",
+            requestID: "submitted",
+            submissionBaselineSequence: 7,
+            phase: .completed
+        )
+        try await store.saveComposerEditRecovery(
+            completed,
+            accountID: accountID,
+            sessionID: "chat-1"
+        )
+        let ignored = await store.loadComposerEditRecovery(
+            accountID: accountID,
+            sessionID: "chat-1"
+        )
+        XCTAssertNil(ignored)
+
+        var next = completed
+        next.requestID = "next-edit"
+        next.submissionBaselineSequence = nil
+        next.phase = .editing
+        try await store.saveComposerEditRecovery(
+            next,
+            accountID: accountID,
+            sessionID: "chat-1"
+        )
+        let restored = await store.loadComposerEditRecovery(
+            accountID: accountID,
+            sessionID: "chat-1"
+        )
+        XCTAssertEqual(restored, next)
+    }
+
+    func testForgettingGatewayInvalidatesItsInMemoryComposerEdit() async throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store = GatewayStore(
+            defaults: defaults,
+            transcriptDirectory: root.appendingPathComponent("Transcripts"),
+            draftDirectory: root.appendingPathComponent("Drafts")
+        )
+        let recorder = GatewayRequestRecorder()
+        let model = AppModel(
+            client: GatewayClient(),
+            store: store,
+            settingsDefaults: defaults,
+            requestSender: { request in await recorder.record(request) }
+        )
+        let first = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        let second = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9192"))
+        try await beginComposerEdit(in: model, recorder: recorder, account: first)
+        model.accounts = [first, second]
+
+        model.forgetSelectedGateway()
+        try await Task.sleep(for: .milliseconds(150))
+        model.selectedAccountID = second.id
+        model.selectedSessionID = "chat-1"
+        model.connectionState = .ready
+        model.composer = "New gateway message"
+        model.sendMessage()
+        try await Task.sleep(for: .milliseconds(30))
+
+        let submissions = await recorder.requests().compactMap { request -> Submission? in
+            guard case .submit(_, let submission) = request else { return nil }
+            return submission
+        }
+        guard case .userInput(let text, _) = try XCTUnwrap(submissions.last).op else {
+            return XCTFail("Expected an ordinary new-gateway message")
+        }
+        XCTAssertEqual(text, "New gateway message")
+    }
+
+    func testDeletingSelectedSessionInvalidatesItsInMemoryComposerEdit() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in await recorder.record(request) })
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        try await beginComposerEdit(in: model, recorder: recorder, account: account)
+        let selected = session(sessionID: "chat-1", state: .idle)
+        model.sessions = [selected]
+
+        model.deleteSession(selected)
+        try await Task.sleep(for: .milliseconds(30))
+        let requests = await recorder.requests()
+        guard case .deleteSession(let deleteID, "chat-1") = try XCTUnwrap(
+            requests.last(where: { if case .deleteSession = $0 { true } else { false } })
+        ) else { return XCTFail("Expected session deletion") }
+        model.handle(.accepted(requestID: deleteID))
+        model.handle(.sessions(requestID: deleteID, sessions: []))
+
+        model.selectedSessionID = "chat-1"
+        model.connectionState = .ready
+        model.composer = "Replacement message"
+        model.sendMessage()
+        try await Task.sleep(for: .milliseconds(30))
+
+        let submissions = await recorder.requests().compactMap { request -> Submission? in
+            guard case .submit(_, let submission) = request else { return nil }
+            return submission
+        }
+        guard case .userInput(let text, _) = try XCTUnwrap(submissions.last).op else {
+            return XCTFail("Expected an ordinary message after deletion")
+        }
+        XCTAssertEqual(text, "Replacement message")
+    }
+
+    func testSwitchingGatewayImmediatelyPersistsTheLatestComposerEdit() async throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store = GatewayStore(
+            defaults: defaults,
+            transcriptDirectory: root.appendingPathComponent("Transcripts"),
+            draftDirectory: root.appendingPathComponent("Drafts")
+        )
+        let recorder = GatewayRequestRecorder()
+        let model = AppModel(
+            client: GatewayClient(),
+            store: store,
+            settingsDefaults: defaults,
+            requestSender: { request in await recorder.record(request) }
+        )
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        let second = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9192"))
+        model.accounts = [account, second]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+        model.openSession("chat-1")
+        try await Task.sleep(for: .milliseconds(30))
+        let openRequests = await recorder.requests()
+        guard case .openSession(let openID, _, _, _) = try XCTUnwrap(openRequests.last) else {
+            return XCTFail("Expected session open")
+        }
+        model.handle(.sessionOpened(
+            requestID: openID,
+            payload: sessionReady(latestSequence: 0, sessionID: "chat-1")
+        ))
+        model.handle(.sessionReplayComplete(requestID: openID, sessionID: "chat-1"))
+        try await Task.sleep(for: .milliseconds(30))
+        try await beginComposerEdit(in: model, recorder: recorder, account: account)
+        model.accounts = [account, second]
+
+        model.composer = "Latest edit before switching"
+        XCTAssertEqual(model.composer, "Latest edit before switching")
+        XCTAssertTrue(model.canSendComposer)
+        model.selectAccount(second.id)
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(model.composer, "")
+
+        let recovery = await store.loadComposerEditRecovery(
+            accountID: account.id,
+            sessionID: "chat-1"
+        )
+        XCTAssertEqual(recovery?.editedInput, "Latest edit before switching")
+    }
+
+    func testSendMessageCannotBypassConnectionOrPendingWidgetEdit() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.selectedSessionID = "chat-1"
+        model.composer = "Do not lose this"
+        model.contributions = [fileAttachmentContribution()]
+
+        model.sendMessage()
+        try await Task.sleep(for: .milliseconds(20))
+        let disconnectedRequests = await recorder.requests()
+        XCTAssertTrue(disconnectedRequests.isEmpty)
+        XCTAssertEqual(model.composer, "Do not lose this")
+
+        model.connectionState = .ready
+        XCTAssertTrue(model.canImportAttachments)
+        model.editWidgetInputInComposer(editableWidget())
+        XCTAssertFalse(model.canImportAttachments)
+        model.sendMessage()
+        try await Task.sleep(for: .milliseconds(50))
+
+        let requests = await recorder.requests()
+        XCTAssertEqual(requests.count, 1)
+        guard case .submit(_, let submission) = requests[0],
+              case .capabilityCommand = submission.op
+        else { return XCTFail("Expected only the edit-removal command") }
+        XCTAssertEqual(model.composer, "Do not lose this")
     }
 
     func testSwitchingGatewaysClearsGatewayScopedStateBeforeTokenLookup() throws {
@@ -608,9 +1198,25 @@ final class AppModelTests: XCTestCase {
             defaultConfig: VersionedAgentConfig(revision: 1, config: composition())
         )))
         try await Task.sleep(for: .milliseconds(50))
-        model.selectedSessionID = "chat-1"
-        model.connectionState = .ready
+        let readyRequests = await recorder.requests()
+        let openRequest = try XCTUnwrap(readyRequests.last(where: {
+            if case .openSession = $0 { return true }
+            return false
+        }))
+        guard case .openSession(let openRequestID, _, _, _) = openRequest else {
+            return XCTFail("Expected session open")
+        }
+        await harness.yield(.sessionOpened(
+            requestID: openRequestID,
+            payload: sessionReady(latestSequence: 0)
+        ))
+        await harness.yield(.sessionReplayComplete(
+            requestID: openRequestID,
+            sessionID: "chat-1"
+        ))
+        try await Task.sleep(for: .milliseconds(50))
         model.composer = "Run this once"
+        XCTAssertTrue(model.canSendComposer)
         model.sendMessage()
         try await Task.sleep(for: .milliseconds(30))
 
@@ -1465,13 +2071,6 @@ final class AppModelTests: XCTestCase {
             references: [FrontendReference(trigger: "$", value: "planning", description: "Planning skill")],
             activeInput: nil
         )]
-        model.middlewareFeatures = [MiddlewareFeature(
-            id: "tasks",
-            label: "Work items",
-            description: "Tracks work items.",
-            required: false,
-            settings: []
-        )]
         model.mountedWidgets = model.contributions.flatMap { contribution in
             contribution.widgets.map {
                 MountedWidget(capability: contribution.capability, widget: $0)
@@ -1482,11 +2081,6 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.messageActionWidgets.first?.widget.text, "Fork chat")
         XCTAssertEqual(model.navigationWidgets.first?.id, "tasks\u{0}journal")
         XCTAssertEqual(model.chatMenuWidgets.first?.widget.text, "Open journal")
-        XCTAssertEqual(model.middlewareContributionCounts, [MiddlewareContributionCount(
-            id: "tasks",
-            label: "Work items",
-            value: 3
-        )])
         let text = "Use $plan"
         let suggestions = try XCTUnwrap(model.referenceSuggestions(in: text, cursor: text.endIndex))
         XCTAssertEqual(String(text[suggestions.range]), "$plan")
@@ -1830,6 +2424,7 @@ final class AppModelTests: XCTestCase {
                     defaultReasoning: "high"
                 )],
                 modelIds: [],
+                reasoningEfforts: [],
                 modelIdsConfigurable: false,
                 webSearch: [.off, .cached, .live]
             )],
@@ -1848,11 +2443,12 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(20))
 
         let requests = await recorder.requests()
-        guard case .registerProvider(_, let provider, let modelIDs) = try XCTUnwrap(requests.first) else {
+        guard case .registerProvider(_, let provider, let modelIDs, let reasoningEfforts) = try XCTUnwrap(requests.first) else {
             return XCTFail("Expected first-provider registration")
         }
         XCTAssertEqual(provider, model.providerDraft)
         XCTAssertTrue(modelIDs.isEmpty)
+        XCTAssertTrue(reasoningEfforts.isEmpty)
 
         let defaultConfig = VersionedAgentConfig(revision: 1, config: composition())
         model.applyGatewayCatalog(ready(defaultConfig: defaultConfig))
@@ -1910,6 +2506,7 @@ final class AppModelTests: XCTestCase {
                 )
             ],
             modelIds: [],
+            reasoningEfforts: [],
             modelIdsConfigurable: false,
             webSearch: [.off]
         )]
@@ -1926,7 +2523,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.agentDraft?.provider.reasoningEffort)
     }
 
-    func testConfigurableProviderCanonicalizesAndSavesMultipleModelIDs() async throws {
+    func testConfigurableProviderCanonicalizesAndSavesModelAndReasoningCatalogs() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model { request in await recorder.record(request) }
         let selection = ProviderConfig(
@@ -1949,23 +2546,33 @@ final class AppModelTests: XCTestCase {
             defaultApiKeyEnv: nil,
             models: [],
             modelIds: ["old-model"],
+            reasoningEfforts: ["medium"],
             modelIdsConfigurable: true,
             webSearch: [.off]
         )]
         model.selectProvider(selection.provider)
         model.updateProviderModelIDs(" model-a, model-b, , model-a ")
+        model.updateProviderReasoningEfforts(" high, medium, , high ")
 
         XCTAssertEqual(model.providerModelIDs, ["model-a", "model-b"])
+        XCTAssertEqual(model.providerReasoningEfforts, ["high", "medium"])
         model.saveProviderAsDefault()
         try await Task.sleep(for: .milliseconds(20))
 
         let requests = await recorder.requests()
         let request = try XCTUnwrap(requests.first)
-        guard case .registerProvider(_, let config, let modelIDs) = request else {
+        guard case .registerProvider(
+            _,
+            let config,
+            let modelIDs,
+            let reasoningEfforts
+        ) = request else {
             return XCTFail("Expected provider registration")
         }
         XCTAssertEqual(modelIDs, ["model-a", "model-b"])
+        XCTAssertEqual(reasoningEfforts, ["high", "medium"])
         XCTAssertEqual(config.model, "model-a")
+        XCTAssertEqual(config.reasoningEffort, "high")
     }
 
     func testDefaultModelSelectionUsesGatewayProviderIdentity() throws {
@@ -2140,7 +2747,7 @@ final class AppModelTests: XCTestCase {
         let registrationRequests = await recorder.requests()
         let registration = try XCTUnwrap(
             registrationRequests.lazy.compactMap { request -> String? in
-                guard case .registerProvider(let requestID, _, _) = request else { return nil }
+                guard case .registerProvider(let requestID, _, _, _) = request else { return nil }
                 return requestID
             }.first
         )
@@ -2187,7 +2794,7 @@ final class AppModelTests: XCTestCase {
         let registrationRequests = await recorder.requests()
         let registration = try XCTUnwrap(
             registrationRequests.lazy.compactMap { request -> String? in
-                guard case .registerProvider(let requestID, _, _) = request else { return nil }
+                guard case .registerProvider(let requestID, _, _, _) = request else { return nil }
                 return requestID
             }.first
         )
