@@ -377,7 +377,7 @@ struct ChatView: View {
             }
         }
         .navigationTitle(model.displayedTranscript.isEmpty ? "Hello" : model.currentSessionTitle)
-        .navigationSubtitle(workspaceName)
+        .navigationSubtitle(chatSubtitle)
         #if os(iOS)
         .toolbarTitleDisplayMode(.inline)
         #endif
@@ -405,6 +405,12 @@ struct ChatView: View {
     private var workspaceName: String {
         guard let path = model.workspace?.path else { return "" }
         return path.split { $0 == "/" || $0 == "\\" }.last.map(String.init) ?? path
+    }
+
+    private var chatSubtitle: String {
+        [workspaceName, model.gatewayMachineName]
+            .filter { !$0.isEmpty }
+            .joined(separator: " • ")
     }
 }
 
@@ -537,6 +543,7 @@ private struct TranscriptView: View {
     // A restored transcript lands after the scroll view exists, so an initial-offset anchor
     // resolves against empty content. A bottom-edge scroll position survives the late fill.
     @State private var position = ScrollPosition(edge: .bottom)
+    @State private var historyAnchorID: String?
     #if os(iOS)
     private let rowSpacing: CGFloat = 12
     private let contentPadding: CGFloat = 16
@@ -550,6 +557,23 @@ private struct TranscriptView: View {
             // ponytail: chat rows have wildly different heights, so exact layout avoids the
             // blank gaps produced by LazyVStack estimates. Paginate before making this lazy again.
             VStack(alignment: .leading, spacing: 0) {
+                if model.hasEarlierHistory {
+                    HStack {
+                        Spacer()
+                        Button(action: loadEarlierHistory) {
+                            if model.isLoadingEarlierHistory {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Label("Load earlier messages", systemImage: "arrow.up")
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(!model.canLoadEarlierHistory)
+                        Spacer()
+                    }
+                    .padding(.bottom, rowSpacing)
+                }
                 ForEach(rows, id: \.entry.id) { row in
                     TranscriptRow(entry: row.entry)
                         .id(row.entry.id)
@@ -557,6 +581,7 @@ private struct TranscriptView: View {
                 }
                 Color.clear.frame(height: max(1, bottomInset))
             }
+            .scrollTargetLayout()
             .frame(maxWidth: 880)
             .frame(maxWidth: .infinity)
             .padding(contentPadding)
@@ -589,6 +614,12 @@ private struct TranscriptView: View {
         // fire. Growing content is what `defaultScrollAnchor(.bottom, for: .sizeChanges)` follows,
         // so only a new row needs an explicit scroll.
         .onChange(of: model.displayedTranscript.count) { followTranscript() }
+        .onChange(of: model.displayedTranscript.first?.id) { previous, _ in
+            guard let historyAnchorID, historyAnchorID == previous else { return }
+            position.scrollTo(id: historyAnchorID, anchor: .top)
+            self.historyAnchorID = nil
+        }
+        .onChange(of: model.selectedSessionID) { historyAnchorID = nil }
         .task(id: model.selectedSessionID) { await openAtLatest() }
     }
 
@@ -606,6 +637,11 @@ private struct TranscriptView: View {
     private func followTranscript() {
         guard isAtBottom || model.activeTurnID != nil else { return }
         position.scrollTo(edge: .bottom)
+    }
+
+    private func loadEarlierHistory() {
+        historyAnchorID = model.displayedTranscript.first?.id
+        model.loadEarlierHistory()
     }
 
     // Spacing is resolved up front: a row body must never index back into the live
@@ -1249,7 +1285,7 @@ private struct ComposerSurface: View {
                 axis: .vertical
             )
             .textFieldStyle(.plain)
-            .lineLimit(1...)
+            .lineLimit(1...8)
             .scrollDismissesKeyboard(.interactively)
             .font(HorusStyle.bodyFont)
             .accessibilityLabel("Message")

@@ -209,47 +209,38 @@ struct AppShell: View {
 private struct AppLockView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
+    @ScaledMetric(relativeTo: .largeTitle) private var iconSize: CGFloat = 72
 
     var body: some View {
         ZStack {
             HorusBackdrop()
-            HorusCard {
-                VStack(spacing: 16) {
-                    HorusIcon(
-                        model.appLockAuthenticationMethod.glyph,
-                        size: 36,
-                        foreground: palette.accent
-                    )
-                    Text("Horus is locked")
-                        .font(.title2.weight(.semibold))
-                    Text(status)
-                        .foregroundStyle(palette.muted)
-                        .multilineTextAlignment(.center)
-                        .accessibilityLabel("App lock status: \(status)")
-                    if model.isAppLockAuthenticating {
-                        ProgressView("Authenticating")
-                    } else {
-                        Button(
-                            model.appLockError == nil
-                                ? model.appLockAuthenticationMethod.unlockTitle
-                                : "Try Again",
-                            glyph: model.appLockError == nil ? .lockOpen : .arrowClockwise
-                        ) {
-                            Task { await model.unlockApp() }
-                        }
-                        .horusProminentButton()
-                        .controlSize(.large)
-                    }
-                }
-                .frame(maxWidth: .infinity)
+            Button {
+                Task { await model.unlockApp() }
+            } label: {
+                HorusIcon(
+                    model.appLockError == nil
+                        ? model.appLockAuthenticationMethod.glyph
+                        : .warningOctagon,
+                    size: iconSize,
+                    foreground: model.appLockError == nil ? palette.accent : palette.danger
+                )
+                .frame(width: 128, height: 128)
+                .contentShape(Circle())
             }
-            .frame(maxWidth: 380)
-            .padding(24)
+            .buttonStyle(.horusPlain)
+            .disabled(model.isAppLockAuthenticating)
+            .opacity(model.isAppLockAuthenticating ? 0.45 : 1)
+            .accessibilityLabel(
+                model.appLockError == nil
+                    ? model.appLockAuthenticationMethod.unlockTitle
+                    : "Try Again"
+            )
+            .accessibilityValue(
+                model.isAppLockAuthenticating
+                    ? "Authenticating"
+                    : model.appLockError ?? "Horus is locked"
+            )
         }
-    }
-
-    private var status: String {
-        model.appLockError ?? "Use Face ID or Touch ID to continue."
     }
 }
 
@@ -1111,7 +1102,6 @@ struct SidebarView: View {
 
 private struct SessionActivityIndicator: View {
     @Environment(\.horusPalette) private var palette
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let state: SessionActivityState
     let isUnread: Bool
 
@@ -1119,18 +1109,10 @@ private struct SessionActivityIndicator: View {
         Group {
             switch state {
             case .running:
-                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { context in
-                    let progress = context.date.timeIntervalSinceReferenceDate
-                        .truncatingRemainder(dividingBy: 0.9) / 0.9
-                    Circle()
-                        .trim(from: 0.08, to: 0.76)
-                        .stroke(
-                            palette.accent,
-                            style: StrokeStyle(lineWidth: 1.7, lineCap: .round)
-                        )
-                        .rotationEffect(.degrees(reduceMotion ? -90 : progress * 360 - 90))
-                }
-                .frame(width: 11, height: 11)
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(palette.accent)
+                    .frame(width: 11, height: 11)
             case .awaitingApproval:
                 Circle()
                     .trim(from: 0.08, to: 0.76)

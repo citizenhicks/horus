@@ -72,10 +72,10 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             config.metadata.clone_from(&state.metadata);
         }
     }
-    let mut replay = if is_new {
-        Vec::new()
+    let (mut replay, next_before_sequence) = if is_new {
+        (Vec::new(), None)
     } else {
-        let transcript = config
+        let page = config
             .checkpoints
             .transcript_page(
                 &config.session_id,
@@ -84,9 +84,13 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
                     max_batches: config.initial_replay_batches,
                 },
             )
-            .await?
-            .into_positioned_items_chronological();
-        replay_events(&transcript, &config.session_id)
+            .await?;
+        let next_before_sequence = page.next_before_sequence;
+        let transcript = page.into_positioned_items_chronological();
+        (
+            replay_events(&transcript, &config.session_id),
+            next_before_sequence,
+        )
     };
     if let Some(turn_id) = state
         .active_execution
@@ -305,5 +309,6 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         model,
         model_choices,
         tool_count,
+        next_before_sequence,
     })
 }

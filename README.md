@@ -1,24 +1,33 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/citizenhicks/horus/main/horus-app/apple/Sources/HorusApp/Assets.xcassets/HorusLogo.imageset/HorusLogo.svg" width="160" height="160" alt="Horus">
+</p>
+
 # Horus
 
-Horus is a small Rust coding-agent framework with one headless gateway and a
-thin terminal client. One gateway process owns machine credentials, up to 32
-concurrent chat agents, artifacts, usage statistics, and scheduled work.
+Horus is a small, frontend-neutral Rust framework for coding agents. Its shipped
+runtime has one headless composition root: `horus-gateway`. The terminal and
+Apple apps are thin clients of that gateway; they do not own agent behavior.
 
-| Package | Purpose |
+| Component | Boundary |
 | --- | --- |
-| [`horus`](https://crates.io/crates/horus) | Frontend-neutral agent framework |
-| [`horus-gateway`](https://crates.io/crates/horus-gateway) | Headless authenticated agent host |
-| [`horus-cli`](https://crates.io/crates/horus-cli) | Terminal gateway client |
+| [`horus`](https://crates.io/crates/horus) | Embeddable agent loop, provider and storage interfaces, sandbox policy, middleware, and frontend-neutral protocol |
+| [`horus-gateway`](https://crates.io/crates/horus-gateway) | The only shipped owner of an `Agent`; composes capabilities and owns authentication, chats, workspaces, artifacts, usage, and cron |
+| [`horus-cli`](https://crates.io/crates/horus-cli) | Ratatui gateway client and local gateway launcher |
+| [Apple app](horus-app/apple/README.md) | SwiftUI gateway client for macOS, iPhone, and iPad |
 
 ## Install
 
-Download one `horus-cli` archive and checksum from
-[GitHub Releases](https://github.com/citizenhicks/horus/releases). It contains both
-`horus` and `horus-gateway`. Rust users can install both commands with Rust 1.89 or newer:
+Download `horus-<version>-<target>.tar.gz` and its checksum from
+[GitHub Releases](https://github.com/citizenhicks/horus/releases). The archive
+contains `horus`, `horus-gateway`, and `cloudflared`. Rust users can install the
+two Horus commands with Rust 1.89 or newer:
 
 ```sh
 cargo install --locked horus-cli
 ```
+
+Cargo does not install `cloudflared`; Quick Connect requires it beside
+`horus-gateway` or on `PATH`.
 
 Users upgrading from the earlier split packages should run
 `cargo install --force --locked horus-cli` once so Cargo transfers both commands to the CLI
@@ -44,8 +53,8 @@ binaries and is not a separate runtime prerequisite.
 
 Plaintext remains limited to loopback. Run `horus-gateway connect` to advertise
 both that local TCP endpoint and the Quick Tunnel's public WSS endpoint with one
-one-use code; pairing through either exchanges it for a per-client token used on
-later connections. A direct TLS listener remains available as an advanced
+single-use pairing code; pairing through either exchanges it for a per-client
+token used on later connections. A direct TLS listener remains available as an advanced
 alternative. See the
 [gateway guide](https://github.com/citizenhicks/horus/blob/main/crates/horus-gateway/README.md),
 the [CLI guide](https://github.com/citizenhicks/horus/blob/main/crates/horus-cli/README.md),
@@ -65,7 +74,7 @@ Horus requires Rust 1.89 or newer.
 
 ```toml
 [dependencies]
-horus = "0.5"
+horus = "0.6"
 ```
 
 The caller owns composition:
@@ -120,44 +129,58 @@ capability implementations do not depend on terminal code. Interrupts target a s
 events carry an optional submission ID so command-driven and unsolicited system events remain
 distinct.
 
-## Modules
+## Architecture
 
-| Module | Owns |
+```text
+Terminal client ─┐
+Apple client ────┼── versioned gateway protocol ⇄ horus-gateway ──> Agent
+Other clients ───┘                                     │
+                                                        ├─ model router
+                                                        ├─ sandbox
+                                                        ├─ checkpoints
+                                                        └─ middleware stack
+```
+
+The gateway is the shipped composition root. It creates one `Agent` per active
+chat and translates authenticated wire operations into frontend-neutral core
+operations. Frontends render gateway events and capability contributions; they
+do not dispatch tools or implement middleware behavior.
+
+| Path | Owns |
 | --- | --- |
-| `agent` | Session handles and the linear command/model/tool loop |
-| `middleware` | Lifecycle hooks, tools, instructions, skills, tasks, steering, context offloading, compaction, sessions, and subagents |
-| `protocol` | Commands, events, approvals, usage, and UI-neutral contribution and setting records |
-| `backend` | Model, sandbox, and checkpoint interfaces plus built-in adapters |
+| `src/agent/` | The linear session, model, and tool loop |
+| `src/backend/model/` | Provider transports, provider manifests, and model routing |
+| `src/backend/sandbox/` | File and command boundaries, approval policy, and background processes |
+| `src/backend/checkpoint/` | Durable checkpoints, journals, transcript pages, and the session catalog |
+| `src/middleware/` | Vertical optional capabilities, including their tools, hooks, state, settings, and UI contributions |
+| `src/protocol/` | Frontend-neutral operations, events, approvals, usage, and presentation records |
+| `crates/horus-gateway/` | Runtime composition, authentication, client sessions, workspaces, artifacts, Git, usage, cron, and the wire protocol |
+| `crates/horus-cli/src/frontend/` | Terminal lifecycle, input, and rendering only |
+| `horus-app/apple/` | Apple lifecycle, platform storage, and SwiftUI rendering only |
 
-Middleware declaration order is execution order. A loop may run with no optional middleware.
-The sandbox enforces approval policy for every approval-required tool.
-Static middleware prompt fragments are composed into the system prompt once when an agent is
-created; runtime hooks do not repeatedly append them to conversation state. Skills and subagents
-expose `prompt` builder overrides, while workspace instructions load a bounded root
-`AGENTS.override.md` or `AGENTS.md` when that middleware is installed.
-Subagents may set default model and reasoning choices at construction, with per-spawn overrides.
-Context offloading masks successful tool output older than its configured trailing token window
-while leaving the latest user turn intact.
-Compaction defaults to 250,000 tokens. Its middleware uses a provider's native endpoint when
-advertised; otherwise it creates a rolling summary while retaining recent raw context.
-Checkpoint backends expose cursor-paginated session catalogs and sequence-bounded transcript
-pages. `AgentConfig::initial_replay_batches` controls the recent history rendered on resume;
-the complete compacted model checkpoint is loaded independently.
+Middleware declaration order is observable hook and prompt-fragment order. Each
+capability owns its complete vertical slice; adding one to the shipped runtime
+changes its module and the explicit gateway registry, not the agent loop or a
+frontend-specific dispatcher. Static prompt fragments are composed once at
+agent creation, while dynamic state enters through runtime hooks.
 
-The local command sandbox currently uses Seatbelt on macOS and Bubblewrap on Linux. Linux must
-permit the selected `bwrap` binary to create user, PID, and network namespaces; AppArmor-restricted
-hosts need a matching Bubblewrap profile. If the platform sandbox is unavailable, command
-execution fails closed. The sandbox offers three approval policies: prompt before dangerous
-tools, allow tools without network, or allow tools with network. Filesystem confinement remains
-active in every mode. `Tools::coding` includes foreground execution plus bounded, session-owned
-background start, poll, and stop operations; background jobs end on completion, explicit stop, or
-session shutdown.
+Checkpoint backends expose cursor-paginated session catalogs and
+sequence-bounded transcript pages. Context offloading and compaction remain
+middleware policy, and provider adapters normalize private wire formats before
+the agent loop sees them.
+
+The sandbox enforces approval policy for every approval-required tool. The local
+backend uses Seatbelt on macOS and Bubblewrap on Linux and fails closed when the
+platform sandbox is unavailable. Linux must permit the selected `bwrap` binary
+to create user, PID, and network namespaces; AppArmor-restricted hosts need a
+matching Bubblewrap profile. Filesystem confinement remains active under every
+approval policy.
 
 ## Contributing
 
 Read [AGENTS.md](https://github.com/citizenhicks/horus/blob/main/AGENTS.md) before changing the framework. It defines module ownership,
-capability extension points, required checks, and the no-compatibility rule for this initial
-release.
+capability extension points, required checks, and the no-compatibility rule while
+the public contract remains under active development.
 
 Release tags are intentionally separate:
 
@@ -168,11 +191,10 @@ Release tags are intentionally separate:
 
 Publish `horus`, then `horus-gateway`, then `horus-cli`, waiting for each dependency to appear in
 the crates.io index. Creating a tag is a release action; ordinary pushes and pull requests only
-run CI. The release workflow expects a `CARGO_REGISTRY_TOKEN` repository secret for the initial
-crates.io publications.
+run CI. The release workflow expects a `CARGO_REGISTRY_TOKEN` repository secret for
+crates.io publication.
 
 ## License
 
-Licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for attribution to
-[OpenAI Codex](https://github.com/openai/codex), Ratatui-derived work, and the
-[Sora](https://github.com/Aejkatappaja/sora) color palette.
+Licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for third-party
+attributions.

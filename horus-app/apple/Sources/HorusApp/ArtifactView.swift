@@ -34,7 +34,11 @@ private struct ArtifactContent: View {
     var body: some View {
         switch model.inspectorPage {
         case .changes:
-            WorkspaceFileList()
+            if model.workspaceFileScope == .modified {
+                WorkspaceDiffView()
+            } else {
+                WorkspaceFileList()
+            }
         case .uploads:
             UploadedFileList()
         }
@@ -65,15 +69,73 @@ private struct WorkspaceScopePicker: View {
 private extension WorkspaceFileScope {
     var title: String {
         switch self {
-        case .modified: "Modified"
+        case .modified: "Unstaged"
         case .all: "All Files"
         }
     }
+}
 
-    var emptyTitle: String {
-        switch self {
-        case .modified: "No modified files"
-        case .all: "No workspace files"
+extension String {
+    var fileGlyph: HorusGlyph {
+        switch URL(fileURLWithPath: self).pathExtension.lowercased() {
+        case "py", "pyi", "pyw": .python
+        case "ts", "tsx": .typeScript
+        case "js", "jsx", "mjs", "cjs": .javaScript
+        case "csv", "tsv": .csv
+        case "rs": .rust
+        case "go": .go
+        case "md", "mdx", "markdown": .markdown
+        case "swift", "c", "h", "cpp", "hpp", "java", "kt", "kts", "rb", "php", "sh", "zsh": .fileScript
+        case "doc", "docx", "odt", "pages", "rtf": .doc
+        case "png", "jpg", "jpeg", "gif", "heic", "webp", "svg": .image01
+        case "json", "yaml", "yml", "toml", "xml", "ini", "plist": .gear
+        default: .fileText
+        }
+    }
+
+    var sourceHighlightLanguage: HighlightLanguage? {
+        switch URL(fileURLWithPath: self).pathExtension.lowercased() {
+        case "py", "pyi", "pyw": .python
+        case "rs": .rust
+        case "go": .go
+        case "ts", "tsx": .typeScript
+        case "js", "jsx", "mjs", "cjs": .javaScript
+        case "md", "mdx", "markdown": .markdown
+        case "swift": .swift
+        case "c", "h": .c
+        case "cpp", "hpp", "cc", "cxx": .cPlusPlus
+        case "java": .java
+        case "kt", "kts": .kotlin
+        case "rb": .ruby
+        case "php": .php
+        case "sh", "zsh", "bash": .shell
+        case "json": .json
+        case "yaml", "yml": .yaml
+        case "toml": .toml
+        default: nil
+        }
+    }
+}
+
+private struct WorkspaceDiffView: View {
+    @Environment(AppModel.self) private var model
+
+    @ViewBuilder
+    var body: some View {
+        if model.isLoadingGitDiff {
+            InspectorLoadingView(title: "Loading unstaged changes")
+        } else if model.gitDiff.isEmpty {
+            HorusUnavailable(title: "No unstaged changes", glyph: .gitBranch)
+        } else {
+            ScrollView(.vertical) {
+                CodeText(model.gitDiff)
+                    .highlightLanguage(.diff)
+                    .font(HorusStyle.metadataFont)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+            .textSelection(.enabled)
         }
     }
 }
@@ -86,7 +148,13 @@ private struct WorkspaceFileList: View {
     var body: some View {
         content
             .searchable(text: $query, placement: .toolbar, prompt: "Search files")
-            .task(id: model.workspaceFiles) { tree = FileTreeNode.tree(from: model.workspaceFiles) }
+            .task(id: model.workspaceFiles) {
+                let files = model.workspaceFiles
+                async let builtTree = FileTreeNode.tree(from: files)
+                let result = await builtTree
+                guard !Task.isCancelled else { return }
+                tree = result
+            }
     }
 
     @ViewBuilder
@@ -94,7 +162,7 @@ private struct WorkspaceFileList: View {
         if model.isLoadingWorkspaceFiles {
             InspectorLoadingView(title: "Loading workspace files")
         } else if model.workspaceFiles.isEmpty {
-            HorusUnavailable(title: model.workspaceFileScope.emptyTitle, glyph: .fileMagnifyingGlass)
+            HorusUnavailable(title: "No workspace files", glyph: .fileMagnifyingGlass)
         } else if !query.isEmpty {
             searchResults
         } else {
@@ -160,7 +228,7 @@ private struct FileTreeRow: View {
     var body: some View {
         HStack(spacing: 10) {
             HorusIcon(
-                node.isFolder ? .folder : .fileText,
+                node.isFolder ? .folder : node.id.fileGlyph,
                 size: 15,
                 foreground: node.isFolder ? palette.muted : palette.accent
             )
@@ -240,7 +308,7 @@ private struct InspectorFileRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            HorusIcon(.fileText, foreground: palette.accent)
+            HorusIcon(name.fileGlyph, foreground: palette.accent)
             VStack(alignment: .leading, spacing: 2) {
                 Text(name)
                     .font(HorusStyle.metadataFont.weight(.semibold))
@@ -280,15 +348,12 @@ struct TextFilePreviewView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView([.horizontal, .vertical]) {
-                CodeText(preview.contents)
-                    .font(HorusStyle.metadataFont)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding()
-            }
-            .background(palette.canvas)
-            .navigationTitle(preview.name)
+            NumberedSourceText(
+                preview.contents,
+                language: preview.name.sourceHighlightLanguage
+            )
+                .background(palette.canvas)
+                .navigationTitle(preview.name)
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
@@ -302,6 +367,83 @@ struct TextFilePreviewView: View {
         .frame(minWidth: 640, minHeight: 560)
         #endif
         .presentationDetents([.large])
+    }
+}
+
+struct NumberedSourceLine: Identifiable {
+    let id: Int
+    let text: AttributedString
+}
+
+struct NumberedSourceText: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let source: String
+    let language: HighlightLanguage?
+    @State private var lines: [NumberedSourceLine]
+
+    init(_ source: String, language: HighlightLanguage? = nil) {
+        self.source = source
+        self.language = language
+        _lines = State(initialValue: Self.lines(from: AttributedString(source)))
+    }
+
+    var body: some View {
+        ScrollView(.vertical) {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(lines) { line in
+                    HStack(alignment: .top, spacing: 0) {
+                        Text(String(line.id))
+                            .font(HorusStyle.metadataFont)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .frame(width: 44, alignment: .trailing)
+                            .padding(.trailing, 12)
+                        Text(line.text.characters.isEmpty ? AttributedString(" ") : line.text)
+                            .font(HorusStyle.metadataFont)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 16)
+            .padding(.trailing, 16)
+        }
+        .textSelection(.enabled)
+        .task(id: colorScheme) {
+            let colors: HighlightColors = colorScheme == .dark ? .dark(.xcode) : .light(.xcode)
+            let mode = language.map(HighlightMode.language) ?? .automatic
+            guard let result = try? await Highlight().request(source, mode: mode, colors: colors),
+                  !Task.isCancelled
+            else { return }
+            lines = Self.lines(from: Self.restoringWhitespace(result.attributedText, in: source))
+        }
+    }
+
+    static func restoringWhitespace(
+        _ highlighted: AttributedString,
+        in source: String
+    ) -> AttributedString {
+        let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              String(highlighted.characters) == trimmed,
+              let range = source.range(of: trimmed)
+        else { return AttributedString(source) }
+        var result = AttributedString(String(source[..<range.lowerBound]))
+        result.append(highlighted)
+        result.append(AttributedString(String(source[range.upperBound...])))
+        return result
+    }
+
+    static func lines(from text: AttributedString) -> [NumberedSourceLine] {
+        var lines: [AttributedString] = []
+        var start = text.startIndex
+        while let newline = text.characters[start...].firstIndex(where: \.isNewline) {
+            lines.append(AttributedString(text[start..<newline]))
+            start = text.characters.index(after: newline)
+        }
+        lines.append(AttributedString(text[start..<text.endIndex]))
+        return lines.enumerated().map { NumberedSourceLine(id: $0.offset + 1, text: $0.element) }
     }
 }
 

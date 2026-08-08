@@ -101,6 +101,11 @@ private struct PendingComposerDraft {
     let attachments: [AttachmentRecord]
 }
 
+private struct ComposerDraftOwner: Equatable, Sendable {
+    let accountID: UUID
+    let sessionID: String
+}
+
 private enum AttachmentUploadRequest {
     case begin(localID: UUID)
     case append(localID: UUID, expectedNextOffset: Int64)
@@ -184,7 +189,7 @@ enum InspectorPage {
 
 /// One entry in the workspace file tree. `children` is nil for a file, which is how
 /// `List(children:)` decides a row gets no disclosure control.
-struct FileTreeNode: Identifiable, Hashable {
+struct FileTreeNode: Identifiable, Hashable, Sendable {
     let id: String
     let name: String
     let size: Int64?
@@ -337,7 +342,7 @@ private let maximumHighlightedPreviewBytes = 1024 * 1024
 
 @Observable
 final class TranscriptEntry: Identifiable {
-    enum Kind: String, Codable {
+    enum Kind: String, Codable, Sendable {
         case user
         case assistant
         case reasoning
@@ -464,14 +469,35 @@ final class AppModel {
     var gitStatus: GitStatus?
     var gitDiff = ""
     var sessions: [SessionRecord] = []
+    var gatewayMachineName = ""
     var selectedSessionID: String?
     private(set) var unreadSessionIDs: Set<String> = []
     var transcript: [TranscriptEntry] = []
     private var replayPresentedTranscript: [TranscriptEntry]?
+    private var visibleTranscriptLimit = 300
     var displayedTranscript: [TranscriptEntry] {
-        replayPresentedTranscript ?? transcript
+        let source = replayPresentedTranscript ?? transcript
+        return source.count > visibleTranscriptLimit
+            ? Array(source.suffix(visibleTranscriptLimit))
+            : source
     }
-    var composer = ""
+    private(set) var isLoadingEarlierHistory = false
+    var hasEarlierHistory: Bool {
+        let source = replayPresentedTranscript ?? transcript
+        return source.count > visibleTranscriptLimit
+            || nextHistoryBeforeSequence != nil
+            || isLoadingEarlierHistory
+    }
+    var canLoadEarlierHistory: Bool {
+        hasEarlierHistory
+            && connectionState.isReady
+            && activeTurnID == nil
+            && pendingApproval == nil
+            && historyRequestID == nil
+    }
+    var composer = "" {
+        didSet { scheduleComposerDraftSave() }
+    }
     var composerAttachments: [ComposerAttachment] = []
     var uploadedAttachments: [AttachmentRecord] = []
     private(set) var isLoadingAttachments = false
@@ -492,7 +518,6 @@ final class AppModel {
     var toolCount = 0
     var mountedWidgets: [MountedWidget] = []
     var pendingPicker: FrontendPickerPrompt?
-    var artifacts: [ArtifactRecord] = []
     var previews: [TranscriptPreview] = []
     var presentedPreview: TranscriptPreview?
     var showsInspector = false
@@ -544,7 +569,13 @@ final class AppModel {
     @ObservationIgnored private let appLockAuthenticator: AppLockAuthenticator
     @ObservationIgnored private let requestSender:
         @MainActor @Sendable (GatewayRequest) async throws -> Void
+    @ObservationIgnored private let connectionOpener:
+        @MainActor @Sendable (GatewayEndpoint) async throws -> AsyncThrowingStream<GatewayEnvelope, Error>
+    @ObservationIgnored private let reconnectDelay: @Sendable (Int) -> Duration
     @ObservationIgnored private var eventTask: Task<Void, Never>?
+    @ObservationIgnored private var reconnectTask: Task<Void, Never>?
+    @ObservationIgnored private var reconnectAttempt = 0
+    @ObservationIgnored private var automaticReconnectBlocked = false
     @ObservationIgnored private var deltaFlushTask: Task<Void, Never>?
     @ObservationIgnored private var bufferedDeltas:
         [(id: String, delta: String, kind: TranscriptEntry.Kind)] = []
@@ -552,11 +583,20 @@ final class AppModel {
     @ObservationIgnored private var reconnectsOnActivation = false
     @ObservationIgnored private var pendingPairingAccount: GatewayAccount?
     @ObservationIgnored private var pendingDrafts: [String: PendingComposerDraft] = [:]
+    @ObservationIgnored private var composerDraftOwner: ComposerDraftOwner?
+    @ObservationIgnored private var composerDraftGeneration = UUID()
+    @ObservationIgnored private var composerDraftSaveTask: Task<Void, Never>?
+    @ObservationIgnored private var composerDraftIOTask: Task<Void, Never>?
+    @ObservationIgnored private var isLoadingComposerDraft = false
+    @ObservationIgnored private var suppressesComposerDraftSave = false
+    @ObservationIgnored private var transcriptIOTask: Task<Void, Never>?
+    @ObservationIgnored private var transcriptLoadGeneration = UUID()
     @ObservationIgnored private var sessionRequestID: String?
     @ObservationIgnored private var sessionOpeningID: String?
     @ObservationIgnored private var pendingCachedTranscript: CachedTranscript?
     @ObservationIgnored private var pendingPresentedTranscript: [TranscriptEntry]?
     private var sessionMutationRequestID: String?
+    @ObservationIgnored private var pendingDeletedSessionID: String?
     @ObservationIgnored private var sessionToRestoreID: String?
     @ObservationIgnored private var configRequestID: String?
     @ObservationIgnored private var defaultConfigRequestID: String?
@@ -589,6 +629,8 @@ final class AppModel {
     @ObservationIgnored private var sessionOpenCursor: UInt64?
     @ObservationIgnored private var replayRequestID: String?
     @ObservationIgnored private var replaySnapshotSequence: UInt64?
+    @ObservationIgnored private var historyRequestID: String?
+    @ObservationIgnored private var nextHistoryBeforeSequence: UInt64?
     @ObservationIgnored private var previewSelections: [String: FrontendPickerOption] = [:]
     @ObservationIgnored private var appIsInBackground = true
 
@@ -597,7 +639,12 @@ final class AppModel {
         store: GatewayStore? = nil,
         settingsDefaults: UserDefaults = .standard,
         appLockAuthenticator: AppLockAuthenticator? = nil,
-        requestSender: (@MainActor @Sendable (GatewayRequest) async throws -> Void)? = nil
+        requestSender: (@MainActor @Sendable (GatewayRequest) async throws -> Void)? = nil,
+        connectionOpener: (
+            @MainActor @Sendable (GatewayEndpoint) async throws
+                -> AsyncThrowingStream<GatewayEnvelope, Error>
+        )? = nil,
+        reconnectDelay: (@Sendable (Int) -> Duration)? = nil
     ) {
         let client = client ?? GatewayClient()
         let store = store ?? GatewayStore()
@@ -610,9 +657,19 @@ final class AppModel {
         self.requestSender = requestSender ?? { request in
             try await client.send(request)
         }
+        self.connectionOpener = connectionOpener ?? { endpoint in
+            try await client.connect(to: endpoint)
+        }
+        self.reconnectDelay = reconnectDelay ?? { attempt in
+            let seconds = min(
+                8,
+                0.5 * pow(2, Double(min(attempt, 4))) * Double.random(in: 0.75...1.25)
+            )
+            return .milliseconds(Int64(seconds * 1_000))
+        }
         self.accounts = store.loadAccounts()
         self.selectedAccountID = store.selectedAccountID()
-        self.theme = ThemePreference(rawValue: UserDefaults.standard.string(forKey: "theme") ?? "") ?? .system
+        self.theme = ThemePreference(rawValue: settingsDefaults.string(forKey: "theme") ?? "") ?? .system
         self.appLockEnabled = appLockEnabled
         self.isAppLocked = appLockEnabled
         self.appLockAuthenticationMethod = appLockAuthenticator.method
@@ -639,7 +696,9 @@ final class AppModel {
 
     deinit {
         eventTask?.cancel()
+        reconnectTask?.cancel()
         deltaFlushTask?.cancel()
+        composerDraftSaveTask?.cancel()
         pairingCodeExpiryTask?.cancel()
         toastDismissTask?.cancel()
     }
@@ -885,6 +944,7 @@ final class AppModel {
     }
 
     private func prefillPairing(_ parse: () throws -> GatewayPairingSetup) {
+        cancelReconnect()
         showsPairing = true
         do {
             let setup = try parse()
@@ -897,6 +957,8 @@ final class AppModel {
     }
 
     func pair() {
+        cancelReconnect()
+        automaticReconnectBlocked = false
         pairingError = nil
         do {
             let endpoint = try GatewayEndpoint(pairingEndpoint)
@@ -919,7 +981,7 @@ final class AppModel {
             pendingPairingAccount = account
             beginConnection(to: endpoint, generation: generation) { [weak self] in
                 guard let self, self.connectionGeneration == generation else { return }
-                try await self.client.send(.pair(
+                try await self.requestSender(.pair(
                     code: code,
                     clientLabel: "Horus Apple",
                     clientKind: .currentApplePlatform
@@ -955,6 +1017,7 @@ final class AppModel {
 
     func setSceneActive(_ active: Bool) {
         guard active else {
+            cancelReconnect()
             reconnectsOnActivation = true
             return
         }
@@ -1017,23 +1080,30 @@ final class AppModel {
 
     func forgetSelectedGateway() {
         guard let account = selectedAccount else { return }
-        do {
-            try store.remove(account)
-            accounts.removeAll { $0.id == account.id }
-            selectedAccountID = nil
-            if let next = accounts.first {
-                connect(to: next)
-            } else {
-                let generation = resetGatewayState(preservingDrafts: false)
-                Task { [weak self] in
-                    guard let self, self.connectionGeneration == generation else { return }
-                    await self.client.disconnect()
+        cancelReconnect()
+        let pendingDraftIO = composerDraftIOTask
+        discardComposerDraft()
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                await pendingDraftIO?.value
+                try await store.remove(account)
+                accounts.removeAll { $0.id == account.id }
+                selectedAccountID = nil
+                if let next = accounts.first {
+                    connect(to: next)
+                } else {
+                    let generation = resetGatewayState(preservingDrafts: false)
+                    Task { [weak self] in
+                        guard let self, self.connectionGeneration == generation else { return }
+                        await self.client.disconnect()
+                    }
+                    showsPairing = true
                 }
-                showsPairing = true
+                showToast("Gateway removed.", tone: .info)
+            } catch {
+                showToast(error.localizedDescription, tone: .error)
             }
-            showToast("Gateway removed.", tone: .info)
-        } catch {
-            showToast(error.localizedDescription, tone: .error)
         }
     }
 
@@ -1043,16 +1113,56 @@ final class AppModel {
 
     func openSession(_ sessionID: String) {
         guard canOpenSession, sessionID != selectedSessionID else { return }
-        let cached = selectedAccountID.flatMap {
-            store.loadTranscript(accountID: $0, sessionID: sessionID)
+        let generation = UUID()
+        transcriptLoadGeneration = generation
+        let accountID = selectedAccountID
+        let previous = transcriptIOTask
+        transcriptIOTask = Task { [weak self, store] in
+            await previous?.value
+            let cached: CachedTranscript? = if let accountID {
+                await store.loadTranscript(accountID: accountID, sessionID: sessionID)
+            } else {
+                nil
+            }
+            guard let self,
+                  generation == transcriptLoadGeneration,
+                  accountID == selectedAccountID,
+                  canOpenSession,
+                  sessionID != selectedSessionID
+            else { return }
+            requestSessionOpen(
+                sessionID,
+                lastSequence: cached?.sequence,
+                replayEpoch: cached?.replayEpoch,
+                cachedTranscript: cached,
+                presentedTranscript: cached?.transcript
+            )
         }
-        requestSessionOpen(
-            sessionID,
-            lastSequence: cached?.sequence,
-            replayEpoch: cached?.replayEpoch,
-            cachedTranscript: cached,
-            presentedTranscript: cached?.transcript
-        )
+    }
+
+    func loadEarlierHistory() {
+        guard canLoadEarlierHistory else { return }
+        let source = replayPresentedTranscript ?? transcript
+        if source.count > visibleTranscriptLimit {
+            visibleTranscriptLimit = min(source.count, visibleTranscriptLimit + 300)
+            return
+        }
+        guard let sessionID = selectedSessionID,
+              let beforeSequence = nextHistoryBeforeSequence
+        else { return }
+        let id = requestID("history")
+        historyRequestID = id
+        isLoadingEarlierHistory = true
+        transmit(.getSessionHistory(
+            requestID: id,
+            sessionID: sessionID,
+            beforeSequence: beforeSequence,
+            maxBatches: 20
+        )) { [weak self] _ in
+            guard self?.historyRequestID == id else { return }
+            self?.historyRequestID = nil
+            self?.isLoadingEarlierHistory = false
+        }
     }
 
     func restoreSession(_ sessionID: String) {
@@ -1067,6 +1177,7 @@ final class AppModel {
         let base = CachedTranscript(
             replayEpoch: epoch,
             sequence: sequence,
+            nextBeforeSequence: nextHistoryBeforeSequence,
             transcript: transcript,
             currentUsage: currentUsage,
             lastUsage: lastUsage
@@ -1074,6 +1185,7 @@ final class AppModel {
         let presentation = CachedTranscript(
             replayEpoch: epoch,
             sequence: sequence,
+            nextBeforeSequence: nextHistoryBeforeSequence,
             transcript: displayedTranscript,
             currentUsage: currentUsage,
             lastUsage: lastUsage
@@ -1155,21 +1267,29 @@ final class AppModel {
     func deleteSession(_ session: SessionRecord) {
         guard sessionMutationRequestID == nil else { return }
         if let accountID = selectedAccountID {
-            store.removeTranscript(accountID: accountID, sessionID: session.sessionId)
+            enqueueTranscriptIO { [store] in
+                await store.removeTranscript(accountID: accountID, sessionID: session.sessionId)
+            }
         }
         let id = requestID("session-delete")
         sessionMutationRequestID = id
+        pendingDeletedSessionID = session.sessionId
         transmit(.deleteSession(
             requestID: id,
             sessionID: session.sessionId
         )) { [weak self] _ in
-            if self?.sessionMutationRequestID == id { self?.sessionMutationRequestID = nil }
+            guard self?.sessionMutationRequestID == id else { return }
+            self?.sessionMutationRequestID = nil
+            self?.pendingDeletedSessionID = nil
         }
     }
 
     private func refreshWorkspaceChanges() {
         refreshGitDiff()
-        guard showsInspector, inspectorPage == .changes else { return }
+        guard showsInspector,
+              inspectorPage == .changes,
+              workspaceFileScope == .all
+        else { return }
         refreshWorkspaceFiles()
     }
 
@@ -1191,11 +1311,18 @@ final class AppModel {
         workspaceFiles = []
         workspaceFilesRequestID = nil
         isLoadingWorkspaceFiles = false
-        refreshWorkspaceFiles()
+        if scope == .modified {
+            refreshGitDiff()
+        } else {
+            refreshWorkspaceFiles()
+        }
     }
 
     private func refreshWorkspaceFiles() {
-        guard connectionState.isReady, let sessionID = selectedSessionID else { return }
+        guard workspaceFileScope == .all,
+              connectionState.isReady,
+              let sessionID = selectedSessionID
+        else { return }
         let id = requestID("workspace-files")
         workspaceFilesRequestID = id
         isLoadingWorkspaceFiles = true
@@ -1411,7 +1538,14 @@ final class AppModel {
             op = .userInput(text: text, attachments: attachments)
         }
         pendingDrafts[id] = PendingComposerDraft(text: text, attachments: attachments)
+        composerDraftSaveTask?.cancel()
+        composerDraftSaveTask = nil
+        if let owner = composerDraftOwner {
+            enqueueComposerDraftSave(text, owner: owner)
+        }
+        suppressesComposerDraftSave = true
         composer = ""
+        suppressesComposerDraftSave = false
         composerAttachments = []
         transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: op))) { [weak self] _ in
             self?.restoreDraft(id: id)
@@ -1819,7 +1953,7 @@ final class AppModel {
 
     func setTheme(_ theme: ThemePreference) {
         self.theme = theme
-        UserDefaults.standard.set(theme.rawValue, forKey: "theme")
+        settingsDefaults.set(theme.rawValue, forKey: "theme")
     }
 
     func refreshAppLockAuthenticationMethod() {
@@ -1845,6 +1979,9 @@ final class AppModel {
 
     func appDidEnterBackground() {
         appIsInBackground = true
+        cancelReconnect()
+        reconnectsOnActivation = true
+        flushComposerDraft()
         guard appLockEnabled else { return }
         discardAttachmentPreview()
         isAppLocked = true
@@ -1881,7 +2018,12 @@ final class AppModel {
         return true
     }
 
-    private func connect(to account: GatewayAccount) {
+    private func connect(to account: GatewayAccount, retrying: Bool = false) {
+        cancelReconnect()
+        if !retrying {
+            reconnectAttempt = 0
+            automaticReconnectBlocked = false
+        }
         let sameGateway = account.id == selectedAccountID
         let sessionID = sameGateway ? selectedSessionID : nil
         let generation = resetGatewayState(
@@ -1900,12 +2042,13 @@ final class AppModel {
                 let token = try self.store.token(for: account)
                 self.beginConnection(to: account.endpoint, generation: generation) { [weak self] in
                     guard let self, self.connectionGeneration == generation else { return }
-                    try await self.client.send(.authenticate(
+                    try await self.requestSender(.authenticate(
                         token: token,
                         clientKind: .currentApplePlatform
                     ))
                 }
             } catch {
+                self.automaticReconnectBlocked = true
                 self.connectionState = .failed(error.localizedDescription)
                 self.showToast(error.localizedDescription, tone: .error)
                 if let storeError = error as? GatewayStore.StoreError,
@@ -1926,7 +2069,7 @@ final class AppModel {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let stream = try await self.client.connect(to: endpoint)
+                let stream = try await self.connectionOpener(endpoint)
                 guard generation == self.connectionGeneration else { return }
                 self.connectionState = .authenticating
                 self.eventTask = Task { [weak self] in
@@ -1991,8 +2134,17 @@ final class AppModel {
         case .sessionReplayComplete(let requestID, let sessionID):
             guard requestID == replayRequestID, sessionID == selectedSessionID else { break }
             finishSessionReplay()
-        case .sessionHistory:
-            break
+        case .sessionHistory(
+            let requestID,
+            let sessionID,
+            let events,
+            let nextBeforeSequence
+        ):
+            guard requestID == historyRequestID, sessionID == selectedSessionID else { break }
+            historyRequestID = nil
+            isLoadingEarlierHistory = false
+            prependHistory(events)
+            self.nextHistoryBeforeSequence = nextBeforeSequence
         case .sessionChanged(let payload):
             guard payload.session.sessionId == selectedSessionID,
                   payload.config.revision >= (agentSnapshot?.revision ?? 0)
@@ -2063,9 +2215,6 @@ final class AppModel {
             }
         case .profile(_, let profile):
             self.profile = profile
-        case .artifacts(_, let sessionID, let artifacts):
-            guard sessionID == selectedSessionID else { break }
-            self.artifacts = artifacts
         case .gitDiff(let requestID, let sessionID, let scope, let diff):
             guard requestID == gitDiffRequestID,
                   sessionID == selectedSessionID,
@@ -2155,10 +2304,17 @@ final class AppModel {
         case .error(let failure):
             if pendingPairingAccount != nil { pairingError = failure.message }
             if failure.code == "unauthorized", pendingPairingAccount == nil {
+                automaticReconnectBlocked = true
+                cancelReconnect()
                 repairSelectedGateway()
             }
             showToast(failure.message, tone: .error)
             if failure.fatal {
+                automaticReconnectBlocked = true
+                cancelReconnect()
+                connectionGeneration = UUID()
+                eventTask?.cancel()
+                eventTask = nil
                 restorePendingDrafts()
                 connectionState = .failed(failure.message)
             }
@@ -2202,18 +2358,27 @@ final class AppModel {
               activeTurnID == nil,
               pendingApproval == nil
         else { return }
-        store.saveTranscript(
-            accountID: accountID,
-            sessionID: sessionID,
+        let snapshot = CachedTranscript(
             replayEpoch: currentReplayEpoch,
             sequence: latestSequence,
+            nextBeforeSequence: nextHistoryBeforeSequence,
             transcript: transcript,
             currentUsage: currentUsage,
             lastUsage: lastUsage
         )
+        enqueueTranscriptIO { [store] in
+            await store.saveTranscript(
+                snapshot,
+                accountID: accountID,
+                sessionID: sessionID
+            )
+        }
     }
 
     private func applyGatewayReady(_ payload: ReadyPayload) {
+        cancelReconnect()
+        reconnectAttempt = 0
+        automaticReconnectBlocked = false
         applyGatewayCatalog(payload)
         if sessionRequestID == nil { connectionState = .ready }
         applySessions(payload.sessions)
@@ -2259,6 +2424,7 @@ final class AppModel {
     }
 
     func applyGatewayCatalog(_ payload: ReadyPayload) {
+        gatewayMachineName = payload.machineName
         let previousDefault = defaultAgentSnapshot
         providerStatuses = payload.providers
         modelChoices = payload.models
@@ -2293,6 +2459,9 @@ final class AppModel {
             : nil
         if selectedSessionID != payload.session.sessionId {
             restorePendingDrafts()
+            changeComposerDraftOwner(to: selectedAccountID.map {
+                ComposerDraftOwner(accountID: $0, sessionID: payload.session.sessionId)
+            })
             resetSessionState()
         }
         if opened {
@@ -2306,6 +2475,11 @@ final class AppModel {
             pendingPresentedTranscript = nil
             replayPresentedTranscript = presented ?? []
             transcript = cached?.transcript ?? []
+            if let cached {
+                nextHistoryBeforeSequence = cached.nextBeforeSequence
+            } else {
+                nextHistoryBeforeSequence = payload.nextBeforeSequence
+            }
             if let cached {
                 currentUsage = cached.currentUsage
                 lastUsage = cached.lastUsage
@@ -2348,14 +2522,24 @@ final class AppModel {
     }
 
     func applySessions(_ records: [SessionRecord]) {
-        let previous = Dictionary(uniqueKeysWithValues: sessions.map { ($0.sessionId, $0.activity) })
-        sessions = records.filter(\.catalogVisible)
-        for session in sessions {
-            applyActivityTransition(
-                from: previous[session.sessionId],
-                to: session.activity,
-                sessionID: session.sessionId
+        let visibleSessions = records.filter(\.catalogVisible)
+        guard Set(visibleSessions.map(\.sessionId)).count == visibleSessions.count else {
+            showToast("The gateway returned duplicate chat identifiers.", tone: .error)
+            return
+        }
+        if sessions != visibleSessions {
+            let previous = Dictionary(
+                sessions.map { ($0.sessionId, $0.activity) },
+                uniquingKeysWith: { _, latest in latest }
             )
+            sessions = visibleSessions
+            for session in sessions {
+                applyActivityTransition(
+                    from: previous[session.sessionId],
+                    to: session.activity,
+                    sessionID: session.sessionId
+                )
+            }
         }
         if let selected = sessions.first(where: { $0.sessionId == selectedSessionID }) {
             applyExecutionStats(selected.executionStats)
@@ -2425,18 +2609,13 @@ final class AppModel {
 
     private func requestSessionData() {
         guard selectedSessionID != nil else { return }
-        refreshArtifacts()
         refreshWorkspaceChanges()
         refreshAttachments()
         refreshCron()
     }
 
-    private func refreshArtifacts() {
-        guard let sessionID = selectedSessionID else { return }
-        transmit(.listArtifacts(requestID: requestID("artifacts"), sessionID: sessionID))
-    }
-
     private func clearSelectedSession() {
+        changeComposerDraftOwner(to: nil)
         latestSequence = nil
         currentReplayEpoch = nil
         sessionOpenCursor = nil
@@ -2446,6 +2625,7 @@ final class AppModel {
     }
 
     private func handleAccepted(_ requestID: String) {
+        if pendingDrafts[requestID] != nil { flushComposerDraft() }
         if requestID == approvalRequestID {
             pendingApproval = nil
             approvalRequestID = nil
@@ -2455,6 +2635,12 @@ final class AppModel {
             configRequestID = nil
         }
         if requestID == sessionMutationRequestID {
+            if let sessionID = pendingDeletedSessionID, let accountID = selectedAccountID {
+                let owner = ComposerDraftOwner(accountID: accountID, sessionID: sessionID)
+                enqueueComposerDraftSave("", owner: owner)
+                if composerDraftOwner == owner { discardComposerDraft() }
+            }
+            pendingDeletedSessionID = nil
             transmit(.listSessions(requestID: requestID)) { [weak self] _ in
                 if self?.sessionMutationRequestID == requestID {
                     self?.sessionMutationRequestID = nil
@@ -2473,12 +2659,21 @@ final class AppModel {
     }
 
     private func handleRejected(_ rejection: GatewayRejection) {
+        if rejection.requestId == historyRequestID {
+            historyRequestID = nil
+            isLoadingEarlierHistory = false
+        }
+        if rejection.requestId == sessionMutationRequestID {
+            pendingDeletedSessionID = nil
+        }
         if rejection.requestId == sessionRequestID,
            rejection.code == "replay_unavailable",
            let sessionID = sessionOpeningID,
            sessionOpenCursor != nil {
             if let accountID = selectedAccountID {
-                store.removeTranscript(accountID: accountID, sessionID: sessionID)
+                enqueueTranscriptIO { [store] in
+                    await store.removeTranscript(accountID: accountID, sessionID: sessionID)
+                }
             }
             sessionRequestID = nil
             sessionOpenCursor = nil
@@ -2573,6 +2768,11 @@ final class AppModel {
                 : .error
         )
         if rejection.fatal {
+            automaticReconnectBlocked = true
+            cancelReconnect()
+            connectionGeneration = UUID()
+            eventTask?.cancel()
+            eventTask = nil
             restorePendingDrafts()
             connectionState = .failed(rejection.message)
         }
@@ -2612,6 +2812,7 @@ final class AppModel {
                 previewSelections.removeValue(forKey: submissionID)
             } else {
                 pendingDrafts.removeValue(forKey: submissionID)
+                flushComposerDraft()
             }
         }
 
@@ -2799,17 +3000,24 @@ final class AppModel {
     }
 
     private func apply(_ block: FrontendBlock) {
+        apply(block, to: &transcript)
+        if block.format == "unified_diff", !block.pending {
+            refreshWorkspaceChanges()
+        }
+    }
+
+    private func apply(_ block: FrontendBlock, to entries: inout [TranscriptEntry]) {
         let id = block.id ?? UUID().uuidString
         let kind: TranscriptEntry.Kind = block.tone == "error" ? .error : .event
-        if let index = transcript.firstIndex(where: { $0.id == id }) {
-            transcript[index].text = block.append ? transcript[index].text + block.text : block.text
-            transcript[index].kind = kind
-            if block.group != nil { transcript[index].group = block.group }
-            transcript[index].pending = block.pending
-            transcript[index].format = block.format
-            transcript[index].tone = block.tone
+        if let index = entries.firstIndex(where: { $0.id == id }) {
+            entries[index].text = block.append ? entries[index].text + block.text : block.text
+            entries[index].kind = kind
+            if block.group != nil { entries[index].group = block.group }
+            entries[index].pending = block.pending
+            entries[index].format = block.format
+            entries[index].tone = block.tone
         } else {
-            transcript.append(TranscriptEntry(
+            entries.append(TranscriptEntry(
                 id: id,
                 text: block.append ? String(block.text.drop(while: { $0 == "\n" })) : block.text,
                 kind: kind,
@@ -2818,10 +3026,6 @@ final class AppModel {
                 tone: block.tone,
                 pending: block.pending
             ))
-        }
-        if block.format == "unified_diff", !block.pending {
-            refreshArtifacts()
-            refreshWorkspaceChanges()
         }
     }
 
@@ -2922,9 +3126,27 @@ final class AppModel {
         messageTarget: MessageTarget? = nil,
         attachments: [AttachmentRecord] = []
     ) {
+        appendText(
+            text,
+            kind: kind,
+            tone: tone,
+            messageTarget: messageTarget,
+            attachments: attachments,
+            to: &transcript
+        )
+    }
+
+    private func appendText(
+        _ text: String?,
+        kind: TranscriptEntry.Kind,
+        tone: String = "neutral",
+        messageTarget: MessageTarget? = nil,
+        attachments: [AttachmentRecord] = [],
+        to entries: inout [TranscriptEntry]
+    ) {
         let text = text ?? ""
         guard !text.isEmpty || !attachments.isEmpty else { return }
-        transcript.append(TranscriptEntry(
+        entries.append(TranscriptEntry(
             id: UUID().uuidString,
             text: text,
             kind: kind,
@@ -2982,12 +3204,26 @@ final class AppModel {
         kind: TranscriptEntry.Kind,
         messageTarget: MessageTarget?
     ) {
-        if let index = transcript.lastIndex(where: { $0.pending && $0.kind == kind }) {
-            transcript[index].text = text
-            transcript[index].pending = false
-            transcript[index].messageTarget = messageTarget
+        completeStream(
+            text: text,
+            kind: kind,
+            messageTarget: messageTarget,
+            in: &transcript
+        )
+    }
+
+    private func completeStream(
+        text: String,
+        kind: TranscriptEntry.Kind,
+        messageTarget: MessageTarget?,
+        in entries: inout [TranscriptEntry]
+    ) {
+        if let index = entries.lastIndex(where: { $0.pending && $0.kind == kind }) {
+            entries[index].text = text
+            entries[index].pending = false
+            entries[index].messageTarget = messageTarget
         } else {
-            appendText(text, kind: kind, messageTarget: messageTarget)
+            appendText(text, kind: kind, messageTarget: messageTarget, to: &entries)
         }
     }
 
@@ -2998,6 +3234,111 @@ final class AppModel {
     private func finishPendingTranscriptEntries() {
         for entry in transcript where entry.pending {
             entry.pending = false
+        }
+    }
+
+    private func prependHistory(_ events: [RenderedEventRecord]) {
+        var earlier: [TranscriptEntry] = []
+        for event in events where event.event["frontendType"]?.stringValue != "picker" {
+            reduceHistory(event, into: &earlier)
+        }
+        let existingIDs = Set(transcript.map(\.id))
+        let existingTargets = Set(transcript.compactMap(\.messageTarget))
+        earlier.removeAll {
+            existingIDs.contains($0.id)
+                || $0.messageTarget.map(existingTargets.contains) == true
+        }
+        guard !earlier.isEmpty else { return }
+        transcript.insert(contentsOf: earlier, at: 0)
+        visibleTranscriptLimit += earlier.count
+    }
+
+    private func reduceHistory(
+        _ rendered: RenderedEventRecord,
+        into entries: inout [TranscriptEntry]
+    ) {
+        let event = rendered.event
+        let type = event["type"]?.stringValue ?? "unknown"
+        for block in rendered.blocks { apply(block, to: &entries) }
+        let wasRendered = !rendered.blocks.isEmpty
+
+        switch type {
+        case "user_message":
+            let attachments = event["attachments"]?.arrayValue?.compactMap {
+                try? AttachmentRecord(json: $0)
+            } ?? []
+            appendText(
+                event["message"]?.stringValue,
+                kind: .user,
+                messageTarget: messageTarget(from: event),
+                attachments: attachments,
+                to: &entries
+            )
+        case "agent_message_content_delta", "agent_reasoning_content_delta":
+            guard let itemID = event["itemId"]?.stringValue else { return }
+            let reasoning = type == "agent_reasoning_content_delta"
+            let id = reasoning ? "reasoning-\(itemID)" : itemID
+            let kind: TranscriptEntry.Kind = reasoning
+                ? .reasoning
+                : (event["phase"]?.stringValue == "commentary" ? .event : .assistant)
+            let delta = event["delta"]?.stringValue ?? ""
+            guard !delta.isEmpty else { return }
+            if let index = entries.lastIndex(where: { $0.id == id }) {
+                entries[index].text.append(delta)
+            } else {
+                entries.append(TranscriptEntry(
+                    id: id,
+                    text: delta,
+                    kind: kind,
+                    format: "plain_text",
+                    tone: "neutral",
+                    pending: true
+                ))
+            }
+        case "agent_message":
+            let kind: TranscriptEntry.Kind = event["phase"]?.stringValue == "commentary"
+                ? .event
+                : .assistant
+            if wasRendered {
+                entries.removeAll { $0.pending && $0.kind == kind }
+            } else {
+                completeStream(
+                    text: event["message"]?.stringValue ?? "",
+                    kind: kind,
+                    messageTarget: messageTarget(from: event),
+                    in: &entries
+                )
+            }
+        case "task_complete":
+            for entry in entries where entry.pending { entry.pending = false }
+        case "web_search_begin":
+            appendText("Searching the web", kind: .event, tone: "warning", to: &entries)
+        case "web_search_end":
+            let query = event["query"]?.stringValue
+                ?? event["action"]?.stringValue
+                ?? "Web search complete"
+            appendText("Searched: \(query)", kind: .event, tone: "success", to: &entries)
+        case "turn_aborted":
+            for entry in entries where entry.pending { entry.pending = false }
+            appendText(
+                "Turn aborted: \(event["reason"]?.stringValue ?? "Unknown reason")",
+                kind: .event,
+                tone: "warning",
+                to: &entries
+            )
+        case "warning":
+            appendText(event["message"]?.stringValue, kind: .event, tone: "warning", to: &entries)
+        case "error":
+            appendText(
+                event["message"]?.stringValue ?? "Agent error",
+                kind: .error,
+                tone: "error",
+                to: &entries
+            )
+        case "frontend":
+            if let block = renderedBlock(from: event) { apply(block, to: &entries) }
+        default:
+            break
         }
     }
 
@@ -3470,6 +3811,111 @@ final class AppModel {
         "\(prefix)-\(UUID().uuidString.lowercased())"
     }
 
+    private func enqueueTranscriptIO(
+        _ operation: @escaping @MainActor @Sendable () async -> Void
+    ) {
+        let previous = transcriptIOTask
+        transcriptIOTask = Task {
+            await previous?.value
+            await operation()
+        }
+    }
+
+    private func scheduleComposerDraftSave() {
+        guard !suppressesComposerDraftSave,
+              !isLoadingComposerDraft,
+              let owner = composerDraftOwner
+        else { return }
+        composerDraftSaveTask?.cancel()
+        let text = composer
+        composerDraftSaveTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(400))
+            } catch {
+                return
+            }
+            guard let self, owner == composerDraftOwner else { return }
+            composerDraftSaveTask = nil
+            enqueueComposerDraftSave(text, owner: owner)
+        }
+    }
+
+    private func flushComposerDraft() {
+        composerDraftSaveTask?.cancel()
+        composerDraftSaveTask = nil
+        guard let owner = composerDraftOwner else { return }
+        enqueueComposerDraftSave(composer, owner: owner)
+    }
+
+    private func enqueueComposerDraftSave(_ text: String, owner: ComposerDraftOwner) {
+        let previous = composerDraftIOTask
+        let store = store
+        composerDraftIOTask = Task {
+            await previous?.value
+            await store.saveComposerDraft(
+                text,
+                accountID: owner.accountID,
+                sessionID: owner.sessionID
+            )
+        }
+    }
+
+    private func changeComposerDraftOwner(to owner: ComposerDraftOwner?) {
+        guard owner != composerDraftOwner else { return }
+        composerDraftSaveTask?.cancel()
+        composerDraftSaveTask = nil
+        let previousOwner = composerDraftOwner
+        let previousText = composer
+        let previousIO = composerDraftIOTask
+        let generation = UUID()
+        composerDraftGeneration = generation
+        composerDraftOwner = owner
+        isLoadingComposerDraft = owner != nil
+        suppressesComposerDraftSave = true
+        composer = previousOwner == nil ? previousText : ""
+        suppressesComposerDraftSave = false
+        let store = store
+        composerDraftIOTask = Task { [weak self] in
+            await previousIO?.value
+            if let previousOwner {
+                await store.saveComposerDraft(
+                    previousText,
+                    accountID: previousOwner.accountID,
+                    sessionID: previousOwner.sessionID
+                )
+            }
+            guard let owner else { return }
+            let restored = await store.loadComposerDraft(
+                accountID: owner.accountID,
+                sessionID: owner.sessionID
+            )
+            guard let self,
+                  composerDraftGeneration == generation,
+                  composerDraftOwner == owner
+            else { return }
+            suppressesComposerDraftSave = true
+            if composer.isEmpty {
+                composer = restored
+            } else if !restored.isEmpty {
+                composer = "\(restored)\n\n\(composer)"
+            }
+            suppressesComposerDraftSave = false
+            isLoadingComposerDraft = false
+            scheduleComposerDraftSave()
+        }
+    }
+
+    private func discardComposerDraft() {
+        composerDraftSaveTask?.cancel()
+        composerDraftSaveTask = nil
+        composerDraftGeneration = UUID()
+        composerDraftOwner = nil
+        isLoadingComposerDraft = false
+        suppressesComposerDraftSave = true
+        composer = ""
+        suppressesComposerDraftSave = false
+    }
+
     private func restoreDraft(id: String) {
         guard let draft = pendingDrafts.removeValue(forKey: id) else { return }
         restoreDraft(draft)
@@ -3507,6 +3953,9 @@ final class AppModel {
 
     private func connectionEnded(generation: UUID, message: String) {
         guard connectionGeneration == generation else { return }
+        connectionGeneration = UUID()
+        transcriptLoadGeneration = UUID()
+        eventTask = nil
         connectionState = .failed(message)
         attachmentUploadRequests.removeAll()
         activeAttachmentUpload = nil
@@ -3520,7 +3969,42 @@ final class AppModel {
         discardAttachmentPreview()
         restorePendingDrafts()
         if pendingPairingAccount != nil { pairingError = message }
-        showToast(message, tone: .error)
+        if reconnectAttempt == 0 { showToast(message, tone: .error) }
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        guard reconnectTask == nil,
+              !automaticReconnectBlocked,
+              pendingPairingAccount == nil,
+              let account = selectedAccount
+        else { return }
+        guard !appIsInBackground else {
+            reconnectsOnActivation = true
+            return
+        }
+        let attempt = reconnectAttempt
+        reconnectAttempt += 1
+        let generation = connectionGeneration
+        reconnectTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(for: reconnectDelay(attempt))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  generation == connectionGeneration,
+                  selectedAccountID == account.id
+            else { return }
+            reconnectTask = nil
+            connect(to: account, retrying: true)
+        }
+    }
+
+    private func cancelReconnect() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
     }
 
     @discardableResult
@@ -3528,8 +4012,10 @@ final class AppModel {
         preservingDrafts: Bool,
         preservingSession: Bool = false
     ) -> UUID {
+        if !preservingSession { changeComposerDraftOwner(to: nil) }
         if preservingSession { flushStreamDeltas() }
         connectionGeneration = UUID()
+        transcriptLoadGeneration = UUID()
         eventTask?.cancel()
         eventTask = nil
         if !preservingSession {
@@ -3539,6 +4025,12 @@ final class AppModel {
         sessionOpenCursor = nil
         replayRequestID = nil
         replaySnapshotSequence = nil
+        historyRequestID = nil
+        isLoadingEarlierHistory = false
+        if !preservingSession {
+            nextHistoryBeforeSequence = nil
+            visibleTranscriptLimit = 300
+        }
         if !preservingSession { replayPresentedTranscript = nil }
         if preservingDrafts {
             discardPendingComposerAttachments()
@@ -3555,6 +4047,7 @@ final class AppModel {
         pendingCachedTranscript = nil
         pendingPresentedTranscript = nil
         sessionMutationRequestID = nil
+        pendingDeletedSessionID = nil
         sessionToRestoreID = nil
         configRequestID = nil
         defaultConfigRequestID = nil
@@ -3579,6 +4072,7 @@ final class AppModel {
         }
         if !preservingSession {
             sessions = []
+            gatewayMachineName = ""
             selectedSessionID = nil
             unreadSessionIDs.removeAll()
             profile = nil
@@ -3645,6 +4139,10 @@ final class AppModel {
         replayRequestID = nil
         replaySnapshotSequence = nil
         replayPresentedTranscript = nil
+        historyRequestID = nil
+        isLoadingEarlierHistory = false
+        nextHistoryBeforeSequence = nil
+        visibleTranscriptLimit = 300
         activeTurnID = nil
         activeOperation = nil
         runStats = RunStats()
@@ -3654,7 +4152,6 @@ final class AppModel {
         approvalRequestID = nil
         pendingPicker = nil
         mountedWidgets = []
-        artifacts = []
         previews = []
         presentedPreview = nil
         previewSelections.removeAll()

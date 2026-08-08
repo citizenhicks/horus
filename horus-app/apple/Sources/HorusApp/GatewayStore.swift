@@ -1,8 +1,12 @@
 import Foundation
 import Security
 
-struct CachedTranscript: Codable {
-    private struct Entry: Codable {
+struct CachedTranscript: Codable, Sendable {
+    private struct HistoryState: Codable, Sendable {
+        let nextBeforeSequence: UInt64?
+    }
+
+    private struct Entry: Codable, Sendable {
         let id: String
         let text: String
         let kind: TranscriptEntry.Kind
@@ -44,11 +48,13 @@ struct CachedTranscript: Codable {
     let sequence: UInt64
     let currentUsage: TokenUsage
     let lastUsage: TokenUsage
+    private let history: HistoryState
     private let entries: [Entry]
 
     init(
         replayEpoch: String,
         sequence: UInt64,
+        nextBeforeSequence: UInt64?,
         transcript: [TranscriptEntry],
         currentUsage: TokenUsage,
         lastUsage: TokenUsage
@@ -57,32 +63,222 @@ struct CachedTranscript: Codable {
         self.sequence = sequence
         self.currentUsage = currentUsage
         self.lastUsage = lastUsage
+        history = HistoryState(nextBeforeSequence: nextBeforeSequence)
         entries = transcript.map(Entry.init)
     }
 
+    var nextBeforeSequence: UInt64? { history.nextBeforeSequence }
     var transcript: [TranscriptEntry] { entries.map(\.transcriptEntry) }
+
+    fileprivate func fitsCache(maximumEntries: Int, maximumContentBytes: Int) -> Bool {
+        guard entries.count <= maximumEntries else { return false }
+        var remaining = maximumContentBytes
+        func consume(_ value: String?) -> Bool {
+            guard let value else { return true }
+            let count = value.utf8.count
+            guard count <= remaining else { return false }
+            remaining -= count
+            return true
+        }
+        for entry in entries {
+            guard consume(entry.id),
+                  consume(entry.text),
+                  consume(entry.group),
+                  consume(entry.format),
+                  consume(entry.tone),
+                  entry.attachments.allSatisfy({ attachment in
+                      consume(attachment.id)
+                          && consume(attachment.name)
+                          && consume(attachment.mediaType)
+                  })
+            else { return false }
+        }
+        return true
+    }
 }
 
-@MainActor
-final class GatewayStore {
+private actor GatewayDiskStore {
     private let maximumCachedTranscriptsPerAccount = 20
     private let maximumCachedTranscriptBytes = 4 * 1024 * 1024
     private let maximumCachedTranscriptContentBytes = 3 * 1024 * 1024
     private let maximumCachedTranscriptEntries = 10_000
-    private let defaults: UserDefaults
     private let transcriptDirectory: URL
+    private let draftDirectory: URL
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+
+    init(transcriptDirectory: URL, draftDirectory: URL) {
+        self.transcriptDirectory = transcriptDirectory
+        self.draftDirectory = draftDirectory
+    }
+
+    func loadTranscript(accountID: UUID, sessionID: String) -> CachedTranscript? {
+        let url = transcriptURL(accountID: accountID, sessionID: sessionID)
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attributes[.size] as? NSNumber)?.intValue
+        else { return nil }
+        guard size <= maximumCachedTranscriptBytes,
+              let data = try? Data(contentsOf: url),
+              let cached = try? decoder.decode(CachedTranscript.self, from: data)
+        else {
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        return cached
+    }
+
+    func saveTranscript(
+        _ transcript: CachedTranscript,
+        accountID: UUID,
+        sessionID: String
+    ) {
+        let url = transcriptURL(accountID: accountID, sessionID: sessionID)
+        guard transcript.fitsCache(
+            maximumEntries: maximumCachedTranscriptEntries,
+            maximumContentBytes: maximumCachedTranscriptContentBytes
+        ) else {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        guard let data = try? encoder.encode(transcript) else { return }
+        guard data.count <= maximumCachedTranscriptBytes else {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        let directory = accountTranscriptDirectory(accountID)
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        guard (try? data.write(to: url, options: protectedWriteOptions)) != nil else { return }
+        trimTranscriptCache(in: directory)
+    }
+
+    func removeTranscript(accountID: UUID, sessionID: String) {
+        try? FileManager.default.removeItem(
+            at: transcriptURL(accountID: accountID, sessionID: sessionID)
+        )
+    }
+
+    func loadComposerDraft(accountID: UUID, sessionID: String) -> String {
+        let url = draftURL(accountID: accountID, sessionID: sessionID)
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attributes[.size] as? NSNumber)?.intValue
+        else { return "" }
+        guard size <= maximumComposerBytes,
+              let data = try? Data(contentsOf: url),
+              let draft = String(data: data, encoding: .utf8),
+              !draft.isEmpty
+        else {
+            try? FileManager.default.removeItem(at: url)
+            return ""
+        }
+        return draft
+    }
+
+    func saveComposerDraft(_ draft: String, accountID: UUID, sessionID: String) {
+        let url = draftURL(accountID: accountID, sessionID: sessionID)
+        guard !draft.isEmpty else {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        let data = Data(draft.utf8)
+        guard data.count <= maximumComposerBytes else {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        try? FileManager.default.createDirectory(
+            at: accountDraftDirectory(accountID),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: url, options: protectedWriteOptions)
+    }
+
+    func removeAccount(_ accountID: UUID) {
+        try? FileManager.default.removeItem(at: accountTranscriptDirectory(accountID))
+        try? FileManager.default.removeItem(at: accountDraftDirectory(accountID))
+    }
+
+    private var protectedWriteOptions: Data.WritingOptions {
+        #if os(iOS)
+        [.atomic, .completeFileProtection]
+        #else
+        .atomic
+        #endif
+    }
+
+    private func accountTranscriptDirectory(_ accountID: UUID) -> URL {
+        transcriptDirectory.appendingPathComponent(accountID.uuidString, isDirectory: true)
+    }
+
+    private func accountDraftDirectory(_ accountID: UUID) -> URL {
+        draftDirectory.appendingPathComponent(accountID.uuidString, isDirectory: true)
+    }
+
+    private func transcriptURL(accountID: UUID, sessionID: String) -> URL {
+        accountTranscriptDirectory(accountID)
+            .appendingPathComponent(filename(for: sessionID))
+            .appendingPathExtension("json")
+    }
+
+    private func draftURL(accountID: UUID, sessionID: String) -> URL {
+        accountDraftDirectory(accountID)
+            .appendingPathComponent(filename(for: sessionID))
+            .appendingPathExtension("txt")
+    }
+
+    private func filename(for sessionID: String) -> String {
+        Data(sessionID.utf8).base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "+", with: "-")
+    }
+
+    private func trimTranscriptCache(in directory: URL) {
+        let cached = ((try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )) ?? [])
+            .filter { $0.pathExtension == "json" }
+            .map { candidate in
+                let date = (try? candidate.resourceValues(
+                    forKeys: [.contentModificationDateKey]
+                ).contentModificationDate) ?? .distantPast
+                return (url: candidate, date: date)
+            }
+            .sorted { $0.date > $1.date }
+        for stale in cached.dropFirst(maximumCachedTranscriptsPerAccount) {
+            try? FileManager.default.removeItem(at: stale.url)
+        }
+    }
+}
+
+@MainActor
+final class GatewayStore {
+    private let defaults: UserDefaults
+    private let diskStore: GatewayDiskStore
     private let accountsKey = "paired-gateways"
     private let selectedAccountKey = "selected-gateway"
     private let keychainService = "app.horus.gateway"
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    init(defaults: UserDefaults = .standard, transcriptDirectory: URL? = nil) {
+    init(
+        defaults: UserDefaults = .standard,
+        transcriptDirectory: URL? = nil,
+        draftDirectory: URL? = nil
+    ) {
         self.defaults = defaults
-        self.transcriptDirectory = transcriptDirectory
-            ?? URL.cachesDirectory
-                .appendingPathComponent("Horus", isDirectory: true)
-                .appendingPathComponent("Transcripts", isDirectory: true)
+        diskStore = GatewayDiskStore(
+            transcriptDirectory: transcriptDirectory
+                ?? URL.cachesDirectory
+                    .appendingPathComponent("Horus", isDirectory: true)
+                    .appendingPathComponent("Transcripts", isDirectory: true),
+            draftDirectory: draftDirectory
+                ?? URL.applicationSupportDirectory
+                    .appendingPathComponent("Horus", isDirectory: true)
+                    .appendingPathComponent("Drafts", isDirectory: true)
+        )
     }
 
     func loadAccounts() -> [GatewayAccount] {
@@ -150,7 +346,7 @@ final class GatewayStore {
         return token
     }
 
-    func remove(_ account: GatewayAccount) throws {
+    func remove(_ account: GatewayAccount) async throws {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: keychainService,
@@ -165,22 +361,19 @@ final class GatewayStore {
         if selectedAccountID() == account.id {
             defaults.removeObject(forKey: selectedAccountKey)
         }
-        try? FileManager.default.removeItem(at: accountTranscriptDirectory(account.id))
+        await diskStore.removeAccount(account.id)
     }
 
-    func loadTranscript(accountID: UUID, sessionID: String) -> CachedTranscript? {
-        let url = transcriptURL(accountID: accountID, sessionID: sessionID)
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = (attributes[.size] as? NSNumber)?.intValue
-        else { return nil }
-        guard size <= maximumCachedTranscriptBytes,
-              let data = try? Data(contentsOf: url),
-              let cached = try? decoder.decode(CachedTranscript.self, from: data)
-        else {
-            try? FileManager.default.removeItem(at: url)
-            return nil
-        }
-        return cached
+    func loadTranscript(accountID: UUID, sessionID: String) async -> CachedTranscript? {
+        await diskStore.loadTranscript(accountID: accountID, sessionID: sessionID)
+    }
+
+    func saveTranscript(
+        _ transcript: CachedTranscript,
+        accountID: UUID,
+        sessionID: String
+    ) async {
+        await diskStore.saveTranscript(transcript, accountID: accountID, sessionID: sessionID)
     }
 
     func saveTranscript(
@@ -188,47 +381,35 @@ final class GatewayStore {
         sessionID: String,
         replayEpoch: String,
         sequence: UInt64,
+        nextBeforeSequence: UInt64? = nil,
         transcript: [TranscriptEntry],
         currentUsage: TokenUsage,
         lastUsage: TokenUsage
-    ) {
+    ) async {
         guard !transcript.isEmpty else { return }
-        let url = transcriptURL(accountID: accountID, sessionID: sessionID)
-        guard transcriptFitsCache(transcript) else {
-            try? FileManager.default.removeItem(at: url)
-            return
-        }
-        let directory = accountTranscriptDirectory(accountID)
-        try? FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true
-        )
-        guard let data = try? encoder.encode(CachedTranscript(
+        await saveTranscript(CachedTranscript(
             replayEpoch: replayEpoch,
             sequence: sequence,
+            nextBeforeSequence: nextBeforeSequence,
             transcript: transcript,
             currentUsage: currentUsage,
             lastUsage: lastUsage
-        )) else { return }
-        guard data.count <= maximumCachedTranscriptBytes else {
-            try? FileManager.default.removeItem(at: url)
-            return
-        }
-        trimTranscriptCache(in: directory, keeping: url)
-        #if os(iOS)
-        let options: Data.WritingOptions = [.atomic, .completeFileProtection]
-        #else
-        let options: Data.WritingOptions = .atomic
-        #endif
-        try? data.write(
-            to: url,
-            options: options
-        )
+        ), accountID: accountID, sessionID: sessionID)
     }
 
-    func removeTranscript(accountID: UUID, sessionID: String) {
-        try? FileManager.default.removeItem(
-            at: transcriptURL(accountID: accountID, sessionID: sessionID)
+    func removeTranscript(accountID: UUID, sessionID: String) async {
+        await diskStore.removeTranscript(accountID: accountID, sessionID: sessionID)
+    }
+
+    func loadComposerDraft(accountID: UUID, sessionID: String) async -> String {
+        await diskStore.loadComposerDraft(accountID: accountID, sessionID: sessionID)
+    }
+
+    func saveComposerDraft(_ draft: String, accountID: UUID, sessionID: String) async {
+        await diskStore.saveComposerDraft(
+            draft,
+            accountID: accountID,
+            sessionID: sessionID
         )
     }
 
@@ -254,57 +435,6 @@ final class GatewayStore {
         guard addStatus == errSecSuccess else { throw StoreError.keychain(addStatus) }
     }
 
-    private func accountTranscriptDirectory(_ accountID: UUID) -> URL {
-        transcriptDirectory.appendingPathComponent(accountID.uuidString, isDirectory: true)
-    }
-
-    private func transcriptURL(accountID: UUID, sessionID: String) -> URL {
-        let filename = Data(sessionID.utf8).base64EncodedString()
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "+", with: "-")
-        return accountTranscriptDirectory(accountID)
-            .appendingPathComponent(filename)
-            .appendingPathExtension("json")
-    }
-
-    private func trimTranscriptCache(in directory: URL, keeping url: URL) {
-        let cached = (try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil
-        ))?
-            .filter { $0.pathExtension == "json" && $0 != url }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-            ?? []
-        for stale in cached.dropFirst(maximumCachedTranscriptsPerAccount - 1) {
-            try? FileManager.default.removeItem(at: stale)
-        }
-    }
-
-    private func transcriptFitsCache(_ transcript: [TranscriptEntry]) -> Bool {
-        guard transcript.count <= maximumCachedTranscriptEntries else { return false }
-        var remaining = maximumCachedTranscriptContentBytes
-        func consume(_ value: String?) -> Bool {
-            guard let value else { return true }
-            let count = value.utf8.count
-            guard count <= remaining else { return false }
-            remaining -= count
-            return true
-        }
-        for entry in transcript {
-            guard consume(entry.id),
-                  consume(entry.text),
-                  consume(entry.group),
-                  consume(entry.format),
-                  consume(entry.tone),
-                  entry.attachments.allSatisfy({ attachment in
-                      consume(attachment.id)
-                          && consume(attachment.name)
-                          && consume(attachment.mediaType)
-                  })
-            else { return false }
-        }
-        return true
-    }
 }
 
 extension GatewayStore {

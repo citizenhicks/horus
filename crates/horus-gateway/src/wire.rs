@@ -45,7 +45,7 @@ mod base64_bytes {
 }
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 18;
+pub const PROTOCOL_VERSION: u16 = 19;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -483,6 +483,7 @@ pub enum ServerMessage {
 /// Gateway-wide frontend-safe state sent after authentication.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReadyPayload {
+    pub machine_name: String,
     pub sessions: Vec<SessionRecord>,
     pub providers: Vec<ProviderStatus>,
     pub default_config: Option<VersionedAgentConfig>,
@@ -497,6 +498,7 @@ pub struct ReadyPayload {
 pub struct SessionReadyPayload {
     pub replay_epoch: String,
     pub latest_sequence: u64,
+    pub next_before_sequence: Option<u64>,
     pub workspace: WorkspaceInfo,
     pub git: Option<GitStatus>,
     pub session: SessionConfiguredEvent,
@@ -1582,6 +1584,7 @@ mod tests {
     fn gateway_ready_contains_no_selected_session() {
         let frame = ServerFrame::new(ServerMessage::Ready {
             payload: ReadyPayload {
+                machine_name: "snowwhite.local".into(),
                 sessions: Vec::new(),
                 providers: Vec::new(),
                 default_config: Some(VersionedAgentConfig {
@@ -1600,10 +1603,11 @@ mod tests {
         assert_eq!(
             (
                 encoded["payload"]["max_active_sessions"].as_u64(),
+                encoded["payload"]["machine_name"].as_str(),
                 encoded["payload"].get("session"),
                 encoded["payload"].get("workspace"),
             ),
-            (Some(32), None, None)
+            (Some(32), Some("snowwhite.local"), None, None)
         );
     }
 
@@ -1616,6 +1620,7 @@ mod tests {
             "payload": {
                 "replay_epoch": "epoch-a",
                 "latest_sequence": 4,
+                "next_before_sequence": 2,
                 "workspace": { "id": "workspace-a", "path": "/workspace" },
                 "git": null,
                 "session": {
@@ -1711,9 +1716,10 @@ mod tests {
             (
                 request_id.as_str(),
                 payload.session.session_id.as_str(),
+                payload.next_before_sequence,
                 payload.contributions[0].widgets[0].action.is_some(),
             ),
-            ("request-open", "session-a", true)
+            ("request-open", "session-a", Some(2), true)
         );
     }
 

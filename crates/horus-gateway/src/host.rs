@@ -139,6 +139,7 @@ struct HostState {
     replay_epoch: String,
     sequence: u64,
     replay: VecDeque<ServerFrame>,
+    replay_truncated: bool,
     artifacts: VecDeque<ArtifactRecord>,
     widgets: SessionWidgets,
     commands: mpsc::Receiver<HostCommand>,
@@ -156,6 +157,7 @@ struct RunningAgent {
     gateway_sandbox: Arc<GatewaySandbox>,
     subagent_template: Option<Arc<OnceLock<AgentConfig>>>,
     tool_count: usize,
+    next_before_sequence: Option<u64>,
 }
 
 struct ActiveCron {
@@ -675,6 +677,7 @@ impl HostHandle {
             replay_epoch: Uuid::new_v4().to_string(),
             sequence: 0,
             replay: VecDeque::with_capacity(REPLAY_CAPACITY),
+            replay_truncated: false,
             artifacts: VecDeque::with_capacity(ARTIFACT_CAPACITY),
             widgets: BTreeMap::new(),
             commands: receiver,
@@ -1443,6 +1446,7 @@ impl HostState {
             &self.running.session_id,
             &replacement.session_id,
         );
+        self.replay_truncated = false;
         let previous = std::mem::replace(&mut self.running, replacement);
         self.accepts_file_attachments.store(
             runtime_accepts_attachments(&self.running.frontend),
@@ -1525,6 +1529,7 @@ impl HostState {
             &self.running.session_id,
             &replacement.session_id,
         );
+        self.replay_truncated = false;
         let previous = std::mem::replace(&mut self.running, replacement);
         self.accepts_file_attachments.store(
             runtime_accepts_attachments(&self.running.frontend),
@@ -1651,7 +1656,7 @@ impl HostState {
             history,
             preview,
         });
-        record_and_publish(
+        self.replay_truncated |= record_and_publish(
             &mut self.replay,
             &self.events,
             frame.clone(),
@@ -1749,6 +1754,11 @@ impl HostState {
         Ok(SessionReadyPayload {
             replay_epoch: self.replay_epoch.clone(),
             latest_sequence: self.sequence,
+            next_before_sequence: next_history_cursor(
+                self.running.next_before_sequence,
+                checkpoint.sequence,
+                self.replay_truncated,
+            ),
             workspace: self.spec.workspace_info(),
             git: git_status(&self.running.gateway_sandbox).await,
             session: self.running.session.clone(),
@@ -2181,6 +2191,7 @@ async fn gateway_ready(state: &GatewayState) -> std::result::Result<ReadyPayload
         configured_model_providers(&config, &state.store, &state.credentials).map_err(internal)?;
     let middleware_features = crate::middleware_manifest::features(&models);
     Ok(ReadyPayload {
+        machine_name: local_machine_name().map_err(internal)?,
         sessions: session_catalog(&state.checkpoints, &state.activities)
             .await
             .map_err(internal)?,
@@ -2192,6 +2203,18 @@ async fn gateway_ready(state: &GatewayState) -> std::result::Result<ReadyPayload
         middleware_features,
         max_active_sessions: MAX_ACTIVE_SESSIONS,
     })
+}
+
+fn local_machine_name() -> Result<String> {
+    let name = nix::unistd::gethostname()
+        .map_err(|error| Error::Config(format!("failed to read the machine hostname: {error}")))?
+        .into_string()
+        .map_err(|_| Error::Config("the machine hostname is not valid UTF-8".into()))?;
+    let name = name.trim();
+    if name.is_empty() || name.len() > 255 || name.chars().any(char::is_control) {
+        return Err(Error::Config("the machine hostname is invalid".into()));
+    }
+    Ok(name.to_owned())
 }
 
 fn setup_agent_config() -> VersionedAgentConfig {
@@ -2239,6 +2262,7 @@ async fn start_agent(
     let session = agent.session().clone();
     let frontend = agent.frontend().clone();
     let tool_count = agent.tool_count();
+    let next_before_sequence = agent.next_before_sequence();
     let session_id = session.session_id.clone();
     let (sender, events) = agent.into_parts();
     Ok(RunningAgent {
@@ -2250,6 +2274,7 @@ async fn start_agent(
         gateway_sandbox,
         subagent_template,
         tool_count,
+        next_before_sequence,
     })
 }
 
@@ -2382,6 +2407,18 @@ fn reset_replay_for_restart(
     previous_session == next_session
 }
 
+fn next_history_cursor(
+    initial: Option<u64>,
+    latest_checkpoint_sequence: u64,
+    replay_truncated: bool,
+) -> Option<u64> {
+    if replay_truncated && latest_checkpoint_sequence > 0 {
+        Some(latest_checkpoint_sequence.saturating_add(1))
+    } else {
+        initial
+    }
+}
+
 fn update_widgets(widgets: &mut SessionWidgets, event: &EventMsg) {
     match event {
         EventMsg::Frontend(FrontendEvent::Widget { capability, item }) => {
@@ -2422,7 +2459,8 @@ fn record_and_publish(
     events: &broadcast::Sender<ServerFrame>,
     frame: ServerFrame,
     suppress_broadcast: bool,
-) {
+) -> bool {
+    let mut truncated = false;
     if !matches!(
         &frame.message,
         ServerMessage::AgentEvent {
@@ -2435,12 +2473,14 @@ fn record_and_publish(
     ) {
         if replay.len() == REPLAY_CAPACITY {
             replay.pop_front();
+            truncated = true;
         }
         replay.push_back(frame.clone());
     }
     if !suppress_broadcast {
         let _ = events.send(frame);
     }
+    truncated
 }
 
 fn publish_ready_and_pending(
@@ -2518,7 +2558,7 @@ fn invalid_cron(error: impl std::fmt::Display) -> Rejection {
 
 #[cfg(test)]
 mod tests {
-    use horus::backend::checkpoint::Checkpoint;
+    use horus::backend::checkpoint::{Checkpoint, TranscriptPageRequest};
     use horus::backend::model::user_message;
     use horus::protocol::{SessionContext, TokenCountEvent, TokenUsageInfo};
 
@@ -2763,7 +2803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_history_pages_are_chronological_and_cursor_driven() {
+    async fn durable_history_pages_and_initial_replay_share_a_cursor() {
         let root = tempfile::tempdir().expect("root");
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
@@ -2811,6 +2851,45 @@ mod tests {
              [RenderedEvent { event: EventMsg::AgentMessage(agent), .. }])
                 if user.message == "first" && agent.message == "second"
         ));
+
+        for sequence in 3..=101 {
+            let item = user_message(&format!("message {sequence}"));
+            checkpoint.sequence = sequence;
+            checkpoint.context.push(item.clone());
+            checkpoints
+                .save(&checkpoint, &[item], None)
+                .await
+                .expect("save history item");
+        }
+        let expected = checkpoints
+            .transcript_page(
+                host.session_id(),
+                TranscriptPageRequest {
+                    before_sequence: None,
+                    max_batches: 100,
+                },
+            )
+            .await
+            .expect("initial transcript page")
+            .next_before_sequence;
+        let session_id = host.session_id().to_owned();
+        assert!(host.stop_if_idle().await);
+        gateway.state.lock().await.sessions.remove(&session_id);
+        drop(host);
+
+        let reopened = gateway
+            .open_session(&session_id)
+            .await
+            .expect("reopen session");
+        let snapshot = reopened
+            .snapshot(None, None)
+            .await
+            .expect("session snapshot");
+
+        assert_eq!(
+            (expected, snapshot.ready.next_before_sequence),
+            (Some(2), Some(2))
+        );
     }
 
     #[test]
@@ -3123,6 +3202,23 @@ mod tests {
         state.ensure_capacity().await.expect("reclaim capacity");
 
         assert_eq!(state.sessions.len(), MAX_ACTIVE_SESSIONS - 1);
+    }
+
+    #[test]
+    fn truncated_replay_pages_from_the_latest_durable_batch() {
+        assert_eq!(next_history_cursor(Some(4), 10, false), Some(4));
+        assert_eq!(next_history_cursor(Some(4), 10, true), Some(11));
+        assert_eq!(next_history_cursor(None, 0, true), None);
+
+        let frame = ServerFrame::new(ServerMessage::Error {
+            code: "test".into(),
+            message: String::new(),
+            fatal: false,
+        });
+        let mut replay = VecDeque::from(vec![frame.clone(); REPLAY_CAPACITY]);
+        let (events, _) = broadcast::channel(1);
+        assert!(record_and_publish(&mut replay, &events, frame, true));
+        assert_eq!(replay.len(), REPLAY_CAPACITY);
     }
 
     #[test]

@@ -305,6 +305,7 @@ pub struct Agent {
     model: ModelInfo,
     model_choices: Vec<ModelChoice>,
     tool_count: usize,
+    next_before_sequence: Option<u64>,
 }
 
 impl Agent {
@@ -356,6 +357,12 @@ impl Agent {
     #[must_use]
     pub const fn tool_count(&self) -> usize {
         self.tool_count
+    }
+
+    /// Returns the cursor immediately preceding the initial transcript replay.
+    #[must_use]
+    pub const fn next_before_sequence(&self) -> Option<u64> {
+        self.next_before_sequence
     }
 
     /// Separates command and event halves for a frontend event loop.

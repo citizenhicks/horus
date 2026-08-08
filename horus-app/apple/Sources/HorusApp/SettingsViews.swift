@@ -1016,7 +1016,6 @@ private struct ProfileRecentRuns: View {
 private struct UsageHeatmap: View {
     @Environment(\.horusPalette) private var palette
     @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiatesWithoutColor
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     let days: [DailyUsage]
 
     var body: some View {
@@ -1047,14 +1046,7 @@ private struct UsageHeatmap: View {
             }
         }
         GeometryReader { geometry in
-            if horizontalSizeClass == .compact {
-                ScrollView(.horizontal) {
-                    canvas.frame(width: max(geometry.size.width, 620), height: 78)
-                }
-                .scrollIndicators(.hidden)
-            } else {
-                canvas.frame(width: geometry.size.width, height: 78)
-            }
+            canvas.frame(width: geometry.size.width, height: 78)
         }
         .frame(height: 78)
         .accessibilityElement(children: .ignore)

@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 18
+let gatewayProtocolVersion = 19
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 let maximumAttachmentReferences = 16
@@ -533,7 +533,6 @@ enum GatewayRequest: Encodable, Sendable {
     case createPairingCode(requestID: String)
     case startProviderLogin(requestID: String, provider: String)
     case getProfile(requestID: String)
-    case listArtifacts(requestID: String, sessionID: String)
     case startCronSetup(requestID: String, sessionID: String, task: String?)
     case listCron(requestID: String, sessionID: String)
     case rescheduleCron(requestID: String, sessionID: String, id: String, schedule: String)
@@ -692,10 +691,6 @@ enum GatewayRequest: Encodable, Sendable {
         case .getProfile(let requestID):
             try container.encode("get_profile", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
-        case .listArtifacts(let requestID, let sessionID):
-            try container.encode("list_artifacts", forKey: "type")
-            try container.encode(requestID, forKey: "requestId")
-            try container.encode(sessionID, forKey: "sessionId")
         case .startCronSetup(let requestID, let sessionID, let task):
             try container.encode("start_cron_setup", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -767,7 +762,6 @@ enum GatewayEnvelope: Decodable, Sendable {
     )
     case providerLoginFinished(requestID: String, loginID: String, provider: String)
     case profile(requestID: String, profile: ProfileSnapshot)
-    case artifacts(requestID: String, sessionID: String, artifacts: [ArtifactRecord])
     case gitDiff(requestID: String, sessionID: String, scope: GitDiffScope, diff: String)
     case workspaceFiles(requestID: String, sessionID: String, files: [WorkspaceFileRecord])
     case workspaceFileChunk(
@@ -825,7 +819,10 @@ enum GatewayEnvelope: Decodable, Sendable {
         case "authenticated":
             self = .authenticated
         case "ready":
-            self = .ready(try container.decode(ReadyPayload.self, forKey: "payload"))
+            self = .ready(try container.decode(
+                ReadyPayload.self,
+                forKey: "payload"
+            ).validated())
         case "session_opened":
             self = .sessionOpened(
                 requestID: try container.decode(String.self, forKey: "requestId"),
@@ -853,7 +850,10 @@ enum GatewayEnvelope: Decodable, Sendable {
         case "gateway_configured":
             self = .gatewayConfigured(
                 requestID: try container.decode(String.self, forKey: "requestId"),
-                payload: try container.decode(ReadyPayload.self, forKey: "payload")
+                payload: try container.decode(
+                    ReadyPayload.self,
+                    forKey: "payload"
+                ).validated()
             )
         case "accepted":
             self = .accepted(requestID: try container.decode(String.self, forKey: "requestId"))
@@ -909,12 +909,6 @@ enum GatewayEnvelope: Decodable, Sendable {
             self = .profile(
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 profile: try container.decode(ProfileSnapshot.self, forKey: "profile")
-            )
-        case "artifacts":
-            self = .artifacts(
-                requestID: try container.decode(String.self, forKey: "requestId"),
-                sessionID: try container.decode(String.self, forKey: "sessionId"),
-                artifacts: try container.decode([ArtifactRecord].self, forKey: "artifacts")
             )
         case "git_diff":
             self = .gitDiff(
@@ -1012,6 +1006,7 @@ struct GatewayFailure: Decodable, Sendable {
 }
 
 struct ReadyPayload: Decodable, Sendable {
+    let machineName: String
     let sessions: [SessionRecord]
     let providers: [ProviderStatus]
     let defaultConfig: VersionedAgentConfig?
@@ -1021,9 +1016,25 @@ struct ReadyPayload: Decodable, Sendable {
     let maxActiveSessions: Int
 }
 
+private extension ReadyPayload {
+    func validated() throws -> Self {
+        guard machineName == machineName.trimmingCharacters(in: .whitespacesAndNewlines),
+              !machineName.isEmpty,
+              machineName.utf8.count <= 255,
+              !machineName.unicodeScalars.contains(where: {
+                  CharacterSet.controlCharacters.contains($0)
+              })
+        else {
+            throw GatewayWireError.invalidFrame("gateway machine name is invalid")
+        }
+        return self
+    }
+}
+
 struct SessionReadyPayload: Decodable, Sendable {
     let replayEpoch: String
     let latestSequence: UInt64
+    let nextBeforeSequence: UInt64?
     let workspace: WorkspaceInfo
     let git: GitStatus?
     let session: SessionConfigured
@@ -1953,14 +1964,33 @@ struct FrontendSetting: Identifiable, Decodable, Equatable, Sendable {
         description = try container.decode(String.self, forKey: .description)
         switch try container.decode(Kind.self, forKey: .type) {
         case .integer:
+            let minimum = try container.decode(Int64.self, forKey: .min)
+            let maximum = try container.decodeIfPresent(Int64.self, forKey: .max)
+            let step = try container.decode(Int64.self, forKey: .step)
+            guard maximum.map({ $0 >= minimum }) ?? true else {
+                throw GatewayWireError.invalidFrame(
+                    "frontend integer setting maximum is below minimum"
+                )
+            }
+            guard step > 0 else {
+                throw GatewayWireError.invalidFrame(
+                    "frontend integer setting step must be positive"
+                )
+            }
             kind = .integer(
-                min: try container.decode(Int64.self, forKey: .min),
-                max: try container.decodeIfPresent(Int64.self, forKey: .max),
-                step: try container.decode(Int64.self, forKey: .step)
+                min: minimum,
+                max: maximum,
+                step: step
             )
         case .select:
+            let options = try container.decode([FrontendSettingOption].self, forKey: .options)
+            guard Set(options.map(\.value)).count == options.count else {
+                throw GatewayWireError.invalidFrame(
+                    "frontend select setting has duplicate option values"
+                )
+            }
             kind = .select(
-                options: try container.decode([FrontendSettingOption].self, forKey: .options),
+                options: options,
                 unsetLabel: try container.decodeIfPresent(String.self, forKey: .unsetLabel)
             )
         }
@@ -2109,18 +2139,6 @@ struct RunSummary: Identifiable, Codable, Equatable, Sendable {
 struct DailyUsage: Codable, Equatable, Sendable {
     let unixDay: UInt64
     let usage: TokenUsage
-}
-
-struct ArtifactRecord: Identifiable, Codable, Equatable, Sendable {
-    let id: String
-    let sessionId: String
-    let kind: ArtifactKind
-    let title: String
-    let block: FrontendBlock
-}
-
-enum ArtifactKind: String, Codable, Equatable, Sendable {
-    case codeDiff = "code_diff"
 }
 
 struct CronTask: Identifiable, Codable, Equatable, Sendable {
