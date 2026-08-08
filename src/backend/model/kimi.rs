@@ -553,7 +553,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "kimi",
         "Kimi",
-        FrontendSymbol::Moon,
+        FrontendSymbol::Kimi,
         "Kimi Chat Completions API",
         ProviderAuth::ApiKey("MOONSHOT_API_KEY"),
         MODELS,

@@ -91,6 +91,7 @@ struct HorusGlyph: Hashable {
     static let info = Self("hi.info")
     static let javaScript = Self("hi.javaScript")
     static let key = Self("hi.key")
+    static let kimiAi = Self("hi.kimiAi")
     static let link = Self("hi.link")
     static let lockOpen = Self("hi.lockOpen")
     static let magnifyingGlass = Self("hi.magnifyingGlass")
@@ -307,6 +308,7 @@ enum HorusSymbol {
         "deepseek": Artwork(glyph: .deepseek, systemImage: "waveform.path.ecg"),
         "delete": Artwork(glyph: .trash, systemImage: "trash"),
         "edit": Artwork(glyph: .pencilSimple, systemImage: "pencil"),
+        "kimi": Artwork(glyph: .kimiAi, systemImage: "k.circle"),
         "moon": Artwork(glyph: .moon, systemImage: "moon"),
         "promote": Artwork(glyph: .arrowCircleUp, systemImage: "arrow.up.circle"),
         "route": Artwork(glyph: .path, systemImage: "point.3.connected.trianglepath.dotted"),

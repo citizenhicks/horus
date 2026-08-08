@@ -4,6 +4,11 @@ use super::*;
 use crate::backend::model::user_message;
 
 #[test]
+fn provider_advertises_kimi_identity() {
+    assert_eq!(provider().symbol(), &FrontendSymbol::Kimi);
+}
+
+#[test]
 fn responses_history_becomes_kimi_messages_and_tools() {
     let provider = Kimi::new("test-key", "kimi-k3")
         .expect("provider")

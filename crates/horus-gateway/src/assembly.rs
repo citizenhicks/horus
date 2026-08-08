@@ -760,7 +760,7 @@ mod tests {
 
         assert_eq!(status.provider, "openai_socket");
         assert_eq!(status.label, "OpenAI (API key)");
-        assert_eq!(status.symbol, FrontendSymbol::Sparkle);
+        assert_eq!(status.symbol, FrontendSymbol::ChatGpt);
         assert_eq!(status.models[0].id, "gpt-5.6-sol");
         assert_eq!(
             status.default_api_key_env.as_deref(),

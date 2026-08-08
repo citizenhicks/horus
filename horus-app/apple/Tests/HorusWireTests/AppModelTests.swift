@@ -98,7 +98,7 @@ final class AppModelTests: XCTestCase {
         ProviderStatus(
             provider: config.provider,
             label: "OpenAI",
-            symbol: "sparkle",
+            symbol: "chat_gpt",
             description: "Test provider",
             configured: true,
             selection: config,
@@ -2725,7 +2725,7 @@ final class AppModelTests: XCTestCase {
             providers: [ProviderStatus(
                 provider: "openai_socket",
                 label: "OpenAI",
-                symbol: "sparkle",
+                symbol: "chat_gpt",
                 description: "Persistent Responses API",
                 configured: true,
                 selection: nil,
@@ -2797,7 +2797,7 @@ final class AppModelTests: XCTestCase {
         model.providerStatuses = [ProviderStatus(
             provider: "kimi",
             label: "Kimi",
-            symbol: "moon",
+            symbol: "kimi",
             description: "Kimi Chat Completions API",
             configured: true,
             selection: nil,

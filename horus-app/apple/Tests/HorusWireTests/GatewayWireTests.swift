@@ -47,7 +47,7 @@ final class GatewayWireTests: XCTestCase {
     }
 
     private var readyPayloadJSON: String {
-        #"{"machine_name":"snowwhite.local","sessions":[\#(sessionRecordJSON)],"providers":[{"provider":"openai_socket","label":"OpenAI","symbol":"sparkle","description":"Persistent Responses API","configured":true,"auth":"api_key","default_base_url":null,"default_api_key_env":"OPENAI_API_KEY","models":[{"id":"gpt-5.6-sol","label":"Sol","description":"Frontier capability for complex work","context_window":1050000,"reasoning":[{"id":"medium","label":"Medium","description":"Balanced reasoning and latency"}],"default_reasoning":"medium"}],"model_ids":[],"reasoning_efforts":[],"model_ids_configurable":false,"web_search":["off","cached","live"]}],"default_config":\#(configJSON),"models":[{"route":"openai_socket/gpt-5.6-sol","group":"OpenAI","model":"gpt-5.6-sol","reasoning_effort":"medium","context_window":200000,"supports_image_input":true}],"model_providers":{"openai_socket/gpt-5.6-sol":"openai_socket"},"middleware_features":[{"id":"skills","label":"Skills","description":"Load focused instructions.","required":false,"settings":[{"id":"limit","label":"Limit","description":"Maximum items","type":"integer","min":1,"step":10},{"id":"route","label":"Route","description":"Default route","type":"select","options":[{"value":"route-a","label":"Route A","description":"First route"}],"unset_label":"Inherit"}]}],"max_active_sessions":4}"#
+        #"{"machine_name":"snowwhite.local","sessions":[\#(sessionRecordJSON)],"providers":[{"provider":"openai_socket","label":"OpenAI","symbol":"chat_gpt","description":"Persistent Responses API","configured":true,"auth":"api_key","default_base_url":null,"default_api_key_env":"OPENAI_API_KEY","models":[{"id":"gpt-5.6-sol","label":"Sol","description":"Frontier capability for complex work","context_window":1050000,"reasoning":[{"id":"medium","label":"Medium","description":"Balanced reasoning and latency"}],"default_reasoning":"medium"}],"model_ids":[],"reasoning_efforts":[],"model_ids_configurable":false,"web_search":["off","cached","live"]}],"default_config":\#(configJSON),"models":[{"route":"openai_socket/gpt-5.6-sol","group":"OpenAI","model":"gpt-5.6-sol","reasoning_effort":"medium","context_window":200000,"supports_image_input":true}],"model_providers":{"openai_socket/gpt-5.6-sol":"openai_socket"},"middleware_features":[{"id":"skills","label":"Skills","description":"Load focused instructions.","required":false,"settings":[{"id":"limit","label":"Limit","description":"Maximum items","type":"integer","min":1,"step":10},{"id":"route","label":"Route","description":"Default route","type":"select","options":[{"value":"route-a","label":"Route A","description":"First route"}],"unset_label":"Inherit"}]}],"max_active_sessions":4}"#
     }
 
     private var sessionReadyPayloadJSON: String {
@@ -407,7 +407,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(payload.sessions.first?.activity.turnId, "turn-1")
         XCTAssertEqual(payload.sessions.first?.executionStats.toolCalls, 6)
         XCTAssertEqual(payload.providers.first?.defaultApiKeyEnv, "OPENAI_API_KEY")
-        XCTAssertEqual(payload.providers.first?.symbol, "sparkle")
+        XCTAssertEqual(payload.providers.first?.symbol, "chat_gpt")
         XCTAssertEqual(payload.providers.first?.description, "Persistent Responses API")
         XCTAssertEqual(payload.providers.first?.auth, .apiKey)
         XCTAssertEqual(payload.providers.first?.models.first?.label, "Sol")

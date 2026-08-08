@@ -502,8 +502,8 @@ pub enum FrontendTone {
 /// A gateway does not know whether the frontend draws SF Symbols, terminal glyphs, or
 /// SVGs, so it names what a glyph stands for and each frontend supplies its own artwork.
 /// Most variants are roles. The rest are provider identity, where no role applies: some
-/// name the vendor outright (`Claude`, `ChatGpt`, `Deepseek`) and the others name what the
-/// mark depicts (`Moon`, `Sparkle`) where a frontend has no vendor artwork to draw.
+/// name the vendor outright (`ChatGpt`, `Claude`, `Deepseek`, `Kimi`) and the others name
+/// what the mark depicts (`Moon`, `Sparkle`) where a frontend has no vendor artwork to draw.
 ///
 /// [`Self::Custom`] carries anything outside this list so a plugin can still ship a glyph
 /// this enum has never heard of. It is explicitly best-effort: a frontend that cannot
@@ -520,6 +520,7 @@ pub enum FrontendSymbol {
     Deepseek,
     Delete,
     Edit,
+    Kimi,
     Moon,
     Promote,
     Route,
@@ -543,6 +544,7 @@ impl FrontendSymbol {
             Self::Deepseek => "deepseek",
             Self::Delete => "delete",
             Self::Edit => "edit",
+            Self::Kimi => "kimi",
             Self::Moon => "moon",
             Self::Promote => "promote",
             Self::Route => "route",
@@ -567,6 +569,7 @@ impl FrontendSymbol {
             "deepseek" => Self::Deepseek,
             "delete" => Self::Delete,
             "edit" => Self::Edit,
+            "kimi" => Self::Kimi,
             "moon" => Self::Moon,
             "promote" => Self::Promote,
             "route" => Self::Route,
@@ -1081,6 +1084,7 @@ mod tests {
             FrontendSymbol::Deepseek,
             FrontendSymbol::Delete,
             FrontendSymbol::Edit,
+            FrontendSymbol::Kimi,
             FrontendSymbol::Moon,
             FrontendSymbol::Promote,
             FrontendSymbol::Route,
