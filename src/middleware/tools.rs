@@ -368,7 +368,7 @@ impl Middleware for Tools {
         }
     }
 
-    fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
+    fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
         let mut block = render_tool_event(event, |name| self.names.contains(name), tool_heading)?;
         match event {
             EventMsg::ToolCallBegin(call) if call.name == "read_file" => {
@@ -404,6 +404,7 @@ pub(crate) fn render_tool_event(
             append: false,
             pending: true,
             text: heading(&call.name, &call.arguments),
+            files: Vec::new(),
             format: FrontendBlockFormat::PlainText,
             tone: FrontendTone::Neutral,
         }),
@@ -419,6 +420,7 @@ pub(crate) fn render_tool_event(
                 } else {
                     format!("\n  {}", output.replace('\n', "\n  "))
                 },
+                files: Vec::new(),
                 format: FrontendBlockFormat::PlainText,
                 tone: if result.is_error {
                     FrontendTone::Error

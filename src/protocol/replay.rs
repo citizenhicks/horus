@@ -125,7 +125,7 @@ pub fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Vec<Event
     events
 }
 
-fn attachment_references(value: &Value) -> Vec<crate::protocol::AttachmentReference> {
+fn attachment_references(value: &Value) -> Vec<crate::protocol::SessionFileReference> {
     value
         .get(ATTACHMENTS_FIELD)
         .cloned()

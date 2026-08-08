@@ -1,7 +1,7 @@
 import SwiftUI
 import HighlightSwift
 
-struct ArtifactView: View {
+struct FilesView: View {
     @Environment(AppModel.self) private var model
 
     // A NavigationStack for the title and, more to the point, for `.searchable`: the search
@@ -9,17 +9,15 @@ struct ArtifactView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                if model.inspectorPage == .changes {
-                    WorkspaceScopePicker()
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 10)
-                    Divider()
-                }
-                ArtifactContent()
+                FilesInspectorTabPicker()
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 10)
+                Divider()
+                FilesContent()
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            .navigationTitle(model.inspectorPage == .changes ? "Files" : "Uploaded files")
+            .navigationTitle("Files")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
@@ -27,50 +25,46 @@ struct ArtifactView: View {
     }
 }
 
-private struct ArtifactContent: View {
+private struct FilesContent: View {
     @Environment(AppModel.self) private var model
 
     @ViewBuilder
     var body: some View {
-        switch model.inspectorPage {
-        case .changes:
-            if model.workspaceFileScope == .modified {
-                WorkspaceDiffView()
-            } else {
-                WorkspaceFileList()
-            }
-        case .uploads:
-            UploadedFileList()
+        switch model.filesInspectorTab {
+        case .unstaged: WorkspaceDiffView()
+        case .allFiles: WorkspaceFileList()
+        case .chatFiles: ChatFileList()
         }
     }
 }
 
-private struct WorkspaceScopePicker: View {
+private struct FilesInspectorTabPicker: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         Picker(
-            "File scope",
+            "File collection",
             selection: Binding(
-                get: { model.workspaceFileScope },
-                set: { scope in model.selectWorkspaceFileScope(scope) }
+                get: { model.filesInspectorTab },
+                set: { tab in model.selectFilesInspectorTab(tab) }
             )
         ) {
-            ForEach(WorkspaceFileScope.allCases) { scope in
-                Text(scope.title).tag(scope)
+            ForEach(FilesInspectorTab.allCases) { tab in
+                Text(tab.title).tag(tab)
             }
         }
         .pickerStyle(.segmented)
         .labelsHidden()
-        .accessibilityLabel("File scope")
+        .accessibilityLabel("File collection")
     }
 }
 
-private extension WorkspaceFileScope {
+private extension FilesInspectorTab {
     var title: String {
         switch self {
-        case .modified: "Unstaged"
-        case .all: "All Files"
+        case .unstaged: "Unstaged"
+        case .allFiles: "All Files"
+        case .chatFiles: "Chat Files"
         }
     }
 }
@@ -216,7 +210,7 @@ private struct WorkspaceFileList: View {
             label
         }
         .buttonStyle(.horusPlain)
-        .disabled(model.isLoadingAttachmentPreview)
+        .disabled(model.isLoadingFilePresentation)
         .accessibilityLabel("Open workspace file \(path)")
     }
 }
@@ -253,38 +247,129 @@ private struct FileTreeRow: View {
     }
 }
 
-private struct UploadedFileList: View {
+private struct ChatFileList: View {
     @Environment(AppModel.self) private var model
 
-    @ViewBuilder
+    private var artifactFiles: [SessionFileReference] {
+        model.artifacts.compactMap(\.file)
+    }
+
     var body: some View {
-        if model.isLoadingAttachments {
-            InspectorLoadingView(title: "Loading uploaded files")
-        } else if model.uploadedAttachments.isEmpty {
-            HorusUnavailable(
-                title: "No uploaded files",
-                glyph: .fileText,
-                detail: "Use the Plus button in the composer to add files."
-            )
-        } else {
-            List(model.uploadedAttachments) { attachment in
-                Button {
-                    model.previewAttachment(attachment)
-                } label: {
-                    InspectorFileRow(
-                        name: attachment.name,
-                        detail: attachment.mediaType,
-                        size: attachment.size
+        List {
+            Section("Artifacts") {
+                if model.isLoadingArtifacts {
+                    InspectorSectionLoadingRow(title: "Loading artifacts")
+                } else if artifactFiles.isEmpty {
+                    InspectorEmptyRow(
+                        title: "No artifacts",
+                        detail: "Files sent by Horus will appear here."
                     )
+                } else {
+                    ForEach(artifactFiles) { file in
+                        SessionFileInspectorRow(
+                            file: file,
+                            accessibilityLabel: "Open artifact \(file.name)"
+                        )
+                    }
                 }
-                .buttonStyle(.horusPlain)
-                .disabled(model.isLoadingAttachmentPreview)
-                .accessibilityLabel("Open uploaded file \(attachment.name)")
-                .inspectorFileListRow()
+                if model.artifactsTruncated {
+                    Text("Some older artifacts are not shown.")
+                        .font(HorusStyle.metadataFont)
+                        .foregroundStyle(.secondary)
+                        .inspectorFileListRow()
+                }
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
+
+            Section("Uploads") {
+                if model.isLoadingSessionUploads {
+                    InspectorSectionLoadingRow(title: "Loading uploads")
+                } else if model.sessionUploads.isEmpty {
+                    InspectorEmptyRow(
+                        title: "No uploads",
+                        detail: "Use the Plus button in the composer to add files."
+                    )
+                } else {
+                    ForEach(model.sessionUploads) { file in
+                        SessionFileInspectorRow(
+                            file: file,
+                            accessibilityLabel: "Open uploaded file \(file.name)"
+                        )
+                    }
+                }
+            }
         }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+    }
+}
+
+private struct SessionFileInspectorRow: View {
+    @Environment(AppModel.self) private var model
+    let file: SessionFileReference
+    let accessibilityLabel: String
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button {
+                model.previewSessionFile(file)
+            } label: {
+                InspectorFileRow(
+                    name: file.name,
+                    detail: file.mediaType,
+                    size: file.size,
+                    showsDisclosure: false
+                )
+            }
+            .accessibilityLabel(accessibilityLabel)
+
+            Menu {
+                Button("Preview", glyph: file.name.fileGlyph) {
+                    model.previewSessionFile(file)
+                }
+                Button("Share or Save…", glyph: .arrowUpRight01) {
+                    model.saveOrShareSessionFile(file)
+                }
+            } label: {
+                HorusIcon(.dotsThree, size: 14)
+                    .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel("File actions for \(file.name)")
+            .help("File actions")
+        }
+        .buttonStyle(.horusPlain)
+        .disabled(model.isLoadingFilePresentation)
+        .inspectorFileListRow()
+    }
+}
+
+private struct InspectorSectionLoadingRow: View {
+    let title: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ProgressView().controlSize(.small)
+            Text(title).foregroundStyle(.secondary)
+        }
+        .frame(minHeight: HorusStyle.iconButtonSize)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct InspectorEmptyRow: View {
+    @Environment(\.horusPalette) private var palette
+    let title: String
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(HorusStyle.metadataFont.weight(.semibold))
+            Text(detail)
+                .font(HorusStyle.metadataFont)
+                .foregroundStyle(palette.muted)
+        }
+        .frame(minHeight: HorusStyle.iconButtonSize)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -310,6 +395,7 @@ private struct InspectorFileRow: View {
     let name: String
     let detail: String
     let size: Int64
+    var showsDisclosure = true
 
     var body: some View {
         HStack(spacing: 10) {
@@ -329,7 +415,9 @@ private struct InspectorFileRow: View {
             Text(size, format: .byteCount(style: .file))
                 .font(HorusStyle.metadataFont)
                 .foregroundStyle(palette.muted)
-            HorusIcon(.caretRight, size: 12, foreground: palette.muted)
+            if showsDisclosure {
+                HorusIcon(.caretRight, size: 12, foreground: palette.muted)
+            }
         }
         .frame(minHeight: HorusStyle.iconButtonSize)
         .contentShape(Rectangle())
@@ -372,6 +460,43 @@ struct TextFilePreviewView: View {
         .frame(minWidth: 640, minHeight: 560)
         #endif
         .presentationDetents([.large])
+    }
+}
+
+struct SessionFileShareView: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.horusPalette) private var palette
+    let file: SessionFileShareItem
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                HorusIcon(file.name.fileGlyph, size: 44, foreground: palette.accent)
+                Text(file.name)
+                    .font(HorusStyle.bodyFont.weight(.semibold))
+                    .multilineTextAlignment(.center)
+                ShareLink(item: file.url) {
+                    Label("Share or Save", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(24)
+            .navigationTitle("File")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done", action: dismiss.callAsFunction)
+                }
+            }
+        }
+        #if os(macOS)
+        .frame(minWidth: 360, minHeight: 260)
+        #endif
+        .presentationDetents([.medium])
     }
 }
 
@@ -552,15 +677,26 @@ struct PreviewBlockView: View {
     let block: FrontendBlock
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            if block.pending { ProgressView().controlSize(.mini) }
-            Text(block.text)
-                .font(block.format == "unified_diff" ? HorusStyle.metadataFont : HorusStyle.bodyFont)
-                .foregroundStyle(
-                    block.tone == "neutral" ? Color.primary : palette.tone(block.tone)
-                )
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(block.files) { file in
+                SessionFileCard(file: file)
+            }
+            if !block.text.isEmpty {
+                HStack(alignment: .top, spacing: 8) {
+                    if block.pending { ProgressView().controlSize(.mini) }
+                    Text(block.text)
+                        .font(
+                            block.format == "unified_diff"
+                                ? HorusStyle.metadataFont
+                                : HorusStyle.bodyFont
+                        )
+                        .foregroundStyle(
+                            block.tone == "neutral" ? Color.primary : palette.tone(block.tone)
+                        )
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
         }
     }
 }

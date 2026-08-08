@@ -18,10 +18,12 @@ pub const MAX_USER_INPUT_BYTES: usize = 1024 * 1024;
 /// Maximum UTF-8 bytes accepted in capability command input or queued active input.
 pub const MAX_CAPABILITY_INPUT_BYTES: usize = 64 * 1024;
 
-/// One immutable file uploaded for a user turn.
+/// One immutable, session-bound file addressed by an opaque reference.
+///
+/// Only upload-origin references are valid in `Op::UserInput.attachments`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AttachmentReference {
+pub struct SessionFileReference {
     pub id: String,
     pub name: String,
     pub size: u64,
@@ -72,7 +74,7 @@ pub enum Op {
     /// Start a user turn.
     UserInput {
         text: String,
-        attachments: Vec<AttachmentReference>,
+        attachments: Vec<SessionFileReference>,
     },
     /// Submit capability-owned input while a turn is active.
     ActiveInput {
@@ -392,6 +394,8 @@ pub struct FrontendBlock {
     /// Whether this block represents work that has not completed yet.
     pub pending: bool,
     pub text: String,
+    /// Downloadable files owned by the session rendering this block.
+    pub files: Vec<SessionFileReference>,
     pub format: FrontendBlockFormat,
     pub tone: FrontendTone,
 }
@@ -657,7 +661,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserMessageEvent {
     pub message: String,
-    pub attachments: Vec<AttachmentReference>,
+    pub attachments: Vec<SessionFileReference>,
     #[serde(deserialize_with = "required_option")]
     pub message_target: Option<MessageTarget>,
 }

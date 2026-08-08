@@ -244,7 +244,7 @@ impl Middleware for Skills {
         }
     }
 
-    fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
+    fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
         render_tool_event(
             event,
             |name| name == "load_skill",

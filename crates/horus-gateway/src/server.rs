@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use horus::agent::validate_submission;
-use horus::middleware::attachments::{AttachmentStore, MAX_UPLOAD_CHUNK_BYTES, PendingAttachment};
+use horus::middleware::session_files::{
+    MAX_UPLOAD_CHUNK_BYTES, PendingSessionFileWrite, SessionFileStore,
+};
 use horus::protocol::Op;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -34,9 +36,10 @@ use crate::config::{ConfigStore, CredentialStore, GatewayConfig, TlsConfig};
 use crate::cron::CronStore;
 use crate::host::{GatewayHost, HostHandle, Rejection};
 use crate::wire::{
-    ClientFrame, ClientKind, ClientMessage, ClientStatus, DirectoryEntry, DirectoryListing,
-    FrameReader, MAX_FRAME_BYTES, ServerFrame, ServerMessage, framed_to_websocket, read_frame,
-    validate_version, websocket_error, websocket_to_framed, write_frame,
+    ArtifactRecord, ClientFrame, ClientKind, ClientMessage, ClientStatus, DirectoryEntry,
+    DirectoryListing, FrameReader, MAX_FRAME_BYTES, ServerFrame, ServerMessage,
+    framed_to_websocket, read_frame, validate_version, websocket_error, websocket_to_framed,
+    write_frame,
 };
 use crate::{Error, Result};
 
@@ -622,8 +625,8 @@ where
     )
     .await?;
     let mut selected: Option<SelectedChat> = None;
-    let attachments = host.attachment_store().await;
-    let mut uploads: BTreeMap<(String, String), PendingAttachment> = BTreeMap::new();
+    let session_files = host.session_file_store().await;
+    let mut uploads: BTreeMap<(String, String), PendingSessionFileWrite> = BTreeMap::new();
 
     loop {
         let incoming = tokio::select! {
@@ -709,7 +712,7 @@ where
             &client,
             ConnectionSessionState {
                 selected: &mut selected,
-                attachments: &attachments,
+                session_files: &session_files,
                 uploads: &mut uploads,
             },
             &mut writer,
@@ -732,8 +735,8 @@ struct AuthenticatedClient<'a> {
 
 struct ConnectionSessionState<'a> {
     selected: &'a mut Option<SelectedChat>,
-    attachments: &'a AttachmentStore,
-    uploads: &'a mut BTreeMap<(String, String), PendingAttachment>,
+    session_files: &'a SessionFileStore,
+    uploads: &'a mut BTreeMap<(String, String), PendingSessionFileWrite>,
 }
 
 async fn selected_broadcast(
@@ -756,7 +759,7 @@ async fn handle_message(
 ) -> Result<()> {
     let ConnectionSessionState {
         selected,
-        attachments,
+        session_files,
         uploads,
     } = connection;
     match message {
@@ -935,39 +938,38 @@ async fn handle_message(
                 && !references.is_empty()
             {
                 if !host.accepts_file_attachments() {
-                    return write_rejection(writer, request_id, attachments_disabled_rejection())
-                        .await;
+                    return write_rejection(writer, request_id, uploads_disabled_rejection()).await;
                 }
                 for reference in references {
-                    if let Err(error) = attachments.verify(&session_id, reference).await {
-                        return write_rejection(writer, request_id, attachment_rejection(error))
+                    if let Err(error) = session_files.verify_upload(&session_id, reference).await {
+                        return write_rejection(writer, request_id, session_file_rejection(error))
                             .await;
                     }
                 }
             }
             write_result(writer, request_id, host.submit(submission).await).await
         }
-        ClientMessage::BeginAttachmentUpload {
+        ClientMessage::BeginSessionFileUpload {
             request_id,
             session_id,
             name,
             size,
             media_type,
         } => {
-            if let Err(rejection) = require_attachments_enabled(selected, &session_id) {
+            if let Err(rejection) = require_uploads_enabled(selected, &session_id) {
                 return write_rejection(writer, request_id, rejection).await;
             }
             if uploads.len() >= MAX_PENDING_UPLOADS {
                 return write_rejection(
                     writer,
                     request_id,
-                    attachment_rejection(format!(
+                    session_file_rejection(format!(
                         "a connection cannot hold more than {MAX_PENDING_UPLOADS} pending uploads"
                     )),
                 )
                 .await;
             }
-            match attachments
+            match session_files
                 .begin_upload(&session_id, name, size, media_type)
                 .await
             {
@@ -976,7 +978,7 @@ async fn handle_message(
                     uploads.insert((session_id.clone(), upload_id.clone()), upload);
                     write_frame(
                         writer,
-                        &ServerFrame::new(ServerMessage::AttachmentUploadStarted {
+                        &ServerFrame::new(ServerMessage::SessionFileUploadReady {
                             request_id,
                             session_id,
                             upload_id,
@@ -986,11 +988,11 @@ async fn handle_message(
                     .await
                 }
                 Err(error) => {
-                    write_rejection(writer, request_id, attachment_rejection(error)).await
+                    write_rejection(writer, request_id, session_file_rejection(error)).await
                 }
             }
         }
-        ClientMessage::AppendAttachmentChunk {
+        ClientMessage::UploadSessionFileChunk {
             request_id,
             session_id,
             upload_id,
@@ -998,7 +1000,7 @@ async fn handle_message(
             data,
         } => {
             let key = (session_id.clone(), upload_id.clone());
-            if let Err(rejection) = require_attachments_enabled(selected, &session_id) {
+            if let Err(rejection) = require_uploads_enabled(selected, &session_id) {
                 uploads.remove(&key);
                 return write_rejection(writer, request_id, rejection).await;
             }
@@ -1006,7 +1008,7 @@ async fn handle_message(
                 return write_rejection(
                     writer,
                     request_id,
-                    attachment_rejection("attachment upload is not active"),
+                    session_file_rejection("session file upload is not active"),
                 )
                 .await;
             };
@@ -1015,7 +1017,7 @@ async fn handle_message(
                 Ok(next_offset) => {
                     write_frame(
                         writer,
-                        &ServerFrame::new(ServerMessage::AttachmentChunkAccepted {
+                        &ServerFrame::new(ServerMessage::SessionFileUploadChunkAccepted {
                             request_id,
                             session_id,
                             upload_id,
@@ -1026,17 +1028,17 @@ async fn handle_message(
                 }
                 Err(error) => {
                     uploads.remove(&key);
-                    write_rejection(writer, request_id, attachment_rejection(error)).await
+                    write_rejection(writer, request_id, session_file_rejection(error)).await
                 }
             }
         }
-        ClientMessage::FinishAttachmentUpload {
+        ClientMessage::FinishSessionFileUpload {
             request_id,
             session_id,
             upload_id,
         } => {
             let key = (session_id.clone(), upload_id);
-            if let Err(rejection) = require_attachments_enabled(selected, &session_id) {
+            if let Err(rejection) = require_uploads_enabled(selected, &session_id) {
                 uploads.remove(&key);
                 return write_rejection(writer, request_id, rejection).await;
             }
@@ -1044,72 +1046,72 @@ async fn handle_message(
                 return write_rejection(
                     writer,
                     request_id,
-                    attachment_rejection("attachment upload is not active"),
+                    session_file_rejection("session file upload is not active"),
                 )
                 .await;
             };
             match upload.finish().await {
-                Ok(attachment) => {
+                Ok(file) => {
                     write_frame(
                         writer,
-                        &ServerFrame::new(ServerMessage::AttachmentUploaded {
+                        &ServerFrame::new(ServerMessage::SessionFileUploadCompleted {
                             request_id,
                             session_id,
-                            attachment,
+                            file,
                         }),
                     )
                     .await
                 }
                 Err(error) => {
-                    write_rejection(writer, request_id, attachment_rejection(error)).await
+                    write_rejection(writer, request_id, session_file_rejection(error)).await
                 }
             }
         }
-        ClientMessage::ListAttachments {
+        ClientMessage::ListSessionUploads {
             request_id,
             session_id,
         } => {
             if let Err(rejection) = require_selected(selected, &session_id) {
                 return write_rejection(writer, request_id, rejection).await;
             }
-            match attachments.list(&session_id).await {
+            match session_files.list_uploads(&session_id).await {
                 Ok(items) => {
                     write_frame(
                         writer,
-                        &ServerFrame::new(ServerMessage::Attachments {
+                        &ServerFrame::new(ServerMessage::SessionUploads {
                             request_id,
                             session_id,
-                            attachments: items,
+                            uploads: items,
                         }),
                     )
                     .await
                 }
                 Err(error) => {
-                    write_rejection(writer, request_id, attachment_rejection(error)).await
+                    write_rejection(writer, request_id, session_file_rejection(error)).await
                 }
             }
         }
-        ClientMessage::ReadAttachment {
+        ClientMessage::ReadSessionFile {
             request_id,
             session_id,
-            attachment_id,
+            file_id,
             offset,
             max_bytes,
         } => {
             if let Err(rejection) = require_selected(selected, &session_id) {
                 return write_rejection(writer, request_id, rejection).await;
             }
-            match attachments
-                .read_chunk(&session_id, &attachment_id, offset, max_bytes)
+            match session_files
+                .read_chunk(&session_id, &file_id, offset, max_bytes)
                 .await
             {
                 Ok(chunk) => {
                     write_frame(
                         writer,
-                        &ServerFrame::new(ServerMessage::AttachmentChunk {
+                        &ServerFrame::new(ServerMessage::SessionFileChunk {
                             request_id,
                             session_id,
-                            attachment_id,
+                            file_id,
                             offset: chunk.offset,
                             data: chunk.data,
                             next_offset: chunk.next_offset,
@@ -1118,7 +1120,7 @@ async fn handle_message(
                     .await
                 }
                 Err(error) => {
-                    write_rejection(writer, request_id, attachment_rejection(error)).await
+                    write_rejection(writer, request_id, session_file_rejection(error)).await
                 }
             }
         }
@@ -1389,11 +1391,7 @@ async fn handle_message(
                 Ok(artifacts) => {
                     write_frame(
                         writer,
-                        &ServerFrame::new(ServerMessage::Artifacts {
-                            request_id,
-                            session_id,
-                            artifacts,
-                        }),
+                        &bounded_artifacts_frame(request_id, session_id, artifacts)?,
                     )
                     .await
                 }
@@ -1540,6 +1538,48 @@ fn encoded_frame_fits(frame: &ServerFrame) -> Result<bool> {
     Ok(serde_json::to_vec(frame)?.len() <= MAX_FRAME_BYTES)
 }
 
+fn bounded_artifacts_frame(
+    request_id: String,
+    session_id: String,
+    artifacts: Vec<ArtifactRecord>,
+) -> Result<ServerFrame> {
+    let artifact_count = artifacts.len();
+    let mut encoded_len = artifacts_frame_base_len(&request_id, &session_id)?;
+    let mut retained = Vec::new();
+    for artifact in artifacts.into_iter().rev() {
+        let artifact_len = serde_json::to_vec(&artifact)?.len();
+        let separator_len = usize::from(!retained.is_empty());
+        let candidate_len = encoded_len
+            .saturating_add(separator_len)
+            .saturating_add(artifact_len);
+        if candidate_len > MAX_FRAME_BYTES {
+            break;
+        }
+        encoded_len = candidate_len;
+        retained.push(artifact);
+    }
+    let truncated = retained.len() < artifact_count;
+    retained.reverse();
+    Ok(ServerFrame::new(ServerMessage::Artifacts {
+        request_id,
+        session_id,
+        artifacts: retained,
+        truncated,
+    }))
+}
+
+fn artifacts_frame_base_len(request_id: &str, session_id: &str) -> Result<usize> {
+    Ok(
+        serde_json::to_vec(&ServerFrame::new(ServerMessage::Artifacts {
+            request_id: request_id.into(),
+            session_id: session_id.into(),
+            artifacts: Vec::new(),
+            truncated: false,
+        }))?
+        .len(),
+    )
+}
+
 async fn write_client_inventory(
     writer: &mut (impl AsyncWrite + Unpin),
     request_id: String,
@@ -1614,20 +1654,20 @@ fn require_selected<'a>(
     Ok(host)
 }
 
-fn require_attachments_enabled<'a>(
+fn require_uploads_enabled<'a>(
     selected: &'a Option<SelectedChat>,
     session_id: &str,
 ) -> std::result::Result<&'a HostHandle, Rejection> {
     let host = require_selected(selected, session_id)?;
     if !host.accepts_file_attachments() {
-        return Err(attachments_disabled_rejection());
+        return Err(uploads_disabled_rejection());
     }
     Ok(host)
 }
 
-fn attachments_disabled_rejection() -> Rejection {
+fn uploads_disabled_rejection() -> Rejection {
     Rejection {
-        code: "attachments_disabled",
+        code: "uploads_disabled",
         message: "enable the optional attachments middleware for this chat first".into(),
         fatal: false,
     }
@@ -1705,9 +1745,9 @@ fn internal_rejection(message: String) -> Rejection {
     }
 }
 
-fn attachment_rejection(error: impl std::fmt::Display) -> Rejection {
+fn session_file_rejection(error: impl std::fmt::Display) -> Rejection {
     Rejection {
-        code: "attachment_rejected",
+        code: "session_file_rejected",
         message: error.to_string(),
         fatal: false,
     }
@@ -1796,7 +1836,10 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use futures_util::SinkExt as _;
-    use horus::protocol::{AttachmentReference, EventMsg, Op, Submission};
+    use horus::protocol::{
+        EventMsg, FrontendBlock, FrontendBlockFormat, FrontendTone, Op, SessionFileReference,
+        Submission,
+    };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::protocol::Message;
@@ -1804,7 +1847,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::client::{Endpoint, GatewayClient, GatewayEvents, GatewaySender};
-    use crate::wire::{SessionActivity, SessionActivityState};
+    use crate::wire::{ArtifactKind, SessionActivity, SessionActivityState};
 
     use super::*;
 
@@ -2216,7 +2259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paired_client_uploads_lists_reads_and_submits_an_attachment() {
+    async fn paired_client_uploads_lists_reads_and_submits_a_session_file() {
         let root = tempfile::tempdir().expect("temporary directory");
         let workspace = root.path().join("workspace");
         fs::create_dir(&workspace).expect("workspace");
@@ -2280,7 +2323,7 @@ mod tests {
             }
         }
 
-        let missing = AttachmentReference {
+        let missing = SessionFileReference {
             id: Uuid::new_v4().to_string(),
             name: "missing.txt".into(),
             size: 1,
@@ -2319,7 +2362,7 @@ mod tests {
             open_chat(&sender, &mut events, &session_id).await;
             let begin_id = format!("begin-unselected-{finish}");
             sender
-                .send(ClientMessage::BeginAttachmentUpload {
+                .send(ClientMessage::BeginSessionFileUpload {
                     request_id: begin_id.clone(),
                     session_id: session_id.clone(),
                     name: format!("unselected-{finish}.bin"),
@@ -2329,7 +2372,7 @@ mod tests {
                 .await
                 .expect("begin upload before switching chat");
             let upload_id = loop {
-                if let ServerMessage::AttachmentUploadStarted {
+                if let ServerMessage::SessionFileUploadReady {
                     request_id,
                     upload_id,
                     ..
@@ -2343,13 +2386,13 @@ mod tests {
             open_chat(&sender, &mut events, &other_session_id).await;
             let rejection_id = format!("reject-unselected-{finish}");
             let request = if finish {
-                ClientMessage::FinishAttachmentUpload {
+                ClientMessage::FinishSessionFileUpload {
                     request_id: rejection_id.clone(),
                     session_id: session_id.clone(),
                     upload_id: upload_id.clone(),
                 }
             } else {
-                ClientMessage::AppendAttachmentChunk {
+                ClientMessage::UploadSessionFileChunk {
                     request_id: rejection_id.clone(),
                     session_id: session_id.clone(),
                     upload_id: upload_id.clone(),
@@ -2375,7 +2418,7 @@ mod tests {
             open_chat(&sender, &mut events, &session_id).await;
             let retry_id = format!("retry-terminated-{finish}");
             sender
-                .send(ClientMessage::FinishAttachmentUpload {
+                .send(ClientMessage::FinishSessionFileUpload {
                     request_id: retry_id.clone(),
                     session_id: session_id.clone(),
                     upload_id,
@@ -2397,7 +2440,7 @@ mod tests {
         }
 
         sender
-            .send(ClientMessage::BeginAttachmentUpload {
+            .send(ClientMessage::BeginSessionFileUpload {
                 request_id: "begin-doomed-upload".into(),
                 session_id: session_id.clone(),
                 name: "doomed.bin".into(),
@@ -2407,7 +2450,7 @@ mod tests {
             .await
             .expect("begin doomed upload");
         let doomed_upload_id = loop {
-            if let ServerMessage::AttachmentUploadStarted {
+            if let ServerMessage::SessionFileUploadReady {
                 request_id,
                 upload_id,
                 ..
@@ -2418,7 +2461,7 @@ mod tests {
             }
         };
         sender
-            .send(ClientMessage::AppendAttachmentChunk {
+            .send(ClientMessage::UploadSessionFileChunk {
                 request_id: "reject-doomed-chunk".into(),
                 session_id: session_id.clone(),
                 upload_id: doomed_upload_id.clone(),
@@ -2437,7 +2480,7 @@ mod tests {
             }
         }
         sender
-            .send(ClientMessage::FinishAttachmentUpload {
+            .send(ClientMessage::FinishSessionFileUpload {
                 request_id: "finish-doomed-upload".into(),
                 session_id: session_id.clone(),
                 upload_id: doomed_upload_id,
@@ -2459,7 +2502,7 @@ mod tests {
 
         let image = b"\x89PNG\r\n\x1a\npayload";
         sender
-            .send(ClientMessage::BeginAttachmentUpload {
+            .send(ClientMessage::BeginSessionFileUpload {
                 request_id: "begin-upload".into(),
                 session_id: session_id.clone(),
                 name: "image.png".into(),
@@ -2469,7 +2512,7 @@ mod tests {
             .await
             .expect("begin upload");
         let upload_id = loop {
-            if let ServerMessage::AttachmentUploadStarted {
+            if let ServerMessage::SessionFileUploadReady {
                 request_id,
                 upload_id,
                 ..
@@ -2485,7 +2528,7 @@ mod tests {
             ("upload-chunk-2", 8_u64, image[8..].to_vec()),
         ] {
             sender
-                .send(ClientMessage::AppendAttachmentChunk {
+                .send(ClientMessage::UploadSessionFileChunk {
                     request_id: request_id.into(),
                     session_id: session_id.clone(),
                     upload_id: upload_id.clone(),
@@ -2497,7 +2540,7 @@ mod tests {
             loop {
                 if matches!(
                     next_gateway_message(&mut events).await,
-                    ServerMessage::AttachmentChunkAccepted { request_id: actual, .. }
+                    ServerMessage::SessionFileUploadChunkAccepted { request_id: actual, .. }
                         if actual == request_id
                 ) {
                     break;
@@ -2506,63 +2549,61 @@ mod tests {
         }
 
         sender
-            .send(ClientMessage::FinishAttachmentUpload {
+            .send(ClientMessage::FinishSessionFileUpload {
                 request_id: "finish-upload".into(),
                 session_id: session_id.clone(),
                 upload_id,
             })
             .await
             .expect("finish upload");
-        let attachment = loop {
-            if let ServerMessage::AttachmentUploaded {
-                request_id,
-                attachment,
-                ..
+        let file = loop {
+            if let ServerMessage::SessionFileUploadCompleted {
+                request_id, file, ..
             } = next_gateway_message(&mut events).await
                 && request_id == "finish-upload"
             {
-                break attachment;
+                break file;
             }
         };
 
         sender
-            .send(ClientMessage::ListAttachments {
-                request_id: "list-attachments".into(),
+            .send(ClientMessage::ListSessionUploads {
+                request_id: "list-session-uploads".into(),
                 session_id: session_id.clone(),
             })
             .await
-            .expect("list attachments");
+            .expect("list session uploads");
         loop {
-            if let ServerMessage::Attachments {
+            if let ServerMessage::SessionUploads {
                 request_id,
-                attachments,
+                uploads,
                 ..
             } = next_gateway_message(&mut events).await
-                && request_id == "list-attachments"
+                && request_id == "list-session-uploads"
             {
-                assert_eq!(attachments, std::slice::from_ref(&attachment));
+                assert_eq!(uploads, std::slice::from_ref(&file));
                 break;
             }
         }
 
         sender
-            .send(ClientMessage::ReadAttachment {
-                request_id: "read-attachment".into(),
+            .send(ClientMessage::ReadSessionFile {
+                request_id: "read-session-file".into(),
                 session_id: session_id.clone(),
-                attachment_id: attachment.id.clone(),
+                file_id: file.id.clone(),
                 offset: 0,
                 max_bytes: image.len(),
             })
             .await
-            .expect("read attachment");
+            .expect("read session file");
         loop {
-            if let ServerMessage::AttachmentChunk {
+            if let ServerMessage::SessionFileChunk {
                 request_id,
                 data,
                 next_offset,
                 ..
             } = next_gateway_message(&mut events).await
-                && request_id == "read-attachment"
+                && request_id == "read-session-file"
             {
                 assert_eq!(data, image);
                 assert_eq!(next_offset, None);
@@ -2578,7 +2619,7 @@ mod tests {
                     id: submission_id.clone(),
                     op: Op::UserInput {
                         text: "describe the image".into(),
-                        attachments: vec![attachment.clone()],
+                        attachments: vec![file.clone()],
                     },
                 },
             })
@@ -2601,7 +2642,7 @@ mod tests {
             }
             match event.msg {
                 EventMsg::UserMessage(message) => {
-                    assert_eq!(message.attachments, std::slice::from_ref(&attachment));
+                    assert_eq!(message.attachments, std::slice::from_ref(&file));
                     saw_user_message = true;
                 }
                 EventMsg::Error(error) => break error.message,
@@ -3007,6 +3048,72 @@ mod tests {
         });
 
         assert!(!encoded_frame_fits(&frame).expect("measure history frame"));
+    }
+
+    #[test]
+    fn artifact_catalog_keeps_the_newest_suffix_that_fits_one_frame() {
+        let artifacts = (0..3)
+            .map(|index| large_artifact(index, MAX_FRAME_BYTES / 3))
+            .collect();
+
+        let frame = bounded_artifacts_frame("artifacts".into(), "session".into(), artifacts)
+            .expect("bound artifact catalog");
+
+        assert!(encoded_frame_fits(&frame).expect("measure artifact frame"));
+        let ServerMessage::Artifacts {
+            artifacts,
+            truncated,
+            ..
+        } = frame.message
+        else {
+            panic!("expected artifact catalog");
+        };
+        assert!(truncated);
+        assert_eq!(
+            artifacts
+                .iter()
+                .map(|artifact| artifact.id.as_str())
+                .collect::<Vec<_>>(),
+            ["artifact-1", "artifact-2"]
+        );
+    }
+
+    #[test]
+    fn artifact_catalog_is_empty_when_its_newest_record_cannot_fit() {
+        let artifacts = vec![large_artifact(0, 1), large_artifact(1, MAX_FRAME_BYTES)];
+
+        let frame = bounded_artifacts_frame("artifacts".into(), "session".into(), artifacts)
+            .expect("bound artifact catalog");
+
+        assert!(encoded_frame_fits(&frame).expect("measure artifact frame"));
+        assert!(matches!(
+            frame.message,
+            ServerMessage::Artifacts {
+                artifacts,
+                truncated: true,
+                ..
+            } if artifacts.is_empty()
+        ));
+    }
+
+    fn large_artifact(index: usize, text_bytes: usize) -> ArtifactRecord {
+        let id = format!("artifact-{index}");
+        ArtifactRecord {
+            id: id.clone(),
+            session_id: "session".into(),
+            kind: ArtifactKind::CodeDiff,
+            title: id.clone(),
+            block: FrontendBlock {
+                id: Some(id),
+                group: None,
+                append: false,
+                pending: false,
+                text: "x".repeat(text_bytes),
+                files: Vec::new(),
+                format: FrontendBlockFormat::UnifiedDiff,
+                tone: FrontendTone::Neutral,
+            },
+        }
     }
 
     #[tokio::test]

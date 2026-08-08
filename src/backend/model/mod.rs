@@ -25,7 +25,7 @@ pub mod openrouter;
 pub mod provider;
 mod transport;
 
-use crate::protocol::{ATTACHMENTS_FIELD, AttachmentReference, INTERNAL_MESSAGE_FIELD};
+use crate::protocol::{ATTACHMENTS_FIELD, INTERNAL_MESSAGE_FIELD, SessionFileReference};
 pub(crate) use crate::protocol::{REPLAY_REASONING_FIELD, TOOL_ERROR_FIELD};
 const MAX_MODEL_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 128;
@@ -594,7 +594,7 @@ pub fn user_message(text: &str) -> Value {
 
 /// Creates a durable user message carrying opaque uploaded-file references.
 #[must_use]
-pub fn user_message_with_attachments(text: &str, attachments: &[AttachmentReference]) -> Value {
+pub fn user_message_with_attachments(text: &str, attachments: &[SessionFileReference]) -> Value {
     let mut message = user_message(text);
     if !attachments.is_empty() {
         message[ATTACHMENTS_FIELD] =

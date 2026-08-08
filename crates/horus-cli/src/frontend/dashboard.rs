@@ -1150,7 +1150,7 @@ fn render_blocks(
             lines.push(Line::default());
         }
         lines.extend(
-            terminal_text(&block.text)
+            terminal_text(&super::block_text(block))
                 .lines()
                 .map(|line| Line::styled(line.to_owned(), theme.style(tone_role(block.tone)))),
         );
@@ -1894,6 +1894,7 @@ mod tests {
                 text: text.into(),
                 format: FrontendBlockFormat::PlainText,
                 tone: FrontendTone::Neutral,
+                files: Vec::new(),
             }],
         }
     }

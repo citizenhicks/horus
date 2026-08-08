@@ -90,13 +90,14 @@ impl Middleware for Compaction {
         MANIFEST.id
     }
 
-    fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
+    fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
         matches!(event, EventMsg::ContextCompacted).then(|| FrontendBlock {
             id: None,
             group: None,
             append: false,
             pending: false,
             text: "context compacted".into(),
+            files: Vec::new(),
             format: crate::protocol::FrontendBlockFormat::PlainText,
             tone: FrontendTone::Neutral,
         })

@@ -99,7 +99,7 @@ impl Runner {
         commands: &mut mpsc::Receiver<Submission>,
         submission_id: String,
         message: String,
-        attachments: Vec<crate::protocol::AttachmentReference>,
+        attachments: Vec<crate::protocol::SessionFileReference>,
     ) -> Result<()> {
         let turn_id = Uuid::new_v4().to_string();
         if self.state.active_execution.is_some() {

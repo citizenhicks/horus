@@ -35,22 +35,21 @@ use horus::backend::sandbox::local::LocalSandbox;
 use horus::middleware::Middleware;
 use horus::middleware::MiddlewareStack;
 use horus::middleware::RuntimeContext;
-use horus::middleware::attachments::AttachmentStore;
 use horus::middleware::attachments::Attachments;
-use horus::middleware::attachments::MAX_UPLOAD_CHUNK_BYTES;
 use horus::middleware::compaction::Compaction;
+use horus::middleware::session_files::{MAX_UPLOAD_CHUNK_BYTES, SessionFileStore};
 use horus::middleware::skills::Skills;
 use horus::middleware::steering::Steering;
 use horus::middleware::subagents::SubagentLaunch;
 use horus::middleware::subagents::SubagentLauncher;
 use horus::middleware::subagents::Subagents;
 use horus::middleware::tools::Tools;
-use horus::protocol::AttachmentReference;
 use horus::protocol::EventMsg;
 use horus::protocol::MessageTarget;
 use horus::protocol::ModelEvent;
 use horus::protocol::Op;
 use horus::protocol::ReviewDecision;
+use horus::protocol::SessionFileReference;
 use horus::protocol::TokenUsage;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -774,7 +773,7 @@ async fn compaction_falls_back_to_a_model_summary_and_keeps_recent_context() {
 async fn attachment_hydration_runs_after_native_compaction_replaces_context() {
     let workspace = TempDir::new().expect("create workspace");
     let session_id = "attachment-compaction";
-    let store = AttachmentStore::new(workspace.path());
+    let store = SessionFileStore::new(workspace.path());
     let attachment = upload_attachment(
         &store,
         session_id,
@@ -850,7 +849,7 @@ async fn attachment_hydration_runs_after_native_compaction_replaces_context() {
 async fn text_attachments_do_not_require_image_input_support() {
     let workspace = TempDir::new().expect("create workspace");
     let session_id = "text-attachment";
-    let store = AttachmentStore::new(workspace.path());
+    let store = SessionFileStore::new(workspace.path());
     let attachment =
         upload_attachment(&store, session_id, "notes.txt", "text/plain", b"hello").await;
     let model = Arc::new(ScriptedModel::new(vec![text_response("done")]));
@@ -882,7 +881,7 @@ async fn text_attachments_do_not_require_image_input_support() {
 async fn over_budget_current_image_fails_but_does_not_poison_later_turns() {
     let workspace = TempDir::new().expect("create workspace");
     let session_id = "oversized-attachment";
-    let store = AttachmentStore::new(workspace.path());
+    let store = SessionFileStore::new(workspace.path());
     let mut oversized_bytes = vec![0_u8; 8 * 1024 * 1024 + 1];
     oversized_bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
     let oversized = upload_attachment(
@@ -1423,12 +1422,12 @@ async fn failed_turn(agent: &mut horus::agent::Agent) -> String {
 }
 
 async fn upload_attachment(
-    store: &AttachmentStore,
+    store: &SessionFileStore,
     session_id: &str,
     name: &str,
     media_type: &str,
     bytes: &[u8],
-) -> AttachmentReference {
+) -> SessionFileReference {
     let mut pending = store
         .begin_upload(
             session_id,

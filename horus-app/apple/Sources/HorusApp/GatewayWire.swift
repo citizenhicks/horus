@@ -3,10 +3,10 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 20
+let gatewayProtocolVersion = 21
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
-let maximumAttachmentReferences = 16
+let maximumSessionFileReferences = 16
 
 enum GatewayWireError: LocalizedError, Equatable {
     case invalidEndpoint(String)
@@ -190,7 +190,7 @@ struct Submission: Encodable, Sendable {
     let op: AgentOperation
 }
 
-struct AttachmentRecord: Identifiable, Codable, Hashable, Sendable {
+struct SessionFileReference: Identifiable, Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey { case id, name, size, mediaType }
 
     let id: String
@@ -215,7 +215,7 @@ struct AttachmentRecord: Identifiable, Codable, Hashable, Sendable {
               let mediaType = json["mediaType"]?.stringValue,
               !mediaType.isEmpty
         else {
-            throw GatewayWireError.invalidFrame("attachment is missing a required field")
+            throw GatewayWireError.invalidFrame("session file is missing a required field")
         }
         self.init(id: id, name: name, size: Int64(size), mediaType: mediaType)
     }
@@ -227,7 +227,7 @@ struct AttachmentRecord: Identifiable, Codable, Hashable, Sendable {
         let size = try container.decode(Int64.self, forKey: .size)
         let mediaType = try container.decode(String.self, forKey: .mediaType)
         guard !id.isEmpty, !name.isEmpty, size >= 0, !mediaType.isEmpty else {
-            throw GatewayWireError.invalidFrame("attachment is missing a required field")
+            throw GatewayWireError.invalidFrame("session file is missing a required field")
         }
         self.init(id: id, name: name, size: size, mediaType: mediaType)
     }
@@ -256,7 +256,7 @@ struct MessageTarget: Codable, Hashable, Sendable {
 }
 
 enum AgentOperation: Codable, Sendable {
-    case userInput(text: String, attachments: [AttachmentRecord])
+    case userInput(text: String, attachments: [SessionFileReference])
     case activeInput(operation: String, turnID: String, text: String)
     case interrupt(turnID: String)
     case execApproval(id: String, decision: ReviewDecision)
@@ -287,13 +287,13 @@ enum AgentOperation: Codable, Sendable {
         switch type {
         case "user_input":
             guard let values = value["attachments"]?.arrayValue,
-                  values.count <= maximumAttachmentReferences
+                  values.count <= maximumSessionFileReferences
             else {
                 throw GatewayWireError.invalidFrame("user_input has invalid attachments")
             }
             self = .userInput(
                 text: try required("text"),
-                attachments: try values.map(AttachmentRecord.init(json:))
+                attachments: try values.map(SessionFileReference.init(json:))
             )
         case "active_input":
             self = .activeInput(
@@ -350,7 +350,7 @@ enum AgentOperation: Codable, Sendable {
         var container = encoder.container(keyedBy: DynamicCodingKey.self)
         switch self {
         case .userInput(let text, let attachments):
-            guard attachments.count <= maximumAttachmentReferences else {
+            guard attachments.count <= maximumSessionFileReferences else {
                 throw GatewayWireError.invalidFrame("user_input has too many attachments")
             }
             try container.encode("user_input", forKey: "type")
@@ -497,26 +497,26 @@ enum GatewayRequest: Encodable, Sendable {
         offset: UInt64,
         maxBytes: Int
     )
-    case beginAttachmentUpload(
+    case beginSessionFileUpload(
         requestID: String,
         sessionID: String,
         name: String,
         size: Int64,
         mediaType: String
     )
-    case appendAttachmentChunk(
+    case uploadSessionFileChunk(
         requestID: String,
         sessionID: String,
         uploadID: String,
         offset: Int64,
         data: Data
     )
-    case finishAttachmentUpload(requestID: String, sessionID: String, uploadID: String)
-    case listAttachments(requestID: String, sessionID: String)
-    case readAttachment(
+    case finishSessionFileUpload(requestID: String, sessionID: String, uploadID: String)
+    case listSessionUploads(requestID: String, sessionID: String)
+    case readSessionFile(
         requestID: String,
         sessionID: String,
-        attachmentID: String,
+        fileID: String,
         offset: Int64,
         maxBytes: Int
     )
@@ -538,6 +538,7 @@ enum GatewayRequest: Encodable, Sendable {
     case createPairingCode(requestID: String)
     case startProviderLogin(requestID: String, provider: String)
     case getProfile(requestID: String)
+    case listArtifacts(requestID: String, sessionID: String)
     case startCronSetup(requestID: String, sessionID: String, task: String?)
     case listCron(requestID: String, sessionID: String)
     case rescheduleCron(requestID: String, sessionID: String, id: String, schedule: String)
@@ -630,34 +631,34 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(path, forKey: "path")
             try container.encode(offset, forKey: "offset")
             try container.encode(maxBytes, forKey: "maxBytes")
-        case .beginAttachmentUpload(let requestID, let sessionID, let name, let size, let mediaType):
-            try container.encode("begin_attachment_upload", forKey: "type")
+        case .beginSessionFileUpload(let requestID, let sessionID, let name, let size, let mediaType):
+            try container.encode("begin_session_file_upload", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
             try container.encode(name, forKey: "name")
             try container.encode(size, forKey: "size")
             try container.encode(mediaType, forKey: "mediaType")
-        case .appendAttachmentChunk(let requestID, let sessionID, let uploadID, let offset, let data):
-            try container.encode("append_attachment_chunk", forKey: "type")
+        case .uploadSessionFileChunk(let requestID, let sessionID, let uploadID, let offset, let data):
+            try container.encode("upload_session_file_chunk", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
             try container.encode(uploadID, forKey: "uploadId")
             try container.encode(offset, forKey: "offset")
             try container.encode(data, forKey: "data")
-        case .finishAttachmentUpload(let requestID, let sessionID, let uploadID):
-            try container.encode("finish_attachment_upload", forKey: "type")
+        case .finishSessionFileUpload(let requestID, let sessionID, let uploadID):
+            try container.encode("finish_session_file_upload", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
             try container.encode(uploadID, forKey: "uploadId")
-        case .listAttachments(let requestID, let sessionID):
-            try container.encode("list_attachments", forKey: "type")
+        case .listSessionUploads(let requestID, let sessionID):
+            try container.encode("list_session_uploads", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
-        case .readAttachment(let requestID, let sessionID, let attachmentID, let offset, let maxBytes):
-            try container.encode("read_attachment", forKey: "type")
+        case .readSessionFile(let requestID, let sessionID, let fileID, let offset, let maxBytes):
+            try container.encode("read_session_file", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
-            try container.encode(attachmentID, forKey: "attachmentId")
+            try container.encode(fileID, forKey: "fileId")
             try container.encode(offset, forKey: "offset")
             try container.encode(maxBytes, forKey: "maxBytes")
         case .switchGitBranch(let requestID, let sessionID, let branch):
@@ -697,6 +698,10 @@ enum GatewayRequest: Encodable, Sendable {
         case .getProfile(let requestID):
             try container.encode("get_profile", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
+        case .listArtifacts(let requestID, let sessionID):
+            try container.encode("list_artifacts", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(sessionID, forKey: "sessionId")
         case .startCronSetup(let requestID, let sessionID, let task):
             try container.encode("start_cron_setup", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -768,6 +773,12 @@ enum GatewayEnvelope: Decodable, Sendable {
     )
     case providerLoginFinished(requestID: String, loginID: String, provider: String)
     case profile(requestID: String, profile: ProfileSnapshot)
+    case artifacts(
+        requestID: String,
+        sessionID: String,
+        artifacts: [ArtifactRecord],
+        truncated: Bool
+    )
     case gitDiff(requestID: String, sessionID: String, scope: GitDiffScope, diff: String)
     case workspaceFiles(requestID: String, sessionID: String, files: [WorkspaceFileRecord])
     case workspaceFileChunk(
@@ -778,28 +789,28 @@ enum GatewayEnvelope: Decodable, Sendable {
         data: Data,
         nextOffset: UInt64?
     )
-    case attachmentUploadStarted(
+    case sessionFileUploadReady(
         requestID: String,
         sessionID: String,
         uploadID: String,
         maxChunkBytes: Int
     )
-    case attachmentChunkAccepted(
+    case sessionFileUploadChunkAccepted(
         requestID: String,
         sessionID: String,
         uploadID: String,
         nextOffset: Int64
     )
-    case attachmentUploaded(
+    case sessionFileUploadCompleted(
         requestID: String,
         sessionID: String,
-        attachment: AttachmentRecord
+        file: SessionFileReference
     )
-    case attachments(requestID: String, sessionID: String, attachments: [AttachmentRecord])
-    case attachmentChunk(
+    case sessionUploads(requestID: String, sessionID: String, uploads: [SessionFileReference])
+    case sessionFileChunk(
         requestID: String,
         sessionID: String,
-        attachmentID: String,
+        fileID: String,
         offset: Int64,
         data: Data,
         nextOffset: Int64?
@@ -916,6 +927,13 @@ enum GatewayEnvelope: Decodable, Sendable {
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 profile: try container.decode(ProfileSnapshot.self, forKey: "profile")
             )
+        case "artifacts":
+            self = .artifacts(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                sessionID: try container.decode(String.self, forKey: "sessionId"),
+                artifacts: try container.decode([ArtifactRecord].self, forKey: "artifacts"),
+                truncated: try container.decode(Bool.self, forKey: "truncated")
+            )
         case "git_diff":
             self = .gitDiff(
                 requestID: try container.decode(String.self, forKey: "requestId"),
@@ -938,37 +956,37 @@ enum GatewayEnvelope: Decodable, Sendable {
                 data: try container.decode(Data.self, forKey: "data"),
                 nextOffset: try container.decodeIfPresent(UInt64.self, forKey: "nextOffset")
             )
-        case "attachment_upload_started":
-            self = .attachmentUploadStarted(
+        case "session_file_upload_ready":
+            self = .sessionFileUploadReady(
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 sessionID: try container.decode(String.self, forKey: "sessionId"),
                 uploadID: try container.decode(String.self, forKey: "uploadId"),
                 maxChunkBytes: try container.decode(Int.self, forKey: "maxChunkBytes")
             )
-        case "attachment_chunk_accepted":
-            self = .attachmentChunkAccepted(
+        case "session_file_upload_chunk_accepted":
+            self = .sessionFileUploadChunkAccepted(
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 sessionID: try container.decode(String.self, forKey: "sessionId"),
                 uploadID: try container.decode(String.self, forKey: "uploadId"),
                 nextOffset: try container.decode(Int64.self, forKey: "nextOffset")
             )
-        case "attachment_uploaded":
-            self = .attachmentUploaded(
+        case "session_file_upload_completed":
+            self = .sessionFileUploadCompleted(
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 sessionID: try container.decode(String.self, forKey: "sessionId"),
-                attachment: try container.decode(AttachmentRecord.self, forKey: "attachment")
+                file: try container.decode(SessionFileReference.self, forKey: "file")
             )
-        case "attachments":
-            self = .attachments(
+        case "session_uploads":
+            self = .sessionUploads(
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 sessionID: try container.decode(String.self, forKey: "sessionId"),
-                attachments: try container.decode([AttachmentRecord].self, forKey: "attachments")
+                uploads: try container.decode([SessionFileReference].self, forKey: "uploads")
             )
-        case "attachment_chunk":
-            self = .attachmentChunk(
+        case "session_file_chunk":
+            self = .sessionFileChunk(
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 sessionID: try container.decode(String.self, forKey: "sessionId"),
-                attachmentID: try container.decode(String.self, forKey: "attachmentId"),
+                fileID: try container.decode(String.self, forKey: "fileId"),
                 offset: try container.decode(Int64.self, forKey: "offset"),
                 data: try container.decode(Data.self, forKey: "data"),
                 nextOffset: try container.decodeIfPresent(Int64.self, forKey: "nextOffset")
@@ -1508,6 +1526,7 @@ struct FrontendBlock: Codable, Hashable, Sendable {
     let text: String
     let format: String
     let tone: String
+    let files: [SessionFileReference]
 }
 
 extension FrontendBlock {
@@ -1530,7 +1549,9 @@ extension FrontendBlock {
               let format = json["format"]?.stringValue,
               ["plain_text", "unified_diff"].contains(format),
               let tone = json["tone"]?.stringValue,
-              ["neutral", "success", "warning", "error"].contains(tone)
+              ["neutral", "success", "warning", "error"].contains(tone),
+              let files = json["files"]?.arrayValue,
+              files.count <= maximumSessionFileReferences
         else {
             throw GatewayWireError.invalidFrame("frontend block is missing a required field")
         }
@@ -1541,6 +1562,7 @@ extension FrontendBlock {
         self.text = text
         self.format = format
         self.tone = tone
+        self.files = try files.map(SessionFileReference.init(json:))
     }
 
     func namespaced(to capability: String) -> Self {
@@ -1551,7 +1573,8 @@ extension FrontendBlock {
             pending: pending,
             text: text,
             format: format,
-            tone: tone
+            tone: tone,
+            files: files
         )
     }
 }
@@ -1716,11 +1739,11 @@ extension AgentEventRecord {
 
         func validateAttachments() throws {
             guard let attachments = msg["attachments"]?.arrayValue,
-                  attachments.count <= maximumAttachmentReferences
+                  attachments.count <= maximumSessionFileReferences
             else {
                 throw GatewayWireError.invalidFrame("\(type) has invalid attachments")
             }
-            try attachments.forEach { _ = try AttachmentRecord(json: $0) }
+            try attachments.forEach { _ = try SessionFileReference(json: $0) }
         }
 
         switch type {
@@ -2147,6 +2170,23 @@ struct RunSummary: Identifiable, Codable, Equatable, Sendable {
 struct DailyUsage: Codable, Equatable, Sendable {
     let unixDay: UInt64
     let usage: TokenUsage
+}
+
+struct ArtifactRecord: Identifiable, Codable, Equatable, Sendable {
+    let id: String
+    let sessionId: String
+    let kind: ArtifactKind
+    let title: String
+    let block: FrontendBlock
+
+    var file: SessionFileReference? {
+        kind == .file ? block.files.first : nil
+    }
+}
+
+enum ArtifactKind: String, Codable, Equatable, Sendable {
+    case codeDiff = "code_diff"
+    case file
 }
 
 struct CronTask: Identifiable, Codable, Equatable, Sendable {

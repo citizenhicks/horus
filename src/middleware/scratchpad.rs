@@ -297,7 +297,7 @@ impl Middleware for Scratchpad {
         }
     }
 
-    fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
+    fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
         render_tool_event(
             event,
             |name| matches!(name, "write_scratchpad" | "promote_scratchpad"),

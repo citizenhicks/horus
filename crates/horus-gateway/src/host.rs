@@ -5,7 +5,7 @@ mod files;
 mod git;
 mod providers;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -19,11 +19,11 @@ use horus::backend::checkpoint::{
 };
 use horus::backend::model::provider::provider;
 use horus::middleware::FrontendExtensions;
-use horus::middleware::attachments::AttachmentStore;
 use horus::middleware::scratchpad::ScratchpadStore;
+use horus::middleware::session_files::SessionFileStore;
 use horus::protocol::{
     Event, EventMsg, FrontendBlock, FrontendBlockFormat, FrontendEvent, Op, ReviewDecision,
-    Submission, TokenUsage, replay_events,
+    SessionFileReference, Submission, TokenUsage, replay_events,
 };
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use uuid::Uuid;
@@ -90,7 +90,7 @@ struct GatewayState {
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     scratchpad: ScratchpadStore,
-    attachments: AttachmentStore,
+    session_files: SessionFileStore,
     // ponytail: one lock is enough for at most 32 tiny catalog writes.
     catalog_lock: Arc<Mutex<()>>,
     activities: SessionActivities,
@@ -123,7 +123,7 @@ struct HostState {
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     scratchpad: ScratchpadStore,
-    attachments: AttachmentStore,
+    session_files: SessionFileStore,
     accepts_file_attachments: Arc<AtomicBool>,
     catalog_lock: Arc<Mutex<()>>,
     activities: SessionActivities,
@@ -230,7 +230,7 @@ enum HostCommand {
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
     Artifacts {
-        reply: oneshot::Sender<Vec<ArtifactRecord>>,
+        reply: oneshot::Sender<std::result::Result<Vec<ArtifactRecord>, Rejection>>,
     },
     RunCron {
         run: ActiveCronRun,
@@ -260,7 +260,7 @@ impl GatewayHost {
         let checkpoints: Arc<dyn CheckpointStore> =
             Arc::new(SqliteCheckpoint::new(store.checkpoints_path())?);
         let scratchpad = ScratchpadStore::new(Arc::clone(&checkpoints));
-        let attachments = AttachmentStore::new(store.state_dir());
+        let session_files = SessionFileStore::new(store.state_dir());
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Self {
             state: Arc::new(Mutex::new(GatewayState {
@@ -270,7 +270,7 @@ impl GatewayHost {
                 cron,
                 checkpoints,
                 scratchpad,
-                attachments,
+                session_files,
                 catalog_lock: Arc::new(Mutex::new(())),
                 activities: Arc::new(StdMutex::new(HashMap::new())),
                 provider_login: Arc::new(StdMutex::new(None)),
@@ -284,8 +284,8 @@ impl GatewayHost {
         self.events.subscribe()
     }
 
-    pub(crate) async fn attachment_store(&self) -> AttachmentStore {
-        self.state.lock().await.attachments.clone()
+    pub(crate) async fn session_file_store(&self) -> SessionFileStore {
+        self.state.lock().await.session_files.clone()
     }
 
     pub(crate) async fn ready(&self) -> std::result::Result<ReadyPayload, Rejection> {
@@ -335,7 +335,7 @@ impl GatewayHost {
             Arc::clone(&state.cron),
             Arc::clone(&state.checkpoints),
             state.scratchpad.clone(),
-            state.attachments.clone(),
+            state.session_files.clone(),
             Arc::clone(&state.catalog_lock),
             Arc::clone(&state.activities),
             self.events.clone(),
@@ -390,7 +390,7 @@ impl GatewayHost {
             Arc::clone(&state.cron),
             Arc::clone(&state.checkpoints),
             state.scratchpad.clone(),
-            state.attachments.clone(),
+            state.session_files.clone(),
             Arc::clone(&state.catalog_lock),
             Arc::clone(&state.activities),
             self.events.clone(),
@@ -489,7 +489,7 @@ impl GatewayHost {
             Arc::clone(&state.cron),
             Arc::clone(&state.checkpoints),
             state.scratchpad.clone(),
-            state.attachments.clone(),
+            state.session_files.clone(),
             Arc::clone(&state.catalog_lock),
             Arc::clone(&state.activities),
             self.events.clone(),
@@ -618,7 +618,7 @@ impl HostHandle {
         cron: Arc<CronStore>,
         checkpoints: Arc<dyn CheckpointStore>,
         scratchpad: ScratchpadStore,
-        attachments: AttachmentStore,
+        session_files: SessionFileStore,
         catalog_lock: Arc<Mutex<()>>,
         activities: SessionActivities,
         gateway_events: broadcast::Sender<ServerFrame>,
@@ -637,7 +637,7 @@ impl HostHandle {
             Arc::clone(&cron),
             Arc::clone(&checkpoints),
             scratchpad.clone(),
-            attachments.clone(),
+            session_files.clone(),
             session_id.clone(),
             origin_label,
             false,
@@ -661,7 +661,7 @@ impl HostHandle {
             cron,
             checkpoints,
             scratchpad,
-            attachments,
+            session_files,
             accepts_file_attachments: Arc::clone(&accepts_file_attachments),
             catalog_lock,
             activities,
@@ -878,7 +878,7 @@ impl HostHandle {
     pub(crate) async fn artifacts(&self) -> std::result::Result<Vec<ArtifactRecord>, Rejection> {
         let (reply, receiver) = oneshot::channel();
         self.send(HostCommand::Artifacts { reply }).await?;
-        receiver.await.map_err(|_| stopped())
+        receive(receiver).await
     }
 
     pub(crate) async fn run_cron(
@@ -1111,7 +1111,7 @@ impl HostState {
                 let _ = reply.send(result);
             }
             HostCommand::Artifacts { reply } => {
-                let _ = reply.send(self.artifacts.iter().cloned().collect());
+                let _ = reply.send(self.list_artifacts().await);
             }
             HostCommand::RunCron { run, input, reply } => {
                 let result = self.run_cron(run, input);
@@ -1435,7 +1435,7 @@ impl HostState {
             Arc::clone(&self.cron),
             Arc::clone(&self.checkpoints),
             self.scratchpad.clone(),
-            self.attachments.clone(),
+            self.session_files.clone(),
             session_id,
             "horus-gateway",
             true,
@@ -1518,7 +1518,7 @@ impl HostState {
             Arc::clone(&self.cron),
             Arc::clone(&self.checkpoints),
             self.scratchpad.clone(),
-            self.attachments.clone(),
+            self.session_files.clone(),
             self.running.session_id.clone(),
             origin_label,
             false,
@@ -1733,12 +1733,22 @@ impl HostState {
     }
 
     fn record_artifacts(&mut self, blocks: &[FrontendBlock]) {
-        for block in blocks
-            .iter()
-            .filter(|block| block.format == FrontendBlockFormat::UnifiedDiff)
-        {
+        for block in blocks {
             upsert_artifact(&mut self.artifacts, &self.running.session_id, block);
         }
+    }
+
+    async fn list_artifacts(&self) -> std::result::Result<Vec<ArtifactRecord>, Rejection> {
+        let stored_files = self
+            .session_files
+            .list_artifacts(&self.running.session_id)
+            .await
+            .map_err(internal)?;
+        Ok(merge_stored_file_artifacts(
+            &self.artifacts,
+            &self.running.session_id,
+            stored_files,
+        ))
     }
 
     async fn ready(&self) -> Result<SessionReadyPayload> {
@@ -2237,7 +2247,7 @@ async fn start_agent(
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     scratchpad: ScratchpadStore,
-    attachments: AttachmentStore,
+    session_files: SessionFileStore,
     session_id: String,
     origin_label: &str,
     override_saved_model_route: bool,
@@ -2254,7 +2264,7 @@ async fn start_agent(
         cron,
         checkpoints,
         scratchpad,
-        attachments,
+        session_files,
         Some(session_id),
         origin_label,
         override_saved_model_route,
@@ -2437,6 +2447,16 @@ fn upsert_artifact(
     session_id: &str,
     block: &FrontendBlock,
 ) {
+    let (kind, title) = if let Some(file) = block.files.first() {
+        (ArtifactKind::File, file.name.clone())
+    } else if block.format == FrontendBlockFormat::UnifiedDiff {
+        (
+            ArtifactKind::CodeDiff,
+            block.group.clone().unwrap_or_else(|| "Code diff".into()),
+        )
+    } else {
+        return;
+    };
     let id = block
         .id
         .clone()
@@ -2449,10 +2469,62 @@ fn upsert_artifact(
     artifacts.push_back(ArtifactRecord {
         id,
         session_id: session_id.into(),
-        kind: ArtifactKind::CodeDiff,
-        title: block.group.clone().unwrap_or_else(|| "Code diff".into()),
+        kind,
+        title,
         block: block.clone(),
     });
+}
+
+fn merge_stored_file_artifacts(
+    live: &VecDeque<ArtifactRecord>,
+    session_id: &str,
+    stored_files: Vec<SessionFileReference>,
+) -> Vec<ArtifactRecord> {
+    let stored_ids = stored_files
+        .iter()
+        .map(|file| file.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen_files = HashSet::new();
+    let mut artifacts = Vec::with_capacity(live.len().saturating_add(stored_files.len()));
+    for artifact in live {
+        if artifact.kind == ArtifactKind::CodeDiff {
+            artifacts.push(artifact.clone());
+            continue;
+        }
+        let Some(file) = artifact.block.files.first() else {
+            continue;
+        };
+        if stored_ids.contains(file.id.as_str()) && seen_files.insert(file.id.clone()) {
+            artifacts.push(artifact.clone());
+        }
+    }
+    for file in stored_files {
+        if seen_files.insert(file.id.clone()) {
+            artifacts.push(stored_file_artifact(session_id, file));
+        }
+    }
+    artifacts
+}
+
+fn stored_file_artifact(session_id: &str, file: SessionFileReference) -> ArtifactRecord {
+    let id = format!("artifacts/file/{}", file.id);
+    let title = file.name.clone();
+    ArtifactRecord {
+        id: id.clone(),
+        session_id: session_id.into(),
+        kind: ArtifactKind::File,
+        title: title.clone(),
+        block: FrontendBlock {
+            id: Some(id),
+            group: None,
+            append: false,
+            pending: false,
+            text: format!("Sent {title}"),
+            files: vec![file],
+            format: FrontendBlockFormat::PlainText,
+            tone: horus::protocol::FrontendTone::Success,
+        },
+    }
 }
 
 fn record_and_publish(
@@ -3356,6 +3428,7 @@ mod tests {
                 text: "rendered child".into(),
                 format: FrontendBlockFormat::PlainText,
                 tone: horus::protocol::FrontendTone::Neutral,
+                files: Vec::new(),
             }]
         })
         .expect("rendered history");
@@ -3380,6 +3453,7 @@ mod tests {
             text: "first diff".into(),
             format: FrontendBlockFormat::UnifiedDiff,
             tone: horus::protocol::FrontendTone::Success,
+            files: Vec::new(),
         };
         upsert_artifact(&mut artifacts, "session-a", &block);
         block.text = "updated diff".into();
@@ -3389,5 +3463,54 @@ mod tests {
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].id, "tools/turn-a/call-a");
         assert_eq!(artifacts[0].block.text, "updated diff");
+    }
+
+    #[test]
+    fn artifact_catalog_uses_session_file_metadata() {
+        let mut artifacts = VecDeque::new();
+        let block = FrontendBlock {
+            id: Some("artifacts/turn-a/call-a".into()),
+            group: Some("artifacts/turn-a".into()),
+            append: false,
+            pending: false,
+            text: "Sent report.xlsx".into(),
+            format: FrontendBlockFormat::PlainText,
+            tone: horus::protocol::FrontendTone::Success,
+            files: vec![horus::protocol::SessionFileReference {
+                id: "file-a".into(),
+                name: "report.xlsx".into(),
+                size: 42,
+                media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    .into(),
+            }],
+        };
+
+        upsert_artifact(&mut artifacts, "session-a", &block);
+
+        assert_eq!(
+            artifacts
+                .front()
+                .map(|artifact| (artifact.kind, artifact.title.as_str())),
+            Some((ArtifactKind::File, "report.xlsx"))
+        );
+    }
+
+    #[test]
+    fn stored_files_restore_the_artifact_catalog_without_live_replay() {
+        let file = horus::protocol::SessionFileReference {
+            id: "file-a".into(),
+            name: "report.xlsx".into(),
+            size: 42,
+            media_type: "application/octet-stream".into(),
+        };
+
+        let artifacts =
+            merge_stored_file_artifacts(&VecDeque::new(), "session-a", vec![file.clone()]);
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].session_id, "session-a");
+        assert_eq!(artifacts[0].kind, ArtifactKind::File);
+        assert_eq!(artifacts[0].title, "report.xlsx");
+        assert_eq!(artifacts[0].block.files, [file]);
     }
 }

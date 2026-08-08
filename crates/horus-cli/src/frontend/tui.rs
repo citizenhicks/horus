@@ -335,7 +335,7 @@ impl TuiState {
 
     fn apply_block(&mut self, block: FrontendBlock) {
         self.commit_reasoning();
-        let mut text = bounded_terminal_text(&block.text, MAX_ENTRY_BYTES);
+        let mut text = bounded_terminal_text(&super::block_text(&block), MAX_ENTRY_BYTES);
         if let Some(id) = block.id.as_deref()
             && let Some(entry) = self
                 .transcript

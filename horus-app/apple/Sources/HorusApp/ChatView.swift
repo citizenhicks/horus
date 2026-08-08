@@ -69,12 +69,12 @@ struct ChatView: View {
     }
 
     private var inspectorButton: some View {
-        Button(action: model.toggleInspector) {
+        Button(action: model.toggleFilesInspector) {
             HorusIcon(.sidebarSimple, foreground: .primary)
         }
-        .accessibilityLabel("Toggle artifact inspector")
+        .accessibilityLabel("Toggle Files")
         .tint(.primary)
-        .help(model.showsInspector ? "Hide inspector" : "Show inspector")
+        .help(model.showsInspector ? "Hide Files" : "Show Files")
     }
 
     private var workspaceName: String {
@@ -121,19 +121,11 @@ private struct ChatOptionsMenu: View {
                     }
                     .disabled(model.isSwitchingGitBranch || !model.canOpenSession)
                 }
-                Button(action: model.showInspector) {
+                Button { model.showFiles() } label: {
                     HorusPlatformMenuLabel(
-                        title: "Open viewer",
+                        title: "Files",
                         glyph: .fileMagnifyingGlass,
                         systemImage: "doc.text.magnifyingglass"
-                    )
-                }
-                .disabled(model.selectedSessionID == nil || !model.connectionState.isReady)
-                Button(action: model.showUploadedFiles) {
-                    HorusPlatformMenuLabel(
-                        title: "Uploaded files…",
-                        glyph: .fileText,
-                        systemImage: "paperclip"
                     )
                 }
                 .disabled(model.selectedSessionID == nil || !model.connectionState.isReady)
@@ -410,8 +402,13 @@ private struct TranscriptRow: View {
                 UserMessageContent(entry: entry)
             }
         case .assistant:
-            MarkdownText(entry.text, streaming: entry.pending)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 6) {
+                TranscriptFileCards(files: entry.files)
+                if !entry.text.isEmpty {
+                    MarkdownText(entry.text, streaming: entry.pending)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         case .reasoning:
             MarkdownText(entry.text, streaming: entry.pending)
                 .foregroundStyle(palette.muted)
@@ -420,14 +417,17 @@ private struct TranscriptRow: View {
                 Rectangle().fill(palette.line).frame(width: 2)
             }
         case .event, .error:
-            if entry.format == "unified_diff" {
-                Button(action: model.showInspector) {
+            VStack(alignment: .leading, spacing: 6) {
+                TranscriptFileCards(files: entry.files)
+                if entry.format == "unified_diff" {
+                    Button { model.showFiles(.unstaged) } label: {
+                        EventCard(entry: entry)
+                    }
+                    .buttonStyle(.horusPlain)
+                    .accessibilityHint("Opens modified files")
+                } else if !entry.text.isEmpty {
                     EventCard(entry: entry)
                 }
-                .buttonStyle(.horusPlain)
-                .accessibilityHint("Opens modified files")
-            } else {
-                EventCard(entry: entry)
             }
         }
     }
@@ -495,27 +495,16 @@ private struct TranscriptRow: View {
     }
 }
 
-/// Attachments sit above the bubble rather than inside it: nesting a bordered card in a
+/// Files sit above the bubble rather than inside it: nesting a bordered card in a
 /// filled bubble reads as a box in a box, and the pill carries the same fill so the pair
 /// still reads as one message.
 private struct UserMessageContent: View {
-    @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
     let entry: TranscriptEntry
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 6) {
-            ForEach(entry.attachments) { attachment in
-                Button {
-                    model.previewAttachment(attachment)
-                } label: {
-                    AttachmentRecordLabel(attachment: attachment)
-                }
-                .buttonStyle(.horusPlain)
-                .disabled(model.isLoadingAttachmentPreview)
-                .accessibilityLabel("Open attachment \(attachment.name)")
-                .accessibilityHint("Opens a preview")
-            }
+            TranscriptFileCards(files: entry.files)
             if !entry.text.isEmpty {
                 Text(entry.text)
                     .textSelection(.enabled)
@@ -523,6 +512,52 @@ private struct UserMessageContent: View {
                     .padding(.vertical, 12)
                     .background(palette.accentSoft, in: HorusStyle.cardShape)
             }
+        }
+    }
+}
+
+private struct TranscriptFileCards: View {
+    let files: [SessionFileReference]
+
+    var body: some View {
+        ForEach(files) { file in
+            SessionFileCard(file: file)
+        }
+    }
+}
+
+struct SessionFileCard: View {
+    @Environment(AppModel.self) private var model
+    let file: SessionFileReference
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Button {
+                model.previewSessionFile(file)
+            } label: {
+                SessionFileCardLabel(file: file)
+            }
+            .buttonStyle(.horusPlain)
+            .disabled(model.isLoadingFilePresentation)
+            .accessibilityLabel("Open file \(file.name)")
+            .accessibilityHint("Downloads and opens a preview")
+
+            Menu {
+                Button("Preview", glyph: file.name.fileGlyph) {
+                    model.previewSessionFile(file)
+                }
+                Button("Share or Save…", glyph: .arrowUpRight01) {
+                    model.saveOrShareSessionFile(file)
+                }
+            } label: {
+                HorusIcon(.dotsThree, size: 14)
+                    .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.horusPlain)
+            .disabled(model.isLoadingFilePresentation)
+            .accessibilityLabel("File actions for \(file.name)")
+            .help("File actions")
         }
     }
 }
@@ -586,14 +621,14 @@ private struct QueuedMessageView: View {
 
 }
 
-private struct AttachmentRecordLabel: View {
+private struct SessionFileCardLabel: View {
     @Environment(\.horusPalette) private var palette
-    let attachment: AttachmentRecord
+    let file: SessionFileReference
 
     var body: some View {
-        AttachmentCard(
-            name: attachment.name,
-            detail: Text("\(Text(attachmentKind(name: attachment.name, mediaType: attachment.mediaType))) · \(Text(attachment.size, format: .byteCount(style: .file)))"),
+        FileCard(
+            name: file.name,
+            detail: Text("\(Text(fileKind(name: file.name, mediaType: file.mediaType))) · \(Text(file.size, format: .byteCount(style: .file)))"),
             detailColor: palette.muted
         )
     }
@@ -601,7 +636,7 @@ private struct AttachmentRecordLabel: View {
 
 /// The shared shape for a file in the transcript and in the composer: a glyph tile, the
 /// name, and one line under it. No thumbnail — the tile carries the weight instead.
-private struct AttachmentCard<Trailing: View>: View {
+private struct FileCard<Trailing: View>: View {
     @Environment(\.horusPalette) private var palette
     let name: String
     let detail: Text
@@ -642,13 +677,13 @@ private struct AttachmentCard<Trailing: View>: View {
 }
 
 /// The extension reads faster than a media type, but a name without one still needs a word.
-private func attachmentKind(name: String, mediaType: String) -> String {
+private func fileKind(name: String, mediaType: String) -> String {
     let ext = URL(fileURLWithPath: name).pathExtension
     if !ext.isEmpty { return ext.uppercased() }
     return mediaType.split(separator: "/").last.map { $0.uppercased() } ?? "File"
 }
 
-extension AttachmentCard where Trailing == EmptyView {
+extension FileCard where Trailing == EmptyView {
     init(name: String, detail: Text, detailColor: Color) {
         self.init(name: name, detail: detail, detailColor: detailColor) { EmptyView() }
     }
@@ -1179,7 +1214,7 @@ private struct ComposerActivityView: View {
                     FrontendWidgetView(widget: widget)
                 }
                 if totals.added > 0 || totals.removed > 0 {
-                    Button(action: model.showInspector) {
+                    Button { model.showFiles(.unstaged) } label: {
                         HStack(spacing: 6) {
                             Text("+\(totals.added)").foregroundStyle(palette.signal)
                             Text("−\(totals.removed)").foregroundStyle(palette.danger)
@@ -1343,7 +1378,7 @@ private struct ComposerAttachmentRow: View {
     let attachment: ComposerAttachment
 
     var body: some View {
-        AttachmentCard(name: attachment.name, detail: status, detailColor: statusColor) {
+        FileCard(name: attachment.name, detail: status, detailColor: statusColor) {
             // A tile has no room for a row of controls, so the state sits in the corner and
             // the glyph keeps saying which file this is.
             HStack(spacing: 2) {

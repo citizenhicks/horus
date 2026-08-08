@@ -413,7 +413,7 @@ impl Middleware for Subagents {
         }
     }
 
-    fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
+    fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
         render_tool_event(
             event,
             |name| {
@@ -1070,24 +1070,30 @@ mod tests {
         ] {
             assert!(
                 middleware
-                    .render(&EventMsg::ToolCallBegin(ToolCallBeginEvent {
-                        turn_id: "turn".into(),
-                        call_id: "call".into(),
-                        name: name.into(),
-                        arguments: serde_json::json!({}),
-                    }))
+                    .render(
+                        &EventMsg::ToolCallBegin(ToolCallBeginEvent {
+                            turn_id: "turn".into(),
+                            call_id: "call".into(),
+                            name: name.into(),
+                            arguments: serde_json::json!({}),
+                        }),
+                        "session"
+                    )
                     .is_some(),
                 "missing begin renderer for {name}"
             );
             assert!(
                 middleware
-                    .render(&EventMsg::ToolCallEnd(ToolCallEndEvent {
-                        turn_id: "turn".into(),
-                        call_id: "call".into(),
-                        name: name.into(),
-                        output: String::new(),
-                        is_error: false,
-                    }))
+                    .render(
+                        &EventMsg::ToolCallEnd(ToolCallEndEvent {
+                            turn_id: "turn".into(),
+                            call_id: "call".into(),
+                            name: name.into(),
+                            output: String::new(),
+                            is_error: false,
+                        }),
+                        "session"
+                    )
                     .is_some(),
                 "missing end renderer for {name}"
             );

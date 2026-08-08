@@ -32,6 +32,7 @@ use crate::protocol::TokenUsage;
 use crate::protocol::ToolCallBeginEvent;
 use crate::protocol::ToolCallEndEvent;
 
+pub mod artifacts;
 pub mod attachments;
 pub mod compaction;
 pub mod context_offloading;
@@ -39,6 +40,7 @@ pub mod cron;
 pub mod instructions;
 pub mod manifest;
 pub mod scratchpad;
+pub mod session_files;
 pub mod sessions;
 pub mod skills;
 pub mod steering;
@@ -435,14 +437,16 @@ pub struct MiddlewareCommandOutput {
 #[derive(Clone)]
 pub struct FrontendExtensions {
     stack: MiddlewareStack,
+    session_id: Arc<str>,
     contributions: Arc<[FrontendContribution]>,
 }
 
 impl FrontendExtensions {
-    pub(crate) fn new(stack: MiddlewareStack) -> Result<Self> {
+    pub(crate) fn new(stack: MiddlewareStack, session_id: impl Into<Arc<str>>) -> Result<Self> {
         let contributions = stack.frontend()?;
         Ok(Self {
             stack,
+            session_id: session_id.into(),
             contributions: contributions.into(),
         })
     }
@@ -461,7 +465,7 @@ impl FrontendExtensions {
             .iter()
             .filter_map(|entry| {
                 entry
-                    .render(event)
+                    .render(event, &self.session_id)
                     .map(|block| block.namespaced(entry.name()))
             })
             .collect()
@@ -490,6 +494,7 @@ impl MiddlewareCommandOutput {
                 append: false,
                 pending: false,
                 text: text.into(),
+                files: Vec::new(),
                 format: crate::protocol::FrontendBlockFormat::PlainText,
                 tone,
             },
@@ -517,8 +522,10 @@ pub trait Middleware: Send + Sync {
         FrontendContribution::default()
     }
 
-    /// Renders an event owned by this capability for thin frontend shells.
-    fn render(&self, _event: &EventMsg) -> Option<FrontendBlock> {
+    /// Renders an event owned by this capability for the destination session.
+    ///
+    /// Session-bound handles must only be exposed when they belong to `session_id`.
+    fn render(&self, _event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
         None
     }
 
@@ -609,7 +616,7 @@ impl Middleware for Sandbox {
         Sandbox::frontend(self)
     }
 
-    fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
+    fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
         Sandbox::render(self, event)
     }
 
@@ -677,7 +684,7 @@ impl MiddlewareStack {
                     .iter()
                     .any(|registered| registered.name == definition.name)
             }) {
-                validate_tool_rendering(entry.as_ref(), &definition.name)?;
+                validate_tool_rendering(entry.as_ref(), &definition.name, &runtime.session_id)?;
             }
         }
         Ok(catalog)
@@ -868,7 +875,11 @@ impl MiddlewareStack {
     }
 }
 
-fn validate_tool_rendering(middleware: &dyn Middleware, tool_name: &str) -> Result<()> {
+fn validate_tool_rendering(
+    middleware: &dyn Middleware,
+    tool_name: &str,
+    session_id: &str,
+) -> Result<()> {
     let events = [
         (
             "ToolCallBegin",
@@ -901,7 +912,7 @@ fn validate_tool_rendering(middleware: &dyn Middleware, tool_name: &str) -> Resu
         ),
     ];
     for (event_name, event) in events {
-        if middleware.render(&event).is_none() {
+        if middleware.render(&event, session_id).is_none() {
             return Err(Error::Config(format!(
                 "middleware `{}` registered tool `{tool_name}` but does not render `{event_name}`",
                 middleware.name()
@@ -1211,13 +1222,14 @@ mod tests {
             "catch_all"
         }
 
-        fn render(&self, _event: &EventMsg) -> Option<FrontendBlock> {
+        fn render(&self, _event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
             Some(FrontendBlock {
                 id: None,
                 group: None,
                 append: false,
                 pending: false,
                 text: String::new(),
+                files: Vec::new(),
                 format: crate::protocol::FrontendBlockFormat::PlainText,
                 tone: FrontendTone::Neutral,
             })

@@ -1,6 +1,7 @@
 //! Horus terminal frontend.
 
 use horus::Result;
+use horus::protocol::FrontendBlock;
 use horus_gateway::client::{GatewayEvents, GatewaySender};
 use horus_gateway::wire::{ReadyPayload, SessionReadyPayload};
 
@@ -22,6 +23,20 @@ pub use tui::terminal_text;
 pub use cloudflare_setup::{CloudflareInit, run as run_cloudflare_setup};
 pub use dashboard::{run as run_gateway_dashboard, run_provider as run_gateway_provider};
 pub use reinitialize::confirm as confirm_gateway_reinitialize;
+
+fn block_text(block: &FrontendBlock) -> String {
+    let mut text = block.text.clone();
+    for file in &block.files {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "[file] {} · {} · {} bytes",
+            file.name, file.media_type, file.size
+        ));
+    }
+    text
+}
 
 pub async fn run(
     sender: GatewaySender,

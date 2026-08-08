@@ -245,7 +245,8 @@ final class AppModelTests: XCTestCase {
         pending: Bool = false,
         text: String,
         format: String = "plain_text",
-        tone: String = "neutral"
+        tone: String = "neutral",
+        files: [SessionFileReference] = []
     ) -> AgentEventRecord {
         AgentEventRecord(submissionId: nil, msg: .object([
             "type": .string("frontend"),
@@ -258,7 +259,15 @@ final class AppModelTests: XCTestCase {
                 "pending": .bool(pending),
                 "text": .string(text),
                 "format": .string(format),
-                "tone": .string(tone)
+                "tone": .string(tone),
+                "files": .array(files.map { file in
+                    .object([
+                        "id": .string(file.id),
+                        "name": .string(file.name),
+                        "size": .number(Double(file.size)),
+                        "mediaType": .string(file.mediaType)
+                    ])
+                })
             ])
         ]))
     }
@@ -1292,6 +1301,41 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(replay.transcript.first?.tone, "warning")
     }
 
+    func testFrontendRenderCarriesFilesThroughReplacementAndAppend() throws {
+        let model = try model()
+        let file = SessionFileReference(
+            id: "file-1",
+            name: "report.xlsx",
+            size: 4,
+            mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        model.reduce(
+            event: renderEvent(pending: true, text: "Creating report"),
+            blocks: [],
+            preview: nil
+        )
+        model.reduce(
+            event: renderEvent(text: "Report ready", files: [file]),
+            blocks: [],
+            preview: nil
+        )
+
+        let completed = try XCTUnwrap(model.transcript.first)
+        XCTAssertEqual(completed.text, "Report ready")
+        XCTAssertEqual(completed.files, [file])
+        XCTAssertFalse(completed.pending)
+
+        model.reduce(
+            event: renderEvent(group: nil, append: true, text: "\nOpen it below."),
+            blocks: [],
+            preview: nil
+        )
+
+        XCTAssertEqual(model.transcript.first?.text, "Report ready\nOpen it below.")
+        XCTAssertEqual(model.transcript.first?.files, [file])
+    }
+
     func testPreviewPreservesRenderedBlocksAndCapabilityRender() throws {
         let model = try model()
         let outer = FrontendBlock(
@@ -1301,7 +1345,8 @@ final class AppModelTests: XCTestCase {
             pending: false,
             text: "Read file",
             format: "plain_text",
-            tone: "neutral"
+            tone: "neutral",
+            files: []
         )
         let rendered = renderEvent(
             capability: "reviewer",
@@ -1371,7 +1416,8 @@ final class AppModelTests: XCTestCase {
             pending: false,
             text: "Done",
             format: "plain_text",
-            tone: "success"
+            tone: "success",
+            files: []
         )
         model.reduce(
             event: AgentEventRecord(submissionId: submission.id, msg: .object([
@@ -1512,7 +1558,7 @@ final class AppModelTests: XCTestCase {
         await fulfillment(of: [changed], timeout: 0.05)
     }
 
-    func testAttachmentUploadUsesAcknowledgedChunksAndSendsNativeReferences() async throws {
+    func testSessionFileUploadUsesAcknowledgedChunksAndSendsNativeReferences() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
             await recorder.record(request)
@@ -1552,15 +1598,15 @@ final class AppModelTests: XCTestCase {
 
         let initialRequests = await recorder.requests()
         guard let begin = initialRequests.first(where: {
-            if case .beginAttachmentUpload = $0 { return true }
+            if case .beginSessionFileUpload = $0 { return true }
             return false
-        }), case .beginAttachmentUpload(let beginID, let sessionID, let name, let size, _) = begin
-        else { return XCTFail("Expected attachment upload start") }
+        }), case .beginSessionFileUpload(let beginID, let sessionID, let name, let size, _) = begin
+        else { return XCTFail("Expected session file upload start") }
         XCTAssertEqual(sessionID, "chat-1")
         XCTAssertEqual(name, "scan.png")
         XCTAssertEqual(size, 3)
 
-        model.handle(.attachmentUploadStarted(
+        model.handle(.sessionFileUploadReady(
             requestID: beginID,
             sessionID: "chat-1",
             uploadID: "upload-1",
@@ -1569,16 +1615,16 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(20))
         let afterStart = await recorder.requests()
         let firstChunk = try XCTUnwrap(afterStart.last(where: {
-            if case .appendAttachmentChunk = $0 { return true }
+            if case .uploadSessionFileChunk = $0 { return true }
             return false
         }))
-        guard case .appendAttachmentChunk(let firstID, _, _, let firstOffset, let firstData) = firstChunk else {
-            return XCTFail("Expected first attachment chunk")
+        guard case .uploadSessionFileChunk(let firstID, _, _, let firstOffset, let firstData) = firstChunk else {
+            return XCTFail("Expected first session file chunk")
         }
         XCTAssertEqual(firstOffset, 0)
         XCTAssertEqual(firstData, Data([1, 2]))
 
-        model.handle(.attachmentChunkAccepted(
+        model.handle(.sessionFileUploadChunkAccepted(
             requestID: firstID,
             sessionID: "chat-1",
             uploadID: "upload-1",
@@ -1587,16 +1633,16 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(20))
         let afterFirstChunk = await recorder.requests()
         let secondChunk = try XCTUnwrap(afterFirstChunk.last(where: {
-            if case .appendAttachmentChunk = $0 { return true }
+            if case .uploadSessionFileChunk = $0 { return true }
             return false
         }))
-        guard case .appendAttachmentChunk(let secondID, _, _, let secondOffset, let secondData) = secondChunk else {
-            return XCTFail("Expected second attachment chunk")
+        guard case .uploadSessionFileChunk(let secondID, _, _, let secondOffset, let secondData) = secondChunk else {
+            return XCTFail("Expected second session file chunk")
         }
         XCTAssertEqual(secondOffset, 2)
         XCTAssertEqual(secondData, Data([3]))
 
-        model.handle(.attachmentChunkAccepted(
+        model.handle(.sessionFileUploadChunkAccepted(
             requestID: secondID,
             sessionID: "chat-1",
             uploadID: "upload-1",
@@ -1605,24 +1651,24 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(20))
         let afterSecondChunk = await recorder.requests()
         let finish = try XCTUnwrap(afterSecondChunk.last(where: {
-            if case .finishAttachmentUpload = $0 { return true }
+            if case .finishSessionFileUpload = $0 { return true }
             return false
         }))
-        guard case .finishAttachmentUpload(let finishID, _, _) = finish else {
-            return XCTFail("Expected attachment upload finish")
+        guard case .finishSessionFileUpload(let finishID, _, _) = finish else {
+            return XCTFail("Expected session file upload finish")
         }
-        let attachment = AttachmentRecord(
+        let attachment = SessionFileReference(
             id: "file-1",
             name: "scan.png",
             size: 3,
             mediaType: "image/png"
         )
-        model.handle(.attachmentUploaded(
+        model.handle(.sessionFileUploadCompleted(
             requestID: finishID,
             sessionID: "chat-1",
-            attachment: attachment
+            file: attachment
         ))
-        XCTAssertEqual(model.uploadedAttachments, [attachment])
+        XCTAssertEqual(model.sessionUploads, [attachment])
         XCTAssertTrue(model.canSendComposer)
 
         model.contributions = []
@@ -1673,7 +1719,7 @@ final class AppModelTests: XCTestCase {
             blocks: [],
             preview: nil
         )
-        XCTAssertEqual(model.transcript.last?.attachments, [attachment])
+        XCTAssertEqual(model.transcript.last?.files, [attachment])
     }
 
     func testNonImageAttachmentSubmitsWithoutImageModelSupport() async throws {
@@ -1693,7 +1739,7 @@ final class AppModelTests: XCTestCase {
             supportsImageInput: false
         )]
         model.contributions = [fileAttachmentContribution()]
-        let attachment = AttachmentRecord(
+        let attachment = SessionFileReference(
             id: "file-1",
             name: "notes.txt",
             size: 3,
@@ -1723,7 +1769,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(attachments, [attachment])
     }
 
-    func testAttachmentUploadRejectsKnownResponseWithWrongPhase() async throws {
+    func testSessionFileUploadRejectsKnownResponseWithWrongPhase() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
             await recorder.record(request)
@@ -1741,12 +1787,12 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(20))
         let requests = await recorder.requests()
         guard let begin = requests.last(where: {
-            if case .beginAttachmentUpload = $0 { return true }
+            if case .beginSessionFileUpload = $0 { return true }
             return false
-        }), case .beginAttachmentUpload(let beginID, _, _, _, _) = begin
-        else { return XCTFail("Expected attachment upload start") }
+        }), case .beginSessionFileUpload(let beginID, _, _, _, _) = begin
+        else { return XCTFail("Expected session file upload start") }
 
-        model.handle(.attachmentChunkAccepted(
+        model.handle(.sessionFileUploadChunkAccepted(
             requestID: beginID,
             sessionID: "chat-1",
             uploadID: "upload-1",
@@ -1760,7 +1806,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(message, "The gateway returned an invalid upload.")
     }
 
-    func testAttachmentUploadRejectsUnexpectedAcknowledgedOffset() async throws {
+    func testSessionFileUploadRejectsUnexpectedAcknowledgedOffset() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
             await recorder.record(request)
@@ -1778,11 +1824,11 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(20))
         let initialRequests = await recorder.requests()
         guard let begin = initialRequests.last(where: {
-            if case .beginAttachmentUpload = $0 { return true }
+            if case .beginSessionFileUpload = $0 { return true }
             return false
-        }), case .beginAttachmentUpload(let beginID, _, _, _, _) = begin
-        else { return XCTFail("Expected attachment upload start") }
-        model.handle(.attachmentUploadStarted(
+        }), case .beginSessionFileUpload(let beginID, _, _, _, _) = begin
+        else { return XCTFail("Expected session file upload start") }
+        model.handle(.sessionFileUploadReady(
             requestID: beginID,
             sessionID: "chat-1",
             uploadID: "upload-1",
@@ -1791,12 +1837,12 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(20))
         let afterStart = await recorder.requests()
         guard let chunk = afterStart.last(where: {
-            if case .appendAttachmentChunk = $0 { return true }
+            if case .uploadSessionFileChunk = $0 { return true }
             return false
-        }), case .appendAttachmentChunk(let chunkID, _, _, _, _) = chunk
-        else { return XCTFail("Expected attachment chunk") }
+        }), case .uploadSessionFileChunk(let chunkID, _, _, _, _) = chunk
+        else { return XCTFail("Expected session file chunk") }
 
-        model.handle(.attachmentChunkAccepted(
+        model.handle(.sessionFileUploadChunkAccepted(
             requestID: chunkID,
             sessionID: "chat-1",
             uploadID: "upload-1",
@@ -1810,7 +1856,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(message, "The gateway returned an invalid upload offset.")
         let finalRequests = await recorder.requests()
         XCTAssertEqual(finalRequests.filter {
-            if case .appendAttachmentChunk = $0 { return true }
+            if case .uploadSessionFileChunk = $0 { return true }
             return false
         }.count, 1)
     }
@@ -1842,7 +1888,7 @@ final class AppModelTests: XCTestCase {
         )]
         let fileSize: Int64 = 25 * 1024 * 1024
         model.composerAttachments = (0..<4).map { index in
-            let attachment = AttachmentRecord(
+            let attachment = SessionFileReference(
                 id: "file-\(index)",
                 name: "file-\(index).bin",
                 size: fileSize,
@@ -1872,7 +1918,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.toast?.message, "Attachments in one message are limited to 100 MiB total.")
     }
 
-    func testInspectorRequestsUnstagedDiffAndAllWorkspaceFiles() async throws {
+    func testFilesInspectorRequestsTheSelectedCollection() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
             await recorder.record(request)
@@ -1880,7 +1926,7 @@ final class AppModelTests: XCTestCase {
         model.connectionState = .ready
         model.selectedSessionID = "chat-1"
 
-        model.showInspector()
+        model.showFiles(.unstaged)
         try await Task.sleep(for: .milliseconds(20))
         let unstagedRequests = await recorder.requests()
         guard let unstagedRequest = unstagedRequests.last(where: {
@@ -1890,14 +1936,12 @@ final class AppModelTests: XCTestCase {
         else { return XCTFail("Expected unstaged Git diff") }
         XCTAssertEqual(sessionID, "chat-1")
         XCTAssertEqual(diffScope, .unstaged)
-        guard let initialFileRequest = unstagedRequests.last(where: {
+        XCTAssertFalse(unstagedRequests.contains {
             if case .listWorkspaceFiles = $0 { return true }
             return false
-        }), case .listWorkspaceFiles(_, "chat-1", let initialScope) = initialFileRequest
-        else { return XCTFail("Expected all workspace files") }
-        XCTAssertEqual(initialScope, .all)
+        })
 
-        model.selectWorkspaceFileScope(.all)
+        model.selectFilesInspectorTab(.allFiles)
         try await Task.sleep(for: .milliseconds(20))
         let allRequests = await recorder.requests()
         guard let allRequest = allRequests.last(where: {
@@ -1906,6 +1950,78 @@ final class AppModelTests: XCTestCase {
         }), case .listWorkspaceFiles(_, _, let allScope) = allRequest
         else { return XCTFail("Expected all workspace files") }
         XCTAssertEqual(allScope, .all)
+
+        model.selectFilesInspectorTab(.chatFiles)
+        try await Task.sleep(for: .milliseconds(20))
+        let chatFileRequests = await recorder.requests()
+        XCTAssertTrue(chatFileRequests.contains {
+            if case .listArtifacts(_, "chat-1") = $0 { return true }
+            return false
+        })
+        XCTAssertTrue(chatFileRequests.contains {
+            if case .listSessionUploads(_, "chat-1") = $0 { return true }
+            return false
+        })
+    }
+
+    func testArtifactListIgnoresAResponseForAnotherSession() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        let file = SessionFileReference(
+            id: "file-1",
+            name: "diagram.svg",
+            size: 3,
+            mediaType: "image/svg+xml"
+        )
+        let artifact = ArtifactRecord(
+            id: "artifact-1",
+            sessionId: "chat-1",
+            kind: .file,
+            title: "Architecture diagram",
+            block: FrontendBlock(
+                id: "artifacts/file-1",
+                group: nil,
+                append: false,
+                pending: false,
+                text: "",
+                format: "plain_text",
+                tone: "neutral",
+                files: [file]
+            )
+        )
+
+        model.showFiles(.chatFiles)
+        try await Task.sleep(for: .milliseconds(20))
+        let requests = await recorder.requests()
+        guard let request = requests.last(where: {
+            if case .listArtifacts = $0 { return true }
+            return false
+        }), case .listArtifacts(let requestID, _) = request
+        else { return XCTFail("Expected artifact list request") }
+
+        model.handle(.artifacts(
+            requestID: requestID,
+            sessionID: "chat-2",
+            artifacts: [artifact],
+            truncated: true
+        ))
+        XCTAssertTrue(model.artifacts.isEmpty)
+        XCTAssertFalse(model.artifactsTruncated)
+        XCTAssertTrue(model.isLoadingArtifacts)
+
+        model.handle(.artifacts(
+            requestID: requestID,
+            sessionID: "chat-1",
+            artifacts: [artifact],
+            truncated: true
+        ))
+        XCTAssertEqual(model.artifacts, [artifact])
+        XCTAssertTrue(model.artifactsTruncated)
+        XCTAssertFalse(model.isLoadingArtifacts)
     }
 
     func testWorkspaceReferencesUseCLIFuzzyRankingAndReplacement() throws {
@@ -1974,7 +2090,7 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.textFilePreview?.contents, contents)
         XCTAssertNil(model.previewURL)
-        model.discardAttachmentPreview()
+        model.discardFilePresentation()
     }
 
     func testWorkspaceBinaryFileUsesQuickLookPreview() async throws {
@@ -2006,7 +2122,212 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertNotNil(model.previewURL)
         XCTAssertNil(model.textFilePreview)
-        model.discardAttachmentPreview()
+        model.discardFilePresentation()
+    }
+
+    func testUnsupportedSessionFileCanBeDownloadedForSharing() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        let data = Data([0, 1, 2, 3])
+        let file = SessionFileReference(
+            id: "file-1",
+            name: "report.xlsx",
+            size: Int64(data.count),
+            mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        model.saveOrShareSessionFile(file)
+        try await Task.sleep(for: .milliseconds(20))
+        let requests = await recorder.requests()
+        guard let request = requests.last(where: {
+            if case .readSessionFile = $0 { return true }
+            return false
+        }), case .readSessionFile(let requestID, let sessionID, let fileID, let offset, _) = request
+        else { return XCTFail("Expected session file read request") }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(fileID, file.id)
+        XCTAssertEqual(offset, 0)
+
+        model.handle(.sessionFileChunk(
+            requestID: requestID,
+            sessionID: sessionID,
+            fileID: fileID,
+            offset: 0,
+            data: data,
+            nextOffset: nil
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+
+        let shareItem = try XCTUnwrap(model.sessionFileShareItem)
+        XCTAssertEqual(shareItem.name, file.name)
+        XCTAssertEqual(shareItem.url.lastPathComponent, file.name)
+        XCTAssertEqual(try Data(contentsOf: shareItem.url), data)
+        XCTAssertNil(model.previewURL)
+        XCTAssertNil(model.textFilePreview)
+        model.discardFilePresentation()
+    }
+
+    func testTextEncodedImageSessionFileUsesQuickLookPreview() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        let data = Data("<svg/>".utf8)
+        let file = SessionFileReference(
+            id: "file-1",
+            name: "diagram.svg",
+            size: Int64(data.count),
+            mediaType: "image/svg+xml"
+        )
+
+        model.previewSessionFile(file)
+        try await Task.sleep(for: .milliseconds(20))
+        let requests = await recorder.requests()
+        guard let request = requests.last(where: {
+            if case .readSessionFile = $0 { return true }
+            return false
+        }), case .readSessionFile(let requestID, _, _, _, _) = request
+        else { return XCTFail("Expected session file read request") }
+
+        model.handle(.sessionFileChunk(
+            requestID: requestID,
+            sessionID: "chat-1",
+            fileID: file.id,
+            offset: 0,
+            data: data,
+            nextOffset: nil
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+
+        XCTAssertEqual(model.previewURL?.pathExtension, "svg")
+        XCTAssertNil(model.textFilePreview)
+        model.discardFilePresentation()
+    }
+
+    func testStaleSessionFileChunkDoesNotCancelNewerDownload() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.selectedSessionID = "chat-1"
+        let firstData = Data("first".utf8)
+        let secondData = Data("second".utf8)
+        let firstFile = SessionFileReference(
+            id: "file-1",
+            name: "first.txt",
+            size: Int64(firstData.count),
+            mediaType: "text/plain"
+        )
+        let secondFile = SessionFileReference(
+            id: "file-2",
+            name: "second.txt",
+            size: Int64(secondData.count),
+            mediaType: "text/plain"
+        )
+
+        model.previewSessionFile(firstFile)
+        try await Task.sleep(for: .milliseconds(20))
+        guard let firstRequest = await recorder.requests().last(where: {
+            if case .readSessionFile = $0 { return true }
+            return false
+        }), case .readSessionFile(let firstRequestID, _, _, _, _) = firstRequest
+        else { return XCTFail("Expected first session file read") }
+
+        model.previewSessionFile(secondFile)
+        try await Task.sleep(for: .milliseconds(20))
+        guard let secondRequest = await recorder.requests().last(where: {
+            if case .readSessionFile = $0 { return true }
+            return false
+        }), case .readSessionFile(let secondRequestID, _, _, _, _) = secondRequest
+        else { return XCTFail("Expected second session file read") }
+        XCTAssertNotEqual(firstRequestID, secondRequestID)
+
+        model.handle(.sessionFileChunk(
+            requestID: firstRequestID,
+            sessionID: "chat-1",
+            fileID: firstFile.id,
+            offset: 0,
+            data: firstData,
+            nextOffset: nil
+        ))
+        XCTAssertTrue(model.isLoadingFilePresentation)
+        XCTAssertNil(model.toast)
+
+        model.handle(.sessionFileChunk(
+            requestID: secondRequestID,
+            sessionID: "chat-1",
+            fileID: secondFile.id,
+            offset: 0,
+            data: secondData,
+            nextOffset: nil
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+
+        XCTAssertEqual(model.textFilePreview?.name, secondFile.name)
+        XCTAssertEqual(model.textFilePreview?.contents, "second")
+        XCTAssertFalse(model.isLoadingFilePresentation)
+        model.discardFilePresentation()
+    }
+
+    func testStaleWorkspaceFileChunkDoesNotCancelNewerDownload() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.selectedSessionID = "chat-1"
+        let firstData = Data("first".utf8)
+        let secondData = Data("second".utf8)
+        let firstFile = WorkspaceFileRecord(path: "first.txt", size: UInt64(firstData.count))
+        let secondFile = WorkspaceFileRecord(path: "second.txt", size: UInt64(secondData.count))
+
+        model.previewWorkspaceFile(firstFile)
+        try await Task.sleep(for: .milliseconds(20))
+        guard let firstRequest = await recorder.requests().last(where: {
+            if case .readWorkspaceFile = $0 { return true }
+            return false
+        }), case .readWorkspaceFile(let firstRequestID, _, _, _, _) = firstRequest
+        else { return XCTFail("Expected first workspace file read") }
+
+        model.previewWorkspaceFile(secondFile)
+        try await Task.sleep(for: .milliseconds(20))
+        guard let secondRequest = await recorder.requests().last(where: {
+            if case .readWorkspaceFile = $0 { return true }
+            return false
+        }), case .readWorkspaceFile(let secondRequestID, _, _, _, _) = secondRequest
+        else { return XCTFail("Expected second workspace file read") }
+        XCTAssertNotEqual(firstRequestID, secondRequestID)
+
+        model.handle(.workspaceFileChunk(
+            requestID: firstRequestID,
+            sessionID: "chat-1",
+            path: firstFile.path,
+            offset: 0,
+            data: firstData,
+            nextOffset: nil
+        ))
+        XCTAssertTrue(model.isLoadingFilePresentation)
+        XCTAssertNil(model.toast)
+
+        model.handle(.workspaceFileChunk(
+            requestID: secondRequestID,
+            sessionID: "chat-1",
+            path: secondFile.path,
+            offset: 0,
+            data: secondData,
+            nextOffset: nil
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+
+        XCTAssertEqual(model.textFilePreview?.name, "second.txt")
+        XCTAssertEqual(model.textFilePreview?.contents, "second")
+        XCTAssertFalse(model.isLoadingFilePresentation)
+        model.discardFilePresentation()
     }
 
     func testContributionCatalogReferencesAndWidgetsAreGeneric() throws {
@@ -2942,7 +3263,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.isLoadingTranscript)
         model.handle(.sessionOpened(requestID: requestID, payload: sessionReady(latestSequence: 2)))
         XCTAssertTrue(model.isLoadingTranscript)
-        model.showInspector()
+        model.showFiles(.unstaged)
         model.handle(.agentEvent(
             sessionID: "chat-1",
             sequence: 1,

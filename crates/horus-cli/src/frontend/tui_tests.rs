@@ -207,6 +207,7 @@ fn completed_diff_replaces_the_pending_block_with_a_styled_diff() {
         text: "◉ Edit note.rs".into(),
         format: FrontendBlockFormat::PlainText,
         tone: FrontendTone::Neutral,
+        files: Vec::new(),
     });
     view::live_transcript_lines(&mut state, 0, 80);
     assert_eq!(
@@ -225,6 +226,7 @@ fn completed_diff_replaces_the_pending_block_with_a_styled_diff() {
         text: "--- note.rs\n+++ note.rs\n@@ -1,5 +1,5 @@\n-fn old_name() {}\n+fn new_name() {}\n keep_one();\n-let removed = false;\n keep_two();\n+let added = true;\n keep_three();\n".into(),
         format: FrontendBlockFormat::UnifiedDiff,
         tone: FrontendTone::Success,
+        files: Vec::new(),
     });
     assert!(
         state
@@ -815,6 +817,7 @@ fn gateway_history_preserves_child_diff_rendering() {
                 text: "--- a/file\n+++ b/file\n-old\n+new".into(),
                 format: FrontendBlockFormat::UnifiedDiff,
                 tone: FrontendTone::Neutral,
+                files: Vec::new(),
             }],
         }]),
         None,
@@ -823,6 +826,32 @@ fn gateway_history_preserves_child_diff_rendering() {
     let entry = state.transcript.back().expect("rendered history entry");
     assert_eq!(entry.format, FrontendBlockFormat::UnifiedDiff);
     assert_eq!(entry.text, "--- a/file\n+++ b/file\n-old\n+new");
+}
+
+#[test]
+fn session_file_block_renders_download_metadata_as_plain_text() {
+    let mut state = state();
+    state.transcript.clear();
+    state.apply_block(FrontendBlock {
+        id: Some("artifacts/turn/file".into()),
+        group: None,
+        append: false,
+        pending: false,
+        text: "Sent report.xlsx".into(),
+        format: FrontendBlockFormat::PlainText,
+        tone: FrontendTone::Success,
+        files: vec![horus::protocol::SessionFileReference {
+            id: "file-a".into(),
+            name: "report.xlsx".into(),
+            size: 42,
+            media_type: "application/octet-stream".into(),
+        }],
+    });
+
+    assert_eq!(
+        state.transcript.front().map(|entry| entry.text.as_str()),
+        Some("Sent report.xlsx\n[file] report.xlsx · application/octet-stream · 42 bytes")
+    );
 }
 
 #[test]

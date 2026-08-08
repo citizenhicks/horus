@@ -36,7 +36,7 @@ struct AppShell: View {
                 } else {
                     shell
                         .inspector(isPresented: $model.showsInspector) {
-                            ArtifactInspector()
+                            FilesInspector()
                                 .overlay(alignment: .top) {
                                     #if os(iOS)
                                     if horizontalSizeClass == .compact { AppToastOverlay() }
@@ -61,11 +61,14 @@ struct AppShell: View {
             }
         }
         .quickLookPreview($model.previewURL)
-        .sheet(item: $model.textFilePreview, onDismiss: model.discardAttachmentPreview) { preview in
+        .sheet(item: $model.textFilePreview, onDismiss: model.discardFilePresentation) { preview in
             TextFilePreviewView(preview: preview)
         }
+        .sheet(item: $model.sessionFileShareItem, onDismiss: model.discardFilePresentation) { file in
+            SessionFileShareView(file: file)
+        }
         .onChange(of: model.previewURL) { oldValue, newValue in
-            if oldValue != nil, newValue == nil { model.discardAttachmentPreview() }
+            if oldValue != nil, newValue == nil { model.discardFilePresentation() }
         }
         .preferredColorScheme(preferredColorScheme)
         .onChange(of: chatIsVisible, initial: true) { _, visible in
@@ -462,9 +465,9 @@ private struct DirectoryBrowserHeader: View {
     }
 }
 
-private struct ArtifactInspector: View {
+private struct FilesInspector: View {
     var body: some View {
-        ArtifactView()
+        FilesView()
             .inspectorColumnWidth(min: 320, ideal: 520, max: 840)
     }
 }

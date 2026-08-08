@@ -86,7 +86,7 @@ impl Middleware for Tasks {
         }
     }
 
-    fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
+    fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
         render_tool_event(
             event,
             |name| name == "write_todos",

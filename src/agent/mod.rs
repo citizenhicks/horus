@@ -253,7 +253,7 @@ pub fn validate_submission(submission: &Submission) -> Result<()> {
 
 fn validate_user_input(
     text: &str,
-    attachments: &[crate::protocol::AttachmentReference],
+    attachments: &[crate::protocol::SessionFileReference],
 ) -> Result<()> {
     if text.trim().is_empty() && attachments.is_empty() {
         return Err(Error::Config("user input cannot be empty".into()));

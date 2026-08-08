@@ -15,12 +15,14 @@ use horus::backend::model::{
 use horus::backend::sandbox::{
     ApprovalPolicy, ApprovalReviewerConfig, ApprovalStrictness, Sandbox, SandboxBackend,
 };
-use horus::middleware::attachments::{AttachmentStore, Attachments};
+use horus::middleware::artifacts::Artifacts;
+use horus::middleware::attachments::Attachments;
 use horus::middleware::compaction::Compaction;
 use horus::middleware::context_offloading::ContextOffloading;
 use horus::middleware::cron::Cron;
 use horus::middleware::instructions::Instructions;
 use horus::middleware::scratchpad::{Scratchpad, ScratchpadStore};
+use horus::middleware::session_files::SessionFileStore;
 use horus::middleware::sessions::Sessions;
 use horus::middleware::skills::Skills;
 use horus::middleware::steering::Steering;
@@ -65,7 +67,7 @@ pub(crate) async fn assemble(
     cron: Arc<CronStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     scratchpad: ScratchpadStore,
-    attachments: AttachmentStore,
+    session_files: SessionFileStore,
     session_id: Option<String>,
     origin_label: &str,
     override_saved_model_route: bool,
@@ -115,7 +117,7 @@ pub(crate) async fn assemble(
         &chat.workspace,
         cron,
         scratchpad,
-        attachments,
+        session_files,
     )?;
     let mut metadata = match session_id.as_deref() {
         Some(session_id) => checkpoints
@@ -663,7 +665,7 @@ fn build_middleware(
     workspace: &std::path::Path,
     cron: Arc<CronStore>,
     scratchpad: ScratchpadStore,
-    attachments: AttachmentStore,
+    session_files: SessionFileStore,
 ) -> Result<(MiddlewareStack, Option<Arc<OnceLock<AgentConfig>>>)> {
     let mut entries: Vec<Arc<dyn Middleware>> = Vec::new();
     let mut subagent_template = None;
@@ -673,7 +675,8 @@ fn build_middleware(
     {
         let middleware: Arc<dyn Middleware> = match feature.kind {
             BuiltinMiddleware::Sandbox => continue,
-            BuiltinMiddleware::Attachments => Arc::new(Attachments::new(attachments.clone())),
+            BuiltinMiddleware::Attachments => Arc::new(Attachments::new(session_files.clone())),
+            BuiltinMiddleware::Artifacts => Arc::new(Artifacts::new(session_files.clone())),
             BuiltinMiddleware::Tools => Arc::new(Tools::coding()),
             BuiltinMiddleware::Instructions => Arc::new(Instructions::discover(workspace)?),
             BuiltinMiddleware::Cron => {
@@ -1015,7 +1018,7 @@ mod tests {
             cron,
             Arc::clone(&checkpoints),
             ScratchpadStore::new(Arc::clone(&checkpoints)),
-            AttachmentStore::new(store.state_dir()),
+            SessionFileStore::new(store.state_dir()),
             Some("chat".into()),
             "test",
             true,

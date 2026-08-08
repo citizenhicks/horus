@@ -29,7 +29,10 @@ use super::NetworkAccess;
 #[cfg(target_os = "linux")]
 use super::ProcessGroupGuard;
 use super::SandboxBackend;
-use super::{CommandMode, CommandOutput, CommandOutputSink, CommandStream, MAX_FILE_BYTES};
+use super::{
+    CommandMode, CommandOutput, CommandOutputSink, CommandStream, MAX_BINARY_FILE_BYTES,
+    MAX_FILE_BYTES,
+};
 #[cfg(target_os = "macos")]
 use super::{MACOS_COMMAND_WRAPPER, MACOS_SEATBELT_BASE_POLICY};
 use crate::BoxFuture;
@@ -687,6 +690,25 @@ impl SandboxBackend for LocalSandbox {
         })
     }
 
+    fn read_bytes<'a>(&'a self, path: &'a str, max_bytes: usize) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            if max_bytes == 0 || max_bytes > MAX_BINARY_FILE_BYTES {
+                return Err(Error::Sandbox(format!(
+                    "binary file read size must be 1–{MAX_BINARY_FILE_BYTES} bytes"
+                )));
+            }
+            validate_root(&self.root, &self.root_dir)?;
+            let root = self.root_dir.try_clone()?;
+            let relative = self.relative(path)?;
+            let requested = path.to_string();
+            tokio::task::spawn_blocking(move || {
+                read_binary_file(root, &relative, &requested, max_bytes)
+            })
+            .await
+            .map_err(|error| Error::Sandbox(format!("file reader failed: {error}")))?
+        })
+    }
+
     fn write<'a>(&'a self, path: &'a str, content: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             if content.len() > MAX_FILE_BYTES {
@@ -743,6 +765,21 @@ fn read_file(root: Dir, relative: &Path, requested: &str) -> Result<String> {
         return Err(Error::Sandbox("file exceeds read limit".into()));
     }
     String::from_utf8(bytes).map_err(|_| Error::Sandbox(format!("{requested} is not valid UTF-8")))
+}
+
+fn read_binary_file(
+    root: Dir,
+    relative: &Path,
+    requested: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let file = open_regular_file(root, relative, requested)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(Error::Sandbox("file exceeds binary read limit".into()));
+    }
+    Ok(bytes)
 }
 
 fn read_file_range(

@@ -120,6 +120,7 @@ impl Shared {
                                 append: false,
                                 pending: false,
                                 text: failure,
+                                files: Vec::new(),
                                 format: crate::protocol::FrontendBlockFormat::PlainText,
                                 tone: FrontendTone::Error,
                             },

@@ -108,6 +108,10 @@ impl SandboxBackend for GatewaySandbox {
         self.delegate.read(path)
     }
 
+    fn read_bytes<'a>(&'a self, path: &'a str, max_bytes: usize) -> BoxFuture<'a, Result<Vec<u8>>> {
+        self.delegate.read_bytes(path, max_bytes)
+    }
+
     fn write<'a>(&'a self, path: &'a str, content: &'a str) -> BoxFuture<'a, Result<()>> {
         self.delegate.write(path, content)
     }
@@ -217,5 +221,23 @@ mod tests {
         assert_ne!(output.exit_code, 0);
         assert!(!output.stdout.contains("gateway-secret"));
         assert!(!output.stdout.contains("tls-secret"));
+    }
+
+    #[tokio::test]
+    async fn binary_reads_preserve_workspace_file_bytes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let expected = [0, 159, 255, 10];
+        std::fs::write(workspace.path().join("report.bin"), expected).expect("binary file");
+        let sandbox =
+            GatewaySandbox::new(workspace.path(), state.path(), None, Duration::from_secs(5))
+                .expect("gateway sandbox");
+
+        let actual = sandbox
+            .read_bytes("report.bin", expected.len())
+            .await
+            .expect("read binary file");
+
+        assert_eq!(actual, expected);
     }
 }

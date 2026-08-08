@@ -387,13 +387,16 @@ fn tools_do_not_claim_footer_space() {
 fn coding_renderer_preserves_patch_diff_blocks() {
     let diff = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
     let block = Tools::coding()
-        .render(&EventMsg::ToolCallEnd(crate::protocol::ToolCallEndEvent {
-            turn_id: "turn".into(),
-            call_id: "call".into(),
-            name: "apply_patch".into(),
-            output: diff.into(),
-            is_error: false,
-        }))
+        .render(
+            &EventMsg::ToolCallEnd(crate::protocol::ToolCallEndEvent {
+                turn_id: "turn".into(),
+                call_id: "call".into(),
+                name: "apply_patch".into(),
+                output: diff.into(),
+                is_error: false,
+            }),
+            "session",
+        )
         .expect("patch rendering");
 
     assert_eq!(block.format, FrontendBlockFormat::UnifiedDiff);
@@ -405,23 +408,27 @@ fn coding_renderer_preserves_patch_diff_blocks() {
 fn coding_renderer_groups_read_lifecycle() {
     let tools = Tools::coding();
     let begin = tools
-        .render(&EventMsg::ToolCallBegin(
-            crate::protocol::ToolCallBeginEvent {
+        .render(
+            &EventMsg::ToolCallBegin(crate::protocol::ToolCallBeginEvent {
                 turn_id: "turn".into(),
                 call_id: "call".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({"path": "note.txt"}),
-            },
-        ))
+            }),
+            "session",
+        )
         .expect("read begin rendering");
     let end = tools
-        .render(&EventMsg::ToolCallEnd(crate::protocol::ToolCallEndEvent {
-            turn_id: "turn".into(),
-            call_id: "call".into(),
-            name: "read_file".into(),
-            output: "contents".into(),
-            is_error: false,
-        }))
+        .render(
+            &EventMsg::ToolCallEnd(crate::protocol::ToolCallEndEvent {
+                turn_id: "turn".into(),
+                call_id: "call".into(),
+                name: "read_file".into(),
+                output: "contents".into(),
+                is_error: false,
+            }),
+            "session",
+        )
         .expect("read end rendering");
 
     assert_eq!(begin.group.as_deref(), Some("read:turn"));

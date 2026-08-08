@@ -61,7 +61,7 @@ impl Middleware for Cron {
         Ok(Some(PROMPT.into()))
     }
 
-    fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
+    fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
         render_tool_event(
             event,
             |name| name == "schedule_task",
@@ -153,7 +153,7 @@ mod tests {
                 is_error: false,
             }),
         ] {
-            assert!(middleware.render(&event).is_some());
+            assert!(middleware.render(&event, "session").is_some());
         }
     }
 

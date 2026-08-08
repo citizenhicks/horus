@@ -15,7 +15,7 @@ struct CachedTranscript: Codable, Sendable {
         let tone: String
         let pending: Bool
         let messageTarget: MessageTarget?
-        let attachments: [AttachmentRecord]
+        let files: [SessionFileReference]
 
         init(_ entry: TranscriptEntry) {
             id = entry.id
@@ -26,7 +26,7 @@ struct CachedTranscript: Codable, Sendable {
             tone = entry.tone
             pending = entry.pending
             messageTarget = entry.messageTarget
-            attachments = entry.attachments
+            files = entry.files
         }
 
         var transcriptEntry: TranscriptEntry {
@@ -39,7 +39,7 @@ struct CachedTranscript: Codable, Sendable {
                 tone: tone,
                 pending: pending,
                 messageTarget: messageTarget,
-                attachments: attachments
+                files: files
             )
         }
     }
@@ -86,10 +86,10 @@ struct CachedTranscript: Codable, Sendable {
                   consume(entry.group),
                   consume(entry.format),
                   consume(entry.tone),
-                  entry.attachments.allSatisfy({ attachment in
-                      consume(attachment.id)
-                          && consume(attachment.name)
-                          && consume(attachment.mediaType)
+                  entry.files.allSatisfy({ file in
+                      consume(file.id)
+                          && consume(file.name)
+                          && consume(file.mediaType)
                   })
             else { return false }
         }

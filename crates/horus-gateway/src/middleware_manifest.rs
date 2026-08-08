@@ -13,6 +13,7 @@ use crate::{Error, Result};
 pub(crate) enum BuiltinMiddleware {
     Sandbox,
     Attachments,
+    Artifacts,
     Tools,
     Instructions,
     Cron,
@@ -31,7 +32,7 @@ pub(crate) struct MiddlewareRegistration {
     pub(crate) manifest: &'static MiddlewareManifest,
 }
 
-pub(crate) const MIDDLEWARE: [MiddlewareRegistration; 13] = [
+pub(crate) const MIDDLEWARE: [MiddlewareRegistration; 14] = [
     MiddlewareRegistration {
         kind: BuiltinMiddleware::Sandbox,
         manifest: &horus::backend::sandbox::MANIFEST,
@@ -39,6 +40,10 @@ pub(crate) const MIDDLEWARE: [MiddlewareRegistration; 13] = [
     MiddlewareRegistration {
         kind: BuiltinMiddleware::Attachments,
         manifest: &horus::middleware::attachments::MANIFEST,
+    },
+    MiddlewareRegistration {
+        kind: BuiltinMiddleware::Artifacts,
+        manifest: &horus::middleware::artifacts::MANIFEST,
     },
     MiddlewareRegistration {
         kind: BuiltinMiddleware::Tools,
@@ -255,6 +260,7 @@ mod tests {
         let features = features(&[]);
 
         assert!(!config.enabled("tasks"));
+        assert!(config.enabled("artifacts"));
         assert!(config.enabled("context_offloading"));
         assert_eq!(
             integer_setting(&config, "context_offloading", "stale_after_tokens")

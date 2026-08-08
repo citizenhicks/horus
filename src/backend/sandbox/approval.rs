@@ -199,6 +199,7 @@ impl Approval {
             append: false,
             pending: false,
             text: format!("approval required\n{}\n  {tools}", request.reason),
+            files: Vec::new(),
             format: crate::protocol::FrontendBlockFormat::PlainText,
             tone: FrontendTone::Warning,
         })

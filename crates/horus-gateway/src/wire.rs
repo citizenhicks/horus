@@ -9,9 +9,9 @@ use horus::backend::checkpoint::SessionSummary;
 use horus::backend::model::ModelChoice;
 use horus::backend::model::provider::HostedWebSearch;
 use horus::protocol::{
-    AttachmentReference, Event, EventMsg, FrontendBlock, FrontendContribution,
-    FrontendSettingValue, FrontendSymbol, FrontendWidget, MiddlewareFeature,
-    SessionConfiguredEvent, Submission, TokenUsage,
+    Event, EventMsg, FrontendBlock, FrontendContribution, FrontendSettingValue, FrontendSymbol,
+    FrontendWidget, MiddlewareFeature, SessionConfiguredEvent, SessionFileReference, Submission,
+    TokenUsage,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ mod base64_bytes {
 }
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 20;
+pub const PROTOCOL_VERSION: u16 = 21;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -154,14 +154,14 @@ pub enum ClientMessage {
         session_id: String,
         submission: Submission,
     },
-    BeginAttachmentUpload {
+    BeginSessionFileUpload {
         request_id: String,
         session_id: String,
         name: String,
         size: u64,
         media_type: String,
     },
-    AppendAttachmentChunk {
+    UploadSessionFileChunk {
         request_id: String,
         session_id: String,
         upload_id: String,
@@ -169,19 +169,19 @@ pub enum ClientMessage {
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
-    FinishAttachmentUpload {
+    FinishSessionFileUpload {
         request_id: String,
         session_id: String,
         upload_id: String,
     },
-    ListAttachments {
+    ListSessionUploads {
         request_id: String,
         session_id: String,
     },
-    ReadAttachment {
+    ReadSessionFile {
         request_id: String,
         session_id: String,
-        attachment_id: String,
+        file_id: String,
         offset: u64,
         max_bytes: usize,
     },
@@ -353,32 +353,32 @@ pub enum ServerMessage {
     Accepted {
         request_id: String,
     },
-    AttachmentUploadStarted {
+    SessionFileUploadReady {
         request_id: String,
         session_id: String,
         upload_id: String,
         max_chunk_bytes: usize,
     },
-    AttachmentChunkAccepted {
+    SessionFileUploadChunkAccepted {
         request_id: String,
         session_id: String,
         upload_id: String,
         next_offset: u64,
     },
-    AttachmentUploaded {
+    SessionFileUploadCompleted {
         request_id: String,
         session_id: String,
-        attachment: AttachmentReference,
+        file: SessionFileReference,
     },
-    Attachments {
+    SessionUploads {
         request_id: String,
         session_id: String,
-        attachments: Vec<AttachmentReference>,
+        uploads: Vec<SessionFileReference>,
     },
-    AttachmentChunk {
+    SessionFileChunk {
         request_id: String,
         session_id: String,
-        attachment_id: String,
+        file_id: String,
         offset: u64,
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
@@ -439,6 +439,7 @@ pub enum ServerMessage {
         request_id: String,
         session_id: String,
         artifacts: Vec<ArtifactRecord>,
+        truncated: bool,
     },
     GitDiff {
         request_id: String,
@@ -870,6 +871,7 @@ pub struct ArtifactRecord {
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     CodeDiff,
+    File,
 }
 
 /// One persisted scheduled task owned by its source session.
@@ -1083,8 +1085,8 @@ mod tests {
     }
 
     #[test]
-    fn attachment_bytes_use_standard_base64_and_round_trip() {
-        let expected = ClientFrame::new(ClientMessage::AppendAttachmentChunk {
+    fn session_file_bytes_use_standard_base64_and_round_trip() {
+        let expected = ClientFrame::new(ClientMessage::UploadSessionFileChunk {
             request_id: "request-upload".into(),
             session_id: "session-a".into(),
             upload_id: "upload-a".into(),
@@ -1096,6 +1098,7 @@ mod tests {
         let decoded: ClientFrame =
             serde_json::from_value(encoded.clone()).expect("decode upload chunk");
 
+        assert_eq!(encoded["type"], "upload_session_file_chunk");
         assert_eq!(encoded["data"], "AP8=");
         assert_eq!(decoded, expected);
     }
@@ -1302,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v20_requires_a_reasoning_catalog_when_registering_a_provider() {
+    fn provider_registration_requires_a_reasoning_catalog() {
         let frame = serde_json::json!({
             "version": PROTOCOL_VERSION,
             "type": "register_provider",
@@ -1317,7 +1320,7 @@ mod tests {
         });
 
         let error = serde_json::from_value::<ClientFrame>(frame)
-            .expect_err("v20 provider registration requires reasoning efforts");
+            .expect_err("provider registration requires reasoning efforts");
 
         assert!(
             error
@@ -1829,5 +1832,13 @@ mod tests {
             let error = validate_version(version).expect_err("incompatible version must fail");
             assert!(matches!(error, Error::Protocol(_)), "{error}");
         }
+    }
+
+    #[test]
+    fn file_artifact_kind_has_a_stable_wire_value() {
+        assert_eq!(
+            serde_json::to_value(ArtifactKind::File).expect("encode artifact kind"),
+            serde_json::json!("file")
+        );
     }
 }

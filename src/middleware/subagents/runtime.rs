@@ -449,6 +449,7 @@ impl Shared {
                             append: false,
                             pending: false,
                             text: format!("{retry_message}: {retry_error}"),
+                            files: Vec::new(),
                             format: crate::protocol::FrontendBlockFormat::PlainText,
                             tone: FrontendTone::Error,
                         },

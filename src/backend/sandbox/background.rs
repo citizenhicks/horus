@@ -310,6 +310,14 @@ mod tests {
             Box::pin(async { unreachable!() })
         }
 
+        fn read_bytes<'a>(
+            &'a self,
+            _path: &'a str,
+            _max_bytes: usize,
+        ) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async { unreachable!() })
+        }
+
         fn write<'a>(&'a self, _path: &'a str, _content: &'a str) -> BoxFuture<'a, Result<()>> {
             Box::pin(async { unreachable!() })
         }
@@ -388,6 +396,14 @@ mod tests {
 
     impl SandboxBackend for PendingBackend {
         fn read<'a>(&'a self, _path: &'a str) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async { unreachable!() })
+        }
+
+        fn read_bytes<'a>(
+            &'a self,
+            _path: &'a str,
+            _max_bytes: usize,
+        ) -> BoxFuture<'a, Result<Vec<u8>>> {
             Box::pin(async { unreachable!() })
         }
 

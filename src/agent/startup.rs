@@ -165,7 +165,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         .into();
     let catalog = config.middleware.catalog(&runtime)?;
     let tool_count = catalog.definitions().len();
-    let frontend = FrontendExtensions::new(config.middleware.clone())?;
+    let frontend = FrontendExtensions::new(config.middleware.clone(), config.session_id.clone())?;
     let mut state_changed =
         metadata_changed || state.model_route.as_deref() != Some(route.as_str());
     state.model_route = Some(route);

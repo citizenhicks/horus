@@ -26,6 +26,7 @@ pub mod local;
 mod process_group;
 
 pub(crate) const MAX_FILE_BYTES: usize = 1024 * 1024;
+const MAX_BINARY_FILE_BYTES: usize = 25 * 1024 * 1024;
 
 const APPROVAL_POLICIES: &[MiddlewareSettingChoice] = &[
     MiddlewareSettingChoice {
@@ -187,6 +188,9 @@ pub trait SandboxBackend: Send + Sync {
     /// Reads a UTF-8 file.
     fn read<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<String>>;
 
+    /// Reads one binary file through a single bounded open handle.
+    fn read_bytes<'a>(&'a self, path: &'a str, max_bytes: usize) -> BoxFuture<'a, Result<Vec<u8>>>;
+
     /// Writes a UTF-8 file.
     fn write<'a>(&'a self, path: &'a str, content: &'a str) -> BoxFuture<'a, Result<()>>;
 
@@ -228,6 +232,22 @@ impl Sandbox {
     /// Reads a UTF-8 file.
     pub fn read<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<String>> {
         self.backend.read(path)
+    }
+
+    /// Reads one bounded binary file.
+    pub fn read_bytes<'a>(
+        &'a self,
+        path: &'a str,
+        max_bytes: usize,
+    ) -> BoxFuture<'a, Result<Vec<u8>>> {
+        if max_bytes == 0 || max_bytes > MAX_BINARY_FILE_BYTES {
+            return Box::pin(async {
+                Err(Error::Sandbox(format!(
+                    "binary file read size must be 1–{MAX_BINARY_FILE_BYTES} bytes"
+                )))
+            });
+        }
+        self.backend.read_bytes(path, max_bytes)
     }
 
     /// Writes a UTF-8 file when this call has mutation authority.
