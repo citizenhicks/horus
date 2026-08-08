@@ -117,21 +117,6 @@ extension String {
     }
 }
 
-private struct WorkspaceDiffView: View {
-    @Environment(AppModel.self) private var model
-
-    @ViewBuilder
-    var body: some View {
-        if model.isLoadingGitDiff {
-            InspectorLoadingView(title: "Loading unstaged changes")
-        } else if model.gitDiff.isEmpty {
-            HorusUnavailable(title: "No unstaged changes", glyph: .gitBranch)
-        } else {
-            NumberedSourceText(model.gitDiff, language: .diff)
-        }
-    }
-}
-
 private struct WorkspaceFileList: View {
     @Environment(AppModel.self) private var model
     @State private var tree: [FileTreeNode] = []
@@ -351,7 +336,7 @@ private struct InspectorFileRow: View {
     }
 }
 
-private struct InspectorLoadingView: View {
+struct InspectorLoadingView: View {
     let title: String
 
     var body: some View {

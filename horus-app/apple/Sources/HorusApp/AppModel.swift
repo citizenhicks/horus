@@ -491,7 +491,10 @@ final class AppModel {
     var destination: AppDestination? = .chat
     var workspace: WorkspaceInfo?
     var gitStatus: GitStatus?
-    var gitDiff = ""
+    private(set) var gitDiffRevision = 0
+    var gitDiff = "" {
+        didSet { gitDiffRevision &+= 1 }
+    }
     var sessions: [SessionRecord] = []
     var gatewayMachineName = ""
     var selectedSessionID: String?

@@ -35,6 +35,10 @@
 		20000000000000000000001C /* ProfileView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000016 /* ProfileView.swift */; };
 		20000000000000000000001D /* ComposingOrb.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000015 /* ComposingOrb.swift */; };
 		20000000000000000000001E /* ComposingOrbTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000017 /* ComposingOrbTests.swift */; };
+		20000000000000000000001F /* UnifiedDiff.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000018 /* UnifiedDiff.swift */; };
+		200000000000000000000020 /* WorkspaceDiffView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000019 /* WorkspaceDiffView.swift */; };
+		200000000000000000000021 /* UnifiedDiff.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000018 /* UnifiedDiff.swift */; };
+		200000000000000000000022 /* UnifiedDiffTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000001A /* UnifiedDiffTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -71,6 +75,9 @@
 		100000000000000000000015 /* ComposingOrb.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposingOrb.swift; sourceTree = "<group>"; };
 		100000000000000000000016 /* ProfileView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileView.swift; sourceTree = "<group>"; };
 		100000000000000000000017 /* ComposingOrbTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposingOrbTests.swift; sourceTree = "<group>"; };
+		100000000000000000000018 /* UnifiedDiff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedDiff.swift; sourceTree = "<group>"; };
+		100000000000000000000019 /* WorkspaceDiffView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceDiffView.swift; sourceTree = "<group>"; };
+		10000000000000000000001A /* UnifiedDiffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedDiffTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -138,6 +145,8 @@
 				100000000000000000000009 /* HorusStyle.swift */,
 				100000000000000000000016 /* ProfileView.swift */,
 				10000000000000000000000A /* SettingsViews.swift */,
+				100000000000000000000018 /* UnifiedDiff.swift */,
+				100000000000000000000019 /* WorkspaceDiffView.swift */,
 				10000000000000000000000B /* Assets.xcassets */,
 				100000000000000000000010 /* PrivacyInfo.xcprivacy */,
 				100000000000000000000012 /* Info.plist */,
@@ -159,6 +168,7 @@
 				100000000000000000000011 /* AppModelTests.swift */,
 				100000000000000000000017 /* ComposingOrbTests.swift */,
 				10000000000000000000000C /* GatewayWireTests.swift */,
+				10000000000000000000001A /* UnifiedDiffTests.swift */,
 			);
 			path = HorusWireTests;
 			sourceTree = "<group>";
@@ -292,6 +302,8 @@
 				200000000000000000000009 /* HorusStyle.swift in Sources */,
 				20000000000000000000001C /* ProfileView.swift in Sources */,
 				20000000000000000000000A /* SettingsViews.swift in Sources */,
+				20000000000000000000001F /* UnifiedDiff.swift in Sources */,
+				200000000000000000000020 /* WorkspaceDiffView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -303,6 +315,8 @@
 				200000000000000000000016 /* AppModel.swift in Sources */,
 				20000000000000000000001D /* ComposingOrb.swift in Sources */,
 				20000000000000000000001E /* ComposingOrbTests.swift in Sources */,
+				200000000000000000000021 /* UnifiedDiff.swift in Sources */,
+				200000000000000000000022 /* UnifiedDiffTests.swift in Sources */,
 				200000000000000000000017 /* GatewayClient.swift in Sources */,
 				200000000000000000000013 /* GatewayStore.swift in Sources */,
 				20000000000000000000000C /* GatewayWire.swift in Sources */,
@@ -420,7 +434,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 30;
+				CURRENT_PROJECT_VERSION = 31;
 				DEVELOPMENT_TEAM = 3T68GZFAR6;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -444,7 +458,7 @@
 					"@executable_path/Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 0.6.11;
+				MARKETING_VERSION = 0.6.12;
 				PRODUCT_BUNDLE_IDENTIFIER = app.horus.client;
 				PRODUCT_NAME = Horus;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
@@ -461,7 +475,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 30;
+				CURRENT_PROJECT_VERSION = 31;
 				DEVELOPMENT_TEAM = 3T68GZFAR6;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -484,7 +498,7 @@
 					"@executable_path/Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 0.6.11;
+				MARKETING_VERSION = 0.6.12;
 				PRODUCT_BUNDLE_IDENTIFIER = app.horus.client;
 				PRODUCT_NAME = Horus;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
