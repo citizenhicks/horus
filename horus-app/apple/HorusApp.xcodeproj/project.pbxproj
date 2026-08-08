@@ -29,6 +29,12 @@
 		200000000000000000000016 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000001 /* AppModel.swift */; };
 		200000000000000000000017 /* GatewayClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000005 /* GatewayClient.swift */; };
 		200000000000000000000018 /* HorusStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000009 /* HorusStyle.swift */; };
+		200000000000000000000019 /* ComposerDictation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000013 /* ComposerDictation.swift */; };
+		20000000000000000000001A /* ComposerOptionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000014 /* ComposerOptionsView.swift */; };
+		20000000000000000000001B /* ComposingOrb.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000015 /* ComposingOrb.swift */; };
+		20000000000000000000001C /* ProfileView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000016 /* ProfileView.swift */; };
+		20000000000000000000001D /* ComposingOrb.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000015 /* ComposingOrb.swift */; };
+		20000000000000000000001E /* ComposingOrbTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000017 /* ComposingOrbTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -60,6 +66,11 @@
 		100000000000000000000010 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		100000000000000000000011 /* AppModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelTests.swift; sourceTree = "<group>"; };
 		100000000000000000000012 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		100000000000000000000013 /* ComposerDictation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerDictation.swift; sourceTree = "<group>"; };
+		100000000000000000000014 /* ComposerOptionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerOptionsView.swift; sourceTree = "<group>"; };
+		100000000000000000000015 /* ComposingOrb.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposingOrb.swift; sourceTree = "<group>"; };
+		100000000000000000000016 /* ProfileView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileView.swift; sourceTree = "<group>"; };
+		100000000000000000000017 /* ComposingOrbTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposingOrbTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -117,11 +128,15 @@
 				100000000000000000000002 /* AppShell.swift */,
 				100000000000000000000003 /* ArtifactView.swift */,
 				100000000000000000000004 /* ChatView.swift */,
+				100000000000000000000013 /* ComposerDictation.swift */,
+				100000000000000000000014 /* ComposerOptionsView.swift */,
+				100000000000000000000015 /* ComposingOrb.swift */,
 				100000000000000000000005 /* GatewayClient.swift */,
 				100000000000000000000006 /* GatewayStore.swift */,
 				100000000000000000000007 /* GatewayWire.swift */,
 				100000000000000000000008 /* HorusApp.swift */,
 				100000000000000000000009 /* HorusStyle.swift */,
+				100000000000000000000016 /* ProfileView.swift */,
 				10000000000000000000000A /* SettingsViews.swift */,
 				10000000000000000000000B /* Assets.xcassets */,
 				100000000000000000000010 /* PrivacyInfo.xcprivacy */,
@@ -142,6 +157,7 @@
 			isa = PBXGroup;
 			children = (
 				100000000000000000000011 /* AppModelTests.swift */,
+				100000000000000000000017 /* ComposingOrbTests.swift */,
 				10000000000000000000000C /* GatewayWireTests.swift */,
 			);
 			path = HorusWireTests;
@@ -266,11 +282,15 @@
 				200000000000000000000002 /* AppShell.swift in Sources */,
 				200000000000000000000003 /* ArtifactView.swift in Sources */,
 				200000000000000000000004 /* ChatView.swift in Sources */,
+				200000000000000000000019 /* ComposerDictation.swift in Sources */,
+				20000000000000000000001A /* ComposerOptionsView.swift in Sources */,
+				20000000000000000000001B /* ComposingOrb.swift in Sources */,
 				200000000000000000000005 /* GatewayClient.swift in Sources */,
 				200000000000000000000006 /* GatewayStore.swift in Sources */,
 				200000000000000000000007 /* GatewayWire.swift in Sources */,
 				200000000000000000000008 /* HorusApp.swift in Sources */,
 				200000000000000000000009 /* HorusStyle.swift in Sources */,
+				20000000000000000000001C /* ProfileView.swift in Sources */,
 				20000000000000000000000A /* SettingsViews.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -281,6 +301,8 @@
 			files = (
 				200000000000000000000015 /* AppModelTests.swift in Sources */,
 				200000000000000000000016 /* AppModel.swift in Sources */,
+				20000000000000000000001D /* ComposingOrb.swift in Sources */,
+				20000000000000000000001E /* ComposingOrbTests.swift in Sources */,
 				200000000000000000000017 /* GatewayClient.swift in Sources */,
 				200000000000000000000013 /* GatewayStore.swift in Sources */,
 				20000000000000000000000C /* GatewayWire.swift in Sources */,
@@ -398,7 +420,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 28;
+				CURRENT_PROJECT_VERSION = 29;
 				DEVELOPMENT_TEAM = 3T68GZFAR6;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -422,7 +444,7 @@
 					"@executable_path/Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 0.6.9;
+				MARKETING_VERSION = 0.6.10;
 				PRODUCT_BUNDLE_IDENTIFIER = app.horus.client;
 				PRODUCT_NAME = Horus;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
@@ -439,7 +461,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 28;
+				CURRENT_PROJECT_VERSION = 29;
 				DEVELOPMENT_TEAM = 3T68GZFAR6;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -462,7 +484,7 @@
 					"@executable_path/Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 0.6.9;
+				MARKETING_VERSION = 0.6.10;
 				PRODUCT_BUNDLE_IDENTIFIER = app.horus.client;
 				PRODUCT_NAME = Horus;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";

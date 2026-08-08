@@ -91,7 +91,10 @@ final class AppModelTests: XCTestCase {
         )
     }
 
-    private func providerStatus(for config: ProviderConfig) -> ProviderStatus {
+    private func providerStatus(
+        for config: ProviderConfig,
+        models: [ProviderModel] = []
+    ) -> ProviderStatus {
         ProviderStatus(
             provider: config.provider,
             label: "OpenAI",
@@ -102,7 +105,7 @@ final class AppModelTests: XCTestCase {
             auth: .apiKey,
             defaultBaseUrl: config.baseUrl,
             defaultApiKeyEnv: "OPENAI_API_KEY",
-            models: [],
+            models: models,
             modelIds: [],
             modelIdsConfigurable: false,
             webSearch: [config.webSearch]
@@ -1996,6 +1999,46 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.agentDraftModelRoute, choice.route)
         XCTAssertNotEqual(model.agentDraft, model.agentSnapshot?.config)
         XCTAssertNotEqual(model.agentDraft, model.defaultAgentSnapshot?.config)
+    }
+
+    func testModelLabelUsesProviderFriendlyName() throws {
+        let model = try model()
+        let config = ProviderConfig(
+            provider: "openai_socket",
+            model: "gpt-5.6-sol",
+            baseUrl: nil,
+            reasoningEffort: "high",
+            webSearch: .cached
+        )
+        let choice = ModelChoice(
+            route: "opaque-route",
+            group: "OpenAI · Sol",
+            model: config.model,
+            reasoningEffort: config.reasoningEffort,
+            contextWindow: 128_000,
+            supportsImageInput: true
+        )
+        model.modelProviders = [choice.route: config.provider]
+        model.providerStatuses = [providerStatus(for: config, models: [ProviderModel(
+            id: config.model,
+            label: "Sol",
+            description: "Coding model",
+            contextWindow: 128_000,
+            reasoning: [],
+            defaultReasoning: "high"
+        )])]
+
+        XCTAssertEqual(model.modelLabel(for: choice), "Sol")
+        XCTAssertEqual(model.modelLabel(
+            for: ModelChoice(
+                route: "custom-route",
+                group: "Custom",
+                model: "custom-model",
+                reasoningEffort: nil,
+                contextWindow: nil,
+                supportsImageInput: false
+            )
+        ), "custom-model")
     }
 
     func testMiddlewareSettingsSetAndClearWithoutCapabilityLogic() {

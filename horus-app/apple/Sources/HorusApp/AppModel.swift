@@ -1733,6 +1733,18 @@ final class AppModel {
         agentDraft = draft
     }
 
+    func modelLabel(for choice: ModelChoice) -> String {
+        modelLabel(provider: modelProviders[choice.route], modelID: choice.model)
+    }
+
+    func modelLabel(provider: String?, modelID: String) -> String {
+        guard let provider else { return modelID }
+        return providerStatuses
+            .first { $0.provider == provider }?
+            .models.first { $0.id == modelID }?
+            .label ?? modelID
+    }
+
     func providerSymbol(for choice: ModelChoice) -> String? {
         providerStatus(for: choice)?.symbol
     }
