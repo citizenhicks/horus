@@ -51,7 +51,7 @@ struct ChatView: View {
                 .zIndex(2)
             }
         }
-        .navigationTitle(model.displayedTranscript.isEmpty ? "Hello" : model.currentSessionTitle)
+        .navigationTitle(model.displayedTranscript.isEmpty ? "new chat" : model.currentSessionTitle)
         .navigationSubtitle(chatSubtitle)
         #if os(iOS)
         .toolbarTitleDisplayMode(.inline)
@@ -227,7 +227,16 @@ private struct TranscriptView: View {
     private let contentPadding: CGFloat = 24
     #endif
 
+    @ViewBuilder
     var body: some View {
+        if model.isLoadingTranscript {
+            TranscriptLoadingView(bottomInset: bottomInset)
+        } else {
+            transcript
+        }
+    }
+
+    private var transcript: some View {
         ScrollView {
             // ponytail: chat rows have wildly different heights, so exact layout avoids the
             // blank gaps produced by LazyVStack estimates. Paginate before making this lazy again.
@@ -271,9 +280,7 @@ private struct TranscriptView: View {
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(.interactively)
         .overlay {
-            if model.isLoadingTranscript {
-                TranscriptLoadingView(bottomInset: bottomInset)
-            } else if model.displayedTranscript.isEmpty {
+            if model.displayedTranscript.isEmpty {
                 emptyState
             }
         }
@@ -347,12 +354,16 @@ private struct TranscriptView: View {
 
 private struct TranscriptLoadingView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
     let bottomInset: CGFloat
 
     var body: some View {
         ZStack {
             HorusBackdrop()
-            TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: reduceMotion)) { _ in
+            TimelineView(.animation(
+                minimumInterval: 1.0 / 30.0,
+                paused: reduceMotion || scenePhase != .active
+            )) { _ in
                 let seconds = ProcessInfo.processInfo.systemUptime
                 HorusComposingOrb(
                     time: reduceMotion ? 0.6 : seconds * HorusComposingOrbRenderer.speed
@@ -850,13 +861,7 @@ private struct MarkdownText: View {
     }
 
     var body: some View {
-        Group {
-            if streaming {
-                StreamingMarkdown(text: normalizedText)
-            } else {
-                MarkdownView(normalizedText)
-            }
-        }
+        StreamingMarkdown(text: normalizedText, streaming: streaming)
             #if os(iOS)
             .markdownFontGroup(HorusMarkdownFonts())
             #endif
@@ -878,17 +883,34 @@ private struct MarkdownText: View {
 }
 
 private struct StreamingMarkdown: View {
-    @State private var source = StreamingMarkdownSource()
+    @State private var source: StreamingMarkdownSource
     let text: String
+    let streaming: Bool
+
+    init(text: String, streaming: Bool) {
+        self.text = text
+        self.streaming = streaming
+        _source = State(initialValue: StreamingMarkdownSource(text))
+    }
 
     var body: some View {
         StreamingMarkdownReader(source) { parseResult in
             MarkdownView(parseResult)
         }
-        .onChange(of: text, initial: true) { _, text in
-            source.text = text
+        .onChange(of: update, initial: true) { _, update in
+            source.text = update.text
+            if !update.streaming { source.finishStreaming() }
         }
     }
+
+    private var update: StreamingMarkdownUpdate {
+        StreamingMarkdownUpdate(text: text, streaming: streaming)
+    }
+}
+
+private struct StreamingMarkdownUpdate: Equatable {
+    let text: String
+    let streaming: Bool
 }
 
 #if os(iOS)
@@ -944,10 +966,10 @@ private struct ComposerSurface: View {
     @State private var dictation = ComposerDictation()
     #endif
     @State private var selection: TextSelection?
+    @State private var referenceSuggestions: ReferenceSuggestions?
 
     var body: some View {
         @Bindable var model = model
-        let suggestions = referenceSuggestions
         VStack(spacing: 0) {
             if !model.composerAttachments.isEmpty {
                 ComposerAttachmentsView()
@@ -993,13 +1015,33 @@ private struct ComposerSurface: View {
         .horusGlass(in: HorusStyle.cardShape, interactive: true)
         .shadow(color: .black.opacity(0.18), radius: 12, y: 6)
         .overlay(alignment: .top) {
-            if let suggestions {
+            if let suggestions = referenceSuggestions {
                 ReferenceSuggestionsPopup(suggestions: suggestions) {
                     complete($0, suggestions: suggestions)
                 }
                 .padding(.horizontal, 8)
                 .zIndex(2)
             }
+        }
+        .task(id: referenceSuggestionRequest) {
+            let request = referenceSuggestionRequest
+            referenceSuggestions = nil
+            guard !request.isDisabled else { return }
+            try? await Task.sleep(for: .milliseconds(80))
+            guard !Task.isCancelled else { return }
+            let references = model.capabilityReferences
+            let files = model.workspaceFiles
+            let searchTask = Task.detached(priority: .userInitiated) {
+                AppModel.referenceSuggestions(
+                    in: request.text,
+                    cursorOffset: request.cursorOffset,
+                    capabilityReferences: references,
+                    workspaceFiles: files
+                )
+            }
+            let result = await searchTask.value
+            guard !Task.isCancelled else { return }
+            referenceSuggestions = result
         }
         #if os(iOS)
         .onChange(of: scenePhase) { _, phase in
@@ -1036,21 +1078,35 @@ private struct ComposerSurface: View {
         model.sendMessage()
     }
 
-    private var referenceSuggestions: ReferenceSuggestions? {
+    private var referenceSuggestionRequest: ReferenceSuggestionRequest {
         #if os(iOS)
-        guard !dictation.isActive else { return nil }
+        let isDisabled = dictation.isActive
+        #else
+        let isDisabled = false
         #endif
+        let text = model.composer
         let cursor: String.Index
-        if let selection, case .selection(let range) = selection.indices, range.isEmpty {
+        if let selection,
+           case .selection(let range) = selection.indices,
+           range.isEmpty,
+           text.indices.contains(range.lowerBound) || range.lowerBound == text.endIndex
+        {
             cursor = range.lowerBound
         } else {
-            cursor = model.composer.endIndex
+            cursor = text.endIndex
         }
-        return model.referenceSuggestions(in: model.composer, cursor: cursor)
+        return ReferenceSuggestionRequest(
+            text: text,
+            cursorOffset: text.distance(from: text.startIndex, to: cursor),
+            capabilityRevision: model.contributionsRevision,
+            workspaceFileRevision: model.workspaceFilesRevision,
+            isDisabled: isDisabled
+        )
     }
 
     private func complete(_ mounted: MountedReference, suggestions: ReferenceSuggestions) {
-        var text = model.composer
+        guard model.composer == suggestions.source else { return }
+        var text = suggestions.source
         let offset = text.distance(from: text.startIndex, to: suggestions.range.lowerBound)
         text.replaceSubrange(suggestions.range, with: mounted.replacement)
         model.composer = text
@@ -1075,6 +1131,14 @@ private struct ComposerSurface: View {
             insertionPoint: text.index(text.startIndex, offsetBy: offset + 1)
         )
     }
+}
+
+private struct ReferenceSuggestionRequest: Equatable, Sendable {
+    let text: String
+    let cursorOffset: Int
+    let capabilityRevision: Int
+    let workspaceFileRevision: Int
+    let isDisabled: Bool
 }
 
 private struct ReferenceSuggestionsPopup: View {
@@ -1135,9 +1199,9 @@ private struct ComposerActivityView: View {
     @Environment(\.horusPalette) private var palette
     @State private var showsWorkspace = false
     @State private var showsBranch = false
+    @State private var totals = DiffLineTotals()
 
     var body: some View {
-        let totals = diffTotals(model.gitDiff)
         GlassEffectContainer(spacing: 8) {
             HStack(spacing: 8) {
                 #if os(macOS)
@@ -1212,6 +1276,15 @@ private struct ComposerActivityView: View {
         }
         .frame(maxWidth: .infinity)
         .accessibilityElement(children: .contain)
+        .task(id: model.gitDiff) {
+            let diff = model.gitDiff
+            let countTask = Task.detached(priority: .utility) {
+                diffTotals(diff)
+            }
+            let result = await countTask.value
+            guard !Task.isCancelled else { return }
+            totals = result
+        }
     }
 
 }
@@ -1846,11 +1919,17 @@ private func copyToPasteboard(_ text: String) {
     #endif
 }
 
-private func diffTotals(_ text: String) -> (added: Int, removed: Int) {
-    text.split(separator: "\n", omittingEmptySubsequences: false).reduce(into: (0, 0)) { result, line in
-        if line.hasPrefix("+") && !line.hasPrefix("+++") { result.0 += 1 }
-        if line.hasPrefix("-") && !line.hasPrefix("---") { result.1 += 1 }
-    }
+private struct DiffLineTotals: Equatable, Sendable {
+    var added = 0
+    var removed = 0
+}
+
+private func diffTotals(_ text: String) -> DiffLineTotals {
+    text.split(separator: "\n", omittingEmptySubsequences: false)
+        .reduce(into: DiffLineTotals()) { result, line in
+            if line.hasPrefix("+") && !line.hasPrefix("+++") { result.added += 1 }
+            if line.hasPrefix("-") && !line.hasPrefix("---") { result.removed += 1 }
+        }
 }
 
 private func formatDuration(_ interval: TimeInterval) -> String {

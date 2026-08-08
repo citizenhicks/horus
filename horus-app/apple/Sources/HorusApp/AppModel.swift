@@ -446,7 +446,8 @@ private enum ConfigurationTarget {
     case defaultAgent
 }
 
-struct ReferenceSuggestions {
+struct ReferenceSuggestions: Sendable {
+    let source: String
     let range: Range<String.Index>
     let matches: [MountedReference]
 }
@@ -540,7 +541,10 @@ final class AppModel {
     var modelProviders: [String: String] = [:]
     var middlewareFeatures: [MiddlewareFeature] = []
     var selectedModelRoute = ""
-    var contributions: [FrontendContribution] = []
+    private(set) var contributionsRevision = 0
+    var contributions: [FrontendContribution] = [] {
+        didSet { contributionsRevision &+= 1 }
+    }
     var toolCount = 0
     var mountedWidgets: [MountedWidget] = []
     var pendingPicker: FrontendPickerPrompt?
@@ -549,7 +553,10 @@ final class AppModel {
     var showsInspector = false
     var inspectorPage: InspectorPage = .changes
     var workspaceFileScope: WorkspaceFileScope = .modified
-    var workspaceFiles: [WorkspaceFileRecord] = []
+    private(set) var workspaceFilesRevision = 0
+    var workspaceFiles: [WorkspaceFileRecord] = [] {
+        didSet { workspaceFilesRevision &+= 1 }
+    }
     private(set) var isLoadingGitDiff = false
     private(set) var isLoadingWorkspaceFiles = false
     var profile: ProfileSnapshot?
@@ -935,6 +942,22 @@ final class AppModel {
 
     func referenceSuggestions(in text: String, cursor: String.Index) -> ReferenceSuggestions? {
         guard text.indices.contains(cursor) || cursor == text.endIndex else { return nil }
+        return Self.referenceSuggestions(
+            in: text,
+            cursorOffset: text.distance(from: text.startIndex, to: cursor),
+            capabilityReferences: capabilityReferences,
+            workspaceFiles: workspaceFiles
+        )
+    }
+
+    nonisolated static func referenceSuggestions(
+        in text: String,
+        cursorOffset: Int,
+        capabilityReferences: [MountedReference],
+        workspaceFiles: [WorkspaceFileRecord]
+    ) -> ReferenceSuggestions? {
+        guard cursorOffset >= 0, cursorOffset <= text.count else { return nil }
+        let cursor = text.index(text.startIndex, offsetBy: cursorOffset)
         let start = text[..<cursor].lastIndex(where: { $0.isWhitespace })
             .map { text.index(after: $0) } ?? text.startIndex
         guard start < cursor, let trigger = text[start..<cursor].first else { return nil }
@@ -948,7 +971,7 @@ final class AppModel {
             matches = Array(capabilityMatches.prefix(8))
             if trigger == "@", matches.count < 8 {
                 matches.append(contentsOf: workspaceFiles.prefix(8 - matches.count).map {
-                    workspaceReference($0)
+                    Self.workspaceReference($0)
                 })
             }
         } else {
@@ -968,15 +991,17 @@ final class AppModel {
             }
             capabilityMatches.forEach(consider)
             if trigger == "@" {
-                workspaceFiles.lazy.map(workspaceReference).forEach(consider)
+                workspaceFiles.lazy.map(Self.workspaceReference).forEach(consider)
             }
             matches = ranked.map { $0.reference }
         }
         guard !matches.isEmpty else { return nil }
-        return ReferenceSuggestions(range: start..<end, matches: matches)
+        return ReferenceSuggestions(source: text, range: start..<end, matches: matches)
     }
 
-    private func workspaceReference(_ file: WorkspaceFileRecord) -> MountedReference {
+    nonisolated private static func workspaceReference(
+        _ file: WorkspaceFileRecord
+    ) -> MountedReference {
         MountedReference(
             capability: "workspace-files",
             reference: FrontendReference(trigger: "@", value: file.path, description: "file"),
@@ -987,7 +1012,10 @@ final class AppModel {
         )
     }
 
-    private func referenceScore(_ value: String, query: String) -> ReferenceMatchScore? {
+    nonisolated private static func referenceScore(
+        _ value: String,
+        query: String
+    ) -> ReferenceMatchScore? {
         let value = value.lowercased()
         let name = value.split(separator: "/").last.map(String.init) ?? value
         let length = value.count
@@ -1016,7 +1044,7 @@ final class AppModel {
         }
     }
 
-    private func subsequenceGaps(in value: String, query: String) -> Int? {
+    nonisolated private static func subsequenceGaps(in value: String, query: String) -> Int? {
         var searchStart = value.startIndex
         var firstOffset: Int?
         var lastOffset = 0
@@ -1601,7 +1629,9 @@ final class AppModel {
         workspaceFilePreviewDownload = nil
         isLoadingAttachmentPreview = false
         if let previewTemporaryDirectory {
-            try? FileManager.default.removeItem(at: previewTemporaryDirectory)
+            Task.detached(priority: .utility) {
+                try? FileManager.default.removeItem(at: previewTemporaryDirectory)
+            }
         }
         previewTemporaryDirectory = nil
         previewURL = nil
@@ -2186,9 +2216,12 @@ final class AppModel {
                 self.connectionState = .authenticating
                 self.eventTask = Task { [weak self] in
                     do {
+                        var handledFrames = 0
                         for try await frame in stream {
                             guard let self, generation == self.connectionGeneration else { return }
                             self.handle(frame)
+                            handledFrames += 1
+                            if handledFrames.isMultiple(of: 32) { await Task.yield() }
                         }
                         self?.connectionEnded(generation: generation, message: "The gateway closed the connection.")
                     } catch {
@@ -3736,6 +3769,7 @@ final class AppModel {
         nextOffset: Int64?
     ) {
         guard var download = attachmentPreviewDownload else { return }
+        attachmentPreviewDownload = nil
         guard download.requestID == requestID,
               download.sessionID == sessionID,
               download.attachment.id == attachmentID,
@@ -3743,7 +3777,6 @@ final class AppModel {
               data.count <= 256 * 1024,
               Int64(download.data.count + data.count) <= download.attachment.size
         else {
-            attachmentPreviewDownload = nil
             isLoadingAttachmentPreview = false
             showToast("The gateway returned an invalid attachment.", tone: .error)
             return
@@ -3751,7 +3784,6 @@ final class AppModel {
         download.data.append(data)
         if let nextOffset {
             guard nextOffset == Int64(download.data.count), nextOffset > offset else {
-                attachmentPreviewDownload = nil
                 isLoadingAttachmentPreview = false
                 showToast("The gateway returned an invalid attachment offset.", tone: .error)
                 return
@@ -3775,12 +3807,10 @@ final class AppModel {
         }
 
         guard Int64(download.data.count) == download.attachment.size else {
-            attachmentPreviewDownload = nil
             isLoadingAttachmentPreview = false
             showToast("The downloaded attachment is incomplete.", tone: .error)
             return
         }
-        attachmentPreviewDownload = nil
         finishFilePreview(
             download.data,
             name: download.attachment.name,
@@ -3797,6 +3827,7 @@ final class AppModel {
         nextOffset: UInt64?
     ) {
         guard var download = workspaceFilePreviewDownload else { return }
+        workspaceFilePreviewDownload = nil
         guard download.requestID == requestID,
               download.sessionID == sessionID,
               download.file.path == path,
@@ -3805,7 +3836,6 @@ final class AppModel {
               offset <= download.file.size,
               UInt64(data.count) <= download.file.size - offset
         else {
-            workspaceFilePreviewDownload = nil
             isLoadingAttachmentPreview = false
             showToast("The gateway returned an invalid workspace file.", tone: .error)
             return
@@ -3813,7 +3843,6 @@ final class AppModel {
         download.data.append(data)
         if let nextOffset {
             guard nextOffset == UInt64(download.data.count), nextOffset > offset else {
-                workspaceFilePreviewDownload = nil
                 isLoadingAttachmentPreview = false
                 showToast("The gateway returned an invalid workspace file offset.", tone: .error)
                 return
@@ -3837,12 +3866,10 @@ final class AppModel {
         }
 
         guard UInt64(download.data.count) == download.file.size else {
-            workspaceFilePreviewDownload = nil
             isLoadingAttachmentPreview = false
             showToast("The downloaded workspace file is incomplete.", tone: .error)
             return
         }
-        workspaceFilePreviewDownload = nil
         finishFilePreview(
             download.data,
             name: URL(fileURLWithPath: download.file.path).lastPathComponent,
@@ -3862,15 +3889,16 @@ final class AppModel {
             do {
                 let file = try await Self.writeAttachmentPreview(data, name: name)
                 guard self.attachmentPreviewGeneration == generation else {
-                    try? FileManager.default.removeItem(at: file.directory)
+                    await Self.removePreviewDirectory(file.directory)
                     return
                 }
-                if let current = self.previewTemporaryDirectory {
-                    try? FileManager.default.removeItem(at: current)
-                }
+                let previousDirectory = self.previewTemporaryDirectory
                 self.previewTemporaryDirectory = file.directory
                 self.previewURL = file.url
                 self.isLoadingAttachmentPreview = false
+                if let previousDirectory {
+                    Task { await Self.removePreviewDirectory(previousDirectory) }
+                }
             } catch {
                 guard self.attachmentPreviewGeneration == generation else { return }
                 self.isLoadingAttachmentPreview = false
@@ -3912,6 +3940,12 @@ final class AppModel {
             try data.write(to: url, options: .atomic)
             #endif
             return AttachmentPreviewFile(directory: directory, url: url)
+        }.value
+    }
+
+    private nonisolated static func removePreviewDirectory(_ directory: URL) async {
+        await Task.detached(priority: .utility) {
+            try? FileManager.default.removeItem(at: directory)
         }.value
     }
 

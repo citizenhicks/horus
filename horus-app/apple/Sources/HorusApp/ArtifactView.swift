@@ -127,15 +127,7 @@ private struct WorkspaceDiffView: View {
         } else if model.gitDiff.isEmpty {
             HorusUnavailable(title: "No unstaged changes", glyph: .gitBranch)
         } else {
-            ScrollView(.vertical) {
-                CodeText(model.gitDiff)
-                    .highlightLanguage(.diff)
-                    .font(HorusStyle.metadataFont)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding()
-            }
-            .textSelection(.enabled)
+            NumberedSourceText(model.gitDiff, language: .diff)
         }
     }
 }
@@ -144,16 +136,36 @@ private struct WorkspaceFileList: View {
     @Environment(AppModel.self) private var model
     @State private var tree: [FileTreeNode] = []
     @State private var query = ""
+    @State private var matches: [WorkspaceFileRecord] = []
+    @State private var matchedQuery = ""
 
     var body: some View {
         content
             .searchable(text: $query, placement: .toolbar, prompt: "Search files")
-            .task(id: model.workspaceFiles) {
+            .task(id: model.workspaceFilesRevision) {
                 let files = model.workspaceFiles
                 async let builtTree = FileTreeNode.tree(from: files)
                 let result = await builtTree
                 guard !Task.isCancelled else { return }
                 tree = result
+            }
+            .task(id: searchRequest) {
+                guard !query.isEmpty else {
+                    matches = []
+                    matchedQuery = ""
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(120))
+                guard !Task.isCancelled else { return }
+                let files = model.workspaceFiles
+                let query = query
+                let searchTask = Task.detached(priority: .userInitiated) {
+                    files.filter { $0.path.localizedCaseInsensitiveContains(query) }
+                }
+                let result = await searchTask.value
+                guard !Task.isCancelled else { return }
+                matches = result
+                matchedQuery = query
             }
     }
 
@@ -186,10 +198,9 @@ private struct WorkspaceFileList: View {
     /// of hits with their full path.
     @ViewBuilder
     private var searchResults: some View {
-        let matches = model.workspaceFiles.filter {
-            $0.path.localizedCaseInsensitiveContains(query)
-        }
-        if matches.isEmpty {
+        if matchedQuery != query {
+            InspectorLoadingView(title: "Searching files")
+        } else if matches.isEmpty {
             HorusUnavailable(title: "No matching files", glyph: .magnifyingGlass)
         } else {
             List(matches) { file in
@@ -208,6 +219,10 @@ private struct WorkspaceFileList: View {
         }
     }
 
+    private var searchRequest: WorkspaceFileSearchRequest {
+        WorkspaceFileSearchRequest(query: query, catalogRevision: model.workspaceFilesRevision)
+    }
+
     private func fileButton(path: String, label: some View) -> some View {
         Button {
             guard let file = model.workspaceFiles.first(where: { $0.path == path }) else { return }
@@ -219,6 +234,11 @@ private struct WorkspaceFileList: View {
         .disabled(model.isLoadingAttachmentPreview)
         .accessibilityLabel("Open workspace file \(path)")
     }
+}
+
+private struct WorkspaceFileSearchRequest: Equatable {
+    let query: String
+    let catalogRevision: Int
 }
 
 private struct FileTreeRow: View {
@@ -370,21 +390,26 @@ struct TextFilePreviewView: View {
     }
 }
 
-struct NumberedSourceLine: Identifiable {
+struct NumberedSourceLine: Identifiable, Sendable {
     let id: Int
     let text: AttributedString
+}
+
+private struct NumberedSourceRenderRequest: Equatable, Sendable {
+    let source: String
+    let language: HighlightLanguage?
+    let isDark: Bool
 }
 
 struct NumberedSourceText: View {
     @Environment(\.colorScheme) private var colorScheme
     let source: String
     let language: HighlightLanguage?
-    @State private var lines: [NumberedSourceLine]
+    @State private var lines: [NumberedSourceLine] = []
 
     init(_ source: String, language: HighlightLanguage? = nil) {
         self.source = source
         self.language = language
-        _lines = State(initialValue: Self.lines(from: AttributedString(source)))
     }
 
     var body: some View {
@@ -410,17 +435,53 @@ struct NumberedSourceText: View {
             .padding(.trailing, 16)
         }
         .textSelection(.enabled)
-        .task(id: colorScheme) {
-            let colors: HighlightColors = colorScheme == .dark ? .dark(.xcode) : .light(.xcode)
-            let mode = language.map(HighlightMode.language) ?? .automatic
-            guard let result = try? await Highlight().request(source, mode: mode, colors: colors),
-                  !Task.isCancelled
-            else { return }
-            lines = Self.lines(from: Self.restoringWhitespace(result.attributedText, in: source))
+        .overlay {
+            if lines.isEmpty, !source.isEmpty {
+                ProgressView("Rendering text")
+            }
+        }
+        .task(id: renderRequest) {
+            lines = []
+
+            let request = renderRequest
+            let plainTask = Task.detached(priority: .userInitiated) {
+                Self.lines(from: AttributedString(request.source))
+            }
+            let plainLines = await plainTask.value
+            guard !Task.isCancelled else { return }
+            lines = plainLines
+
+            let highlightTask = Task.detached(priority: .userInitiated) {
+                guard !Task.isCancelled else { return Optional<[NumberedSourceLine]>.none }
+                let colors: HighlightColors = request.isDark ? .dark(.xcode) : .light(.xcode)
+                let mode = request.language.map(HighlightMode.language) ?? .automatic
+                guard let result = try? await Highlight().request(
+                    request.source,
+                    mode: mode,
+                    colors: colors
+                ), !Task.isCancelled else { return nil }
+                let text = Self.restoringWhitespace(result.attributedText, in: request.source)
+                return Self.lines(from: text)
+            }
+            let highlightedLines = await withTaskCancellationHandler {
+                await highlightTask.value
+            } onCancel: {
+                highlightTask.cancel()
+            }
+            guard let highlightedLines, !Task.isCancelled else { return }
+            lines = highlightedLines
         }
     }
 
-    static func restoringWhitespace(
+    private var renderRequest: NumberedSourceRenderRequest {
+        NumberedSourceRenderRequest(
+            source: source,
+            language: language,
+            isDark: colorScheme == .dark
+        )
+    }
+
+    nonisolated static func restoringWhitespace(
         _ highlighted: AttributedString,
         in source: String
     ) -> AttributedString {
@@ -435,7 +496,7 @@ struct NumberedSourceText: View {
         return result
     }
 
-    static func lines(from text: AttributedString) -> [NumberedSourceLine] {
+    nonisolated static func lines(from text: AttributedString) -> [NumberedSourceLine] {
         var lines: [AttributedString] = []
         var start = text.startIndex
         while let newline = text.characters[start...].firstIndex(where: \.isNewline) {
