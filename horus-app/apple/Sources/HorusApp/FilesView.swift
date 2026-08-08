@@ -1,5 +1,8 @@
 import SwiftUI
 import HighlightSwift
+#if os(iOS)
+import UIKit
+#endif
 
 struct FilesView: View {
     @Environment(AppModel.self) private var model
@@ -262,7 +265,7 @@ private struct ChatFileList: View {
                 } else if artifactFiles.isEmpty {
                     InspectorEmptyRow(
                         title: "No artifacts",
-                        detail: "Files sent by Horus will appear here."
+                        glyph: .fileAxisThreeD
                     )
                 } else {
                     ForEach(artifactFiles) { file in
@@ -286,7 +289,7 @@ private struct ChatFileList: View {
                 } else if model.sessionUploads.isEmpty {
                     InspectorEmptyRow(
                         title: "No uploads",
-                        detail: "Use the Plus button in the composer to add files."
+                        glyph: .fileUpload
                     )
                 } else {
                     ForEach(model.sessionUploads) { file in
@@ -359,16 +362,19 @@ private struct InspectorSectionLoadingRow: View {
 private struct InspectorEmptyRow: View {
     @Environment(\.horusPalette) private var palette
     let title: String
-    let detail: String
+    let glyph: HorusGlyph
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(HorusStyle.metadataFont.weight(.semibold))
-            Text(detail)
-                .font(HorusStyle.metadataFont)
+        VStack(spacing: 8) {
+            HorusIcon(glyph, size: 44, foreground: palette.muted)
+            Text(title)
+                .font(HorusStyle.metadataFont.weight(.semibold))
                 .foregroundStyle(palette.muted)
         }
-        .frame(minHeight: HorusStyle.iconButtonSize)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 16)
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
         .accessibilityElement(children: .combine)
     }
 }
@@ -463,6 +469,17 @@ struct TextFilePreviewView: View {
     }
 }
 
+#if os(iOS)
+struct SessionFileShareView: UIViewControllerRepresentable {
+    let file: SessionFileShareItem
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [file.url], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ viewController: UIActivityViewController, context: Context) {}
+}
+#else
 struct SessionFileShareView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.horusPalette) private var palette
@@ -499,6 +516,7 @@ struct SessionFileShareView: View {
         .presentationDetents([.medium])
     }
 }
+#endif
 
 struct NumberedSourceLine: Identifiable, Sendable {
     let id: Int
