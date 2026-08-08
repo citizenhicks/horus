@@ -1263,7 +1263,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.toast?.message, "Attachments in one message are limited to 100 MiB total.")
     }
 
-    func testInspectorRequestsUnstagedDiffThenAllWorkspaceFiles() async throws {
+    func testInspectorRequestsUnstagedDiffAndAllWorkspaceFiles() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
             await recorder.record(request)
@@ -1281,10 +1281,12 @@ final class AppModelTests: XCTestCase {
         else { return XCTFail("Expected unstaged Git diff") }
         XCTAssertEqual(sessionID, "chat-1")
         XCTAssertEqual(diffScope, .unstaged)
-        XCTAssertFalse(unstagedRequests.contains { request in
-            if case .listWorkspaceFiles = request { return true }
+        guard let initialFileRequest = unstagedRequests.last(where: {
+            if case .listWorkspaceFiles = $0 { return true }
             return false
-        })
+        }), case .listWorkspaceFiles(_, "chat-1", let initialScope) = initialFileRequest
+        else { return XCTFail("Expected all workspace files") }
+        XCTAssertEqual(initialScope, .all)
 
         model.selectWorkspaceFileScope(.all)
         try await Task.sleep(for: .milliseconds(20))
@@ -1295,6 +1297,39 @@ final class AppModelTests: XCTestCase {
         }), case .listWorkspaceFiles(_, _, let allScope) = allRequest
         else { return XCTFail("Expected all workspace files") }
         XCTAssertEqual(allScope, .all)
+    }
+
+    func testWorkspaceReferencesUseCLIFuzzyRankingAndReplacement() throws {
+        let model = try model()
+        model.workspaceFiles = [
+            WorkspaceFileRecord(path: "examples/application.txt", size: 1),
+            WorkspaceFileRecord(path: "Sources/App.swift", size: 1),
+            WorkspaceFileRecord(path: "docs/My App.md", size: 1),
+            WorkspaceFileRecord(path: "src/main.rs", size: 1)
+        ]
+
+        let prefix = "Review @app"
+        let prefixSuggestions = try XCTUnwrap(model.referenceSuggestions(
+            in: prefix,
+            cursor: prefix.endIndex
+        ))
+        XCTAssertEqual(prefixSuggestions.matches.first?.label, "@Sources/App.swift")
+        XCTAssertEqual(prefixSuggestions.matches.first?.replacement, "Sources/App.swift")
+
+        let spaced = "Review @my"
+        let spacedSuggestions = try XCTUnwrap(model.referenceSuggestions(
+            in: spaced,
+            cursor: spaced.endIndex
+        ))
+        XCTAssertEqual(spacedSuggestions.matches.first?.label, "@docs/My App.md")
+        XCTAssertEqual(spacedSuggestions.matches.first?.replacement, "\"docs/My App.md\"")
+
+        let fuzzy = "Review @smr"
+        let fuzzySuggestions = try XCTUnwrap(model.referenceSuggestions(
+            in: fuzzy,
+            cursor: fuzzy.endIndex
+        ))
+        XCTAssertEqual(fuzzySuggestions.matches.first?.label, "@src/main.rs")
     }
 
     func testWorkspaceSourceFileUsesTextPreview() async throws {
@@ -2254,7 +2289,9 @@ final class AppModelTests: XCTestCase {
         guard case .openSession(let requestID, _, nil, nil) = request else {
             return XCTFail("Expected an uncached session open")
         }
+        XCTAssertTrue(model.isLoadingTranscript)
         model.handle(.sessionOpened(requestID: requestID, payload: sessionReady(latestSequence: 2)))
+        XCTAssertTrue(model.isLoadingTranscript)
         model.showInspector()
         model.handle(.agentEvent(
             sessionID: "chat-1",
@@ -2284,11 +2321,16 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(300))
         XCTAssertTrue(model.displayedTranscript.isEmpty)
         model.handle(.sessionReplayComplete(requestID: requestID, sessionID: "chat-1"))
+        XCTAssertFalse(model.isLoadingTranscript)
         XCTAssertEqual(model.displayedTranscript.map(\.text), ["Hello"])
         try await Task.sleep(for: .milliseconds(20))
         let refreshed = await recorder.requests()
         XCTAssertTrue(refreshed.contains { request in
             guard case .getGitDiff(_, "chat-1", .unstaged) = request else { return false }
+            return true
+        })
+        XCTAssertTrue(refreshed.contains { request in
+            guard case .listWorkspaceFiles(_, "chat-1", .all) = request else { return false }
             return true
         })
     }

@@ -596,7 +596,11 @@ private struct TranscriptView: View {
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(.interactively)
         .overlay {
-            if model.displayedTranscript.isEmpty { emptyState }
+            if model.isLoadingTranscript {
+                TranscriptLoadingView(bottomInset: bottomInset)
+            } else if model.displayedTranscript.isEmpty {
+                emptyState
+            }
         }
         // Measured against the furthest reachable offset, including the bottom inset:
         // comparing the visible rect to the content height never reads as "at bottom".
@@ -663,6 +667,31 @@ private struct TranscriptView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.horizontal, 24)
             .padding(.bottom, bottomInset)
+    }
+}
+
+private struct TranscriptLoadingView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let bottomInset: CGFloat
+
+    var body: some View {
+        ZStack {
+            HorusBackdrop()
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { timeline in
+                let seconds = timeline.date.timeIntervalSinceReferenceDate
+                let progress = reduceMotion ? 0 : seconds.truncatingRemainder(dividingBy: 3.2) / 3.2
+                let pulse = reduceMotion ? 1 : 0.98 + 0.02 * (sin(seconds * .pi) + 1) / 2
+                Image("HorusLogo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 112, height: 112)
+                    .rotationEffect(.degrees(progress * 360))
+                    .scaleEffect(pulse)
+            }
+            .offset(y: -bottomInset / 2)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Loading conversation")
     }
 }
 
@@ -1250,29 +1279,8 @@ private struct ComposerSurface: View {
 
     var body: some View {
         @Bindable var model = model
+        let suggestions = referenceSuggestions
         VStack(spacing: 0) {
-            if let suggestions = referenceSuggestions {
-                ScrollView(.horizontal) {
-                    HStack(spacing: 6) {
-                        ForEach(suggestions.matches) { mounted in
-                            Button { complete(mounted, suggestions: suggestions) } label: {
-                                HorusBadge(
-                                    text: mounted.replacement,
-                                    tone: "neutral",
-                                    interactive: true
-                                )
-                            }
-                            .buttonStyle(.horusPlain)
-                            .help(mounted.reference.description)
-                            .accessibilityLabel(mounted.replacement)
-                            .accessibilityHint(mounted.reference.description)
-                        }
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 10)
-                }
-                .scrollIndicators(.hidden)
-            }
             if !model.composerAttachments.isEmpty {
                 ComposerAttachmentsView()
                     .padding(.horizontal, 12)
@@ -1316,6 +1324,15 @@ private struct ComposerSurface: View {
         }
         .horusGlass(in: HorusStyle.cardShape, interactive: true)
         .shadow(color: .black.opacity(0.18), radius: 12, y: 6)
+        .overlay(alignment: .top) {
+            if let suggestions {
+                ReferenceSuggestionsPopup(suggestions: suggestions) {
+                    complete($0, suggestions: suggestions)
+                }
+                .padding(.horizontal, 8)
+                .zIndex(2)
+            }
+        }
         #if os(iOS)
         .onChange(of: scenePhase) { _, phase in
             guard phase == .background else { return }
@@ -1389,6 +1406,59 @@ private struct ComposerSurface: View {
         self.selection = TextSelection(
             insertionPoint: text.index(text.startIndex, offsetBy: offset + 1)
         )
+    }
+}
+
+private struct ReferenceSuggestionsPopup: View {
+    @Environment(\.horusPalette) private var palette
+    let suggestions: ReferenceSuggestions
+    let select: (MountedReference) -> Void
+
+    private var height: CGFloat {
+        min(CGFloat(suggestions.matches.count) * 48 + 12, 252)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                ForEach(suggestions.matches) { mounted in
+                    Button { select(mounted) } label: {
+                        HStack(spacing: 10) {
+                            Text(String(mounted.reference.trigger))
+                                .font(HorusStyle.controlFont.monospaced().weight(.semibold))
+                                .foregroundStyle(palette.accent)
+                                .frame(width: 18, alignment: .center)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(mounted.reference.value)
+                                    .font(HorusStyle.controlFont)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Text(mounted.reference.description)
+                                    .font(HorusStyle.metadataFont)
+                                    .foregroundStyle(palette.muted)
+                                    .lineLimit(1)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .frame(height: 48)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.horusPlain)
+                    .help(mounted.reference.description)
+                    .accessibilityLabel(mounted.label)
+                    .accessibilityHint(mounted.reference.description)
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .scrollIndicators(.hidden)
+        .frame(height: height)
+        .background(palette.panel, in: HorusStyle.tileShape)
+        .horusGlass(in: HorusStyle.tileShape)
+        .shadow(color: .black.opacity(0.2), radius: 16, y: 8)
+        .offset(y: -height - 8)
     }
 }
 

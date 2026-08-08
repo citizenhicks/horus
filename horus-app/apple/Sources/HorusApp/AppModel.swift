@@ -419,9 +419,20 @@ struct MountedWidget: Identifiable, Sendable {
 struct MountedReference: Identifiable, Sendable {
     let capability: String
     let reference: FrontendReference
+    let replacement: String
+
+    init(
+        capability: String,
+        reference: FrontendReference,
+        replacement: String? = nil
+    ) {
+        self.capability = capability
+        self.reference = reference
+        self.replacement = replacement ?? "\(reference.trigger)\(reference.value)"
+    }
 
     var id: String { "\(capability)\u{0}\(reference.trigger)\u{0}\(reference.value)" }
-    var replacement: String { "\(reference.trigger)\(reference.value)" }
+    var label: String { "\(reference.trigger)\(reference.value)" }
 }
 
 struct MiddlewareContributionCount: Identifiable, Equatable, Sendable {
@@ -438,6 +449,18 @@ private enum ConfigurationTarget {
 struct ReferenceSuggestions {
     let range: Range<String.Index>
     let matches: [MountedReference]
+}
+
+private struct ReferenceMatchScore: Comparable {
+    let tier: Int
+    let gaps: Int
+    let length: Int
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        if lhs.tier != rhs.tier { return lhs.tier < rhs.tier }
+        if lhs.gaps != rhs.gaps { return lhs.gaps < rhs.gaps }
+        return lhs.length < rhs.length
+    }
 }
 
 struct PreviewBlock: Identifiable, Sendable {
@@ -480,6 +503,9 @@ final class AppModel {
         return source.count > visibleTranscriptLimit
             ? Array(source.suffix(visibleTranscriptLimit))
             : source
+    }
+    var isLoadingTranscript: Bool {
+        connectionState == .loading && (sessionRequestID != nil || replayRequestID != nil)
     }
     private(set) var isLoadingEarlierHistory = false
     var hasEarlierHistory: Bool {
@@ -912,16 +938,98 @@ final class AppModel {
         let start = text[..<cursor].lastIndex(where: { $0.isWhitespace })
             .map { text.index(after: $0) } ?? text.startIndex
         guard start < cursor, let trigger = text[start..<cursor].first else { return nil }
+        let end = text[cursor...].firstIndex(where: { $0.isWhitespace }) ?? text.endIndex
         let queryStart = text.index(after: start)
-        let query = text[queryStart..<cursor]
-        let matches = capabilityReferences
-            .filter {
-                $0.reference.trigger == trigger
-                    && (query.isEmpty || $0.reference.value.localizedCaseInsensitiveContains(query))
+        let query = String(text[queryStart..<end]).lowercased()
+        let capabilityMatches = capabilityReferences.filter { $0.reference.trigger == trigger }
+        var matches: [MountedReference]
+
+        if query.isEmpty {
+            matches = Array(capabilityMatches.prefix(8))
+            if trigger == "@", matches.count < 8 {
+                matches.append(contentsOf: workspaceFiles.prefix(8 - matches.count).map {
+                    workspaceReference($0)
+                })
             }
-            .prefix(8)
+        } else {
+            var ranked: [(score: ReferenceMatchScore, reference: MountedReference)] = []
+            func consider(_ reference: MountedReference) {
+                guard let score = referenceScore(reference.reference.value, query: query) else {
+                    return
+                }
+                let index = ranked.firstIndex {
+                    score < $0.score
+                        || (score == $0.score
+                            && reference.reference.value < $0.reference.reference.value)
+                } ?? ranked.endIndex
+                guard index < 8 else { return }
+                ranked.insert((score, reference), at: index)
+                if ranked.count > 8 { ranked.removeLast() }
+            }
+            capabilityMatches.forEach(consider)
+            if trigger == "@" {
+                workspaceFiles.lazy.map(workspaceReference).forEach(consider)
+            }
+            matches = ranked.map { $0.reference }
+        }
         guard !matches.isEmpty else { return nil }
-        return ReferenceSuggestions(range: start..<cursor, matches: Array(matches))
+        return ReferenceSuggestions(range: start..<end, matches: matches)
+    }
+
+    private func workspaceReference(_ file: WorkspaceFileRecord) -> MountedReference {
+        MountedReference(
+            capability: "workspace-files",
+            reference: FrontendReference(trigger: "@", value: file.path, description: "file"),
+            replacement: file.path.contains(where: \Character.isWhitespace)
+                && !file.path.contains("\"")
+                ? "\"\(file.path)\""
+                : file.path
+        )
+    }
+
+    private func referenceScore(_ value: String, query: String) -> ReferenceMatchScore? {
+        let value = value.lowercased()
+        let name = value.split(separator: "/").last.map(String.init) ?? value
+        let length = value.count
+        if name == query { return ReferenceMatchScore(tier: 0, gaps: 0, length: length) }
+        if name.hasPrefix(query) { return ReferenceMatchScore(tier: 1, gaps: 0, length: length) }
+        if value.hasPrefix(query) { return ReferenceMatchScore(tier: 2, gaps: 0, length: length) }
+        if let range = name.range(of: query) {
+            return ReferenceMatchScore(
+                tier: 3,
+                gaps: name.distance(from: name.startIndex, to: range.lowerBound),
+                length: length
+            )
+        }
+        if let range = value.range(of: query) {
+            return ReferenceMatchScore(
+                tier: 4,
+                gaps: value.distance(from: value.startIndex, to: range.lowerBound),
+                length: length
+            )
+        }
+        if let gaps = subsequenceGaps(in: name, query: query) {
+            return ReferenceMatchScore(tier: 5, gaps: gaps, length: length)
+        }
+        return subsequenceGaps(in: value, query: query).map {
+            ReferenceMatchScore(tier: 6, gaps: $0, length: length)
+        }
+    }
+
+    private func subsequenceGaps(in value: String, query: String) -> Int? {
+        var searchStart = value.startIndex
+        var firstOffset: Int?
+        var lastOffset = 0
+        var count = 0
+        for wanted in query {
+            guard let index = value[searchStart...].firstIndex(of: wanted) else { return nil }
+            let offset = value.distance(from: value.startIndex, to: index)
+            if firstOffset == nil { firstOffset = offset }
+            lastOffset = offset
+            count += 1
+            searchStart = value.index(after: index)
+        }
+        return lastOffset + 1 - (firstOffset ?? 0) - count
     }
 
     func start() {
@@ -1286,10 +1394,6 @@ final class AppModel {
 
     private func refreshWorkspaceChanges() {
         refreshGitDiff()
-        guard showsInspector,
-              inspectorPage == .changes,
-              workspaceFileScope == .all
-        else { return }
         refreshWorkspaceFiles()
     }
 
@@ -1308,9 +1412,6 @@ final class AppModel {
     func selectWorkspaceFileScope(_ scope: WorkspaceFileScope) {
         guard workspaceFileScope != scope else { return }
         workspaceFileScope = scope
-        workspaceFiles = []
-        workspaceFilesRequestID = nil
-        isLoadingWorkspaceFiles = false
         if scope == .modified {
             refreshGitDiff()
         } else {
@@ -1319,8 +1420,7 @@ final class AppModel {
     }
 
     private func refreshWorkspaceFiles() {
-        guard workspaceFileScope == .all,
-              connectionState.isReady,
+        guard connectionState.isReady,
               let sessionID = selectedSessionID
         else { return }
         let id = requestID("workspace-files")
@@ -1329,7 +1429,7 @@ final class AppModel {
         transmit(.listWorkspaceFiles(
             requestID: id,
             sessionID: sessionID,
-            scope: workspaceFileScope
+            scope: .all
         )) { [weak self] _ in
             guard self?.workspaceFilesRequestID == id else { return }
             self?.workspaceFilesRequestID = nil

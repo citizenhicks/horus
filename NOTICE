@@ -47,6 +47,11 @@ The Apple client uses HighlightSwift (https://github.com/appstefan/HighlightSwif
 licensed under the MIT License reproduced above.
 Copyright (c) 2023 Stefan Britton
 
+The Horus logo is adapted from the Composing preset in thinking-orbs
+(https://github.com/Jakubantalik/thinking-orbs), licensed under the MIT License
+reproduced above.
+Copyright (c) 2026 Jakub Antalik
+
 HighlightSwift bundles highlight.js (https://highlightjs.org), licensed under
 the BSD 3-Clause License:
 
