@@ -60,6 +60,13 @@ struct AppShell: View {
                 AppToastOverlay().zIndex(10)
             }
         }
+        .quickLookPreview($model.previewURL)
+        .sheet(item: $model.textFilePreview, onDismiss: model.discardAttachmentPreview) { preview in
+            TextFilePreviewView(preview: preview)
+        }
+        .onChange(of: model.previewURL) { oldValue, newValue in
+            if oldValue != nil, newValue == nil { model.discardAttachmentPreview() }
+        }
         .preferredColorScheme(preferredColorScheme)
         .onChange(of: chatIsVisible, initial: true) { _, visible in
             model.setChatVisible(visible)
@@ -451,19 +458,9 @@ private struct DirectoryBrowserHeader: View {
 }
 
 private struct ArtifactInspector: View {
-    @Environment(AppModel.self) private var model
-
     var body: some View {
-        @Bindable var model = model
         ArtifactView()
             .inspectorColumnWidth(min: 320, ideal: 520, max: 840)
-            .quickLookPreview($model.previewURL)
-            .sheet(item: $model.textFilePreview, onDismiss: model.discardAttachmentPreview) { preview in
-                TextFilePreviewView(preview: preview)
-            }
-            .onChange(of: model.previewURL) { oldValue, newValue in
-                if oldValue != nil, newValue == nil { model.discardAttachmentPreview() }
-            }
     }
 }
 
