@@ -372,6 +372,7 @@ final class TranscriptEntry: Identifiable {
     enum Kind: String, Codable, Sendable {
         case user
         case assistant
+        case commentary
         case reasoning
         case event
         case error
@@ -847,8 +848,6 @@ final class AppModel {
 
     var canOpenSession: Bool {
         connectionState.isReady
-            && activeTurnID == nil
-            && pendingApproval == nil
             && pendingDrafts.isEmpty
             && sessionRequestID == nil
             && sessionMutationRequestID == nil
@@ -861,6 +860,10 @@ final class AppModel {
     }
 
     var canCreateSession: Bool { canOpenSession }
+
+    var canModifySelectedSession: Bool {
+        canOpenSession && activeTurnID == nil && pendingApproval == nil
+    }
 
     var isSwitchingGitBranch: Bool { gitBranchRequestID != nil }
 
@@ -1571,7 +1574,7 @@ final class AppModel {
     }
 
     func switchGitBranch(to branch: String) {
-        guard canOpenSession,
+        guard canModifySelectedSession,
               let sessionID = selectedSessionID,
               let gitStatus,
               branch != gitStatus.currentBranch,
@@ -3297,10 +3300,11 @@ final class AppModel {
         case "agent_message_content_delta":
             let phase = event.msg["phase"]?.stringValue
             guard let itemID = event.msg["itemId"]?.stringValue else { return }
+            let commentary = phase == "commentary"
             appendStream(
-                id: itemID,
+                id: commentary ? "commentary-\(itemID)" : itemID,
                 delta: event.msg["delta"]?.stringValue ?? "",
-                kind: phase == "commentary" ? .event : .assistant
+                kind: commentary ? .commentary : .assistant
             )
         case "agent_reasoning_content_delta":
             guard let itemID = event.msg["itemId"]?.stringValue else { return }
@@ -3311,7 +3315,7 @@ final class AppModel {
             )
         case "agent_message":
             let phase = event.msg["phase"]?.stringValue
-            let kind: TranscriptEntry.Kind = phase == "commentary" ? .event : .assistant
+            let kind: TranscriptEntry.Kind = phase == "commentary" ? .commentary : .assistant
             if wasRendered {
                 transcript.removeAll { $0.pending && $0.kind == kind }
             } else {
@@ -3799,10 +3803,13 @@ final class AppModel {
         case "agent_message_content_delta", "agent_reasoning_content_delta":
             guard let itemID = event["itemId"]?.stringValue else { return }
             let reasoning = type == "agent_reasoning_content_delta"
-            let id = reasoning ? "reasoning-\(itemID)" : itemID
+            let commentary = event["phase"]?.stringValue == "commentary"
+            let id = reasoning
+                ? "reasoning-\(itemID)"
+                : (commentary ? "commentary-\(itemID)" : itemID)
             let kind: TranscriptEntry.Kind = reasoning
                 ? .reasoning
-                : (event["phase"]?.stringValue == "commentary" ? .event : .assistant)
+                : (commentary ? .commentary : .assistant)
             let delta = event["delta"]?.stringValue ?? ""
             guard !delta.isEmpty else { return }
             if let index = entries.lastIndex(where: { $0.id == id }) {
@@ -3819,7 +3826,7 @@ final class AppModel {
             }
         case "agent_message":
             let kind: TranscriptEntry.Kind = event["phase"]?.stringValue == "commentary"
-                ? .event
+                ? .commentary
                 : .assistant
             if wasRendered {
                 entries.removeAll { $0.pending && $0.kind == kind }

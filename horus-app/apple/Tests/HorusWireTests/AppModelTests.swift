@@ -446,6 +446,88 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(model.transcript.first).pending)
     }
 
+    func testCommentaryAndFinalAnswerRemainSeparateAssistantMessages() throws {
+        let model = try model()
+
+        for (phase, delta) in [("commentary", "Checking **the workspace**"), ("final_answer", "Done")] {
+            model.reduce(
+                event: AgentEventRecord(submissionId: nil, msg: .object([
+                    "type": .string("agent_message_content_delta"),
+                    "itemId": .string("response-1"),
+                    "phase": .string(phase),
+                    "delta": .string(delta)
+                ])),
+                blocks: [],
+                preview: nil
+            )
+        }
+
+        for (phase, message) in [("commentary", "Checking **the workspace**"), ("final_answer", "Done")] {
+            model.reduce(
+                event: AgentEventRecord(submissionId: nil, msg: .object([
+                    "type": .string("agent_message"),
+                    "phase": .string(phase),
+                    "message": .string(message)
+                ])),
+                blocks: [],
+                preview: nil
+            )
+        }
+
+        XCTAssertEqual(model.transcript.map(\.text), ["Checking **the workspace**", "Done"])
+        XCTAssertEqual(model.transcript.map(\.kind), [.commentary, .assistant])
+        XCTAssertTrue(model.transcript.allSatisfy { !$0.pending })
+    }
+
+    func testActiveRunAllowsSessionNavigationButNotSelectedSessionMutation() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.activeTurnID = "turn-1"
+        model.pendingApproval = PendingApproval(
+            id: "approval-1",
+            reason: "Approve this tool?",
+            calls: []
+        )
+        model.gitStatus = GitStatus(currentBranch: "main", branches: ["feature", "main"])
+
+        XCTAssertTrue(model.canOpenSession)
+        XCTAssertTrue(model.canCreateSession)
+        XCTAssertFalse(model.canModifySelectedSession)
+
+        model.switchGitBranch(to: "feature")
+        model.openSession("chat-2")
+        try await Task.sleep(for: .milliseconds(30))
+
+        let requests = await recorder.requests()
+        XCTAssertFalse(requests.contains { request in
+            if case .switchGitBranch = request { return true }
+            return false
+        })
+        XCTAssertTrue(requests.contains { request in
+            guard case .openSession(_, "chat-2", _, _) = request else { return false }
+            return true
+        })
+    }
+
+    func testActiveRunAllowsCreatingAnotherSession() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.activeTurnID = "turn-1"
+
+        model.chooseWorkspace("/srv/another-project")
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        XCTAssertTrue(requests.contains { request in
+            guard case .createSession(_, "/srv/another-project") = request else { return false }
+            return true
+        })
+    }
+
     func testTaskCompleteFlushesPendingReasoning() throws {
         let model = try model()
 
@@ -3460,6 +3542,11 @@ final class AppModelTests: XCTestCase {
             ]), blocks: []),
             RenderedEventRecord(event: .object([
                 "type": .string("agent_message"),
+                "phase": .string("commentary"),
+                "message": .string("Earlier update")
+            ]), blocks: []),
+            RenderedEventRecord(event: .object([
+                "type": .string("agent_message"),
                 "message": .string("Older answer")
             ]), blocks: []),
         ]
@@ -3480,7 +3567,11 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(
             model.displayedTranscript.map(\.text),
-            ["Older question", "Older answer", "Current"]
+            ["Older question", "Earlier update", "Older answer", "Current"]
+        )
+        XCTAssertEqual(
+            model.displayedTranscript.map(\.kind),
+            [.user, .commentary, .assistant, .assistant]
         )
         XCTAssertEqual(model.selectedModelRoute, "current-route")
         XCTAssertFalse(model.hasEarlierHistory)

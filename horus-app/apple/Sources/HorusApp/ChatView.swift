@@ -119,7 +119,7 @@ private struct ChatOptionsMenu: View {
                             systemImage: "arrow.trianglehead.branch"
                         )
                     }
-                    .disabled(model.isSwitchingGitBranch || !model.canOpenSession)
+                    .disabled(model.isSwitchingGitBranch || !model.canModifySelectedSession)
                 }
                 Button { model.showFiles() } label: {
                     HorusPlatformMenuLabel(
@@ -161,7 +161,7 @@ private struct ChatOptionsMenu: View {
                         systemImage: "calendar.badge.clock"
                     )
                 }
-                .disabled(!model.canOpenSession || model.selectedSessionID == nil)
+                .disabled(!model.canModifySelectedSession || model.selectedSessionID == nil)
                 Button {
                     model.openWorkspaceBrowser()
                 } label: {
@@ -449,7 +449,7 @@ private struct TranscriptRow: View {
                 Spacer(minLength: 42)
                 UserMessageContent(entry: entry)
             }
-        case .assistant:
+        case .assistant, .commentary:
             VStack(alignment: .leading, spacing: 6) {
                 TranscriptFileCards(files: entry.files)
                 if !entry.text.isEmpty {
@@ -482,7 +482,7 @@ private struct TranscriptRow: View {
                     ) {
                         model.submitMessageAction(widget, target: target)
                     }
-                    .disabled(!model.canOpenSession)
+                    .disabled(!model.canModifySelectedSession)
                 }
             }
         }
@@ -497,7 +497,7 @@ private struct TranscriptRow: View {
                     Button(widget.widget.text, glyph: messageActionGlyph(widget)) {
                         model.submitMessageAction(widget, target: target)
                     }
-                    .disabled(!model.canOpenSession)
+                    .disabled(!model.canModifySelectedSession)
                 }
             }
         }
@@ -508,19 +508,23 @@ private struct TranscriptRow: View {
     }
 
     private var hasMessageActions: Bool {
-        entry.kind == .user || entry.kind == .assistant
+        entry.kind == .user || isAssistantMessage
     }
 
     private var hasInlineControls: Bool {
         #if os(macOS)
         true
         #else
-        entry.kind == .assistant
+        isAssistantMessage
         #endif
     }
 
     private var inlineControlsVisible: Bool {
-        entry.kind == .assistant || isHovered
+        isAssistantMessage || isHovered
+    }
+
+    private var isAssistantMessage: Bool {
+        entry.kind == .assistant || entry.kind == .commentary
     }
 
     private var actionAlignment: HorizontalAlignment {
