@@ -1,13 +1,13 @@
 ## Highlights
 
-- Bundles `horus-gateway` 0.6.13 and `horus` 0.6.11 with durable transcript markers for context
+- Bundles `horus-gateway` 0.6.14 and `horus` 0.6.11 with durable transcript markers for context
   compaction.
 
 ## Install or upgrade
 
 ```sh
 horus-gateway exit
-cargo install --force --locked horus-cli --version 0.6.13
+cargo install --force --locked horus-cli --version 0.6.14
 horus-gateway serve --background
 ```
 
