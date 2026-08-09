@@ -25,7 +25,25 @@ fn responses_input_strips_only_top_level_provider_metadata() {
             "type": "reasoning",
             "encrypted_content": "opaque",
             "format": "openai-responses-v1",
+            "status": "completed",
             "summary": []
+        }),
+        serde_json::json!({
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "inspect",
+            "arguments": "{}",
+            "status": "completed"
+        }),
+        serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "done"}]
+        }),
+        serde_json::json!({
+            "type": "web_search_call",
+            "status": "completed"
         }),
     ];
 
@@ -41,6 +59,21 @@ fn responses_input_strips_only_top_level_provider_metadata() {
                 "encrypted_content": "opaque",
                 "summary": []
             }),
+            serde_json::json!({
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "inspect",
+                "arguments": "{}"
+            }),
+            serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            }),
+            serde_json::json!({
+                "type": "web_search_call",
+                "status": "completed"
+            }),
         ]
     );
 }
@@ -51,12 +84,14 @@ fn responses_decode_strips_reasoning_wire_metadata() {
         "output": [{
             "type": "reasoning",
             "format": "openai-responses-v1",
+            "status": "completed",
             "summary": [{"type": "summary_text", "text": "Plan."}]
         }]
     }))
     .expect("decode response");
 
     assert_eq!(decoded.output()[0].get("format"), None);
+    assert_eq!(decoded.output()[0].get("status"), None);
     assert_eq!(decoded.output()[0][REPLAY_REASONING_FIELD], "Plan.");
 }
 

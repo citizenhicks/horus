@@ -128,6 +128,9 @@ pub(crate) async fn assemble(
     };
     metadata.extend(chat.metadata()?);
     let workspace = chat.workspace_info();
+    let max_model_steps = usize::try_from(chat.agent.config.max_model_steps).map_err(|_| {
+        Error::Config("maximum model steps exceed this platform's supported range".into())
+    })?;
     let mut agent_config = AgentConfig::new(
         models,
         sandbox,
@@ -136,6 +139,7 @@ pub(crate) async fn assemble(
         chat.agent.config.system_prompt.clone(),
     )
     .context_window(context_window)
+    .max_model_steps(max_model_steps)
     .metadata(metadata)
     .session_context(SessionContext {
         user_name: local_user_name(),

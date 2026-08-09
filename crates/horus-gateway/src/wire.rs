@@ -45,7 +45,7 @@ mod base64_bytes {
 }
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 21;
+pub const PROTOCOL_VERSION: u16 = 22;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -637,6 +637,7 @@ pub struct AgentComposition {
     pub provider: ProviderConfig,
     pub middleware: MiddlewareConfig,
     pub system_prompt: String,
+    pub max_model_steps: u64,
 }
 
 /// Provider and model settings. Credentials are resolved only on the gateway host.
@@ -1728,7 +1729,8 @@ mod tests {
                                 "context_offloading": {"stale_after_tokens": 50000}
                             }
                         },
-                        "system_prompt": "test"
+                        "system_prompt": "test",
+                        "max_model_steps": 256
                     }
                 }
             }

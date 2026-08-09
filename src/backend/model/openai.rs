@@ -325,7 +325,7 @@ pub(super) fn wire_input(input: &[Value], allow_images: bool) -> Result<Vec<Valu
         if let Some(fields) = item.as_object_mut() {
             fields.retain(|name, _| !name.starts_with('_'));
         }
-        strip_reasoning_wire_metadata(item);
+        strip_replay_wire_metadata(item);
         let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
@@ -570,7 +570,7 @@ pub(super) fn decode_response(response: Value) -> Result<ModelOutput> {
         .cloned()
         .ok_or_else(|| Error::Provider("response omitted output".into()))?;
     for item in &mut output {
-        strip_reasoning_wire_metadata(item);
+        strip_replay_wire_metadata(item);
         if item.get("type").and_then(Value::as_str) != Some("reasoning") {
             continue;
         }
@@ -596,11 +596,18 @@ pub(super) fn decode_response(response: Value) -> Result<ModelOutput> {
     ModelOutput::from_output(output, end_turn, decode_usage(response.get("usage"))?)
 }
 
-fn strip_reasoning_wire_metadata(item: &mut Value) {
-    if item.get("type").and_then(Value::as_str) == Some("reasoning")
-        && let Some(fields) = item.as_object_mut()
-    {
+fn strip_replay_wire_metadata(item: &mut Value) {
+    let item_type = item.get("type").and_then(Value::as_str);
+    let strip_format = item_type == Some("reasoning");
+    let strip_status = matches!(item_type, Some("message" | "reasoning" | "function_call"));
+    let Some(fields) = item.as_object_mut() else {
+        return;
+    };
+    if strip_format {
         fields.remove("format");
+    }
+    if strip_status {
+        fields.remove("status");
     }
 }
 

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use horus::agent::DEFAULT_MAX_MODEL_STEPS;
 use horus::backend::model::provider::{
     ProviderAuth, ProviderDefinition, default_provider, provider,
 };
@@ -25,8 +26,8 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 12;
-const CHAT_SPEC_VERSION: u32 = 5;
+const CONFIG_VERSION: u32 = 13;
+const CHAT_SPEC_VERSION: u32 = 6;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
 const CLOUDFLARE_TOKEN_FILE: &str = "cloudflare-token";
@@ -150,6 +151,7 @@ impl Default for AgentComposition {
             },
             middleware: crate::middleware_manifest::default_config(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
+            max_model_steps: DEFAULT_MAX_MODEL_STEPS as u64,
         }
     }
 }
@@ -814,6 +816,9 @@ pub fn load_cloudflare_token(path: &Path) -> Result<String> {
 
 /// Validates the complete frontend-writable agent composition.
 pub fn validate_agent_composition(config: &AgentComposition) -> Result<()> {
+    if config.max_model_steps == 0 {
+        return Err(Error::Config("maximum model steps must be positive".into()));
+    }
     if config.system_prompt.trim().is_empty()
         || config.system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES
     {
@@ -1275,22 +1280,22 @@ mod tests {
     }
 
     #[test]
-    fn gateway_config_rejects_v11_without_migration() {
+    fn gateway_config_rejects_v12_without_migration() {
         let root = tempfile::tempdir().expect("temporary directory");
         let state = root.path().join("state");
         ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
         let path = state.join(CONFIG_FILE);
         let contents = fs::read_to_string(&path)
             .expect("read gateway config")
-            .replacen("version = 12", "version = 11", 1);
-        fs::write(&path, contents).expect("write v11 config");
+            .replacen("version = 13", "version = 12", 1);
+        fs::write(&path, contents).expect("write v12 config");
 
-        let error = ConfigStore::open(state).expect_err("v11 must be rejected");
+        let error = ConfigStore::open(state).expect_err("v12 must be rejected");
 
         assert!(
             error
                 .to_string()
-                .contains("unsupported gateway config version 11")
+                .contains("unsupported gateway config version 12")
         );
     }
 
@@ -1320,7 +1325,8 @@ mod tests {
         let contents = fs::read_to_string(state.join(CONFIG_FILE)).expect("read config");
         let (_, restored) = ConfigStore::open(state).expect("open config");
 
-        assert!(contents.starts_with("version = 12"));
+        assert!(contents.starts_with("version = 13"));
+        assert!(contents.contains("max_model_steps = 256"));
         assert!(contents.contains("[default_agent.config.middleware.settings.context_offloading]"));
         assert!(contents.contains("[default_agent.config.middleware.settings.sessions]"));
         assert_eq!(restored, config);
@@ -1904,6 +1910,28 @@ mod tests {
         let error = validate_agent_composition(&config).expect_err("empty prompt must fail");
 
         assert!(error.to_string().contains("system prompt"));
+    }
+
+    #[test]
+    fn agent_composition_requires_a_positive_model_step_limit() {
+        let config = AgentComposition {
+            max_model_steps: 0,
+            ..AgentComposition::default()
+        };
+
+        let error = validate_agent_composition(&config).expect_err("zero limit must fail");
+
+        assert!(error.to_string().contains("maximum model steps"));
+    }
+
+    #[test]
+    fn agent_composition_has_no_policy_upper_model_step_limit() {
+        let config = AgentComposition {
+            max_model_steps: u64::MAX,
+            ..AgentComposition::default()
+        };
+
+        validate_agent_composition(&config).expect("platform maximum must be accepted");
     }
 
     #[cfg(unix)]

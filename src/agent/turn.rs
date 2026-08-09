@@ -5,7 +5,6 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::COMMAND_QUEUE_CAPACITY;
-use super::MAX_MODEL_STEPS;
 use super::Runner;
 use super::input::ActiveTurnRouter;
 use super::input::Wait;
@@ -356,7 +355,8 @@ impl Runner {
         turn_id: String,
     ) -> Result<()> {
         let mut last_agent_message = None;
-        for model_step in 0..MAX_MODEL_STEPS {
+        let mut model_step = 0;
+        loop {
             if let Some(interrupt_submission_id) = self.drain_commands(commands, &turn_id).await? {
                 self.abort(
                     &interrupt_submission_id,
@@ -366,6 +366,12 @@ impl Runner {
                 )
                 .await?;
                 return Ok(());
+            }
+            if model_step >= self.config.max_model_steps {
+                return Err(Error::Stopped(format!(
+                    "turn reached the configured limit of {} model steps",
+                    self.config.max_model_steps
+                )));
             }
             let request_input = match self
                 .before_model_phase(commands, &submission_id, &turn_id, model_step)
@@ -439,6 +445,7 @@ impl Runner {
                 return Ok(());
             };
             after_model?;
+            model_step += 1;
             for event in after_model_events {
                 self.emit(&submission_id, event).await?;
             }
@@ -577,9 +584,6 @@ impl Runner {
             self.state.pending_approval = None;
             self.save().await?;
         }
-        Err(Error::Stopped(format!(
-            "model exceeded {MAX_MODEL_STEPS} tool steps"
-        )))
     }
 
     async fn drain_commands(

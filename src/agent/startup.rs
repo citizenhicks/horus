@@ -47,6 +47,9 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             "initial replay batch limit must be positive".into(),
         ));
     }
+    if config.max_model_steps == 0 {
+        return Err(Error::Config("maximum model steps must be positive".into()));
+    }
     config.middleware = config
         .middleware
         .with_sandbox(Arc::clone(&config.sandbox))?;

@@ -770,6 +770,19 @@ fn scripted_message(text: &str) -> ModelOutput {
     .expect("message output")
 }
 
+fn scripted_continuation(text: &str) -> ModelOutput {
+    ModelOutput::from_output(
+        vec![serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]
+        })],
+        false,
+        scripted_usage(),
+    )
+    .expect("continuation output")
+}
+
 fn auto_review_config(
     workspace: &Path,
     checkpoints: Arc<dyn CheckpointStore>,
@@ -979,6 +992,79 @@ async fn request_only_input_reaches_the_model_without_entering_the_checkpoint() 
             .context
             .iter()
             .all(|item| internal_message_kind(item) != Some("request_only"))
+    );
+}
+
+#[tokio::test]
+async fn configured_model_step_limit_stops_after_primary_model_calls() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let model = Arc::new(ScriptedModel {
+        outputs: Mutex::new(VecDeque::from([
+            scripted_continuation("one"),
+            scripted_continuation("two"),
+            scripted_message("unexpected"),
+        ])),
+        tool_counts: Mutex::new(Vec::new()),
+        inputs: Mutex::new(Vec::new()),
+    });
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints;
+    let config = AgentConfig::new(
+        Arc::new(ModelRouter::new("main", model.clone())),
+        Arc::new(Sandbox::new(
+            Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+            ApprovalPolicy::Ask,
+        )),
+        checkpoint_store,
+        MiddlewareStack::new(Vec::new()).expect("middleware"),
+        "test prompt",
+    )
+    .session_id("model-step-limit")
+    .max_model_steps(2);
+    let mut agent = create_agent(config).await.expect("create agent");
+    agent.next_event().await.expect("configured event");
+    agent.next_event().await.expect("sandbox widget");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "continue".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit input");
+    let message = loop {
+        if let EventMsg::Error(error) = agent.next_event().await.expect("agent event").msg {
+            break error.message;
+        }
+    };
+
+    assert_eq!(model.inputs.lock().expect("input lock").len(), 2);
+    assert_eq!(
+        message,
+        "agent stopped: turn reached the configured limit of 2 model steps"
+    );
+}
+
+#[tokio::test]
+async fn zero_model_step_limit_is_rejected_at_agent_creation() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let result = create_agent(
+        config(workspace.path(), checkpoints, "zero-model-step-limit").max_model_steps(0),
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("zero model-step limit must fail");
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "configuration error: maximum model steps must be positive"
     );
 }
 

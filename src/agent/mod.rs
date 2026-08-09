@@ -42,7 +42,6 @@ mod turn;
 
 pub use self::startup::create_agent;
 
-const MAX_MODEL_STEPS: usize = 64;
 const COMMAND_QUEUE_CAPACITY: usize = 64;
 const EVENT_QUEUE_CAPACITY: usize = 256;
 const MAX_DEFERRED_SUBMISSIONS: usize = 64;
@@ -50,6 +49,9 @@ const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
 const MAX_OPERATION_BYTES: usize = 256;
 const MAX_ATTACHMENT_REFERENCES: usize = 16;
 const DEFAULT_INITIAL_REPLAY_BATCHES: usize = 100;
+
+/// Default maximum number of primary model steps in one turn.
+pub const DEFAULT_MAX_MODEL_STEPS: usize = 256;
 
 /// Dependencies and policy for one agent session.
 #[derive(Clone)]
@@ -68,6 +70,7 @@ pub struct AgentConfig {
     metadata_configured: bool,
     model_route_configured: bool,
     initial_replay_batches: usize,
+    max_model_steps: usize,
 }
 
 impl AgentConfig {
@@ -96,6 +99,7 @@ impl AgentConfig {
             metadata_configured: false,
             model_route_configured: false,
             initial_replay_batches: DEFAULT_INITIAL_REPLAY_BATCHES,
+            max_model_steps: DEFAULT_MAX_MODEL_STEPS,
         }
     }
 
@@ -125,6 +129,13 @@ impl AgentConfig {
     #[must_use]
     pub fn initial_replay_batches(mut self, max_batches: usize) -> Self {
         self.initial_replay_batches = max_batches;
+        self
+    }
+
+    /// Sets the maximum number of primary model steps in one turn.
+    #[must_use]
+    pub fn max_model_steps(mut self, max_steps: usize) -> Self {
+        self.max_model_steps = max_steps;
         self
     }
 
