@@ -453,7 +453,7 @@ private struct TranscriptRow: View {
             VStack(alignment: .leading, spacing: 6) {
                 TranscriptFileCards(files: entry.files)
                 if !entry.text.isEmpty {
-                    MarkdownText(entry.text, streaming: entry.pending)
+                    HorusMarkdownText(entry.text, streaming: entry.pending)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -832,13 +832,18 @@ private struct ReasoningLine: View {
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 HorusIcon(.setup01, size: 13, foreground: palette.muted)
-                Text(entry.text)
+                HorusMarkdownText(
+                    entry.text,
+                    streaming: entry.pending,
+                    presentation: .text
+                )
                     .font(HorusStyle.bodyFont)
                     .foregroundStyle(palette.muted)
                     .multilineTextAlignment(.leading)
                     .lineLimit(isExpanded ? nil : 1)
                     .truncationMode(.tail)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .allowsHitTesting(false)
             }
             .frame(minHeight: 26)
             .contentShape(Rectangle())
@@ -950,17 +955,32 @@ private struct EventLine: View {
     }
 }
 
-private struct MarkdownText: View {
+private enum MarkdownPresentation {
+    case blocks
+    case text
+}
+
+private struct HorusMarkdownText: View {
     let text: String
     let streaming: Bool
+    let presentation: MarkdownPresentation
 
-    init(_ text: String, streaming: Bool) {
+    init(
+        _ text: String,
+        streaming: Bool,
+        presentation: MarkdownPresentation = .blocks
+    ) {
         self.text = text
         self.streaming = streaming
+        self.presentation = presentation
     }
 
     var body: some View {
-        StreamingMarkdown(text: normalizedText, streaming: streaming)
+        StreamingMarkdown(
+            text: normalizedText,
+            streaming: streaming,
+            presentation: presentation
+        )
             #if os(iOS)
             .markdownFontGroup(HorusMarkdownFonts())
             #endif
@@ -973,7 +993,8 @@ private struct MarkdownText: View {
     }
 
     private var normalizedText: String {
-        text.replacingOccurrences(
+        guard text.contains(#"\dots"#) else { return text }
+        return text.replacingOccurrences(
             of: #"\\dots\b"#,
             with: #"\\ldots"#,
             options: .regularExpression
@@ -985,16 +1006,23 @@ private struct StreamingMarkdown: View {
     @State private var source: StreamingMarkdownSource
     let text: String
     let streaming: Bool
+    let presentation: MarkdownPresentation
 
-    init(text: String, streaming: Bool) {
+    init(text: String, streaming: Bool, presentation: MarkdownPresentation) {
         self.text = text
         self.streaming = streaming
+        self.presentation = presentation
         _source = State(initialValue: StreamingMarkdownSource(text))
     }
 
     var body: some View {
         StreamingMarkdownReader(source) { parseResult in
-            MarkdownView(parseResult)
+            switch presentation {
+            case .blocks:
+                MarkdownView(parseResult)
+            case .text:
+                MarkdownText(parseResult)
+            }
         }
         .onChange(of: update, initial: true) { _, update in
             source.text = update.text
