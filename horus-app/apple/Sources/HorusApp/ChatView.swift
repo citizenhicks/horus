@@ -51,12 +51,32 @@ struct ChatView: View {
                 .zIndex(2)
             }
         }
-        .navigationTitle(model.displayedTranscript.isEmpty ? "new chat" : model.currentSessionTitle)
+        .navigationTitle(chatTitle)
+        #if os(macOS)
         .navigationSubtitle(chatSubtitle)
-        #if os(iOS)
+        #else
         .toolbarTitleDisplayMode(.inline)
         #endif
         .toolbar {
+            #if os(iOS)
+            // A system title cannot shimmer, and the on-device rename happens under the
+            // reader; a principal item is the same title in a view this app owns.
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 1) {
+                    Text(chatTitle)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .horusShimmer(active: isRetitling)
+                    if !chatSubtitle.isEmpty {
+                        Text(chatSubtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .accessibilityElement(children: .combine)
+            }
+            #endif
             ToolbarItem(placement: .primaryAction) {
                 inspectorButton
             }
@@ -80,6 +100,14 @@ struct ChatView: View {
     private var workspaceName: String {
         guard let path = model.workspace?.path else { return "" }
         return path.split { $0 == "/" || $0 == "\\" }.last.map(String.init) ?? path
+    }
+
+    private var chatTitle: String {
+        model.displayedTranscript.isEmpty ? "new chat" : model.currentSessionTitle
+    }
+
+    private var isRetitling: Bool {
+        model.retitledSessionID != nil && model.retitledSessionID == model.selectedSessionID
     }
 
     private var chatSubtitle: String {
@@ -242,15 +270,13 @@ private struct TranscriptView: View {
                     HStack {
                         Spacer()
                         Button(action: loadEarlierHistory) {
-                            if model.isLoadingEarlierHistory {
-                                HorusSpinner(size: 18, foreground: palette.accent)
-                            } else {
-                                HorusLabel(
-                                    title: "Load earlier messages",
-                                    glyph: .arrowUp,
-                                    iconColor: palette.accent
-                                )
-                            }
+                            HorusLabel(
+                                title: model.isLoadingEarlierHistory
+                                    ? "Loading earlier messages"
+                                    : "Load earlier messages",
+                                glyph: .arrowUp,
+                                iconColor: palette.accent
+                            )
                         }
                         .buttonStyle(.horusPlain)
                         .foregroundStyle(model.canLoadEarlierHistory ? palette.accent : palette.muted)

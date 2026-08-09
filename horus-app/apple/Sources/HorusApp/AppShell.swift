@@ -1010,6 +1010,7 @@ struct SidebarView: View {
                         .lineLimit(1)
                         .foregroundStyle(isSelected ? palette.accent : .primary)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .horusShimmer(active: model.retitledSessionID == session.sessionId)
                     SessionActivityIndicator(
                         state: session.activity.state,
                         isUnread: isUnread

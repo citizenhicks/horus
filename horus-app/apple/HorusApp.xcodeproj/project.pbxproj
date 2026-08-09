@@ -39,6 +39,16 @@
 		200000000000000000000020 /* WorkspaceDiffView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000019 /* WorkspaceDiffView.swift */; };
 		200000000000000000000021 /* UnifiedDiff.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000018 /* UnifiedDiff.swift */; };
 		200000000000000000000022 /* UnifiedDiffTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000001A /* UnifiedDiffTests.swift */; };
+		200000000000000000000023 /* HorusActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000001B /* HorusActivityAttributes.swift */; };
+		200000000000000000000024 /* HorusActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000001B /* HorusActivityAttributes.swift */; };
+		200000000000000000000025 /* HorusActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000001B /* HorusActivityAttributes.swift */; };
+		200000000000000000000026 /* HorusWidgets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000001C /* HorusWidgets.swift */; };
+		200000000000000000000027 /* ComposingOrb.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000015 /* ComposingOrb.swift */; };
+		200000000000000000000028 /* LiveActivityController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000001F /* LiveActivityController.swift */; };
+		200000000000000000000029 /* HorusWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 10000000000000000000001E /* HorusWidgets.appex */; platformFilter = ios; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		20000000000000000000002A /* LiveActivityController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000001F /* LiveActivityController.swift */; };
+		20000000000000000000002B /* ChatTitleWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000020 /* ChatTitleWriter.swift */; };
+		20000000000000000000002C /* ChatTitleWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000020 /* ChatTitleWriter.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -48,6 +58,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = 400000000000000000000001;
 			remoteInfo = HorusApp;
+		};
+		900000000000000000000003 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 000000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 400000000000000000000003;
+			remoteInfo = HorusWidgets;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -78,6 +95,12 @@
 		100000000000000000000018 /* UnifiedDiff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedDiff.swift; sourceTree = "<group>"; };
 		100000000000000000000019 /* WorkspaceDiffView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceDiffView.swift; sourceTree = "<group>"; };
 		10000000000000000000001A /* UnifiedDiffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedDiffTests.swift; sourceTree = "<group>"; };
+		10000000000000000000001B /* HorusActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HorusActivityAttributes.swift; sourceTree = "<group>"; };
+		10000000000000000000001C /* HorusWidgets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HorusWidgets.swift; sourceTree = "<group>"; };
+		10000000000000000000001D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		10000000000000000000001E /* HorusWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = HorusWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		10000000000000000000001F /* LiveActivityController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityController.swift; sourceTree = "<group>"; };
+		100000000000000000000020 /* ChatTitleWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTitleWriter.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -95,6 +118,13 @@
 			buildActionMask = 2147483647;
 			files = (
 				20000000000000000000000E /* XCTest.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		300000000000000000000008 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -116,6 +146,7 @@
 			children = (
 				10000000000000000000000D /* Horus.app */,
 				10000000000000000000000E /* HorusWireTests.xctest */,
+				10000000000000000000001E /* HorusWidgets.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -124,6 +155,7 @@
 			isa = PBXGroup;
 			children = (
 				000000000000000000000005 /* HorusApp */,
+				000000000000000000000009 /* HorusWidgets */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -135,6 +167,7 @@
 				100000000000000000000002 /* AppShell.swift */,
 				100000000000000000000003 /* FilesView.swift */,
 				100000000000000000000004 /* ChatView.swift */,
+				100000000000000000000020 /* ChatTitleWriter.swift */,
 				100000000000000000000013 /* ComposerDictation.swift */,
 				100000000000000000000014 /* ComposerOptionsView.swift */,
 				100000000000000000000015 /* ComposingOrb.swift */,
@@ -143,6 +176,8 @@
 				100000000000000000000007 /* GatewayWire.swift */,
 				100000000000000000000008 /* HorusApp.swift */,
 				100000000000000000000009 /* HorusStyle.swift */,
+				10000000000000000000001B /* HorusActivityAttributes.swift */,
+				10000000000000000000001F /* LiveActivityController.swift */,
 				100000000000000000000016 /* ProfileView.swift */,
 				10000000000000000000000A /* SettingsViews.swift */,
 				100000000000000000000018 /* UnifiedDiff.swift */,
@@ -181,6 +216,15 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
+		000000000000000000000009 /* HorusWidgets */ = {
+			isa = PBXGroup;
+			children = (
+				10000000000000000000001C /* HorusWidgets.swift */,
+				10000000000000000000001D /* Info.plist */,
+			);
+			path = HorusWidgets;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -191,10 +235,12 @@
 				300000000000000000000002 /* Sources */,
 				300000000000000000000001 /* Frameworks */,
 				300000000000000000000003 /* Resources */,
+				30000000000000000000000A /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				900000000000000000000004 /* PBXTargetDependency */,
 			);
 			name = HorusApp;
 			packageProductDependencies = (
@@ -223,6 +269,23 @@
 			productReference = 10000000000000000000000E /* HorusWireTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		400000000000000000000003 /* HorusWidgets */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 600000000000000000000004 /* Build configuration list for PBXNativeTarget "HorusWidgets" */;
+			buildPhases = (
+				300000000000000000000007 /* Sources */,
+				300000000000000000000008 /* Frameworks */,
+				300000000000000000000009 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = HorusWidgets;
+			productName = HorusWidgets;
+			productReference = 10000000000000000000001E /* HorusWidgets.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -237,6 +300,9 @@
 						CreatedOnToolsVersion = 26.6;
 					};
 					400000000000000000000002 = {
+						CreatedOnToolsVersion = 26.6;
+					};
+					400000000000000000000003 = {
 						CreatedOnToolsVersion = 26.6;
 					};
 				};
@@ -260,9 +326,24 @@
 			targets = (
 				400000000000000000000001 /* HorusApp */,
 				400000000000000000000002 /* HorusWireTests */,
+				400000000000000000000003 /* HorusWidgets */,
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		30000000000000000000000A /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				200000000000000000000029 /* HorusWidgets.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXResourcesBuildPhase section */
 		300000000000000000000003 /* Resources */ = {
@@ -281,6 +362,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		300000000000000000000009 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -292,6 +380,7 @@
 				200000000000000000000002 /* AppShell.swift in Sources */,
 				200000000000000000000003 /* FilesView.swift in Sources */,
 				200000000000000000000004 /* ChatView.swift in Sources */,
+				20000000000000000000002B /* ChatTitleWriter.swift in Sources */,
 				200000000000000000000019 /* ComposerDictation.swift in Sources */,
 				20000000000000000000001A /* ComposerOptionsView.swift in Sources */,
 				20000000000000000000001B /* ComposingOrb.swift in Sources */,
@@ -300,6 +389,8 @@
 				200000000000000000000007 /* GatewayWire.swift in Sources */,
 				200000000000000000000008 /* HorusApp.swift in Sources */,
 				200000000000000000000009 /* HorusStyle.swift in Sources */,
+				200000000000000000000023 /* HorusActivityAttributes.swift in Sources */,
+				200000000000000000000028 /* LiveActivityController.swift in Sources */,
 				20000000000000000000001C /* ProfileView.swift in Sources */,
 				20000000000000000000000A /* SettingsViews.swift in Sources */,
 				20000000000000000000001F /* UnifiedDiff.swift in Sources */,
@@ -322,6 +413,19 @@
 				20000000000000000000000C /* GatewayWire.swift in Sources */,
 				20000000000000000000000D /* GatewayWireTests.swift in Sources */,
 				200000000000000000000018 /* HorusStyle.swift in Sources */,
+				200000000000000000000025 /* HorusActivityAttributes.swift in Sources */,
+				20000000000000000000002A /* LiveActivityController.swift in Sources */,
+				20000000000000000000002C /* ChatTitleWriter.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		300000000000000000000007 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				200000000000000000000024 /* HorusActivityAttributes.swift in Sources */,
+				200000000000000000000026 /* HorusWidgets.swift in Sources */,
+				200000000000000000000027 /* ComposingOrb.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -332,6 +436,12 @@
 			isa = PBXTargetDependency;
 			target = 400000000000000000000001 /* HorusApp */;
 			targetProxy = 900000000000000000000001 /* PBXContainerItemProxy */;
+		};
+		900000000000000000000004 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			platformFilter = ios;
+			target = 400000000000000000000003 /* HorusWidgets */;
+			targetProxy = 900000000000000000000003 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -434,7 +544,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 47;
+				CURRENT_PROJECT_VERSION = 48;
 				DEVELOPMENT_TEAM = 3T68GZFAR6;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -458,7 +568,7 @@
 					"@executable_path/Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 0.6.29;
+				MARKETING_VERSION = 0.6.30;
 				PRODUCT_BUNDLE_IDENTIFIER = app.horus.client;
 				PRODUCT_NAME = Horus;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
@@ -475,7 +585,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 47;
+				CURRENT_PROJECT_VERSION = 48;
 				DEVELOPMENT_TEAM = 3T68GZFAR6;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -498,7 +608,7 @@
 					"@executable_path/Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 0.6.29;
+				MARKETING_VERSION = 0.6.30;
 				PRODUCT_BUNDLE_IDENTIFIER = app.horus.client;
 				PRODUCT_NAME = Horus;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
@@ -550,6 +660,65 @@
 			};
 			name = Release;
 		};
+		500000000000000000000007 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 48;
+				DEVELOPMENT_TEAM = 3T68GZFAR6;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Sources/HorusWidgets/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Horus Chats";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 0.6.30;
+				PRODUCT_BUNDLE_IDENTIFIER = app.horus.client.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		500000000000000000000008 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 48;
+				DEVELOPMENT_TEAM = 3T68GZFAR6;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Sources/HorusWidgets/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Horus Chats";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 0.6.30;
+				PRODUCT_BUNDLE_IDENTIFIER = app.horus.client.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -576,6 +745,15 @@
 			buildConfigurations = (
 				500000000000000000000005 /* Debug */,
 				500000000000000000000006 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		600000000000000000000004 /* Build configuration list for PBXNativeTarget "HorusWidgets" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				500000000000000000000007 /* Debug */,
+				500000000000000000000008 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

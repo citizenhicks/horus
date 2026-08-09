@@ -209,6 +209,49 @@ struct HorusSpinner: View {
     }
 }
 
+/// A band of light crossing a label once, to mark text that just rewrote itself.
+///
+/// The chat title is renamed under the reader by the on-device model, and text that changes
+/// with no motion reads as a glitch rather than as a result. One pass, then nothing.
+private struct HorusShimmer: ViewModifier {
+    let active: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var phase: CGFloat = -1
+
+    func body(content: Content) -> some View {
+        content
+            .overlay {
+                if active, !reduceMotion {
+                    GeometryReader { proxy in
+                        LinearGradient(
+                            colors: [.clear, .white.opacity(0.9), .clear],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                        .frame(width: max(proxy.size.width * 0.45, 40))
+                        .offset(x: phase * (proxy.size.width + 80))
+                        .blendMode(.plusLighter)
+                    }
+                    // Masking by the same content keeps the light inside the glyphs.
+                    .mask(content)
+                    .allowsHitTesting(false)
+                }
+            }
+            .onChange(of: active, initial: true) { _, isActive in
+                guard isActive, !reduceMotion else { return }
+                phase = -1
+                withAnimation(.easeInOut(duration: 0.9)) { phase = 1 }
+            }
+    }
+}
+
+extension View {
+    /// Runs one shimmer pass over this view each time `active` turns true.
+    func horusShimmer(active: Bool) -> some View {
+        modifier(HorusShimmer(active: active))
+    }
+}
+
 struct HorusLabel: View {
     let title: String
     let glyph: HorusGlyph

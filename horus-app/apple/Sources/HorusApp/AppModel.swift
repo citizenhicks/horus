@@ -214,6 +214,71 @@ enum FilesInspectorTab: String, CaseIterable, Identifiable {
     var id: Self { self }
 }
 
+extension HorusChatSnapshot {
+    /// The chats the island surfaces, most pressing first: an approval blocks its run, a
+    /// running chat is live, and a finished chat nobody has read is the quietest of the
+    /// three. Ties break on recency.
+    static func live(
+        sessions: [SessionRecord],
+        unread: Set<String>,
+        limit: Int = 3
+    ) -> [HorusChatSnapshot] {
+        sessions
+            .compactMap { session -> (rank: Int, updatedAt: Int64, snapshot: HorusChatSnapshot)? in
+                let standing: Standing
+                switch session.activity.state {
+                case .awaitingApproval: standing = .awaitingApproval
+                case .running: standing = .running
+                case .idle:
+                    guard unread.contains(session.sessionId) else { return nil }
+                    standing = .unread
+                }
+                let rank = switch standing {
+                case .awaitingApproval: 0
+                case .running: 1
+                case .unread: 2
+                }
+                return (rank, session.updatedAt, HorusChatSnapshot(
+                    id: bounded(session.sessionId, utf8Limit: 96),
+                    title: shortTitle(
+                        session.title ?? session.firstUserMessage ?? "New chat"
+                    ),
+                    workspace: shortWorkspace(session.sessionContext.workspaceLabel),
+                    tokens: session.executionStats.usage.totalTokens,
+                    startedAt: session.activity.startedAt.map {
+                        Date(timeIntervalSince1970: TimeInterval($0))
+                    },
+                    standing: standing
+                ))
+            }
+            .sorted {
+                $0.rank == $1.rank
+                    ? $0.updatedAt > $1.updatedAt
+                    : $0.rank < $1.rank
+            }
+            .prefix(max(0, limit))
+            .map(\.snapshot)
+    }
+
+    /// Everything running, and everything waiting on the reader — including the chats that
+    /// did not fit in the list.
+    static func tallies(
+        sessions: [SessionRecord],
+        unread: Set<String>
+    ) -> (running: Int, attention: Int) {
+        var running = 0
+        var attention = 0
+        for session in sessions {
+            switch session.activity.state {
+            case .running: running += 1
+            case .awaitingApproval: attention += 1
+            case .idle: if unread.contains(session.sessionId) { attention += 1 }
+            }
+        }
+        return (running, attention)
+    }
+}
+
 /// One entry in the workspace file tree. `children` is nil for a file, which is how
 /// `List(children:)` decides a row gets no disclosure control.
 struct FileTreeNode: Identifiable, Hashable, Sendable {
@@ -573,6 +638,18 @@ struct FrontendPickerPrompt: Sendable {
     let options: [FrontendPickerOption]
 }
 
+private struct ChatTitleAttempt: Hashable {
+    let accountID: UUID
+    let sessionID: String
+    let prompt: String
+}
+
+private struct PendingChatTitleRename {
+    let attempt: ChatTitleAttempt
+    let requestID: String
+    let title: String
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -588,6 +665,17 @@ final class AppModel {
     }
     var sessions: [SessionRecord] = []
     var gatewayMachineName = ""
+    /// The chat the on-device model just renamed, for as long as its shimmer runs.
+    var retitledSessionID: String?
+    @ObservationIgnored private let titleWriter: ChatTitleWriter
+    @ObservationIgnored private var chatTitleTask: Task<Void, Never>?
+    @ObservationIgnored private var retitleAnimationTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingChatTitleSessionID: String?
+    @ObservationIgnored private var attemptedChatTitle: ChatTitleAttempt?
+    @ObservationIgnored private var pendingChatTitleRename: PendingChatTitleRename?
+    #if os(iOS)
+    @ObservationIgnored private let liveActivity = LiveActivityController()
+    #endif
     var selectedSessionID: String?
     private(set) var unreadSessionIDs: Set<String> = []
     var transcript: [TranscriptEntry] = []
@@ -783,7 +871,8 @@ final class AppModel {
             @MainActor @Sendable (GatewayEndpoint) async throws
                 -> AsyncThrowingStream<GatewayEnvelope, Error>
         )? = nil,
-        reconnectDelay: (@Sendable (Int) -> Duration)? = nil
+        reconnectDelay: (@Sendable (Int) -> Duration)? = nil,
+        titleWriter: ChatTitleWriter? = nil
     ) {
         let client = client ?? GatewayClient()
         let store = store ?? GatewayStore()
@@ -793,6 +882,7 @@ final class AppModel {
         self.store = store
         self.settingsDefaults = settingsDefaults
         self.appLockAuthenticator = appLockAuthenticator
+        self.titleWriter = titleWriter ?? ChatTitleWriter()
         self.requestSender = requestSender ?? { request in
             try await client.send(request)
         }
@@ -840,6 +930,8 @@ final class AppModel {
         composerDraftSaveTask?.cancel()
         pairingCodeExpiryTask?.cancel()
         toastDismissTask?.cancel()
+        chatTitleTask?.cancel()
+        retitleAnimationTask?.cancel()
     }
 
     var selectedAccount: GatewayAccount? {
@@ -1013,9 +1105,130 @@ final class AppModel {
 
     func setChatVisible(_ visible: Bool) {
         isChatVisible = visible
-        if visible, let selectedSessionID {
-            unreadSessionIDs.remove(selectedSessionID)
+        if visible,
+           let selectedSessionID,
+           unreadSessionIDs.remove(selectedSessionID) != nil {
+            refreshLiveActivity()
         }
+    }
+
+    /// Gives a chat created by this client a short on-device title once its first message
+    /// reaches the catalogue. Historical chats are deliberately left alone.
+    private func renameUntitledChat() {
+        guard chatTitleTask == nil,
+              pendingChatTitleRename == nil,
+              sessionMutationRequestID == nil,
+              connectionState.isReady,
+              titleWriter.isAvailable,
+              let accountID = selectedAccountID,
+              let sessionID = pendingChatTitleSessionID,
+              sessionID == selectedSessionID,
+              let session = sessions.first(where: { $0.sessionId == sessionID })
+        else { return }
+        guard session.title == nil else {
+            pendingChatTitleSessionID = nil
+            return
+        }
+        let prompt = (session.firstUserMessage ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+        let attempt = ChatTitleAttempt(
+            accountID: accountID,
+            sessionID: sessionID,
+            prompt: prompt
+        )
+        guard attemptedChatTitle != attempt else { return }
+        attemptedChatTitle = attempt
+        let generation = connectionGeneration
+        let titleWriter = titleWriter
+        chatTitleTask = Task { [weak self] in
+            let title = await titleWriter.title(for: prompt)
+            guard let self else { return }
+            self.finishChatTitle(title, attempt: attempt, generation: generation)
+        }
+    }
+
+    private func finishChatTitle(
+        _ title: String?,
+        attempt: ChatTitleAttempt,
+        generation: UUID
+    ) {
+        chatTitleTask = nil
+        defer { renameUntitledChat() }
+        guard !Task.isCancelled, let title else { return }
+        guard connectionGeneration == generation,
+              selectedAccountID == attempt.accountID,
+              selectedSessionID == attempt.sessionID,
+              pendingChatTitleSessionID == attempt.sessionID,
+              connectionState.isReady,
+              sessionMutationRequestID == nil,
+              let current = sessions.first(where: { $0.sessionId == attempt.sessionID }),
+              current.title == nil,
+              current.firstUserMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+                == attempt.prompt
+        else {
+            if attemptedChatTitle == attempt { attemptedChatTitle = nil }
+            return
+        }
+        guard let requestID = renameSession(current, title: title) else {
+            if attemptedChatTitle == attempt { attemptedChatTitle = nil }
+            return
+        }
+        pendingChatTitleRename = PendingChatTitleRename(
+            attempt: attempt,
+            requestID: requestID,
+            title: title
+        )
+    }
+
+    private func reconcilePendingChatTitle() {
+        guard let pending = pendingChatTitleRename else { return }
+        guard pending.attempt.accountID == selectedAccountID,
+              let session = sessions.first(where: {
+                  $0.sessionId == pending.attempt.sessionID
+              })
+        else {
+            pendingChatTitleRename = nil
+            return
+        }
+        if session.title == pending.title {
+            pendingChatTitleRename = nil
+            pendingChatTitleSessionID = nil
+            retitleAnimationTask?.cancel()
+            retitledSessionID = session.sessionId
+            retitleAnimationTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(1.2))
+                guard !Task.isCancelled, let self else { return }
+                if retitledSessionID == session.sessionId { retitledSessionID = nil }
+            }
+        } else if session.title != nil {
+            pendingChatTitleRename = nil
+            pendingChatTitleSessionID = nil
+        } else if sessionMutationRequestID == nil {
+            // A transport failure cleared the mutation slot without changing the catalogue.
+            pendingChatTitleRename = nil
+            if attemptedChatTitle == pending.attempt { attemptedChatTitle = nil }
+        }
+    }
+
+    private func prepareChatTitle(for sessionID: String) {
+        chatTitleTask?.cancel()
+        chatTitleTask = nil
+        pendingChatTitleRename = nil
+        pendingChatTitleSessionID = sessionID
+        attemptedChatTitle = nil
+    }
+
+    /// Hands the current chat list to the Live Activity. Called wherever the list or the
+    /// unread set changes, since the island shows both.
+    private func refreshLiveActivity() {
+        #if os(iOS)
+        liveActivity.update(
+            sessions: sessions,
+            unread: unreadSessionIDs,
+            gateway: gatewayMachineName
+        )
+        #endif
     }
 
     var capabilityReferences: [MountedReference] {
@@ -1186,6 +1399,15 @@ final class AppModel {
 
     func applyPairingURL(_ url: URL) {
         prefillPairing { try GatewayPairingSetup(url: url) }
+    }
+
+    func handleOpenURL(_ url: URL) {
+        if url.scheme?.lowercased() == "horus",
+           url.host?.lowercased() == "chats" {
+            destination = .chat
+            return
+        }
+        applyPairingURL(url)
     }
 
     private func prefillPairing(_ parse: () throws -> GatewayPairingSetup) {
@@ -1484,10 +1706,11 @@ final class AppModel {
 
     // Renaming, pinning and deleting address a session by id, so they work on any chat in the
     // catalogue rather than only the open one.
-    func renameSession(_ session: SessionRecord, title: String) {
-        guard sessionMutationRequestID == nil else { return }
+    @discardableResult
+    func renameSession(_ session: SessionRecord, title: String) -> String? {
+        guard sessionMutationRequestID == nil else { return nil }
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty else { return }
+        guard !title.isEmpty else { return nil }
         let id = requestID("session-rename")
         sessionMutationRequestID = id
         transmit(.renameSession(
@@ -1497,6 +1720,7 @@ final class AppModel {
         )) { [weak self] _ in
             if self?.sessionMutationRequestID == id { self?.sessionMutationRequestID = nil }
         }
+        return id
     }
 
     func setSessionPinned(_ session: SessionRecord, pinned: Bool) {
@@ -2889,6 +3113,7 @@ final class AppModel {
         opened: Bool,
         replayRequestID: String? = nil
     ) {
+        let createdByThisClient = opened && isChangingWorkspace
         let cursor = sessionOpenCursor
         let cached = opened && sessionOpeningID == payload.session.sessionId
             ? pendingCachedTranscript
@@ -2932,7 +3157,11 @@ final class AppModel {
         isChangingWorkspace = false
         showsWorkspaceBrowser = false
         selectedSessionID = payload.session.sessionId
-        if isChatVisible { unreadSessionIDs.remove(payload.session.sessionId) }
+        if createdByThisClient { prepareChatTitle(for: payload.session.sessionId) }
+        if isChatVisible,
+           unreadSessionIDs.remove(payload.session.sessionId) != nil {
+            refreshLiveActivity()
+        }
         selectedModelRoute = payload.session.model.route
         modelContextWindow = payload.session.model.modelContextWindow
         contributions = payload.contributions
@@ -2966,6 +3195,7 @@ final class AppModel {
             applyState = .applied
             showToast("Agent configuration applied.", tone: .success)
         }
+        renameUntitledChat()
     }
 
     func applySessions(_ records: [SessionRecord]) {
@@ -2994,6 +3224,9 @@ final class AppModel {
         }
         let visible = Set(sessions.map(\.sessionId))
         unreadSessionIDs.formIntersection(visible)
+        reconcilePendingChatTitle()
+        refreshLiveActivity()
+        renameUntitledChat()
         guard let selectedSessionID,
               !sessions.contains(where: { $0.sessionId == selectedSessionID }),
               sessionRequestID == nil
@@ -3114,6 +3347,11 @@ final class AppModel {
         }
         if rejection.requestId == sessionMutationRequestID {
             pendingDeletedSessionID = nil
+            if pendingChatTitleRename?.requestID == rejection.requestId,
+               let attempt = pendingChatTitleRename?.attempt {
+                if attemptedChatTitle == attempt { attemptedChatTitle = nil }
+                pendingChatTitleRename = nil
+            }
         }
         if rejection.requestId == sessionRequestID,
            rejection.code == "replay_unavailable",
@@ -4885,6 +5123,11 @@ final class AppModel {
         pendingPresentedTranscript = nil
         sessionMutationRequestID = nil
         pendingDeletedSessionID = nil
+        chatTitleTask?.cancel()
+        chatTitleTask = nil
+        if pendingChatTitleRename == nil {
+            attemptedChatTitle = nil
+        }
         sessionToRestoreID = nil
         configRequestID = nil
         defaultConfigRequestID = nil
@@ -4914,6 +5157,12 @@ final class AppModel {
             gatewayMachineName = ""
             selectedSessionID = nil
             unreadSessionIDs.removeAll()
+            pendingChatTitleSessionID = nil
+            pendingChatTitleRename = nil
+            attemptedChatTitle = nil
+            retitleAnimationTask?.cancel()
+            retitleAnimationTask = nil
+            retitledSessionID = nil
             profile = nil
             modelChoices = []
             modelProviders = [:]
@@ -4936,6 +5185,7 @@ final class AppModel {
         pairingCodeInfo = nil
         pairingCode = ""
         pairingError = nil
+        if !preservingSession { refreshLiveActivity() }
         if !preservingSession { resetSessionState() }
         if preservingDrafts { restorePendingDrafts() }
         return connectionGeneration

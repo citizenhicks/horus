@@ -47,7 +47,8 @@ private actor GatewayConnectionHarness {
 @MainActor
 final class AppModelTests: XCTestCase {
     private func model(
-        requestSender: (@MainActor @Sendable (GatewayRequest) async throws -> Void)? = nil
+        requestSender: (@MainActor @Sendable (GatewayRequest) async throws -> Void)? = nil,
+        titleWriter: ChatTitleWriter? = nil
     ) throws -> AppModel {
         let suiteName = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -65,7 +66,8 @@ final class AppModelTests: XCTestCase {
                 method: { .unavailable },
                 authenticate: { _ in false }
             ),
-            requestSender: requestSender
+            requestSender: requestSender,
+            titleWriter: titleWriter
         )
     }
 
@@ -239,6 +241,28 @@ final class AppModelTests: XCTestCase {
         )
     }
 
+    private func openNewSession(
+        in model: AppModel,
+        recorder: GatewayRequestRecorder,
+        account: GatewayAccount,
+        sessionID: String = "chat-1"
+    ) async throws {
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+        model.chooseWorkspace("/srv/horus")
+        try await Task.sleep(for: .milliseconds(30))
+        let requests = await recorder.requests()
+        guard case .createSession(let requestID, _) = try XCTUnwrap(requests.last) else {
+            return XCTFail("Expected a create-session request")
+        }
+        model.handle(.sessionOpened(
+            requestID: requestID,
+            payload: sessionReady(latestSequence: 0, sessionID: sessionID)
+        ))
+        model.handle(.sessionReplayComplete(requestID: requestID, sessionID: sessionID))
+    }
+
     private func renderEvent(
         capability: String = "tools",
         id: String = "result",
@@ -282,7 +306,10 @@ final class AppModelTests: XCTestCase {
         turnID: String? = nil,
         executionStats: ExecutionStats = ExecutionStats(),
         createdAt: Int64 = 100,
-        updatedAt: Int64 = 100
+        updatedAt: Int64 = 100,
+        firstUserMessage: String? = "Review",
+        title: String? = nil,
+        workspaceLabel: String = "/srv/horus"
     ) -> SessionRecord {
         SessionRecord(
             sessionId: sessionID,
@@ -291,16 +318,16 @@ final class AppModelTests: XCTestCase {
                 userId: nil,
                 userName: nil,
                 workspaceId: "workspace-1",
-                workspaceLabel: "/srv/horus",
+                workspaceLabel: workspaceLabel,
                 originLabel: nil
             ),
             parentSessionId: nil,
             parentSequence: nil,
             sequence: 1,
             catalogVisible: true,
-            firstUserMessage: "Review",
+            firstUserMessage: firstUserMessage,
             executionStats: executionStats,
-            title: nil,
+            title: title,
             pinned: false,
             activity: SessionActivity(
                 state: state,
@@ -4291,6 +4318,211 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertNil(model.toast)
         XCTAssertEqual(model.transcript.last?.text, "Old error")
+    }
+
+    func testChatsDeepLinkDoesNotEnterPairing() throws {
+        let model = try model()
+        model.destination = .profile
+        model.showsPairing = false
+
+        model.handleOpenURL(try XCTUnwrap(URL(string: "horus://chats")))
+
+        XCTAssertEqual(model.destination, .chat)
+        XCTAssertNil(model.pairingError)
+        XCTAssertFalse(model.showsPairing)
+    }
+
+    func testDelayedGeneratedTitleDoesNotOverwriteAnExplicitRename() async throws {
+        let recorder = GatewayRequestRecorder()
+        let writer = ChatTitleWriter { _ in
+            try? await Task.sleep(for: .milliseconds(100))
+            return "Generated title"
+        }
+        let model = try model(
+            requestSender: { request in await recorder.record(request) },
+            titleWriter: writer
+        )
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        try await openNewSession(in: model, recorder: recorder, account: account)
+
+        model.applySessions([session(
+            state: .idle,
+            firstUserMessage: "Review the gateway"
+        )])
+        await Task.yield()
+        model.applySessions([session(
+            state: .idle,
+            firstUserMessage: "Review the gateway",
+            title: "Manual title"
+        )])
+        try await Task.sleep(for: .milliseconds(150))
+
+        let requests = await recorder.requests()
+        XCTAssertFalse(requests.contains {
+            if case .renameSession = $0 { return true }
+            return false
+        })
+        XCTAssertNil(model.retitledSessionID)
+    }
+
+    func testGeneratedTitleShimmersOnlyAfterCatalogConfirmation() async throws {
+        let recorder = GatewayRequestRecorder()
+        let writer = ChatTitleWriter { _ in "Generated title" }
+        let model = try model(
+            requestSender: { request in await recorder.record(request) },
+            titleWriter: writer
+        )
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        try await openNewSession(in: model, recorder: recorder, account: account)
+        let untitled = session(
+            state: .idle,
+            firstUserMessage: "Review the gateway"
+        )
+
+        model.applySessions([untitled])
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertNil(model.retitledSessionID)
+        let rename = await recorder.requests().first { request in
+            guard case .renameSession(_, "chat-1", "Generated title") = request else {
+                return false
+            }
+            return true
+        }
+        XCTAssertNotNil(rename)
+
+        model.applySessions([session(
+            state: .idle,
+            firstUserMessage: "Review the gateway",
+            title: "Generated title"
+        )])
+
+        XCTAssertEqual(model.retitledSessionID, "chat-1")
+    }
+}
+
+final class ChatTitleWriterTests: XCTestCase {
+    func testStripsTheDressingSmallModelsAddToTitles() {
+        XCTAssertEqual(ChatTitleWriter.cleaned("\"Fix the retry backoff\""), "Fix the retry backoff")
+        XCTAssertEqual(ChatTitleWriter.cleaned("Title: Rename the gateway"), "Rename the gateway")
+        XCTAssertEqual(ChatTitleWriter.cleaned("Audit the sandbox policy."), "Audit the sandbox policy")
+        XCTAssertEqual(ChatTitleWriter.cleaned("  Trim whitespace \n and drop the rest"), "Trim whitespace")
+    }
+
+    func testRejectsAnythingUnusableSoTheGatewayTitleStands() {
+        XCTAssertNil(ChatTitleWriter.cleaned(""))
+        XCTAssertNil(ChatTitleWriter.cleaned("   \n  "))
+        XCTAssertNil(ChatTitleWriter.cleaned("\"\""))
+        // A model that answered the prompt instead of naming it runs long; better to keep
+        // the gateway's title than to show a paragraph.
+        XCTAssertNil(ChatTitleWriter.cleaned(String(repeating: "long ", count: 20)))
+    }
+}
+
+final class LiveActivitySnapshotTests: XCTestCase {
+    private func session(
+        _ id: String,
+        state: SessionActivityState,
+        updatedAt: Int64,
+        title: String? = nil,
+        firstUserMessage: String = "First prompt",
+        workspaceLabel: String = "horus"
+    ) -> SessionRecord {
+        SessionRecord(
+            sessionId: id,
+            sessionContext: SessionContext(
+                tenantId: nil,
+                userId: nil,
+                userName: nil,
+                workspaceId: "w",
+                workspaceLabel: workspaceLabel,
+                originLabel: nil
+            ),
+            parentSessionId: nil,
+            parentSequence: nil,
+            sequence: 1,
+            catalogVisible: true,
+            firstUserMessage: firstUserMessage,
+            executionStats: ExecutionStats(),
+            title: title,
+            pinned: false,
+            activity: SessionActivity(
+                state: state,
+                turnId: nil,
+                startedAt: state == .idle ? nil : 100,
+                lastOutcome: nil,
+                message: nil
+            ),
+            createdAt: 1,
+            updatedAt: updatedAt
+        )
+    }
+
+    func testRanksApprovalsThenRunningThenUnreadAndCapsTheList() {
+        let sessions = [
+            session("unread", state: .idle, updatedAt: 10),
+            session("running-old", state: .running, updatedAt: 20),
+            session("approval", state: .awaitingApproval, updatedAt: 5),
+            session("running-new", state: .running, updatedAt: 30),
+            session("idle-read", state: .idle, updatedAt: 40)
+        ]
+
+        let chats = HorusChatSnapshot.live(sessions: sessions, unread: ["unread"])
+
+        // An idle chat nobody flagged as unread never appears, and the cap drops the tail.
+        XCTAssertEqual(chats.map(\.id), ["approval", "running-new", "running-old"])
+        XCTAssertEqual(chats.first?.standing, .awaitingApproval)
+        XCTAssertEqual(chats.first?.startedAt, Date(timeIntervalSince1970: 100))
+
+        let tallies = HorusChatSnapshot.tallies(sessions: sessions, unread: ["unread"])
+        XCTAssertEqual(tallies.running, 2)
+        XCTAssertEqual(tallies.attention, 2)
+    }
+
+    func testTitleFallsBackToTheFirstPromptAndIsShortened() {
+        let chats = HorusChatSnapshot.live(
+            sessions: [session("a", state: .running, updatedAt: 1)],
+            unread: []
+        )
+
+        XCTAssertEqual(chats.first?.title, "First prompt")
+        XCTAssertEqual(chats.first?.workspace, "horus")
+        XCTAssertEqual(
+            HorusChatSnapshot.shortTitle("Refactor the gateway session store and retry logic"),
+            "Refactor the gateway session…"
+        )
+        XCTAssertEqual(HorusChatSnapshot.shortTitle("Short one"), "Short one")
+    }
+
+    func testRecencySortHandlesTheFullTimestampRange() {
+        let chats = HorusChatSnapshot.live(
+            sessions: [
+                session("old", state: .running, updatedAt: .min),
+                session("new", state: .running, updatedAt: .max)
+            ],
+            unread: []
+        )
+
+        XCTAssertEqual(chats.map(\.id), ["new", "old"])
+    }
+
+    func testSnapshotBoundsUntrustedPresentationText() throws {
+        let huge = String(repeating: "🧪", count: 2_000)
+        let chats = HorusChatSnapshot.live(
+            sessions: [session(
+                huge,
+                state: .running,
+                updatedAt: 1,
+                firstUserMessage: huge,
+                workspaceLabel: "/srv/\(huge)"
+            )],
+            unread: []
+        )
+        let chat = try XCTUnwrap(chats.first)
+
+        XCTAssertLessThanOrEqual(chat.id.utf8.count, 96)
+        XCTAssertLessThanOrEqual(chat.workspace.utf8.count, 48)
+        XCTAssertLessThan(try JSONEncoder().encode(chats).count, 4_096)
     }
 }
 
