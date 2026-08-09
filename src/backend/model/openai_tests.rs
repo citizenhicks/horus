@@ -38,6 +38,7 @@ fn responses_input_strips_only_top_level_provider_metadata() {
         serde_json::json!({
             "type": "message",
             "role": "assistant",
+            "phase": "commentary",
             "status": "completed",
             "content": [{"type": "output_text", "text": "done"}]
         }),
@@ -68,6 +69,7 @@ fn responses_input_strips_only_top_level_provider_metadata() {
             serde_json::json!({
                 "type": "message",
                 "role": "assistant",
+                "phase": "commentary",
                 "content": [{"type": "output_text", "text": "done"}]
             }),
             serde_json::json!({
@@ -199,6 +201,46 @@ fn responses_emits_reasoning_text_deltas() {
     assert_eq!(
         *seen.lock().expect("events lock"),
         vec![ModelEvent::ReasoningDelta("Plan.".into())]
+    );
+}
+
+#[test]
+fn responses_emits_commentary_text_deltas() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_seen = Arc::clone(&seen);
+    let events: ModelEventSink = Arc::new(move |event| {
+        sink_seen.lock().expect("events lock").push(event);
+        Ok(())
+    });
+    let mut commentary = BTreeSet::new();
+
+    emit_text_event(
+        &serde_json::json!({
+            "type": "response.output_item.added",
+            "item": {
+                "id": "message-1",
+                "type": "message",
+                "phase": "commentary"
+            }
+        }),
+        &mut commentary,
+        &events,
+    )
+    .expect("commentary item");
+    emit_text_event(
+        &serde_json::json!({
+            "type": "response.output_text.delta",
+            "item_id": "message-1",
+            "delta": "Checking."
+        }),
+        &mut commentary,
+        &events,
+    )
+    .expect("commentary delta");
+
+    assert_eq!(
+        *seen.lock().expect("events lock"),
+        vec![ModelEvent::CommentaryDelta("Checking.".into())]
     );
 }
 

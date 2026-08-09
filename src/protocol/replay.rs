@@ -75,9 +75,14 @@ pub fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Vec<Event
         if value.get("role").and_then(Value::as_str) == Some("assistant") {
             push_reasoning(&mut events, reasoning_text(value), session_id, &item_id);
             if let Some(message) = message_text(value, "assistant") {
+                let phase = if value.get("phase").and_then(Value::as_str) == Some("commentary") {
+                    AgentMessagePhase::Commentary
+                } else {
+                    AgentMessagePhase::FinalAnswer
+                };
                 events.push(EventMsg::AgentMessage(AgentMessageEvent {
                     message,
-                    phase: Some(AgentMessagePhase::FinalAnswer),
+                    phase: Some(phase),
                     message_target,
                 }));
             }
@@ -293,6 +298,31 @@ mod tests {
             events.as_slice(),
             [EventMsg::UserMessage(message)] if message.message.is_empty()
                 && message.attachments[0].name == "photo.png"
+        ));
+    }
+
+    #[test]
+    fn replay_preserves_commentary_phase() {
+        let history = [(
+            MessageTarget {
+                checkpoint_sequence: 2,
+                batch_item_count: 1,
+            },
+            serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "Checking the workspace."}]
+            }),
+        )];
+
+        let replayed = events(&history, "session");
+
+        assert!(matches!(
+            replayed.as_slice(),
+            [EventMsg::AgentMessage(message)]
+                if message.message == "Checking the workspace."
+                    && message.phase == Some(AgentMessagePhase::Commentary)
         ));
     }
 

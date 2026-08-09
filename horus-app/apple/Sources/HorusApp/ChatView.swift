@@ -950,7 +950,7 @@ private struct EventLine: View {
         if entry.kind == .error || entry.tone == "error" { return .xCircle }
         if entry.format == "unified_diff" { return .fileMagnifyingGlass }
         if entry.isWebSearch { return .globe02 }
-        return .timelineEvent
+        return .typeCursor
     }
 
     private var middlewareLabel: String {
