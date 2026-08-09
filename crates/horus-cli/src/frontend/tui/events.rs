@@ -18,6 +18,18 @@ use horus_gateway::wire::{RenderedEvent, RenderedPreview};
 
 impl TuiState {
     pub(super) fn handle_agent_event(&mut self, event: EventMsg, blocks: Vec<FrontendBlock>) {
+        let is_commentary = matches!(
+            &event,
+            EventMsg::AgentMessageContentDelta(delta)
+                if delta.phase == Some(AgentMessagePhase::Commentary)
+        ) || matches!(
+            &event,
+            EventMsg::AgentMessage(message)
+                if message.phase == Some(AgentMessagePhase::Commentary)
+        );
+        if !is_commentary {
+            self.commit_commentary_stream();
+        }
         let was_rendered = !blocks.is_empty();
         for block in blocks {
             self.apply_block(block);
@@ -25,7 +37,6 @@ impl TuiState {
         match event {
             EventMsg::TurnStarted(turn) => {
                 self.commit_stream();
-                self.status_message.clear();
                 self.active_turn = Some(turn.turn_id);
                 self.turn_started_at = Some(Instant::now());
                 self.clear_approval();
@@ -34,25 +45,22 @@ impl TuiState {
                 self.push(format!("› {}", message.message), TranscriptTone::User);
             }
             EventMsg::AgentMessageContentDelta(delta) => {
-                if delta.phase == Some(AgentMessagePhase::Commentary) {
-                    self.append_status(&delta.delta);
-                } else {
-                    self.status_message.clear();
-                    self.append_stream(&delta.delta);
-                }
+                let phase = delta.phase.unwrap_or(AgentMessagePhase::FinalAnswer);
+                self.append_stream(&delta.delta, phase);
             }
             EventMsg::AgentReasoningContentDelta(delta) => {
                 self.append_reasoning(&delta.delta);
             }
             EventMsg::AgentMessage(message) => {
-                if message.phase == Some(AgentMessagePhase::Commentary) {
-                    self.status_message = super::bounded_status(&message.message);
-                } else {
-                    self.status_message.clear();
+                let phase = message.phase.unwrap_or(AgentMessagePhase::FinalAnswer);
+                if self.streaming_phase == Some(phase) {
                     self.streaming.clear();
-                    if !was_rendered {
-                        self.push(message.message, TranscriptTone::Assistant);
-                    }
+                    self.streaming_phase = None;
+                } else {
+                    self.commit_stream();
+                }
+                if !was_rendered {
+                    self.push(message.message, TranscriptTone::Assistant);
                 }
             }
             EventMsg::ContextCompacted => {}

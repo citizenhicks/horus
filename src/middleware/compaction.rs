@@ -112,7 +112,7 @@ impl Middleware for Compaction {
     fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let estimated = context.estimated_input_tokens();
-            let observed = if starts_compacted(context.input()) {
+            let observed = if contains_compaction(context.input()) {
                 estimated
             } else {
                 context
@@ -145,9 +145,9 @@ impl Middleware for Compaction {
                     "compaction returned an empty context".into(),
                 ));
             }
-            let active_turn = active_turn(context.input());
+            let active_user = latest_real_user(context.input());
             let mut compacted = output.output;
-            preserve_active_turn(&mut compacted, active_turn);
+            restore_user_private_fields(&mut compacted, active_user);
             context.replace_input(compacted);
             context.usage.push(output.usage);
             context.events.push(EventMsg::ContextCompacted);
@@ -156,41 +156,40 @@ impl Middleware for Compaction {
     }
 }
 
-fn active_turn(input: &[Value]) -> &[Value] {
-    input
-        .iter()
-        .rposition(|item| {
-            item.get("role").and_then(Value::as_str) == Some("user") && !is_internal_message(item)
-        })
-        .map_or(&[], |index| &input[index..])
+fn latest_real_user(input: &[Value]) -> Option<&Value> {
+    input.iter().rfind(|item| {
+        item.get("role").and_then(Value::as_str) == Some("user") && !is_internal_message(item)
+    })
 }
 
-fn preserve_active_turn(compacted: &mut Vec<Value>, active_turn: &[Value]) {
-    if active_turn.is_empty() || compacted.ends_with(active_turn) {
+fn restore_user_private_fields(compacted: &mut Vec<Value>, user: Option<&Value>) {
+    let Some(user) = user else {
+        return;
+    };
+    let Some(fields) = user.as_object() else {
+        return;
+    };
+    let private = fields
+        .iter()
+        .filter(|(name, _)| name.starts_with('_'))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    if private.is_empty() {
         return;
     }
-    if let Some(start) = compacted.len().checked_sub(active_turn.len())
-        && compacted[start..]
-            .iter()
-            .zip(active_turn)
-            .all(|(left, right)| equal_without_private_fields(left, right))
-    {
-        compacted.truncate(start);
-    }
-    compacted.extend_from_slice(active_turn);
-}
-
-fn equal_without_private_fields(left: &Value, right: &Value) -> bool {
-    if left == right {
-        return true;
-    }
-    let (Some(mut left), Some(mut right)) = (left.as_object().cloned(), right.as_object().cloned())
-    else {
-        return false;
+    let retained = compacted.iter_mut().rfind(|item| {
+        !is_internal_message(item)
+            && item.get("role") == user.get("role")
+            && item.get("content") == user.get("content")
+    });
+    let Some(retained) = retained else {
+        compacted.push(user.clone());
+        return;
     };
-    left.retain(|field, _| !field.starts_with('_'));
-    right.retain(|field, _| !field.starts_with('_'));
-    left == right
+    let Some(fields) = retained.as_object_mut() else {
+        return;
+    };
+    fields.extend(private);
 }
 
 async fn summarize(context: &ModelContext<'_>) -> Result<CompactOutput> {
@@ -345,8 +344,8 @@ fn compacted_summary(item: &Value) -> Option<String> {
         .map(|summary| summary.trim().to_string())
 }
 
-fn starts_compacted(input: &[Value]) -> bool {
-    input.first().is_some_and(|item| {
+fn contains_compaction(input: &[Value]) -> bool {
+    input.iter().any(|item| {
         item.get("type").and_then(Value::as_str) == Some("compaction")
             || compacted_summary(item).is_some()
     })
@@ -426,20 +425,69 @@ mod tests {
     }
 
     #[test]
-    fn compaction_restores_private_fields_on_the_active_turn_without_duplication() {
-        let active = serde_json::json!({
+    fn compaction_restores_private_fields_on_the_retained_user() {
+        let user = serde_json::json!({
             "role": "user",
             "content": [{"type": "input_text", "text": "inspect"}],
-            "_horus_attachments": [{"id": "attachment"}]
+            "_middleware_state": {"id": "state"}
         });
         let mut compacted = vec![
+            serde_json::json!({
+                "type": "message",
+                "id": "message-1",
+                "role": "user",
+                "status": "completed",
+                "content": [{"type": "input_text", "text": "inspect"}]
+            }),
             serde_json::json!({"type": "compaction", "encrypted_content": "opaque"}),
-            user_message("inspect"),
         ];
 
-        preserve_active_turn(&mut compacted, std::slice::from_ref(&active));
+        restore_user_private_fields(&mut compacted, Some(&user));
 
         assert_eq!(compacted.len(), 2);
-        assert_eq!(compacted[1], active);
+        assert_eq!(compacted[0]["id"], "message-1");
+        assert_eq!(compacted[0]["status"], "completed");
+        assert_eq!(
+            compacted[0]["_middleware_state"],
+            serde_json::json!({"id": "state"})
+        );
+    }
+
+    #[test]
+    fn compaction_omitting_a_private_user_does_not_restore_its_tool_tail() {
+        let input = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect"}],
+                "_middleware_state": {"id": "state"}
+            }),
+            serde_json::json!({
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "read",
+                "arguments": "{}"
+            }),
+            tool_output("call-1", "large result", false),
+        ];
+        let mut compacted = vec![serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "opaque"
+        })];
+
+        restore_user_private_fields(&mut compacted, latest_real_user(&input));
+
+        assert_eq!(compacted.len(), 2);
+        assert_eq!(compacted[0]["type"], "compaction");
+        assert_eq!(compacted[1], input[0]);
+    }
+
+    #[test]
+    fn compaction_marker_may_follow_retained_messages() {
+        let input = vec![
+            user_message("inspect"),
+            serde_json::json!({"type": "compaction", "encrypted_content": "opaque"}),
+        ];
+
+        assert!(contains_compaction(&input));
     }
 }

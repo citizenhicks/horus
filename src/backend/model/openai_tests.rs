@@ -98,6 +98,52 @@ fn responses_decode_strips_reasoning_wire_metadata() {
 }
 
 #[test]
+fn compact_decode_normalizes_provider_wire_items() {
+    let decoded = decode_compact_response(serde_json::json!({
+        "output": [
+            {
+                "type": "message",
+                "id": "message-1",
+                "role": "user",
+                "status": "completed",
+                "content": [{"type": "input_text", "text": "inspect"}]
+            },
+            {
+                "type": "reasoning",
+                "format": "openai-responses-v1",
+                "status": "completed",
+                "encrypted_content": "reasoning"
+            },
+            {
+                "type": "compaction_summary",
+                "encrypted_content": "opaque"
+            }
+        ]
+    }))
+    .expect("decode compact response");
+
+    assert_eq!(
+        decoded.output(),
+        &[
+            serde_json::json!({
+                "type": "message",
+                "id": "message-1",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect"}]
+            }),
+            serde_json::json!({
+                "type": "reasoning",
+                "encrypted_content": "reasoning"
+            }),
+            serde_json::json!({
+                "type": "compaction",
+                "encrypted_content": "opaque"
+            })
+        ]
+    );
+}
+
+#[test]
 fn responses_converts_neutral_images_and_rejects_them_when_disabled() {
     let input = [serde_json::json!({
         "role": "user",

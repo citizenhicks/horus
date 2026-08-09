@@ -648,6 +648,79 @@ async fn compaction_uses_the_context_window_of_a_new_model_route() {
 }
 
 #[tokio::test]
+async fn native_compaction_ignores_stale_usage_after_a_retained_user() {
+    let workspace = TempDir::new().expect("create workspace");
+    let model = Arc::new(ScriptedModel::with_compaction(
+        vec![
+            text_response_with_usage("first done", usage(2_000)),
+            text_response_with_usage("second done", usage(2_000)),
+            text_response("third done"),
+        ],
+        vec![
+            CompactOutput::from_output(
+                vec![
+                    serde_json::json!({
+                        "type": "message",
+                        "id": "message-2",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "second"}]
+                    }),
+                    serde_json::json!({
+                        "type": "compaction",
+                        "encrypted_content": "opaque"
+                    }),
+                ],
+                usage(10),
+            )
+            .expect("compaction output"),
+        ],
+    ));
+    let mut agent = create_agent(test_config(
+        workspace.path(),
+        Arc::clone(&model),
+        vec![Arc::new(Compaction::new(1_000).expect("compaction"))],
+    ))
+    .await
+    .expect("create agent");
+
+    for (prompt, expected) in [
+        ("first", "first done"),
+        ("second", "second done"),
+        ("third", "third done"),
+    ] {
+        agent
+            .sender()
+            .submit(Op::UserInput {
+                text: prompt.into(),
+                attachments: Vec::new(),
+            })
+            .expect("submit turn");
+        assert_eq!(final_message(&mut agent).await, expected);
+    }
+
+    assert_eq!(
+        model
+            .compact_requests
+            .lock()
+            .expect("compact requests")
+            .len(),
+        1
+    );
+    let requests = model.requests.lock().expect("requests");
+    let second_users = requests[2]
+        .input
+        .iter()
+        .filter(|item| {
+            item.get("role").and_then(Value::as_str) == Some("user")
+                && item.pointer("/content/0/text").and_then(Value::as_str) == Some("second")
+        })
+        .count();
+    let rebuilt = serde_json::to_string(&requests[2].input).expect("serialize rebuilt context");
+    assert_eq!(second_users, 1);
+    assert!(rebuilt.contains("opaque"));
+}
+
+#[tokio::test]
 async fn interrupt_only_aborts_its_target_turn() {
     let workspace = TempDir::new().expect("create workspace");
     let scripted = Arc::new(ScriptedModel::new(vec![text_response("unused")]));
@@ -760,6 +833,17 @@ async fn compaction_falls_back_to_a_model_summary_and_keeps_recent_context() {
     let rebuilt = serde_json::to_string(&requests[2].input).expect("serialize rebuilt context");
     assert!(rebuilt.contains("<compacted_context>"));
     assert!(rebuilt.contains("continue"));
+    assert_eq!(
+        requests[2]
+            .input
+            .iter()
+            .filter(|item| {
+                item.get("role").and_then(Value::as_str) == Some("user")
+                    && item.pointer("/content/0/text").and_then(Value::as_str) == Some("continue")
+            })
+            .count(),
+        1
+    );
     assert!(
         model
             .compact_requests

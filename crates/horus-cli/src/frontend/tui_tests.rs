@@ -738,7 +738,7 @@ fn narrow_terminal_keeps_session_card_and_compact_footer() {
 }
 
 #[test]
-fn commentary_is_transient_until_final_output_starts() {
+fn commentary_and_final_output_are_separate_assistant_messages() {
     let mut state = state();
     state.active_turn = Some("turn".into());
     state.handle_agent_event(
@@ -752,28 +752,104 @@ fn commentary_is_transient_until_final_output_starts() {
         Vec::new(),
     );
 
-    assert_eq!(state.status_message, "Checking the workspace");
-    assert!(state.streaming.is_empty());
+    assert_eq!(state.streaming, "Checking the workspace");
+    assert_eq!(state.streaming_phase, Some(AgentMessagePhase::Commentary));
 
     state.handle_agent_event(
-        EventMsg::AgentMessageContentDelta(horus::protocol::AgentMessageContentDeltaEvent {
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-            item_id: "answer".into(),
-            delta: "Done".into(),
+        EventMsg::AgentMessage(horus::protocol::AgentMessageEvent {
+            message: "Done".into(),
             phase: Some(AgentMessagePhase::FinalAnswer),
+            message_target: None,
         }),
         Vec::new(),
     );
 
-    assert!(state.status_message.is_empty());
-    assert_eq!(state.streaming, "Done");
+    assert!(state.streaming.is_empty());
+    assert_eq!(state.streaming_phase, None);
+    assert_eq!(
+        state
+            .transcript
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>(),
+        ["Checking the workspace", "Done"]
+    );
+    assert!(
+        state
+            .transcript
+            .iter()
+            .all(|entry| matches!(entry.tone, TranscriptTone::Assistant))
+    );
+}
+
+#[test]
+fn commentary_is_committed_before_a_tool_block() {
+    let mut state = state();
+    state.handle_agent_event(
+        EventMsg::AgentMessageContentDelta(horus::protocol::AgentMessageContentDeltaEvent {
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item_id: "response".into(),
+            delta: "I’ll inspect the file first.".into(),
+            phase: Some(AgentMessagePhase::Commentary),
+        }),
+        Vec::new(),
+    );
+
+    state.handle_agent_event(
+        EventMsg::ToolCallBegin(horus::protocol::ToolCallBeginEvent {
+            turn_id: "turn".into(),
+            call_id: "call".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        }),
+        vec![FrontendBlock {
+            id: Some("tool-call".into()),
+            group: None,
+            append: false,
+            pending: true,
+            text: "Read src/lib.rs".into(),
+            format: FrontendBlockFormat::PlainText,
+            tone: FrontendTone::Neutral,
+            files: Vec::new(),
+        }],
+    );
+
+    assert_eq!(
+        state
+            .transcript
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>(),
+        ["I’ll inspect the file first.", "Read src/lib.rs"]
+    );
+}
+
+#[test]
+fn durable_commentary_is_an_assistant_message() {
+    let mut state = state();
+    state.handle_agent_event(
+        EventMsg::AgentMessage(horus::protocol::AgentMessageEvent {
+            message: "The first check passed.".into(),
+            phase: Some(AgentMessagePhase::Commentary),
+            message_target: None,
+        }),
+        Vec::new(),
+    );
+
+    let entry = state
+        .transcript
+        .back()
+        .expect("commentary transcript entry");
+    assert_eq!(entry.text, "The first check passed.");
+    assert!(matches!(entry.tone, TranscriptTone::Assistant));
 }
 
 #[test]
 fn final_message_replaces_an_incomplete_stream() {
     let mut state = state();
     state.streaming = "partial".into();
+    state.streaming_phase = Some(AgentMessagePhase::FinalAnswer);
 
     state.handle_agent_event(
         EventMsg::AgentMessage(horus::protocol::AgentMessageEvent {
@@ -785,6 +861,7 @@ fn final_message_replaces_an_incomplete_stream() {
     );
 
     assert!(state.streaming.is_empty());
+    assert_eq!(state.transcript.len(), 1);
     assert_eq!(
         state.transcript.back().map(|entry| entry.text.as_str()),
         Some("complete answer")

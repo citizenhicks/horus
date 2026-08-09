@@ -23,6 +23,7 @@ pub use self::view::terminal_text;
 use super::catalog::{MenuItem, UiCatalog};
 use horus::backend::model::ModelChoice;
 use horus::backend::model::ModelInfo;
+use horus::protocol::AgentMessagePhase;
 use horus::protocol::FrontendBlock;
 use horus::protocol::FrontendBlockFormat;
 use horus::protocol::FrontendPickerOption;
@@ -30,11 +31,11 @@ use horus::protocol::FrontendTone;
 use horus::protocol::FrontendWidget;
 use horus::protocol::SessionResumeRequestedEvent;
 #[cfg(test)]
-use horus::protocol::{AgentMessagePhase, EventMsg, FrontendEvent, Op};
+use horus::protocol::{EventMsg, FrontendEvent, Op};
 
 const MAX_ENTRY_BYTES: usize = 40_000;
 const MAX_COMPOSER_HISTORY_ENTRIES: usize = 100;
-const MAX_STATUS_BYTES: usize = 160;
+const MAX_TITLE_BYTES: usize = 160;
 const MAX_STREAM_BYTES: usize = 64 * 1024;
 const MAX_TRANSCRIPT_ENTRIES: usize = 512;
 
@@ -146,7 +147,7 @@ struct PreviewState {
 impl PreviewState {
     fn new(title: String, content: PreviewContent) -> Self {
         Self {
-            title: bounded_status(&title),
+            title: bounded_title(&title),
             content,
             viewport: Viewport::default(),
         }
@@ -170,8 +171,8 @@ struct TuiState {
     transcript: VecDeque<TranscriptEntry>,
     transcript_viewport: Viewport,
     streaming: String,
+    streaming_phase: Option<AgentMessagePhase>,
     reasoning: String,
-    status_message: String,
     input: String,
     cursor: usize,
     pastes: BTreeMap<char, String>,
@@ -215,8 +216,8 @@ impl TuiState {
             transcript: VecDeque::new(),
             transcript_viewport: Viewport::default(),
             streaming: String::new(),
+            streaming_phase: None,
             reasoning: String::new(),
-            status_message: String::new(),
             input: String::new(),
             cursor: 0,
             pastes: BTreeMap::new(),
@@ -371,8 +372,12 @@ impl TuiState {
         self.trim_transcript();
     }
 
-    fn append_stream(&mut self, delta: &str) {
+    fn append_stream(&mut self, delta: &str, phase: AgentMessagePhase) {
         self.commit_reasoning();
+        if self.streaming_phase.is_some_and(|current| current != phase) {
+            self.commit_stream();
+        }
+        self.streaming_phase = Some(phase);
         if self.streaming.len() >= MAX_STREAM_BYTES {
             return;
         }
@@ -400,22 +405,20 @@ impl TuiState {
         }
     }
 
-    fn append_status(&mut self, delta: &str) {
-        if self.status_message.len() >= MAX_STATUS_BYTES {
-            return;
-        }
-        let mut delta = terminal_text(delta).replace(['\n', '\t'], " ");
-        let available = MAX_STATUS_BYTES - self.status_message.len();
-        truncate_bytes(&mut delta, available);
-        self.status_message.push_str(&delta);
-    }
-
     fn commit_stream(&mut self) {
         if self.streaming.is_empty() {
+            self.streaming_phase = None;
             return;
         }
         let text = std::mem::take(&mut self.streaming);
+        self.streaming_phase = None;
         self.push_entry(text, TranscriptTone::Assistant);
+    }
+
+    fn commit_commentary_stream(&mut self) {
+        if self.streaming_phase == Some(AgentMessagePhase::Commentary) {
+            self.commit_stream();
+        }
     }
 
     fn commit_reasoning(&mut self) {
@@ -457,7 +460,6 @@ impl TuiState {
     fn finish_turn(&mut self) {
         self.commit_reasoning();
         self.commit_stream();
-        self.status_message.clear();
         self.active_turn = None;
         self.turn_started_at = None;
         self.clear_approval();
@@ -471,9 +473,9 @@ impl TuiState {
     }
 }
 
-fn bounded_status(value: &str) -> String {
+fn bounded_title(value: &str) -> String {
     let mut value = terminal_text(value).replace(['\n', '\t'], " ");
-    truncate_bytes(&mut value, MAX_STATUS_BYTES);
+    truncate_bytes(&mut value, MAX_TITLE_BYTES);
     value
 }
 

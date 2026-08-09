@@ -743,24 +743,7 @@ fn status_line(state: &TuiState) -> Line<'static> {
             theme.style(Role::Warning),
         );
     }
-    let status = latest_status(&state.status_message);
-    if state.is_working() && !status.is_empty() {
-        return shimmer::line(
-            &format!("{AGENT_MARKER}{}", display_value(status)),
-            theme.color(Role::Accent),
-            theme.color(Role::AccentStrong),
-        );
-    }
     Line::default()
-}
-
-fn latest_status(status: &str) -> &str {
-    status
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default()
-        .trim()
 }
 
 fn elapsed_label(elapsed: std::time::Duration) -> String {

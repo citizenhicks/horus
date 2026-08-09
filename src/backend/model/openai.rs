@@ -256,14 +256,7 @@ impl OpenAi {
         }
         let response: Value =
             serde_json::from_slice(&read_limited(response, MAX_JSON_BYTES, "Responses").await?)?;
-        CompactOutput::from_output(
-            response
-                .get("output")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-            decode_usage(response.get("usage"))?,
-        )
+        decode_compact_response(response)
     }
 
     async fn authorize(
@@ -570,7 +563,7 @@ pub(super) fn decode_response(response: Value) -> Result<ModelOutput> {
         .cloned()
         .ok_or_else(|| Error::Provider("response omitted output".into()))?;
     for item in &mut output {
-        strip_replay_wire_metadata(item);
+        normalize_replay_item(item);
         if item.get("type").and_then(Value::as_str) != Some("reasoning") {
             continue;
         }
@@ -594,6 +587,27 @@ pub(super) fn decode_response(response: Value) -> Result<ModelOutput> {
         }
     }
     ModelOutput::from_output(output, end_turn, decode_usage(response.get("usage"))?)
+}
+
+pub(super) fn decode_compact_response(response: Value) -> Result<CompactOutput> {
+    let mut output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for item in &mut output {
+        normalize_replay_item(item);
+    }
+    CompactOutput::from_output(output, decode_usage(response.get("usage"))?)
+}
+
+fn normalize_replay_item(item: &mut Value) {
+    if item.get("type").and_then(Value::as_str) == Some("compaction_summary")
+        && let Some(fields) = item.as_object_mut()
+    {
+        fields.insert("type".into(), Value::String("compaction".into()));
+    }
+    strip_replay_wire_metadata(item);
 }
 
 fn strip_replay_wire_metadata(item: &mut Value) {
