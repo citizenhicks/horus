@@ -130,18 +130,12 @@ struct ComposerOptionsView: View {
 
     private var approvalMenu: some View {
         Menu {
-            ForEach(approvalOptions) { option in
-                let selected = option.value == approvalValue
-                Button {
-                    model.setApprovalPolicyForCurrentChat(option.value)
-                } label: {
-                    menuOptionLabel(
-                        option.label,
-                        selected: selected
-                    )
+            Picker("Approval policy", selection: approvalPickerSelection) {
+                ForEach(approvalOptions) { option in
+                    Text(option.label).tag(option.value)
                 }
-                .accessibilityAddTraits(selected ? .isSelected : [])
             }
+            .labelsHidden()
         } label: {
             HorusLabel(
                 title: approvalLabel,
@@ -165,46 +159,32 @@ struct ComposerOptionsView: View {
 
     @ViewBuilder
     private var modelMenuContent: some View {
-        ForEach(distinctModels, id: \.route) { choice in
-            let selected = choice.group == currentChoice?.group
-                && choice.model == currentChoice?.model
-            Button {
-                let effort = currentChoice?.reasoningEffort
-                let target = model.modelChoices.first {
-                    $0.group == choice.group && $0.model == choice.model && $0.reasoningEffort == effort
-                } ?? choice
-                model.selectModel(target.route)
-            } label: {
-                menuOptionLabel(
+        Picker("Model", selection: modelPickerSelection) {
+            ForEach(distinctModels, id: \.route) { choice in
+                modelMenuOptionLabel(
                     model.modelLabel(for: choice),
-                    selected: selected,
                     providerSymbol: model.providerSymbol(for: choice)
                 )
+                .tag(choice.route)
             }
-            .accessibilityAddTraits(selected ? .isSelected : [])
         }
+        .labelsHidden()
     }
 
     @ViewBuilder
     private var reasoningMenuContent: some View {
-        ForEach(reasoningChoices, id: \.route) { choice in
-            let selected = choice.route == model.selectedModelRoute
-            Button {
-                model.selectModel(choice.route)
-            } label: {
-                menuOptionLabel(
-                    choice.reasoningEffort?.capitalized ?? "Default",
-                    selected: selected
-                )
+        Picker("Reasoning", selection: reasoningPickerSelection) {
+            ForEach(reasoningChoices, id: \.route) { choice in
+                Text(choice.reasoningEffort?.capitalized ?? "Default")
+                    .tag(choice.route)
             }
-            .accessibilityAddTraits(selected ? .isSelected : [])
         }
+        .labelsHidden()
     }
 
-    private func menuOptionLabel(
+    private func modelMenuOptionLabel(
         _ title: String,
-        selected: Bool,
-        providerSymbol: String? = nil
+        providerSymbol: String?
     ) -> some View {
         Group {
             if let providerSymbol,
@@ -218,8 +198,6 @@ struct ComposerOptionsView: View {
                 Text(title)
             }
         }
-        .fontWeight(selected ? .bold : nil)
-        .foregroundStyle(selected ? palette.accent : Color.primary)
     }
 
     @ViewBuilder
@@ -292,6 +270,32 @@ struct ComposerOptionsView: View {
         model.modelChoices.first { $0.route == model.selectedModelRoute }
     }
 
+    private var modelPickerSelection: Binding<String> {
+        Binding {
+            guard let currentChoice else { return "" }
+            return distinctModels.first {
+                $0.group == currentChoice.group && $0.model == currentChoice.model
+            }?.route ?? currentChoice.route
+        } set: { route in
+            guard let choice = distinctModels.first(where: { $0.route == route }) else { return }
+            let effort = currentChoice?.reasoningEffort
+            let target = model.modelChoices.first {
+                $0.group == choice.group
+                    && $0.model == choice.model
+                    && $0.reasoningEffort == effort
+            } ?? choice
+            model.selectModel(target.route)
+        }
+    }
+
+    private var reasoningPickerSelection: Binding<String> {
+        Binding {
+            model.selectedModelRoute
+        } set: { route in
+            model.selectModel(route)
+        }
+    }
+
     private var distinctModels: [ModelChoice] {
         var seen = Set<String>()
         return model.modelChoices.filter { seen.insert("\($0.group)\u{0}\($0.model)").inserted }
@@ -319,6 +323,14 @@ struct ComposerOptionsView: View {
               case .string(let policy) = value
         else { return nil }
         return policy
+    }
+
+    private var approvalPickerSelection: Binding<String> {
+        Binding {
+            approvalValue ?? ""
+        } set: { policy in
+            model.setApprovalPolicyForCurrentChat(policy)
+        }
     }
 
     private var approvalLabel: String {
