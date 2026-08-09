@@ -93,11 +93,12 @@ final class AppModelTests: XCTestCase {
 
     private func providerStatus(
         for config: ProviderConfig,
-        models: [ProviderModel] = []
+        models: [ProviderModel] = [],
+        label: String = "OpenAI"
     ) -> ProviderStatus {
         ProviderStatus(
             provider: config.provider,
-            label: "OpenAI",
+            label: label,
             symbol: "chat_gpt",
             description: "Test provider",
             configured: true,
@@ -2969,6 +2970,38 @@ final class AppModelTests: XCTestCase {
         ), "custom-model")
     }
 
+    func testProviderLabelsStayCompact() throws {
+        let model = try model()
+        let codex = ProviderConfig(
+            provider: "openai_codex",
+            model: "gpt-5.4",
+            baseUrl: nil,
+            reasoningEffort: "high",
+            webSearch: .off
+        )
+        model.providerStatuses = [
+            providerStatus(for: codex, label: "OpenAI (ChatGPT)"),
+            providerStatus(for: ProviderConfig(
+                provider: "openai_socket",
+                model: "gpt-5.6-sol",
+                baseUrl: nil,
+                reasoningEffort: "high",
+                webSearch: .cached
+            ), label: "OpenAI (API key)"),
+            providerStatus(for: ProviderConfig(
+                provider: "responses",
+                model: "local-model",
+                baseUrl: "http://localhost:8080/v1",
+                reasoningEffort: nil,
+                webSearch: .off
+            ), label: "Local and Other")
+        ]
+
+        XCTAssertEqual(model.providerLabel(for: "openai_codex"), "Codex")
+        XCTAssertEqual(model.providerLabel(for: "openai_socket"), "OpenAI")
+        XCTAssertEqual(model.providerLabel(for: "responses"), "Local")
+    }
+
     func testMiddlewareSettingsSetAndClearWithoutCapabilityLogic() {
         var middleware = MiddlewareConfig(enabled: ["example"], settings: [:])
 
@@ -4098,6 +4131,48 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertNil(model.toast)
         XCTAssertEqual(model.transcript.last?.text, "Old error")
+    }
+}
+
+final class TranscriptEventLineTests: XCTestCase {
+    private func entry(
+        id: String,
+        text: String,
+        kind: TranscriptEntry.Kind = .event,
+        tone: String = "neutral",
+        format: String = "plain_text"
+    ) -> TranscriptEntry {
+        TranscriptEntry(id: id, text: text, kind: kind, format: format, tone: tone, pending: false)
+    }
+
+    func testSplitsHeadingFromOutput() {
+        let call = entry(id: "tools/turn-1/call-1", text: "◉ Bash ls -la\ntotal 8\ndrwxr-xr-x")
+
+        XCTAssertEqual(call.capability, "tools")
+        XCTAssertEqual(call.headline, "Bash ls -la")
+        XCTAssertEqual(call.eventDetail, "total 8\ndrwxr-xr-x")
+    }
+
+    func testFallsBackWhenTheBlockCarriesNoHeadingOrNamespace() {
+        let bare = entry(id: "9C4F-2B", text: "")
+
+        XCTAssertNil(bare.capability)
+        XCTAssertNil(entry(id: "x", text: "").capability)
+        XCTAssertEqual(bare.headline, "Event")
+        XCTAssertEqual(bare.eventDetail, "")
+        XCTAssertEqual(entry(id: "x", text: "", tone: "error").headline, "Error")
+    }
+
+    func testSummaryCountsAndPluralisesByCategory() {
+        let entries = [
+            entry(id: "tools/t/1", text: "◉ Bash ls"),
+            entry(id: "tools/t/2", text: "◉ Read a.swift"),
+            entry(id: "skills/t/3", text: "◉ Read skill review"),
+            entry(id: "tools/t/4", text: "◉ Bash boom", kind: .error, tone: "error")
+        ]
+
+        XCTAssertEqual(TranscriptEntry.summary(for: entries), "2 tool calls • 1 event • 1 error")
+        XCTAssertEqual(TranscriptEntry.summary(for: [entries[0]]), "1 tool call")
     }
 }
 

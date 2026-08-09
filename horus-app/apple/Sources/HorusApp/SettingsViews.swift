@@ -30,7 +30,7 @@ struct AgentSettingsView: View {
                                 Button {
                                     model.selectAgentDraftModel(choice.route)
                                 } label: {
-                                    let title = "\(choice.group) · \(choice.model) · \(choice.reasoningEffort?.capitalized ?? "Default")"
+                                    let title = modelChoiceLabel(choice)
                                     if choice.route == model.agentDraftModelRoute {
                                         HorusPlatformMenuLabel(
                                             title: title,
@@ -279,7 +279,15 @@ struct AgentSettingsView: View {
         guard let route = model.agentDraftModelRoute,
               let choice = model.modelChoices.first(where: { $0.route == route })
         else { return "Select" }
-        return "\(choice.model) · \(choice.reasoningEffort?.capitalized ?? "Default")"
+        return "\(model.modelLabel(for: choice)) · \(choice.reasoningEffort?.capitalized ?? "Default")"
+    }
+
+    private func modelChoiceLabel(_ choice: ModelChoice) -> String {
+        [
+            model.providerLabel(for: choice),
+            model.modelLabel(for: choice),
+            choice.reasoningEffort?.capitalized ?? "Default"
+        ].joined(separator: " · ")
     }
 
     private func middleware(_ feature: MiddlewareFeature) -> Binding<Bool> {
@@ -394,7 +402,7 @@ struct ProvidersView: View {
                             .foregroundStyle(palette.muted)
                     } else {
                         ForEach(configuredProviders) { status in
-                            LabeledContent(status.label) {
+                            LabeledContent(model.providerLabel(for: status.provider)) {
                                 Text("Configured")
                                     .foregroundStyle(palette.signal)
                             }
@@ -416,7 +424,7 @@ struct ProvidersView: View {
                     LabeledContent {
                         Picker("Provider", selection: providerID) {
                             ForEach(model.providerStatuses) { status in
-                                Text(status.label).tag(status.provider)
+                                Text(model.providerLabel(for: status.provider)).tag(status.provider)
                             }
                         }
                         .labelsHidden()
@@ -426,7 +434,8 @@ struct ProvidersView: View {
                         HStack(spacing: 5) {
                             Text("Provider")
                             SettingsInfoButton(
-                                title: selectedStatus?.label ?? "Provider",
+                                title: selectedStatus.map { model.providerLabel(for: $0.provider) }
+                                    ?? "Provider",
                                 detail: selectedStatus?.description
                                     ?? "Selects the model service configured on this gateway."
                             )
@@ -571,12 +580,12 @@ struct ProvidersView: View {
         case .savingCredential:
             StatusBanner(tone: .neutral, title: "Sending credential", detail: "The value is not persisted by this app.", progress: true)
         case .credentialSaved(let provider):
-            StatusBanner(tone: .success, title: "Credential updated", detail: "\(provider) is configured on the gateway.")
+            StatusBanner(tone: .success, title: "Credential updated", detail: "\(model.providerLabel(for: provider)) is configured on the gateway.")
         case .startingLogin(let provider):
-            StatusBanner(tone: .neutral, title: "Starting \(provider) sign-in", detail: "Waiting for a device code.", progress: true)
+            StatusBanner(tone: .neutral, title: "Starting \(model.providerLabel(for: provider)) sign-in", detail: "Waiting for a device code.", progress: true)
         case .deviceCode(let provider, let url, let code):
             VStack(alignment: .leading, spacing: 12) {
-                Text("Finish \(provider) sign-in")
+                Text("Finish \(model.providerLabel(for: provider)) sign-in")
                     .font(.headline)
                 Text("Open the verification page and enter this code.")
                     .font(HorusStyle.bodyFont)
@@ -590,7 +599,7 @@ struct ProvidersView: View {
                 deviceCodeActions(url: url, code: code)
             }
         case .loginFinished(let provider):
-            StatusBanner(tone: .success, title: "Sign-in complete", detail: "\(provider) is ready on the gateway.")
+            StatusBanner(tone: .success, title: "Sign-in complete", detail: "\(model.providerLabel(for: provider)) is ready on the gateway.")
         case .failed(let message):
             StatusBanner(tone: .error, title: "Provider action failed", detail: message)
         }

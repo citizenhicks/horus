@@ -410,6 +410,58 @@ final class TranscriptEntry: Identifiable {
     }
 }
 
+/// What a transcript event collapses to on one line, and how a run of them is summarised.
+///
+/// Blocks arrive namespaced as "capability/turn/call" with the middleware's own heading on
+/// the first line of the text, marked with the bullet the terminal frontends draw. Both are
+/// parsed rather than carried on the wire, so a middleware that skips either still reads.
+extension TranscriptEntry {
+    var capability: String? {
+        let parts = id.split(separator: "/", maxSplits: 1)
+        guard parts.count == 2 else { return nil }
+        return String(parts[0])
+    }
+
+    var headline: String {
+        if format == "unified_diff" { return "Code change" }
+        let line = text.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? ""
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("◉") else {
+            return trimmed.isEmpty ? (tone == "error" ? "Error" : "Event") : trimmed
+        }
+        let stripped = trimmed.dropFirst().trimmingCharacters(in: .whitespaces)
+        return stripped.isEmpty ? "Event" : stripped
+    }
+
+    /// Everything under the heading — the tool output the one-line row hides.
+    var eventDetail: String {
+        guard format != "unified_diff" else { return text }
+        let parts = text.split(separator: "\n", maxSplits: 1)
+        guard parts.count > 1 else { return "" }
+        return parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// "3 tool calls • 2 events • 1 error", in that order, skipping the empty categories.
+    static func summary(for entries: [TranscriptEntry]) -> String {
+        var tools = 0
+        var events = 0
+        var errors = 0
+        for entry in entries {
+            if entry.kind == .error || entry.tone == "error" {
+                errors += 1
+            } else if entry.capability == "tools" {
+                tools += 1
+            } else {
+                events += 1
+            }
+        }
+        return [(tools, "tool call"), (events, "event"), (errors, "error")]
+            .filter { $0.0 > 0 }
+            .map { "\($0.0) \($0.0 == 1 ? $0.1 : $0.1 + "s")" }
+            .joined(separator: " • ")
+    }
+}
+
 private struct BufferedAgentEvent {
     let sequence: UInt64
     let event: AgentEventRecord
@@ -1952,6 +2004,23 @@ final class AppModel {
             .first { $0.provider == provider }?
             .models.first { $0.id == modelID }?
             .label ?? modelID
+    }
+
+    func providerLabel(for provider: String) -> String {
+        let advertised = providerStatuses.first { $0.provider == provider }?.label ?? provider
+        if advertised == "OpenAI (ChatGPT)" { return "Codex" }
+        if let qualifier = advertised.range(of: " (") {
+            return String(advertised[..<qualifier.lowerBound])
+        }
+        let genericSuffix = " and Other"
+        return advertised.hasSuffix(genericSuffix)
+            ? String(advertised.dropLast(genericSuffix.count))
+            : advertised
+    }
+
+    func providerLabel(for choice: ModelChoice) -> String {
+        guard let provider = modelProviders[choice.route] else { return choice.group }
+        return providerLabel(for: provider)
     }
 
     func providerSymbol(for choice: ModelChoice) -> String? {

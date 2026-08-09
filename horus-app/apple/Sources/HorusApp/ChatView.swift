@@ -197,9 +197,13 @@ private struct ChatOptionsMenu: View {
     }
 }
 
-private struct TranscriptRowLayout {
-    let entry: TranscriptEntry
+/// One row of the transcript: a single entry, or a run of events that share one summary.
+private struct TranscriptRowLayout: Identifiable {
+    let entries: [TranscriptEntry]
     let topSpacing: CGFloat
+
+    var id: String { entries.first?.id ?? "" }
+    var isEventGroup: Bool { entries.count > 1 }
 }
 
 private struct TranscriptView: View {
@@ -250,10 +254,16 @@ private struct TranscriptView: View {
                     }
                     .padding(.bottom, rowSpacing)
                 }
-                ForEach(rows, id: \.entry.id) { row in
-                    TranscriptRow(entry: row.entry)
-                        .id(row.entry.id)
-                        .padding(.top, row.topSpacing)
+                ForEach(rows) { row in
+                    Group {
+                        if row.isEventGroup {
+                            EventGroupView(entries: row.entries)
+                        } else if let entry = row.entries.first {
+                            TranscriptRow(entry: entry)
+                        }
+                    }
+                    .id(row.id)
+                    .padding(.top, row.topSpacing)
                 }
                 ForEach(model.transcriptTailWidgets) { widget in
                     QueuedMessageView(widget: widget)
@@ -299,7 +309,6 @@ private struct TranscriptView: View {
         .onChange(of: model.displayedTranscript.first?.id) { previous, _ in
             guard let historyAnchorID, historyAnchorID == previous else { return }
             position.scrollTo(id: historyAnchorID, anchor: .top)
-            self.historyAnchorID = nil
         }
         .onChange(of: model.selectedSessionID) { historyAnchorID = nil }
         .task(id: model.selectedSessionID) { await openAtLatest() }
@@ -328,16 +337,42 @@ private struct TranscriptView: View {
 
     // Spacing is resolved up front: a row body must never index back into the live
     // transcript, which can shrink between layout passes.
+    //
+    // Consecutive events collapse into one row. A lone event is left alone: hiding a single
+    // step behind a disclosure costs a tap and saves nothing.
     private var rows: [TranscriptRowLayout] {
-        var previousGroup: String?
-        return model.displayedTranscript.enumerated().map { index, entry in
-            let joinsPrevious = index > 0 && entry.group != nil && entry.group == previousGroup
-            previousGroup = entry.group
-            return TranscriptRowLayout(
-                entry: entry,
-                topSpacing: joinsPrevious ? 0 : (index == 0 ? 0 : rowSpacing)
-            )
+        var result: [TranscriptRowLayout] = []
+        var run: [TranscriptEntry] = []
+
+        func append(_ entries: [TranscriptEntry]) {
+            result.append(TranscriptRowLayout(
+                entries: entries,
+                topSpacing: result.isEmpty ? 0 : rowSpacing
+            ))
         }
+
+        func flushRun() {
+            guard !run.isEmpty else { return }
+            if run.count >= 2 {
+                append(run)
+            } else {
+                for entry in run { append([entry]) }
+            }
+            run = []
+        }
+
+        for entry in model.displayedTranscript {
+            // Keep the previous page boundary as a stable scroll target after prepending.
+            if entry.id == historyAnchorID { flushRun() }
+            if entry.kind == .event || entry.kind == .error {
+                run.append(entry)
+            } else {
+                flushRun()
+                append([entry])
+            }
+        }
+        flushRun()
+        return result
     }
 
     private var emptyState: some View {
@@ -419,14 +454,8 @@ private struct TranscriptRow: View {
         case .event, .error:
             VStack(alignment: .leading, spacing: 6) {
                 TranscriptFileCards(files: entry.files)
-                if entry.format == "unified_diff" {
-                    Button { model.showFiles(.unstaged) } label: {
-                        EventCard(entry: entry)
-                    }
-                    .buttonStyle(.horusPlain)
-                    .accessibilityHint("Opens modified files")
-                } else if !entry.text.isEmpty {
-                    EventCard(entry: entry)
+                if !entry.text.isEmpty {
+                    EventLine(entry: entry)
                 }
             }
         }
@@ -716,100 +745,164 @@ private struct MessageActionButton: View {
     }
 }
 
-private struct EventCard: View {
+/// A run of consecutive events behind one summary line, so a long turn costs one row until
+/// the reader asks for more.
+private struct EventGroupView: View {
+    @Environment(\.horusPalette) private var palette
+    @State private var isExpanded = false
+    let entries: [TranscriptEntry]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // Files an event produced are the deliverable, not a detail, so they stay out.
+            TranscriptFileCards(files: files)
+            if !lines.isEmpty {
+                Button {
+                    withAnimation(.easeOut(duration: 0.16)) { isExpanded.toggle() }
+                } label: {
+                    header
+                }
+                .buttonStyle(.horusPlain)
+                .accessibilityLabel(TranscriptEntry.summary(for: lines))
+                .accessibilityHint(isExpanded ? "Collapses the steps" : "Expands the steps")
+                if isExpanded {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(lines) { EventLine(entry: $0) }
+                    }
+                }
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            // The slot is held whether or not the orb is in it: losing it when the run ends
+            // would shift the summary sideways.
+            Group {
+                if isPending {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Color.clear
+                }
+            }
+            .frame(width: 18, height: 18)
+            Text(TranscriptEntry.summary(for: lines))
+                .font(HorusStyle.metadataFont)
+                .foregroundStyle(palette.muted)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            HorusIcon(.caretUpDown, size: 13, foreground: palette.muted)
+        }
+        .frame(minHeight: 30)
+        .contentShape(Rectangle())
+    }
+
+    private var lines: [TranscriptEntry] {
+        entries.filter { !$0.text.isEmpty }
+    }
+
+    /// Two events in a run can carry the same file, and `ForEach` needs the ids unique.
+    private var files: [SessionFileReference] {
+        var seen = Set<String>()
+        return entries.flatMap(\.files).filter { seen.insert($0.id).inserted }
+    }
+
+    private var isPending: Bool {
+        entries.contains(where: \.pending)
+    }
+}
+
+/// One event on one line: which middleware raised it, what it was doing, and the transfer
+/// arrow that opens the rest.
+private struct EventLine: View {
+    @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
     @State private var isExpanded = false
     let entry: TranscriptEntry
 
-    @ViewBuilder
     var body: some View {
-        if isTruncatable {
-            Button { isExpanded.toggle() } label: {
-                card
+        VStack(alignment: .leading, spacing: 4) {
+            if isInteractive {
+                Button(action: activate) { line }
+                    .buttonStyle(.horusPlain)
+                    .accessibilityLabel("\(middlewareLabel), \(headline)")
+                    .accessibilityHint(accessibilityHint)
+            } else {
+                line
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("\(middlewareLabel), \(headline)")
             }
-            .buttonStyle(.horusPlain)
-            .accessibilityHint(isExpanded ? "Collapses details" : "Expands details")
-        } else {
-            card
+            if isExpanded, !entry.eventDetail.isEmpty {
+                Text(entry.eventDetail)
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(palette.muted)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(palette.panel, in: HorusStyle.controlShape)
+            }
         }
     }
 
-    private var card: some View {
-        HStack(alignment: .top, spacing: 10) {
+    private func activate() {
+        if entry.format == "unified_diff" {
+            model.showFiles(.unstaged)
+        } else {
+            withAnimation(.easeOut(duration: 0.16)) { isExpanded.toggle() }
+        }
+    }
+
+    private var line: some View {
+        HStack(spacing: 6) {
+            Text(middlewareLabel)
+                .foregroundStyle(palette.accent)
+            Text("•")
+                .foregroundStyle(palette.muted)
+            Text(headline)
+                .foregroundStyle(headlineColor)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 6)
             if entry.pending {
-                ProgressView().controlSize(.mini).frame(width: 14, height: 14)
-            } else {
-                HorusIcon(glyph, size: 14, foreground: foreground)
-                    .padding(.top, 1)
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Text(label)
-                        .font(HorusStyle.metadataFont.weight(.semibold))
-                        .foregroundStyle(foreground)
-                    if entry.format == "unified_diff" {
-                        Text(diffSummary(entry.text))
-                            .font(HorusStyle.metadataFont)
-                            .foregroundStyle(palette.muted)
-                            .lineLimit(1)
-                    }
-                }
-                if entry.format != "unified_diff" {
-                    Text(detail)
-                        .font(HorusStyle.metadataFont)
-                        .foregroundStyle(entry.tone == "neutral" ? palette.muted : foreground)
-                        .lineLimit(isExpanded ? nil : 2)
-                        .textSelection(.enabled)
-                }
-            }
-            Spacer(minLength: 0)
-            if isTruncatable {
-                HorusIcon(
-                    isExpanded ? .caretUp : .caretDown,
-                    size: 12,
-                    foreground: palette.muted
-                )
+                ProgressView().controlSize(.mini)
+            } else if entry.format == "unified_diff" {
+                HorusIcon(.arrowUpRight01, size: 12, foreground: palette.muted)
+            } else if !entry.eventDetail.isEmpty {
+                HorusIcon(.caretUpDown, size: 12, foreground: palette.muted)
             }
         }
+        .font(HorusStyle.metadataFont)
+        .frame(minHeight: 26)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(
-            entry.tone == "neutral" ? palette.panel : foreground.opacity(0.10),
-            in: HorusStyle.controlShape
-        )
         .contentShape(Rectangle())
     }
 
-    private var detail: String {
-        entry.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// A diff says more as a count of changed lines than as the word "Code change".
+    private var headline: String {
+        entry.format == "unified_diff" ? diffSummary(entry.text) : entry.headline
     }
 
-    private var isTruncatable: Bool {
-        entry.format != "unified_diff" && detail.contains("\n")
-    }
-
-    /// Event ids arrive namespaced as "capability/block", which is the best label available.
-    private var label: String {
-        if entry.format == "unified_diff" { return "Code change" }
-        let capability = entry.id.split(separator: "/").first.map(String.init) ?? ""
-        guard !capability.isEmpty, capability.count < 24, !capability.contains("-") else {
-            return entry.tone == "error" ? "Error" : "Event"
+    private var middlewareLabel: String {
+        guard let capability = entry.capability else { return "Event" }
+        if let feature = model.middlewareFeatures.first(where: { $0.id == capability }) {
+            return feature.label
         }
         return capability.replacingOccurrences(of: "_", with: " ").capitalized
     }
 
-    private var glyph: HorusGlyph {
-        if entry.format == "unified_diff" { return .fileMagnifyingGlass }
-        switch entry.tone {
-        case "success": return .checkCircle
-        case "warning": return .warning
-        case "error": return .xCircle
-        default: return .terminalWindow
-        }
+    private var headlineColor: Color {
+        entry.tone == "neutral" ? .primary : palette.tone(entry.tone)
     }
 
-    private var foreground: Color { palette.tone(entry.tone) }
+    private var isInteractive: Bool {
+        entry.format == "unified_diff" || !entry.eventDetail.isEmpty
+    }
+
+    private var accessibilityHint: String {
+        if entry.format == "unified_diff" { return "Opens modified files" }
+        return isExpanded ? "Collapses details" : "Expands details"
+    }
 }
 
 private struct MarkdownText: View {
