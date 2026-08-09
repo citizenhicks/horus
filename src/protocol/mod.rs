@@ -6,8 +6,8 @@ use serde::Serialize;
 
 pub use self::replay::events as replay_events;
 pub(crate) use self::replay::{
-    ATTACHMENTS_FIELD, INTERNAL_MESSAGE_FIELD, REPLAY_REASONING_FIELD, TOOL_ERROR_FIELD,
-    internal_message_kind, is_internal_message, strip_attachment_references,
+    ATTACHMENTS_FIELD, CONTEXT_COMPACTED_MARKER, INTERNAL_MESSAGE_FIELD, REPLAY_REASONING_FIELD,
+    TOOL_ERROR_FIELD, internal_message_kind, is_internal_message, strip_attachment_references,
 };
 
 mod replay;

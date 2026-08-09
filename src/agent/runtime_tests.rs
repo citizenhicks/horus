@@ -21,6 +21,8 @@ use crate::backend::checkpoint::ExecutionPageRequest;
 use crate::backend::checkpoint::QueuedInput;
 use crate::backend::checkpoint::TranscriptPageRequest;
 use crate::backend::checkpoint::sqlite::SqliteCheckpoint;
+use crate::backend::model::CompactOutput;
+use crate::backend::model::CompactRequest;
 use crate::backend::model::Model;
 use crate::backend::model::ModelEventSink;
 use crate::backend::model::ModelOutput;
@@ -39,6 +41,7 @@ use crate::middleware::Middleware;
 use crate::middleware::MiddlewareStack;
 use crate::middleware::ModelContext;
 use crate::middleware::RuntimeContext;
+use crate::middleware::compaction::Compaction;
 use crate::middleware::steering::Steering;
 use crate::middleware::tools::ApprovalRequirement;
 use crate::middleware::tools::Catalog;
@@ -62,6 +65,8 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 struct TestModel;
+
+struct NativeCompactionModel;
 
 struct ScriptedModel {
     outputs: Mutex<VecDeque<ModelOutput>>,
@@ -672,6 +677,32 @@ impl Model for TestModel {
     }
 }
 
+impl Model for NativeCompactionModel {
+    fn respond<'a>(
+        &'a self,
+        _request: ModelRequest,
+        _events: ModelEventSink,
+    ) -> BoxFuture<'a, Result<ModelOutput>> {
+        Box::pin(async { Ok(scripted_message("done")) })
+    }
+
+    fn compaction_endpoint(&self) -> bool {
+        true
+    }
+
+    fn compact<'a>(&'a self, _request: CompactRequest<'a>) -> BoxFuture<'a, Result<CompactOutput>> {
+        Box::pin(async {
+            CompactOutput::from_output(
+                vec![serde_json::json!({
+                    "type": "compaction",
+                    "encrypted_content": "opaque"
+                })],
+                scripted_usage(),
+            )
+        })
+    }
+}
+
 impl Model for ScriptedModel {
     fn respond<'a>(
         &'a self,
@@ -1144,6 +1175,68 @@ async fn completed_before_model_effects_are_settled_when_a_later_hook_fails() {
             .context
             .iter()
             .any(|item| internal_message_kind(item) == Some("settled"))
+    );
+}
+
+#[tokio::test]
+async fn compaction_marker_survives_transcript_replay() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let config = AgentConfig::new(
+        Arc::new(ModelRouter::new("main", Arc::new(NativeCompactionModel))),
+        Arc::new(Sandbox::new(
+            Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+            ApprovalPolicy::Ask,
+        )),
+        checkpoint_store,
+        MiddlewareStack::new(vec![Arc::new(
+            Compaction::new(1).expect("compaction middleware"),
+        )])
+        .expect("middleware"),
+        "test prompt",
+    )
+    .session_id("durable-compaction");
+    let mut agent = create_agent(config).await.expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "hello".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit input");
+
+    let mut live_markers = 0;
+    loop {
+        match agent.next_event().await.expect("agent event").msg {
+            EventMsg::ContextCompacted => live_markers += 1,
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    let transcript = checkpoints
+        .transcript_page(
+            "durable-compaction",
+            TranscriptPageRequest {
+                before_sequence: None,
+                max_batches: 100,
+            },
+        )
+        .await
+        .expect("load transcript")
+        .into_positioned_items_chronological();
+    let replayed = crate::protocol::replay_events(&transcript, "durable-compaction");
+
+    assert_eq!(live_markers, 1);
+    assert_eq!(
+        replayed
+            .iter()
+            .filter(|event| matches!(event, EventMsg::ContextCompacted))
+            .count(),
+        1
     );
 }
 

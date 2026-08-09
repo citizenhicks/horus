@@ -15,6 +15,7 @@ use crate::protocol::ToolCallEndEvent;
 use crate::protocol::UserMessageEvent;
 
 pub(crate) const INTERNAL_MESSAGE_FIELD: &str = "_horus_internal";
+pub(crate) const CONTEXT_COMPACTED_MARKER: &str = "context_compacted";
 pub(crate) const ATTACHMENTS_FIELD: &str = "_horus_attachments";
 pub(crate) const REPLAY_REASONING_FIELD: &str = "_horus_reasoning";
 pub(crate) const TOOL_ERROR_FIELD: &str = "_horus_is_error";
@@ -55,6 +56,10 @@ pub fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Vec<Event
     let mut tools = BTreeMap::new();
     let complete = tool_complete_boundaries(context.iter().map(|(_, value)| value));
     for (index, (target, value)) in context.iter().enumerate() {
+        if internal_message_kind(value) == Some(CONTEXT_COMPACTED_MARKER) {
+            events.push(EventMsg::ContextCompacted);
+            continue;
+        }
         let message_target = complete
             .binary_search(&(index + 1))
             .is_ok()
@@ -220,6 +225,7 @@ fn value_text(value: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use crate::backend::model::internal_user_message;
+    use crate::backend::model::user_message;
 
     #[test]
     fn replay_uses_only_neutral_reasoning_and_hides_internal_messages() {
@@ -268,6 +274,44 @@ mod tests {
                     checkpoint_sequence: 4,
                     batch_item_count: 1,
                 })
+        ));
+    }
+
+    #[test]
+    fn replay_emits_repeated_compaction_markers_in_transcript_order() {
+        let history = vec![
+            user_message("first"),
+            internal_user_message(CONTEXT_COMPACTED_MARKER, ""),
+            serde_json::json!({"role": "assistant", "content": "answer"}),
+            internal_user_message(CONTEXT_COMPACTED_MARKER, ""),
+            user_message("second"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            (
+                MessageTarget {
+                    checkpoint_sequence: index as u64 + 1,
+                    batch_item_count: 1,
+                },
+                item,
+            )
+        })
+        .collect::<Vec<_>>();
+
+        let replayed = events(&history, "session");
+
+        assert!(matches!(
+            replayed.as_slice(),
+            [
+                EventMsg::UserMessage(first),
+                EventMsg::ContextCompacted,
+                EventMsg::AgentMessage(answer),
+                EventMsg::ContextCompacted,
+                EventMsg::UserMessage(second),
+            ] if first.message == "first"
+                && answer.message == "answer"
+                && second.message == "second"
         ));
     }
 

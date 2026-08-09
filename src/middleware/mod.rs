@@ -321,6 +321,12 @@ impl ModelContext<'_> {
         *self.request_input = input;
     }
 
+    /// Appends a durable replay item without adding it to provider context.
+    pub(crate) fn record_transcript_item(&mut self, item: Value) {
+        self.transcript_delta.push(item);
+        *self.checkpoint_changed = true;
+    }
+
     /// Appends durable input to model context and its transcript journal.
     pub fn push_input(&mut self, item: Value) -> MessageTarget {
         self.request_input.push(item.clone());

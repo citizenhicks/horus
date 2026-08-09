@@ -18,6 +18,7 @@ use crate::backend::model::ModelRequest;
 use crate::backend::model::internal_user_message;
 use crate::backend::model::tool_complete_boundaries;
 use crate::backend::model::user_message;
+use crate::protocol::CONTEXT_COMPACTED_MARKER;
 use crate::protocol::EventMsg;
 use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendTone;
@@ -149,6 +150,7 @@ impl Middleware for Compaction {
             let mut compacted = output.output;
             restore_user_private_fields(&mut compacted, active_user);
             context.replace_input(compacted);
+            context.record_transcript_item(internal_user_message(CONTEXT_COMPACTED_MARKER, ""));
             context.usage.push(output.usage);
             context.events.push(EventMsg::ContextCompacted);
             Ok(())
