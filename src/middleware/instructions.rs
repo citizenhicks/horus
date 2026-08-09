@@ -12,6 +12,13 @@ use super::Middleware;
 use super::manifest::MiddlewareManifest;
 use crate::{Error, Result};
 
+mod text {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_middleware_instructions_text.rs"
+    ));
+}
+
 const OVERRIDE_FILE: &str = "AGENTS.override.md";
 const INSTRUCTIONS_FILE: &str = "AGENTS.md";
 const MAX_INSTRUCTIONS_BYTES: u64 = 40_000;
@@ -19,8 +26,8 @@ const MAX_INSTRUCTIONS_BYTES: u64 = 40_000;
 /// Configuration and presentation metadata for workspace instructions.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "instructions",
-    label: "Workspace instructions",
-    description: "Load optional root AGENTS.md guidance",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: false,
     default_enabled: true,
     settings: &[],

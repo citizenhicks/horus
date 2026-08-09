@@ -18,8 +18,6 @@ use super::image_data_url;
 use super::image_input;
 use super::openai_auth::ApiKeyAuthorization;
 use super::openai_auth::OpenAiAuthorization;
-use super::provider::HostedWebSearch;
-use super::provider::ModelPreset;
 use super::provider::ProviderAuth;
 use super::provider::ProviderBuildConfig;
 use super::provider::ProviderDefinition;
@@ -36,6 +34,13 @@ use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
 use crate::protocol::FrontendSymbol;
+
+mod manifest {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_backend_model_openai_manifest.rs"
+    ));
+}
 use crate::protocol::ModelEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::WebSearchAction;
@@ -407,18 +412,16 @@ pub(super) fn wire_tools(
     tools
 }
 
-const MODELS: &[ModelPreset] = &[];
-const SEARCH: &[HostedWebSearch] = &[HostedWebSearch::Off];
-
 pub(super) const fn generic_provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "responses",
-        "Local and Other",
+        manifest::PROVIDER_LABEL,
         FrontendSymbol::Storage,
-        "Any local or remote OpenAI-compatible Responses endpoint",
+        manifest::PROVIDER_DESCRIPTION,
         ProviderAuth::ApiKey("OPENAI_API_KEY"),
-        MODELS,
-        SEARCH,
+        manifest::MODELS,
+        manifest::DEFAULT_MODEL,
+        manifest::SEARCH,
         build_generic,
     )
     .with_image_input()

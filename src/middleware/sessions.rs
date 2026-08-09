@@ -29,24 +29,33 @@ use crate::protocol::Op;
 use crate::protocol::replay_events;
 use crate::protocol::strip_attachment_references;
 
-/// Default number of chats loaded per catalog page.
-pub const DEFAULT_PAGE_SIZE: usize = 100;
+mod text {
+    include!(concat!(env!("OUT_DIR"), "/src_middleware_sessions_text.rs"));
+}
+
 const MAX_PAGE_SIZE: usize = 1_000;
+const _: () = {
+    assert!(text::DEFAULTS_PAGE_SIZE >= 1);
+    assert!(text::DEFAULTS_PAGE_SIZE <= MAX_PAGE_SIZE as i64);
+    assert!(text::SETTING_PAGE_SIZE_STEP > 0);
+};
+/// Default number of chats loaded per catalog page.
+pub const DEFAULT_PAGE_SIZE: usize = text::DEFAULTS_PAGE_SIZE as usize;
 const SETTINGS: &[MiddlewareSettingManifest] = &[MiddlewareSettingManifest::Integer {
     id: "page_size",
-    label: "Catalog page size",
-    description: "Maximum chats loaded in each catalog page",
+    label: text::SETTING_PAGE_SIZE_LABEL,
+    description: text::SETTING_PAGE_SIZE_DESCRIPTION,
     min: 1,
     max: Some(MAX_PAGE_SIZE as i64),
-    step: 10,
+    step: text::SETTING_PAGE_SIZE_STEP,
     default: DEFAULT_PAGE_SIZE as i64,
 }];
 
 /// Configuration and presentation metadata for durable sessions.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "sessions",
-    label: "Sessions",
-    description: "Resume and fork durable chats; always available",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: true,
     default_enabled: true,
     settings: SETTINGS,
@@ -91,18 +100,18 @@ impl Middleware for Sessions {
                 FrontendCommand {
                     name: "resume".into(),
                     arguments: String::new(),
-                    description: "resume a saved chat".into(),
+                    description: text::COMMAND_RESUME_DESCRIPTION.into(),
                 },
                 FrontendCommand {
                     name: "fork".into(),
                     arguments: String::new(),
-                    description: "create a resumable branch from this chat".into(),
+                    description: text::COMMAND_FORK_DESCRIPTION.into(),
                 },
             ],
             widgets: vec![FrontendWidget {
                 id: "fork".into(),
                 slot: FrontendSlot::MessageActions,
-                text: "Fork chat".into(),
+                text: text::WIDGET_FORK_CHAT.into(),
                 tone: FrontendTone::Neutral,
                 symbol: Some(FrontendSymbol::Branch),
                 icon_only: true,
@@ -161,7 +170,7 @@ async fn fork(context: MiddlewareCommandContext<'_>) -> Result<MiddlewareCommand
         }
         return Ok(MiddlewareCommandOutput::events(vec![
             FrontendEvent::Picker {
-                title: "Fork chat from message".into(),
+                title: text::PICKER_FORK_CHAT_FROM_MESSAGE.into(),
                 options,
             },
         ]));
@@ -223,11 +232,13 @@ fn fork_options(
         .rev()
         .filter_map(|event| {
             let (description, message, target) = match event {
-                EventMsg::UserMessage(message) => {
-                    ("User message", message.message, message.message_target?)
-                }
+                EventMsg::UserMessage(message) => (
+                    text::PICKER_USER_MESSAGE,
+                    message.message,
+                    message.message_target?,
+                ),
                 EventMsg::AgentMessage(message) => (
-                    "Assistant message",
+                    text::PICKER_ASSISTANT_MESSAGE,
                     message.message,
                     message.message_target?,
                 ),
@@ -337,7 +348,7 @@ async fn resume(
     }
     Ok(MiddlewareCommandOutput::events(vec![
         FrontendEvent::Picker {
-            title: "Resume chat".into(),
+            title: text::PICKER_RESUME_CHAT.into(),
             options,
         },
     ]))
@@ -373,7 +384,7 @@ fn resume_page_options(
         .collect::<Vec<_>>();
     if let Some(cursor) = page.next_cursor {
         options.push(FrontendPickerOption {
-            label: "More chats…".into(),
+            label: text::WIDGET_MORE_CHATS.into(),
             description: String::new(),
             detail: String::new(),
             op: Op::CapabilityCommand {

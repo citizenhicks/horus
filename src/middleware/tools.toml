@@ -1,0 +1,33 @@
+[manifest]
+label = "Tools"
+description = "Read and modify workspace files and run sandboxed commands"
+
+[render]
+read_file = "Read"
+write_file = "Write"
+apply_patch = "Patch"
+bash = "Bash"
+start_command = "Start"
+poll_command = "Poll"
+stop_command = "Stop"
+
+[tool.read_file]
+description = "Read a UTF-8 workspace file."
+
+[tool.write_file]
+description = "Write a UTF-8 workspace file."
+
+[tool.apply_patch]
+description = "Apply a unified diff to one existing workspace file."
+
+[tool.bash]
+description = "Run a command in the local sandbox under the active network policy."
+
+[tool.start_command]
+description = "Start a sandboxed command in the background and return an opaque ID."
+
+[tool.poll_command]
+description = "Read incremental background command output; completion consumes the ID."
+
+[tool.stop_command]
+description = "Stop an owned background command and consume its ID."

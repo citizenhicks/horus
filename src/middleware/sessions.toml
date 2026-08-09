@@ -1,0 +1,27 @@
+[manifest]
+label = "Sessions"
+description = "Resume and fork durable chats; always available"
+
+[setting.page_size]
+label = "Catalog page size"
+description = "Maximum chats loaded in each catalog page"
+step = 10
+
+[defaults]
+page_size = 100
+
+[command.resume]
+description = "resume a saved chat"
+
+[command.fork]
+description = "create a resumable branch from this chat"
+
+[widget]
+fork_chat = "Fork chat"
+more_chats = "More chats…"
+
+[picker]
+fork_chat_from_message = "Fork chat from message"
+resume_chat = "Resume chat"
+user_message = "User message"
+assistant_message = "Assistant message"

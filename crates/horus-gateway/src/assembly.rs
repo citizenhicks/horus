@@ -33,8 +33,8 @@ use horus::middleware::{Middleware, MiddlewareStack};
 use horus::protocol::SessionContext;
 
 use crate::config::{
-    ChatSpec, ConfigStore, ConfiguredProvider, CredentialStore, GatewayConfig,
-    effective_reasoning_effort, local_user_name, model_route_id,
+    ChatSpec, ConfigStore, ConfiguredProvider, CredentialStore, DEFAULT_CONTEXT_WINDOW,
+    GatewayConfig, effective_reasoning_effort, local_user_name, model_route_id,
 };
 use crate::cron::CronStore;
 use crate::middleware_manifest::{BuiltinMiddleware, MIDDLEWARE};
@@ -45,7 +45,6 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const DEFAULT_CONTEXT_WINDOW: i64 = 272_000;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_MODEL_ROUTE_BYTES: usize = 4 * 1024;
 
@@ -759,7 +758,7 @@ mod tests {
         let status = provider_status(provider("openai_socket").expect("provider"), false, None);
 
         assert_eq!(status.provider, "openai_socket");
-        assert_eq!(status.label, "OpenAI (API key)");
+        assert_eq!(status.label, "OpenAI");
         assert_eq!(status.symbol, FrontendSymbol::ChatGpt);
         assert_eq!(status.models[0].id, "gpt-5.6-sol");
         assert_eq!(

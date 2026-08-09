@@ -24,35 +24,41 @@ use crate::protocol::FrontendTone;
 use crate::protocol::internal_message_kind;
 use crate::protocol::is_internal_message;
 
+mod text {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_middleware_compaction_text.rs"
+    ));
+}
+
 const KEEP_RECENT_TOKENS: usize = 20_000;
 const MAX_SUMMARY_TOOL_RESULT_CHARS: usize = 2_000;
 const COMPACTION_RESERVE_TOKENS: i64 = 16_384;
+const _: () = {
+    assert!(text::DEFAULTS_COMPACTION_TOKENS >= 1);
+    assert!(text::SETTING_AT_TOKENS_STEP > 0);
+};
 /// Default compaction trigger for middleware instances without an override.
-pub const DEFAULT_COMPACTION_TOKENS: i64 = 250_000;
+pub const DEFAULT_COMPACTION_TOKENS: i64 = text::DEFAULTS_COMPACTION_TOKENS;
 const SETTINGS: &[MiddlewareSettingManifest] = &[MiddlewareSettingManifest::Integer {
     id: "at_tokens",
-    label: "Compact after tokens",
-    description: "Compact conversation history after this many input tokens",
+    label: text::SETTING_AT_TOKENS_LABEL,
+    description: text::SETTING_AT_TOKENS_DESCRIPTION,
     min: 1,
     max: None,
-    step: 10_000,
+    step: text::SETTING_AT_TOKENS_STEP,
     default: DEFAULT_COMPACTION_TOKENS,
 }];
 
 /// Configuration and presentation metadata for compaction.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "compaction",
-    label: "Compaction",
-    description: "Compact long conversations as context fills",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: false,
     default_enabled: true,
     settings: SETTINGS,
 };
-const SUMMARY_SYSTEM_PROMPT: &str = "Summarize coding-agent history for continuation. Do not \
-    continue the conversation. Output only the checkpoint.";
-const SUMMARY_TASK: &str = "Create or update a concise checkpoint with: Goal; Constraints; \
-    Progress (Done, In Progress, Blocked); Key Decisions; Next Steps; Critical Context. Preserve \
-    exact paths, identifiers, commands, and errors.";
 
 /// Compacts visible context after a configurable token threshold.
 pub struct Compaction {
@@ -96,7 +102,7 @@ impl Middleware for Compaction {
             group: None,
             append: false,
             pending: false,
-            text: "context compacted".into(),
+            text: text::RENDER_CONTEXT_COMPACTED.into(),
             files: Vec::new(),
             format: crate::protocol::FrontendBlockFormat::PlainText,
             tone: FrontendTone::Neutral,
@@ -198,7 +204,7 @@ async fn summarize(context: &ModelContext<'_>) -> Result<CompactOutput> {
             context.provider,
             ModelRequest {
                 session_id: &session_id,
-                instructions: SUMMARY_SYSTEM_PROMPT,
+                instructions: text::PROMPT_SUMMARY_SYSTEM,
                 input: &input,
                 tools: &[],
                 allow_hosted_tools: false,
@@ -291,7 +297,7 @@ fn summary_prompt(history: &[Value]) -> Option<String> {
             "\n<previous_summary>\n{summary}\n</previous_summary>\n"
         ));
     }
-    prompt.push_str(&format!("\n{SUMMARY_TASK}"));
+    prompt.push_str(&format!("\n{}", text::PROMPT_SUMMARY_TASK));
     Some(prompt)
 }
 

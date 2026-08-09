@@ -1,0 +1,8 @@
+[search.off]
+label = "Off"
+
+[search.cached]
+label = "Cached"
+
+[search.live]
+label = "Live"

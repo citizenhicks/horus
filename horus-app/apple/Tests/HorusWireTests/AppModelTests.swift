@@ -372,6 +372,46 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.runStats.active)
     }
 
+    func testSessionSnapshotRestoresActiveTurnInterrupt() async throws {
+        let recorder = GatewayRequestRecorder()
+        let interruptSent = expectation(description: "Interrupt sent")
+        let model = try model { request in
+            await recorder.record(request)
+            guard case .submit(_, let submission) = request,
+                  case .interrupt = submission.op
+            else { return }
+            interruptSent.fulfill()
+        }
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        var stats = RunStats()
+        stats.active = RunSummary(
+            sessionId: "chat-1",
+            submissionId: "submission-1",
+            turnId: "turn-1",
+            startedAtMs: 1_000,
+            finishedAtMs: nil,
+            elapsedMs: 500,
+            outcome: nil,
+            modelCalls: 1,
+            toolCalls: 0,
+            failedToolCalls: 0,
+            usage: TokenUsage()
+        )
+
+        model.handle(.sessionChanged(sessionReady(latestSequence: 8, runStats: stats)))
+
+        XCTAssertEqual(model.activeTurnID, "turn-1")
+        model.interrupt()
+        await fulfillment(of: [interruptSent], timeout: 1)
+        let requests = await recorder.requests()
+        guard case .submit(let sessionID, let submission) = try XCTUnwrap(requests.last),
+              case .interrupt(let turnID) = submission.op
+        else { return XCTFail("Expected active-turn interrupt") }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(turnID, "turn-1")
+    }
+
     func testStreamDeltasStayBatchedUntilTheCanonicalMessage() async throws {
         let model = try model()
 
@@ -2858,7 +2898,7 @@ final class AppModelTests: XCTestCase {
         model.agentDraft = composition()
         model.providerStatuses = [ProviderStatus(
             provider: selection.provider,
-            label: "Local and Other",
+            label: "Local",
             symbol: "storage",
             description: "OpenAI-compatible endpoint",
             configured: true,
@@ -2970,7 +3010,7 @@ final class AppModelTests: XCTestCase {
         ), "custom-model")
     }
 
-    func testProviderLabelsStayCompact() throws {
+    func testProviderLabelsUseAdvertisedNames() throws {
         let model = try model()
         let codex = ProviderConfig(
             provider: "openai_codex",
@@ -2980,21 +3020,21 @@ final class AppModelTests: XCTestCase {
             webSearch: .off
         )
         model.providerStatuses = [
-            providerStatus(for: codex, label: "OpenAI (ChatGPT)"),
+            providerStatus(for: codex, label: "Codex"),
             providerStatus(for: ProviderConfig(
                 provider: "openai_socket",
                 model: "gpt-5.6-sol",
                 baseUrl: nil,
                 reasoningEffort: "high",
                 webSearch: .cached
-            ), label: "OpenAI (API key)"),
+            ), label: "OpenAI"),
             providerStatus(for: ProviderConfig(
                 provider: "responses",
                 model: "local-model",
                 baseUrl: "http://localhost:8080/v1",
                 reasoningEffort: nil,
                 webSearch: .off
-            ), label: "Local and Other")
+            ), label: "Local")
         ]
 
         XCTAssertEqual(model.providerLabel(for: "openai_codex"), "Codex")
@@ -3367,9 +3407,35 @@ final class AppModelTests: XCTestCase {
         )]
         model.selectedModelRoute = "current-route"
 
+        let initialRequests = await recorder.requests()
+        let historyRequestCount = initialRequests.filter {
+            if case .getSessionHistory = $0 { return true }
+            return false
+        }.count
+        model.connectionState = .disconnected
+        model.loadEarlierHistory()
+        try await Task.sleep(for: .milliseconds(20))
+        let disconnectedRequests = await recorder.requests()
+        XCTAssertEqual(
+            disconnectedRequests.filter {
+                if case .getSessionHistory = $0 { return true }
+                return false
+            }.count,
+            historyRequestCount
+        )
+
+        model.connectionState = .ready
+        model.loadEarlierHistory()
         model.loadEarlierHistory()
         try await Task.sleep(for: .milliseconds(30))
         let requests = await recorder.requests()
+        XCTAssertEqual(
+            requests.filter {
+                if case .getSessionHistory = $0 { return true }
+                return false
+            }.count,
+            1
+        )
         guard case .getSessionHistory(
             let historyID,
             "chat-1",

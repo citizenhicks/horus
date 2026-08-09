@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use super::openai_auth::OpenAiAuthorization;
 use super::openai_auth::ResolvedAuthorization;
+use super::openai_socket::DEFAULT_MODEL;
 use super::openai_socket::MODELS;
 use super::openai_socket::OpenAiSocket;
 use super::openai_socket::SEARCH;
@@ -52,6 +53,13 @@ use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
 use crate::protocol::FrontendSymbol;
+
+mod manifest {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_backend_model_openai_codex_manifest.rs"
+    ));
+}
 
 const PROVIDER_ID: &str = "openai_codex";
 const HTTP_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -775,7 +783,7 @@ impl DeviceLogin for ChatGptDeviceLogin {
 }
 
 static BROWSER_AUTH: BrowserAuth = BrowserAuth::new(
-    "ChatGPT",
+    manifest::AUTH_LABEL,
     browser_configured,
     browser_credential,
     browser_login,
@@ -803,11 +811,12 @@ fn device_login() -> BoxFuture<'static, Result<Box<dyn DeviceLogin>>> {
 pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         PROVIDER_ID,
-        "OpenAI (ChatGPT)",
+        manifest::PROVIDER_LABEL,
         FrontendSymbol::ChatGpt,
-        "Use a ChatGPT Plus or Pro subscription",
+        manifest::PROVIDER_DESCRIPTION,
         ProviderAuth::Browser(&BROWSER_AUTH),
         MODELS,
+        DEFAULT_MODEL,
         SEARCH,
         build_provider,
     )

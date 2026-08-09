@@ -259,6 +259,7 @@ mod tests {
         let config = default_config();
         let features = features(&[]);
 
+        assert!(validate(&config).is_ok());
         assert!(!config.enabled("tasks"));
         assert!(config.enabled("artifacts"));
         assert!(config.enabled("context_offloading"));

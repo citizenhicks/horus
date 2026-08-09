@@ -7,10 +7,7 @@ use std::sync::Arc;
 
 use super::MAX_TOOL_CALLS;
 use super::REPLAY_REASONING_FIELD;
-use super::provider::{
-    HostedWebSearch, ModelPreset, ProviderAuth, ProviderBuildConfig, ProviderDefinition,
-    ReasoningPreset,
-};
+use super::provider::{ProviderAuth, ProviderBuildConfig, ProviderDefinition};
 use super::transport::MAX_SSE_FRAME_BYTES;
 use super::transport::frame_data;
 use super::transport::push_sse_chunk;
@@ -21,6 +18,13 @@ use super::usage_i64;
 use super::{Model, ModelEventSink, ModelInfo, ModelOutput, ModelRequest, ToolDefinition};
 use super::{image_data_url, image_input};
 use crate::protocol::FrontendSymbol;
+
+mod manifest {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_backend_model_kimi_manifest.rs"
+    ));
+}
 use crate::protocol::ModelEvent;
 use crate::protocol::TokenUsage;
 use crate::{BoxFuture, Error, Result};
@@ -62,18 +66,17 @@ impl Kimi {
         })
     }
 
-    /// Selects a Kimi K3 reasoning effort.
+    /// Selects an effort advertised for this Kimi model.
     pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Result<Self> {
         let effort = effort.into();
-        if self.model != "kimi-k3" {
+        let supported = manifest::MODELS
+            .iter()
+            .find(|model| model.id == self.model)
+            .is_some_and(|model| model.reasoning.iter().any(|preset| preset.id == effort));
+        if !supported {
             return Err(Error::Config(format!(
-                "model `{}` does not support K3 reasoning effort",
+                "model `{}` does not support reasoning effort `{effort}`",
                 self.model
-            )));
-        }
-        if !matches!(effort.as_str(), "low" | "high" | "max") {
-            return Err(Error::Config(format!(
-                "unsupported Kimi reasoning effort `{effort}`"
             )));
         }
         self.reasoning_effort = Some(effort);
@@ -510,54 +513,16 @@ fn decode_usage(usage: Option<&Value>) -> Result<TokenUsage> {
     })
 }
 
-const REASONING: &[ReasoningPreset] = &[
-    ReasoningPreset {
-        id: "low",
-        label: "Low",
-        description: "Prefer speed and lower cost",
-    },
-    ReasoningPreset {
-        id: "high",
-        label: "High",
-        description: "Use deeper reasoning",
-    },
-    ReasoningPreset {
-        id: "max",
-        label: "Maximum",
-        description: "Use K3's maximum reasoning effort",
-    },
-];
-
-const MODELS: &[ModelPreset] = &[
-    ModelPreset {
-        id: "kimi-k3",
-        label: "Kimi K3",
-        description: "Moonshot's agentic coding model",
-        context_window: 1_048_576,
-        reasoning: REASONING,
-        default_reasoning: Some("max"),
-    },
-    ModelPreset {
-        id: "kimi-k2.7-code",
-        label: "Kimi K2.7 Code",
-        description: "Moonshot's coding model",
-        context_window: 262_144,
-        reasoning: &[],
-        default_reasoning: None,
-    },
-];
-
-const SEARCH: &[HostedWebSearch] = &[HostedWebSearch::Off];
-
 pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "kimi",
-        "Kimi",
+        manifest::PROVIDER_LABEL,
         FrontendSymbol::Kimi,
-        "Kimi Chat Completions API",
+        manifest::PROVIDER_DESCRIPTION,
         ProviderAuth::ApiKey("MOONSHOT_API_KEY"),
-        MODELS,
-        SEARCH,
+        manifest::MODELS,
+        manifest::DEFAULT_MODEL,
+        manifest::SEARCH,
         build_provider,
     )
     .with_image_input()

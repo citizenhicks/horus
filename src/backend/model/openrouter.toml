@@ -1,0 +1,4 @@
+[provider]
+label = "OpenRouter"
+description = "Responses API across multiple model vendors"
+web_search = ["off", "live"]

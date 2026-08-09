@@ -41,12 +41,19 @@ const MAX_CLOUDFLARE_TOKEN_BYTES: usize = 16 * 1024;
 const SECONDS_PER_DAY: u64 = 86_400;
 const USAGE_HISTORY_DAYS: u64 = 52 * 7;
 
+mod defaults {
+    include!(concat!(env!("OUT_DIR"), "/defaults.rs"));
+}
+
 /// Default loopback listener used by a local gateway.
 pub const DEFAULT_LISTEN: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8741);
 
 /// Default system prompt installed by `horus-gateway init`.
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Horus, a concise coding agent. Inspect the workspace before editing, make focused changes, preserve unrelated work, and verify the result.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = defaults::DEFAULT_SYSTEM_PROMPT;
+
+/// Context window used for custom models without an advertised preset.
+pub const DEFAULT_CONTEXT_WINDOW: i64 = defaults::DEFAULT_CONTEXT_WINDOW;
 
 /// Certificate paths required by a TLS listener.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,7 +133,10 @@ struct UsageHistory {
 impl Default for AgentComposition {
     fn default() -> Self {
         let provider = default_provider();
-        let model = provider.models().first().expect("default model manifest");
+        let model = provider
+            .default_model()
+            .and_then(|id| provider.model(id))
+            .expect("default model manifest");
         Self {
             provider: ProviderConfig {
                 provider: provider.id().into(),

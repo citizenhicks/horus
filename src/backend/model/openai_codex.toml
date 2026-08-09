@@ -1,0 +1,6 @@
+[provider]
+label = "Codex"
+description = "Use a ChatGPT Plus or Pro subscription"
+
+[auth]
+label = "ChatGPT"

@@ -17,16 +17,18 @@ use crate::protocol::{
 };
 use crate::{BoxFuture, Error, Result};
 
+mod text {
+    include!(concat!(env!("OUT_DIR"), "/src_middleware_tasks_text.rs"));
+}
+
 const STATE_KEY: &str = "tasks.v1";
 const MAX_TODOS: usize = 50;
 const MAX_TODO_BYTES: usize = 500;
-const PROMPT: &str = "Use `write_todos` only for genuinely multi-step work. Keep the list short, mark work in_progress before starting and completed immediately after finishing, and end with a substantive answer.";
-
 /// Configuration and presentation metadata for durable tasks.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "tasks",
-    label: "Tasks",
-    description: "Maintain a durable todo list for multi-step work",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: false,
     default_enabled: false,
     settings: &[],
@@ -71,7 +73,7 @@ impl Middleware for Tasks {
     }
 
     fn prompt_fragment(&self, _runtime: &RuntimeContext) -> Result<Option<String>> {
-        Ok(Some(PROMPT.into()))
+        Ok(Some(text::PROMPT_MAIN.into()))
     }
 
     fn frontend(&self) -> FrontendContribution {
@@ -80,7 +82,7 @@ impl Middleware for Tasks {
             commands: vec![FrontendCommand {
                 name: "tasks".into(),
                 arguments: String::new(),
-                description: "show the current todo list".into(),
+                description: text::COMMAND_TASKS_DESCRIPTION.into(),
             }],
             ..FrontendContribution::default()
         }
@@ -95,7 +97,7 @@ impl Middleware for Tasks {
                     .get("todos")
                     .and_then(Value::as_array)
                     .map_or(0, Vec::len);
-                format!("◉ Tasks {count}")
+                format!("◉ {} {count}", text::RENDER_HEADING)
             },
         )
     }
@@ -138,7 +140,7 @@ impl Tool for WriteTodos {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_todos".into(),
-            description: "Replace the session todo list; an empty list clears it.".into(),
+            description: text::TOOL_WRITE_TODOS_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -241,7 +243,7 @@ fn widget_event(todos: &[Todo]) -> FrontendEvent {
                 total: todos.len(),
             }),
             content: Some(FrontendWidgetContent::ActionList {
-                title: "Tasks".into(),
+                title: text::RENDER_HEADING.into(),
                 items: todos
                     .iter()
                     .enumerate()
@@ -264,7 +266,7 @@ fn widget_event(todos: &[Todo]) -> FrontendEvent {
 
 fn format_todos(todos: &[Todo]) -> String {
     if todos.is_empty() {
-        return "No tasks.".into();
+        return text::RENDER_EMPTY.into();
     }
     todos
         .iter()

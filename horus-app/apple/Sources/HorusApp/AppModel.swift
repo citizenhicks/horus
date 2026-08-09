@@ -2007,15 +2007,7 @@ final class AppModel {
     }
 
     func providerLabel(for provider: String) -> String {
-        let advertised = providerStatuses.first { $0.provider == provider }?.label ?? provider
-        if advertised == "OpenAI (ChatGPT)" { return "Codex" }
-        if let qualifier = advertised.range(of: " (") {
-            return String(advertised[..<qualifier.lowerBound])
-        }
-        let genericSuffix = " and Other"
-        return advertised.hasSuffix(genericSuffix)
-            ? String(advertised.dropLast(genericSuffix.count))
-            : advertised
+        providerStatuses.first { $0.provider == provider }?.label ?? provider
     }
 
     func providerLabel(for choice: ModelChoice) -> String {
@@ -2933,6 +2925,7 @@ final class AppModel {
             upsertWidget(MountedWidget(capability: widget.capability, widget: widget.item))
         }
         runStats = payload.runStats
+        activeTurnID = payload.runStats.active?.turnId
         activeOperation = payload.contributions.compactMap(\.activeInput?.operation).first
         agentDraft = refreshedAgentDraft(
             currentDraft: agentDraft,

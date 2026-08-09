@@ -1,0 +1,18 @@
+[manifest]
+label = "Scheduling"
+description = "Schedule recurring agent work; always available"
+
+[prompt]
+main = "Use `schedule_task` only during an explicit recurring-task setup. During setup, ask only for missing task or timing details, then call it once with standalone task instructions and a five-field cron expression in the host's local time. Outside explicit setup, never call it."
+
+[render]
+schedule = "Schedule"
+
+[tool.schedule_task]
+description = "Save the recurring task confirmed during explicit setup."
+
+[tool.schedule_task.parameter.task]
+description = "Complete standalone task instructions in Markdown."
+
+[tool.schedule_task.parameter.schedule]
+description = "Five-field cron expression evaluated in the host's local time."

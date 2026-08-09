@@ -28,71 +28,78 @@ mod process_group;
 pub(crate) const MAX_FILE_BYTES: usize = 1024 * 1024;
 const MAX_BINARY_FILE_BYTES: usize = 25 * 1024 * 1024;
 
+mod text {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_backend_sandbox_sandbox_text.rs"
+    ));
+}
+
 const APPROVAL_POLICIES: &[MiddlewareSettingChoice] = &[
     MiddlewareSettingChoice {
         value: "ask",
-        label: "Ask",
-        description: "Pause approval-required actions for a human decision",
+        label: text::APPROVAL_POLICY_ASK_LABEL,
+        description: text::APPROVAL_POLICY_ASK_DESCRIPTION,
     },
     MiddlewareSettingChoice {
         value: "allow",
-        label: "Allow · no network",
-        description: "Run approval-required actions without network access",
+        label: text::APPROVAL_POLICY_ALLOW_LABEL,
+        description: text::APPROVAL_POLICY_ALLOW_DESCRIPTION,
     },
     MiddlewareSettingChoice {
         value: "allow_network",
-        label: "Allow · network",
-        description: "Run approval-required actions with network access",
+        label: text::APPROVAL_POLICY_ALLOW_NETWORK_LABEL,
+        description: text::APPROVAL_POLICY_ALLOW_NETWORK_DESCRIPTION,
     },
     MiddlewareSettingChoice {
         value: "auto_approve",
-        label: "Auto approve",
-        description: "Use an independent reviewer with network access; ask when uncertain",
+        label: text::APPROVAL_POLICY_AUTO_APPROVE_LABEL,
+        description: text::APPROVAL_POLICY_AUTO_APPROVE_DESCRIPTION,
     },
 ];
 const REVIEWER_STRICTNESS: &[MiddlewareSettingChoice] = &[
     MiddlewareSettingChoice {
         value: "relaxed",
-        label: "Relaxed",
-        description: "Approve reasonably aligned and bounded actions",
+        label: text::REVIEWER_STRICTNESS_RELAXED_LABEL,
+        description: text::REVIEWER_STRICTNESS_RELAXED_DESCRIPTION,
     },
     MiddlewareSettingChoice {
         value: "standard",
-        label: "Standard",
-        description: "Require actions to be clearly aligned and proportionate",
+        label: text::REVIEWER_STRICTNESS_STANDARD_LABEL,
+        description: text::REVIEWER_STRICTNESS_STANDARD_DESCRIPTION,
     },
     MiddlewareSettingChoice {
         value: "strict",
-        label: "Strict",
-        description: "Require actions to be unambiguous and narrowly scoped",
+        label: text::REVIEWER_STRICTNESS_STRICT_LABEL,
+        description: text::REVIEWER_STRICTNESS_STRICT_DESCRIPTION,
     },
 ];
 const SETTINGS: &[MiddlewareSettingManifest] = &[
     MiddlewareSettingManifest::Select {
         id: "approval_policy",
-        label: "Approval policy",
-        description: "How approval-required actions receive mutation authority",
+        label: text::SETTING_APPROVAL_POLICY_LABEL,
+        description: text::SETTING_APPROVAL_POLICY_DESCRIPTION,
         choices: MiddlewareSettingChoices::Static(APPROVAL_POLICIES),
         unset_label: None,
-        default: Some("auto_approve"),
+        default: Some(text::DEFAULTS_APPROVAL_POLICY),
         max_bytes: 32,
     },
     MiddlewareSettingManifest::Select {
         id: "reviewer_model_route",
-        label: "Reviewer model",
-        description: "Model route used for independent automatic approval review",
+        label: text::SETTING_REVIEWER_MODEL_ROUTE_LABEL,
+        description: text::SETTING_REVIEWER_MODEL_ROUTE_DESCRIPTION,
         choices: MiddlewareSettingChoices::ModelRoutes,
-        unset_label: Some("Inherit main"),
+        unset_label: Some(text::SETTING_REVIEWER_MODEL_ROUTE_UNSET_LABEL),
         default: None,
         max_bytes: 4 * 1024,
     },
     MiddlewareSettingManifest::Select {
         id: "reviewer_strictness",
-        label: "Reviewer strictness",
-        description: "How cautiously the independent reviewer grants authority",
+        label: text::SETTING_REVIEWER_STRICTNESS_LABEL,
+        description: text::SETTING_REVIEWER_STRICTNESS_DESCRIPTION,
         choices: MiddlewareSettingChoices::Static(REVIEWER_STRICTNESS),
         unset_label: None,
-        default: Some("strict"),
+        default: Some(text::DEFAULTS_REVIEWER_STRICTNESS),
         max_bytes: 16,
     },
 ];
@@ -100,8 +107,8 @@ const SETTINGS: &[MiddlewareSettingManifest] = &[
 /// Configuration and presentation metadata for sandbox approval policy.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "sandbox",
-    label: "Sandbox",
-    description: "Control mutation approval and sandbox network access",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: true,
     default_enabled: true,
     settings: SETTINGS,

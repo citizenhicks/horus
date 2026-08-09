@@ -7,25 +7,36 @@ use super::{Middleware, ModelContext, approximate_item_tokens};
 use crate::protocol::{TOOL_ERROR_FIELD, is_internal_message};
 use crate::{BoxFuture, Error, Result};
 
+mod text {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_middleware_context_offloading_text.rs"
+    ));
+}
+
 const MASKED_TOOL_OUTPUT: &str = "[offloaded]";
 
+const _: () = {
+    assert!(text::DEFAULTS_STALE_AFTER_TOKENS >= 1);
+    assert!(text::SETTING_STALE_AFTER_TOKENS_STEP > 0);
+};
 /// Default trailing token window retained by context offloading.
-pub const DEFAULT_STALE_AFTER_TOKENS: i64 = 50_000;
+pub const DEFAULT_STALE_AFTER_TOKENS: i64 = text::DEFAULTS_STALE_AFTER_TOKENS;
 const SETTINGS: &[MiddlewareSettingManifest] = &[MiddlewareSettingManifest::Integer {
     id: "stale_after_tokens",
-    label: "Stale after tokens",
-    description: "Successful tool results older than this trailing window are masked",
+    label: text::SETTING_STALE_AFTER_TOKENS_LABEL,
+    description: text::SETTING_STALE_AFTER_TOKENS_DESCRIPTION,
     min: 1,
     max: None,
-    step: 10_000,
+    step: text::SETTING_STALE_AFTER_TOKENS_STEP,
     default: DEFAULT_STALE_AFTER_TOKENS,
 }];
 
 /// Configuration and presentation metadata for context offloading.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "context_offloading",
-    label: "Context offloading",
-    description: "Mask stale successful tool output from active model context",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: false,
     default_enabled: true,
     settings: SETTINGS,

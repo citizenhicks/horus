@@ -16,11 +16,9 @@ use super::TOOL_ERROR_FIELD;
 use super::ToolDefinition;
 use super::image_input;
 use super::provider::HostedWebSearch;
-use super::provider::ModelPreset;
 use super::provider::ProviderAuth;
 use super::provider::ProviderBuildConfig;
 use super::provider::ProviderDefinition;
-use super::provider::ReasoningPreset;
 use super::transport::MAX_SSE_FRAME_BYTES;
 use super::transport::frame_data;
 use super::transport::push_sse_chunk;
@@ -32,6 +30,13 @@ use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
 use crate::protocol::FrontendSymbol;
+
+mod manifest {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_backend_model_anthropic_manifest.rs"
+    ));
+}
 use crate::protocol::ModelEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::WebSearchAction;
@@ -41,63 +46,6 @@ const API_VERSION: &str = "2023-06-01";
 const MAX_OUTPUT_TOKENS: u64 = 64_000;
 const MAX_CONTENT_BLOCKS: usize = 1_024;
 const RAW_CONTENT: &str = "_anthropic_content";
-
-const REASONING: &[ReasoningPreset] = &[
-    ReasoningPreset {
-        id: "low",
-        label: "Low",
-        description: "Prefer speed and lower cost",
-    },
-    ReasoningPreset {
-        id: "medium",
-        label: "Medium",
-        description: "Balance reasoning and latency",
-    },
-    ReasoningPreset {
-        id: "high",
-        label: "High",
-        description: "Anthropic's default reasoning effort",
-    },
-    ReasoningPreset {
-        id: "xhigh",
-        label: "Extra high",
-        description: "Extended effort for long-horizon work",
-    },
-    ReasoningPreset {
-        id: "max",
-        label: "Maximum",
-        description: "Use maximum available reasoning",
-    },
-];
-
-const MODELS: &[ModelPreset] = &[
-    ModelPreset {
-        id: "claude-sonnet-5",
-        label: "Claude Sonnet 5",
-        description: "Fast frontier model for coding and agents",
-        context_window: 1_000_000,
-        reasoning: REASONING,
-        default_reasoning: Some("high"),
-    },
-    ModelPreset {
-        id: "claude-opus-4-8",
-        label: "Claude Opus 4.8",
-        description: "Highest-capability Anthropic model",
-        context_window: 1_000_000,
-        reasoning: REASONING,
-        default_reasoning: Some("high"),
-    },
-    ModelPreset {
-        id: "claude-haiku-4-5",
-        label: "Claude Haiku 4.5",
-        description: "Fast, economical Anthropic model",
-        context_window: 200_000,
-        reasoning: &[],
-        default_reasoning: None,
-    },
-];
-
-const SEARCH: &[HostedWebSearch] = &[HostedWebSearch::Off, HostedWebSearch::Live];
 
 /// Anthropic's native Messages API provider.
 pub struct Anthropic {
@@ -139,9 +87,14 @@ impl Anthropic {
     /// Enables adaptive thinking at one supported Anthropic effort level.
     pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Result<Self> {
         let effort = effort.into();
-        if !matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
+        let supported = manifest::MODELS
+            .iter()
+            .find(|model| model.id == self.model)
+            .is_some_and(|model| model.reasoning.iter().any(|preset| preset.id == effort));
+        if !supported {
             return Err(Error::Config(format!(
-                "unsupported Anthropic reasoning effort `{effort}`"
+                "model `{}` does not support reasoning effort `{effort}`",
+                self.model
             )));
         }
         self.reasoning_effort = Some(effort);
@@ -678,12 +631,13 @@ fn update_i64(target: &mut i64, value: &Value, path: &str) -> Result<()> {
 pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "anthropic",
-        "Anthropic",
+        manifest::PROVIDER_LABEL,
         FrontendSymbol::Claude,
-        "Native Messages API with adaptive thinking",
+        manifest::PROVIDER_DESCRIPTION,
         ProviderAuth::ApiKey("ANTHROPIC_API_KEY"),
-        MODELS,
-        SEARCH,
+        manifest::MODELS,
+        manifest::DEFAULT_MODEL,
+        manifest::SEARCH,
         build_provider,
     )
     .with_image_input()
@@ -696,10 +650,14 @@ fn build_provider(config: ProviderBuildConfig) -> Result<Arc<dyn Model>> {
         Some(effort) => provider.with_reasoning_effort(effort)?,
         None => provider,
     };
-    let provider = if config.web_search == HostedWebSearch::Live {
-        provider.with_web_search()
-    } else {
-        provider
+    let provider = match config.web_search {
+        HostedWebSearch::Off => provider,
+        HostedWebSearch::Cached => {
+            return Err(Error::Config(
+                "Anthropic does not support cached web search".into(),
+            ));
+        }
+        HostedWebSearch::Live => provider.with_web_search(),
     };
     Ok(Arc::new(provider))
 }

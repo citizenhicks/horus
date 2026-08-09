@@ -29,6 +29,10 @@ use crate::protocol::FrontendBlockFormat;
 use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendTone;
 
+mod text {
+    include!(concat!(env!("OUT_DIR"), "/src_middleware_tools_text.rs"));
+}
+
 const MAX_TOOL_OUTPUT_BYTES: usize = 40_000;
 const MAX_TOOL_UI_BYTES: usize = 512;
 const MAX_TOOL_UI_LINES: usize = 5;
@@ -39,8 +43,8 @@ const MAX_PATCH_MATCH_WORK: usize = 32 * 1024 * 1024;
 /// Configuration and presentation metadata for workspace tools.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "tools",
-    label: "Tools",
-    description: "Read and modify workspace files and run sandboxed commands",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: false,
     default_enabled: true,
     settings: &[],
@@ -435,13 +439,13 @@ pub(crate) fn render_tool_event(
 
 fn tool_heading(name: &str, arguments: &Value) -> String {
     let (label, detail) = match name {
-        "read_file" => ("Read", "path"),
-        "write_file" => ("Write", "path"),
-        "apply_patch" => ("Patch", "path"),
-        "bash" => ("Bash", "command"),
-        "start_command" => ("Start", "command"),
-        "poll_command" => ("Poll", "command_id"),
-        "stop_command" => ("Stop", "command_id"),
+        "read_file" => (text::RENDER_READ_FILE, "path"),
+        "write_file" => (text::RENDER_WRITE_FILE, "path"),
+        "apply_patch" => (text::RENDER_APPLY_PATCH, "path"),
+        "bash" => (text::RENDER_BASH, "command"),
+        "start_command" => (text::RENDER_START_COMMAND, "command"),
+        "poll_command" => (text::RENDER_POLL_COMMAND, "command_id"),
+        "stop_command" => (text::RENDER_STOP_COMMAND, "command_id"),
         _ => return format!("◉ {name} {}", preview_json(arguments)),
     };
     labeled_tool_heading(label, detail, arguments)
@@ -469,7 +473,7 @@ impl Tool for ReadFile {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".into(),
-            description: "Read a UTF-8 workspace file.".into(),
+            description: text::TOOL_READ_FILE_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -503,7 +507,7 @@ impl Tool for WriteFile {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_file".into(),
-            description: "Write a UTF-8 workspace file.".into(),
+            description: text::TOOL_WRITE_FILE_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -553,7 +557,7 @@ impl Tool for ApplyPatch {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "apply_patch".into(),
-            description: "Apply a unified diff to one existing workspace file.".into(),
+            description: text::TOOL_APPLY_PATCH_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -726,8 +730,7 @@ impl Tool for Bash {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".into(),
-            description: "Run a command in the local sandbox under the active network policy."
-                .into(),
+            description: text::TOOL_BASH_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -763,8 +766,7 @@ impl Tool for StartCommand {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "start_command".into(),
-            description: "Start a sandboxed command in the background and return an opaque ID."
-                .into(),
+            description: text::TOOL_START_COMMAND_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -801,8 +803,7 @@ impl Tool for PollCommand {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "poll_command".into(),
-            description: "Read incremental background command output; completion consumes the ID."
-                .into(),
+            description: text::TOOL_POLL_COMMAND_DESCRIPTION.into(),
             parameters: command_id_schema(),
         }
     }
@@ -826,7 +827,7 @@ impl Tool for StopCommand {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "stop_command".into(),
-            description: "Stop an owned background command and consume its ID.".into(),
+            description: text::TOOL_STOP_COMMAND_DESCRIPTION.into(),
             parameters: command_id_schema(),
         }
     }

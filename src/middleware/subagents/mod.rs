@@ -48,54 +48,73 @@ mod runtime;
 
 const MAX_TASK_NAME_BYTES: usize = 64;
 const IDENTITY_KEY: &str = "subagents.identity";
-const DEFAULT_WAIT_MS: u64 = 30_000;
+mod text {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_middleware_subagents_text.rs"
+    ));
+}
+
 const MIN_WAIT_MS: u64 = 10_000;
 const MAX_WAIT_MS: u64 = 3_600_000;
-const DEFAULT_PROMPT: &str = "Complete the task and report concisely to your parent.";
-/// Default maximum child-agent nesting depth.
-pub const DEFAULT_MAX_DEPTH: u8 = 4;
-/// Default number of concurrently active agents, including the root.
-pub const DEFAULT_MAX_CONCURRENCY: usize = 8;
-/// Default number of retained agents, including the root.
-pub const DEFAULT_MAX_AGENTS: usize = 32;
 const MAX_CONFIGURED_DEPTH: u8 = 16;
 const MAX_CONFIGURED_CONCURRENCY: usize = 64;
 const MAX_CONFIGURED_AGENTS: usize = 256;
+const _: () = {
+    assert!(text::DEFAULTS_WAIT_MS >= MIN_WAIT_MS as i64);
+    assert!(text::DEFAULTS_WAIT_MS <= MAX_WAIT_MS as i64);
+    assert!(text::DEFAULTS_MAX_DEPTH >= 1);
+    assert!(text::DEFAULTS_MAX_DEPTH <= MAX_CONFIGURED_DEPTH as i64);
+    assert!(text::DEFAULTS_MAX_CONCURRENCY >= 2);
+    assert!(text::DEFAULTS_MAX_CONCURRENCY <= MAX_CONFIGURED_CONCURRENCY as i64);
+    assert!(text::DEFAULTS_MAX_AGENTS >= text::DEFAULTS_MAX_CONCURRENCY);
+    assert!(text::DEFAULTS_MAX_AGENTS <= MAX_CONFIGURED_AGENTS as i64);
+    assert!(text::SETTING_MAX_DEPTH_STEP > 0);
+    assert!(text::SETTING_MAX_CONCURRENCY_STEP > 0);
+    assert!(text::SETTING_MAX_AGENTS_STEP > 0);
+};
+const DEFAULT_WAIT_MS: u64 = text::DEFAULTS_WAIT_MS as u64;
+/// Default maximum child-agent nesting depth.
+pub const DEFAULT_MAX_DEPTH: u8 = text::DEFAULTS_MAX_DEPTH as u8;
+/// Default number of concurrently active agents, including the root.
+pub const DEFAULT_MAX_CONCURRENCY: usize = text::DEFAULTS_MAX_CONCURRENCY as usize;
+/// Default number of retained agents, including the root.
+pub const DEFAULT_MAX_AGENTS: usize = text::DEFAULTS_MAX_AGENTS as usize;
 const SETTINGS: &[MiddlewareSettingManifest] = &[
     MiddlewareSettingManifest::Select {
         id: "model_route",
-        label: "Default model",
-        description: "Model route used by child agents when a spawn does not select one",
+        label: text::SETTING_MODEL_ROUTE_LABEL,
+        description: text::SETTING_MODEL_ROUTE_DESCRIPTION,
         choices: MiddlewareSettingChoices::ModelRoutes,
-        unset_label: Some("Inherit parent"),
+        unset_label: Some(text::SETTING_MODEL_ROUTE_UNSET_LABEL),
         default: None,
         max_bytes: 4 * 1024,
     },
     MiddlewareSettingManifest::Integer {
         id: "max_depth",
-        label: "Maximum depth",
-        description: "Maximum child-agent nesting depth",
+        label: text::SETTING_MAX_DEPTH_LABEL,
+        description: text::SETTING_MAX_DEPTH_DESCRIPTION,
         min: 1,
         max: Some(MAX_CONFIGURED_DEPTH as i64),
-        step: 1,
+        step: text::SETTING_MAX_DEPTH_STEP,
         default: DEFAULT_MAX_DEPTH as i64,
     },
     MiddlewareSettingManifest::Integer {
         id: "max_concurrency",
-        label: "Maximum concurrency",
-        description: "Maximum active agents, including the root",
+        label: text::SETTING_MAX_CONCURRENCY_LABEL,
+        description: text::SETTING_MAX_CONCURRENCY_DESCRIPTION,
         min: 2,
         max: Some(MAX_CONFIGURED_CONCURRENCY as i64),
-        step: 1,
+        step: text::SETTING_MAX_CONCURRENCY_STEP,
         default: DEFAULT_MAX_CONCURRENCY as i64,
     },
     MiddlewareSettingManifest::Integer {
         id: "max_agents",
-        label: "Maximum agents",
-        description: "Maximum retained agents, including the root",
+        label: text::SETTING_MAX_AGENTS_LABEL,
+        description: text::SETTING_MAX_AGENTS_DESCRIPTION,
         min: 2,
         max: Some(MAX_CONFIGURED_AGENTS as i64),
-        step: 1,
+        step: text::SETTING_MAX_AGENTS_STEP,
         default: DEFAULT_MAX_AGENTS as i64,
     },
 ];
@@ -103,8 +122,8 @@ const SETTINGS: &[MiddlewareSettingManifest] = &[
 /// Configuration and presentation metadata for child-agent collaboration.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "subagents",
-    label: "Subagents",
-    description: "Delegate independent work to durable child agents",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: false,
     default_enabled: true,
     settings: SETTINGS,
@@ -310,7 +329,7 @@ impl Subagents {
             launch_agent,
             default_model: None,
             default_reasoning: None,
-            prompt: DEFAULT_PROMPT.into(),
+            prompt: text::PROMPT_DEFAULT.into(),
             shared: Arc::new(Shared::new(max_concurrency, max_agents)?),
         })
     }
@@ -405,7 +424,7 @@ impl Middleware for Subagents {
             commands: vec![FrontendCommand {
                 name: "subagents".into(),
                 arguments: String::new(),
-                description: "open a subagent thread".into(),
+                description: text::COMMAND_DESCRIPTION.into(),
             }],
             widgets: Vec::new(),
             references: Vec::new(),
@@ -428,12 +447,18 @@ impl Middleware for Subagents {
                 )
             },
             |name, arguments| match name {
-                "spawn_agent" => labeled_tool_heading("Agent", "task_name", arguments),
-                "send_message" => labeled_tool_heading("Message", "target", arguments),
-                "followup_task" => labeled_tool_heading("Follow up", "target", arguments),
-                "list_agents" => labeled_tool_heading("Agents", "path_prefix", arguments),
-                "interrupt_agent" => labeled_tool_heading("Interrupt", "target", arguments),
-                "wait_agent" => labeled_tool_heading("Wait", "timeout_ms", arguments),
+                "spawn_agent" => labeled_tool_heading(text::RENDER_AGENT, "task_name", arguments),
+                "send_message" => labeled_tool_heading(text::RENDER_MESSAGE, "target", arguments),
+                "followup_task" => {
+                    labeled_tool_heading(text::RENDER_FOLLOW_UP, "target", arguments)
+                }
+                "list_agents" => {
+                    labeled_tool_heading(text::RENDER_AGENTS, "path_prefix", arguments)
+                }
+                "interrupt_agent" => {
+                    labeled_tool_heading(text::RENDER_INTERRUPT, "target", arguments)
+                }
+                "wait_agent" => labeled_tool_heading(text::RENDER_WAIT, "timeout_ms", arguments),
                 _ => format!("◉ {name}"),
             },
         )
@@ -470,13 +495,13 @@ impl Middleware for Subagents {
             if options.is_empty() {
                 return Ok(MiddlewareCommandOutput::render(
                     "subagents",
-                    "no subagents",
+                    text::RENDER_EMPTY,
                     FrontendTone::Neutral,
                 ));
             }
             Ok(MiddlewareCommandOutput::events(vec![
                 FrontendEvent::Picker {
-                    title: "Open subagent".into(),
+                    title: text::RENDER_OPEN.into(),
                     options,
                 },
             ]))
@@ -543,27 +568,26 @@ impl Tool for SpawnAgent {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "spawn_agent".into(),
-            description:
-                "Start an async child for independent work; return its canonical task name.".into(),
+            description: text::TOOL_SPAWN_AGENT_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "task_name": {
                         "type": "string",
-                        "description": "1-64 lowercase letters, digits, or underscores."
+                        "description": text::TOOL_SPAWN_AGENT_PARAMETER_TASK_NAME_DESCRIPTION
                     },
                     "message": {"type": "string"},
                     "fork_turns": {
                         "type": "string",
-                        "description": "`none`, `all`, or a positive integer string (default `none`)."
+                        "description": text::TOOL_SPAWN_AGENT_PARAMETER_FORK_TURNS_DESCRIPTION
                     },
                     "model": {
                         "type": "string",
-                        "description": "Registered route; defaults to the child route, then parent."
+                        "description": text::TOOL_SPAWN_AGENT_PARAMETER_MODEL_DESCRIPTION
                     },
                     "reasoning_effort": {
                         "type": "string",
-                        "description": "Reasoning effort for the selected model; defaults to middleware configuration."
+                        "description": text::TOOL_SPAWN_AGENT_PARAMETER_REASONING_EFFORT_DESCRIPTION
                     }
                 },
                 "required": ["task_name", "message"],
@@ -670,7 +694,7 @@ struct MessageArgs {
 
 impl Tool for SendMessage {
     fn definition(&self) -> ToolDefinition {
-        message_definition("send_message", "Queue a message without starting a turn.")
+        message_definition("send_message", text::TOOL_SEND_MESSAGE_DESCRIPTION)
     }
 
     fn call<'a>(
@@ -695,10 +719,7 @@ impl Tool for SendMessage {
 
 impl Tool for FollowupTask {
     fn definition(&self) -> ToolDefinition {
-        message_definition(
-            "followup_task",
-            "Send follow-up work, starting a turn if idle.",
-        )
+        message_definition("followup_task", text::TOOL_FOLLOWUP_TASK_DESCRIPTION)
     }
 
     fn call<'a>(
@@ -823,7 +844,7 @@ impl Tool for ListAgents {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_agents".into(),
-            description: "List agents in this task tree.".into(),
+            description: text::TOOL_LIST_AGENTS_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {"path_prefix": {"type": "string"}},
@@ -866,7 +887,7 @@ impl Tool for InterruptAgent {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "interrupt_agent".into(),
-            description: "Interrupt an agent and return its prior status.".into(),
+            description: text::TOOL_INTERRUPT_AGENT_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {"target": {"type": "string"}},
@@ -907,7 +928,7 @@ impl Tool for WaitAgent {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "wait_agent".into(),
-            description: "Wait for an agent update.".into(),
+            description: text::TOOL_WAIT_AGENT_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

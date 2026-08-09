@@ -33,19 +33,19 @@ use crate::protocol::FrontendSlot;
 use crate::protocol::FrontendTone;
 use crate::protocol::FrontendWidget;
 
+mod text {
+    include!(concat!(env!("OUT_DIR"), "/src_middleware_skills_text.rs"));
+}
+
 const MAX_SKILLS: usize = 64;
 const MAX_SKILL_BYTES: u64 = 40_000;
 const MAX_SKILL_PATH_BYTES: usize = 4_096;
 const SKILL_FILE: &str = "SKILL.md";
-const DEFAULT_PROMPT: &str = "When a skill is named or matches the task, call `load_skill` before \
-                              using it. Load files referenced by its instructions with \
-                              `load_skill`'s `path` argument.";
-
 /// Configuration and presentation metadata for local skills.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "skills",
-    label: "Skills",
-    description: "Discover local SKILL.md capabilities",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: false,
     default_enabled: true,
     settings: &[],
@@ -71,7 +71,7 @@ impl Skills {
         discover_roots(roots, &mut skills, false)?;
         Ok(Self {
             skills,
-            prompt: DEFAULT_PROMPT.into(),
+            prompt: text::PROMPT_DEFAULT.into(),
         })
     }
 
@@ -248,7 +248,7 @@ impl Middleware for Skills {
         render_tool_event(
             event,
             |name| name == "load_skill",
-            |_, arguments| labeled_tool_heading("Skill", "name", arguments),
+            |_, arguments| labeled_tool_heading(text::RENDER_SKILL, "name", arguments),
         )
     }
 }
@@ -267,9 +267,7 @@ impl Tool for LoadSkill {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "load_skill".into(),
-            description: "Load discovered skill instructions or a UTF-8 file relative to its \
-                          directory."
-                .into(),
+            description: text::TOOL_LOAD_SKILL_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -278,7 +276,7 @@ impl Tool for LoadSkill {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": MAX_SKILL_PATH_BYTES,
-                        "description": "Relative path inside the skill; defaults to SKILL.md."
+                        "description": text::TOOL_LOAD_SKILL_PARAMETER_PATH_DESCRIPTION
                     }
                 },
                 "required": ["name"],
@@ -387,7 +385,7 @@ fn skill_metadata(path: &std::path::Path, content: &str) -> (String, String) {
         name.filter(|value| !value.is_empty()).unwrap_or(fallback),
         description
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "Local workflow instructions.".into())
+            .unwrap_or_else(|| text::FALLBACK_SKILL_DESCRIPTION.into())
             .chars()
             .take(500)
             .collect(),

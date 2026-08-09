@@ -1,6 +1,6 @@
 [package]
 name = "horus"
-version = "0.6.6"
+version = "0.6.7"
 edition = "2024"
 rust-version = "1.89"
 description = "A small, modular Rust framework for building coding agents"
@@ -11,7 +11,15 @@ readme = "README.md"
 publish = ["crates-io"]
 keywords = ["agent", "ai", "llm", "openai", "tools"]
 categories = ["asynchronous", "development-tools"]
-include = ["/src/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE", "/NOTICE"]
+include = [
+    "/build.rs",
+    "/src/**",
+    "/tests/**",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+    "/NOTICE",
+]
 
 [lints]
 workspace = true
@@ -39,6 +47,10 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+
+[build-dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

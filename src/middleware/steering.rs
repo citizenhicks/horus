@@ -24,24 +24,33 @@ use crate::protocol::MAX_CAPABILITY_INPUT_BYTES;
 use crate::protocol::Op;
 use crate::protocol::UserMessageEvent;
 
-/// Default number of queued steering messages retained during a turn.
-pub const DEFAULT_MAX_PENDING: usize = 64;
+mod text {
+    include!(concat!(env!("OUT_DIR"), "/src_middleware_steering_text.rs"));
+}
+
 const MAX_PENDING_MESSAGES: usize = 1_024;
+const _: () = {
+    assert!(text::DEFAULTS_MAX_PENDING >= 1);
+    assert!(text::DEFAULTS_MAX_PENDING <= MAX_PENDING_MESSAGES as i64);
+    assert!(text::SETTING_MAX_PENDING_STEP > 0);
+};
+/// Default number of queued steering messages retained during a turn.
+pub const DEFAULT_MAX_PENDING: usize = text::DEFAULTS_MAX_PENDING as usize;
 const SETTINGS: &[MiddlewareSettingManifest] = &[MiddlewareSettingManifest::Integer {
     id: "max_pending",
-    label: "Maximum pending messages",
-    description: "Maximum steering messages queued during an active turn",
+    label: text::SETTING_MAX_PENDING_LABEL,
+    description: text::SETTING_MAX_PENDING_DESCRIPTION,
     min: 1,
     max: Some(MAX_PENDING_MESSAGES as i64),
-    step: 1,
+    step: text::SETTING_MAX_PENDING_STEP,
     default: DEFAULT_MAX_PENDING as i64,
 }];
 
 /// Configuration and presentation metadata for turn steering.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "steering",
-    label: "Steering",
-    description: "Accept guidance during an active turn",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: false,
     default_enabled: true,
     settings: SETTINGS,

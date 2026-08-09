@@ -1,0 +1,55 @@
+[manifest]
+label = "Scratchpad"
+description = "Keep concise session notes and explicitly approved global lessons"
+
+[prompt]
+main = "Use `write_scratchpad` only for concise conclusions that will improve later work in this chat. The scratchpad is a diary of learned facts, decisions, preferences, and reusable lessons, not a reasoning log. Never store chain-of-thought, private reasoning, raw tool or model output, secrets, credentials, or transient progress. Use `promote_scratchpad` only when an exact existing session note should help future chats; promotion requires approval."
+
+[command]
+arguments = "[read|refresh|promote <note-id>|edit <session|global> <note-id>|forget <session|global> <note-id>]"
+description = "read or manage session and global agent notes"
+usage = "! usage: scratchpad [read|refresh|promote <note-id>|edit <session|global> <note-id>|forget <session|global> <note-id>]"
+
+[render]
+remember = "Remember"
+promote = "Promote"
+
+[tool.write_scratchpad]
+description = "Add one concise learned conclusion to this session's scratchpad. Never store reasoning, raw outputs, secrets, or transient narration."
+
+[tool.write_scratchpad.parameter.note]
+description = "Concise reusable fact, decision, preference, or lesson."
+
+[tool.promote_scratchpad]
+description = "Copy one exact existing session scratchpad note into the global scratchpad after approval."
+
+[tool.promote_scratchpad.parameter.note]
+description = "Exact content of an existing session scratchpad note."
+
+[widget]
+text = "Scratchpad"
+global_title = "Global Scratchpad"
+session_title = "Chat Scratchpad"
+
+[action]
+promote = "Promote"
+edit = "Edit"
+delete = "Delete"
+
+[message]
+updated = "Updated the scratchpad note."
+forgot = "Forgot the scratchpad note."
+added_session = "added the session scratchpad note"
+updated_session = "updated the session scratchpad note"
+existing_session = "the session scratchpad already contains that note"
+promoted_global = "promoted the scratchpad note globally"
+upgraded_global = "upgraded the global scratchpad note provenance"
+updated_provenance = "Updated the scratchpad note provenance."
+global_existing = "The global scratchpad already contains that note."
+existing_global = "the global scratchpad already contains that note"
+no_notes = "No notes."
+session_heading = "Session"
+global_heading = "Global"
+agent_observation = "agent observation"
+user_confirmed = "user confirmed"
+verified = "verified"

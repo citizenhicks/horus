@@ -16,14 +16,18 @@ use crate::backend::model::ToolDefinition;
 use crate::protocol::{EventMsg, FrontendBlock, FrontendContribution, SessionFileReference};
 use crate::{BoxFuture, Error, Result};
 
-const PROMPT: &str = "To send a generated file to the user, first create it in the workspace with \
-    another tool, then call `send_artifact` with its relative path.";
+mod text {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_middleware_artifacts_text.rs"
+    ));
+}
 
 /// Configuration metadata for agent-published files.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "artifacts",
-    label: "Artifacts",
-    description: "Let the agent publish workspace files to the current chat",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: false,
     default_enabled: true,
     settings: &[],
@@ -54,7 +58,7 @@ impl Middleware for Artifacts {
     }
 
     fn prompt_fragment(&self, _runtime: &RuntimeContext) -> Result<Option<String>> {
-        Ok(Some(PROMPT.into()))
+        Ok(Some(text::PROMPT_MAIN.into()))
     }
 
     fn frontend(&self) -> FrontendContribution {
@@ -68,7 +72,7 @@ impl Middleware for Artifacts {
         let mut block = render_tool_event(
             event,
             |name| name == "send_artifact",
-            |_, arguments| labeled_tool_heading("Send", "path", arguments),
+            |_, arguments| labeled_tool_heading(text::RENDER_SEND, "path", arguments),
         )?;
         let EventMsg::ToolCallEnd(result) = event else {
             return Some(block);
@@ -81,10 +85,10 @@ impl Middleware for Artifacts {
         };
         block.append = false;
         if session_id == output.session_id {
-            block.text = format!("Sent {}", output.file.name);
+            block.text = format!("{}{}", text::RENDER_SENT_PREFIX, output.file.name);
             block.files = vec![output.file];
         } else {
-            block.text = format!("Artifact unavailable in this session: {}", output.file.name);
+            block.text = format!("{}{}", text::RENDER_UNAVAILABLE_PREFIX, output.file.name);
         }
         Some(block)
     }
@@ -112,13 +116,13 @@ impl Tool for SendArtifact {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "send_artifact".into(),
-            description: "Send one existing workspace file to the user.".into(),
+            description: text::TOOL_SEND_ARTIFACT_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative path to the finished file."
+                        "description": text::TOOL_SEND_ARTIFACT_PARAMETER_PATH_DESCRIPTION
                     }
                 },
                 "required": ["path"],

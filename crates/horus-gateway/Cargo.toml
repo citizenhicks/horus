@@ -1,6 +1,6 @@
 [package]
 name = "horus-gateway"
-version = "0.6.7"
+version = "0.6.8"
 edition = "2024"
 rust-version = "1.89"
 description = "Headless authenticated gateway for Horus frontends"
@@ -20,7 +20,7 @@ base64 = "0.22"
 chrono = "0.4"
 croner = "3"
 futures-util = { version = "0.3", features = ["sink"] }
-horus = { version = "=0.6.6", path = "../.." }
+horus = { version = "=0.6.7", path = "../.." }
 qrcode = { version = "0.14.1", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
@@ -40,6 +40,9 @@ webpki-roots = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+
+[build-dependencies]
+toml = "1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["hostname", "signal"] }

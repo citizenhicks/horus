@@ -1,0 +1,75 @@
+[manifest]
+label = "Subagents"
+description = "Delegate independent work to durable child agents"
+
+[prompt]
+default = "Complete the task and report concisely to your parent."
+
+[setting.model_route]
+label = "Default model"
+description = "Model route used by child agents when a spawn does not select one"
+unset_label = "Inherit parent"
+
+[setting.max_depth]
+label = "Maximum depth"
+description = "Maximum child-agent nesting depth"
+step = 1
+
+[setting.max_concurrency]
+label = "Maximum concurrency"
+description = "Maximum active agents, including the root"
+step = 1
+
+[setting.max_agents]
+label = "Maximum agents"
+description = "Maximum retained agents, including the root"
+step = 1
+
+[defaults]
+wait_ms = 30000
+max_depth = 4
+max_concurrency = 8
+max_agents = 32
+
+[command]
+description = "open a subagent thread"
+
+[render]
+agent = "Agent"
+message = "Message"
+follow_up = "Follow up"
+agents = "Agents"
+interrupt = "Interrupt"
+wait = "Wait"
+open = "Open subagent"
+empty = "no subagents"
+
+[tool.spawn_agent]
+description = "Start an async child for independent work; return its canonical task name."
+
+[tool.spawn_agent.parameter.task_name]
+description = "1-64 lowercase letters, digits, or underscores."
+
+[tool.spawn_agent.parameter.fork_turns]
+description = "`none`, `all`, or a positive integer string (default `none`)."
+
+[tool.spawn_agent.parameter.model]
+description = "Registered route; defaults to the child route, then parent."
+
+[tool.spawn_agent.parameter.reasoning_effort]
+description = "Reasoning effort for the selected model; defaults to middleware configuration."
+
+[tool.send_message]
+description = "Queue a message without starting a turn."
+
+[tool.followup_task]
+description = "Send follow-up work, starting a turn if idle."
+
+[tool.list_agents]
+description = "List agents in this task tree."
+
+[tool.interrupt_agent]
+description = "Interrupt an agent and return its prior status."
+
+[tool.wait_agent]
+description = "Wait for an agent update."

@@ -1,0 +1,4 @@
+[provider]
+label = "Local"
+description = "Any local or remote OpenAI-compatible Responses endpoint"
+web_search = ["off"]

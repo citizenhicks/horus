@@ -46,12 +46,18 @@ use super::provider::ModelPreset;
 use super::provider::ProviderAuth;
 use super::provider::ProviderBuildConfig;
 use super::provider::ProviderDefinition;
-use super::provider::ReasoningPreset;
 use super::transport::account_stream_bytes;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
 use crate::protocol::FrontendSymbol;
+
+mod manifest {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_backend_model_openai_socket_manifest.rs"
+    ));
+}
 use tokio::time::timeout;
 
 const OPENAI_HTTP_URL: &str = "https://api.openai.com/v1";
@@ -141,8 +147,15 @@ impl OpenAiSocket {
     /// Selects a Responses reasoning effort.
     pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Result<Self> {
         let effort = effort.into();
-        if effort.trim().is_empty() {
-            return Err(Error::Config("reasoning effort cannot be empty".into()));
+        let supported = manifest::MODELS
+            .iter()
+            .find(|model| model.id == self.model)
+            .is_some_and(|model| model.reasoning.iter().any(|preset| preset.id == effort));
+        if !supported {
+            return Err(Error::Config(format!(
+                "model `{}` does not support reasoning effort `{effort}`",
+                self.model
+            )));
         }
         self.reasoning_effort = Some(effort);
         Ok(self)
@@ -505,80 +518,19 @@ fn socket_error(error: impl std::fmt::Display) -> Error {
     Error::Provider(format!("WebSocket: {error}").into())
 }
 
-const REASONING: &[ReasoningPreset] = &[
-    ReasoningPreset {
-        id: "none",
-        label: "None",
-        description: "Skip reasoning for the lowest latency",
-    },
-    ReasoningPreset {
-        id: "low",
-        label: "Low",
-        description: "Faster answers for straightforward work",
-    },
-    ReasoningPreset {
-        id: "medium",
-        label: "Medium",
-        description: "Balanced reasoning and latency",
-    },
-    ReasoningPreset {
-        id: "high",
-        label: "High",
-        description: "Deeper reasoning for complex work",
-    },
-    ReasoningPreset {
-        id: "xhigh",
-        label: "Extra high",
-        description: "Extended reasoning for demanding work",
-    },
-    ReasoningPreset {
-        id: "max",
-        label: "Maximum",
-        description: "Maximum reasoning for the hardest work",
-    },
-];
-
-pub(super) const MODELS: &[ModelPreset] = &[
-    ModelPreset {
-        id: "gpt-5.6-sol",
-        label: "Sol",
-        description: "Frontier capability for complex work",
-        context_window: 1_050_000,
-        reasoning: REASONING,
-        default_reasoning: Some("medium"),
-    },
-    ModelPreset {
-        id: "gpt-5.6-terra",
-        label: "Terra",
-        description: "Balance intelligence and cost",
-        context_window: 1_050_000,
-        reasoning: REASONING,
-        default_reasoning: Some("medium"),
-    },
-    ModelPreset {
-        id: "gpt-5.6-luna",
-        label: "Luna",
-        description: "Efficient, high-volume workloads",
-        context_window: 1_050_000,
-        reasoning: REASONING,
-        default_reasoning: Some("medium"),
-    },
-];
-
-pub(super) const SEARCH: &[HostedWebSearch] = &[
-    HostedWebSearch::Off,
-    HostedWebSearch::Cached,
-    HostedWebSearch::Live,
-];
+pub(super) const MODELS: &[ModelPreset] = manifest::MODELS;
+pub(super) const DEFAULT_MODEL: Option<&str> = manifest::DEFAULT_MODEL;
+pub(super) const SEARCH: &[HostedWebSearch] = manifest::SEARCH;
 
 pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "openai_socket",
-        "OpenAI (API key)",
+        manifest::PROVIDER_LABEL,
         FrontendSymbol::ChatGpt,
-        "Persistent Responses WebSocket with native compaction",
+        manifest::PROVIDER_DESCRIPTION,
         ProviderAuth::ApiKey("OPENAI_API_KEY"),
         MODELS,
+        DEFAULT_MODEL,
         SEARCH,
         build_provider,
     )

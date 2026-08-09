@@ -14,6 +14,13 @@ use crate::Error;
 use crate::Result;
 use crate::protocol::FrontendSymbol;
 
+mod text {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_backend_model_provider_text.rs"
+    ));
+}
+
 pub use super::transport::streaming_client;
 pub use reqwest::Client as HttpClient;
 
@@ -61,9 +68,9 @@ impl HostedWebSearch {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Off => "Off",
-            Self::Cached => "Cached",
-            Self::Live => "Live",
+            Self::Off => text::SEARCH_OFF_LABEL,
+            Self::Cached => text::SEARCH_CACHED_LABEL,
+            Self::Live => text::SEARCH_LIVE_LABEL,
         }
     }
 }
@@ -210,6 +217,7 @@ pub struct ProviderDefinition {
     description: &'static str,
     auth: ProviderAuth,
     models: &'static [ModelPreset],
+    default_model: Option<&'static str>,
     web_search: &'static [HostedWebSearch],
     supports_image_input: bool,
     default_base_url: Option<&'static str>,
@@ -228,6 +236,7 @@ impl ProviderDefinition {
         description: &'static str,
         auth: ProviderAuth,
         models: &'static [ModelPreset],
+        default_model: Option<&'static str>,
         web_search: &'static [HostedWebSearch],
         builder: ProviderBuilder,
     ) -> Self {
@@ -238,6 +247,7 @@ impl ProviderDefinition {
             description,
             auth,
             models,
+            default_model,
             web_search,
             supports_image_input: false,
             default_base_url: None,
@@ -285,6 +295,12 @@ impl ProviderDefinition {
     #[must_use]
     pub const fn models(&self) -> &'static [ModelPreset] {
         self.models
+    }
+
+    /// Returns the model selected for a newly configured provider.
+    #[must_use]
+    pub const fn default_model(&self) -> Option<&'static str> {
+        self.default_model
     }
 
     #[must_use]
@@ -467,6 +483,20 @@ mod tests {
             assert!(!provider.symbol().as_str().trim().is_empty());
             assert!(!provider.description().trim().is_empty());
             assert_eq!(provider.web_search().first(), Some(&HostedWebSearch::Off));
+
+            assert_eq!(
+                provider.default_model().is_some(),
+                !provider.models().is_empty(),
+                "provider `{}` must advertise exactly one default model when it has presets",
+                provider.id()
+            );
+            assert!(
+                provider
+                    .default_model()
+                    .is_none_or(|default| provider.model(default).is_some()),
+                "provider `{}` has an unknown default model",
+                provider.id()
+            );
 
             let mut model_ids = BTreeSet::new();
             for model in provider.models() {

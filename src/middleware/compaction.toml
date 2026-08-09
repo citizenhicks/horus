@@ -1,0 +1,18 @@
+[manifest]
+label = "Compaction"
+description = "Compact long conversations as context fills"
+
+[setting.at_tokens]
+label = "Compact after tokens"
+description = "Compact conversation history after this many input tokens"
+step = 10000
+
+[defaults]
+compaction_tokens = 250000
+
+[prompt]
+summary_system = "Summarize coding-agent history for continuation. Do not continue the conversation. Output only the checkpoint."
+summary_task = "Create or update a concise checkpoint with: Goal; Constraints; Progress (Done, In Progress, Blocked); Key Decisions; Next Steps; Critical Context. Preserve exact paths, identifiers, commands, and errors."
+
+[render]
+context_compacted = "context compacted"

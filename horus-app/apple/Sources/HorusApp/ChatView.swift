@@ -208,6 +208,7 @@ private struct TranscriptRowLayout: Identifiable {
 
 private struct TranscriptView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
     let bottomInset: CGFloat
     @Binding var isAtBottom: Bool
     let scrollToBottomRequest: Int
@@ -245,11 +246,22 @@ private struct TranscriptView: View {
                                 ProgressView()
                                     .controlSize(.small)
                             } else {
-                                Label("Load earlier messages", systemImage: "arrow.up")
+                                HorusLabel(
+                                    title: "Load earlier messages",
+                                    glyph: .arrowUp,
+                                    iconColor: palette.accent
+                                )
                             }
                         }
-                        .buttonStyle(.borderless)
+                        .buttonStyle(.horusPlain)
+                        .foregroundStyle(model.canLoadEarlierHistory ? palette.accent : palette.muted)
+                        .tint(palette.accent)
                         .disabled(!model.canLoadEarlierHistory)
+                        .accessibilityLabel(
+                            model.isLoadingEarlierHistory
+                                ? "Loading earlier messages"
+                                : "Load earlier messages"
+                        )
                         Spacer()
                     }
                     .padding(.bottom, rowSpacing)
@@ -285,6 +297,7 @@ private struct TranscriptView: View {
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(.interactively)
+        .refreshable { loadEarlierHistory() }
         .overlay {
             if model.displayedTranscript.isEmpty {
                 emptyState
@@ -331,6 +344,7 @@ private struct TranscriptView: View {
     }
 
     private func loadEarlierHistory() {
+        guard model.canLoadEarlierHistory else { return }
         historyAnchorID = model.displayedTranscript.first?.id
         model.loadEarlierHistory()
     }

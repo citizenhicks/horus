@@ -26,6 +26,13 @@ use crate::protocol::{
 };
 use crate::{BoxFuture, Error, Result};
 
+mod text {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/src_middleware_scratchpad_text.rs"
+    ));
+}
+
 const SESSION_STATE_KEY: &str = "scratchpad.v1";
 const GLOBAL_SCOPE: &str = "scratchpad.global";
 const GLOBAL_STATE_KEY: &str = "entries.v1";
@@ -33,17 +40,12 @@ const MAX_NOTES: usize = 20;
 const MAX_NOTE_BYTES: usize = 500;
 const MAX_BASIS_ID_BYTES: usize = 4 * 1024;
 const MAX_INJECTION_BYTES: usize = 4 * 1024;
-const PROMPT: &str = "Use `write_scratchpad` only for concise conclusions that will improve later \
-    work in this chat. The scratchpad is a diary of learned facts, decisions, preferences, and \
-    reusable lessons, not a reasoning log. Never store chain-of-thought, private reasoning, raw \
-    tool or model output, secrets, credentials, or transient progress. Use `promote_scratchpad` \
-    only when an exact existing session note should help future chats; promotion requires approval.";
 
 /// Configuration and presentation metadata for durable agent notes.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "scratchpad",
-    label: "Scratchpad",
-    description: "Keep concise session notes and explicitly approved global lessons",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: false,
     default_enabled: true,
     settings: &[],
@@ -276,7 +278,7 @@ impl Middleware for Scratchpad {
     }
 
     fn prompt_fragment(&self, _runtime: &RuntimeContext) -> Result<Option<String>> {
-        Ok(Some(PROMPT.into()))
+        Ok(Some(text::PROMPT_MAIN.into()))
     }
 
     fn frontend(&self) -> FrontendContribution {
@@ -286,10 +288,8 @@ impl Middleware for Scratchpad {
             count: None,
             commands: vec![FrontendCommand {
                 name: "scratchpad".into(),
-                arguments:
-                    "[read|refresh|promote <note-id>|edit <session|global> <note-id>|forget <session|global> <note-id>]"
-                        .into(),
-                description: "read or manage session and global agent notes".into(),
+                arguments: text::COMMAND_ARGUMENTS.into(),
+                description: text::COMMAND_DESCRIPTION.into(),
             }],
             widgets: surface_widgets(&Snapshot::default()),
             references: Vec::new(),
@@ -302,8 +302,12 @@ impl Middleware for Scratchpad {
             event,
             |name| matches!(name, "write_scratchpad" | "promote_scratchpad"),
             |name, arguments| match name {
-                "write_scratchpad" => labeled_tool_heading("Remember", "note", arguments),
-                "promote_scratchpad" => labeled_tool_heading("Promote", "note", arguments),
+                "write_scratchpad" => {
+                    labeled_tool_heading(text::RENDER_REMEMBER, "note", arguments)
+                }
+                "promote_scratchpad" => {
+                    labeled_tool_heading(text::RENDER_PROMOTE, "note", arguments)
+                }
                 _ => unreachable!("renderer is guarded by the owned tool names"),
             },
         )
@@ -367,7 +371,7 @@ impl Middleware for Scratchpad {
                         events.extend(
                             MiddlewareCommandOutput::render(
                                 self.name(),
-                                "Updated the scratchpad note.",
+                                text::MESSAGE_UPDATED,
                                 FrontendTone::Success,
                             )
                             .events,
@@ -388,7 +392,7 @@ impl Middleware for Scratchpad {
                             events.extend(
                                 MiddlewareCommandOutput::render(
                                     self.name(),
-                                    "Forgot the scratchpad note.",
+                                    text::MESSAGE_FORGOT,
                                     FrontendTone::Success,
                                 )
                                 .events,
@@ -433,8 +437,8 @@ impl Tool for WriteScratchpad {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_scratchpad".into(),
-            description: "Add one concise learned conclusion to this session's scratchpad. Never store reasoning, raw outputs, secrets, or transient narration.".into(),
-            parameters: note_schema("Concise reusable fact, decision, preference, or lesson."),
+            description: text::TOOL_WRITE_SCRATCHPAD_DESCRIPTION.into(),
+            parameters: note_schema(text::TOOL_WRITE_SCRATCHPAD_PARAMETER_NOTE_DESCRIPTION),
         }
     }
 
@@ -453,11 +457,9 @@ impl Tool for WriteScratchpad {
                 publish_current_widgets(&self.store, &self.session_id, &self.frontend).await?;
             }
             Ok(match outcome {
-                WriteOutcome::Added => "added the session scratchpad note".into(),
-                WriteOutcome::Updated => "updated the session scratchpad note".into(),
-                WriteOutcome::Existing => {
-                    "the session scratchpad already contains that note".into()
-                }
+                WriteOutcome::Added => text::MESSAGE_ADDED_SESSION.into(),
+                WriteOutcome::Updated => text::MESSAGE_UPDATED_SESSION.into(),
+                WriteOutcome::Existing => text::MESSAGE_EXISTING_SESSION.into(),
             })
         })
     }
@@ -473,8 +475,8 @@ impl Tool for PromoteScratchpad {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "promote_scratchpad".into(),
-            description: "Copy one exact existing session scratchpad note into the global scratchpad after approval.".into(),
-            parameters: note_schema("Exact content of an existing session scratchpad note."),
+            description: text::TOOL_PROMOTE_SCRATCHPAD_DESCRIPTION.into(),
+            parameters: note_schema(text::TOOL_PROMOTE_SCRATCHPAD_PARAMETER_NOTE_DESCRIPTION),
         }
     }
 
@@ -497,9 +499,9 @@ impl Tool for PromoteScratchpad {
                 publish_current_widgets(&self.store, &self.session_id, &self.frontend).await?;
             }
             Ok(match outcome {
-                WriteOutcome::Added => "promoted the scratchpad note globally".into(),
-                WriteOutcome::Updated => "upgraded the global scratchpad note provenance".into(),
-                WriteOutcome::Existing => "the global scratchpad already contains that note".into(),
+                WriteOutcome::Added => text::MESSAGE_PROMOTED_GLOBAL.into(),
+                WriteOutcome::Updated => text::MESSAGE_UPGRADED_GLOBAL.into(),
+                WriteOutcome::Existing => text::MESSAGE_EXISTING_GLOBAL.into(),
             })
         })
     }
@@ -630,15 +632,20 @@ fn surface_widgets(snapshot: &Snapshot) -> Vec<FrontendWidget> {
         frontend_widget(
             "navigation",
             FrontendSlot::Navigation,
-            "Scratchpad",
-            action_list_content("Global Scratchpad", Scope::Global, &snapshot.global, None),
+            text::WIDGET_TEXT,
+            action_list_content(
+                text::WIDGET_GLOBAL_TITLE,
+                Scope::Global,
+                &snapshot.global,
+                None,
+            ),
         ),
         frontend_widget(
             "chat_menu",
             FrontendSlot::ChatMenu,
-            "Scratchpad",
+            text::WIDGET_TEXT,
             action_list_content(
-                "Chat Scratchpad",
+                text::WIDGET_SESSION_TITLE,
                 Scope::Session,
                 &snapshot.session,
                 Some(&global_notes),
@@ -701,7 +708,7 @@ fn action_list_item(scope: Scope, entry: &Entry, already_global: bool) -> Fronte
         actions.push(list_action(
             entry,
             FrontendSymbol::Promote,
-            "Promote",
+            text::ACTION_PROMOTE,
             FrontendTone::Neutral,
             format!("promote {}", entry.id),
             None,
@@ -710,7 +717,7 @@ fn action_list_item(scope: Scope, entry: &Entry, already_global: bool) -> Fronte
     actions.push(list_action(
         entry,
         FrontendSymbol::Edit,
-        "Edit",
+        text::ACTION_EDIT,
         FrontendTone::Neutral,
         format!("edit {scope_name} {}", entry.id),
         Some(&entry.note),
@@ -718,7 +725,7 @@ fn action_list_item(scope: Scope, entry: &Entry, already_global: bool) -> Fronte
     actions.push(list_action(
         entry,
         FrontendSymbol::Delete,
-        "Delete",
+        text::ACTION_DELETE,
         FrontendTone::Error,
         format!("forget {scope_name} {}", entry.id),
         None,
@@ -796,11 +803,7 @@ const fn scope_name(scope: Scope) -> &'static str {
 }
 
 fn usage() -> MiddlewareCommandOutput {
-    MiddlewareCommandOutput::render(
-        MANIFEST.id,
-        "! usage: scratchpad [read|refresh|promote <note-id>|edit <session|global> <note-id>|forget <session|global> <note-id>]",
-        FrontendTone::Warning,
-    )
+    MiddlewareCommandOutput::render(MANIFEST.id, text::COMMAND_USAGE, FrontendTone::Warning)
 }
 
 fn command_confirmation(
@@ -810,8 +813,8 @@ fn command_confirmation(
 ) -> MiddlewareCommandOutput {
     let text = match outcome {
         WriteOutcome::Added => format!("Successfully {action} the scratchpad note."),
-        WriteOutcome::Updated => "Updated the scratchpad note provenance.".into(),
-        WriteOutcome::Existing => "The global scratchpad already contains that note.".into(),
+        WriteOutcome::Updated => text::MESSAGE_UPDATED_PROVENANCE.into(),
+        WriteOutcome::Existing => text::MESSAGE_GLOBAL_EXISTING.into(),
     };
     let mut events = widget_events(snapshot);
     events.extend(MiddlewareCommandOutput::render(MANIFEST.id, text, FrontendTone::Success).events);
@@ -820,15 +823,17 @@ fn command_confirmation(
 
 fn format_snapshot(snapshot: &Snapshot) -> String {
     format!(
-        "Session\n{}\n\nGlobal\n{}",
+        "{}\n{}\n\n{}\n{}",
+        text::MESSAGE_SESSION_HEADING,
         format_entries(&snapshot.session),
+        text::MESSAGE_GLOBAL_HEADING,
         format_entries(&snapshot.global)
     )
 }
 
 fn format_entries(entries: &[Entry]) -> String {
     if entries.is_empty() {
-        return "No notes.".into();
+        return text::MESSAGE_NO_NOTES.into();
     }
     entries
         .iter()
@@ -847,9 +852,9 @@ fn entry_metadata(entry: &Entry) -> String {
 
 fn basis_label(basis: &Basis) -> &'static str {
     match basis {
-        Basis::AgentObservation => "agent observation",
-        Basis::UserConfirmed => "user confirmed",
-        Basis::Verified { .. } => "verified",
+        Basis::AgentObservation => text::MESSAGE_AGENT_OBSERVATION,
+        Basis::UserConfirmed => text::MESSAGE_USER_CONFIRMED,
+        Basis::Verified { .. } => text::MESSAGE_VERIFIED,
     }
 }
 

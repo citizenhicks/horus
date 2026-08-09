@@ -14,16 +14,15 @@ use crate::backend::model::ToolDefinition;
 use crate::protocol::{EventMsg, FrontendBlock};
 use crate::{BoxFuture, Result};
 
-const PROMPT: &str = "Use `schedule_task` only during an explicit recurring-task setup. During \
-                      setup, ask only for missing task or timing details, then call it once with \
-                      standalone task instructions and a five-field cron expression in the \
-                      host's local time. Outside explicit setup, never call it.";
+mod text {
+    include!(concat!(env!("OUT_DIR"), "/src_middleware_cron_text.rs"));
+}
 
 /// Configuration and presentation metadata for scheduled work.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "cron",
-    label: "Scheduling",
-    description: "Schedule recurring agent work; always available",
+    label: text::MANIFEST_LABEL,
+    description: text::MANIFEST_DESCRIPTION,
     required: true,
     default_enabled: true,
     settings: &[],
@@ -58,14 +57,14 @@ impl Middleware for Cron {
     }
 
     fn prompt_fragment(&self, _runtime: &RuntimeContext) -> Result<Option<String>> {
-        Ok(Some(PROMPT.into()))
+        Ok(Some(text::PROMPT_MAIN.into()))
     }
 
     fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
         render_tool_event(
             event,
             |name| name == "schedule_task",
-            |_, arguments| labeled_tool_heading("Schedule", "schedule", arguments),
+            |_, arguments| labeled_tool_heading(text::RENDER_SCHEDULE, "schedule", arguments),
         )
     }
 }
@@ -86,17 +85,17 @@ impl Tool for ScheduleTask {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "schedule_task".into(),
-            description: "Save the recurring task confirmed during explicit setup.".into(),
+            description: text::TOOL_SCHEDULE_TASK_DESCRIPTION.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": "Complete standalone task instructions in Markdown."
+                        "description": text::TOOL_SCHEDULE_TASK_PARAMETER_TASK_DESCRIPTION
                     },
                     "schedule": {
                         "type": "string",
-                        "description": "Five-field cron expression evaluated in the host's local time."
+                        "description": text::TOOL_SCHEDULE_TASK_PARAMETER_SCHEDULE_DESCRIPTION
                     }
                 },
                 "required": ["task", "schedule"],

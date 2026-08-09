@@ -1,5 +1,23 @@
 use super::*;
+use crate::backend::model::provider::ProviderCredential;
 use crate::backend::model::user_message;
+
+#[test]
+fn advertised_web_search_modes_build() {
+    let definition = provider();
+    for web_search in definition.web_search().iter().copied() {
+        definition
+            .build(ProviderBuildConfig {
+                credential: ProviderCredential::ApiKey("test-key".into()),
+                model: definition.default_model().expect("default model").into(),
+                base_url: None,
+                reasoning_effort: None,
+                web_search,
+                http: reqwest::Client::new(),
+            })
+            .expect("advertised web search mode builds");
+    }
+}
 
 #[test]
 fn hosted_search_can_be_disabled_per_request() {
