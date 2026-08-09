@@ -822,6 +822,8 @@ private struct EventGroupView: View {
 
 /// Reasoning is its own disclosure: the first row is the summary and expands in place.
 private struct ReasoningLine: View {
+    private static let summaryCharacterLimit = 512
+
     @Environment(\.horusPalette) private var palette
     @State private var isExpanded = false
     let entry: TranscriptEntry
@@ -832,11 +834,13 @@ private struct ReasoningLine: View {
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 HorusIcon(.setup01, size: 13, foreground: palette.muted)
-                HorusMarkdownText(
-                    entry.text,
-                    streaming: entry.pending,
-                    presentation: .text
-                )
+                Group {
+                    if isExpanded {
+                        HorusMarkdownText(entry.text, streaming: entry.pending)
+                    } else {
+                        Text(summary)
+                    }
+                }
                     .font(HorusStyle.bodyFont)
                     .foregroundStyle(palette.muted)
                     .multilineTextAlignment(.leading)
@@ -851,6 +855,22 @@ private struct ReasoningLine: View {
         .buttonStyle(.horusPlain)
         .accessibilityLabel(entry.text)
         .accessibilityHint(isExpanded ? "Collapses the reasoning" : "Expands the reasoning")
+    }
+
+    private var summary: AttributedString {
+        let lineEnd = entry.text.firstIndex(of: "\n") ?? entry.text.endIndex
+        let line = entry.text[..<lineEnd]
+        let end = line.index(
+            line.startIndex,
+            offsetBy: Self.summaryCharacterLimit,
+            limitedBy: line.endIndex
+        ) ?? line.endIndex
+        let source = String(line[..<end])
+        var summary = (try? AttributedString(markdown: source)) ?? AttributedString(source)
+        if end != line.endIndex || lineEnd != entry.text.endIndex {
+            summary.append(AttributedString("…"))
+        }
+        return summary
     }
 }
 
@@ -955,32 +975,17 @@ private struct EventLine: View {
     }
 }
 
-private enum MarkdownPresentation {
-    case blocks
-    case text
-}
-
 private struct HorusMarkdownText: View {
     let text: String
     let streaming: Bool
-    let presentation: MarkdownPresentation
 
-    init(
-        _ text: String,
-        streaming: Bool,
-        presentation: MarkdownPresentation = .blocks
-    ) {
+    init(_ text: String, streaming: Bool) {
         self.text = text
         self.streaming = streaming
-        self.presentation = presentation
     }
 
     var body: some View {
-        StreamingMarkdown(
-            text: normalizedText,
-            streaming: streaming,
-            presentation: presentation
-        )
+        StreamingMarkdown(text: normalizedText, streaming: streaming)
             #if os(iOS)
             .markdownFontGroup(HorusMarkdownFonts())
             #endif
@@ -1006,23 +1011,16 @@ private struct StreamingMarkdown: View {
     @State private var source: StreamingMarkdownSource
     let text: String
     let streaming: Bool
-    let presentation: MarkdownPresentation
 
-    init(text: String, streaming: Bool, presentation: MarkdownPresentation) {
+    init(text: String, streaming: Bool) {
         self.text = text
         self.streaming = streaming
-        self.presentation = presentation
         _source = State(initialValue: StreamingMarkdownSource(text))
     }
 
     var body: some View {
         StreamingMarkdownReader(source) { parseResult in
-            switch presentation {
-            case .blocks:
-                MarkdownView(parseResult)
-            case .text:
-                MarkdownText(parseResult)
-            }
+            MarkdownView(parseResult)
         }
         .onChange(of: update, initial: true) { _, update in
             source.text = update.text
