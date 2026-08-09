@@ -131,19 +131,16 @@ struct ComposerOptionsView: View {
     private var approvalMenu: some View {
         Menu {
             ForEach(approvalOptions) { option in
+                let selected = option.value == approvalValue
                 Button {
                     model.setApprovalPolicyForCurrentChat(option.value)
                 } label: {
-                    if option.value == approvalValue {
-                        HorusPlatformMenuLabel(
-                            title: option.label,
-                            glyph: .check,
-                            systemImage: "checkmark"
-                        )
-                    } else {
-                        Text(option.label)
-                    }
+                    menuOptionLabel(
+                        option.label,
+                        selected: selected
+                    )
                 }
+                .accessibilityAddTraits(selected ? .isSelected : [])
             }
         } label: {
             HorusLabel(
@@ -169,6 +166,8 @@ struct ComposerOptionsView: View {
     @ViewBuilder
     private var modelMenuContent: some View {
         ForEach(distinctModels, id: \.route) { choice in
+            let selected = choice.group == currentChoice?.group
+                && choice.model == currentChoice?.model
             Button {
                 let effort = currentChoice?.reasoningEffort
                 let target = model.modelChoices.first {
@@ -176,41 +175,51 @@ struct ComposerOptionsView: View {
                 } ?? choice
                 model.selectModel(target.route)
             } label: {
-                let selected = choice.group == currentChoice?.group
-                    && choice.model == currentChoice?.model
-                let title = model.modelLabel(for: choice)
-                if selected {
-                    HorusPlatformMenuLabel(
-                        title: title,
-                        glyph: .check,
-                        systemImage: "checkmark"
-                    )
-                } else {
-                    Text(title)
-                }
+                menuOptionLabel(
+                    model.modelLabel(for: choice),
+                    selected: selected,
+                    providerSymbol: model.providerSymbol(for: choice)
+                )
             }
+            .accessibilityAddTraits(selected ? .isSelected : [])
         }
     }
 
     @ViewBuilder
     private var reasoningMenuContent: some View {
         ForEach(reasoningChoices, id: \.route) { choice in
+            let selected = choice.route == model.selectedModelRoute
             Button {
                 model.selectModel(choice.route)
             } label: {
-                let selected = choice.route == model.selectedModelRoute
-                let title = choice.reasoningEffort?.capitalized ?? "Default"
-                if selected {
-                    HorusPlatformMenuLabel(
-                        title: title,
-                        glyph: .check,
-                        systemImage: "checkmark"
-                    )
-                } else {
-                    Text(title)
-                }
+                menuOptionLabel(
+                    choice.reasoningEffort?.capitalized ?? "Default",
+                    selected: selected
+                )
+            }
+            .accessibilityAddTraits(selected ? .isSelected : [])
+        }
+    }
+
+    private func menuOptionLabel(
+        _ title: String,
+        selected: Bool,
+        providerSymbol: String? = nil
+    ) -> some View {
+        Group {
+            if let providerSymbol,
+               let glyph = HorusSymbol.knownGlyph(for: providerSymbol) {
+                HorusPlatformMenuLabel(
+                    title: title,
+                    glyph: glyph,
+                    systemImage: HorusSymbol.systemImage(for: providerSymbol)
+                )
+            } else {
+                Text(title)
             }
         }
+        .fontWeight(selected ? .bold : nil)
+        .foregroundStyle(selected ? palette.accent : Color.primary)
     }
 
     @ViewBuilder

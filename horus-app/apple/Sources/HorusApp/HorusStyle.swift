@@ -549,7 +549,7 @@ struct HorusMenuLabel: View {
         HStack(spacing: 6) {
             if let glyph { HorusIcon(glyph, size: 14, foreground: palette.accent) }
             Text(text)
-                .font(HorusStyle.controlFont)
+                .font(HorusStyle.badgeFont)
                 .lineLimit(1)
                 .truncationMode(.middle)
             if let detail {
