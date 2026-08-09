@@ -243,8 +243,7 @@ private struct TranscriptView: View {
                         Spacer()
                         Button(action: loadEarlierHistory) {
                             if model.isLoadingEarlierHistory {
-                                ProgressView()
-                                    .controlSize(.small)
+                                HorusSpinner(size: 18, foreground: palette.accent)
                             } else {
                                 HorusLabel(
                                     title: "Load earlier messages",
@@ -459,12 +458,7 @@ private struct TranscriptRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         case .reasoning:
-            MarkdownText(entry.text, streaming: entry.pending)
-                .foregroundStyle(palette.muted)
-            .padding(.leading, 14)
-            .overlay(alignment: .leading) {
-                Rectangle().fill(palette.line).frame(width: 2)
-            }
+            ReasoningLine(entry: entry)
         case .event, .error:
             VStack(alignment: .leading, spacing: 6) {
                 TranscriptFileCards(files: entry.files)
@@ -790,13 +784,13 @@ private struct EventGroupView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            // The slot is held whether or not the orb is in it: losing it when the run ends
-            // would shift the summary sideways.
+            // The run's own mark gives way to the spinner while it is still going, so the
+            // slot keeps its size and the summary never shifts sideways.
             Group {
                 if isPending {
-                    ProgressView().controlSize(.mini)
+                    HorusSpinner(size: 15)
                 } else {
-                    Color.clear
+                    HorusIcon(.group01, size: 14, foreground: palette.muted)
                 }
             }
             .frame(width: 18, height: 18)
@@ -823,6 +817,57 @@ private struct EventGroupView: View {
 
     private var isPending: Bool {
         entries.contains(where: \.pending)
+    }
+}
+
+/// Reasoning reads like a tool step: one line by default, opened on the same arrow. A turn
+/// that thinks for a page costs a row until the reader wants it.
+private struct ReasoningLine: View {
+    @Environment(\.horusPalette) private var palette
+    @State private var isExpanded = false
+    let entry: TranscriptEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.easeOut(duration: 0.16)) { isExpanded.toggle() }
+            } label: {
+                line
+            }
+            .buttonStyle(.horusPlain)
+            .accessibilityLabel(title)
+            .accessibilityHint(isExpanded ? "Collapses the reasoning" : "Expands the reasoning")
+            if isExpanded {
+                MarkdownText(entry.text, streaming: entry.pending)
+                    .foregroundStyle(palette.muted)
+                    .padding(.leading, 14)
+                    .overlay(alignment: .leading) {
+                        Rectangle().fill(palette.line).frame(width: 2)
+                    }
+            }
+        }
+    }
+
+    private var line: some View {
+        HStack(spacing: 6) {
+            HorusIcon(.setup01, size: 13, foreground: palette.muted)
+            Text(title)
+                .foregroundStyle(palette.muted)
+            Spacer(minLength: 6)
+            if entry.pending {
+                HorusSpinner(size: 13)
+            } else {
+                HorusIcon(.caretUpDown, size: 12, foreground: palette.muted)
+            }
+        }
+        .font(HorusStyle.metadataFont)
+        .frame(minHeight: 26)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+
+    private var title: String {
+        entry.pending ? "Thinking" : "Reasoning"
     }
 }
 
@@ -869,6 +914,7 @@ private struct EventLine: View {
 
     private var line: some View {
         HStack(spacing: 6) {
+            HorusIcon(glyph, size: 13, foreground: headlineColor)
             Text(middlewareLabel)
                 .foregroundStyle(palette.accent)
             Text("•")
@@ -879,7 +925,7 @@ private struct EventLine: View {
                 .truncationMode(.middle)
             Spacer(minLength: 6)
             if entry.pending {
-                ProgressView().controlSize(.mini)
+                HorusSpinner(size: 13)
             } else if entry.format == "unified_diff" {
                 HorusIcon(.arrowUpRight01, size: 12, foreground: palette.muted)
             } else if !entry.eventDetail.isEmpty {
@@ -895,6 +941,13 @@ private struct EventLine: View {
     /// A diff says more as a count of changed lines than as the word "Code change".
     private var headline: String {
         entry.format == "unified_diff" ? diffSummary(entry.text) : entry.headline
+    }
+
+    private var glyph: HorusGlyph {
+        if entry.kind == .error || entry.tone == "error" { return .xCircle }
+        if entry.format == "unified_diff" { return .fileMagnifyingGlass }
+        if entry.isWebSearch { return .globe02 }
+        return .timelineEvent
     }
 
     private var middlewareLabel: String {
@@ -1506,7 +1559,7 @@ private struct ComposerAttachmentRow: View {
     private var stateControl: some View {
         switch attachment.state {
         case .queued, .uploading:
-            ProgressView().controlSize(.small).frame(width: 26, height: 26)
+            HorusSpinner(size: 15).frame(width: 26, height: 26)
         case .uploaded:
             EmptyView()
         case .failed:

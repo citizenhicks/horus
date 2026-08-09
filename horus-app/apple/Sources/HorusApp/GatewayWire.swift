@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-let gatewayProtocolVersion = 21
+let gatewayProtocolVersion = 22
 let maximumGatewayFrameBytes = 2 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 let maximumSessionFileReferences = 16
@@ -1889,6 +1889,34 @@ struct AgentComposition: Codable, Equatable, Sendable {
     var provider: ProviderConfig
     var middleware: MiddlewareConfig
     var systemPrompt: String
+    var maxModelSteps: UInt64
+}
+
+extension AgentComposition {
+    private enum CodingKeys: String, CodingKey {
+        case provider
+        case middleware
+        case systemPrompt
+        case maxModelSteps
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let maxModelSteps = try container.decode(UInt64.self, forKey: .maxModelSteps)
+        guard maxModelSteps > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .maxModelSteps,
+                in: container,
+                debugDescription: "Maximum model steps must be positive."
+            )
+        }
+        self.init(
+            provider: try container.decode(ProviderConfig.self, forKey: .provider),
+            middleware: try container.decode(MiddlewareConfig.self, forKey: .middleware),
+            systemPrompt: try container.decode(String.self, forKey: .systemPrompt),
+            maxModelSteps: maxModelSteps
+        )
+    }
 }
 
 struct ProviderConfig: Codable, Equatable, Sendable {

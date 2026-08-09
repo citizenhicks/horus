@@ -61,6 +61,17 @@ struct AgentSettingsView: View {
                             )
                         }
                     }
+
+                    HStack(spacing: 5) {
+                        Stepper(value: maxModelSteps, in: 1...UInt64.max) {
+                            Text("Maximum model steps: \(maxModelSteps.wrappedValue.formatted())")
+                        }
+                        SettingsInfoButton(
+                            title: "Maximum model steps",
+                            detail: "Maximum primary model rounds allowed in one run before Horus stops it."
+                        )
+                    }
+                    .sensoryFeedback(.selection, trigger: maxModelSteps.wrappedValue)
                 }
 
                 Section("Capabilities") {
@@ -272,6 +283,13 @@ struct AgentSettingsView: View {
         Binding(
             get: { model.agentDraft?.systemPrompt ?? "" },
             set: { model.agentDraft?.systemPrompt = $0 }
+        )
+    }
+
+    private var maxModelSteps: Binding<UInt64> {
+        Binding(
+            get: { model.agentDraft?.maxModelSteps ?? 1 },
+            set: { model.agentDraft?.maxModelSteps = Swift.max($0, 1) }
         )
     }
 

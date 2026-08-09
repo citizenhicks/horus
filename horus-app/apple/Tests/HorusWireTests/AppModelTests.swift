@@ -87,7 +87,8 @@ final class AppModelTests: XCTestCase {
                     ]
                 ]
             ),
-            systemPrompt: systemPrompt
+            systemPrompt: systemPrompt,
+            maxModelSteps: 256
         )
     }
 
@@ -2833,7 +2834,8 @@ final class AppModelTests: XCTestCase {
                     "context_offloading": ["stale_after_tokens": .integer(50_000)]
                 ]
             ),
-            systemPrompt: "Test"
+            systemPrompt: "Test",
+            maxModelSteps: 256
         )
         model.providerStatuses = [ProviderStatus(
             provider: "kimi",
@@ -3068,7 +3070,8 @@ final class AppModelTests: XCTestCase {
                     "context_offloading": ["stale_after_tokens": .integer(50_000)]
                 ]
             ),
-            systemPrompt: "Active"
+            systemPrompt: "Active",
+            maxModelSteps: 256
         )
         var edited = active
         edited.systemPrompt = "Unsaved active edit"
@@ -4234,11 +4237,26 @@ final class TranscriptEventLineTests: XCTestCase {
             entry(id: "tools/t/1", text: "◉ Bash ls"),
             entry(id: "tools/t/2", text: "◉ Read a.swift"),
             entry(id: "skills/t/3", text: "◉ Read skill review"),
-            entry(id: "tools/t/4", text: "◉ Bash boom", kind: .error, tone: "error")
+            entry(id: "tools/t/4", text: "◉ searching the web"),
+            entry(id: "tools/t/5", text: "◉ Bash boom", kind: .error, tone: "error")
         ]
 
-        XCTAssertEqual(TranscriptEntry.summary(for: entries), "2 tool calls • 1 event • 1 error")
+        XCTAssertEqual(
+            TranscriptEntry.summary(for: entries),
+            "2 tool calls • 1 web search • 1 event • 1 error"
+        )
         XCTAssertEqual(TranscriptEntry.summary(for: [entries[0]]), "1 tool call")
+        // "search" takes -es, which a bare +"s" would get wrong.
+        XCTAssertEqual(
+            TranscriptEntry.summary(for: [entries[3], entries[3]]),
+            "2 web searches"
+        )
+    }
+
+    func testWebSearchIsRecognisedFromTheHeadingOrCapability() {
+        XCTAssertTrue(entry(id: "tools/t/1", text: "◉ Search web nord palette").isWebSearch)
+        XCTAssertTrue(entry(id: "web_search/t/1", text: "◉ Anything").isWebSearch)
+        XCTAssertFalse(entry(id: "tools/t/1", text: "◉ Bash grep -r search .").isWebSearch)
     }
 }
 

@@ -441,24 +441,41 @@ extension TranscriptEntry {
         return parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// "3 tool calls • 2 events • 1 error", in that order, skipping the empty categories.
+    /// Hosted web search reaches the transcript without a capability of its own, so the
+    /// heading is the only signal that an event is one.
+    var isWebSearch: Bool {
+        if capability == "web_search" { return true }
+        let heading = headline.lowercased()
+        return heading.contains("search") && heading.contains("web")
+    }
+
+    /// "3 tool calls • 4 web searches • 2 events • 1 error", skipping the empty categories.
     static func summary(for entries: [TranscriptEntry]) -> String {
         var tools = 0
+        var searches = 0
         var events = 0
         var errors = 0
         for entry in entries {
             if entry.kind == .error || entry.tone == "error" {
                 errors += 1
+            } else if entry.isWebSearch {
+                searches += 1
             } else if entry.capability == "tools" {
                 tools += 1
             } else {
                 events += 1
             }
         }
-        return [(tools, "tool call"), (events, "event"), (errors, "error")]
+        return [(tools, "tool call"), (searches, "web search"), (events, "event"), (errors, "error")]
             .filter { $0.0 > 0 }
-            .map { "\($0.0) \($0.0 == 1 ? $0.1 : $0.1 + "s")" }
+            .map { counted($0.0, $0.1) }
             .joined(separator: " • ")
+    }
+
+    private static func counted(_ count: Int, _ noun: String) -> String {
+        guard count != 1 else { return "1 \(noun)" }
+        let sibilant = ["ch", "sh", "s", "x"].contains { noun.hasSuffix($0) }
+        return "\(count) \(noun)\(sibilant ? "es" : "s")"
     }
 }
 

@@ -85,7 +85,9 @@ struct HorusGlyph: Hashable {
     static let folderPlus = Self("hi.folderPlus")
     static let gear = Self("hi.gear")
     static let gitBranch = Self("hi.gitBranch")
+    static let globe02 = Self("hi.globe02")
     static let go = Self("hi.go")
+    static let group01 = Self("hi.group01")
     static let hardDrives = Self("hi.hardDrives")
     static let image01 = Self("hi.image01")
     static let info = Self("hi.info")
@@ -93,6 +95,7 @@ struct HorusGlyph: Hashable {
     static let key = Self("hi.key")
     static let kimiAi = Self("hi.kimiAi")
     static let link = Self("hi.link")
+    static let loading02 = Self("hi.loading02")
     static let lockOpen = Self("hi.lockOpen")
     static let magnifyingGlass = Self("hi.magnifyingGlass")
     static let markdown = Self("hi.markdown")
@@ -118,11 +121,13 @@ struct HorusGlyph: Hashable {
     static let sidebarSimple = Self("hi.sidebarSimple")
     static let signIn = Self("hi.signIn")
     static let slidersHorizontal = Self("hi.slidersHorizontal")
+    static let setup01 = Self("hi.setup01")
     static let sparkle = Self("hi.sparkle")
     static let squaresFour = Self("hi.squaresFour")
     static let stopFill = Self("hi.stopFill")
     static let terminalWindow = Self("hi.terminalWindow")
     static let text = Self("hi.text")
+    static let timelineEvent = Self("hi.timelineEvent")
     static let trash = Self("hi.trash")
     static let typeScript = Self("hi.typeScript")
     static let userFocus = Self("hi.userFocus")
@@ -159,6 +164,48 @@ struct HorusIcon: View {
         } else {
             icon
         }
+    }
+}
+
+/// The app's own pending mark: the loader glyph, turning once a second.
+///
+/// The angle comes off the clock rather than an `onAppear` animation because streaming turns
+/// rebuild these rows and would visibly restart a `repeatForever` animation. Canvas keeps the
+/// drawing asynchronous; TimelineView still schedules the lightweight view update.
+struct HorusSpinner: View {
+    @Environment(\.horusPalette) private var palette
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    var size = HorusStyle.iconSize
+    var foreground: Color?
+
+    var body: some View {
+        let paused = reduceMotion || scenePhase != .active
+        let tint = foreground ?? palette.muted
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: paused)) { _ in
+            let turn = paused
+                ? 0
+                : ProcessInfo.processInfo.systemUptime.truncatingRemainder(dividingBy: 1)
+            Canvas(rendersAsynchronously: true) { [tint, turn] context, canvasSize in
+                var glyph = context.resolve(
+                    Image(HorusGlyph.loading02.asset).renderingMode(.template)
+                )
+                glyph.shading = .color(tint)
+                context.translateBy(x: canvasSize.width / 2, y: canvasSize.height / 2)
+                context.rotate(by: .degrees(turn * 360))
+                context.draw(
+                    glyph,
+                    in: CGRect(
+                        x: -canvasSize.width / 2,
+                        y: -canvasSize.height / 2,
+                        width: canvasSize.width,
+                        height: canvasSize.height
+                    )
+                )
+            }
+            .frame(width: size, height: size)
+        }
+        .accessibilityHidden(true)
     }
 }
 
