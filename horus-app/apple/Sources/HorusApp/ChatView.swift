@@ -820,54 +820,32 @@ private struct EventGroupView: View {
     }
 }
 
-/// Reasoning reads like a tool step: one line by default, opened on the same arrow. A turn
-/// that thinks for a page costs a row until the reader wants it.
+/// Reasoning is its own disclosure: the first row is the summary and expands in place.
 private struct ReasoningLine: View {
     @Environment(\.horusPalette) private var palette
     @State private var isExpanded = false
     let entry: TranscriptEntry
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Button {
-                withAnimation(.easeOut(duration: 0.16)) { isExpanded.toggle() }
-            } label: {
-                line
-            }
-            .buttonStyle(.horusPlain)
-            .accessibilityLabel(title)
-            .accessibilityHint(isExpanded ? "Collapses the reasoning" : "Expands the reasoning")
-            if isExpanded {
-                MarkdownText(entry.text, streaming: entry.pending)
+        Button {
+            withAnimation(.easeOut(duration: 0.16)) { isExpanded.toggle() }
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                HorusIcon(.setup01, size: 13, foreground: palette.muted)
+                Text(entry.text)
+                    .font(HorusStyle.bodyFont)
                     .foregroundStyle(palette.muted)
-                    .padding(.leading, 14)
-                    .overlay(alignment: .leading) {
-                        Rectangle().fill(palette.line).frame(width: 2)
-                    }
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(isExpanded ? nil : 1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .frame(minHeight: 26)
+            .contentShape(Rectangle())
         }
-    }
-
-    private var line: some View {
-        HStack(spacing: 6) {
-            HorusIcon(.setup01, size: 13, foreground: palette.muted)
-            Text(title)
-                .foregroundStyle(palette.muted)
-            Spacer(minLength: 6)
-            if entry.pending {
-                HorusSpinner(size: 13)
-            } else {
-                HorusIcon(.caretUpDown, size: 12, foreground: palette.muted)
-            }
-        }
-        .font(HorusStyle.metadataFont)
-        .frame(minHeight: 26)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-    }
-
-    private var title: String {
-        entry.pending ? "Thinking" : "Reasoning"
+        .buttonStyle(.horusPlain)
+        .accessibilityLabel(entry.text)
+        .accessibilityHint(isExpanded ? "Collapses the reasoning" : "Expands the reasoning")
     }
 }
 
