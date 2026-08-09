@@ -63,7 +63,7 @@ struct AgentSettingsView: View {
                     }
 
                     HStack(spacing: 5) {
-                        Stepper(value: maxModelSteps, in: 1...UInt64.max) {
+                        Stepper(value: maxModelSteps, in: 1...42_000) {
                             Text("Maximum model steps: \(maxModelSteps.wrappedValue.formatted())")
                         }
                         SettingsInfoButton(
