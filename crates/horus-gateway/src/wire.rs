@@ -47,7 +47,7 @@ mod base64_bytes {
 /// Current gateway protocol version.
 pub const PROTOCOL_VERSION: u16 = 22;
 /// Maximum encoded JSON payload accepted in one frame.
-pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = 20 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Cancellation-safe reader for length-prefixed gateway frames.
@@ -1826,6 +1826,16 @@ mod tests {
             .expect_err("oversized frame must fail");
 
         assert!(matches!(error, Error::Protocol(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn write_frame_accepts_payloads_above_the_previous_two_mebibyte_limit() {
+        let mut writer = tokio::io::sink();
+        let payload = "x".repeat(2 * 1024 * 1024 + 1);
+
+        write_frame(&mut writer, &payload)
+            .await
+            .expect("20 MiB envelope accepts a larger payload");
     }
 
     #[test]

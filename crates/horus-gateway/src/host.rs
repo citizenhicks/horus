@@ -36,9 +36,9 @@ use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig, usage
 use crate::cron::{ActiveCronRun, BeginRun, CronStore};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{
-    AgentComposition, ArtifactKind, ArtifactRecord, CronRunStatus, GitDiffScope, ProfileSnapshot,
-    ProviderConfig, ReadyPayload, RenderedEvent, RenderedPreview, RunStats, RunSummary,
-    ServerFrame, ServerMessage, SessionActivity, SessionActivityState, SessionOutcome,
+    AgentComposition, ArtifactKind, ArtifactRecord, CronRunStatus, GitDiffScope, MAX_FRAME_BYTES,
+    ProfileSnapshot, ProviderConfig, ReadyPayload, RenderedEvent, RenderedPreview, RunStats,
+    RunSummary, ServerFrame, ServerMessage, SessionActivity, SessionActivityState, SessionOutcome,
     SessionReadyPayload, SessionRecord, SessionRunGroup, SessionWidget, VersionedAgentConfig,
     WorkspaceFileScope,
 };
@@ -56,6 +56,7 @@ use self::git::{
 const COMMAND_CAPACITY: usize = 128;
 const BROADCAST_CAPACITY: usize = 512;
 const REPLAY_CAPACITY: usize = 1024;
+const MAX_REPLAY_BYTES: usize = MAX_FRAME_BYTES;
 const ARTIFACT_CAPACITY: usize = 256;
 const SESSION_PAGE_SIZE: usize = 100;
 const RECENT_RUN_LIMIT: usize = 30;
@@ -139,6 +140,7 @@ struct HostState {
     replay_epoch: String,
     sequence: u64,
     replay: VecDeque<ServerFrame>,
+    replay_bytes: usize,
     replay_truncated: bool,
     artifacts: VecDeque<ArtifactRecord>,
     widgets: SessionWidgets,
@@ -677,6 +679,7 @@ impl HostHandle {
             replay_epoch: Uuid::new_v4().to_string(),
             sequence: 0,
             replay: VecDeque::with_capacity(REPLAY_CAPACITY),
+            replay_bytes: 0,
             replay_truncated: false,
             artifacts: VecDeque::with_capacity(ARTIFACT_CAPACITY),
             widgets: BTreeMap::new(),
@@ -1444,6 +1447,7 @@ impl HostState {
         .map_err(internal)?;
         let suppress_history_broadcast = reset_replay_for_restart(
             &mut self.replay,
+            &mut self.replay_bytes,
             &self.running.session_id,
             &replacement.session_id,
         );
@@ -1527,6 +1531,7 @@ impl HostState {
         .map_err(internal)?;
         let suppress_history_broadcast = reset_replay_for_restart(
             &mut self.replay,
+            &mut self.replay_bytes,
             &self.running.session_id,
             &replacement.session_id,
         );
@@ -1625,7 +1630,7 @@ impl HostState {
         Ok(())
     }
 
-    fn record_event(&mut self, event: Event, suppress_broadcast: bool) -> Result<ServerFrame> {
+    fn record_event(&mut self, mut event: Event, suppress_broadcast: bool) -> Result<ServerFrame> {
         if let Some(delta) = live_usage_delta(&mut self.usage_baseline, &event)? {
             let mut gateway = self
                 .gateway
@@ -1645,13 +1650,16 @@ impl HostState {
             }
         }
         let preview = render_preview(&self.running.frontend, &event.msg);
-        self.sequence = self
+        if history.is_some() {
+            omit_raw_session_history(&mut event);
+        }
+        let sequence = self
             .sequence
             .checked_add(1)
             .ok_or_else(|| Error::Config("event sequence overflow".into()))?;
         let frame = ServerFrame::new(ServerMessage::AgentEvent {
             session_id: self.running.session_id.clone(),
-            sequence: self.sequence,
+            sequence,
             event,
             blocks,
             history,
@@ -1659,10 +1667,12 @@ impl HostState {
         });
         self.replay_truncated |= record_and_publish(
             &mut self.replay,
+            &mut self.replay_bytes,
             &self.events,
             frame.clone(),
             suppress_broadcast,
-        );
+        )?;
+        self.sequence = sequence;
         Ok(frame)
     }
 
@@ -2356,6 +2366,12 @@ fn render_history(frontend: &FrontendExtensions, event: &EventMsg) -> Option<Vec
     render_history_with(event, |event| frontend.render(event))
 }
 
+fn omit_raw_session_history(event: &mut Event) {
+    if let EventMsg::SessionHistory(history) = &mut event.msg {
+        history.events.clear();
+    }
+}
+
 fn render_history_with(
     event: &EventMsg,
     render: impl Fn(&EventMsg) -> Vec<FrontendBlock>,
@@ -2411,10 +2427,12 @@ fn event_sequence(frame: &ServerFrame) -> Option<u64> {
 
 fn reset_replay_for_restart(
     replay: &mut VecDeque<ServerFrame>,
+    replay_bytes: &mut usize,
     previous_session: &str,
     next_session: &str,
 ) -> bool {
     replay.clear();
+    *replay_bytes = 0;
     previous_session == next_session
 }
 
@@ -2529,10 +2547,17 @@ fn stored_file_artifact(session_id: &str, file: SessionFileReference) -> Artifac
 
 fn record_and_publish(
     replay: &mut VecDeque<ServerFrame>,
+    replay_bytes: &mut usize,
     events: &broadcast::Sender<ServerFrame>,
     frame: ServerFrame,
     suppress_broadcast: bool,
-) -> bool {
+) -> Result<bool> {
+    let frame_bytes = serde_json::to_vec(&frame)?.len();
+    if frame_bytes > MAX_FRAME_BYTES {
+        return Err(Error::Protocol(format!(
+            "agent event exceeds the {MAX_FRAME_BYTES}-byte gateway frame limit"
+        )));
+    }
     let mut truncated = false;
     if !matches!(
         &frame.message,
@@ -2544,16 +2569,22 @@ fn record_and_publish(
             ..
         }
     ) {
-        if replay.len() == REPLAY_CAPACITY {
-            replay.pop_front();
+        while replay.len() >= REPLAY_CAPACITY
+            || replay_bytes.saturating_add(frame_bytes) > MAX_REPLAY_BYTES
+        {
+            let Some(discarded) = replay.pop_front() else {
+                break;
+            };
+            *replay_bytes = replay_bytes.saturating_sub(serde_json::to_vec(&discarded)?.len());
             truncated = true;
         }
+        *replay_bytes = replay_bytes.saturating_add(frame_bytes);
         replay.push_back(frame.clone());
     }
     if !suppress_broadcast {
         let _ = events.send(frame);
     }
-    truncated
+    Ok(truncated)
 }
 
 fn publish_ready_and_pending(
@@ -2634,6 +2665,8 @@ mod tests {
     use horus::backend::checkpoint::{Checkpoint, TranscriptPageRequest};
     use horus::backend::model::user_message;
     use horus::protocol::{SessionContext, TokenCountEvent, TokenUsageInfo};
+
+    use crate::assembly::INITIAL_REPLAY_BATCHES;
 
     use super::*;
 
@@ -2939,7 +2972,7 @@ mod tests {
                 host.session_id(),
                 TranscriptPageRequest {
                     before_sequence: None,
-                    max_batches: 100,
+                    max_batches: INITIAL_REPLAY_BATCHES,
                 },
             )
             .await
@@ -2961,7 +2994,7 @@ mod tests {
 
         assert_eq!(
             (expected, snapshot.ready.next_before_sequence),
-            (Some(2), Some(2))
+            (Some(82), Some(82))
         );
     }
 
@@ -3293,9 +3326,44 @@ mod tests {
             fatal: false,
         });
         let mut replay = VecDeque::from(vec![frame.clone(); REPLAY_CAPACITY]);
+        let mut replay_bytes =
+            serde_json::to_vec(&frame).expect("encode frame").len() * replay.len();
         let (events, _) = broadcast::channel(1);
-        assert!(record_and_publish(&mut replay, &events, frame, true));
+        assert!(
+            record_and_publish(&mut replay, &mut replay_bytes, &events, frame, true)
+                .expect("record event")
+        );
         assert_eq!(replay.len(), REPLAY_CAPACITY);
+    }
+
+    #[test]
+    fn replay_is_bounded_by_encoded_bytes() {
+        let (events, _) = broadcast::channel(1);
+        let mut replay = VecDeque::new();
+        let mut replay_bytes = 0;
+        let large_message = "x".repeat(MAX_REPLAY_BYTES / 2);
+        let first = ServerFrame::new(ServerMessage::Error {
+            code: "first".into(),
+            message: large_message.clone(),
+            fatal: false,
+        });
+        let second = ServerFrame::new(ServerMessage::Error {
+            code: "second".into(),
+            message: large_message,
+            fatal: false,
+        });
+
+        assert!(
+            !record_and_publish(&mut replay, &mut replay_bytes, &events, first, true)
+                .expect("record first frame")
+        );
+        assert!(
+            record_and_publish(&mut replay, &mut replay_bytes, &events, second, true)
+                .expect("record second frame")
+        );
+
+        assert_eq!(replay.len(), 1);
+        assert!(replay_bytes <= MAX_REPLAY_BYTES);
     }
 
     #[test]
@@ -3305,13 +3373,17 @@ mod tests {
             message: "old session".into(),
             fatal: false,
         })]);
+        let mut replay_bytes = serde_json::to_vec(&replay[0]).expect("encode frame").len();
 
-        let suppress = reset_replay_for_restart(&mut replay, "session-a", "session-a");
+        let suppress =
+            reset_replay_for_restart(&mut replay, &mut replay_bytes, "session-a", "session-a");
 
         assert!(replay.is_empty());
+        assert_eq!(replay_bytes, 0);
         assert!(suppress);
         assert!(!reset_replay_for_restart(
             &mut replay,
+            &mut replay_bytes,
             "session-a",
             "session-b"
         ));
@@ -3322,7 +3394,14 @@ mod tests {
             message: "recorded only".into(),
             fatal: false,
         });
-        record_and_publish(&mut replay, &events, history.clone(), true);
+        record_and_publish(
+            &mut replay,
+            &mut replay_bytes,
+            &events,
+            history.clone(),
+            true,
+        )
+        .expect("record history");
 
         assert_eq!(replay.back(), Some(&history));
         assert!(matches!(
@@ -3335,6 +3414,7 @@ mod tests {
     fn resume_requests_are_broadcast_without_entering_replay() {
         let (events, mut receiver) = broadcast::channel(1);
         let mut replay = VecDeque::new();
+        let mut replay_bytes = 0;
         let frame = ServerFrame::new(ServerMessage::AgentEvent {
             session_id: "source".into(),
             sequence: 1,
@@ -3352,9 +3432,17 @@ mod tests {
             preview: None,
         });
 
-        record_and_publish(&mut replay, &events, frame.clone(), false);
+        record_and_publish(
+            &mut replay,
+            &mut replay_bytes,
+            &events,
+            frame.clone(),
+            false,
+        )
+        .expect("broadcast resume request");
 
         assert!(replay.is_empty());
+        assert_eq!(replay_bytes, 0);
         assert_eq!(receiver.try_recv().expect("live resume request"), frame);
     }
 
@@ -3385,7 +3473,7 @@ mod tests {
     }
 
     #[test]
-    fn session_history_carries_rendered_blocks_and_child_actions() {
+    fn session_history_carries_rendered_blocks_without_duplicate_source_events() {
         let action = Op::CapabilityCommand {
             capability: "subagents".into(),
             command: "subagents".into(),
@@ -3439,6 +3527,18 @@ mod tests {
             &rendered[1].event,
             EventMsg::Frontend(FrontendEvent::Widget { item, .. })
                 if item.action.as_ref() == Some(&action)
+        ));
+
+        let mut wire_event = Event {
+            submission_id: None,
+            msg: event,
+        };
+        omit_raw_session_history(&mut wire_event);
+
+        assert!(matches!(
+            wire_event.msg,
+            EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent { events })
+                if events.is_empty()
         ));
     }
 

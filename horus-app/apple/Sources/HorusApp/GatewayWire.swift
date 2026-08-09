@@ -4,7 +4,7 @@ import UIKit
 #endif
 
 let gatewayProtocolVersion = 22
-let maximumGatewayFrameBytes = 2 * 1024 * 1024
+let maximumGatewayFrameBytes = 20 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 let maximumSessionFileReferences = 16
 

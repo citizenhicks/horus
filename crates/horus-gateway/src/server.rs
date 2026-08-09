@@ -52,7 +52,7 @@ const MAX_HISTORY_BATCHES: usize = 100;
 const MAX_PENDING_UPLOADS: usize = 8;
 const WEBSOCKET_BRIDGE_BYTES: usize = 16 * 1024;
 
-const _: () = assert!(MAX_FRAME_BYTES < 1 << 24);
+const _: () = assert!(MAX_FRAME_BYTES <= u32::MAX as usize);
 
 struct WebSocketUpgradePolicy {
     expected_host: Option<String>,
