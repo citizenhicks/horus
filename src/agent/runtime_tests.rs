@@ -1113,7 +1113,7 @@ async fn provider_failure_records_one_failed_execution() {
 }
 
 #[tokio::test]
-async fn automatic_approval_uses_an_isolated_toolless_review_and_counts_usage() {
+async fn automatic_approval_counts_isolated_review_usage_without_replacing_primary_usage() {
     let workspace = tempfile::tempdir().expect("workspace");
     let checkpoints = Arc::new(
         SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
@@ -1151,16 +1151,16 @@ async fn automatic_approval_uses_an_isolated_toolless_review_and_counts_usage() 
             attachments: Vec::new(),
         })
         .expect("submit input");
-    let mut usage_totals = Vec::new();
+    let mut usage_events = Vec::new();
     loop {
         match agent.next_event().await.expect("agent event").msg {
-            EventMsg::TokenCount(count) => usage_totals.push(
-                count
-                    .info
-                    .expect("usage info")
-                    .total_token_usage
-                    .total_tokens,
-            ),
+            EventMsg::TokenCount(count) => {
+                let usage = count.info.expect("usage info");
+                usage_events.push((
+                    usage.total_token_usage.total_tokens,
+                    usage.last_token_usage.total_tokens,
+                ));
+            }
             EventMsg::TurnComplete(_) => break,
             _ => {}
         }
@@ -1194,7 +1194,7 @@ async fn automatic_approval_uses_an_isolated_toolless_review_and_counts_usage() 
     );
     assert_eq!(saved.total_usage.total_tokens, 9);
     assert_eq!(saved.last_usage, Some(scripted_usage()));
-    assert_eq!(usage_totals, [1, 8, 9]);
+    assert_eq!(usage_events, [(1, 1), (8, 1), (9, 1)]);
     assert_eq!(
         (
             execution.outcome,
