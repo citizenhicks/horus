@@ -104,6 +104,7 @@ actor GatewayClient {
             throw GatewayWireError.invalidEndpoint("The WebSocket gateway address is invalid.")
         }
         let task = URLSession.shared.webSocketTask(with: url)
+        task.maximumMessageSize = maximumGatewayFrameBytes
         let generation = UUID()
         connectionGeneration = generation
         webSocketTask = task
