@@ -14,28 +14,49 @@ fn base_url_rejects_serializable_secret_locations() {
 
 #[test]
 fn responses_input_strips_only_top_level_provider_metadata() {
-    let input = vec![serde_json::json!({
-        "type": "function_call",
-        "arguments": {"_keep": true},
-        "_horus_reasoning": "Plan.",
-        "_provider_internal": [{"type": "thinking"}]
-    })];
+    let input = vec![
+        serde_json::json!({
+            "type": "function_call",
+            "arguments": {"_keep": true},
+            "_horus_reasoning": "Plan.",
+            "_provider_internal": [{"type": "thinking"}]
+        }),
+        serde_json::json!({
+            "type": "reasoning",
+            "encrypted_content": "opaque",
+            "format": "openai-responses-v1",
+            "summary": []
+        }),
+    ];
 
     assert_eq!(
         wire_input(&input, true).expect("wire input"),
-        vec![serde_json::json!({
-            "type": "function_call",
-            "arguments": {"_keep": true}
-        })]
+        vec![
+            serde_json::json!({
+                "type": "function_call",
+                "arguments": {"_keep": true}
+            }),
+            serde_json::json!({
+                "type": "reasoning",
+                "encrypted_content": "opaque",
+                "summary": []
+            }),
+        ]
     );
+}
 
+#[test]
+fn responses_decode_strips_reasoning_wire_metadata() {
     let decoded = decode_response(serde_json::json!({
         "output": [{
             "type": "reasoning",
+            "format": "openai-responses-v1",
             "summary": [{"type": "summary_text", "text": "Plan."}]
         }]
     }))
     .expect("decode response");
+
+    assert_eq!(decoded.output()[0].get("format"), None);
     assert_eq!(decoded.output()[0][REPLAY_REASONING_FIELD], "Plan.");
 }
 
