@@ -157,6 +157,63 @@ struct HorusIcon: View {
     }
 }
 
+/// A band of light travelling across a label for as long as the work behind it is running.
+///
+/// Built like the spinner and for the same reason: the phase comes off the clock rather than
+/// a `repeatForever` animation, because a streaming turn rebuilds these rows constantly and
+/// a repeating animation restarts — visibly stuttering — on every rebuild. The band is
+/// masked by the content, so it lights the glyphs rather than a rectangle around them.
+private struct HorusRunningShimmer: ViewModifier {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    let active: Bool
+
+    private static let period = 1.6
+
+    func body(content: Content) -> some View {
+        let paused = reduceMotion || scenePhase != .active
+        if active, !paused {
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { _ in
+                let phase = ProcessInfo.processInfo.systemUptime
+                    .truncatingRemainder(dividingBy: Self.period) / Self.period
+                // The row is dimmed and a full-strength copy of itself is revealed through a
+                // travelling band. Painting light *over* the row instead does nothing here:
+                // these labels are already near-white, and white on white is white.
+                content
+                    .opacity(0.5)
+                    .overlay {
+                        content
+                            .mask {
+                                GeometryReader { proxy in
+                                    let travel = proxy.size.width + 200
+                                    LinearGradient(
+                                        colors: [.clear, .white, .white, .clear],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                    .frame(width: 120)
+                                    .offset(x: CGFloat(phase) * travel - 100)
+                                }
+                            }
+                            .allowsHitTesting(false)
+                    }
+            }
+        } else if active {
+            // Reduce Motion and inactive scenes retain a non-animated pending cue.
+            content.opacity(0.5)
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    /// Runs a shimmer across this view while `active` is true.
+    func horusRunningShimmer(active: Bool) -> some View {
+        modifier(HorusRunningShimmer(active: active))
+    }
+}
+
 /// The app's own pending mark: the loader glyph, turning once a second.
 ///
 /// The angle comes off the clock rather than an `onAppear` animation because streaming turns

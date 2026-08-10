@@ -786,20 +786,18 @@ private struct EventGroupView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            // The run's own mark gives way to the spinner while it is still going, so the
-            // slot keeps its size and the summary never shifts sideways.
-            Group {
-                if isPending {
-                    HorusSpinner(size: 15)
-                } else {
-                    HorusIcon(.group01, size: 14, foreground: palette.muted)
-                }
-            }
-            .frame(width: 18, height: 18)
+            // The group keeps its own mark whether or not it is running: the summary beside
+            // it shimmers while the run is live, so swapping in a spinner said the same
+            // thing twice and cost the row its identity while it mattered most.
+            HorusIcon(.group01, size: 14, foreground: palette.muted)
+                .frame(width: 18, height: 18)
             Text(TranscriptEntry.summary(for: lines))
                 .font(HorusStyle.metadataFont)
                 .foregroundStyle(palette.muted)
                 .lineLimit(1)
+                // Collapsed, the header is all the reader sees of a run in progress, so the
+                // shimmer rides the summary rather than the whole row.
+                .horusRunningShimmer(active: isPending)
             Spacer(minLength: 8)
             HorusIcon(.caretUpDown, size: 13, foreground: palette.muted)
         }
@@ -850,6 +848,8 @@ private struct ReasoningLine: View {
                     .truncationMode(.tail)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .allowsHitTesting(false)
+                    // Reasoning streams in, so the same running mark applies while it does.
+                    .horusRunningShimmer(active: entry.pending && !isExpanded)
             }
             .frame(minHeight: 26)
             .contentShape(Rectangle())
@@ -920,18 +920,22 @@ private struct EventLine: View {
     private var line: some View {
         HStack(spacing: 6) {
             HorusIcon(glyph, size: 13, foreground: headlineColor)
-            Text(middlewareLabel)
-                .foregroundStyle(palette.accent)
-            Text("•")
-                .foregroundStyle(palette.muted)
-            Text(headline)
-                .foregroundStyle(headlineColor)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            HStack(spacing: 6) {
+                Text(middlewareLabel)
+                    .foregroundStyle(palette.accent)
+                Text("•")
+                    .foregroundStyle(palette.muted)
+                Text(headline)
+                    .foregroundStyle(headlineColor)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            // A step reads as running while it runs, not only once it has landed.
+            .horusRunningShimmer(active: entry.pending)
             Spacer(minLength: 6)
-            if entry.pending {
-                HorusSpinner(size: 13)
-            } else if entry.format == "unified_diff" {
+            // No spinner: the shimmer already says this step is running, and two marks for
+            // one fact left the trailing slot flickering between them as steps completed.
+            if entry.format == "unified_diff" {
                 HorusIcon(.arrowUpRight01, size: 12, foreground: palette.muted)
             } else if !entry.eventDetail.isEmpty {
                 HorusIcon(.caretUpDown, size: 12, foreground: palette.muted)

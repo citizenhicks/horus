@@ -4897,7 +4897,7 @@ final class AppModelTests: XCTestCase {
             recorder: recorder
         )
         await fulfillment(of: [titleStarted], timeout: 1)
-        XCTAssertEqual(model.currentSessionTitle, "Review the gateway…")
+        XCTAssertEqual(model.currentSessionTitle, "Review the gateway")
 
         let requestCount = await recorder.requestCount()
         model.reduce(
@@ -5158,7 +5158,7 @@ final class AppModelTests: XCTestCase {
         await fulfillment(of: [secondTitleFinished], timeout: 1)
 
         XCTAssertEqual(prompts, ["Review the gateway", "Review the gateway again"])
-        XCTAssertEqual(model.currentSessionTitle, "Review the gateway again…")
+        XCTAssertEqual(model.currentSessionTitle, "Review the gateway again")
     }
 
     func testPromptPreviewRemainsWhenAppleDoesNotProduceATitle() async throws {
@@ -5175,7 +5175,7 @@ final class AppModelTests: XCTestCase {
             in: model,
             recorder: recorder
         )
-        XCTAssertEqual(model.currentSessionTitle, "Review the gateway retry behavior…")
+        XCTAssertEqual(model.currentSessionTitle, "Review the gateway retry behavior")
         XCTAssertEqual(model.toast?.message, "Apple did not produce a chat title.")
         XCTAssertEqual(model.toast?.tone, .warning)
 
@@ -5192,7 +5192,7 @@ final class AppModelTests: XCTestCase {
             firstUserMessage: "Review the gateway retry behavior"
         )])
 
-        XCTAssertEqual(model.currentSessionTitle, "Review the gateway retry behavior…")
+        XCTAssertEqual(model.currentSessionTitle, "Review the gateway retry behavior")
         let requests = await recorder.requests()
         XCTAssertFalse(requests.contains {
             if case .renameSession = $0 { return true }
@@ -5338,7 +5338,11 @@ final class ChatTitleWriterTests: XCTestCase {
     func testBuildsACompactPromptPreview() {
         XCTAssertEqual(
             ChatTitleWriter.preview(for: "  Review\n the   gateway retry behavior"),
-            "Review the gateway retry behavior…"
+            "Review the gateway retry behavior"
+        )
+        XCTAssertEqual(
+            ChatTitleWriter.preview(for: String(repeating: "a", count: 42) + "   \n"),
+            String(repeating: "a", count: 42)
         )
         XCTAssertEqual(
             ChatTitleWriter.preview(for: String(repeating: "🧪", count: 43)),
@@ -5351,6 +5355,7 @@ final class ChatTitleWriterTests: XCTestCase {
     func testStripsTheDressingSmallModelsAddToTitles() {
         XCTAssertEqual(ChatTitleWriter.cleaned("\"Fix the retry backoff\""), "Fix the retry backoff")
         XCTAssertEqual(ChatTitleWriter.cleaned("Title: Rename the gateway"), "Rename the gateway")
+        XCTAssertEqual(ChatTitleWriter.cleaned("Title:\nUseful title"), "Useful title")
         XCTAssertEqual(ChatTitleWriter.cleaned("Audit the sandbox policy."), "Audit the sandbox policy")
         XCTAssertEqual(ChatTitleWriter.cleaned("  Trim whitespace \n and drop the rest"), "Trim whitespace")
     }
@@ -5359,9 +5364,20 @@ final class ChatTitleWriterTests: XCTestCase {
         XCTAssertNil(ChatTitleWriter.cleaned(""))
         XCTAssertNil(ChatTitleWriter.cleaned("   \n  "))
         XCTAssertNil(ChatTitleWriter.cleaned("\"\""))
+        XCTAssertNil(ChatTitleWriter.cleaned("One two three four five"))
         // A model that answered the prompt instead of naming it runs long; better to keep
         // the gateway's title than to show a paragraph.
         XCTAssertNil(ChatTitleWriter.cleaned(String(repeating: "long ", count: 20)))
+    }
+
+    @MainActor
+    func testInjectedGeneratorUsesTheProductionValidationPath() async {
+        let writer = ChatTitleWriter { _ in "One two three four five" }
+
+        guard case .failed(let message) = await writer.title(for: "Review the gateway") else {
+            return XCTFail("Expected the overlong generated title to be rejected")
+        }
+        XCTAssertEqual(message, "Apple returned an unusable chat title.")
     }
 }
 
