@@ -1,4 +1,3 @@
-#if os(iOS)
 @preconcurrency import ActivityKit
 import Foundation
 
@@ -110,4 +109,3 @@ final class LiveActivityController {
         )
     }
 }
-#endif

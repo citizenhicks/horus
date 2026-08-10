@@ -1,8 +1,6 @@
 import SwiftUI
 import HighlightSwift
-#if os(iOS)
 import UIKit
-#endif
 
 struct FilesView: View {
     @Environment(AppModel.self) private var model
@@ -21,9 +19,7 @@ struct FilesView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .navigationTitle("Files")
-            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
-            #endif
         }
     }
 }
@@ -453,23 +449,17 @@ struct TextFilePreviewView: View {
             )
                 .background(palette.canvas)
                 .navigationTitle(preview.name)
-            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
-            #endif
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done", action: dismiss.callAsFunction)
                 }
             }
         }
-        #if os(macOS)
-        .frame(minWidth: 640, minHeight: 560)
-        #endif
         .presentationDetents([.large])
     }
 }
 
-#if os(iOS)
 struct SessionFileShareView: UIViewControllerRepresentable {
     let file: SessionFileShareItem
 
@@ -479,44 +469,6 @@ struct SessionFileShareView: UIViewControllerRepresentable {
 
     func updateUIViewController(_ viewController: UIActivityViewController, context: Context) {}
 }
-#else
-struct SessionFileShareView: View {
-    @Environment(\.dismiss) private var dismiss
-    @Environment(\.horusPalette) private var palette
-    let file: SessionFileShareItem
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 16) {
-                HorusIcon(file.name.fileGlyph, size: 44, foreground: palette.accent)
-                Text(file.name)
-                    .font(HorusStyle.bodyFont.weight(.semibold))
-                    .multilineTextAlignment(.center)
-                ShareLink(item: file.url) {
-                    Label("Share or Save", systemImage: "square.and.arrow.up")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(24)
-            .navigationTitle("File")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done", action: dismiss.callAsFunction)
-                }
-            }
-        }
-        #if os(macOS)
-        .frame(minWidth: 360, minHeight: 260)
-        #endif
-        .presentationDetents([.medium])
-    }
-}
-#endif
 
 struct NumberedSourceLine: Identifiable, Sendable {
     let id: Int
@@ -637,7 +589,6 @@ struct NumberedSourceText: View {
 }
 
 struct PreviewTranscriptSheet: View {
-    @Environment(\.dismiss) private var dismiss
     let preview: TranscriptPreview
 
     var body: some View {
@@ -674,18 +625,7 @@ struct PreviewTranscriptSheet: View {
                 }
                 .scrollIndicators(.hidden)
             }
-            #if os(macOS)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Close", glyph: .x, action: dismiss.callAsFunction)
-                        .labelStyle(.iconOnly)
-                }
-            }
-            #endif
         }
-        #if os(macOS)
-        .frame(minWidth: 560, minHeight: 520)
-        #endif
         .presentationDetents([.medium, .large])
     }
 }

@@ -88,9 +88,7 @@ private struct UnifiedDiffView: View {
         }
         .environment(\.defaultMinListRowHeight, 0)
         .listStyle(.plain)
-        #if os(iOS)
         .listRowSpacing(0)
-        #endif
         .scrollContentBackground(.hidden)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(

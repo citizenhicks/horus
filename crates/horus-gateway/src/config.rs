@@ -26,7 +26,7 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 13;
+const CONFIG_VERSION: u32 = 14;
 const CHAT_SPEC_VERSION: u32 = 6;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
@@ -128,7 +128,7 @@ struct StoredCredential {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UsageHistory {
-    days: BTreeMap<u64, TokenUsage>,
+    days: BTreeMap<u64, BTreeMap<String, TokenUsage>>,
 }
 
 impl Default for AgentComposition {
@@ -249,8 +249,8 @@ impl GatewayConfig {
     }
 
     /// Records one live token-usage increment and reports whether daily usage changed.
-    pub fn observe_usage(&mut self, usage: &TokenUsage) -> Result<bool> {
-        self.usage.observe(usage, SystemTime::now())
+    pub fn observe_usage(&mut self, provider: &str, usage: &TokenUsage) -> Result<bool> {
+        self.usage.observe(provider, usage, SystemTime::now())
     }
 
     /// Returns frontend-safe local identity and daily aggregate usage.
@@ -262,9 +262,12 @@ impl GatewayConfig {
                 .usage
                 .days
                 .iter()
-                .map(|(unix_day, usage)| DailyUsage {
-                    unix_day: *unix_day,
-                    usage: usage.clone(),
+                .flat_map(|(unix_day, providers)| {
+                    providers.iter().map(|(provider, usage)| DailyUsage {
+                        unix_day: *unix_day,
+                        provider: provider.clone(),
+                        usage: usage.clone(),
+                    })
                 })
                 .collect(),
             run_stats: crate::wire::RunStats::default(),
@@ -336,8 +339,11 @@ impl GatewayConfig {
                 }
             }
         }
-        for usage in self.usage.days.values() {
-            validate_usage(usage)?;
+        for providers in self.usage.days.values() {
+            for (provider, usage) in providers {
+                validate_usage_provider(provider)?;
+                validate_usage(usage)?;
+            }
         }
         Ok(())
     }
@@ -1151,17 +1157,26 @@ pub(crate) fn local_user_name() -> Option<String> {
 }
 
 impl UsageHistory {
-    fn observe(&mut self, usage: &TokenUsage, now: SystemTime) -> Result<bool> {
+    fn observe(&mut self, provider: &str, usage: &TokenUsage, now: SystemTime) -> Result<bool> {
+        validate_usage_provider(provider)?;
         validate_usage(usage)?;
         if usage == &TokenUsage::default() {
             return Ok(false);
         }
         let day = unix_day(now)?;
-        let mut bucket = self.days.get(&day).cloned().unwrap_or_default();
+        let mut bucket = self
+            .days
+            .get(&day)
+            .and_then(|providers| providers.get(provider))
+            .cloned()
+            .unwrap_or_default();
         bucket
             .checked_add(usage)
             .ok_or_else(|| Error::Config("daily token usage overflow".into()))?;
-        self.days.insert(day, bucket);
+        self.days
+            .entry(day)
+            .or_default()
+            .insert(provider.into(), bucket);
         let first_day = day.saturating_sub(USAGE_HISTORY_DAYS - 1);
         self.days.retain(|stored, _| *stored >= first_day);
         Ok(true)
@@ -1176,34 +1191,22 @@ fn unix_day(now: SystemTime) -> Result<u64> {
         / SECONDS_PER_DAY)
 }
 
-pub(crate) fn usage_delta(
-    current: &TokenUsage,
-    previous: &TokenUsage,
-) -> Result<Option<TokenUsage>> {
-    validate_usage(current)?;
-    Ok(checked_usage_delta(current, previous).filter(usage_nonnegative))
-}
-
-fn checked_usage_delta(current: &TokenUsage, previous: &TokenUsage) -> Option<TokenUsage> {
-    Some(TokenUsage {
-        input_tokens: current.input_tokens.checked_sub(previous.input_tokens)?,
-        cached_input_tokens: current
-            .cached_input_tokens
-            .checked_sub(previous.cached_input_tokens)?,
-        cache_write_input_tokens: current
-            .cache_write_input_tokens
-            .checked_sub(previous.cache_write_input_tokens)?,
-        output_tokens: current.output_tokens.checked_sub(previous.output_tokens)?,
-        reasoning_output_tokens: current
-            .reasoning_output_tokens
-            .checked_sub(previous.reasoning_output_tokens)?,
-        total_tokens: current.total_tokens.checked_sub(previous.total_tokens)?,
-    })
-}
-
 fn validate_usage(usage: &TokenUsage) -> Result<()> {
     if !usage_nonnegative(usage) {
         return Err(Error::Config("token usage cannot be negative".into()));
+    }
+    Ok(())
+}
+
+fn validate_usage_provider(provider: &str) -> Result<()> {
+    if provider.trim().is_empty()
+        || provider != provider.trim()
+        || provider.len() > 256
+        || provider.chars().any(char::is_control)
+    {
+        return Err(Error::Config(
+            "usage provider ID must be canonical and 1–256 bytes".into(),
+        ));
     }
     Ok(())
 }
@@ -1280,22 +1283,22 @@ mod tests {
     }
 
     #[test]
-    fn gateway_config_rejects_v12_without_migration() {
+    fn gateway_config_rejects_v13_without_migration() {
         let root = tempfile::tempdir().expect("temporary directory");
         let state = root.path().join("state");
         ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
         let path = state.join(CONFIG_FILE);
         let contents = fs::read_to_string(&path)
             .expect("read gateway config")
-            .replacen("version = 13", "version = 12", 1);
-        fs::write(&path, contents).expect("write v12 config");
+            .replacen("version = 14", "version = 13", 1);
+        fs::write(&path, contents).expect("write v13 config");
 
-        let error = ConfigStore::open(state).expect_err("v12 must be rejected");
+        let error = ConfigStore::open(state).expect_err("v13 must be rejected");
 
         assert!(
             error
                 .to_string()
-                .contains("unsupported gateway config version 12")
+                .contains("unsupported gateway config version 13")
         );
     }
 
@@ -1316,6 +1319,7 @@ mod tests {
         config
             .usage
             .observe(
+                "openai_socket",
                 &usage,
                 UNIX_EPOCH + std::time::Duration::from_secs(2 * SECONDS_PER_DAY),
             )
@@ -1325,7 +1329,7 @@ mod tests {
         let contents = fs::read_to_string(state.join(CONFIG_FILE)).expect("read config");
         let (_, restored) = ConfigStore::open(state).expect("open config");
 
-        assert!(contents.starts_with("version = 13"));
+        assert!(contents.starts_with("version = 14"));
         assert!(contents.contains("max_model_steps = 256"));
         assert!(contents.contains("[default_agent.config.middleware.settings.context_offloading]"));
         assert!(contents.contains("[default_agent.config.middleware.settings.sessions]"));
@@ -1896,10 +1900,47 @@ mod tests {
         };
         let mut history = UsageHistory::default();
 
-        assert!(history.observe(&usage(30), now).expect("observe first"));
-        assert!(history.observe(&usage(40), now).expect("observe second"));
+        assert!(
+            history
+                .observe("openai_socket", &usage(30), now)
+                .expect("observe first")
+        );
+        assert!(
+            history
+                .observe("openai_socket", &usage(40), now)
+                .expect("observe second")
+        );
+        assert!(
+            history
+                .observe("kimi", &usage(5), now)
+                .expect("observe other provider")
+        );
 
-        assert_eq!(history.days.get(&2), Some(&usage(70)));
+        assert_eq!(
+            history.days.get(&2),
+            Some(&BTreeMap::from([
+                ("kimi".into(), usage(5)),
+                ("openai_socket".into(), usage(70)),
+            ]))
+        );
+
+        let mut config = GatewayConfig::new(DEFAULT_LISTEN, None).expect("gateway config");
+        config.usage = history;
+        assert_eq!(
+            config.profile().daily_usage,
+            [
+                DailyUsage {
+                    unix_day: 2,
+                    provider: "kimi".into(),
+                    usage: usage(5),
+                },
+                DailyUsage {
+                    unix_day: 2,
+                    provider: "openai_socket".into(),
+                    usage: usage(70),
+                },
+            ]
+        );
     }
 
     #[test]

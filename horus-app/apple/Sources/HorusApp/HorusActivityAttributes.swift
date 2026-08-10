@@ -1,7 +1,5 @@
 import Foundation
-#if os(iOS)
 import ActivityKit
-#endif
 
 /// One chat as the Dynamic Island and the Live Activity draw it.
 ///
@@ -64,7 +62,6 @@ extension HorusChatSnapshot {
 
 /// The static half of the activity. There is one activity for the whole app rather than one
 /// per chat: the island shows a single item, and several chats commonly run at once.
-#if os(iOS)
 struct HorusActivityAttributes: ActivityAttributes {
     struct ContentState: Codable, Hashable {
         var chats: [HorusChatSnapshot]
@@ -94,4 +91,3 @@ struct HorusActivityAttributes: ActivityAttributes {
     /// Named so several gateways stay tellable apart in the activity.
     var gateway: String
 }
-#endif

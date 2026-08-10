@@ -13,14 +13,10 @@ private let debugStartsOnDetail: Bool = {
 struct AppShell: View {
     @Environment(AppModel.self) private var model
     @Environment(\.scenePhase) private var scenePhase
-    #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    #endif
     @State private var columnVisibility = NavigationSplitViewVisibility.all
     @State private var compactColumn = debugStartsOnDetail ? NavigationSplitViewColumn.detail : .sidebar
-    #if os(iOS)
     @State private var sidebarIsOpen = !debugStartsOnDetail
-    #endif
 
     var body: some View {
         @Bindable var model = model
@@ -38,9 +34,7 @@ struct AppShell: View {
                         .inspector(isPresented: $model.showsInspector) {
                             FilesInspector()
                                 .overlay(alignment: .top) {
-                                    #if os(iOS)
                                     if horizontalSizeClass == .compact { AppToastOverlay() }
-                                    #endif
                                 }
                         }
                         .sheet(isPresented: $model.showsPairing) {
@@ -80,9 +74,7 @@ struct AppShell: View {
                 "\(toast.tone.title): \(toast.message)"
             ).post()
         }
-        #if os(iOS)
         .sensoryFeedback(.impact(weight: .light), trigger: model.toast?.id) { _, id in id != nil }
-        #endif
         // Only a backgrounded scene loses its socket. `.inactive` covers a window losing focus
         // or a notification banner, and reconnecting on those drops a healthy session.
         .onChange(of: scenePhase) { _, newPhase in
@@ -103,7 +95,6 @@ struct AppShell: View {
     /// where two columns fit side by side and nothing has to slide out of the way.
     @ViewBuilder
     private var shell: some View {
-        #if os(iOS)
         if horizontalSizeClass == .compact {
             SidebarDrawer(isOpen: $sidebarIsOpen) {
                 SidebarView(showDetail: showDetail)
@@ -128,9 +119,6 @@ struct AppShell: View {
         } else {
             splitView
         }
-        #else
-        splitView
-        #endif
     }
 
     private var splitView: some View {
@@ -151,7 +139,7 @@ struct AppShell: View {
         switch model.destination ?? .chat {
         case .chat: ChatView()
         case .gateway: GatewayView()
-        case .agent: AgentSettingsView()
+        case .agent: AgentSettingsView(scope: .gatewayDefault)
         case .providers: ProvidersView()
         case .cron: CronView()
         case .profile: ProfileView()
@@ -180,7 +168,6 @@ struct AppShell: View {
     /// setting the destination outside the animation swaps the page's content in a frame of its
     /// own, which reads as a jump before the slide rather than one move.
     private func showDetail(_ destination: AppDestination) {
-        #if os(iOS)
         // The drawer keeps the detail mounted the whole time, so picking something in the
         // sidebar only has to slide it back over. The split view's compact column needed a
         // round trip through `.sidebar` here to re-fire a transition; nothing pushes now.
@@ -191,7 +178,6 @@ struct AppShell: View {
             }
             return
         }
-        #endif
         model.destination = destination
         compactColumn = .detail
     }
@@ -204,15 +190,11 @@ struct AppShell: View {
               !model.showsPairing,
               !model.showsWorkspaceBrowser
         else { return false }
-        #if os(iOS)
         // The drawer, not the split view's column, decides whether the chat is on screen in
         // compact: `compactColumn` no longer moves there, so reading it would report the chat
         // permanently hidden and stop delivering it as visible.
         return horizontalSizeClass != .compact
             || !sidebarIsOpen && !model.showsInspector
-        #else
-        return true
-        #endif
     }
 }
 
@@ -524,7 +506,6 @@ enum SidebarDrawerMetrics {
     static let displayCornerRadius: CGFloat = 62
 }
 
-#if os(iOS)
 /// Compact navigation that reveals the sidebar underneath instead of pushing a page over it.
 ///
 /// The detail stays mounted and slides aside, so its scroll position, keyboard focus, and any
@@ -662,7 +643,6 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
         withAnimation(SidebarDrawerMetrics.animation) { isOpen = open }
     }
 }
-#endif
 
 struct SidebarView: View {
     @Environment(AppModel.self) private var model
@@ -718,7 +698,7 @@ struct SidebarView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     navigationButton("Gateway", destination: .gateway)
                     navigationButton("Providers", destination: .providers)
-                    navigationButton("Agent settings", destination: .agent)
+                    navigationButton("Default agent", destination: .agent)
                     navigationButton("Cron", destination: .cron)
                     ForEach(model.navigationWidgets) { widget in
                         contributionNavigationButton(widget)
@@ -775,9 +755,7 @@ struct SidebarView: View {
             }
             .padding(12)
         }
-        #if os(iOS)
         .toolbarVisibility(.hidden, for: .navigationBar)
-        #endif
         .alert("Rename chat", isPresented: renamePresented) {
             TextField("Chat name", text: $renameDraft)
             Button("Cancel", role: .cancel) { sessionToRename = nil }
@@ -1040,42 +1018,33 @@ struct SidebarView: View {
                 Button {
                     model.setSessionPinned(session, pinned: !session.pinned)
                 } label: {
-                    HorusPlatformMenuLabel(
+                    HorusLabel(
                         title: session.pinned ? "Unpin" : "Pin",
-                        glyph: session.pinned ? .pushPinSlash : .pushPin,
-                        systemImage: session.pinned ? "pin.slash" : "pin"
+                        glyph: session.pinned ? .pushPinSlash : .pushPin
                     )
                 }
                 Button {
                     renameDraft = model.displayedTitle(for: session)
                     sessionToRename = session
                 } label: {
-                    HorusPlatformMenuLabel(
+                    HorusLabel(
                         title: "Rename",
-                        glyph: .pencilSimple,
-                        systemImage: "pencil"
+                        glyph: .pencilSimple
                     )
                 }
                 Divider()
                 Button(role: .destructive) {
                     sessionToDelete = session
                 } label: {
-                    HorusPlatformMenuLabel(
+                    HorusLabel(
                         title: "Delete",
-                        glyph: .trash,
-                        systemImage: "trash"
+                        glyph: .trash
                     )
                 }
             } label: {
-                #if os(macOS)
-                Image(systemName: "ellipsis")
-                    .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
-                    .contentShape(Rectangle())
-                #else
                 HorusIcon(.dotsThree)
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                     .contentShape(Rectangle())
-                #endif
             }
             .labelStyle(.titleAndIcon)
             .buttonStyle(.horusPlain)
@@ -1171,7 +1140,7 @@ struct PairingView: View {
                 HStack(alignment: .top) {
                     SectionHeading(
                         title: "Pair with a gateway",
-                        detail: "Use the same address and one-time code on Mac, iPad, or iPhone."
+                        detail: "Use the same address and one-time code on iPad or iPhone."
                     )
                     Spacer()
                     if canCancel {
@@ -1239,9 +1208,7 @@ struct PairingView: View {
         }
         .scrollIndicators(.hidden)
         .scrollBounceBehavior(.basedOnSize)
-        #if os(iOS)
         .scrollDismissesKeyboard(.interactively)
-        #endif
         .safeAreaInset(edge: .bottom) { pairAction }
         .onSubmit { model.pair() }
     }
@@ -1258,13 +1225,12 @@ struct PairingView: View {
             if model.connectionState == .connecting || model.connectionState == .authenticating {
                 ProgressView().controlSize(.small)
             }
-            Button("Pair gateway", action: model.pair)
+            Button("Pair to self-hosted gateway", action: model.pair)
                 .horusProminentButton()
                 .buttonBorderShape(.capsule)
                 .controlSize(.large)
-                #if os(iOS)
                 .buttonSizing(.flexible)
-                #endif
+            HorusCloudOfferButton()
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 16)

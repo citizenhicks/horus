@@ -170,7 +170,7 @@ impl Runner {
         let Ok(output) = output else {
             return Ok(Some(false));
         };
-        self.record_usage(output.usage())?;
+        self.record_usage(&route, output.usage())?;
         self.save().await?;
         self.emit_usage(submission_id)?;
         let approved = output.tool_calls().is_empty()

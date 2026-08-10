@@ -11,9 +11,5 @@ struct HorusAppleApp: App {
                 .horusTheme()
                 .onOpenURL { model.handleOpenURL($0) }
         }
-#if os(macOS)
-        .defaultSize(width: 1180, height: 780)
-        .windowToolbarStyle(.unified)
-#endif
     }
 }

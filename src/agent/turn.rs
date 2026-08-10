@@ -269,11 +269,12 @@ impl Runner {
             Wait::Interrupted { submission_id } => (None, Some(submission_id)),
         };
         let usage_changed = !middleware_usage.is_empty();
-        if let Some(last_usage) = middleware_usage.last().cloned() {
+        if usage_changed {
+            let route = self.config.provider.clone();
             for usage in &middleware_usage {
-                self.record_usage(usage)?;
+                self.record_usage(&route, usage)?;
+                self.state.last_usage = Some(usage.clone());
             }
-            self.state.last_usage = Some(last_usage);
         }
         checkpoint_changed |= usage_changed || had_queued_input || queue_changed;
         if let Some(error) = hook_error {
@@ -420,7 +421,7 @@ impl Runner {
                 return Ok(());
             };
             let output = output?;
-            self.record_usage(&output.usage)?;
+            self.record_usage(&provider, &output.usage)?;
             self.state.last_usage = Some(output.usage.clone());
             let mut after_model_events = Vec::new();
             let middleware = self.config.middleware.clone();

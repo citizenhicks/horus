@@ -13,7 +13,7 @@ Apple apps are thin clients of that gateway; they do not own agent behavior.
 | [`horus`](https://crates.io/crates/horus) | Embeddable agent loop, provider and storage interfaces, sandbox policy, middleware, and frontend-neutral protocol |
 | [`horus-gateway`](https://crates.io/crates/horus-gateway) | The only shipped owner of an `Agent`; composes capabilities and owns authentication, chats, workspaces, artifacts, usage, and cron |
 | [`horus-cli`](https://crates.io/crates/horus-cli) | Ratatui gateway client and local gateway launcher |
-| [Apple app](horus-app/apple/README.md) | SwiftUI gateway client for macOS, iPhone, and iPad |
+| [iOS app](horus-app/apple/README.md) | SwiftUI gateway client for iPhone and iPad |
 
 ## Install
 
@@ -74,7 +74,7 @@ Horus requires Rust 1.89 or newer.
 
 ```toml
 [dependencies]
-horus = "0.6"
+horus = "0.7"
 ```
 
 The caller owns composition:

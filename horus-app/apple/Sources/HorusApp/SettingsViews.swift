@@ -1,19 +1,24 @@
 import SwiftUI
 
+enum AgentSettingsScope: Equatable {
+    case gatewayDefault
+    case currentChat
+}
+
 struct AgentSettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.horusPalette) private var palette
     @State private var showsAgentStatus = false
+    let scope: AgentSettingsScope
 
     var body: some View {
         PageScaffold(
-            title: "Agent",
-            detail: "Change the prompt, capabilities, and execution policy used by the gateway agent.",
-            centersContentOnMac: model.agentDraft == nil,
+            title: pageTitle,
+            detail: pageDetail,
             headerAccessory: { agentStatusButton }
         ) {
-            if model.agentDraft != nil {
+            if draft != nil {
                 Section("System prompt") {
                     TextField("System prompt", text: systemPrompt, axis: .vertical)
                         .font(HorusStyle.bodyFont)
@@ -23,19 +28,18 @@ struct AgentSettingsView: View {
                         .accessibilityLabel("System prompt")
                 }
 
-                Section("Default AI model") {
+                Section(modelSectionTitle) {
                     LabeledContent {
                         Menu {
                             ForEach(model.modelChoices) { choice in
                                 Button {
-                                    model.selectAgentDraftModel(choice.route)
+                                    selectModel(choice.route)
                                 } label: {
                                     let title = modelChoiceLabel(choice)
-                                    if choice.route == model.agentDraftModelRoute {
-                                        HorusPlatformMenuLabel(
+                                    if choice.route == selectedModelRoute {
+                                        HorusLabel(
                                             title: title,
-                                            glyph: .check,
-                                            systemImage: "checkmark"
+                                            glyph: .check
                                         )
                                     } else {
                                         Text(title)
@@ -56,8 +60,8 @@ struct AgentSettingsView: View {
                         HStack(spacing: 5) {
                             Text("Model")
                             SettingsInfoButton(
-                                title: "Default AI model",
-                                detail: "Sets the provider, model, and reasoning used for new chats when this draft is saved as the gateway default."
+                                title: modelSectionTitle,
+                                detail: modelSectionDetail
                             )
                         }
                     }
@@ -89,11 +93,9 @@ struct AgentSettingsView: View {
                     .settingsStandaloneRow()
             } else {
                 HorusUnavailable(
-                    title: "Agent unavailable",
+                    title: unavailableTitle,
                     glyph: .slidersHorizontal,
-                    detail: model.connectionState.isReady
-                        ? "Configure a provider first."
-                        : "Connect to a gateway first."
+                    detail: unavailableDetail
                 )
             }
         }
@@ -131,11 +133,11 @@ struct AgentSettingsView: View {
             Text(agentStatusDetail)
                 .font(HorusStyle.bodyFont)
                 .foregroundStyle(palette.muted)
-            if case .conflict = model.applyState {
+            if case .conflict = applyState {
                 Divider()
                 Button("Reload") {
                     showsAgentStatus = false
-                    model.reloadAgentDraft()
+                    reloadDraft()
                 }
             }
         }
@@ -146,10 +148,10 @@ struct AgentSettingsView: View {
     }
 
     private var agentStatusLabel: String {
-        guard model.agentDraft != nil else { return "Unavailable" }
-        return switch model.applyState {
+        guard draft != nil else { return "Unavailable" }
+        return switch applyState {
         case .idle, .applied:
-            hasActiveChanges || hasDefaultChanges ? "Unsaved changes" : "Up to date"
+            hasChanges ? "Unsaved changes" : "Up to date"
         case .applying: "Applying configuration"
         case .restarting: "Restarting"
         case .busy: "Busy"
@@ -160,10 +162,10 @@ struct AgentSettingsView: View {
     }
 
     private var agentStatusColor: Color {
-        guard model.agentDraft != nil else { return palette.danger }
-        return switch model.applyState {
+        guard draft != nil else { return palette.danger }
+        return switch applyState {
         case .idle, .applied:
-            hasActiveChanges || hasDefaultChanges ? palette.warning : palette.signal
+            hasChanges ? palette.warning : palette.signal
         case .applying:
             palette.accent
         case .restarting, .busy, .conflict:
@@ -174,16 +176,10 @@ struct AgentSettingsView: View {
     }
 
     private var agentStatusDetail: String {
-        guard model.agentDraft != nil else {
-            return model.connectionState.isReady
-                ? "Configure a provider first."
-                : "Connect to a gateway first."
-        }
-        return switch model.applyState {
+        guard draft != nil else { return unavailableDetail }
+        return switch applyState {
         case .idle, .applied:
-            hasActiveChanges || hasDefaultChanges
-                ? "Apply the draft to this chat or save it as the gateway default."
-                : "The draft matches the saved agent configuration."
+            hasChanges ? unsavedStatusDetail : savedStatusDetail
         case .applying:
             "The gateway is validating this revision."
         case .restarting:
@@ -281,20 +277,20 @@ struct AgentSettingsView: View {
 
     private var systemPrompt: Binding<String> {
         Binding(
-            get: { model.agentDraft?.systemPrompt ?? "" },
-            set: { model.agentDraft?.systemPrompt = $0 }
+            get: { draft?.systemPrompt ?? "" },
+            set: { value in updateDraft { $0.systemPrompt = value } }
         )
     }
 
     private var maxModelSteps: Binding<UInt64> {
         Binding(
-            get: { model.agentDraft?.maxModelSteps ?? 1 },
-            set: { model.agentDraft?.maxModelSteps = Swift.max($0, 1) }
+            get: { draft?.maxModelSteps ?? 1 },
+            set: { value in updateDraft { $0.maxModelSteps = Swift.max(value, 1) } }
         )
     }
 
     private var defaultModelLabel: String {
-        guard let route = model.agentDraftModelRoute,
+        guard let route = selectedModelRoute,
               let choice = model.modelChoices.first(where: { $0.route == route })
         else { return "Select" }
         return "\(model.modelLabel(for: choice)) · \(choice.reasoningEffort?.capitalized ?? "Default")"
@@ -312,16 +308,16 @@ struct AgentSettingsView: View {
         Binding(
             get: { middlewareEnabled(feature) },
             set: { isEnabled in
-                guard !feature.required, var enabled = model.agentDraft?.middleware.enabled else { return }
+                guard !feature.required, var enabled = draft?.middleware.enabled else { return }
                 if isEnabled { enabled.insert(feature.id) }
                 else { enabled.remove(feature.id) }
-                model.agentDraft?.middleware.enabled = enabled
+                updateDraft { $0.middleware.enabled = enabled }
             }
         )
     }
 
     private func middlewareEnabled(_ feature: MiddlewareFeature) -> Bool {
-        feature.required || (model.agentDraft?.middleware.enabled.contains(feature.id) ?? false)
+        feature.required || (draft?.middleware.enabled.contains(feature.id) ?? false)
     }
 
     private func integerSetting(
@@ -332,7 +328,7 @@ struct AgentSettingsView: View {
     ) -> Binding<Int64> {
         Binding(
             get: {
-                guard let configured = model.agentDraft?
+                guard let configured = draft?
                     .middleware.settings[feature.id]?[setting.id],
                     case .integer(let value) = configured
                 else { return minimum }
@@ -341,11 +337,13 @@ struct AgentSettingsView: View {
             set: { value in
                 let bounded = maximum.map { Swift.min(Swift.max(value, minimum), $0) }
                     ?? Swift.max(value, minimum)
-                model.agentDraft?.middleware.setSetting(
-                    .integer(bounded),
-                    middleware: feature.id,
-                    setting: setting.id
-                )
+                updateDraft {
+                    $0.middleware.setSetting(
+                        .integer(bounded),
+                        middleware: feature.id,
+                        setting: setting.id
+                    )
+                }
             }
         )
     }
@@ -356,50 +354,148 @@ struct AgentSettingsView: View {
     ) -> Binding<String?> {
         Binding(
             get: {
-                guard let configured = model.agentDraft?
+                guard let configured = draft?
                     .middleware.settings[feature.id]?[setting.id],
                     case .string(let value) = configured
                 else { return nil }
                 return value
             },
             set: { value in
-                model.agentDraft?.middleware.setSetting(
-                    value.map(FrontendSettingValue.string),
-                    middleware: feature.id,
-                    setting: setting.id
-                )
+                updateDraft {
+                    $0.middleware.setSetting(
+                        value.map(FrontendSettingValue.string),
+                        middleware: feature.id,
+                        setting: setting.id
+                    )
+                }
             }
         )
     }
 
     @ViewBuilder
     private var agentConfigurationActions: some View {
-        Button(
-            "Change for this chat only",
-            glyph: .chatDots,
-            action: model.changeAgentForCurrentChat
-        )
-            .horusProminentButton()
-            .disabled(!hasActiveChanges || model.isApplyingConfiguration)
-
-        Button(
-            "Save as default",
-            glyph: .floppyDisk,
-            action: model.saveAgentAsDefault
-        )
-            .disabled(!hasDefaultChanges || model.isApplyingConfiguration)
-    }
-
-    private var hasActiveChanges: Bool {
-        guard let snapshot = model.agentSnapshot, let draft = model.agentDraft else { return false }
-        return snapshot.config != draft
-    }
-
-    private var hasDefaultChanges: Bool {
-        guard let snapshot = model.defaultAgentSnapshot, let draft = model.agentDraft else {
-            return false
+        Group {
+            switch scope {
+            case .currentChat:
+                Button(
+                    "Apply to this chat",
+                    glyph: .chatDots,
+                    action: model.changeAgentForCurrentChat
+                )
+            case .gatewayDefault:
+                Button(
+                    "Save as gateway default",
+                    glyph: .floppyDisk,
+                    action: model.saveAgentAsDefault
+                )
+            }
         }
+        .horusProminentButton()
+        .disabled(!hasChanges || model.isApplyingConfiguration)
+    }
+
+    private var draft: AgentComposition? {
+        switch scope {
+        case .gatewayDefault: model.defaultAgentDraft
+        case .currentChat: model.agentDraft
+        }
+    }
+
+    private var snapshot: VersionedAgentConfig? {
+        switch scope {
+        case .gatewayDefault: model.defaultAgentSnapshot
+        case .currentChat: model.agentSnapshot
+        }
+    }
+
+    private var applyState: ApplyState {
+        switch scope {
+        case .gatewayDefault: model.defaultAgentApplyState
+        case .currentChat: model.chatAgentApplyState
+        }
+    }
+
+    private var selectedModelRoute: String? {
+        switch scope {
+        case .gatewayDefault: model.defaultAgentDraftModelRoute
+        case .currentChat: model.agentDraftModelRoute
+        }
+    }
+
+    private var hasChanges: Bool {
+        guard let snapshot, let draft else { return false }
         return snapshot.config != draft
+    }
+
+    private func updateDraft(_ update: (inout AgentComposition) -> Void) {
+        guard var draft else { return }
+        update(&draft)
+        switch scope {
+        case .gatewayDefault: model.defaultAgentDraft = draft
+        case .currentChat: model.agentDraft = draft
+        }
+    }
+
+    private func selectModel(_ route: String) {
+        switch scope {
+        case .gatewayDefault: model.selectDefaultAgentDraftModel(route)
+        case .currentChat: model.selectAgentDraftModel(route)
+        }
+    }
+
+    private func reloadDraft() {
+        switch scope {
+        case .gatewayDefault: model.reloadDefaultAgentDraft()
+        case .currentChat: model.reloadAgentDraft()
+        }
+    }
+
+    private var pageTitle: String {
+        scope == .gatewayDefault ? "Default agent" : "Chat agent"
+    }
+
+    private var pageDetail: String {
+        switch scope {
+        case .gatewayDefault:
+            "Set the prompt, model, capabilities, and execution policy inherited by new chats."
+        case .currentChat:
+            "Change the prompt, model, capabilities, and execution policy for this chat only."
+        }
+    }
+
+    private var modelSectionTitle: String {
+        scope == .gatewayDefault ? "Default AI model" : "Chat AI model"
+    }
+
+    private var modelSectionDetail: String {
+        switch scope {
+        case .gatewayDefault:
+            "Sets the provider, model, and reasoning inherited by new chats."
+        case .currentChat:
+            "Sets the provider, model, and reasoning used by this chat."
+        }
+    }
+
+    private var unavailableTitle: String {
+        scope == .gatewayDefault ? "Default agent unavailable" : "Chat agent unavailable"
+    }
+
+    private var unavailableDetail: String {
+        guard model.connectionState.isReady else { return "Connect to a gateway first." }
+        if scope == .currentChat, model.selectedSessionID == nil { return "Open a chat first." }
+        return "Configure a provider first."
+    }
+
+    private var unsavedStatusDetail: String {
+        scope == .gatewayDefault
+            ? "Save this draft as the gateway default for new chats."
+            : "Apply this draft to the current chat."
+    }
+
+    private var savedStatusDetail: String {
+        scope == .gatewayDefault
+            ? "The draft matches the gateway default."
+            : "The draft matches this chat's saved agent configuration."
     }
 }
 
@@ -410,8 +506,7 @@ struct ProvidersView: View {
     var body: some View {
         PageScaffold(
             title: "Providers",
-            detail: "",
-            centersContentOnMac: model.providerDraft == nil
+            detail: ""
         ) {
             if model.providerDraft != nil {
                 Section {
@@ -935,7 +1030,9 @@ struct GatewayView: View {
 
             HorusActionRow(collapsesToIcons: true) {
                 Button("Reconnect", glyph: .arrowClockwise, action: model.reconnect)
-                Button("Add gateway", glyph: .plus) { model.showsPairing = true }
+                Button("Pair to self-hosted gateway", glyph: .plus) {
+                    model.showsPairing = true
+                }
                 Button("Rename", glyph: .pencilSimple) {
                     renameDraft = model.selectedAccount?.displayName ?? ""
                     showsRename = true
@@ -946,6 +1043,11 @@ struct GatewayView: View {
                 }
             }
             .settingsStandaloneRow()
+
+            Section("Horus Cloud") {
+                SettingsCaption("Let Horus provision and manage a private gateway for you, with a 7-day trial and included Luna usage.")
+                HorusCloudOfferButton()
+            }
 
             Section("Pair another device") {
                 SettingsCaption("Ask this gateway for a short-lived code, then enter it with the same gateway address on the other device.")
@@ -1004,47 +1106,24 @@ struct PageScaffold<HeaderAccessory: View, Content: View>: View {
     @Environment(\.horusPalette) private var palette
     let title: String
     let detail: String
-    let centersContentOnMac: Bool
     let headerAccessory: HeaderAccessory
     let content: Content
 
     init(
         title: String,
         detail: String,
-        centersContentOnMac: Bool = false,
         @ViewBuilder headerAccessory: () -> HeaderAccessory,
         @ViewBuilder content: () -> Content
     ) {
         self.title = title
         self.detail = detail
-        self.centersContentOnMac = centersContentOnMac
         self.headerAccessory = headerAccessory()
         self.content = content()
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            #if os(macOS)
-            HStack(alignment: .top, spacing: 16) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(title)
-                        .font(.title2.weight(.semibold))
-                    if !detail.isEmpty {
-                        Text(detail)
-                            .font(HorusStyle.bodyFont)
-                            .foregroundStyle(palette.muted)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                headerAccessory
-            }
-            .padding(.horizontal, 38)
-            .padding(.top, 20)
-            .padding(.bottom, 8)
-            #endif
-
             Form {
-                #if os(iOS)
                 if !detail.isEmpty {
                     Text(detail)
                         .font(HorusStyle.bodyFont)
@@ -1052,34 +1131,17 @@ struct PageScaffold<HeaderAccessory: View, Content: View>: View {
                         .listRowBackground(Color.clear)
                         .listRowSeparator(.hidden)
                 }
-                #endif
-
-                #if os(macOS)
-                if !centersContentOnMac { content }
-                #else
                 content
-                #endif
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
-            #if os(iOS)
             .scrollDismissesKeyboard(.interactively)
-            #else
-            .overlay {
-                if centersContentOnMac { content }
-            }
-            #endif
         }
-        #if os(macOS)
-        .frame(maxWidth: 780)
-        .frame(maxWidth: .infinity)
-        #else
         .navigationTitle(title)
         .toolbarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) { headerAccessory }
         }
-        #endif
         .background(HorusBackdrop())
     }
 }
@@ -1088,13 +1150,11 @@ extension PageScaffold where HeaderAccessory == EmptyView {
     init(
         title: String,
         detail: String,
-        centersContentOnMac: Bool = false,
         @ViewBuilder content: () -> Content
     ) {
         self.init(
             title: title,
             detail: detail,
-            centersContentOnMac: centersContentOnMac,
             headerAccessory: EmptyView.init,
             content: content
         )
@@ -1123,13 +1183,9 @@ private extension View {
         pickerStyle(.menu)
     }
 
-    /// Trailing-aligned entry like Settings.app on iOS, fixed width on macOS.
+    /// Trailing-aligned entry like Settings.app.
     func settingsField() -> some View {
-        #if os(iOS)
         multilineTextAlignment(.trailing)
-        #else
-        frame(maxWidth: 300)
-        #endif
     }
 
     func settingsStandaloneRow() -> some View {

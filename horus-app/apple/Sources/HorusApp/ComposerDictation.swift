@@ -1,4 +1,3 @@
-#if os(iOS)
 @preconcurrency import AVFoundation
 import Foundation
 import Observation
@@ -321,4 +320,3 @@ private final class ComposerAudioBufferConverter {
         return converted
     }
 }
-#endif

@@ -45,7 +45,7 @@ mod base64_bytes {
 }
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 22;
+pub const PROTOCOL_VERSION: u16 = 23;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 20 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -854,6 +854,7 @@ pub struct RunSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DailyUsage {
     pub unix_day: u64,
+    pub provider: String,
     pub usage: TokenUsage,
 }
 
@@ -1844,6 +1845,24 @@ mod tests {
             let error = validate_version(version).expect_err("incompatible version must fail");
             assert!(matches!(error, Error::Protocol(_)), "{error}");
         }
+    }
+
+    #[test]
+    fn daily_usage_carries_its_provider_on_the_wire() {
+        let usage = DailyUsage {
+            unix_day: 42,
+            provider: "openai_socket".into(),
+            usage: TokenUsage {
+                total_tokens: 11,
+                ..TokenUsage::default()
+            },
+        };
+
+        let encoded = serde_json::to_value(&usage).expect("encode daily usage");
+        let decoded: DailyUsage = serde_json::from_value(encoded.clone()).expect("decode usage");
+
+        assert_eq!(encoded["provider"], "openai_socket");
+        assert_eq!(decoded, usage);
     }
 
     #[test]

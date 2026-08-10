@@ -1,21 +1,14 @@
 import Foundation
 import SwiftUI
 import MarkdownView
-#if os(macOS)
-import AppKit
-#elseif os(iOS)
 @preconcurrency import AVFoundation
 import UIKit
-#endif
 
 extension MountedWidget {
     var glyph: HorusGlyph {
         widget.symbol.map { HorusSymbol.glyph(for: $0) } ?? .squaresFour
     }
 
-    var systemImage: String {
-        widget.symbol.map { HorusSymbol.systemImage(for: $0) } ?? "square.grid.2x2"
-    }
 }
 
 struct ChatView: View {
@@ -24,6 +17,7 @@ struct ChatView: View {
     @State private var isAtBottom = true
     @State private var scrollToBottomRequest = 0
     @State private var presentedWidget: MountedWidget?
+    @State private var showsChatAgentSettings = false
 
     var body: some View {
         @Bindable var model = model
@@ -52,13 +46,8 @@ struct ChatView: View {
             }
         }
         .navigationTitle(chatTitle)
-        #if os(macOS)
-        .navigationSubtitle(chatSubtitle)
-        #else
         .toolbarTitleDisplayMode(.inline)
-        #endif
         .toolbar {
-            #if os(iOS)
             // Title changes animate glyphs, so the principal title must be a view the app
             // owns rather than the system's opaque navigation title.
             ToolbarItem(placement: .principal) {
@@ -75,16 +64,28 @@ struct ChatView: View {
                 }
                 .accessibilityElement(children: .combine)
             }
-            #endif
             ToolbarItem(placement: .primaryAction) {
                 inspectorButton
             }
             ToolbarItem(placement: .primaryAction) {
-                ChatOptionsMenu(presentedWidget: $presentedWidget)
+                ChatOptionsMenu(
+                    presentedWidget: $presentedWidget,
+                    showsAgentSettings: $showsChatAgentSettings
+                )
             }
         }
         .sheet(item: $model.presentedPreview, content: PreviewTranscriptSheet.init)
         .sheet(item: $presentedWidget, content: FrontendWidgetSheet.init)
+        .sheet(isPresented: $showsChatAgentSettings) {
+            NavigationStack {
+                AgentSettingsView(scope: .currentChat)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { showsChatAgentSettings = false }
+                        }
+                    }
+            }
+        }
     }
 
     private var inspectorButton: some View {
@@ -115,6 +116,7 @@ struct ChatView: View {
 private struct ChatOptionsMenu: View {
     @Environment(AppModel.self) private var model
     @Binding var presentedWidget: MountedWidget?
+    @Binding var showsAgentSettings: Bool
 
     var body: some View {
         Menu {
@@ -125,52 +127,54 @@ private struct ChatOptionsMenu: View {
                             Button {
                                 model.switchGitBranch(to: branch)
                             } label: {
-                                HorusPlatformMenuLabel(
+                                HorusLabel(
                                     title: branch,
-                                    glyph: branch == git.currentBranch ? .check : .gitBranch,
-                                    systemImage: branch == git.currentBranch
-                                        ? "checkmark"
-                                        : "arrow.trianglehead.branch"
+                                    glyph: branch == git.currentBranch ? .check : .gitBranch
                                 )
                             }
                             .disabled(branch == git.currentBranch)
                         }
                     } label: {
-                        HorusPlatformMenuLabel(
+                        HorusLabel(
                             title: git.currentBranch,
-                            glyph: .gitBranch,
-                            systemImage: "arrow.trianglehead.branch"
+                            glyph: .gitBranch
                         )
                     }
                     .disabled(model.isSwitchingGitBranch || !model.canModifySelectedSession)
                 }
                 Button { model.showFiles() } label: {
-                    HorusPlatformMenuLabel(
+                    HorusLabel(
                         title: "Files",
-                        glyph: .fileMagnifyingGlass,
-                        systemImage: "doc.text.magnifyingglass"
+                        glyph: .fileMagnifyingGlass
                     )
                 }
                 .disabled(model.selectedSessionID == nil || !model.connectionState.isReady)
                 if let path = model.workspace?.path {
                     Button { copyToPasteboard(path) } label: {
-                        HorusPlatformMenuLabel(
+                        HorusLabel(
                             title: "Copy workspace path",
-                            glyph: .copy,
-                            systemImage: "doc.on.doc"
+                            glyph: .copy
                         )
                     }
                 }
             }
             Section {
+                Button {
+                    showsAgentSettings = true
+                } label: {
+                    HorusLabel(
+                        title: "Chat agent settings",
+                        glyph: .slidersHorizontal
+                    )
+                }
+                .disabled(model.selectedSessionID == nil || model.agentSnapshot == nil)
                 ForEach(model.chatMenuWidgets) { widget in
                     Button {
                         activate(widget)
                     } label: {
-                        HorusPlatformMenuLabel(
+                        HorusLabel(
                             title: widget.widget.text,
-                            glyph: widget.glyph,
-                            systemImage: widget.systemImage
+                            glyph: widget.glyph
                         )
                     }
                     .disabled(widget.widget.content == nil && widget.widget.action == nil)
@@ -178,30 +182,24 @@ private struct ChatOptionsMenu: View {
                 Button {
                     model.startCronSetup()
                 } label: {
-                    HorusPlatformMenuLabel(
+                    HorusLabel(
                         title: "Schedule as a task…",
-                        glyph: .calendarDots,
-                        systemImage: "calendar.badge.clock"
+                        glyph: .calendarDots
                     )
                 }
                 .disabled(!model.canModifySelectedSession || model.selectedSessionID == nil)
                 Button {
                     model.openWorkspaceBrowser()
                 } label: {
-                    HorusPlatformMenuLabel(
+                    HorusLabel(
                         title: "New chat in another folder…",
-                        glyph: .folderPlus,
-                        systemImage: "folder.badge.plus"
+                        glyph: .folderPlus
                     )
                 }
                 .disabled(!model.canCreateSession)
             }
         } label: {
-            #if os(macOS)
-            Image(systemName: "ellipsis")
-            #else
             HorusIcon(.dotsThree)
-            #endif
         }
         .labelStyle(.titleAndIcon)
         .menuIndicator(.hidden)
@@ -239,13 +237,8 @@ private struct TranscriptView: View {
     // resolves against empty content. A bottom-edge scroll position survives the late fill.
     @State private var position = ScrollPosition(edge: .bottom)
     @State private var historyAnchorID: String?
-    #if os(iOS)
     private let rowSpacing: CGFloat = 12
     private let contentPadding: CGFloat = 16
-    #else
-    private let rowSpacing: CGFloat = 16
-    private let contentPadding: CGFloat = 24
-    #endif
 
     @ViewBuilder
     var body: some View {
@@ -533,11 +526,7 @@ private struct TranscriptRow: View {
     }
 
     private var hasInlineControls: Bool {
-        #if os(macOS)
-        true
-        #else
         isAssistantMessage
-        #endif
     }
 
     private var inlineControlsVisible: Bool {
@@ -999,9 +988,7 @@ private struct HorusMarkdownText: View {
 
     var body: some View {
         StreamingMarkdown(text: normalizedText, streaming: streaming)
-            #if os(iOS)
             .markdownFontGroup(HorusMarkdownFonts())
-            #endif
             .markdownMathRenderingEnabled()
             .markdownTableStyle(.github)
             .markdownBlockQuoteStyle(.github)
@@ -1051,7 +1038,6 @@ private struct StreamingMarkdownUpdate: Equatable {
     let streaming: Bool
 }
 
-#if os(iOS)
 private struct HorusMarkdownFonts: MarkdownFontGroup {
     var h1: any CustomCTFontConvertible { Font.title3.weight(.semibold) }
     var h2: any CustomCTFontConvertible { Font.headline }
@@ -1063,7 +1049,6 @@ private struct HorusMarkdownFonts: MarkdownFontGroup {
     var inlineMath: any CustomCTFontConvertible { HorusStyle.bodyFont }
     var displayMath: any CustomCTFontConvertible { HorusStyle.bodyFont }
 }
-#endif
 
 struct ComposerView: View {
     @Environment(AppModel.self) private var model
@@ -1099,10 +1084,8 @@ private struct ComposerStack: View {
 
 private struct ComposerSurface: View {
     @Environment(AppModel.self) private var model
-    #if os(iOS)
     @Environment(\.scenePhase) private var scenePhase
     @State private var dictation = ComposerDictation()
-    #endif
     @State private var selection: TextSelection?
     @FocusState private var isComposerFocused: Bool
     @State private var referenceSuggestions: ReferenceSuggestions?
@@ -1127,9 +1110,7 @@ private struct ComposerSurface: View {
             .scrollDismissesKeyboard(.interactively)
             .font(HorusStyle.bodyFont)
             .accessibilityLabel("Message")
-            #if os(iOS)
             .disabled(dictation.isActive)
-            #endif
             .onSubmit(submit)
             .onKeyPress(.return, phases: .down) { keyPress in
                 if keyPress.modifiers.contains(.shift) {
@@ -1142,15 +1123,9 @@ private struct ComposerSurface: View {
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, 4)
-            #if os(iOS)
             ComposerOptionsView(dictation: dictation, selection: $selection)
                 .padding(.horizontal, HorusStyle.iconRowPadding)
                 .padding(.bottom, HorusStyle.iconRowPadding)
-            #else
-            ComposerOptionsView()
-                .padding(.horizontal, HorusStyle.iconRowPadding)
-                .padding(.bottom, HorusStyle.iconRowPadding)
-            #endif
         }
         .horusGlass(in: HorusStyle.cardShape, interactive: true)
         .shadow(color: .black.opacity(0.18), radius: 12, y: 6)
@@ -1186,7 +1161,6 @@ private struct ComposerSurface: View {
         .onChange(of: model.composerFocusRequest) { _, _ in
             isComposerFocused = true
         }
-        #if os(iOS)
         .onChange(of: scenePhase) { _, phase in
             guard phase == .background else { return }
             Task { await dictation.cancel() }
@@ -1210,23 +1184,16 @@ private struct ComposerSurface: View {
         .onDisappear {
             Task { await dictation.cancel() }
         }
-        #endif
     }
 
     private func submit() {
-        #if os(iOS)
         guard !dictation.isActive else { return }
-        #endif
         selection = nil
         model.sendMessage()
     }
 
     private var referenceSuggestionRequest: ReferenceSuggestionRequest {
-        #if os(iOS)
         let isDisabled = dictation.isActive
-        #else
-        let isDisabled = false
-        #endif
         let text = model.composer
         let cursor: String.Index
         if let selection,
@@ -1340,53 +1307,11 @@ private struct ReferenceSuggestionsPopup: View {
 private struct ComposerActivityView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
-    @State private var showsWorkspace = false
-    @State private var showsBranch = false
     @State private var totals = DiffLineTotals()
 
     var body: some View {
         GlassEffectContainer(spacing: 8) {
             HStack(spacing: 8) {
-                #if os(macOS)
-                if let workspace = model.workspace {
-                    Button { showsWorkspace = true } label: {
-                        HorusBadge(text: "", glyph: .folder, interactive: true)
-                    }
-                        .buttonStyle(.horusPlain)
-                        .help(workspace.path)
-                        .accessibilityLabel("Workspace")
-                        .accessibilityValue(workspace.path)
-                        .popover(isPresented: $showsWorkspace) {
-                            BadgePopover(title: "Folder") {
-                                Text(workspace.path)
-                                    .font(HorusStyle.bodyFont.monospaced())
-                                    .textSelection(.enabled)
-                            }
-                        }
-                }
-
-                if let git = model.gitStatus, !git.currentBranch.isEmpty {
-                    Button { showsBranch = true } label: {
-                        HorusBadge(
-                            text: "",
-                            glyph: .gitBranch,
-                            interactive: true
-                        )
-                    }
-                        .buttonStyle(.horusPlain)
-                        .help(git.currentBranch)
-                        .accessibilityLabel("Git branch")
-                        .accessibilityValue(git.currentBranch)
-                        .popover(isPresented: $showsBranch) {
-                            BadgePopover(title: "Git branch") {
-                                Text(git.currentBranch)
-                                    .font(HorusStyle.bodyFont.monospaced())
-                                    .textSelection(.enabled)
-                            }
-                        }
-                }
-                #endif
-
                 ForEach(model.composerFooterWidgets) { widget in
                     FrontendWidgetView(widget: widget)
                 }
@@ -1801,52 +1726,28 @@ private struct FrontendActionListRow: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
             if !item.actions.isEmpty {
-                #if os(iOS)
-            Menu {
-                ForEach(item.actions) { action in
-                    Button(role: action.tone == "error" ? .destructive : nil) {
-                        activate(action)
-                    } label: {
-                        HorusLabel(
-                            title: action.label,
-                            glyph: HorusSymbol.glyph(for: action.symbol)
-                        )
+                Menu {
+                    ForEach(item.actions) { action in
+                        Button(role: action.tone == "error" ? .destructive : nil) {
+                            activate(action)
+                        } label: {
+                            HorusLabel(
+                                title: action.label,
+                                glyph: HorusSymbol.glyph(for: action.symbol)
+                            )
+                        }
                     }
-                }
-            } label: {
-                HorusIcon(.dotsThree, foreground: palette.accent)
-                    .frame(
-                        width: HorusStyle.iconButtonSize,
-                        height: HorusStyle.iconButtonSize
-                    )
-                    .contentShape(Rectangle())
-            }
-            .accessibilityLabel("More actions")
-            .accessibilityHint("Shows available actions for this item")
-            .help("More actions")
-            #else
-            HStack(spacing: 0) {
-                ForEach(item.actions) { action in
-                    Button(role: action.tone == "error" ? .destructive : nil) {
-                        activate(action)
-                    } label: {
-                        HorusIcon(
-                            HorusSymbol.glyph(for: action.symbol),
-                            foreground: actionColor(action)
-                        )
+                } label: {
+                    HorusIcon(.dotsThree, foreground: palette.accent)
                         .frame(
                             width: HorusStyle.iconButtonSize,
                             height: HorusStyle.iconButtonSize
                         )
                         .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.horusPlain)
-                    .accessibilityLabel(action.label)
-                    .help(action.label)
                 }
-            }
-            .fixedSize()
-                #endif
+                .accessibilityLabel("More actions")
+                .accessibilityHint("Shows available actions for this item")
+                .help("More actions")
             }
         }
         .accessibilityElement(children: .contain)
@@ -1900,10 +1801,6 @@ private struct FrontendActionListRow: View {
         } else {
             model.submitFrontendOperation(action.op)
         }
-    }
-
-    private func actionColor(_ action: FrontendActionListAction) -> Color {
-        action.tone == "neutral" ? palette.accent : palette.tone(action.tone)
     }
 
     private var statusGlyph: HorusGlyph? {
@@ -1994,18 +1891,8 @@ struct FrontendWidgetSheet: View {
             .scrollContentBackground(.hidden)
             .navigationTitle(currentWidget?.title ?? widget.title)
             .toolbarTitleDisplayMode(.inline)
-            #if os(macOS)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done", action: dismiss.callAsFunction)
-                }
-            }
-            #endif
             .background(HorusBackdrop())
         }
-        #if os(macOS)
-        .frame(minWidth: 520, minHeight: 460)
-        #endif
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
     }
@@ -2054,12 +1941,7 @@ private struct FrontendPickerView: View {
 }
 
 private func copyToPasteboard(_ text: String) {
-    #if os(macOS)
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(text, forType: .string)
-    #elseif os(iOS)
     UIPasteboard.general.string = text
-    #endif
 }
 
 private struct DiffLineTotals: Equatable, Sendable {

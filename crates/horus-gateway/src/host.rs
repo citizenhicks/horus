@@ -23,7 +23,7 @@ use horus::middleware::scratchpad::ScratchpadStore;
 use horus::middleware::session_files::SessionFileStore;
 use horus::protocol::{
     Event, EventMsg, FrontendBlock, FrontendBlockFormat, FrontendEvent, Op, ReviewDecision,
-    SessionFileReference, Submission, TokenUsage, replay_events,
+    SessionFileReference, Submission, replay_events,
 };
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use uuid::Uuid;
@@ -32,7 +32,7 @@ use crate::assembly::{
     BuiltAgent, assemble, configured_model_choices, configured_model_providers,
     configured_provider_for_route, provider_statuses,
 };
-use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig, usage_delta};
+use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig};
 use crate::cron::{ActiveCronRun, BeginRun, CronStore};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{
@@ -129,7 +129,6 @@ struct HostState {
     catalog_lock: Arc<Mutex<()>>,
     activities: SessionActivities,
     running: RunningAgent,
-    usage_baseline: TokenUsage,
     pending_turns: usize,
     approval_active: bool,
     turn_error: Option<String>,
@@ -627,12 +626,8 @@ impl HostHandle {
         session_id: String,
         origin_label: &str,
     ) -> Result<Self> {
-        let gateway_config = gateway
-            .lock()
-            .map_err(|_| Error::Config("gateway configuration lock is poisoned".into()))?
-            .clone();
         let running = start_agent(
-            &gateway_config,
+            Arc::clone(&gateway),
             &spec,
             &store,
             Arc::clone(&credentials),
@@ -668,7 +663,6 @@ impl HostHandle {
             catalog_lock,
             activities,
             running,
-            usage_baseline: TokenUsage::default(),
             pending_turns: 0,
             approval_active: false,
             turn_error: None,
@@ -1431,7 +1425,7 @@ impl HostState {
             .map_err(invalid_config)?;
         let session_id = self.running.session_id.clone();
         let replacement = start_agent(
-            &gateway,
+            Arc::clone(&self.gateway),
             &next,
             &self.store,
             Arc::clone(&self.credentials),
@@ -1509,13 +1503,8 @@ impl HostState {
     }
 
     async fn restart(&mut self, origin_label: &str) -> std::result::Result<(), Rejection> {
-        let gateway = self
-            .gateway
-            .lock()
-            .map_err(|_| internal("gateway configuration lock is poisoned"))?
-            .clone();
         let replacement = start_agent(
-            &gateway,
+            Arc::clone(&self.gateway),
             &self.spec,
             &self.store,
             Arc::clone(&self.credentials),
@@ -1631,15 +1620,6 @@ impl HostState {
     }
 
     fn record_event(&mut self, mut event: Event, suppress_broadcast: bool) -> Result<ServerFrame> {
-        if let Some(delta) = live_usage_delta(&mut self.usage_baseline, &event)? {
-            let mut gateway = self
-                .gateway
-                .lock()
-                .map_err(|_| Error::Config("gateway configuration lock is poisoned".into()))?;
-            if gateway.observe_usage(&delta)? {
-                self.store.save(&gateway)?;
-            }
-        }
         update_widgets(&mut self.widgets, &event.msg);
         let blocks = self.running.frontend.render(&event.msg);
         self.record_artifacts(&blocks);
@@ -1954,21 +1934,6 @@ impl HostState {
     }
 }
 
-fn live_usage_delta(baseline: &mut TokenUsage, event: &Event) -> Result<Option<TokenUsage>> {
-    let EventMsg::TokenCount(count) = &event.msg else {
-        return Ok(None);
-    };
-    let Some(info) = &count.info else {
-        return Ok(None);
-    };
-    let delta = usage_delta(&info.total_token_usage, baseline)?;
-    baseline.clone_from(&info.total_token_usage);
-    if event.submission_id.is_none() {
-        return Ok(None);
-    }
-    Ok(delta)
-}
-
 fn provider_credential_matches(
     selection: &ProviderConfig,
     provider_id: &str,
@@ -2250,7 +2215,7 @@ fn setup_agent_config() -> VersionedAgentConfig {
     reason = "agent assembly keeps chat and gateway dependencies explicit"
 )]
 async fn start_agent(
-    gateway: &GatewayConfig,
+    gateway: Arc<StdMutex<GatewayConfig>>,
     spec: &ChatSpec,
     store: &ConfigStore,
     credentials: Arc<CredentialStore>,
@@ -2664,41 +2629,11 @@ fn invalid_cron(error: impl std::fmt::Display) -> Rejection {
 mod tests {
     use horus::backend::checkpoint::{Checkpoint, TranscriptPageRequest};
     use horus::backend::model::user_message;
-    use horus::protocol::{SessionContext, TokenCountEvent, TokenUsageInfo};
+    use horus::protocol::{SessionContext, TokenUsage};
 
     use crate::assembly::INITIAL_REPLAY_BATCHES;
 
     use super::*;
-
-    #[test]
-    fn startup_usage_seeds_the_live_delta_without_being_counted() {
-        let usage = |tokens| TokenUsage {
-            input_tokens: tokens,
-            total_tokens: tokens,
-            ..TokenUsage::default()
-        };
-        let event = |submission_id: Option<&str>, tokens| Event {
-            submission_id: submission_id.map(str::to_owned),
-            msg: EventMsg::TokenCount(TokenCountEvent {
-                info: Some(TokenUsageInfo {
-                    total_token_usage: usage(tokens),
-                    last_token_usage: usage(tokens),
-                    model_context_window: None,
-                }),
-                rate_limits: None,
-            }),
-        };
-        let mut baseline = TokenUsage::default();
-
-        let startup = live_usage_delta(&mut baseline, &event(None, 100)).expect("startup usage");
-        let live =
-            live_usage_delta(&mut baseline, &event(Some("submission"), 130)).expect("live usage");
-
-        assert_eq!(
-            (startup, live, baseline),
-            (None, Some(usage(30)), usage(130))
-        );
-    }
 
     #[test]
     fn widget_snapshot_is_namespaced_updated_and_removed() {

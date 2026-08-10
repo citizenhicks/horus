@@ -272,11 +272,7 @@ private actor GatewayDiskStore {
     }
 
     private var protectedWriteOptions: Data.WritingOptions {
-        #if os(iOS)
         [.atomic, .completeFileProtection]
-        #else
-        .atomic
-        #endif
     }
 
     private func accountTranscriptDirectory(_ accountID: UUID) -> URL {

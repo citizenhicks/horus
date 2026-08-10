@@ -1,17 +1,10 @@
 import SwiftUI
 
 enum HorusStyle {
-    #if os(iOS)
     static let bodyFont: Font = .body
     static let controlFont: Font = .body.weight(.medium)
     static let metadataFont: Font = .footnote.monospaced()
     static let badgeFont: Font = .footnote.weight(.medium)
-    #else
-    static let bodyFont: Font = .system(size: 14)
-    static let controlFont: Font = .system(size: 14, weight: .medium)
-    static let metadataFont: Font = .caption.monospaced()
-    static let badgeFont: Font = .caption.weight(.medium)
-    #endif
     static let cardRadius: CGFloat = 22
     static let controlRadius: CGFloat = 9
     /// Between a control and a card: the radius a card keeps when it shrinks to a tile.
@@ -23,11 +16,7 @@ enum HorusStyle {
     static let controlHeight: CGFloat = 30
     static let badgeHeight: CGFloat = 26
     static let iconSize: CGFloat = 16
-    #if os(iOS)
     static let iconButtonSize: CGFloat = 44
-    #else
-    static let iconButtonSize: CGFloat = 32
-    #endif
     static let borderWidth: CGFloat = 0.75
     /// Empty space an icon button keeps around its glyph to reach a full tap target.
     static let iconButtonInset = (iconButtonSize - iconSize) / 2
@@ -349,27 +338,10 @@ struct HorusLabel: View {
     }
 }
 
-/// Uses SF Symbols for native macOS menus, whose tinting is owned by AppKit.
-struct HorusPlatformMenuLabel: View {
-    let title: String
-    let glyph: HorusGlyph
-    let systemImage: String
-
-    var body: some View {
-        #if os(macOS)
-        Label(title, systemImage: systemImage)
-        #else
-        HorusLabel(title: title, glyph: glyph)
-        #endif
-    }
-}
-
 /// Row of capsule actions. Rows of several actions drop their labels on a narrow
 /// screen; a single action keeps its label and goes full width instead.
 struct HorusActionRow<Content: View>: View {
-    #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    #endif
     var collapsesToIcons = false
     @ViewBuilder let content: Content
 
@@ -380,13 +352,9 @@ struct HorusActionRow<Content: View>: View {
                     .labelStyle(.iconOnly)
                     .buttonBorderShape(.circle)
             } else {
-                #if os(iOS)
                 // Full width keeps the label: measuring for a horizontal fit either
                 // hyphenates or truncates it away.
                 VStack(spacing: 8) { content }.buttonSizing(.flexible)
-                #else
-                HStack(spacing: 8) { content }
-                #endif
             }
         }
         .frame(maxWidth: .infinity)
@@ -397,11 +365,7 @@ struct HorusActionRow<Content: View>: View {
     }
 
     private var iconsOnly: Bool {
-        #if os(iOS)
         collapsesToIcons && horizontalSizeClass == .compact
-        #else
-        false
-        #endif
     }
 }
 
@@ -438,61 +402,45 @@ extension Button where Label == HorusLabel {
 /// Draws the gateway's `FrontendSymbol` vocabulary in HugeIcons.
 ///
 /// The protocol names what a glyph stands for and leaves the artwork to each frontend, so
-/// this table is the Apple client's half of that contract: one entry per `FrontendSymbol`
+/// this table is the iOS client's half of that contract: one entry per `FrontendSymbol`
 /// variant, and the gateway never names an icon itself. Keep it in step with the enum in
 /// `src/protocol/mod.rs` — a variant with no entry here falls back to `placeholder`.
 ///
 /// `FrontendSymbol::Custom` has no entry by definition. It carries a name from outside the
 /// protocol's vocabulary, which this app has no artwork for, so it draws the placeholder.
 enum HorusSymbol {
-    private struct Artwork {
-        let glyph: HorusGlyph
-        let systemImage: String
-    }
-
-    private static let placeholder = Artwork(
-        glyph: .question,
-        systemImage: "questionmark.square.dashed"
-    )
+    private static let placeholder = HorusGlyph.question
 
     static func glyph(for symbol: String) -> HorusGlyph {
-        artwork(for: symbol).glyph
+        vocabulary[symbol] ?? placeholder
     }
 
     /// Nil where `glyph(for:)` would return the placeholder. Beside a label the placeholder
     /// reads as a broken glyph rather than a neutral one, so a caller can drop it instead.
     static func knownGlyph(for symbol: String) -> HorusGlyph? {
-        vocabulary[symbol]?.glyph
-    }
-
-    static func systemImage(for symbol: String) -> String {
-        artwork(for: symbol).systemImage
+        vocabulary[symbol]
     }
 
     /// One entry per `FrontendSymbol` variant.
-    private static let vocabulary: [String: Artwork] = [
-        "agent": Artwork(glyph: .robot, systemImage: "person.fill"),
-        "brain": Artwork(glyph: .brain, systemImage: "brain.head.profile"),
-        "branch": Artwork(glyph: .gitBranch, systemImage: "arrow.trianglehead.branch"),
-        "chat": Artwork(glyph: .chatCircle, systemImage: "text.bubble"),
-        "chat_gpt": Artwork(glyph: .chatGpt, systemImage: "bubble.left.and.text.bubble.right"),
-        "claude": Artwork(glyph: .claude, systemImage: "sparkles"),
-        "deepseek": Artwork(glyph: .deepseek, systemImage: "waveform.path.ecg"),
-        "delete": Artwork(glyph: .trash, systemImage: "trash"),
-        "edit": Artwork(glyph: .pencilSimple, systemImage: "pencil"),
-        "kimi": Artwork(glyph: .kimiAi, systemImage: "k.circle"),
-        "moon": Artwork(glyph: .moon, systemImage: "moon"),
-        "promote": Artwork(glyph: .arrowCircleUp, systemImage: "arrow.up.circle"),
-        "route": Artwork(glyph: .path, systemImage: "point.3.connected.trianglepath.dotted"),
-        "search": Artwork(glyph: .magnifyingGlass, systemImage: "magnifyingglass"),
-        "sparkle": Artwork(glyph: .sparkle, systemImage: "sparkles"),
-        "storage": Artwork(glyph: .hardDrives, systemImage: "externaldrive.connected.to.line.below"),
-        "task": Artwork(glyph: .checkCircle, systemImage: "checklist"),
+    private static let vocabulary: [String: HorusGlyph] = [
+        "agent": .robot,
+        "brain": .brain,
+        "branch": .gitBranch,
+        "chat": .chatCircle,
+        "chat_gpt": .chatGpt,
+        "claude": .claude,
+        "deepseek": .deepseek,
+        "delete": .trash,
+        "edit": .pencilSimple,
+        "kimi": .kimiAi,
+        "moon": .moon,
+        "promote": .arrowCircleUp,
+        "route": .path,
+        "search": .magnifyingGlass,
+        "sparkle": .sparkle,
+        "storage": .hardDrives,
+        "task": .checkCircle,
     ]
-
-    private static func artwork(for symbol: String) -> Artwork {
-        vocabulary[symbol] ?? placeholder
-    }
 }
 
 struct HorusPalette: Sendable {
@@ -695,14 +643,9 @@ struct HorusFeedbackButtonStyle<Base: PrimitiveButtonStyle>: PrimitiveButtonStyl
 
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        #if os(iOS)
         FeedbackButton(configuration: configuration, base: base)
-        #else
-        base.makeBody(configuration: configuration)
-        #endif
     }
 
-    #if os(iOS)
     private struct FeedbackButton: View {
         @State private var feedback = false
         let configuration: PrimitiveButtonStyleConfiguration
@@ -719,7 +662,6 @@ struct HorusFeedbackButtonStyle<Base: PrimitiveButtonStyle>: PrimitiveButtonStyl
             .sensoryFeedback(.impact(weight: .light), trigger: feedback)
         }
     }
-    #endif
 }
 
 extension PrimitiveButtonStyle where Self == HorusFeedbackButtonStyle<DefaultButtonStyle> {
@@ -779,9 +721,7 @@ struct HorusIconButtonStyle: ButtonStyle {
                 }
             }
             .opacity(isPressed ? 0.72 : 1)
-            #if os(iOS)
             .sensoryFeedback(.impact(weight: .light), trigger: isPressed) { _, pressed in pressed }
-            #endif
         }
 
         private var foreground: Color {
@@ -793,68 +733,18 @@ struct HorusIconButtonStyle: ButtonStyle {
 }
 
 /// A prominent button with a label that stays legible on the accent in both schemes.
-///
-/// iOS draws `.glassProminent` from the tint this app sets, so the label colour and the
-/// fill agree. macOS lets the system own that fill: it desaturates for an inactive window
-/// and can follow the accent colour chosen in System Settings, neither of which the label
-/// colour here knows about, so a label picked for the Nord accent ends up on a surface the
-/// app never chose. Painting the fill in the style keeps the pair together — the same
-/// `Glass.regular.tint(...)` path `HorusIconButtonStyle` already uses on both platforms.
 private struct HorusProminentButton: ViewModifier {
     @Environment(\.horusPalette) private var palette
 
     func body(content: Content) -> some View {
-        #if os(macOS)
-        content.buttonStyle(HorusProminentButtonStyle())
-        #else
         // `.glassProminent` fills from the tint, so it needs the accessible one rather than
         // the global tint `HorusTheme` sets for switches, pickers, and links.
         content
             .buttonStyle(.horusGlassProminent)
             .tint(palette.accentFill)
             .foregroundStyle(palette.onAccent)
-        #endif
     }
 }
-
-#if os(macOS)
-struct HorusProminentButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        ProminentLabel(label: configuration.label, isPressed: configuration.isPressed)
-    }
-
-    private struct ProminentLabel: View {
-        @Environment(\.horusPalette) private var palette
-        // A custom style gets no automatic disabled treatment: without this the label keeps
-        // its full-strength accent colour on a button that no longer responds.
-        @Environment(\.isEnabled) private var isEnabled
-        @Environment(\.controlSize) private var controlSize
-        let label: ButtonStyleConfiguration.Label
-        let isPressed: Bool
-
-        var body: some View {
-            label
-                .font(HorusStyle.controlFont)
-                .foregroundStyle(isEnabled ? palette.onAccent : palette.muted)
-                .padding(.horizontal, 14)
-                .frame(height: height)
-                // A glass effect adds no hit area of its own.
-                .contentShape(Capsule())
-                .horusGlass(in: Capsule(), interactive: isEnabled, prominent: isEnabled)
-                .opacity(isPressed ? 0.72 : 1)
-        }
-
-        // `buttonBorderShape` and `controlSize` only reach the built-in styles, so the
-        // call sites asking for a large capsule are honoured here instead.
-        private var height: CGFloat {
-            switch controlSize {
-            case .large, .extraLarge: 36
-            default: HorusStyle.controlHeight
-            }
-        }
-    }
-}
-#endif
 
 extension View {
     func horusProminentButton() -> some View { modifier(HorusProminentButton()) }

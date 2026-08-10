@@ -176,8 +176,8 @@ fn render_profile(profile: &ProfileSnapshot) -> String {
     let mut lines = vec![profile.user_name.as_deref().unwrap_or("user").into()];
     lines.extend(profile.daily_usage.iter().map(|day| {
         format!(
-            "day {} · {} tokens · {} cached",
-            day.unix_day, day.usage.total_tokens, day.usage.cached_input_tokens
+            "day {} · {} · {} tokens · {} cached",
+            day.unix_day, day.provider, day.usage.total_tokens, day.usage.cached_input_tokens
         )
     }));
     lines.join("\n")
@@ -218,7 +218,32 @@ fn render_cron_history(runs: &[CronRun]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use horus::protocol::TokenUsage;
+    use horus_gateway::wire::{DailyUsage, RunStats};
+
     use super::*;
+
+    #[test]
+    fn profile_usage_names_each_provider() {
+        let profile = ProfileSnapshot {
+            user_name: Some("user".into()),
+            daily_usage: vec![DailyUsage {
+                unix_day: 7,
+                provider: "openai_socket".into(),
+                usage: TokenUsage {
+                    total_tokens: 11,
+                    ..TokenUsage::default()
+                },
+            }],
+            run_stats: RunStats::default(),
+            recent_run_groups: Vec::new(),
+        };
+
+        assert_eq!(
+            render_profile(&profile),
+            "user\nday 7 · openai_socket · 11 tokens · 0 cached"
+        );
+    }
 
     #[test]
     fn cron_parser_covers_remote_scheduler_operations() {

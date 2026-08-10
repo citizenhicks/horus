@@ -32,9 +32,9 @@ use crate::backend::model::TOOL_ERROR_FIELD;
 use crate::backend::model::ToolCall;
 use crate::backend::model::ToolDefinition;
 use crate::backend::model::user_message;
-use crate::backend::sandbox::ApprovalPolicy;
 use crate::backend::sandbox::Sandbox;
 use crate::backend::sandbox::local::LocalSandbox;
+use crate::backend::sandbox::{ApprovalPolicy, ApprovalReviewerConfig};
 use crate::middleware::ActiveSubmissionContext;
 use crate::middleware::ActiveSubmissionResult;
 use crate::middleware::Middleware;
@@ -820,12 +820,22 @@ fn auto_review_config(
     model: Arc<ScriptedModel>,
     session_id: &str,
 ) -> AgentConfig {
+    let mut models = ModelRouter::new("main", model.clone());
+    models
+        .register("reviewer", model)
+        .expect("reviewer model route");
+    let reviewer = ApprovalReviewerConfig::default()
+        .model_route("reviewer")
+        .expect("reviewer route");
     AgentConfig::new(
-        Arc::new(ModelRouter::new("main", model)),
-        Arc::new(Sandbox::new(
-            Arc::new(LocalSandbox::new(workspace).expect("local sandbox")),
-            ApprovalPolicy::AutoApprove,
-        )),
+        Arc::new(models),
+        Arc::new(
+            Sandbox::new(
+                Arc::new(LocalSandbox::new(workspace).expect("local sandbox")),
+                ApprovalPolicy::AutoApprove,
+            )
+            .approval_reviewer(reviewer),
+        ),
         checkpoints,
         MiddlewareStack::new(vec![Arc::new(Tools::new(vec![Arc::new(
             ApprovalRequiredTestTool,
@@ -1107,6 +1117,8 @@ async fn completed_before_model_effects_are_settled_when_a_later_hook_fails() {
             .expect("checkpoint store"),
     );
     let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let observed_usage = Arc::new(Mutex::new(Vec::new()));
+    let usage_observer = Arc::clone(&observed_usage);
     let config = AgentConfig::new(
         Arc::new(ModelRouter::new("main", Arc::new(TestModel))),
         Arc::new(Sandbox::new(
@@ -1121,7 +1133,14 @@ async fn completed_before_model_effects_are_settled_when_a_later_hook_fails() {
         .expect("middleware"),
         "test prompt",
     )
-    .session_id("settled-hooks");
+    .session_id("settled-hooks")
+    .usage_observer(move |route, usage| {
+        usage_observer
+            .lock()
+            .expect("usage observer lock")
+            .push((route.to_owned(), usage.total_tokens));
+        Ok(())
+    });
     let mut agent = create_agent(config).await.expect("create agent");
     agent.next_event().await.expect("configured event");
     agent.next_event().await.expect("sandbox widget");
@@ -1160,6 +1179,13 @@ async fn completed_before_model_effects_are_settled_when_a_later_hook_fails() {
         .expect("failed execution");
 
     assert!(saw_effect);
+    assert_eq!(
+        observed_usage
+            .lock()
+            .expect("observed usage lock")
+            .as_slice(),
+        [("main".into(), 1)]
+    );
     assert_eq!(saved.total_usage.total_tokens, 1);
     assert_eq!(
         (
@@ -1315,14 +1341,22 @@ async fn automatic_approval_counts_isolated_review_usage_without_replacing_prima
         inputs: Mutex::new(Vec::new()),
     });
     let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
-    let mut agent = create_agent(auto_review_config(
+    let observed_usage = Arc::new(Mutex::new(Vec::new()));
+    let usage_observer = Arc::clone(&observed_usage);
+    let config = auto_review_config(
         workspace.path(),
         checkpoint_store,
         model.clone(),
         "auto-review",
-    ))
-    .await
-    .expect("create agent");
+    )
+    .usage_observer(move |route, usage| {
+        usage_observer
+            .lock()
+            .expect("usage observer lock")
+            .push((route.to_owned(), usage.total_tokens));
+        Ok(())
+    });
+    let mut agent = create_agent(config).await.expect("create agent");
     agent
         .sender()
         .submit(Op::UserInput {
@@ -1375,6 +1409,17 @@ async fn automatic_approval_counts_isolated_review_usage_without_replacing_prima
     assert_eq!(saved.last_usage, Some(scripted_usage()));
     assert_eq!(usage_events, [(1, 1), (8, 1), (9, 1)]);
     assert_eq!(
+        observed_usage
+            .lock()
+            .expect("observed usage lock")
+            .as_slice(),
+        [
+            ("main".into(), 1),
+            ("reviewer".into(), 7),
+            ("main".into(), 1)
+        ]
+    );
+    assert_eq!(
         (
             execution.outcome,
             execution.model_calls,
@@ -1385,6 +1430,131 @@ async fn automatic_approval_counts_isolated_review_usage_without_replacing_prima
         ),
         (ExecutionOutcome::Completed, 3, 1, 0, 9, 1)
     );
+}
+
+#[tokio::test]
+async fn cloned_agent_config_inherits_route_aware_usage_observer() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let model = Arc::new(ScriptedModel {
+        outputs: Mutex::new(VecDeque::from([scripted_message("done")])),
+        tool_counts: Mutex::new(Vec::new()),
+        inputs: Mutex::new(Vec::new()),
+    });
+    let mut models = ModelRouter::new("main", model.clone());
+    models
+        .register("alternate", model)
+        .expect("alternate route");
+    let observed_usage = Arc::new(Mutex::new(Vec::new()));
+    let usage_observer = Arc::clone(&observed_usage);
+    let template = AgentConfig::new(
+        Arc::new(models),
+        Arc::new(Sandbox::new(
+            Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+            ApprovalPolicy::Ask,
+        )),
+        checkpoints,
+        MiddlewareStack::new(Vec::new()).expect("middleware"),
+        "test prompt",
+    )
+    .usage_observer(move |route, usage| {
+        usage_observer
+            .lock()
+            .expect("usage observer lock")
+            .push((route.to_owned(), usage.total_tokens));
+        Ok(())
+    });
+    let config = template
+        .clone()
+        .session_id("child")
+        .model_route("alternate", None)
+        .expect("child route");
+    let mut agent = create_agent(config).await.expect("create child agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "hello".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit input");
+    while !matches!(
+        agent.next_event().await.expect("agent event").msg,
+        EventMsg::TurnComplete(_)
+    ) {}
+
+    assert_eq!(
+        observed_usage
+            .lock()
+            .expect("observed usage lock")
+            .as_slice(),
+        [("alternate".into(), 1)]
+    );
+}
+
+#[tokio::test]
+async fn failing_usage_observer_aborts_before_checkpoint_usage_is_committed() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let model = Arc::new(ScriptedModel {
+        outputs: Mutex::new(VecDeque::from([scripted_message("done")])),
+        tool_counts: Mutex::new(Vec::new()),
+        inputs: Mutex::new(Vec::new()),
+    });
+    let config = AgentConfig::new(
+        Arc::new(ModelRouter::new("main", model)),
+        Arc::new(Sandbox::new(
+            Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+            ApprovalPolicy::Ask,
+        )),
+        checkpoint_store,
+        MiddlewareStack::new(Vec::new()).expect("middleware"),
+        "test prompt",
+    )
+    .session_id("usage-observer-failure")
+    .usage_observer(|_, _| Err(Error::Checkpoint("usage sink failed".into())));
+    let mut agent = create_agent(config).await.expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "hello".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit input");
+    while !matches!(
+        agent.next_event().await.expect("agent event").msg,
+        EventMsg::TurnAborted(_)
+    ) {}
+    let saved = checkpoints
+        .load("usage-observer-failure")
+        .await
+        .expect("load checkpoint")
+        .expect("saved checkpoint");
+    let execution = checkpoints
+        .execution_page(
+            "usage-observer-failure",
+            ExecutionPageRequest {
+                before_sequence: None,
+                limit: 1,
+            },
+        )
+        .await
+        .expect("execution page")
+        .executions
+        .pop()
+        .expect("failed execution");
+
+    assert_eq!(saved.total_usage, TokenUsage::default());
+    assert_eq!(saved.last_usage, None);
+    assert_eq!(execution.outcome, ExecutionOutcome::Failed);
+    assert_eq!(execution.model_calls, 1);
+    assert_eq!(execution.usage, TokenUsage::default());
 }
 
 #[tokio::test]

@@ -12,6 +12,41 @@ private actor GatewayRequestRecorder {
     func requests() -> [GatewayRequest] {
         recorded
     }
+
+    func requestCount() -> Int {
+        recorded.count
+    }
+
+    func firstRequest(
+        after index: Int,
+        matching predicate: @Sendable (GatewayRequest) -> Bool
+    ) async -> GatewayRequest? {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(1))
+        repeat {
+            if let request = recorded.dropFirst(index).first(where: predicate) {
+                return request
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        } while clock.now < deadline
+        return recorded.dropFirst(index).first(where: predicate)
+    }
+}
+
+private actor AsyncGate {
+    private var isOpen = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+
+    func open() {
+        isOpen = true
+        waiter?.resume()
+        waiter = nil
+    }
 }
 
 private actor GatewayConnectionHarness {
@@ -69,6 +104,19 @@ final class AppModelTests: XCTestCase {
             requestSender: requestSender,
             titleWriter: titleWriter
         )
+    }
+
+    private func eventually(
+        timeout: Duration = .seconds(1),
+        _ predicate: @MainActor () async -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        repeat {
+            if await predicate() { return true }
+            try? await Task.sleep(for: .milliseconds(5))
+        } while clock.now < deadline
+        return await predicate()
     }
 
     private func composition(systemPrompt: String = "Test") -> AgentComposition {
@@ -184,13 +232,16 @@ final class AppModelTests: XCTestCase {
         model.connectionState = .ready
         model.selectedSessionID = sessionID
         model.composer = "Displaced draft"
+        let requestCount = await recorder.requestCount()
         model.editWidgetInputInComposer(editableWidget())
-        try await Task.sleep(for: .milliseconds(30))
-        let submissions = await recorder.requests().compactMap { request -> Submission? in
+        let request = await recorder.firstRequest(after: requestCount) {
+            if case .submit = $0 { return true }
+            return false
+        }
+        let submission = try XCTUnwrap(request.flatMap { request -> Submission? in
             guard case .submit(_, let submission) = request else { return nil }
             return submission
-        }
-        let submission = try XCTUnwrap(submissions.last)
+        })
         model.reduce(
             event: AgentEventRecord(submissionId: submission.id, msg: .object([
                 "type": .string("frontend"),
@@ -253,10 +304,13 @@ final class AppModelTests: XCTestCase {
         model.accounts = [account]
         model.selectedAccountID = account.id
         model.connectionState = .ready
+        let requestCount = await recorder.requestCount()
         model.chooseWorkspace("/srv/horus")
-        try await Task.sleep(for: .milliseconds(30))
-        let requests = await recorder.requests()
-        guard case .createSession(let requestID, _) = try XCTUnwrap(requests.last) else {
+        let request = await recorder.firstRequest(after: requestCount) {
+            if case .createSession = $0 { return true }
+            return false
+        }
+        guard case .createSession(let requestID, _) = try XCTUnwrap(request) else {
             return XCTFail("Expected a create-session request")
         }
         model.handle(.sessionOpened(
@@ -264,7 +318,17 @@ final class AppModelTests: XCTestCase {
             payload: sessionReady(latestSequence: 0, sessionID: sessionID)
         ))
         model.handle(.sessionReplayComplete(requestID: requestID, sessionID: sessionID))
-        try await Task.sleep(for: .milliseconds(100))
+        guard !model.canCreateSession else { return }
+        let ready = expectation(description: "New session finished loading")
+        withObservationTracking {
+            _ = model.canCreateSession
+        } onChange: {
+            ready.fulfill()
+        }
+        if !model.canCreateSession {
+            await fulfillment(of: [ready], timeout: 1)
+        }
+        XCTAssertTrue(model.canCreateSession)
     }
 
     @discardableResult
@@ -275,15 +339,18 @@ final class AppModelTests: XCTestCase {
         sessionID: String = "chat-1"
     ) async throws -> Submission {
         model.composer = text
+        let requestCount = await recorder.requestCount()
         model.sendMessage()
-        try await Task.sleep(for: .milliseconds(30))
-        let submissions = await recorder.requests().compactMap { request -> Submission? in
-            guard case .submit(let submittedSessionID, let submission) = request,
-                  submittedSessionID == sessionID
-            else { return nil }
-            return submission
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            guard case .submit(let submittedSessionID, _) = request else { return false }
+            return submittedSessionID == sessionID
         }
-        return try XCTUnwrap(submissions.last)
+        let submission = try XCTUnwrap(request.flatMap { request -> Submission? in
+            guard case .submit(_, let submission) = request else { return nil }
+            return submission
+        })
+        try await Task.sleep(for: .milliseconds(30))
+        return submission
     }
 
     private func renderEvent(
@@ -680,12 +747,16 @@ final class AppModelTests: XCTestCase {
         model.gitStatus = GitStatus(currentBranch: "main", branches: ["feature", "main"])
 
         model.switchGitBranch(to: "unknown")
+        let requestCount = await recorder.requestCount()
         model.switchGitBranch(to: "feature")
-        try await Task.sleep(for: .milliseconds(20))
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            if case .switchGitBranch = request { return true }
+            return false
+        }
 
         let requests = await recorder.requests()
         XCTAssertEqual(requests.count, 1)
-        guard case .switchGitBranch(_, let sessionID, let branch) = requests[0] else {
+        guard case .switchGitBranch(_, let sessionID, let branch) = try XCTUnwrap(request) else {
             return XCTFail("Expected a branch switch request")
         }
         XCTAssertEqual(sessionID, "chat-1")
@@ -703,13 +774,16 @@ final class AppModelTests: XCTestCase {
         model.activeOperation = "steer"
         model.composer = "Use the smaller patch"
 
+        var requestCount = await recorder.requestCount()
         model.sendMessage()
-        try await Task.sleep(for: .milliseconds(20))
-        let firstSubmissions = await recorder.requests().compactMap { request -> Submission? in
+        let firstRequest = await recorder.firstRequest(after: requestCount) { request in
+            if case .submit = request { return true }
+            return false
+        }
+        let first = try XCTUnwrap(firstRequest.flatMap { request -> Submission? in
             guard case .submit(_, let submission) = request else { return nil }
             return submission
-        }
-        let first = try XCTUnwrap(firstSubmissions.first)
+        })
         model.reduce(
             event: AgentEventRecord(submissionId: first.id, msg: .object([
                 "type": .string("frontend"),
@@ -753,13 +827,16 @@ final class AppModelTests: XCTestCase {
 
         model.connectionState = .ready
         model.composer = "Retry this steering"
+        requestCount = await recorder.requestCount()
         model.sendMessage()
-        try await Task.sleep(for: .milliseconds(20))
-        let secondSubmissions = await recorder.requests().compactMap { request -> Submission? in
+        let secondRequest = await recorder.firstRequest(after: requestCount) { request in
+            if case .submit = request { return true }
+            return false
+        }
+        let second = try XCTUnwrap(secondRequest.flatMap { request -> Submission? in
             guard case .submit(_, let submission) = request else { return nil }
             return submission
-        }
-        let second = try XCTUnwrap(secondSubmissions.last)
+        })
         model.reduce(
             event: AgentEventRecord(submissionId: second.id, msg: .object([
                 "type": .string("warning"),
@@ -823,11 +900,13 @@ final class AppModelTests: XCTestCase {
         model.composer = "Keep this draft"
         let focusRequest = model.composerFocusRequest
 
+        var requestCount = await recorder.requestCount()
         model.editWidgetInputInComposer(queued)
-        try await Task.sleep(for: .milliseconds(20))
-
-        let requests = await recorder.requests()
-        guard case .submit(let sessionID, let editSubmission) = try XCTUnwrap(requests.first),
+        let editRequest = await recorder.firstRequest(after: requestCount) { request in
+            if case .submit = request { return true }
+            return false
+        }
+        guard case .submit(let sessionID, let editSubmission) = try XCTUnwrap(editRequest),
               case .capabilityCommand(
                   let capability,
                   let command,
@@ -865,14 +944,16 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.transcriptTailWidgets.map(\.id), [sibling.id])
 
         model.composer = "Edited input"
+        requestCount = await recorder.requestCount()
         model.sendMessage()
-        try await Task.sleep(for: .milliseconds(20))
-
-        let submissions = await recorder.requests().compactMap { request -> Submission? in
+        let editedRequest = await recorder.firstRequest(after: requestCount) { request in
+            if case .submit = request { return true }
+            return false
+        }
+        let editedSubmission = try XCTUnwrap(editedRequest.flatMap { request -> Submission? in
             guard case .submit(_, let submission) = request else { return nil }
             return submission
-        }
-        let editedSubmission = try XCTUnwrap(submissions.last)
+        })
         guard case .activeInput(let operation, let turnID, let text) = editedSubmission.op
         else { return XCTFail("Expected fresh active input") }
         XCTAssertEqual(operation, "steer")
@@ -1017,10 +1098,13 @@ final class AppModelTests: XCTestCase {
         model.accounts = [account]
         model.selectedAccountID = account.id
         model.connectionState = .ready
+        let openRequestCount = await recorder.requestCount()
         model.openSession("chat-1")
-        try await Task.sleep(for: .milliseconds(30))
-        let openRequests = await recorder.requests()
-        guard case .openSession(let openID, _, _, _) = try XCTUnwrap(openRequests.last) else {
+        let openRequest = await recorder.firstRequest(after: openRequestCount) { request in
+            guard case .openSession(_, "chat-1", _, _) = request else { return false }
+            return true
+        }
+        guard case .openSession(let openID, _, _, _) = try XCTUnwrap(openRequest) else {
             return XCTFail("Expected session open")
         }
 
@@ -1127,25 +1211,39 @@ final class AppModelTests: XCTestCase {
             draftDirectory: root.appendingPathComponent("Drafts")
         )
         let recorder = GatewayRequestRecorder()
+        let ordinaryMessageSent = expectation(description: "Ordinary message sent")
         let model = AppModel(
             client: GatewayClient(),
             store: store,
             settingsDefaults: defaults,
-            requestSender: { request in await recorder.record(request) }
+            requestSender: { request in
+                await recorder.record(request)
+                if case .submit(_, let submission) = request,
+                   case .userInput(let text, _) = submission.op,
+                   text == "New gateway message" {
+                    ordinaryMessageSent.fulfill()
+                }
+            }
         )
         let first = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
         let second = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9192"))
         try await beginComposerEdit(in: model, recorder: recorder, account: first)
         model.accounts = [first, second]
 
+        let gatewayForgotten = expectation(description: "Gateway forgotten")
+        withObservationTracking {
+            _ = model.accounts
+        } onChange: {
+            gatewayForgotten.fulfill()
+        }
         model.forgetSelectedGateway()
-        try await Task.sleep(for: .milliseconds(150))
+        await fulfillment(of: [gatewayForgotten], timeout: 1)
         model.selectedAccountID = second.id
         model.selectedSessionID = "chat-1"
         model.connectionState = .ready
         model.composer = "New gateway message"
         model.sendMessage()
-        try await Task.sleep(for: .milliseconds(30))
+        await fulfillment(of: [ordinaryMessageSent], timeout: 1)
 
         let submissions = await recorder.requests().compactMap { request -> Submission? in
             guard case .submit(_, let submission) = request else { return nil }
@@ -1216,10 +1314,13 @@ final class AppModelTests: XCTestCase {
         model.accounts = [account, second]
         model.selectedAccountID = account.id
         model.connectionState = .ready
+        let openRequestCount = await recorder.requestCount()
         model.openSession("chat-1")
-        try await Task.sleep(for: .milliseconds(30))
-        let openRequests = await recorder.requests()
-        guard case .openSession(let openID, _, _, _) = try XCTUnwrap(openRequests.last) else {
+        let openRequest = await recorder.firstRequest(after: openRequestCount) { request in
+            guard case .openSession(_, "chat-1", _, _) = request else { return false }
+            return true
+        }
+        guard case .openSession(let openID, _, _, _) = try XCTUnwrap(openRequest) else {
             return XCTFail("Expected session open")
         }
         model.handle(.sessionOpened(
@@ -1227,7 +1328,8 @@ final class AppModelTests: XCTestCase {
             payload: sessionReady(latestSequence: 0, sessionID: "chat-1")
         ))
         model.handle(.sessionReplayComplete(requestID: openID, sessionID: "chat-1"))
-        try await Task.sleep(for: .milliseconds(30))
+        let sessionReady = await eventually { model.canCreateSession }
+        XCTAssertTrue(sessionReady)
         try await beginComposerEdit(in: model, recorder: recorder, account: account)
         model.accounts = [account, second]
 
@@ -1235,9 +1337,15 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.composer, "Latest edit before switching")
         XCTAssertTrue(model.canSendComposer)
         model.selectAccount(second.id)
-        try await Task.sleep(for: .milliseconds(500))
         XCTAssertEqual(model.composer, "")
 
+        let recoverySaved = await eventually {
+            await store.loadComposerEditRecovery(
+                accountID: account.id,
+                sessionID: "chat-1"
+            )?.editedInput == "Latest edit before switching"
+        }
+        XCTAssertTrue(recoverySaved)
         let recovery = await store.loadComposerEditRecovery(
             accountID: account.id,
             sessionID: "chat-1"
@@ -1267,12 +1375,18 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.canImportAttachments)
         model.editWidgetInputInComposer(editableWidget())
         XCTAssertFalse(model.canImportAttachments)
+        let requestCount = await recorder.requestCount()
         model.sendMessage()
-        try await Task.sleep(for: .milliseconds(50))
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            guard case .submit(_, let submission) = request,
+                  case .capabilityCommand = submission.op
+            else { return false }
+            return true
+        }
 
         let requests = await recorder.requests()
-        XCTAssertEqual(requests.count, 1)
-        guard case .submit(_, let submission) = requests[0],
+        XCTAssertEqual(requests.count, requestCount + 1)
+        guard case .submit(_, let submission) = try XCTUnwrap(request),
               case .capabilityCommand = submission.op
         else { return XCTFail("Expected only the edit-removal command") }
         XCTAssertEqual(model.composer, "Do not lose this")
@@ -1563,6 +1677,7 @@ final class AppModelTests: XCTestCase {
             await recorder.record(request)
         })
         model.selectedSessionID = "chat-1"
+        let requestCount = await recorder.requestCount()
         model.submitPickerOption(try FrontendPickerOption(json: .object([
             "label": .string("reviewer"),
             "description": .string("running"),
@@ -1576,13 +1691,13 @@ final class AppModelTests: XCTestCase {
                 "target": .null
             ])
         ])))
-        try await Task.sleep(for: .milliseconds(20))
-
-        let requests = await recorder.requests()
-        let submission = try XCTUnwrap(requests.lazy.compactMap { request -> Submission? in
-            guard case .submit(_, let submission) = request else { return nil }
-            return submission
-        }.first)
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            guard case .submit("chat-1", _) = request else { return false }
+            return true
+        }
+        guard case .submit(_, let submission) = try XCTUnwrap(request) else {
+            return XCTFail("Expected picker submission")
+        }
         let block = FrontendBlock(
             id: "worker/message",
             group: nil,
@@ -1646,8 +1761,10 @@ final class AppModelTests: XCTestCase {
 
     func testFrontendOperationSubmitsEditedCapabilityInput() async throws {
         let recorder = GatewayRequestRecorder()
+        let operationSent = expectation(description: "Frontend operation sent")
         let model = try model(requestSender: { request in
             await recorder.record(request)
+            if case .submit = request { operationSent.fulfill() }
         })
         model.selectedSessionID = "chat-1"
 
@@ -1658,7 +1775,7 @@ final class AppModelTests: XCTestCase {
             input: "Use one row.",
             target: nil
         ))
-        try await Task.sleep(for: .milliseconds(20))
+        await fulfillment(of: [operationSent], timeout: 1)
 
         let requests = await recorder.requests()
         guard case .submit(let sessionID, let submission) = try XCTUnwrap(requests.first),
@@ -1686,6 +1803,7 @@ final class AppModelTests: XCTestCase {
         model.selectedSessionID = "chat-1"
         model.connectionState = .ready
 
+        let requestCount = await recorder.requestCount()
         model.reduce(
             event: renderEvent(
                 capability: "reviewer",
@@ -1695,13 +1813,11 @@ final class AppModelTests: XCTestCase {
             blocks: [],
             preview: nil
         )
-        try await Task.sleep(for: .milliseconds(20))
-
-        let requests = await recorder.requests()
-        XCTAssertTrue(requests.contains {
-            guard case .getGitDiff(_, "chat-1", .unstaged) = $0 else { return false }
+        let refresh = await recorder.firstRequest(after: requestCount) { request in
+            guard case .getGitDiff(_, "chat-1", .unstaged) = request else { return false }
             return true
-        })
+        }
+        XCTAssertNotNil(refresh)
     }
 
     func testDuplicateSessionIdentifiersAreRejectedWithoutReplacingTheCatalog() throws {
@@ -1767,67 +1883,74 @@ final class AppModelTests: XCTestCase {
         let fileURL = directory.appendingPathComponent("scan.png")
         try Data([1, 2, 3]).write(to: fileURL)
 
+        var requestCount = await recorder.requestCount()
         await model.importAttachments([fileURL])
-        try await Task.sleep(for: .milliseconds(20))
-
-        let initialRequests = await recorder.requests()
-        guard let begin = initialRequests.first(where: {
-            if case .beginSessionFileUpload = $0 { return true }
+        let begin = await recorder.firstRequest(after: requestCount) { request in
+            if case .beginSessionFileUpload = request { return true }
             return false
-        }), case .beginSessionFileUpload(let beginID, let sessionID, let name, let size, _) = begin
+        }
+        guard case .beginSessionFileUpload(let beginID, let sessionID, let name, let size, _) = try XCTUnwrap(
+            begin
+        )
         else { return XCTFail("Expected session file upload start") }
         XCTAssertEqual(sessionID, "chat-1")
         XCTAssertEqual(name, "scan.png")
         XCTAssertEqual(size, 3)
 
+        requestCount = await recorder.requestCount()
         model.handle(.sessionFileUploadReady(
             requestID: beginID,
             sessionID: "chat-1",
             uploadID: "upload-1",
             maxChunkBytes: 2
         ))
-        try await Task.sleep(for: .milliseconds(20))
-        let afterStart = await recorder.requests()
-        let firstChunk = try XCTUnwrap(afterStart.last(where: {
-            if case .uploadSessionFileChunk = $0 { return true }
+        let firstChunkRequest = await recorder.firstRequest(
+            after: requestCount
+        ) { request in
+            if case .uploadSessionFileChunk = request { return true }
             return false
-        }))
+        }
+        let firstChunk = try XCTUnwrap(firstChunkRequest)
         guard case .uploadSessionFileChunk(let firstID, _, _, let firstOffset, let firstData) = firstChunk else {
             return XCTFail("Expected first session file chunk")
         }
         XCTAssertEqual(firstOffset, 0)
         XCTAssertEqual(firstData, Data([1, 2]))
 
+        requestCount = await recorder.requestCount()
         model.handle(.sessionFileUploadChunkAccepted(
             requestID: firstID,
             sessionID: "chat-1",
             uploadID: "upload-1",
             nextOffset: 2
         ))
-        try await Task.sleep(for: .milliseconds(20))
-        let afterFirstChunk = await recorder.requests()
-        let secondChunk = try XCTUnwrap(afterFirstChunk.last(where: {
-            if case .uploadSessionFileChunk = $0 { return true }
+        let secondChunkRequest = await recorder.firstRequest(
+            after: requestCount
+        ) { request in
+            if case .uploadSessionFileChunk = request { return true }
             return false
-        }))
+        }
+        let secondChunk = try XCTUnwrap(secondChunkRequest)
         guard case .uploadSessionFileChunk(let secondID, _, _, let secondOffset, let secondData) = secondChunk else {
             return XCTFail("Expected second session file chunk")
         }
         XCTAssertEqual(secondOffset, 2)
         XCTAssertEqual(secondData, Data([3]))
 
+        requestCount = await recorder.requestCount()
         model.handle(.sessionFileUploadChunkAccepted(
             requestID: secondID,
             sessionID: "chat-1",
             uploadID: "upload-1",
             nextOffset: 3
         ))
-        try await Task.sleep(for: .milliseconds(20))
-        let afterSecondChunk = await recorder.requests()
-        let finish = try XCTUnwrap(afterSecondChunk.last(where: {
-            if case .finishSessionFileUpload = $0 { return true }
+        let finishRequest = await recorder.firstRequest(
+            after: requestCount
+        ) { request in
+            if case .finishSessionFileUpload = request { return true }
             return false
-        }))
+        }
+        let finish = try XCTUnwrap(finishRequest)
         guard case .finishSessionFileUpload(let finishID, _, _) = finish else {
             return XCTFail("Expected session file upload finish")
         }
@@ -1865,13 +1988,15 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.toast?.message, "The selected model does not accept image attachments.")
         model.modelChoices = [capableChoice]
 
+        requestCount = await recorder.requestCount()
         model.sendMessage()
-        try await Task.sleep(for: .milliseconds(20))
-        let afterSend = await recorder.requests()
-        let submit = try XCTUnwrap(afterSend.last(where: {
-            if case .submit = $0 { return true }
+        let submitRequest = await recorder.firstRequest(
+            after: requestCount
+        ) { request in
+            if case .submit = request { return true }
             return false
-        }))
+        }
+        let submit = try XCTUnwrap(submitRequest)
         guard case .submit(_, let submission) = submit,
               case .userInput(let text, let attachments) = submission.op
         else { return XCTFail("Expected attachment submission") }
@@ -1929,14 +2054,15 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertTrue(model.canImportAttachments)
         XCTAssertTrue(model.canSendComposer)
+        let requestCount = await recorder.requestCount()
         model.sendMessage()
-        try await Task.sleep(for: .milliseconds(20))
-
-        let requests = await recorder.requests()
-        let submission = try XCTUnwrap(requests.compactMap { request -> Submission? in
-            guard case .submit(_, let submission) = request else { return nil }
-            return submission
-        }.last)
+        let request = await recorder.firstRequest(after: requestCount) {
+            guard case .submit("chat-1", _) = $0 else { return false }
+            return true
+        }
+        guard case .submit(_, let submission) = try XCTUnwrap(request) else {
+            return XCTFail("Expected attachment submission")
+        }
         guard case .userInput(_, let attachments) = submission.op else {
             return XCTFail("Expected attachment submission")
         }
@@ -1957,13 +2083,13 @@ final class AppModelTests: XCTestCase {
         try Data([1, 2, 3]).write(to: fileURL)
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
+        let requestCount = await recorder.requestCount()
         await model.importAttachments([fileURL])
-        try await Task.sleep(for: .milliseconds(20))
-        let requests = await recorder.requests()
-        guard let begin = requests.last(where: {
+        let beginRequest = await recorder.firstRequest(after: requestCount) {
             if case .beginSessionFileUpload = $0 { return true }
             return false
-        }), case .beginSessionFileUpload(let beginID, _, _, _, _) = begin
+        }
+        guard case .beginSessionFileUpload(let beginID, _, _, _, _) = try XCTUnwrap(beginRequest)
         else { return XCTFail("Expected session file upload start") }
 
         model.handle(.sessionFileUploadChunkAccepted(
@@ -1994,26 +2120,26 @@ final class AppModelTests: XCTestCase {
         try Data([1, 2, 3]).write(to: fileURL)
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
+        var requestCount = await recorder.requestCount()
         await model.importAttachments([fileURL])
-        try await Task.sleep(for: .milliseconds(20))
-        let initialRequests = await recorder.requests()
-        guard let begin = initialRequests.last(where: {
+        let beginRequest = await recorder.firstRequest(after: requestCount) {
             if case .beginSessionFileUpload = $0 { return true }
             return false
-        }), case .beginSessionFileUpload(let beginID, _, _, _, _) = begin
+        }
+        guard case .beginSessionFileUpload(let beginID, _, _, _, _) = try XCTUnwrap(beginRequest)
         else { return XCTFail("Expected session file upload start") }
+        requestCount = await recorder.requestCount()
         model.handle(.sessionFileUploadReady(
             requestID: beginID,
             sessionID: "chat-1",
             uploadID: "upload-1",
             maxChunkBytes: 2
         ))
-        try await Task.sleep(for: .milliseconds(20))
-        let afterStart = await recorder.requests()
-        guard let chunk = afterStart.last(where: {
+        let chunkRequest = await recorder.firstRequest(after: requestCount) {
             if case .uploadSessionFileChunk = $0 { return true }
             return false
-        }), case .uploadSessionFileChunk(let chunkID, _, _, _, _) = chunk
+        }
+        guard case .uploadSessionFileChunk(let chunkID, _, _, _, _) = try XCTUnwrap(chunkRequest)
         else { return XCTFail("Expected session file chunk") }
 
         model.handle(.sessionFileUploadChunkAccepted(
@@ -2100,13 +2226,14 @@ final class AppModelTests: XCTestCase {
         model.connectionState = .ready
         model.selectedSessionID = "chat-1"
 
+        var requestCount = await recorder.requestCount()
         model.showFiles(.unstaged)
-        try await Task.sleep(for: .milliseconds(20))
-        let unstagedRequests = await recorder.requests()
-        guard let unstagedRequest = unstagedRequests.last(where: {
+        let unstagedRequest = await recorder.firstRequest(after: requestCount) {
             if case .getGitDiff = $0 { return true }
             return false
-        }), case .getGitDiff(_, let sessionID, let diffScope) = unstagedRequest
+        }
+        let unstagedRequests = await recorder.requests()
+        guard case .getGitDiff(_, let sessionID, let diffScope) = try XCTUnwrap(unstagedRequest)
         else { return XCTFail("Expected unstaged Git diff") }
         XCTAssertEqual(sessionID, "chat-1")
         XCTAssertEqual(diffScope, .unstaged)
@@ -2115,27 +2242,28 @@ final class AppModelTests: XCTestCase {
             return false
         })
 
+        requestCount = await recorder.requestCount()
         model.selectFilesInspectorTab(.allFiles)
-        try await Task.sleep(for: .milliseconds(20))
-        let allRequests = await recorder.requests()
-        guard let allRequest = allRequests.last(where: {
+        let allRequest = await recorder.firstRequest(after: requestCount) {
             if case .listWorkspaceFiles = $0 { return true }
             return false
-        }), case .listWorkspaceFiles(_, _, let allScope) = allRequest
+        }
+        guard case .listWorkspaceFiles(_, _, let allScope) = try XCTUnwrap(allRequest)
         else { return XCTFail("Expected all workspace files") }
         XCTAssertEqual(allScope, .all)
 
+        requestCount = await recorder.requestCount()
         model.selectFilesInspectorTab(.chatFiles)
-        try await Task.sleep(for: .milliseconds(20))
-        let chatFileRequests = await recorder.requests()
-        XCTAssertTrue(chatFileRequests.contains {
+        let artifactRequest = await recorder.firstRequest(after: requestCount) {
             if case .listArtifacts(_, "chat-1") = $0 { return true }
             return false
-        })
-        XCTAssertTrue(chatFileRequests.contains {
+        }
+        let uploadRequest = await recorder.firstRequest(after: requestCount) {
             if case .listSessionUploads(_, "chat-1") = $0 { return true }
             return false
-        })
+        }
+        XCTAssertNotNil(artifactRequest)
+        XCTAssertNotNil(uploadRequest)
     }
 
     func testArtifactListIgnoresAResponseForAnotherSession() async throws {
@@ -2242,16 +2370,24 @@ final class AppModelTests: XCTestCase {
         let data = Data(contents.utf8)
         let file = WorkspaceFileRecord(path: "Sources/App.swift", size: UInt64(data.count))
 
+        let requestCount = await recorder.requestCount()
         model.previewWorkspaceFile(file)
-        try await Task.sleep(for: .milliseconds(20))
-        let readRequests = await recorder.requests()
-        guard let readRequest = readRequests.last(where: {
-            if case .readWorkspaceFile = $0 { return true }
+        let readRequest = await recorder.firstRequest(after: requestCount) { request in
+            if case .readWorkspaceFile = request { return true }
             return false
-        }), case .readWorkspaceFile(let readID, _, let path, let offset, _) = readRequest
+        }
+        guard case .readWorkspaceFile(let readID, _, let path, let offset, _) = try XCTUnwrap(
+            readRequest
+        )
         else { return XCTFail("Expected workspace file read request") }
         XCTAssertEqual(path, file.path)
         XCTAssertEqual(offset, 0)
+        let previewFinished = expectation(description: "Source preview finished")
+        withObservationTracking {
+            _ = model.textFilePreview
+        } onChange: {
+            previewFinished.fulfill()
+        }
         model.handle(.workspaceFileChunk(
             requestID: readID,
             sessionID: "chat-1",
@@ -2260,7 +2396,7 @@ final class AppModelTests: XCTestCase {
             data: data,
             nextOffset: nil
         ))
-        try await Task.sleep(for: .milliseconds(20))
+        await fulfillment(of: [previewFinished], timeout: 1)
 
         XCTAssertEqual(model.textFilePreview?.contents, contents)
         XCTAssertNil(model.previewURL)
@@ -2276,14 +2412,20 @@ final class AppModelTests: XCTestCase {
         model.selectedSessionID = "chat-1"
         let file = WorkspaceFileRecord(path: "image.bin", size: 3)
 
+        let requestCount = await recorder.requestCount()
         model.previewWorkspaceFile(file)
-        try await Task.sleep(for: .milliseconds(20))
-        let requests = await recorder.requests()
-        guard let request = requests.last(where: {
-            if case .readWorkspaceFile = $0 { return true }
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            if case .readWorkspaceFile = request { return true }
             return false
-        }), case .readWorkspaceFile(let requestID, _, _, _, _) = request
+        }
+        guard case .readWorkspaceFile(let requestID, _, _, _, _) = try XCTUnwrap(request)
         else { return XCTFail("Expected workspace file read request") }
+        let previewFinished = expectation(description: "Binary preview finished")
+        withObservationTracking {
+            _ = model.previewURL
+        } onChange: {
+            previewFinished.fulfill()
+        }
         model.handle(.workspaceFileChunk(
             requestID: requestID,
             sessionID: "chat-1",
@@ -2292,7 +2434,7 @@ final class AppModelTests: XCTestCase {
             data: Data([0, 1, 2]),
             nextOffset: nil
         ))
-        try await Task.sleep(for: .milliseconds(20))
+        await fulfillment(of: [previewFinished], timeout: 1)
 
         XCTAssertNotNil(model.previewURL)
         XCTAssertNil(model.textFilePreview)
@@ -2314,18 +2456,26 @@ final class AppModelTests: XCTestCase {
             mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
+        let requestCount = await recorder.requestCount()
         model.saveOrShareSessionFile(file)
-        try await Task.sleep(for: .milliseconds(20))
-        let requests = await recorder.requests()
-        guard let request = requests.last(where: {
-            if case .readSessionFile = $0 { return true }
-            return false
-        }), case .readSessionFile(let requestID, let sessionID, let fileID, let offset, _) = request
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            guard case .readSessionFile(_, _, let fileID, _, _) = request else { return false }
+            return fileID == file.id
+        }
+        guard case .readSessionFile(let requestID, let sessionID, let fileID, let offset, _) = try XCTUnwrap(
+            request
+        )
         else { return XCTFail("Expected session file read request") }
         XCTAssertEqual(sessionID, "chat-1")
         XCTAssertEqual(fileID, file.id)
         XCTAssertEqual(offset, 0)
 
+        let shareFinished = expectation(description: "Share download finished")
+        withObservationTracking {
+            _ = model.sessionFileShareItem
+        } onChange: {
+            shareFinished.fulfill()
+        }
         model.handle(.sessionFileChunk(
             requestID: requestID,
             sessionID: sessionID,
@@ -2334,7 +2484,7 @@ final class AppModelTests: XCTestCase {
             data: data,
             nextOffset: nil
         ))
-        try await Task.sleep(for: .milliseconds(20))
+        await fulfillment(of: [shareFinished], timeout: 1)
 
         let shareItem = try XCTUnwrap(model.sessionFileShareItem)
         XCTAssertEqual(shareItem.name, file.name)
@@ -2360,15 +2510,21 @@ final class AppModelTests: XCTestCase {
             mediaType: "image/svg+xml"
         )
 
+        let requestCount = await recorder.requestCount()
         model.previewSessionFile(file)
-        try await Task.sleep(for: .milliseconds(20))
-        let requests = await recorder.requests()
-        guard let request = requests.last(where: {
-            if case .readSessionFile = $0 { return true }
-            return false
-        }), case .readSessionFile(let requestID, _, _, _, _) = request
+        let request = await recorder.firstRequest(after: requestCount) {
+            guard case .readSessionFile(_, _, let fileID, _, _) = $0 else { return false }
+            return fileID == file.id
+        }
+        guard case .readSessionFile(let requestID, _, _, _, _) = try XCTUnwrap(request)
         else { return XCTFail("Expected session file read request") }
 
+        let previewFinished = expectation(description: "Image preview finished")
+        withObservationTracking {
+            _ = model.previewURL
+        } onChange: {
+            previewFinished.fulfill()
+        }
         model.handle(.sessionFileChunk(
             requestID: requestID,
             sessionID: "chat-1",
@@ -2377,7 +2533,7 @@ final class AppModelTests: XCTestCase {
             data: data,
             nextOffset: nil
         ))
-        try await Task.sleep(for: .milliseconds(20))
+        await fulfillment(of: [previewFinished], timeout: 1)
 
         XCTAssertEqual(model.previewURL?.pathExtension, "svg")
         XCTAssertNil(model.textFilePreview)
@@ -2385,11 +2541,6 @@ final class AppModelTests: XCTestCase {
     }
 
     func testStaleSessionFileChunkDoesNotCancelNewerDownload() async throws {
-        let recorder = GatewayRequestRecorder()
-        let model = try model(requestSender: { request in
-            await recorder.record(request)
-        })
-        model.selectedSessionID = "chat-1"
         let firstData = Data("first".utf8)
         let secondData = Data("second".utf8)
         let firstFile = SessionFileReference(
@@ -2404,20 +2555,30 @@ final class AppModelTests: XCTestCase {
             size: Int64(secondData.count),
             mediaType: "text/plain"
         )
+        let recorder = GatewayRequestRecorder()
+        let firstReadSent = expectation(description: "First file read sent")
+        let secondReadSent = expectation(description: "Second file read sent")
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+            guard case .readSessionFile(_, _, let fileID, _, _) = request else { return }
+            if fileID == firstFile.id { firstReadSent.fulfill() }
+            if fileID == secondFile.id { secondReadSent.fulfill() }
+        })
+        model.selectedSessionID = "chat-1"
 
         model.previewSessionFile(firstFile)
-        try await Task.sleep(for: .milliseconds(20))
+        await fulfillment(of: [firstReadSent], timeout: 1)
         guard let firstRequest = await recorder.requests().last(where: {
-            if case .readSessionFile = $0 { return true }
-            return false
+            guard case .readSessionFile(_, _, let fileID, _, _) = $0 else { return false }
+            return fileID == firstFile.id
         }), case .readSessionFile(let firstRequestID, _, _, _, _) = firstRequest
         else { return XCTFail("Expected first session file read") }
 
         model.previewSessionFile(secondFile)
-        try await Task.sleep(for: .milliseconds(20))
+        await fulfillment(of: [secondReadSent], timeout: 1)
         guard let secondRequest = await recorder.requests().last(where: {
-            if case .readSessionFile = $0 { return true }
-            return false
+            guard case .readSessionFile(_, _, let fileID, _, _) = $0 else { return false }
+            return fileID == secondFile.id
         }), case .readSessionFile(let secondRequestID, _, _, _, _) = secondRequest
         else { return XCTFail("Expected second session file read") }
         XCTAssertNotEqual(firstRequestID, secondRequestID)
@@ -2433,6 +2594,12 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.isLoadingFilePresentation)
         XCTAssertNil(model.toast)
 
+        let previewFinished = expectation(description: "Second file preview finished")
+        withObservationTracking {
+            _ = model.textFilePreview
+        } onChange: {
+            previewFinished.fulfill()
+        }
         model.handle(.sessionFileChunk(
             requestID: secondRequestID,
             sessionID: "chat-1",
@@ -2441,7 +2608,7 @@ final class AppModelTests: XCTestCase {
             data: secondData,
             nextOffset: nil
         ))
-        try await Task.sleep(for: .milliseconds(20))
+        await fulfillment(of: [previewFinished], timeout: 1)
 
         XCTAssertEqual(model.textFilePreview?.name, secondFile.name)
         XCTAssertEqual(model.textFilePreview?.contents, "second")
@@ -2683,11 +2850,14 @@ final class AppModelTests: XCTestCase {
             )
         )
 
+        let requestCount = await recorder.requestCount()
         model.submitMessageAction(widget, target: target)
-        try await Task.sleep(for: .milliseconds(20))
-
+        let request = await recorder.firstRequest(after: requestCount) {
+            guard case .submit("chat-1", _) = $0 else { return false }
+            return true
+        }
         let requests = await recorder.requests()
-        guard case .submit(let sessionID, let submission) = try XCTUnwrap(requests.first),
+        guard case .submit(let sessionID, let submission) = try XCTUnwrap(request),
               case .capabilityCommand(
                   let capability,
                   let command,
@@ -2948,12 +3118,13 @@ final class AppModelTests: XCTestCase {
 
         let defaultConfig = VersionedAgentConfig(revision: 1, config: composition())
         model.applyGatewayCatalog(ready(defaultConfig: defaultConfig))
-        XCTAssertEqual(model.agentDraft, defaultConfig.config)
+        XCTAssertNil(model.agentDraft)
+        XCTAssertEqual(model.defaultAgentDraft, defaultConfig.config)
     }
 
     func testProviderSelectionUsesGatewayManifestDefaults() throws {
         let model = try model()
-        model.agentDraft = AgentComposition(
+        model.defaultAgentDraft = AgentComposition(
             provider: ProviderConfig(
                 provider: "old",
                 model: "old-model",
@@ -3010,14 +3181,14 @@ final class AppModelTests: XCTestCase {
 
         model.selectProvider("kimi")
 
-        XCTAssertEqual(model.agentDraft?.provider.model, "kimi-k3")
-        XCTAssertEqual(model.agentDraft?.provider.reasoningEffort, "max")
-        XCTAssertEqual(model.agentDraft?.provider.webSearch, .off)
+        XCTAssertEqual(model.defaultAgentDraft?.provider.model, "kimi-k3")
+        XCTAssertEqual(model.defaultAgentDraft?.provider.reasoningEffort, "max")
+        XCTAssertEqual(model.defaultAgentDraft?.provider.webSearch, .off)
 
         model.selectProviderModel("kimi-k2.7-code")
 
-        XCTAssertEqual(model.agentDraft?.provider.model, "kimi-k2.7-code")
-        XCTAssertNil(model.agentDraft?.provider.reasoningEffort)
+        XCTAssertEqual(model.defaultAgentDraft?.provider.model, "kimi-k2.7-code")
+        XCTAssertNil(model.defaultAgentDraft?.provider.reasoningEffort)
     }
 
     func testConfigurableProviderCanonicalizesAndSavesModelAndReasoningCatalogs() async throws {
@@ -3030,7 +3201,7 @@ final class AppModelTests: XCTestCase {
             reasoningEffort: nil,
             webSearch: .off
         )
-        model.agentDraft = composition()
+        model.defaultAgentDraft = composition()
         model.providerStatuses = [ProviderStatus(
             provider: selection.provider,
             label: "Local",
@@ -3072,7 +3243,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(config.reasoningEffort, "high")
     }
 
-    func testDefaultModelSelectionUsesGatewayProviderIdentity() throws {
+    func testScopedModelSelectionUsesGatewayProviderIdentity() throws {
         let model = try model()
         let target = ProviderConfig(
             provider: "kimi",
@@ -3093,6 +3264,7 @@ final class AppModelTests: XCTestCase {
         model.agentSnapshot = VersionedAgentConfig(revision: 1, config: original)
         model.defaultAgentSnapshot = VersionedAgentConfig(revision: 1, config: original)
         model.agentDraft = original
+        model.defaultAgentDraft = original
         model.modelChoices = [choice]
         model.modelProviders = [choice.route: target.provider]
         model.providerStatuses = [providerStatus(for: target)]
@@ -3101,8 +3273,15 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.agentDraft?.provider, target)
         XCTAssertEqual(model.agentDraftModelRoute, choice.route)
+        XCTAssertEqual(model.defaultAgentDraft, original)
         XCTAssertNotEqual(model.agentDraft, model.agentSnapshot?.config)
-        XCTAssertNotEqual(model.agentDraft, model.defaultAgentSnapshot?.config)
+
+        model.agentDraft = original
+        model.selectDefaultAgentDraftModel(choice.route)
+
+        XCTAssertEqual(model.defaultAgentDraft?.provider, target)
+        XCTAssertEqual(model.defaultAgentDraftModelRoute, choice.route)
+        XCTAssertEqual(model.agentDraft, original)
     }
 
     func testModelLabelUsesProviderFriendlyName() throws {
@@ -3212,6 +3391,8 @@ final class AppModelTests: XCTestCase {
         gatewayDefault.systemPrompt = "New chat default"
         model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
         model.agentDraft = edited
+        model.defaultAgentSnapshot = VersionedAgentConfig(revision: 7, config: active)
+        model.defaultAgentDraft = active
 
         model.applyGatewayCatalog(ReadyPayload(
             machineName: "snowwhite.local",
@@ -3226,10 +3407,39 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.agentSnapshot, VersionedAgentConfig(revision: 3, config: active))
         XCTAssertEqual(model.agentDraft, edited)
+        XCTAssertEqual(model.defaultAgentDraft, gatewayDefault)
         XCTAssertEqual(
             model.defaultAgentSnapshot,
             VersionedAgentConfig(revision: 8, config: gatewayDefault)
         )
+    }
+
+    func testClearingCurrentChatPreservesGatewayDefaultSettings() throws {
+        let model = try model()
+        let active = composition(systemPrompt: "Active chat")
+        let gatewayDefault = composition(systemPrompt: "New chats")
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.sessions = [session(state: .idle)]
+        model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
+        model.agentDraft = active
+        model.chatAgentApplyState = .failed("Chat failure")
+        model.defaultAgentSnapshot = VersionedAgentConfig(revision: 8, config: gatewayDefault)
+        model.defaultAgentDraft = gatewayDefault
+        model.defaultAgentApplyState = .failed("Default failure")
+
+        model.applySessions([])
+
+        XCTAssertNil(model.selectedSessionID)
+        XCTAssertNil(model.agentSnapshot)
+        XCTAssertNil(model.agentDraft)
+        XCTAssertEqual(model.chatAgentApplyState, .idle)
+        XCTAssertEqual(
+            model.defaultAgentSnapshot,
+            VersionedAgentConfig(revision: 8, config: gatewayDefault)
+        )
+        XCTAssertEqual(model.defaultAgentDraft, gatewayDefault)
+        XCTAssertEqual(model.defaultAgentApplyState, .failed("Default failure"))
     }
 
     func testApprovalPolicyConfiguresTheActiveChatThroughMiddleware() async throws {
@@ -3260,62 +3470,21 @@ final class AppModelTests: XCTestCase {
         )
     }
 
-    func testProviderRegistrationChainsIntoActiveChatConfiguration() async throws {
-        let recorder = GatewayRequestRecorder()
-        let model = try model(requestSender: { request in
-            await recorder.record(request)
-        })
-        let draft = composition(systemPrompt: "Active draft")
-        model.selectedSessionID = "chat-1"
-        model.agentSnapshot = VersionedAgentConfig(revision: 3, config: composition())
-        model.agentDraft = draft
-        model.providerStatuses = [providerStatus(for: draft.provider)]
-
-        model.changeProviderForCurrentChat()
-        try await Task.sleep(for: .milliseconds(20))
-
-        let registrationRequests = await recorder.requests()
-        let registration = try XCTUnwrap(
-            registrationRequests.lazy.compactMap { request -> String? in
-                guard case .registerProvider(let requestID, _, _, _) = request else { return nil }
-                return requestID
-            }.first
-        )
-        model.applyGatewayConfigurationResponse(
-            requestID: registration,
-            payload: ready(defaultConfig: VersionedAgentConfig(
-                revision: 8,
-                config: composition(systemPrompt: "Gateway default")
-            ))
-        )
-        try await Task.sleep(for: .milliseconds(20))
-
-        let requests = await recorder.requests()
-        guard let configured = requests.first(where: {
-            if case .configureSession = $0 { return true }
-            return false
-        }), case .configureSession(
-            _,
-            let sessionID,
-            let expectedRevision,
-            let config
-        ) = configured else {
-            return XCTFail("Expected provider registration to configure the active chat")
-        }
-        XCTAssertEqual(sessionID, "chat-1")
-        XCTAssertEqual(expectedRevision, 3)
-        XCTAssertEqual(config, draft)
-    }
-
     func testProviderRegistrationChainsIntoDefaultConfiguration() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
             await recorder.record(request)
         })
         let draft = composition(systemPrompt: "New default")
+        let previousDefault = composition(systemPrompt: "Previous default")
         model.selectedSessionID = "chat-1"
         model.agentSnapshot = VersionedAgentConfig(revision: 3, config: composition())
-        model.agentDraft = draft
+        model.agentDraft = composition(systemPrompt: "Active chat")
+        model.defaultAgentSnapshot = VersionedAgentConfig(
+            revision: 8,
+            config: previousDefault
+        )
+        model.defaultAgentDraft = draft
         model.providerStatuses = [providerStatus(for: draft.provider)]
 
         model.saveProviderAsDefault()
@@ -3328,13 +3497,13 @@ final class AppModelTests: XCTestCase {
                 return requestID
             }.first
         )
-        model.applyGatewayConfigurationResponse(
-            requestID: registration,
-            payload: ready(defaultConfig: VersionedAgentConfig(
-                revision: 8,
-                config: composition(systemPrompt: "Previous default")
-            ))
-        )
+        let response = ready(defaultConfig: VersionedAgentConfig(
+            revision: 8,
+            config: previousDefault
+        ))
+        model.handle(.ready(response))
+        XCTAssertEqual(model.defaultAgentDraft, draft)
+        model.applyGatewayConfigurationResponse(requestID: registration, payload: response)
         try await Task.sleep(for: .milliseconds(20))
 
         let requests = await recorder.requests()
@@ -3352,9 +3521,16 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(config, draft)
     }
 
-    func testSavingDefaultAlsoConfiguresActiveChat() async throws {
+    func testSavingDefaultLeavesActiveChatUntouched() async throws {
         let recorder = GatewayRequestRecorder()
-        let model = try model { request in await recorder.record(request) }
+        let defaultSaved = expectation(description: "Default agent saved")
+        let sessionConfigured = expectation(description: "Active chat configured")
+        sessionConfigured.isInverted = true
+        let model = try model { request in
+            await recorder.record(request)
+            if case .configureDefaultAgent = request { defaultSaved.fulfill() }
+            if case .configureSession = request { sessionConfigured.fulfill() }
+        }
         let active = composition()
         var draft = active
         draft.middleware.setSetting(
@@ -3366,10 +3542,11 @@ final class AppModelTests: XCTestCase {
         model.sessions = [session(state: .idle)]
         model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
         model.defaultAgentSnapshot = VersionedAgentConfig(revision: 7, config: active)
-        model.agentDraft = draft
+        model.agentDraft = active
+        model.defaultAgentDraft = draft
 
         model.saveAgentAsDefault()
-        try await Task.sleep(for: .milliseconds(20))
+        await fulfillment(of: [defaultSaved], timeout: 1)
 
         let defaultRequests = await recorder.requests()
         let defaultRequest = try XCTUnwrap(
@@ -3383,35 +3560,35 @@ final class AppModelTests: XCTestCase {
         }
         XCTAssertEqual(savedDraft, draft)
 
-        model.applyGatewayConfigurationResponse(
-            requestID: requestID,
-            payload: ready(defaultConfig: VersionedAgentConfig(revision: 8, config: draft))
+        let response = ready(
+            defaultConfig: VersionedAgentConfig(revision: 8, config: draft)
         )
-        try await Task.sleep(for: .milliseconds(20))
+        model.handle(.ready(response))
+        XCTAssertEqual(model.defaultAgentDraft, draft)
+        model.applyGatewayConfigurationResponse(requestID: requestID, payload: response)
+        await fulfillment(of: [sessionConfigured], timeout: 0.05)
 
         let sessionRequests = await recorder.requests()
-        let sessionRequest = try XCTUnwrap(
-            sessionRequests.first { request in
-                if case .configureSession = request { return true }
-                return false
-            }
-        )
-        guard case .configureSession(
-            _,
-            let sessionID,
-            let expectedRevision,
-            let activeDraft
-        ) = sessionRequest else {
-            return XCTFail("Expected active-chat configuration")
-        }
-        XCTAssertEqual(sessionID, "chat-1")
-        XCTAssertEqual(expectedRevision, 3)
-        XCTAssertEqual(activeDraft, draft)
+        XCTAssertFalse(sessionRequests.contains {
+            if case .configureSession = $0 { return true }
+            return false
+        })
+        XCTAssertEqual(model.agentDraft, active)
+        XCTAssertEqual(model.defaultAgentDraft, draft)
+        XCTAssertEqual(model.defaultAgentApplyState, .applied)
+        XCTAssertEqual(model.chatAgentApplyState, .idle)
     }
 
-    func testSavingDefaultDoesNotApplyALaterDraftToActiveChat() async throws {
+    func testSavingDefaultPreservesALaterDefaultDraft() async throws {
         let recorder = GatewayRequestRecorder()
-        let model = try model { request in await recorder.record(request) }
+        let defaultSaved = expectation(description: "Default agent saved")
+        let sessionConfigured = expectation(description: "Active chat configured")
+        sessionConfigured.isInverted = true
+        let model = try model { request in
+            await recorder.record(request)
+            if case .configureDefaultAgent = request { defaultSaved.fulfill() }
+            if case .configureSession = request { sessionConfigured.fulfill() }
+        }
         let active = composition()
         var draft = active
         draft.middleware.setSetting(
@@ -3422,36 +3599,41 @@ final class AppModelTests: XCTestCase {
         model.selectedSessionID = "chat-1"
         model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
         model.defaultAgentSnapshot = VersionedAgentConfig(revision: 7, config: active)
-        model.agentDraft = draft
+        model.agentDraft = active
+        model.defaultAgentDraft = draft
 
         model.saveAgentAsDefault()
-        try await Task.sleep(for: .milliseconds(20))
+        await fulfillment(of: [defaultSaved], timeout: 1)
         let requests = await recorder.requests()
         let requestID = try XCTUnwrap(requests.lazy.compactMap { request -> String? in
             guard case .configureDefaultAgent(let requestID, _, _) = request else { return nil }
             return requestID
         }.first)
 
-        var laterDraft = draft
-        laterDraft.middleware.setSetting(
+        var laterDefaultDraft = draft
+        laterDefaultDraft.middleware.setSetting(
             .string("second"),
             middleware: "example",
             setting: "mode"
         )
-        model.agentDraft = laterDraft
-        model.applyGatewayConfigurationResponse(
-            requestID: requestID,
-            payload: ready(defaultConfig: VersionedAgentConfig(revision: 8, config: draft))
+        model.defaultAgentDraft = laterDefaultDraft
+        let response = ready(
+            defaultConfig: VersionedAgentConfig(revision: 8, config: draft)
         )
-        try await Task.sleep(for: .milliseconds(20))
+        model.handle(.ready(response))
+        XCTAssertEqual(model.defaultAgentDraft, laterDefaultDraft)
+        model.applyGatewayConfigurationResponse(requestID: requestID, payload: response)
+        await fulfillment(of: [sessionConfigured], timeout: 0.05)
 
         let configuredSessions = await recorder.requests().filter { request in
             if case .configureSession = request { return true }
             return false
         }
         XCTAssertTrue(configuredSessions.isEmpty)
-        XCTAssertEqual(model.agentDraft, laterDraft)
-        XCTAssertEqual(model.applyState, .applied)
+        XCTAssertEqual(model.agentDraft, active)
+        XCTAssertEqual(model.defaultAgentDraft, laterDefaultDraft)
+        XCTAssertEqual(model.defaultAgentApplyState, .applied)
+        XCTAssertEqual(model.chatAgentApplyState, .idle)
     }
 
     func testHistoricalReplayAppearsOnlyWhenTheSnapshotIsComplete() async throws {
@@ -3462,10 +3644,13 @@ final class AppModelTests: XCTestCase {
         model.selectedAccountID = account.id
         model.connectionState = .ready
 
+        let openRequestCount = await recorder.requestCount()
         model.openSession("chat-1")
-        try await Task.sleep(for: .milliseconds(20))
-        let requests = await recorder.requests()
-        let request = try XCTUnwrap(requests.first)
+        let openRequest = await recorder.firstRequest(after: openRequestCount) {
+            guard case .openSession(_, "chat-1", nil, nil) = $0 else { return false }
+            return true
+        }
+        let request = try XCTUnwrap(openRequest)
         guard case .openSession(let requestID, _, nil, nil) = request else {
             return XCTFail("Expected an uncached session open")
         }
@@ -3498,21 +3683,22 @@ final class AppModelTests: XCTestCase {
             history: nil,
             preview: nil
         ))
-        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(model.transcript.map(\.text), ["Hello"])
         XCTAssertTrue(model.displayedTranscript.isEmpty)
+        let refreshRequestCount = await recorder.requestCount()
         model.handle(.sessionReplayComplete(requestID: requestID, sessionID: "chat-1"))
         XCTAssertFalse(model.isLoadingTranscript)
         XCTAssertEqual(model.displayedTranscript.map(\.text), ["Hello"])
-        try await Task.sleep(for: .milliseconds(20))
-        let refreshed = await recorder.requests()
-        XCTAssertTrue(refreshed.contains { request in
+        let gitDiffRequest = await recorder.firstRequest(after: refreshRequestCount) { request in
             guard case .getGitDiff(_, "chat-1", .unstaged) = request else { return false }
             return true
-        })
-        XCTAssertTrue(refreshed.contains { request in
+        }
+        let workspaceFilesRequest = await recorder.firstRequest(after: refreshRequestCount) { request in
             guard case .listWorkspaceFiles(_, "chat-1", .all) = request else { return false }
             return true
-        })
+        }
+        XCTAssertNotNil(gitDiffRequest)
+        XCTAssertNotNil(workspaceFilesRequest)
     }
 
     func testEarlierHistoryUsesTheReadyCursorAndPrependsOnlyTranscriptState() async throws {
@@ -3523,12 +3709,14 @@ final class AppModelTests: XCTestCase {
         model.selectedAccountID = account.id
         model.connectionState = .ready
 
+        let openRequestCount = await recorder.requestCount()
         model.openSession("chat-1")
-        try await Task.sleep(for: .milliseconds(30))
-        let openRequests = await recorder.requests()
-        guard case .openSession(let openID, _, _, _) = try XCTUnwrap(
-            openRequests.first
-        ) else { return XCTFail("Expected session open") }
+        let openRequest = await recorder.firstRequest(after: openRequestCount) { request in
+            guard case .openSession(_, "chat-1", _, _) = request else { return false }
+            return true
+        }
+        guard case .openSession(let openID, _, _, _) = try XCTUnwrap(openRequest)
+        else { return XCTFail("Expected session open") }
         model.handle(.sessionOpened(
             requestID: openID,
             payload: sessionReady(latestSequence: 8, nextBeforeSequence: 40)
@@ -3550,7 +3738,6 @@ final class AppModelTests: XCTestCase {
         }.count
         model.connectionState = .disconnected
         model.loadEarlierHistory()
-        try await Task.sleep(for: .milliseconds(20))
         let disconnectedRequests = await recorder.requests()
         XCTAssertEqual(
             disconnectedRequests.filter {
@@ -3561,9 +3748,13 @@ final class AppModelTests: XCTestCase {
         )
 
         model.connectionState = .ready
+        let readyRequestCount = await recorder.requestCount()
         model.loadEarlierHistory()
         model.loadEarlierHistory()
-        try await Task.sleep(for: .milliseconds(30))
+        let historyRequest = await recorder.firstRequest(after: readyRequestCount) { request in
+            if case .getSessionHistory = request { return true }
+            return false
+        }
         let requests = await recorder.requests()
         XCTAssertEqual(
             requests.filter {
@@ -3577,10 +3768,9 @@ final class AppModelTests: XCTestCase {
             "chat-1",
             40,
             20
-        ) = try XCTUnwrap(requests.last(where: {
-            if case .getSessionHistory = $0 { return true }
-            return false
-        })) else { return XCTFail("Expected paged history request") }
+        ) = try XCTUnwrap(historyRequest) else {
+            return XCTFail("Expected paged history request")
+        }
 
         let events = [
             RenderedEventRecord(event: .object([
@@ -3775,9 +3965,14 @@ final class AppModelTests: XCTestCase {
             pending: false
         )]
 
+        let requestCount = await recorder.requestCount()
         model.openSession("chat-2")
-        try await Task.sleep(for: .milliseconds(20))
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            guard case .openSession(_, "chat-2", _, _) = request else { return false }
+            return true
+        }
 
+        XCTAssertNotNil(request)
         XCTAssertTrue(model.isLoadingTranscript)
         XCTAssertEqual(model.displayedTranscript.map(\.text), ["Previous chat"])
     }
@@ -4035,7 +4230,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertNotNil(newestOldCache)
         XCTAssertNil(oldestCache)
         XCTAssertNotNil(newCache)
-        #if os(iOS) && !targetEnvironment(simulator)
+        #if !targetEnvironment(simulator)
         let attributes = try FileManager.default.attributesOfItem(atPath: XCTUnwrap(files.first).path)
         XCTAssertEqual(attributes[.protectionKey] as? FileProtectionType, .complete)
         #endif
@@ -4123,29 +4318,32 @@ final class AppModelTests: XCTestCase {
         model.selectedAccountID = account.id
         model.connectionState = .ready
 
+        var requestCount = await recorder.requestCount()
         model.openSession("chat-1")
-        try await Task.sleep(for: .milliseconds(30))
-        let firstRequests = await recorder.requests()
-        guard case .openSession(let firstID, "chat-1", _, _) = try XCTUnwrap(
-            firstRequests.last
-        ) else { return XCTFail("Expected first session open") }
+        let firstRequest = await recorder.firstRequest(after: requestCount) { request in
+            guard case .openSession(_, "chat-1", _, _) = request else { return false }
+            return true
+        }
+        guard case .openSession(let firstID, "chat-1", _, _) = try XCTUnwrap(firstRequest)
+        else { return XCTFail("Expected first session open") }
         model.composer = "Typed while opening"
         model.handle(.sessionOpened(
             requestID: firstID,
             payload: sessionReady(latestSequence: 1, sessionID: "chat-1")
         ))
         model.handle(.sessionReplayComplete(requestID: firstID, sessionID: "chat-1"))
-        try await Task.sleep(for: .milliseconds(30))
+        let firstSessionReady = await eventually { model.canCreateSession }
+        XCTAssertTrue(firstSessionReady)
         XCTAssertEqual(model.composer, "Typed while opening")
         model.composer = "Draft one"
 
+        requestCount = await recorder.requestCount()
         model.openSession("chat-2")
-        try await Task.sleep(for: .milliseconds(50))
-        let secondRequests = await recorder.requests()
-        let secondOpen = try XCTUnwrap(secondRequests.last(where: { request in
+        let secondRequest = await recorder.firstRequest(after: requestCount) { request in
             guard case .openSession(_, "chat-2", _, _) = request else { return false }
             return true
-        }))
+        }
+        let secondOpen = try XCTUnwrap(secondRequest)
         guard case .openSession(let secondID, _, _, _) = secondOpen else {
             return XCTFail("Expected second session open")
         }
@@ -4154,8 +4352,18 @@ final class AppModelTests: XCTestCase {
             payload: sessionReady(latestSequence: 1, sessionID: "chat-2")
         ))
         model.handle(.sessionReplayComplete(requestID: secondID, sessionID: "chat-2"))
-        try await Task.sleep(for: .milliseconds(100))
+        let secondSessionReady = await eventually {
+            model.canCreateSession && model.composer == "Draft two"
+        }
+        XCTAssertTrue(secondSessionReady)
 
+        let firstDraftSaved = await eventually {
+            await store.loadComposerDraft(
+                accountID: account.id,
+                sessionID: "chat-1"
+            ) == "Draft one"
+        }
+        XCTAssertTrue(firstDraftSaved)
         let firstDraft = await store.loadComposerDraft(
             accountID: account.id,
             sessionID: "chat-1"
@@ -4163,35 +4371,52 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(firstDraft, "Draft one")
         XCTAssertEqual(model.composer, "Draft two")
 
+        requestCount = await recorder.requestCount()
         model.sendMessage()
         model.composer = "Next draft"
-        try await Task.sleep(for: .milliseconds(50))
+        let submitRequest = await recorder.firstRequest(after: requestCount) { request in
+            if case .submit = request { return true }
+            return false
+        }
         let submittedDraft = await store.loadComposerDraft(
             accountID: account.id,
             sessionID: "chat-2"
         )
         XCTAssertEqual(submittedDraft, "Draft two")
-        let submitted = await recorder.requests().compactMap { request -> String? in
-            guard case .submit(_, let submission) = request else { return nil }
-            return submission.id
+        guard case .submit(_, let submission) = try XCTUnwrap(submitRequest) else {
+            return XCTFail("Expected submitted draft")
         }
-        model.handle(.accepted(requestID: try XCTUnwrap(submitted.last)))
-        try await Task.sleep(for: .milliseconds(50))
+        model.handle(.accepted(requestID: submission.id))
+        let nextDraftSaved = await eventually {
+            await store.loadComposerDraft(
+                accountID: account.id,
+                sessionID: "chat-2"
+            ) == "Next draft"
+        }
+        XCTAssertTrue(nextDraftSaved)
         let nextDraft = await store.loadComposerDraft(
             accountID: account.id,
             sessionID: "chat-2"
         )
         XCTAssertEqual(nextDraft, "Next draft")
 
+        requestCount = await recorder.requestCount()
         model.deleteSession(session(sessionID: "chat-2", state: .idle))
-        try await Task.sleep(for: .milliseconds(30))
-        let deleteRequests = await recorder.requests()
-        guard case .deleteSession(let deleteID, "chat-2") = try XCTUnwrap(
-            deleteRequests.last
-        ) else { return XCTFail("Expected session delete") }
+        let deleteRequest = await recorder.firstRequest(after: requestCount) { request in
+            guard case .deleteSession(_, "chat-2") = request else { return false }
+            return true
+        }
+        guard case .deleteSession(let deleteID, "chat-2") = try XCTUnwrap(deleteRequest)
+        else { return XCTFail("Expected session delete") }
         model.handle(.accepted(requestID: deleteID))
         model.handle(.sessions(requestID: deleteID, sessions: []))
-        try await Task.sleep(for: .milliseconds(50))
+        let deletedDraftRemoved = await eventually {
+            await store.loadComposerDraft(
+                accountID: account.id,
+                sessionID: "chat-2"
+            ).isEmpty
+        }
+        XCTAssertTrue(deletedDraftRemoved)
         let deletedDraft = await store.loadComposerDraft(
             accountID: account.id,
             sessionID: "chat-2"
@@ -4348,19 +4573,28 @@ final class AppModelTests: XCTestCase {
         model.connectionState = .ready
 
         model.openSession("chat-1")
-        try await Task.sleep(for: .milliseconds(20))
-        let requests = await recorder.requests()
-        let first = try XCTUnwrap(requests.first)
+        let firstRequest = await recorder.firstRequest(after: 0) { request in
+            guard case .openSession(_, "chat-1", 7, "epoch-1") = request else {
+                return false
+            }
+            return true
+        }
+        let first = try XCTUnwrap(firstRequest)
         guard case .openSession(let requestID, _, 7, "epoch-1") = first else {
             return XCTFail("Expected the cached cursor")
         }
+        let requestCount = await recorder.requestCount()
         model.handle(.rejected(GatewayRejection(
             requestId: requestID,
             code: "replay_unavailable",
             message: "Reload",
             fatal: false
         )))
-        try await Task.sleep(for: .milliseconds(20))
+        let retryRequest = await recorder.firstRequest(after: requestCount) { request in
+            guard case .openSession(_, "chat-1", nil, nil) = request else { return false }
+            return true
+        }
+        _ = try XCTUnwrap(retryRequest)
 
         let opens = await recorder.requests().compactMap { request -> (String, UInt64?)? in
             guard case .openSession(_, let sessionID, let cursor, _) = request else { return nil }
@@ -4369,7 +4603,13 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(opens.count, 2)
         XCTAssertEqual(opens.last?.0, "chat-1")
         XCTAssertNil(opens.last?.1)
-        let cached = await store.loadTranscript(accountID: account.id, sessionID: "chat-1")
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(1))
+        var cached = await store.loadTranscript(accountID: account.id, sessionID: "chat-1")
+        while cached != nil, clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+            cached = await store.loadTranscript(accountID: account.id, sessionID: "chat-1")
+        }
         XCTAssertNil(cached)
     }
 
@@ -4559,8 +4799,11 @@ final class AppModelTests: XCTestCase {
 
     func testGeneratedTitlePersistsWhenUserMessageArrivesBeforeGeneration() async throws {
         let recorder = GatewayRequestRecorder()
+        let titleStarted = expectation(description: "Title generation started")
+        let titleGate = AsyncGate()
         let writer = ChatTitleWriter { _ in
-            try? await Task.sleep(for: .milliseconds(80))
+            titleStarted.fulfill()
+            await titleGate.wait()
             return "Generated title"
         }
         let model = try model(
@@ -4574,8 +4817,10 @@ final class AppModelTests: XCTestCase {
             in: model,
             recorder: recorder
         )
+        await fulfillment(of: [titleStarted], timeout: 1)
         XCTAssertEqual(model.currentSessionTitle, "Review the gateway…")
 
+        let requestCount = await recorder.requestCount()
         model.reduce(
             event: AgentEventRecord(submissionId: submission.id, msg: .object([
                 "type": .string("user_message"),
@@ -4584,31 +4829,51 @@ final class AppModelTests: XCTestCase {
             blocks: [],
             preview: nil
         )
-        try await Task.sleep(for: .milliseconds(100))
+        await titleGate.open()
 
-        let requests = await recorder.requests()
-        XCTAssertTrue(requests.contains {
-            guard case .renameSession(_, "chat-1", "Generated title") = $0 else {
+        let rename = await recorder.firstRequest(after: requestCount) { request in
+            guard case .renameSession(_, "chat-1", "Generated title") = request else {
                 return false
             }
             return true
-        })
+        }
+        XCTAssertNotNil(rename)
     }
 
     func testReplayedFirstMessagePersistsThePendingTitle() async throws {
         let recorder = GatewayRequestRecorder()
+        let titleStarted = expectation(description: "Title generation started")
+        let titleGate = AsyncGate()
         let model = try model(
             requestSender: { request in await recorder.record(request) },
-            titleWriter: ChatTitleWriter { _ in "Generated title" }
+            titleWriter: ChatTitleWriter { _ in
+                titleStarted.fulfill()
+                await titleGate.wait()
+                return "Generated title"
+            }
         )
         let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
         try await openNewSession(in: model, recorder: recorder, account: account)
         try await submitMessage("Review the gateway", in: model, recorder: recorder)
+        await fulfillment(of: [titleStarted], timeout: 1)
 
+        let titleGenerated = expectation(description: "Generated title applied")
+        withObservationTracking {
+            _ = model.currentSessionTitle
+        } onChange: {
+            titleGenerated.fulfill()
+        }
+        await titleGate.open()
+        await fulfillment(of: [titleGenerated], timeout: 1)
+        XCTAssertEqual(model.currentSessionTitle, "Generated title")
+
+        let requestCount = await recorder.requestCount()
         model.restoreSession("chat-1")
-        try await Task.sleep(for: .milliseconds(30))
-        let requests = await recorder.requests()
-        guard case .openSession(let requestID, _, _, _) = try XCTUnwrap(requests.last) else {
+        let open = await recorder.firstRequest(after: requestCount) { request in
+            guard case .openSession(_, "chat-1", _, _) = request else { return false }
+            return true
+        }
+        guard case .openSession(let requestID, _, _, _) = try XCTUnwrap(open) else {
             return XCTFail("Expected the selected chat to reopen")
         }
         model.handle(.sessionOpened(
@@ -4633,16 +4898,16 @@ final class AppModelTests: XCTestCase {
             ]), blocks: [])],
             preview: nil
         ))
+        let replayRequestCount = await recorder.requestCount()
         model.handle(.sessionReplayComplete(requestID: requestID, sessionID: "chat-1"))
-        try await Task.sleep(for: .milliseconds(30))
 
-        let replayedRequests = await recorder.requests()
-        XCTAssertTrue(replayedRequests.contains {
-            guard case .renameSession(_, "chat-1", "Generated title") = $0 else {
+        let rename = await recorder.firstRequest(after: replayRequestCount) { request in
+            guard case .renameSession(_, "chat-1", "Generated title") = request else {
                 return false
             }
             return true
-        })
+        }
+        XCTAssertNotNil(rename)
         XCTAssertEqual(model.currentSessionTitle, "Generated title")
     }
 
@@ -4666,6 +4931,8 @@ final class AppModelTests: XCTestCase {
         let harness = GatewayConnectionHarness()
         let recorder = GatewayRequestRecorder()
         var prompts: [String] = []
+        let firstTitleGenerated = expectation(description: "Initial title generated")
+        let secondTitleGenerated = expectation(description: "Rearmed title generated")
         let model = AppModel(
             client: GatewayClient(),
             store: store,
@@ -4675,35 +4942,46 @@ final class AppModelTests: XCTestCase {
             reconnectDelay: { _ in .zero },
             titleWriter: ChatTitleWriter { prompt in
                 prompts.append(prompt)
+                if prompts.count == 1 { firstTitleGenerated.fulfill() }
+                if prompts.count == 2 { secondTitleGenerated.fulfill() }
                 return "Generated title"
             }
         )
         await model.appDidBecomeActive()
 
         model.start()
-        try await Task.sleep(for: .milliseconds(100))
+        let initialConnectionOpened = await eventually { await harness.attemptCount() >= 2 }
+        XCTAssertTrue(initialConnectionOpened)
         await harness.yield(.authenticated)
         await harness.yield(.ready(ready(
             defaultConfig: VersionedAgentConfig(revision: 1, config: composition()),
             sessions: []
         )))
+        let gatewayReady = await eventually { model.connectionState.isReady }
+        XCTAssertTrue(gatewayReady)
         try await openNewSession(in: model, recorder: recorder, account: account)
         try await submitMessage("Review the gateway", in: model, recorder: recorder)
+        await fulfillment(of: [firstTitleGenerated], timeout: 1)
         XCTAssertEqual(model.currentSessionTitle, "Generated title")
 
+        let reconnectRequestCount = await recorder.requestCount()
         await harness.fail()
-        try await Task.sleep(for: .milliseconds(100))
+        let reconnectOpened = await eventually { await harness.attemptCount() >= 3 }
+        XCTAssertTrue(reconnectOpened)
+        let attemptCount = await harness.attemptCount()
+        XCTAssertGreaterThanOrEqual(attemptCount, 3)
         await harness.yield(.authenticated)
         await harness.yield(.ready(ready(
             defaultConfig: VersionedAgentConfig(revision: 1, config: composition()),
             sessions: [session(state: .idle, firstUserMessage: nil)]
         )))
-        try await Task.sleep(for: .milliseconds(30))
-        let reconnectRequests = await recorder.requests()
-        let reconnectOpen = try XCTUnwrap(reconnectRequests.last(where: {
-            if case .openSession = $0 { return true }
-            return false
-        }))
+        let reconnectRequest = await recorder.firstRequest(
+            after: reconnectRequestCount
+        ) { request in
+            guard case .openSession(_, "chat-1", _, _) = request else { return false }
+            return true
+        }
+        let reconnectOpen = try XCTUnwrap(reconnectRequest)
         guard case .openSession(let requestID, _, _, _) = reconnectOpen else {
             return XCTFail("Expected the selected chat to reopen")
         }
@@ -4712,11 +4990,12 @@ final class AppModelTests: XCTestCase {
             payload: sessionReady(latestSequence: 0)
         ))
         await harness.yield(.sessionReplayComplete(requestID: requestID, sessionID: "chat-1"))
-        try await Task.sleep(for: .milliseconds(50))
-
+        let replayFinished = await eventually { model.canCreateSession }
+        XCTAssertTrue(replayFinished)
         XCTAssertEqual(model.currentSessionTitle, "new conversation")
         XCTAssertEqual(model.composer, "Review the gateway")
         try await submitMessage("Review the gateway", in: model, recorder: recorder)
+        await fulfillment(of: [secondTitleGenerated], timeout: 1)
         XCTAssertEqual(prompts, ["Review the gateway", "Review the gateway"])
         XCTAssertEqual(model.currentSessionTitle, "Generated title")
     }
@@ -4771,11 +5050,18 @@ final class AppModelTests: XCTestCase {
         let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
         try await openNewSession(in: model, recorder: recorder, account: account)
 
+        let firstTitleFinished = expectation(description: "First title generation finished")
+        withObservationTracking {
+            _ = model.toast
+        } onChange: {
+            firstTitleFinished.fulfill()
+        }
         let firstSubmission = try await submitMessage(
             "Review the gateway",
             in: model,
             recorder: recorder
         )
+        await fulfillment(of: [firstTitleFinished], timeout: 1)
 
         model.handle(.rejected(GatewayRejection(
             requestId: firstSubmission.id,
@@ -4783,7 +5069,14 @@ final class AppModelTests: XCTestCase {
             message: "Try again",
             fatal: false
         )))
+        let secondTitleFinished = expectation(description: "Second title generation finished")
+        withObservationTracking {
+            _ = model.toast
+        } onChange: {
+            secondTitleFinished.fulfill()
+        }
         try await submitMessage("Review the gateway again", in: model, recorder: recorder)
+        await fulfillment(of: [secondTitleFinished], timeout: 1)
 
         XCTAssertEqual(prompts, ["Review the gateway", "Review the gateway again"])
         XCTAssertEqual(model.currentSessionTitle, "Review the gateway ag…")
@@ -4830,12 +5123,23 @@ final class AppModelTests: XCTestCase {
 
     func testAcceptedDeleteCancelsPendingTitleGeneration() async throws {
         let recorder = GatewayRequestRecorder()
+        let deleteSent = expectation(description: "Delete request sent")
+        let titleCancelled = expectation(description: "Title generation cancelled")
         let writer = ChatTitleWriter { _ in
-            try? await Task.sleep(for: .milliseconds(100))
+            do {
+                try await Task.sleep(for: .seconds(10))
+            } catch is CancellationError {
+                titleCancelled.fulfill()
+            } catch {
+                return nil
+            }
             return "Generated title"
         }
         let model = try model(
-            requestSender: { request in await recorder.record(request) },
+            requestSender: { request in
+                await recorder.record(request)
+                if case .deleteSession = request { deleteSent.fulfill() }
+            },
             titleWriter: writer
         )
         let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
@@ -4845,7 +5149,7 @@ final class AppModelTests: XCTestCase {
         let chat = session(state: .running, firstUserMessage: "Review the gateway")
         model.applySessions([chat])
         model.deleteSession(chat)
-        try await Task.sleep(for: .milliseconds(20))
+        await fulfillment(of: [deleteSent], timeout: 1)
         let deleteIDs = await recorder.requests().compactMap { request -> String? in
             guard case .deleteSession(let requestID, "chat-1") = request else { return nil }
             return requestID
@@ -4853,7 +5157,7 @@ final class AppModelTests: XCTestCase {
         let deleteID = try XCTUnwrap(deleteIDs.last)
 
         model.handle(.accepted(requestID: deleteID))
-        try await Task.sleep(for: .milliseconds(120))
+        await fulfillment(of: [titleCancelled], timeout: 1)
 
         let requests = await recorder.requests()
         XCTAssertFalse(requests.contains {
@@ -4864,15 +5168,18 @@ final class AppModelTests: XCTestCase {
 
     func testOpeningAnotherNewChatDoesNotCancelTheFirstTitle() async throws {
         let recorder = GatewayRequestRecorder()
+        let firstTitleStarted = expectation(description: "First title generation started")
+        let secondTitleStarted = expectation(description: "Second title generation started")
+        let firstTitleGate = AsyncGate()
+        let secondTitleGate = AsyncGate()
         let writer = ChatTitleWriter { prompt in
             if prompt == "First prompt" {
-                do {
-                    try await Task.sleep(for: .milliseconds(100))
-                } catch {
-                    return nil
-                }
+                firstTitleStarted.fulfill()
+                await firstTitleGate.wait()
                 return "First title"
             }
+            secondTitleStarted.fulfill()
+            await secondTitleGate.wait()
             return "Second title"
         }
         let model = try model(
@@ -4893,6 +5200,7 @@ final class AppModelTests: XCTestCase {
             recorder: recorder,
             sessionID: "chat-1"
         )
+        await fulfillment(of: [firstTitleStarted], timeout: 1)
         model.reduce(
             event: AgentEventRecord(submissionId: firstSubmission.id, msg: .object([
                 "type": .string("user_message"),
@@ -4914,7 +5222,27 @@ final class AppModelTests: XCTestCase {
             recorder: recorder,
             sessionID: "chat-2"
         )
-        try await Task.sleep(for: .milliseconds(120))
+        await fulfillment(of: [secondTitleStarted], timeout: 1)
+
+        let secondTitleGenerated = expectation(description: "Second title applied")
+        withObservationTracking {
+            _ = model.currentSessionTitle
+        } onChange: {
+            secondTitleGenerated.fulfill()
+        }
+        await secondTitleGate.open()
+        await fulfillment(of: [secondTitleGenerated], timeout: 1)
+        XCTAssertEqual(model.currentSessionTitle, "Second title")
+
+        let requestCount = await recorder.requestCount()
+        await firstTitleGate.open()
+        let firstRename = await recorder.firstRequest(after: requestCount) { request in
+            guard case .renameSession(_, "chat-1", "First title") = request else {
+                return false
+            }
+            return true
+        }
+        XCTAssertNotNil(firstRename)
 
         XCTAssertEqual(
             model.displayedTitle(for: session(
@@ -4924,7 +5252,6 @@ final class AppModelTests: XCTestCase {
             )),
             "First title"
         )
-        XCTAssertEqual(model.currentSessionTitle, "Second title")
     }
 }
 

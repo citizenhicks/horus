@@ -6,12 +6,15 @@ struct ProfileView: View {
 
     var body: some View {
         let usage = model.profile?.dailyUsage ?? []
+        let providerLabels = model.providerStatuses.reduce(into: [String: String]()) {
+            $0[$1.provider] = $1.label
+        }
         PageScaffold(
             title: "Settings",
             detail: ""
         ) {
             Section("Usage") {
-                ProfileUsageSection(days: usage)
+                ProfileUsageSection(days: usage, providerLabels: providerLabels)
             }
             if let stats = model.profile?.runStats {
                 Section("Runs") {
@@ -32,11 +35,12 @@ struct ProfileView: View {
     }
 }
 
-private let usageHeatmapWeekCount = 25
+private let profileUsageWeekCount = 25
 
 private struct ProfileUsageSection: View {
     @Environment(\.horusPalette) private var palette
     let days: [DailyUsage]
+    let providerLabels: [String: String]
 
     var body: some View {
         let total = days.reduce(into: TokenUsage()) { result, day in
@@ -46,6 +50,9 @@ private struct ProfileUsageSection: View {
             result.totalTokens += day.usage.totalTokens
         }
         VStack(alignment: .leading, spacing: 16) {
+            Text("Recorded totals")
+                .font(HorusStyle.controlFont)
+                .foregroundStyle(palette.muted)
             // Four fixed columns: an adaptive grid drops to three and orphans the last metric.
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 16) {
                 UsageMetric(label: "TOKENS", value: compact(total.totalTokens))
@@ -53,7 +60,20 @@ private struct ProfileUsageSection: View {
                 UsageMetric(label: "OUTPUT", value: compact(total.outputTokens))
                 UsageMetric(label: "CACHE", value: cacheHit(total))
             }
-            Text("\(usageHeatmapWeekCount)-week activity")
+            HStack(alignment: .firstTextBaseline) {
+                Text("Usage by provider")
+                    .font(HorusStyle.controlFont)
+                Spacer()
+                Text("Last \(profileUsageWeekCount) weeks")
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(palette.muted)
+            }
+            ProviderUsageChart(
+                usage: days,
+                providerLabels: providerLabels,
+                weekCount: profileUsageWeekCount
+            )
+            Text("\(profileUsageWeekCount)-week activity")
                 .font(HorusStyle.controlFont)
                 .foregroundStyle(palette.muted)
             UsageHeatmap(days: days)
@@ -235,17 +255,17 @@ private struct UsageHeatmap: View {
         let canvas = Canvas { context, size in
             let spacing: CGFloat = 3
             let cell = min(
-                (size.width - spacing * CGFloat(usageHeatmapWeekCount - 1))
-                    / CGFloat(usageHeatmapWeekCount),
+                (size.width - spacing * CGFloat(profileUsageWeekCount - 1))
+                    / CGFloat(profileUsageWeekCount),
                 (size.height - spacing * 6) / 7
             )
-            let width = cell * CGFloat(usageHeatmapWeekCount)
-                + spacing * CGFloat(usageHeatmapWeekCount - 1)
+            let width = cell * CGFloat(profileUsageWeekCount)
+                + spacing * CGFloat(profileUsageWeekCount - 1)
             let originX = (size.width - width) / 2
 
             for index in chart.values.indices {
-                let week = index % usageHeatmapWeekCount
-                let weekday = index / usageHeatmapWeekCount
+                let week = index % profileUsageWeekCount
+                let weekday = index / profileUsageWeekCount
                 let rect = CGRect(
                     x: originX + CGFloat(week) * (cell + spacing),
                     y: CGFloat(weekday) * (cell + spacing),
@@ -264,7 +284,7 @@ private struct UsageHeatmap: View {
         }
         .frame(height: 78)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(usageHeatmapWeekCount)-week token activity")
+        .accessibilityLabel("\(profileUsageWeekCount)-week token activity")
         .accessibilityValue("\(chart.activeDays) active days, \(chart.totalTokens) total tokens")
     }
 
@@ -273,11 +293,11 @@ private struct UsageHeatmap: View {
             values[day.unixDay, default: 0] += day.usage.totalTokens
         }
         let today = UInt64(Date.now.timeIntervalSince1970 / 86_400)
-        let dayCount = usageHeatmapWeekCount * 7
+        let dayCount = profileUsageWeekCount * 7
         let start = today - min(today, UInt64(dayCount - 1))
         let samples = (0..<dayCount).map { index in
-            let week = index % usageHeatmapWeekCount
-            let weekday = index / usageHeatmapWeekCount
+            let week = index % profileUsageWeekCount
+            let weekday = index / profileUsageWeekCount
             return values[start + UInt64(week * 7 + weekday)] ?? 0
         }
         return (
@@ -347,11 +367,7 @@ private struct AppLockSettings: View {
         if model.appLockAuthenticationMethod.isAvailable {
             return "Locks Horus when it enters the background. This setting stays on this device."
         }
-        #if os(macOS)
-        return "Set up Touch ID in System Settings before enabling app lock."
-        #else
         return "Set up Face ID or Touch ID in Settings before enabling app lock."
-        #endif
     }
 }
 

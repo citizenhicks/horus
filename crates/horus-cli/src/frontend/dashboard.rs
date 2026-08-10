@@ -14,8 +14,8 @@ use horus::{Error, Result};
 use horus_gateway::client::{Endpoint, GatewayClient, GatewayEvents, GatewaySender};
 use horus_gateway::config::{ConfigStore, GatewayConfig};
 use horus_gateway::wire::{
-    ClientKind, ClientMessage, ClientStatus, ProfileSnapshot, ReadyPayload, ServerMessage,
-    SessionActivityState, SessionReadyPayload, SessionRecord,
+    ClientKind, ClientMessage, ClientStatus, DailyUsage, ProfileSnapshot, ReadyPayload,
+    ServerMessage, SessionActivityState, SessionReadyPayload, SessionRecord,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -1565,21 +1565,13 @@ fn render_usage(frame: &mut ratatui::Frame<'_>, area: Rect, profile: Option<&Pro
         || empty("Loading usage…"),
         |profile| {
             let today = current_unix_day()
-                .and_then(|day| {
-                    profile
-                        .daily_usage
-                        .iter()
-                        .find(|entry| entry.unix_day == day)
-                })
-                .map(|entry| &entry.usage)
-                .cloned()
-                .unwrap_or_default();
+                .map_or(0_i64, |day| token_total_for_day(&profile.daily_usage, day));
             let total = profile.daily_usage.iter().fold(0_i64, |total, entry| {
                 total.saturating_add(entry.usage.total_tokens)
             });
             let stats = &profile.run_stats;
             vec![
-                Line::from(format!(" Today      {} tokens", number(today.total_tokens))),
+                Line::from(format!(" Today      {} tokens", number(today))),
                 Line::from(format!(
                     " Runs       {} · {} failed · {} aborted",
                     number(stats.run_count),
@@ -1598,6 +1590,15 @@ fn render_usage(frame: &mut ratatui::Frame<'_>, area: Rect, profile: Option<&Pro
         },
     );
     frame.render_widget(Paragraph::new(lines).block(panel("Usage", false)), area);
+}
+
+fn token_total_for_day(usage: &[DailyUsage], unix_day: u64) -> i64 {
+    usage
+        .iter()
+        .filter(|entry| entry.unix_day == unix_day)
+        .fold(0_i64, |total, entry| {
+            total.saturating_add(entry.usage.total_tokens)
+        })
 }
 
 fn elapsed_ms(milliseconds: u64) -> String {
@@ -1665,9 +1666,9 @@ mod tests {
     use horus::protocol::{
         FrontendAction, FrontendActionListItem, FrontendBlock, FrontendBlockFormat, FrontendEvent,
         FrontendListItemState, FrontendPickerOption, FrontendSlot, FrontendSymbol, FrontendTone,
-        FrontendWidget, FrontendWidgetContent, Op, SessionContext,
+        FrontendWidget, FrontendWidgetContent, Op, SessionContext, TokenUsage,
     };
-    use horus_gateway::wire::{SessionActivity, SessionActivityState, SessionRecord};
+    use horus_gateway::wire::{DailyUsage, SessionActivity, SessionActivityState, SessionRecord};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1675,8 +1676,40 @@ mod tests {
 
     use super::{
         CapabilityOverlay, activate_overlay, handle_action_input_key, moved_index,
-        ordered_sessions, prepare_overlay_operation, render_action_list,
+        ordered_sessions, prepare_overlay_operation, render_action_list, token_total_for_day,
     };
+
+    #[test]
+    fn daily_usage_sums_all_providers_on_the_same_day() {
+        let usage = [
+            DailyUsage {
+                unix_day: 7,
+                provider: "openai_socket".into(),
+                usage: TokenUsage {
+                    total_tokens: 11,
+                    ..TokenUsage::default()
+                },
+            },
+            DailyUsage {
+                unix_day: 7,
+                provider: "kimi".into(),
+                usage: TokenUsage {
+                    total_tokens: 13,
+                    ..TokenUsage::default()
+                },
+            },
+            DailyUsage {
+                unix_day: 8,
+                provider: "responses".into(),
+                usage: TokenUsage {
+                    total_tokens: 17,
+                    ..TokenUsage::default()
+                },
+            },
+        ];
+
+        assert_eq!(token_total_for_day(&usage, 7), 24);
+    }
 
     #[test]
     fn moved_index_clamps_scroll_to_the_history() {

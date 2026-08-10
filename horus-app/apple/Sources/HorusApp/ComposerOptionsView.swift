@@ -1,12 +1,9 @@
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
-#if os(iOS)
 import CoreTransferable
 import PhotosUI
-#endif
 
-#if os(iOS)
 private struct ImportedPhotoFile: Transferable {
     let url: URL
 
@@ -28,20 +25,15 @@ private struct ImportedPhotoFile: Transferable {
         }
     }
 }
-#endif
 
 struct ComposerOptionsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
-    #if os(iOS)
     let dictation: ComposerDictation
     @Binding var selection: TextSelection?
-    #endif
     @State private var isFileImporterPresented = false
-    #if os(iOS)
     @State private var isPhotoPickerPresented = false
     @State private var photoSelection: [PhotosPickerItem] = []
-    #endif
 
     var body: some View {
         // The icon buttons already pad their own glyphs, so they need no spacing between
@@ -59,7 +51,6 @@ struct ComposerOptionsView: View {
             allowsMultipleSelection: true,
             onCompletion: importFiles
         )
-        #if os(iOS)
         // The picker runs out of process, so this needs no photo library permission.
         .photosPicker(
             isPresented: $isPhotoPickerPresented,
@@ -72,20 +63,18 @@ struct ComposerOptionsView: View {
             photoSelection = []
             Task { await importPhotos(items) }
         }
-        #endif
     }
 
     /// The photo library and the file browser are separate pickers, so the plus offers both
     /// rather than assuming every attachment lives in Files.
     @ViewBuilder
     private var addAttachmentControl: some View {
-        #if os(iOS)
         Menu {
             Button { isPhotoPickerPresented = true } label: {
-                HorusPlatformMenuLabel(title: "Photos", glyph: .image01, systemImage: "photo")
+                HorusLabel(title: "Photos", glyph: .image01)
             }
             Button { isFileImporterPresented = true } label: {
-                HorusPlatformMenuLabel(title: "Files", glyph: .fileText, systemImage: "folder")
+                HorusLabel(title: "Files", glyph: .fileText)
             }
         } label: {
             HorusLabel(title: "Add attachment", glyph: .plus)
@@ -96,15 +85,6 @@ struct ComposerOptionsView: View {
         .buttonStyle(.horusPlain)
         .disabled(!model.canImportAttachments)
         .accessibilityLabel("Add attachment")
-        #else
-        Button("Add files", glyph: .plus) {
-            isFileImporterPresented = true
-        }
-        .labelStyle(.iconOnly)
-        .buttonStyle(HorusIconButtonStyle(bare: true))
-        .disabled(!model.canImportAttachments)
-        .help("Add files")
-        #endif
     }
 
     private var modelMenu: some View {
@@ -121,9 +101,7 @@ struct ComposerOptionsView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.horusPlain)
-        #if os(iOS)
         .sensoryFeedback(.selection, trigger: model.selectedModelRoute)
-        #endif
         .accessibilityLabel("Model and reasoning")
         .accessibilityValue(modelLabel)
     }
@@ -148,9 +126,7 @@ struct ComposerOptionsView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.horusPlain)
-        #if os(iOS)
         .sensoryFeedback(.selection, trigger: approvalValue)
-        #endif
         .disabled(model.agentDraft == nil || approvalOptions.isEmpty)
         .help(approvalLabel)
         .accessibilityLabel("Approval policy")
@@ -189,10 +165,9 @@ struct ComposerOptionsView: View {
         Group {
             if let providerSymbol,
                let glyph = HorusSymbol.knownGlyph(for: providerSymbol) {
-                HorusPlatformMenuLabel(
+                HorusLabel(
                     title: title,
-                    glyph: glyph,
-                    systemImage: HorusSymbol.systemImage(for: providerSymbol)
+                    glyph: glyph
                 )
             } else {
                 Text(title)
@@ -202,7 +177,6 @@ struct ComposerOptionsView: View {
 
     @ViewBuilder
     private var actionButtons: some View {
-        #if os(iOS)
         Button(action: toggleDictation) {
             if dictation.isTransitioning {
                 ProgressView()
@@ -217,7 +191,6 @@ struct ComposerOptionsView: View {
         .help(dictationLabel)
         .accessibilityLabel(dictationLabel)
         .accessibilityValue(dictationValue)
-        #endif
 
         if model.activeTurnID != nil && !canSend {
             Button("Stop", glyph: .stopFill) { model.interrupt() }
@@ -247,7 +220,6 @@ struct ComposerOptionsView: View {
         }
     }
 
-    #if os(iOS)
     /// Keep the filename supplied by Photos while taking the same import path and limits as Files.
     private func importPhotos(_ items: [PhotosPickerItem]) async {
         var urls: [URL] = []
@@ -264,7 +236,6 @@ struct ComposerOptionsView: View {
         await model.importAttachments(urls)
         for url in urls { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
     }
-    #endif
 
     private var currentChoice: ModelChoice? {
         model.modelChoices.first { $0.route == model.selectedModelRoute }
@@ -370,14 +341,9 @@ struct ComposerOptionsView: View {
               model.selectedSessionID != nil,
               model.activeTurnID == nil || model.composerAttachments.isEmpty
         else { return false }
-        #if os(iOS)
         return !dictation.isActive
-        #else
-        return true
-        #endif
     }
 
-    #if os(iOS)
     private var canToggleDictation: Bool {
         dictation.isRecording
             || dictation.canToggle
@@ -427,5 +393,4 @@ struct ComposerOptionsView: View {
             }
         }
     }
-    #endif
 }

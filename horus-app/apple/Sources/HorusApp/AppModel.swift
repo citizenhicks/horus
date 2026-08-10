@@ -352,12 +352,7 @@ enum AppLockAuthenticationMethod: Equatable {
         case .faceID: "Require Face ID"
         case .touchID: "Require Touch ID"
         case .biometrics: "Require Biometric Authentication"
-        case .unavailable:
-            #if os(macOS)
-            "Require Touch ID"
-            #else
-            "Require Face ID or Touch ID"
-            #endif
+        case .unavailable: "Require Face ID or Touch ID"
         }
     }
 
@@ -366,12 +361,7 @@ enum AppLockAuthenticationMethod: Equatable {
         case .faceID: "Unlock with Face ID"
         case .touchID: "Unlock with Touch ID"
         case .biometrics: "Unlock with Biometrics"
-        case .unavailable:
-            #if os(macOS)
-            "Unlock with Touch ID"
-            #else
-            "Unlock with Face ID or Touch ID"
-            #endif
+        case .unavailable: "Unlock with Face ID or Touch ID"
         }
     }
 
@@ -690,9 +680,7 @@ final class AppModel {
     @ObservationIgnored private var chatTitleTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var titleEligibleSessionIDs: Set<String> = []
     private var pendingChatTitles: [String: PendingChatTitle] = [:]
-    #if os(iOS)
     @ObservationIgnored private let liveActivity = LiveActivityController()
-    #endif
     var selectedSessionID: String?
     private(set) var unreadSessionIDs: Set<String> = []
     var transcript: [TranscriptEntry] = []
@@ -784,8 +772,10 @@ final class AppModel {
     var agentSnapshot: VersionedAgentConfig?
     var defaultAgentSnapshot: VersionedAgentConfig?
     var agentDraft: AgentComposition?
+    var defaultAgentDraft: AgentComposition?
     private var setupProviderDraft: ProviderConfig?
-    var applyState: ApplyState = .idle
+    var chatAgentApplyState: ApplyState = .idle
+    var defaultAgentApplyState: ApplyState = .idle
     var providerStatuses: [ProviderStatus] = []
     var providerAPIKey = ""
     var providerModelIDsText = ""
@@ -848,6 +838,7 @@ final class AppModel {
     @ObservationIgnored private var sessionToRestoreID: String?
     @ObservationIgnored private var configRequestID: String?
     @ObservationIgnored private var defaultConfigRequestID: String?
+    @ObservationIgnored private var submittedDefaultAgentDraft: AgentComposition?
     @ObservationIgnored private var approvalRequestID: String?
     @ObservationIgnored private var directoryRequestID: String?
     @ObservationIgnored private var gitDiffRequestID: String?
@@ -869,7 +860,6 @@ final class AppModel {
     @ObservationIgnored private var pairingCodeExpiryTask: Task<Void, Never>?
     @ObservationIgnored private var providerLoginRequestID: String?
     @ObservationIgnored private var providerRegistrationRequestID: String?
-    @ObservationIgnored private var providerRegistrationTarget: ConfigurationTarget?
     @ObservationIgnored private var cronRequestIDs: Set<String> = []
     @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
     @ObservationIgnored private var isChatVisible = false
@@ -968,8 +958,7 @@ final class AppModel {
             && sessionFileUploadRequests.isEmpty
             && pendingWidgetEdit == nil
             && !isLoadingComposerEditRecovery
-            && applyState != .applying
-            && applyState != .restarting
+            && !isApplyingConfiguration
     }
 
     var canCreateSession: Bool { canOpenSession }
@@ -1057,19 +1046,21 @@ final class AppModel {
         configRequestID != nil
             || defaultConfigRequestID != nil
             || providerRegistrationRequestID != nil
-            || applyState == .applying
-            || applyState == .restarting
+            || chatAgentApplyState == .applying
+            || chatAgentApplyState == .restarting
+            || defaultAgentApplyState == .applying
+            || defaultAgentApplyState == .restarting
     }
 
     var providerDraft: ProviderConfig? {
-        get { agentDraft?.provider ?? setupProviderDraft }
+        get { defaultAgentDraft?.provider ?? setupProviderDraft }
         set {
             guard let newValue else {
                 setupProviderDraft = nil
                 return
             }
-            if agentDraft != nil {
-                agentDraft?.provider = newValue
+            if defaultAgentDraft != nil {
+                defaultAgentDraft?.provider = newValue
             } else {
                 setupProviderDraft = newValue
             }
@@ -1312,14 +1303,12 @@ final class AppModel {
     /// Hands the current chat list to the Live Activity. Called wherever the list or the
     /// unread set changes, since the island shows both.
     private func refreshLiveActivity() {
-        #if os(iOS)
         liveActivity.update(
             sessions: sessions,
             unread: unreadSessionIDs,
             gateway: gatewayMachineName,
             titleOverrides: pendingChatTitles.mapValues(\.displayTitle)
         )
-        #endif
     }
 
     var capabilityReferences: [MountedReference] {
@@ -2335,7 +2324,15 @@ final class AppModel {
     }
 
     var agentDraftModelRoute: String? {
-        guard let provider = agentDraft?.provider else { return nil }
+        modelRoute(for: agentDraft)
+    }
+
+    var defaultAgentDraftModelRoute: String? {
+        modelRoute(for: defaultAgentDraft)
+    }
+
+    private func modelRoute(for draft: AgentComposition?) -> String? {
+        guard let provider = draft?.provider else { return nil }
         return modelChoices.first { choice in
             choice.model == provider.model
                 && choice.reasoningEffort == provider.reasoningEffort
@@ -2344,15 +2341,26 @@ final class AppModel {
     }
 
     func selectAgentDraftModel(_ route: String) {
+        agentDraft = draft(agentDraft, selectingModelRoute: route)
+    }
+
+    func selectDefaultAgentDraftModel(_ route: String) {
+        defaultAgentDraft = draft(defaultAgentDraft, selectingModelRoute: route)
+    }
+
+    private func draft(
+        _ currentDraft: AgentComposition?,
+        selectingModelRoute route: String
+    ) -> AgentComposition? {
         guard let choice = modelChoices.first(where: { $0.route == route }),
               let status = providerStatus(for: choice),
               var provider = status.selection,
-              var draft = agentDraft
-        else { return }
+              var draft = currentDraft
+        else { return currentDraft }
         provider.model = choice.model
         provider.reasoningEffort = choice.reasoningEffort
         draft.provider = provider
-        agentDraft = draft
+        return draft
     }
 
     func modelLabel(for choice: ModelChoice) -> String {
@@ -2438,11 +2446,11 @@ final class AppModel {
     }
 
     func changeAgentForCurrentChat() {
-        applyAgentConfiguration(to: .session)
+        applyAgentConfiguration(agentDraft, to: .session)
     }
 
     func saveAgentAsDefault() {
-        applyAgentConfiguration(to: .defaultAgent)
+        applyAgentConfiguration(defaultAgentDraft, to: .defaultAgent)
     }
 
     func setApprovalPolicyForCurrentChat(_ policy: String) {
@@ -2465,16 +2473,19 @@ final class AppModel {
         changeAgentForCurrentChat()
     }
 
-    private func applyAgentConfiguration(to target: ConfigurationTarget) {
-        guard !isApplyingConfiguration, let draft = agentDraft else { return }
+    private func applyAgentConfiguration(
+        _ draft: AgentComposition?,
+        to target: ConfigurationTarget
+    ) {
+        guard !isApplyingConfiguration, let draft else { return }
         let id = requestID("configure")
-        applyState = .applying
         switch target {
         case .session:
             guard let sessionID = selectedSessionID, let snapshot = agentSnapshot else {
-                applyState = .idle
+                chatAgentApplyState = .idle
                 return
             }
+            chatAgentApplyState = .applying
             configRequestID = id
             transmit(.configureSession(
                 requestID: id,
@@ -2484,14 +2495,18 @@ final class AppModel {
             )) { [weak self] message in
                 guard self?.configRequestID == id else { return }
                 self?.configRequestID = nil
-                self?.applyState = .failed(message)
+                self?.chatAgentApplyState = .failed(message)
             }
         case .defaultAgent:
             guard let snapshot = defaultAgentSnapshot else {
-                applyState = .failed("The gateway has no default agent configuration.")
+                defaultAgentApplyState = .failed(
+                    "The gateway has no default agent configuration."
+                )
                 return
             }
+            defaultAgentApplyState = .applying
             defaultConfigRequestID = id
+            submittedDefaultAgentDraft = draft
             transmit(.configureDefaultAgent(
                 requestID: id,
                 expectedRevision: snapshot.revision,
@@ -2499,15 +2514,22 @@ final class AppModel {
             )) { [weak self] message in
                 guard self?.defaultConfigRequestID == id else { return }
                 self?.defaultConfigRequestID = nil
-                self?.applyState = .failed(message)
+                self?.submittedDefaultAgentDraft = nil
+                self?.defaultAgentApplyState = .failed(message)
             }
         }
     }
 
     func reloadAgentDraft() {
         agentDraft = agentSnapshot?.config
-        applyState = .idle
+        chatAgentApplyState = .idle
         showToast("Agent draft reloaded.", tone: .info)
+    }
+
+    func reloadDefaultAgentDraft() {
+        defaultAgentDraft = defaultAgentSnapshot?.config
+        defaultAgentApplyState = .idle
+        showToast("Default agent draft reloaded.", tone: .info)
     }
 
     func selectProvider(_ provider: String) {
@@ -2595,17 +2617,12 @@ final class AppModel {
         }
     }
 
-    func changeProviderForCurrentChat() {
-        registerProvider(for: .session)
-    }
-
     func saveProviderAsDefault() {
-        registerProvider(for: .defaultAgent)
+        registerProvider()
     }
 
-    private func registerProvider(for target: ConfigurationTarget) {
-        if case .session = target, selectedSessionID == nil { return }
-        guard var config = providerDraft,
+    private func registerProvider() {
+        guard var config = defaultAgentDraft?.provider ?? setupProviderDraft,
               let status = providerStatuses.first(where: { $0.provider == config.provider })
         else { return }
         let modelIDs = status.modelIdsConfigurable ? providerModelIDs : status.modelIds
@@ -2617,10 +2634,10 @@ final class AppModel {
             config.model = first
             config.reasoningEffort = reasoningEfforts.first
         }
+        defaultAgentDraft?.provider = config
         let id = requestID("provider")
         providerRegistrationRequestID = id
-        providerRegistrationTarget = target
-        applyState = .applying
+        defaultAgentApplyState = .applying
         transmit(.registerProvider(
             requestID: id,
             config: config,
@@ -2629,8 +2646,7 @@ final class AppModel {
         )) { [weak self] message in
             guard self?.providerRegistrationRequestID == id else { return }
             self?.providerRegistrationRequestID = nil
-            self?.providerRegistrationTarget = nil
-            self?.applyState = .failed(message)
+            self?.defaultAgentApplyState = .failed(message)
         }
     }
 
@@ -3200,45 +3216,51 @@ final class AppModel {
         requestID: String,
         payload: ReadyPayload
     ) {
+        let registeredProviderDraft = requestID == providerRegistrationRequestID
+            ? defaultAgentDraft
+            : nil
+        let editedDefaultDraft = requestID == defaultConfigRequestID
+            ? defaultAgentDraft
+            : nil
         applyGatewayReady(payload)
         if requestID == providerRegistrationRequestID {
-            let target = providerRegistrationTarget
             providerRegistrationRequestID = nil
-            providerRegistrationTarget = nil
-            applyState = .idle
-            if let target { applyAgentConfiguration(to: target) }
+            defaultAgentApplyState = .idle
+            if let registeredProviderDraft { defaultAgentDraft = registeredProviderDraft }
+            applyAgentConfiguration(defaultAgentDraft, to: .defaultAgent)
         } else if requestID == defaultConfigRequestID {
             defaultConfigRequestID = nil
-            applyState = .idle
-            if selectedSessionID != nil,
-               let snapshot = agentSnapshot,
-               let draft = agentDraft,
-               draft == payload.defaultConfig?.config,
-               draft != snapshot.config {
-                applyAgentConfiguration(to: .session)
-            } else {
-                applyState = .applied
-                showToast("Default agent saved for new chats.", tone: .success)
+            if let editedDefaultDraft,
+               let submittedDefaultAgentDraft,
+               editedDefaultDraft != submittedDefaultAgentDraft {
+                defaultAgentDraft = editedDefaultDraft
             }
+            submittedDefaultAgentDraft = nil
+            defaultAgentApplyState = .applied
+            showToast("Default agent saved for new chats.", tone: .success)
         }
     }
 
     func applyGatewayCatalog(_ payload: ReadyPayload) {
         gatewayMachineName = payload.machineName
         let previousDefault = defaultAgentSnapshot
+        let pendingDefaultDraft: AgentComposition? = if defaultConfigRequestID != nil
+            || providerRegistrationRequestID != nil {
+            defaultAgentDraft
+        } else {
+            nil
+        }
         providerStatuses = payload.providers
         modelChoices = payload.models
         modelProviders = payload.modelProviders
         middlewareFeatures = payload.middlewareFeatures
         defaultAgentSnapshot = payload.defaultConfig
-        if agentSnapshot == nil {
-            agentDraft = payload.defaultConfig.map {
-                refreshedAgentDraft(
-                    currentDraft: agentDraft,
-                    currentSnapshot: previousDefault,
-                    incomingSnapshot: $0
-                )
-            }
+        defaultAgentDraft = payload.defaultConfig.map { incomingSnapshot in
+            pendingDefaultDraft ?? refreshedAgentDraft(
+                currentDraft: defaultAgentDraft,
+                currentSnapshot: previousDefault,
+                incomingSnapshot: incomingSnapshot
+            )
         }
         if providerDraft == nil, let provider = providerStatuses.first {
             selectProvider(provider.provider)
@@ -3328,8 +3350,8 @@ final class AppModel {
                 )
             )
         }
-        if applyState == .restarting {
-            applyState = .applied
+        if chatAgentApplyState == .restarting {
+            chatAgentApplyState = .applied
             showToast("Agent configuration applied.", tone: .success)
         }
         persistGeneratedChatTitles()
@@ -3447,7 +3469,7 @@ final class AppModel {
             approvalRequestID = nil
         }
         if requestID == configRequestID {
-            applyState = .restarting
+            chatAgentApplyState = .restarting
             configRequestID = nil
         }
         if requestID == sessionMutationRequestID {
@@ -3533,14 +3555,21 @@ final class AppModel {
         rejectComposerEdit(requestID: rejection.requestId)
         if rejection.requestId == configRequestID
             || rejection.requestId == defaultConfigRequestID {
-            switch rejection.code {
-            case "revision_conflict": applyState = .conflict(rejection.message)
-            case "agent_busy": applyState = .busy(rejection.message)
-            case "invalid_config": applyState = .invalid(rejection.message)
-            default: applyState = .failed(rejection.message)
+            let state: ApplyState = switch rejection.code {
+            case "revision_conflict": .conflict(rejection.message)
+            case "agent_busy": .busy(rejection.message)
+            case "invalid_config": .invalid(rejection.message)
+            default: .failed(rejection.message)
             }
-            if rejection.requestId == configRequestID { configRequestID = nil }
-            if rejection.requestId == defaultConfigRequestID { defaultConfigRequestID = nil }
+            if rejection.requestId == configRequestID {
+                chatAgentApplyState = state
+                configRequestID = nil
+            }
+            if rejection.requestId == defaultConfigRequestID {
+                defaultAgentApplyState = state
+                defaultConfigRequestID = nil
+                submittedDefaultAgentDraft = nil
+            }
         }
         if rejection.requestId == approvalRequestID {
             approvalRequestID = nil
@@ -3583,9 +3612,8 @@ final class AppModel {
             providerLoginRequestID = nil
         }
         if rejection.requestId == providerRegistrationRequestID {
-            applyState = .failed(rejection.message)
+            defaultAgentApplyState = .failed(rejection.message)
             providerRegistrationRequestID = nil
-            providerRegistrationTarget = nil
         }
         if rejection.requestId == pairingCodeRequestID {
             pairingCodeRequestID = nil
@@ -4743,11 +4771,7 @@ final class AppModel {
             } else {
                 url = directory.appending(path: "file").appendingPathExtension(safeExtension)
             }
-            #if os(iOS)
             try data.write(to: url, options: [.atomic, .completeFileProtection])
-            #else
-            try data.write(to: url, options: .atomic)
-            #endif
             return TemporarySessionFile(directory: directory, url: url)
         }.value
     }
@@ -5274,7 +5298,9 @@ final class AppModel {
         sessionToRestoreID = nil
         configRequestID = nil
         defaultConfigRequestID = nil
-        applyState = .idle
+        submittedDefaultAgentDraft = nil
+        chatAgentApplyState = .idle
+        defaultAgentApplyState = .idle
         workspaceError = nil
         isChangingWorkspace = false
         showsWorkspaceBrowser = false
@@ -5310,6 +5336,7 @@ final class AppModel {
             middlewareFeatures = []
             providerStatuses = []
             defaultAgentSnapshot = nil
+            defaultAgentDraft = nil
             setupProviderDraft = nil
         }
         providerAPIKey = ""
@@ -5319,7 +5346,6 @@ final class AppModel {
         credentialRequestID = nil
         providerLoginRequestID = nil
         providerRegistrationRequestID = nil
-        providerRegistrationTarget = nil
         pairingCodeRequestID = nil
         pairingCodeExpiryTask?.cancel()
         pairingCodeExpiryTask = nil
@@ -5357,8 +5383,8 @@ final class AppModel {
         selectedModelRoute = ""
         contributions = []
         agentSnapshot = nil
-        agentDraft = defaultAgentSnapshot?.config
-        applyState = .idle
+        agentDraft = nil
+        chatAgentApplyState = .idle
         configRequestID = nil
         cronTasks = []
         cronRuns = []

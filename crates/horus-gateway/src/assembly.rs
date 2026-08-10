@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use horus::Error as HorusError;
@@ -30,7 +30,7 @@ use horus::middleware::subagents::{SubagentLaunch, SubagentLauncher, Subagents};
 use horus::middleware::tasks::Tasks;
 use horus::middleware::tools::Tools;
 use horus::middleware::{Middleware, MiddlewareStack};
-use horus::protocol::SessionContext;
+use horus::protocol::{SessionContext, TokenUsage};
 
 use crate::config::{
     ChatSpec, ConfigStore, ConfiguredProvider, CredentialStore, DEFAULT_CONTEXT_WINDOW,
@@ -60,7 +60,7 @@ pub(crate) struct BuiltAgent {
     reason = "the headless composition root keeps its runtime dependencies explicit"
 )]
 pub(crate) async fn assemble(
-    gateway: &GatewayConfig,
+    gateway: Arc<Mutex<GatewayConfig>>,
     chat: &ChatSpec,
     store: &ConfigStore,
     credentials: Arc<CredentialStore>,
@@ -72,16 +72,29 @@ pub(crate) async fn assemble(
     origin_label: &str,
     override_saved_model_route: bool,
 ) -> Result<BuiltAgent> {
+    let gateway_config = gateway
+        .lock()
+        .map_err(|_| Error::Config("gateway configuration lock is poisoned".into()))?
+        .clone();
+    let model_providers = configured_model_providers(&gateway_config, store, &credentials)?;
     let (models, context_window) =
         if credential_is_configured(&chat.agent.config.provider, store, &credentials)? {
-            build_models(gateway, &chat.agent.config.provider, store, &credentials)?
+            build_models(
+                &gateway_config,
+                &chat.agent.config.provider,
+                store,
+                &credentials,
+            )?
         } else {
-            unavailable_models(gateway, &chat.agent.config.provider)?
+            unavailable_models(&gateway_config, &chat.agent.config.provider)?
         };
     let gateway_sandbox = Arc::new(GatewaySandbox::new(
         &chat.workspace,
         store.state_dir(),
-        gateway.tls.as_ref().map(|tls| tls.private_key.as_path()),
+        gateway_config
+            .tls
+            .as_ref()
+            .map(|tls| tls.private_key.as_path()),
         COMMAND_TIMEOUT,
     )?);
     let backend: Arc<dyn SandboxBackend> = gateway_sandbox.clone();
@@ -129,6 +142,7 @@ pub(crate) async fn assemble(
     };
     metadata.extend(chat.metadata()?);
     let workspace = chat.workspace_info();
+    let usage_store = store.clone();
     let max_model_steps = usize::try_from(chat.agent.config.max_model_steps).map_err(|_| {
         Error::Config("maximum model steps exceed this platform's supported range".into())
     })?;
@@ -143,6 +157,9 @@ pub(crate) async fn assemble(
     .initial_replay_batches(INITIAL_REPLAY_BATCHES)
     .max_model_steps(max_model_steps)
     .metadata(metadata)
+    .usage_observer(move |route, usage| {
+        persist_usage(&gateway, &usage_store, &model_providers, route, usage)
+    })
     .session_context(SessionContext {
         user_name: local_user_name(),
         workspace_id: Some(workspace.id),
@@ -169,6 +186,32 @@ pub(crate) async fn assemble(
         gateway_sandbox,
         subagent_template: template,
     })
+}
+
+fn persist_usage(
+    gateway: &Mutex<GatewayConfig>,
+    store: &ConfigStore,
+    model_providers: &BTreeMap<String, String>,
+    route: &str,
+    usage: &TokenUsage,
+) -> horus::Result<()> {
+    let provider = model_providers.get(route).ok_or_else(|| {
+        HorusError::Config("model route is not in the configured gateway usage catalog".into())
+    })?;
+    let mut gateway = gateway
+        .lock()
+        .map_err(|_| HorusError::Config("gateway configuration lock is poisoned".into()))?;
+    let mut next = gateway.clone();
+    if next
+        .observe_usage(provider, usage)
+        .map_err(|error| HorusError::Config(error.to_string()))?
+    {
+        store
+            .save(&next)
+            .map_err(|error| HorusError::Config(error.to_string()))?;
+        *gateway = next;
+    }
+    Ok(())
 }
 
 pub(crate) fn provider_statuses(
@@ -871,6 +914,34 @@ mod tests {
     }
 
     #[test]
+    fn usage_sink_attributes_a_model_route_to_its_provider() {
+        let root = tempfile::tempdir().expect("root");
+        let state = root.path().join("state");
+        let (store, config) = ConfigStore::initialize(
+            state.clone(),
+            "127.0.0.1:8741".parse().expect("listen address"),
+            None,
+        )
+        .expect("config");
+        let gateway = Mutex::new(config);
+        let model_providers = BTreeMap::from([("primary".into(), "openai_socket".into())]);
+        let usage = TokenUsage {
+            input_tokens: 11,
+            total_tokens: 11,
+            ..TokenUsage::default()
+        };
+
+        persist_usage(&gateway, &store, &model_providers, "primary", &usage)
+            .expect("persist usage");
+
+        let (_, restored) = ConfigStore::open(state).expect("reopen config");
+        let daily_usage = restored.profile().daily_usage;
+        assert_eq!(daily_usage.len(), 1);
+        assert_eq!(daily_usage[0].provider, "openai_socket");
+        assert_eq!(daily_usage[0].usage, usage);
+    }
+
+    #[test]
     fn custom_selection_without_reasoning_uses_the_first_configured_effort() {
         let root = tempfile::tempdir().expect("root");
         let (store, config) = ConfigStore::initialize(
@@ -1014,9 +1085,10 @@ mod tests {
         let updated = original
             .replacing_agent(1, composition, &gateway, store.state_dir(), None)
             .expect("updated chat spec");
+        let gateway = Arc::new(Mutex::new(gateway));
 
         let built = assemble(
-            &gateway,
+            gateway,
             &updated,
             &store,
             credentials,

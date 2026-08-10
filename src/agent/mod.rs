@@ -33,6 +33,7 @@ use crate::protocol::SessionConfiguredEvent;
 use crate::protocol::SessionContext;
 use crate::protocol::SessionResumeRequestedEvent;
 use crate::protocol::Submission;
+use crate::protocol::TokenUsage;
 use crate::protocol::WarningEvent;
 
 mod input;
@@ -49,6 +50,8 @@ const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
 const MAX_OPERATION_BYTES: usize = 256;
 const MAX_ATTACHMENT_REFERENCES: usize = 16;
 const DEFAULT_INITIAL_REPLAY_BATCHES: usize = 100;
+
+type UsageObserver = Arc<dyn Fn(&str, &TokenUsage) -> Result<()> + Send + Sync>;
 
 /// Default maximum number of primary model steps in one turn.
 pub const DEFAULT_MAX_MODEL_STEPS: usize = 256;
@@ -67,6 +70,7 @@ pub struct AgentConfig {
     default_context_window: i64,
     session_context: SessionContext,
     metadata: BTreeMap<String, Value>,
+    usage_observer: Option<UsageObserver>,
     metadata_configured: bool,
     model_route_configured: bool,
     initial_replay_batches: usize,
@@ -96,6 +100,7 @@ impl AgentConfig {
             default_context_window: 272_000,
             session_context: SessionContext::default(),
             metadata: BTreeMap::new(),
+            usage_observer: None,
             metadata_configured: false,
             model_route_configured: false,
             initial_replay_batches: DEFAULT_INITIAL_REPLAY_BATCHES,
@@ -147,6 +152,19 @@ impl AgentConfig {
     pub fn metadata(mut self, metadata: BTreeMap<String, Value>) -> Self {
         self.metadata = metadata;
         self.metadata_configured = true;
+        self
+    }
+
+    /// Observes normalized token-usage increments with their selected model route.
+    ///
+    /// Returning an error aborts the active turn before the increment is committed
+    /// to the session checkpoint.
+    #[must_use]
+    pub fn usage_observer(
+        mut self,
+        observer: impl Fn(&str, &TokenUsage) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.usage_observer = Some(Arc::new(observer));
         self
     }
 
@@ -624,7 +642,7 @@ impl Runner {
         Ok(())
     }
 
-    fn record_usage(&mut self, usage: &crate::protocol::TokenUsage) -> Result<()> {
+    fn record_usage(&mut self, route: &str, usage: &TokenUsage) -> Result<()> {
         let mut total_usage = self.state.total_usage.clone();
         total_usage.checked_add(usage).ok_or_else(|| {
             Error::Provider("provider token usage exceeds the supported range".into())
@@ -636,6 +654,9 @@ impl Runner {
         execution_usage.checked_add(usage).ok_or_else(|| {
             Error::Provider("provider token usage exceeds the supported range".into())
         })?;
+        if let Some(observer) = &self.config.usage_observer {
+            observer(route, usage)?;
+        }
         self.state.total_usage = total_usage;
         active.usage = execution_usage;
         Ok(())

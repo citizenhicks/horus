@@ -1,9 +1,7 @@
 import Foundation
-#if os(iOS)
 import UIKit
-#endif
 
-let gatewayProtocolVersion = 22
+let gatewayProtocolVersion = 23
 let maximumGatewayFrameBytes = 20 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 let maximumSessionFileReferences = 16
@@ -140,11 +138,7 @@ struct GatewayEndpoint: Hashable, Codable, Sendable {
 
     var displayName: String {
         if Self.isLoopback(host) {
-            #if os(macOS)
-            return "This Mac · \(port)"
-            #else
             return "This device · \(port)"
-            #endif
         }
         let quickSuffix = ".trycloudflare.com"
         if host.hasSuffix(quickSuffix) {
@@ -2095,13 +2089,7 @@ enum GatewayClientKind: String, Codable, Sendable {
     case gatewayDashboard = "gateway_dashboard"
 
     @MainActor static var currentApplePlatform: Self {
-        #if os(macOS)
-        .macos
-        #elseif os(iOS)
         UIDevice.current.userInterfaceIdiom == .pad ? .ipados : .ios
-        #else
-        #error("Unsupported Horus Apple platform")
-        #endif
     }
 }
 
@@ -2197,6 +2185,7 @@ struct RunSummary: Identifiable, Codable, Equatable, Sendable {
 
 struct DailyUsage: Codable, Equatable, Sendable {
     let unixDay: UInt64
+    let provider: String
     let usage: TokenUsage
 }
 

@@ -1,20 +1,16 @@
-# Horus for Apple platforms
+# Horus for iPhone and iPad
 
-One SwiftUI client target builds for macOS 26+ and iOS/iPadOS 26+. Both platforms use the same `AppModel`, `GatewayClient`, pairing flow, and versioned Horus gateway protocol.
+One SwiftUI client target builds for iOS and iPadOS 26+. Both device families use the same `AppModel`, `GatewayClient`, pairing flow, and versioned Horus gateway protocol.
 
-Open `HorusApp.xcodeproj` and run the shared `HorusApp` scheme on a Mac, iPhone, or iPad destination. Command-line builds use:
+Open `HorusApp.xcodeproj` and run the shared `HorusApp` scheme on an iPhone or iPad destination. Command-line builds use:
 
 ```sh
-xcodebuild -project HorusApp.xcodeproj -scheme HorusApp \
-  -destination 'generic/platform=macOS' CODE_SIGNING_ALLOWED=NO build
-
 xcodebuild -project HorusApp.xcodeproj -scheme HorusApp \
   -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 ```
 
-On macOS, pair with the advertised loopback endpoint for a gateway on that Mac.
-For an iPhone, iPad, or a Mac connecting to another host, select **Quick Connect**
-during first-time setup, or request a fresh code from an initialized gateway:
+On an iPhone or iPad, select **Quick Connect** during first-time setup, or request
+a fresh code from an initialized gateway:
 
 ```sh
 horus-gateway init
@@ -22,12 +18,21 @@ horus-gateway init
 horus-gateway connect
 ```
 
-Choose **Add gateway** and paste the displayed setup code, or scan its QR with
+Choose **Pair self-hosted gateway** and paste the displayed setup code, or scan its QR with
 the iPhone/iPad Camera. The QR opens Horus with the public `wss://` address and
 one-time code prefilled; pairing still requires confirmation. The same one-use
 code works through the advertised local `tcp://` endpoint. Plaintext remote
 endpoints are rejected; a direct TLS listener remains available as an advanced
 option in the gateway guide.
+
+## Horus Cloud beta placeholder
+
+The cloud offer requests `app.horus.client.cloud.monthly` from StoreKit and
+renders its storefront-localized `displayPrice`. Configure that product in App
+Store Connect as a one-month auto-renewable subscription with a seven-day free
+introductory offer before distributing through TestFlight. The current Apple
+signup button is intentionally a UI boundary: it does not authenticate,
+purchase, or grant an entitlement yet.
 
 The one-time code is only the first pairing credential. A successful pairing
 returns a per-pairing bearer token, which this app stores in device-only Keychain
