@@ -103,6 +103,7 @@ struct HorusGlyph: Hashable {
     static let question = Self("hi.question")
     static let robot = Self("hi.robot")
     static let rust = Self("hi.rust")
+    static let saveAll = Self("hi.saveAll")
     static let sealCheck = Self("hi.sealCheck")
     static let shield02 = Self("hi.shield02")
     static let shieldAlert = Self("hi.shieldAlert")

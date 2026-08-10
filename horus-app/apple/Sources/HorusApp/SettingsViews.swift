@@ -5,69 +5,200 @@ enum AgentSettingsScope: Equatable {
     case currentChat
 }
 
+/// Model and reasoning as two rows, in the composer's glyph-led menu style.
+///
+/// The gateway advertises one route per model-and-effort pair, so one combined list
+/// multiplies every model by every effort and buries the choice that matters. Split, each
+/// list stays short and the effort reads as its own decision. The reasoning row appears only
+/// when the chosen model actually offers more than one.
+struct ModelRoutePicker: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+    let label: String
+    let detail: String
+    let choices: [ModelChoice]
+    var unsetLabel: String?
+    var isEnabled = true
+    @Binding var route: String?
+
+    var body: some View {
+        LabeledContent {
+            Menu {
+                Picker(label, selection: modelSelection) {
+                    if let unsetLabel {
+                        Text(unsetLabel).tag(String?.none)
+                    }
+                    ForEach(distinctModels, id: \.route) { choice in
+                        optionLabel(
+                            model.modelLabel(for: choice),
+                            symbol: model.providerSymbol(for: choice)
+                        )
+                        .tag(Optional(choice.route))
+                    }
+                }
+                .labelsHidden()
+            } label: {
+                menuLabel(selectedModelLabel, glyph: selectedGlyph)
+            }
+            .menuIndicator(.hidden)
+            .buttonStyle(.horusPlain)
+            .disabled(!isEnabled)
+            .accessibilityLabel(label)
+            .accessibilityValue(selectedModelLabel)
+        } label: {
+            HStack(spacing: 5) {
+                Text(label)
+                SettingsInfoButton(title: label, detail: detail)
+            }
+        }
+        .sensoryFeedback(.selection, trigger: route)
+
+        if reasoningChoices.count > 1 {
+            LabeledContent("Reasoning") {
+                Menu {
+                    Picker("Reasoning", selection: reasoningSelection) {
+                        ForEach(reasoningChoices, id: \.route) { choice in
+                            Text(effortLabel(choice)).tag(choice.route)
+                        }
+                    }
+                    .labelsHidden()
+                } label: {
+                    menuLabel(selected.map(effortLabel) ?? "Default", glyph: nil)
+                }
+                .menuIndicator(.hidden)
+                .buttonStyle(.horusPlain)
+                .disabled(!isEnabled)
+                .accessibilityLabel("Reasoning")
+                .accessibilityValue(selected.map(effortLabel) ?? "Default")
+            }
+        }
+    }
+
+    private func menuLabel(_ text: String, glyph: HorusGlyph?) -> some View {
+        HStack(spacing: 5) {
+            if let glyph { HorusIcon(glyph, size: 14) }
+            Text(text)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            HorusIcon(.caretUpDown, size: 12)
+                .accessibilityHidden(true)
+        }
+        .foregroundStyle(palette.accent)
+    }
+
+    @ViewBuilder
+    private func optionLabel(_ title: String, symbol: String?) -> some View {
+        if let symbol, let glyph = HorusSymbol.knownGlyph(for: symbol) {
+            HorusLabel(title: title, glyph: glyph)
+        } else {
+            Text(title)
+        }
+    }
+
+    private var selected: ModelChoice? {
+        choices.first { $0.route == route }
+    }
+
+    private var selectedModelLabel: String {
+        guard let selected else { return unsetLabel ?? "Select" }
+        return model.modelLabel(for: selected)
+    }
+
+    private var selectedGlyph: HorusGlyph? {
+        selected
+            .flatMap { model.providerSymbol(for: $0) }
+            .flatMap { HorusSymbol.knownGlyph(for: $0) }
+    }
+
+    private func effortLabel(_ choice: ModelChoice) -> String {
+        choice.reasoningEffort?.capitalized ?? "Default"
+    }
+
+    private var distinctModels: [ModelChoice] {
+        var seen = Set<String>()
+        return choices.filter { seen.insert("\($0.group)\u{0}\($0.model)").inserted }
+    }
+
+    private var reasoningChoices: [ModelChoice] {
+        guard let selected else { return [] }
+        return choices.filter { $0.group == selected.group && $0.model == selected.model }
+    }
+
+    /// Switching model keeps the effort when the new model offers the same one, so changing
+    /// model does not silently reset reasoning to the provider default.
+    private var modelSelection: Binding<String?> {
+        Binding {
+            guard let selected else { return nil }
+            return distinctModels.first {
+                $0.group == selected.group && $0.model == selected.model
+            }?.route ?? selected.route
+        } set: { newRoute in
+            guard let newRoute, let choice = choices.first(where: { $0.route == newRoute }) else {
+                route = nil
+                return
+            }
+            let effort = selected?.reasoningEffort
+            route = choices.first {
+                $0.group == choice.group
+                    && $0.model == choice.model
+                    && $0.reasoningEffort == effort
+            }?.route ?? choice.route
+        }
+    }
+
+    private var reasoningSelection: Binding<String> {
+        Binding { route ?? "" } set: { route = $0 }
+    }
+}
+
 struct AgentSettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.horusPalette) private var palette
     @State private var showsAgentStatus = false
+    @Namespace private var agentAccessoryNamespace
     let scope: AgentSettingsScope
 
     var body: some View {
         PageScaffold(
             title: pageTitle,
             detail: pageDetail,
-            headerAccessory: { agentStatusButton }
+            headerAccessory: { agentStatusAccessory }
         ) {
             if draft != nil {
                 Section("System prompt") {
+                    // The same glass card the composer uses: this is the one field on the
+                    // page you write prose into, and it should feel like the other one.
                     TextField("System prompt", text: systemPrompt, axis: .vertical)
                         .font(HorusStyle.bodyFont)
-                        .lineLimit(2...)
+                        .lineLimit(3...)
                         .textFieldStyle(.plain)
                         .labelsHidden()
                         .accessibilityLabel("System prompt")
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+                        .horusGlass(in: HorusStyle.cardShape, interactive: true)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
                 }
 
                 Section(modelSectionTitle) {
-                    LabeledContent {
-                        Menu {
-                            ForEach(model.modelChoices) { choice in
-                                Button {
-                                    selectModel(choice.route)
-                                } label: {
-                                    let title = modelChoiceLabel(choice)
-                                    if choice.route == selectedModelRoute {
-                                        HorusLabel(
-                                            title: title,
-                                            glyph: .check
-                                        )
-                                    } else {
-                                        Text(title)
-                                    }
-                                }
-                            }
-                        } label: {
-                            HStack(spacing: 5) {
-                                Text(defaultModelLabel)
-                                HorusIcon(.caretUpDown, size: 12)
-                            }
-                            .foregroundStyle(palette.accent)
-                        }
-                        .menuIndicator(.hidden)
-                        .buttonStyle(.horusPlain)
-                        .disabled(model.modelChoices.isEmpty)
-                    } label: {
-                        HStack(spacing: 5) {
-                            Text("Model")
-                            SettingsInfoButton(
-                                title: modelSectionTitle,
-                                detail: modelSectionDetail
-                            )
-                        }
-                    }
+                    ModelRoutePicker(
+                        label: "Model",
+                        detail: modelSectionDetail,
+                        choices: model.modelChoices,
+                        isEnabled: !model.modelChoices.isEmpty,
+                        route: Binding(
+                            get: { selectedModelRoute },
+                            set: { if let route = $0 { selectModel(route) } }
+                        )
+                    )
 
                     HStack(spacing: 5) {
-                        Stepper(value: maxModelSteps, in: 1...42_000) {
+                        // Hundreds: this ceiling is set in the thousands, and stepping by one
+                        // makes the control useless for reaching any value someone wants.
+                        Stepper(value: maxModelSteps, in: 1...42_000, step: 100) {
                             Text("Maximum model steps: \(maxModelSteps.wrappedValue.formatted())")
                         }
                         SettingsInfoButton(
@@ -88,9 +219,6 @@ struct AgentSettingsView: View {
                     }
                 }
                 .toggleStyle(.switch)
-
-                HorusActionRow { agentConfigurationActions }
-                    .settingsStandaloneRow()
             } else {
                 HorusUnavailable(
                     title: unavailableTitle,
@@ -99,6 +227,40 @@ struct AgentSettingsView: View {
                 )
             }
         }
+    }
+
+    /// The status dot, with the save control splitting out of it once the draft diverges.
+    ///
+    /// A shared `glassEffectID` namespace is what makes the second glass shape grow out of
+    /// the first rather than fade in beside it, so the toolbar reads as one control that
+    /// gained an action — and it is the only save affordance on the page, which is why it
+    /// stays visible while the form scrolls.
+    private var agentStatusAccessory: some View {
+        // The container's spacing is a merge threshold, not a gap: at 6 it matched the stack
+        // spacing, so the two circles fused into one capsule with an outline drawn round the
+        // pair. Zero keeps them separate shapes that still morph from the shared namespace.
+        GlassEffectContainer(spacing: 0) {
+            // Save sits before the dot: this accessory is pinned to the trailing edge, so
+            // growing rightwards would shove the dot inward and the status would appear to
+            // move. Leading-side growth leaves the dot where the reader last saw it.
+            HStack(spacing: 8) {
+                if hasChanges {
+                    agentSaveButton
+                        .glassEffect(
+                            .regular.tint(palette.accentFill).interactive(),
+                            in: .circle
+                        )
+                        .glassEffectID("agent-save", in: agentAccessoryNamespace)
+                }
+                agentStatusButton
+                    .glassEffect(.regular.interactive(), in: .circle)
+                    .glassEffectID("agent-status", in: agentAccessoryNamespace)
+            }
+        }
+        .animation(
+            reduceMotion ? nil : .spring(response: 0.34, dampingFraction: 0.78),
+            value: hasChanges
+        )
     }
 
     private var agentStatusButton: some View {
@@ -114,7 +276,7 @@ struct AgentSettingsView: View {
                     isActive: !reduceMotion
                 )
                 .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
-                .contentShape(Rectangle())
+                .contentShape(Circle())
         }
         .buttonStyle(.horusPlain)
         .accessibilityLabel("Agent status")
@@ -122,6 +284,39 @@ struct AgentSettingsView: View {
         .help("Agent: \(agentStatusLabel)")
         .popover(isPresented: $showsAgentStatus) {
             agentStatusDetails
+        }
+    }
+
+    private var agentSaveButton: some View {
+        Button(action: applyConfiguration) {
+            Group {
+                if model.isApplyingConfiguration {
+                    HorusSpinner(size: 17, foreground: palette.onAccent)
+                } else {
+                    HorusIcon(.saveAll, size: 17, foreground: palette.onAccent)
+                }
+            }
+            .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+            .contentShape(Circle())
+        }
+        .buttonStyle(.horusPlain)
+        .disabled(model.isApplyingConfiguration)
+        .accessibilityLabel(applyTitle)
+        .help(applyTitle)
+        .sensoryFeedback(.success, trigger: hasChanges) { was, now in was && !now }
+    }
+
+    private var applyTitle: String {
+        switch scope {
+        case .currentChat: "Apply to this chat"
+        case .gatewayDefault: "Save as gateway default"
+        }
+    }
+
+    private func applyConfiguration() {
+        switch scope {
+        case .currentChat: model.changeAgentForCurrentChat()
+        case .gatewayDefault: model.saveAgentAsDefault()
         }
     }
 
@@ -230,6 +425,22 @@ struct AgentSettingsView: View {
                 SettingsInfoButton(title: setting.label, detail: setting.description)
             }
             .sensoryFeedback(.selection, trigger: value.wrappedValue)
+        case .select(let options, let unsetLabel)
+            where options.allSatisfy({ option in
+                model.modelChoices.contains { $0.route == option.value }
+            }) && !options.isEmpty:
+            // The gateway advertises reviewer and subagent models as plain selects over
+            // routes. They are model choices like any other, so they get the same split.
+            ModelRoutePicker(
+                label: setting.label,
+                detail: setting.description,
+                choices: options.compactMap { option in
+                    model.modelChoices.first { $0.route == option.value }
+                },
+                unsetLabel: unsetLabel,
+                isEnabled: middlewareEnabled(feature),
+                route: selectSetting(feature, setting)
+            )
         case .select(let options, let unsetLabel):
             let selection = selectSetting(feature, setting)
             let selectedDescription = selection.wrappedValue.flatMap { selected in
@@ -370,28 +581,6 @@ struct AgentSettingsView: View {
                 }
             }
         )
-    }
-
-    @ViewBuilder
-    private var agentConfigurationActions: some View {
-        Group {
-            switch scope {
-            case .currentChat:
-                Button(
-                    "Apply to this chat",
-                    glyph: .chatDots,
-                    action: model.changeAgentForCurrentChat
-                )
-            case .gatewayDefault:
-                Button(
-                    "Save as gateway default",
-                    glyph: .floppyDisk,
-                    action: model.saveAgentAsDefault
-                )
-            }
-        }
-        .horusProminentButton()
-        .disabled(!hasChanges || model.isApplyingConfiguration)
     }
 
     private var draft: AgentComposition? {
@@ -1140,7 +1329,11 @@ struct PageScaffold<HeaderAccessory: View, Content: View>: View {
         .navigationTitle(title)
         .toolbarTitleDisplayMode(.inline)
         .toolbar {
+            // iOS 26 wraps a toolbar item in its own glass capsule. These accessories bring
+            // their own treatment — the agent pages a pair of glass circles, the rest a bare
+            // glyph — and the system's capsule drew a second background around both.
             ToolbarItem(placement: .topBarTrailing) { headerAccessory }
+                .sharedBackgroundVisibility(.hidden)
         }
         .background(HorusBackdrop())
     }
