@@ -636,6 +636,15 @@ final class AppModel {
             ? Array(source.suffix(visibleTranscriptLimit))
             : source
     }
+    /// The one visible activity label that represents the live turn's current step.
+    /// `pending` is a block lifecycle flag and can remain true after a later step begins.
+    var activeTranscriptStepID: String? {
+        guard activeTurnID != nil, let entry = displayedTranscript.last else { return nil }
+        return switch entry.kind {
+        case .reasoning, .event, .error: entry.id
+        case .user, .assistant, .commentary: nil
+        }
+    }
     var isLoadingTranscript: Bool {
         guard connectionState == .loading,
               sessionRequestID != nil || replayRequestID != nil

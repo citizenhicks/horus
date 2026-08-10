@@ -279,12 +279,19 @@ private struct TranscriptView: View {
                     }
                     .padding(.bottom, rowSpacing)
                 }
+                let activeStepID = model.activeTranscriptStepID
                 ForEach(rows) { row in
                     Group {
                         if row.isEventGroup {
-                            EventGroupView(entries: row.entries)
+                            EventGroupView(
+                                entries: row.entries,
+                                isActive: row.entries.contains { $0.id == activeStepID }
+                            )
                         } else if let entry = row.entries.first {
-                            TranscriptRow(entry: entry)
+                            TranscriptRow(
+                                entry: entry,
+                                isActive: entry.id == activeStepID
+                            )
                         }
                     }
                     .id(row.id)
@@ -431,6 +438,7 @@ private struct TranscriptRow: View {
     @Environment(\.horusPalette) private var palette
     @State private var isHovered = false
     let entry: TranscriptEntry
+    let isActive: Bool
 
     var body: some View {
         Group {
@@ -472,12 +480,12 @@ private struct TranscriptRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         case .reasoning:
-            ReasoningLine(entry: entry)
+            ReasoningLine(entry: entry, isActive: isActive)
         case .event, .error:
             VStack(alignment: .leading, spacing: 6) {
                 TranscriptFileCards(files: entry.files)
                 if !entry.text.isEmpty {
-                    EventLine(entry: entry)
+                    EventLine(entry: entry, isActive: isActive)
                 }
             }
         }
@@ -761,6 +769,7 @@ private struct EventGroupView: View {
     @Environment(\.horusPalette) private var palette
     @State private var isExpanded = false
     let entries: [TranscriptEntry]
+    let isActive: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -777,7 +786,7 @@ private struct EventGroupView: View {
                 .accessibilityHint(isExpanded ? "Collapses the steps" : "Expands the steps")
                 if isExpanded {
                     VStack(alignment: .leading, spacing: 2) {
-                        ForEach(lines) { EventLine(entry: $0) }
+                        ForEach(lines) { EventLine(entry: $0, isActive: false) }
                     }
                 }
             }
@@ -795,9 +804,8 @@ private struct EventGroupView: View {
                 .font(HorusStyle.metadataFont)
                 .foregroundStyle(palette.muted)
                 .lineLimit(1)
-                // Collapsed, the header is all the reader sees of a run in progress, so the
-                // shimmer rides the summary rather than the whole row.
-                .horusRunningShimmer(active: isPending)
+                // The group is one transcript step, so its summary owns the running mark.
+                .horusRunningShimmer(active: isActive)
             Spacer(minLength: 8)
             HorusIcon(.caretUpDown, size: 13, foreground: palette.muted)
         }
@@ -814,10 +822,6 @@ private struct EventGroupView: View {
         var seen = Set<String>()
         return entries.flatMap(\.files).filter { seen.insert($0.id).inserted }
     }
-
-    private var isPending: Bool {
-        entries.contains(where: \.pending)
-    }
 }
 
 /// Reasoning is its own disclosure: the first row is the summary and expands in place.
@@ -827,6 +831,7 @@ private struct ReasoningLine: View {
     @Environment(\.horusPalette) private var palette
     @State private var isExpanded = false
     let entry: TranscriptEntry
+    let isActive: Bool
 
     var body: some View {
         Button {
@@ -848,8 +853,9 @@ private struct ReasoningLine: View {
                     .truncationMode(.tail)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .allowsHitTesting(false)
-                    // Reasoning streams in, so the same running mark applies while it does.
-                    .horusRunningShimmer(active: entry.pending && !isExpanded)
+                    // The transcript owns which phase is current; an older reasoning stream
+                    // can remain pending while a later tool call is already running.
+                    .horusRunningShimmer(active: isActive && !isExpanded)
             }
             .frame(minHeight: 26)
             .contentShape(Rectangle())
@@ -883,6 +889,7 @@ private struct EventLine: View {
     @Environment(\.horusPalette) private var palette
     @State private var isExpanded = false
     let entry: TranscriptEntry
+    let isActive: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -930,8 +937,7 @@ private struct EventLine: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            // A step reads as running while it runs, not only once it has landed.
-            .horusRunningShimmer(active: entry.pending)
+            .horusRunningShimmer(active: isActive)
             Spacer(minLength: 6)
             // No spinner: the shimmer already says this step is running, and two marks for
             // one fact left the trailing slot flickering between them as steps completed.

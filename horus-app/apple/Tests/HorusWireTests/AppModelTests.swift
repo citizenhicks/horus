@@ -677,6 +677,51 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(model.transcript.first).pending)
     }
 
+    func testOnlyLatestActivityStepIsActiveDuringTurn() throws {
+        let model = try model()
+        model.activeTurnID = "turn-1"
+        model.transcript = [
+            TranscriptEntry(
+                id: "reasoning-1",
+                text: "Considering the request",
+                kind: .reasoning,
+                format: "plain_text",
+                pending: true
+            ),
+            TranscriptEntry(
+                id: "tools/turn-1/call-1",
+                text: "Read the file",
+                kind: .event,
+                group: "tools/turn-1",
+                format: "plain_text",
+                pending: false
+            ),
+            TranscriptEntry(
+                id: "tools/turn-1/call-2",
+                text: "Run the tests",
+                kind: .event,
+                group: "tools/turn-1",
+                format: "plain_text",
+                pending: false
+            ),
+        ]
+
+        XCTAssertEqual(model.activeTranscriptStepID, "tools/turn-1/call-2")
+
+        model.transcript.append(TranscriptEntry(
+            id: "answer-1",
+            text: "Here is the answer",
+            kind: .assistant,
+            format: "plain_text",
+            pending: true
+        ))
+        XCTAssertNil(model.activeTranscriptStepID)
+
+        model.transcript.removeLast()
+        model.activeTurnID = nil
+        XCTAssertNil(model.activeTranscriptStepID)
+    }
+
     func testAppLockAuthenticatesBeforePersistingAndRelocks() async throws {
         let suiteName = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
