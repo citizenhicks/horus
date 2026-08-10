@@ -214,6 +214,21 @@ enum FilesInspectorTab: String, CaseIterable, Identifiable {
     var id: Self { self }
 }
 
+extension SessionRecord {
+    static let untitledDisplayTitle = "new conversation"
+
+    var explicitTitle: String? {
+        guard let title = title?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.isEmpty
+        else { return nil }
+        return title
+    }
+
+    var displayTitle: String {
+        explicitTitle ?? Self.untitledDisplayTitle
+    }
+}
+
 extension HorusChatSnapshot {
     /// The chats the island surfaces, most pressing first: an approval blocks its run, a
     /// running chat is live, and a finished chat nobody has read is the quietest of the
@@ -221,6 +236,7 @@ extension HorusChatSnapshot {
     static func live(
         sessions: [SessionRecord],
         unread: Set<String>,
+        titleOverrides: [String: String] = [:],
         limit: Int = 3
     ) -> [HorusChatSnapshot] {
         sessions
@@ -240,9 +256,7 @@ extension HorusChatSnapshot {
                 }
                 return (rank, session.updatedAt, HorusChatSnapshot(
                     id: bounded(session.sessionId, utf8Limit: 96),
-                    title: shortTitle(
-                        session.title ?? session.firstUserMessage ?? "New chat"
-                    ),
+                    title: shortTitle(titleOverrides[session.sessionId] ?? session.displayTitle),
                     workspace: shortWorkspace(session.sessionContext.workspaceLabel),
                     tokens: session.executionStats.usage.totalTokens,
                     startedAt: session.activity.startedAt.map {
@@ -641,13 +655,14 @@ struct FrontendPickerPrompt: Sendable {
 private struct ChatTitleAttempt: Hashable {
     let accountID: UUID
     let sessionID: String
+    let submissionID: String
     let prompt: String
 }
 
-private struct PendingChatTitleRename {
+private struct PendingChatTitle {
     let attempt: ChatTitleAttempt
-    let requestID: String
-    let title: String
+    var generatedTitle: String?
+    var renameRequestID: String?
 }
 
 @MainActor
@@ -665,14 +680,10 @@ final class AppModel {
     }
     var sessions: [SessionRecord] = []
     var gatewayMachineName = ""
-    /// The chat the on-device model just renamed, for as long as its shimmer runs.
-    var retitledSessionID: String?
     @ObservationIgnored private let titleWriter: ChatTitleWriter
-    @ObservationIgnored private var chatTitleTask: Task<Void, Never>?
-    @ObservationIgnored private var retitleAnimationTask: Task<Void, Never>?
-    @ObservationIgnored private var pendingChatTitleSessionID: String?
-    @ObservationIgnored private var attemptedChatTitle: ChatTitleAttempt?
-    @ObservationIgnored private var pendingChatTitleRename: PendingChatTitleRename?
+    @ObservationIgnored private var chatTitleTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var titleEligibleSessionIDs: Set<String> = []
+    private var pendingChatTitles: [String: PendingChatTitle] = [:]
     #if os(iOS)
     @ObservationIgnored private let liveActivity = LiveActivityController()
     #endif
@@ -688,7 +699,12 @@ final class AppModel {
             : source
     }
     var isLoadingTranscript: Bool {
-        connectionState == .loading && (sessionRequestID != nil || replayRequestID != nil)
+        guard connectionState == .loading,
+              sessionRequestID != nil || replayRequestID != nil
+        else { return false }
+
+        let opensAnotherSession = sessionOpeningID.map { $0 != selectedSessionID } ?? false
+        return opensAnotherSession || (replayPresentedTranscript ?? transcript).isEmpty
     }
     private(set) var isLoadingEarlierHistory = false
     var hasEarlierHistory: Bool {
@@ -930,8 +946,7 @@ final class AppModel {
         composerDraftSaveTask?.cancel()
         pairingCodeExpiryTask?.cancel()
         toastDismissTask?.cancel()
-        chatTitleTask?.cancel()
-        retitleAnimationTask?.cancel()
+        chatTitleTasks.values.forEach { $0.cancel() }
     }
 
     var selectedAccount: GatewayAccount? {
@@ -952,6 +967,10 @@ final class AppModel {
     }
 
     var canCreateSession: Bool { canOpenSession }
+
+    var canRenameSession: Bool {
+        connectionState.isReady && sessionMutationRequestID == nil
+    }
 
     var canModifySelectedSession: Bool {
         canOpenSession && activeTurnID == nil && pendingApproval == nil
@@ -1112,111 +1131,154 @@ final class AppModel {
         }
     }
 
-    /// Gives a chat created by this client a short on-device title once its first message
-    /// reaches the catalogue. Historical chats are deliberately left alone.
-    private func renameUntitledChat() {
-        guard chatTitleTask == nil,
-              pendingChatTitleRename == nil,
-              sessionMutationRequestID == nil,
-              connectionState.isReady,
-              titleWriter.isAvailable,
-              let accountID = selectedAccountID,
-              let sessionID = pendingChatTitleSessionID,
-              sessionID == selectedSessionID,
-              let session = sessions.first(where: { $0.sessionId == sessionID })
+    /// Starts the on-device rewrite with the submitted first message. The task is stored,
+    /// but deliberately not awaited, so the gateway turn and Foundation Models run together.
+    private func startChatTitle(
+        prompt submittedPrompt: String,
+        submissionID: String,
+        sessionID: String
+    ) {
+        let prompt = submittedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty,
+              titleEligibleSessionIDs.contains(sessionID),
+              let accountID = selectedAccountID
         else { return }
-        guard session.title == nil else {
-            pendingChatTitleSessionID = nil
+        guard sessions.first(where: { $0.sessionId == sessionID })?.explicitTitle == nil
+        else {
+            titleEligibleSessionIDs.remove(sessionID)
             return
         }
-        let prompt = (session.firstUserMessage ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else { return }
+
         let attempt = ChatTitleAttempt(
             accountID: accountID,
             sessionID: sessionID,
+            submissionID: submissionID,
             prompt: prompt
         )
-        guard attemptedChatTitle != attempt else { return }
-        attemptedChatTitle = attempt
-        let generation = connectionGeneration
+        pendingChatTitles[sessionID] = PendingChatTitle(
+            attempt: attempt,
+            generatedTitle: nil,
+            renameRequestID: nil
+        )
+        titleEligibleSessionIDs.remove(sessionID)
+        guard titleWriter.isAvailable else { return }
         let titleWriter = titleWriter
-        chatTitleTask = Task { [weak self] in
+        chatTitleTasks[sessionID] = Task { [weak self] in
             let title = await titleWriter.title(for: prompt)
             guard let self else { return }
-            self.finishChatTitle(title, attempt: attempt, generation: generation)
+            self.finishChatTitle(title, attempt: attempt)
         }
     }
 
-    private func finishChatTitle(
-        _ title: String?,
-        attempt: ChatTitleAttempt,
-        generation: UUID
-    ) {
-        chatTitleTask = nil
-        defer { renameUntitledChat() }
-        guard !Task.isCancelled, let title else { return }
-        guard connectionGeneration == generation,
-              selectedAccountID == attempt.accountID,
-              selectedSessionID == attempt.sessionID,
-              pendingChatTitleSessionID == attempt.sessionID,
-              connectionState.isReady,
-              sessionMutationRequestID == nil,
-              let current = sessions.first(where: { $0.sessionId == attempt.sessionID }),
-              current.title == nil,
-              current.firstUserMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
-                == attempt.prompt
+    private func finishChatTitle(_ title: String?, attempt: ChatTitleAttempt) {
+        guard pendingChatTitles[attempt.sessionID]?.attempt == attempt else { return }
+        chatTitleTasks.removeValue(forKey: attempt.sessionID)
+        guard !Task.isCancelled, selectedAccountID == attempt.accountID
         else {
-            if attemptedChatTitle == attempt { attemptedChatTitle = nil }
+            pendingChatTitles.removeValue(forKey: attempt.sessionID)
             return
         }
-        guard let requestID = renameSession(current, title: title) else {
-            if attemptedChatTitle == attempt { attemptedChatTitle = nil }
-            return
-        }
-        pendingChatTitleRename = PendingChatTitleRename(
-            attempt: attempt,
-            requestID: requestID,
-            title: title
-        )
+        guard let title else { return }
+        pendingChatTitles[attempt.sessionID]?.generatedTitle = title
+        refreshLiveActivity()
+        persistGeneratedChatTitles()
     }
 
-    private func reconcilePendingChatTitle() {
-        guard let pending = pendingChatTitleRename else { return }
-        guard pending.attempt.accountID == selectedAccountID,
-              let session = sessions.first(where: {
-                  $0.sessionId == pending.attempt.sessionID
-              })
-        else {
-            pendingChatTitleRename = nil
-            return
-        }
-        if session.title == pending.title {
-            pendingChatTitleRename = nil
-            pendingChatTitleSessionID = nil
-            retitleAnimationTask?.cancel()
-            retitledSessionID = session.sessionId
-            retitleAnimationTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(1.2))
-                guard !Task.isCancelled, let self else { return }
-                if retitledSessionID == session.sessionId { retitledSessionID = nil }
+    private func reconcileChatTitles() {
+        for sessionID in Array(pendingChatTitles.keys) {
+            guard let pending = pendingChatTitles[sessionID] else { continue }
+            guard pending.attempt.accountID == selectedAccountID else {
+                cancelChatTitle(sessionID)
+                continue
             }
-        } else if session.title != nil {
-            pendingChatTitleRename = nil
-            pendingChatTitleSessionID = nil
-        } else if sessionMutationRequestID == nil {
-            // A transport failure cleared the mutation slot without changing the catalogue.
-            pendingChatTitleRename = nil
-            if attemptedChatTitle == pending.attempt { attemptedChatTitle = nil }
+            guard let session = sessions.first(where: { $0.sessionId == sessionID }) else {
+                continue
+            }
+            if let durableTitle = session.explicitTitle {
+                if durableTitle == pending.generatedTitle {
+                    completeChatTitle(sessionID)
+                } else {
+                    // An explicit user or another client always wins.
+                    cancelChatTitle(sessionID)
+                }
+            } else if pending.generatedTitle == nil,
+                      chatTitleTasks[sessionID] == nil {
+                let catalogPrompt = (session.firstUserMessage ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !catalogPrompt.isEmpty {
+                    if catalogPrompt == pending.attempt.prompt {
+                        completeChatTitle(sessionID)
+                    } else {
+                        cancelChatTitle(sessionID)
+                    }
+                }
+            } else if let requestID = pending.renameRequestID,
+                      requestID != sessionMutationRequestID {
+                // The mutation slot cleared without the generated title reaching the catalog.
+                cancelChatTitle(sessionID)
+            }
         }
+        persistGeneratedChatTitles()
+    }
+
+    private func persistGeneratedChatTitles() {
+        guard connectionState.isReady,
+              sessionMutationRequestID == nil,
+              let accountID = selectedAccountID
+        else { return }
+
+        for sessionID in pendingChatTitles.keys.sorted() {
+            guard var pending = pendingChatTitles[sessionID],
+                  pending.attempt.accountID == accountID,
+                  let title = pending.generatedTitle,
+                  pending.renameRequestID == nil,
+                  let session = sessions.first(where: { $0.sessionId == sessionID })
+            else { continue }
+            guard session.explicitTitle == nil else {
+                cancelChatTitle(sessionID)
+                continue
+            }
+            let catalogPrompt = (session.firstUserMessage ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !catalogPrompt.isEmpty else { continue }
+            guard catalogPrompt == pending.attempt.prompt else {
+                cancelChatTitle(sessionID)
+                continue
+            }
+            guard let requestID = requestSessionRename(
+                session,
+                title: title,
+                generatedTitleSessionID: sessionID
+            ) else { return }
+            pending.renameRequestID = requestID
+            pendingChatTitles[sessionID] = pending
+            return
+        }
+    }
+
+    private func cancelChatTitle(_ sessionID: String, rearm: Bool = false) {
+        chatTitleTasks.removeValue(forKey: sessionID)?.cancel()
+        pendingChatTitles.removeValue(forKey: sessionID)
+        if rearm { titleEligibleSessionIDs.insert(sessionID) }
+        refreshLiveActivity()
+    }
+
+    private func cancelChatTitle(submissionID: String, rearm: Bool) {
+        guard let sessionID = pendingChatTitles.first(where: {
+            $0.value.attempt.submissionID == submissionID
+        })?.key else { return }
+        cancelChatTitle(sessionID, rearm: rearm)
+    }
+
+    private func completeChatTitle(_ sessionID: String) {
+        chatTitleTasks.removeValue(forKey: sessionID)?.cancel()
+        pendingChatTitles.removeValue(forKey: sessionID)
+        titleEligibleSessionIDs.remove(sessionID)
     }
 
     private func prepareChatTitle(for sessionID: String) {
-        chatTitleTask?.cancel()
-        chatTitleTask = nil
-        pendingChatTitleRename = nil
-        pendingChatTitleSessionID = sessionID
-        attemptedChatTitle = nil
+        cancelChatTitle(sessionID)
+        titleEligibleSessionIDs.insert(sessionID)
     }
 
     /// Hands the current chat list to the Live Activity. Called wherever the list or the
@@ -1226,7 +1288,8 @@ final class AppModel {
         liveActivity.update(
             sessions: sessions,
             unread: unreadSessionIDs,
-            gateway: gatewayMachineName
+            gateway: gatewayMachineName,
+            titleOverrides: pendingChatTitles.compactMapValues(\.generatedTitle)
         )
         #endif
     }
@@ -1240,16 +1303,20 @@ final class AppModel {
     }
 
     var currentSessionTitle: String {
-        selectedSessionID.map(sessionTitle) ?? "New conversation"
+        selectedSessionID.map(sessionTitle) ?? SessionRecord.untitledDisplayTitle
+    }
+
+    func displayedTitle(for session: SessionRecord) -> String {
+        pendingChatTitles[session.sessionId]?.generatedTitle ?? session.displayTitle
     }
 
     private func sessionTitle(_ sessionID: String) -> String {
+        if let generatedTitle = pendingChatTitles[sessionID]?.generatedTitle {
+            return generatedTitle
+        }
         let session = sessions.first(where: { $0.sessionId == sessionID })
-        guard let message = (session?.title ?? session?.firstUserMessage)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !message.isEmpty
-        else { return "New conversation" }
-        return String(message.prefix(72))
+        return session.map { String($0.displayTitle.prefix(72)) }
+            ?? SessionRecord.untitledDisplayTitle
     }
 
     var headerWidgets: [MountedWidget] { widgets(in: .header) }
@@ -1708,9 +1775,23 @@ final class AppModel {
     // catalogue rather than only the open one.
     @discardableResult
     func renameSession(_ session: SessionRecord, title: String) -> String? {
-        guard sessionMutationRequestID == nil else { return nil }
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else { return nil }
+        guard sessionMutationRequestID == nil else {
+            showToast("Another chat update is finishing.", tone: .info)
+            return nil
+        }
+        cancelChatTitle(session.sessionId)
+        return requestSessionRename(session, title: title)
+    }
+
+    @discardableResult
+    private func requestSessionRename(
+        _ session: SessionRecord,
+        title: String,
+        generatedTitleSessionID: String? = nil
+    ) -> String? {
+        guard sessionMutationRequestID == nil else { return nil }
         let id = requestID("session-rename")
         sessionMutationRequestID = id
         transmit(.renameSession(
@@ -1718,7 +1799,12 @@ final class AppModel {
             sessionID: session.sessionId,
             title: title
         )) { [weak self] _ in
-            if self?.sessionMutationRequestID == id { self?.sessionMutationRequestID = nil }
+            guard let self else { return }
+            if self.sessionMutationRequestID == id { self.sessionMutationRequestID = nil }
+            if let generatedTitleSessionID,
+               self.pendingChatTitles[generatedTitleSessionID]?.renameRequestID == id {
+                self.cancelChatTitle(generatedTitleSessionID)
+            }
         }
         return id
     }
@@ -2037,6 +2123,7 @@ final class AppModel {
             op = .activeInput(operation: activeOperation, turnID: activeTurnID, text: text)
         } else {
             op = .userInput(text: text, attachments: attachments)
+            startChatTitle(prompt: text, submissionID: id, sessionID: sessionID)
         }
         pendingDrafts[id] = PendingComposerDraft(text: text, attachments: attachments)
         composerDraftSaveTask?.cancel()
@@ -2050,7 +2137,9 @@ final class AppModel {
         suppressesComposerDraftSave = false
         composerAttachments = []
         transmit(.submit(sessionID: sessionID, submission: Submission(id: id, op: op))) { [weak self] _ in
-            self?.restoreDraft(id: id)
+            guard let self else { return }
+            self.restoreDraft(id: id)
+            self.cancelChatTitle(submissionID: id, rearm: true)
         }
         if let stashedText, !stashedText.isEmpty {
             composer = stashedText
@@ -3195,7 +3284,7 @@ final class AppModel {
             applyState = .applied
             showToast("Agent configuration applied.", tone: .success)
         }
-        renameUntitledChat()
+        persistGeneratedChatTitles()
     }
 
     func applySessions(_ records: [SessionRecord]) {
@@ -3224,9 +3313,8 @@ final class AppModel {
         }
         let visible = Set(sessions.map(\.sessionId))
         unreadSessionIDs.formIntersection(visible)
-        reconcilePendingChatTitle()
+        reconcileChatTitles()
         refreshLiveActivity()
-        renameUntitledChat()
         guard let selectedSessionID,
               !sessions.contains(where: { $0.sessionId == selectedSessionID }),
               sessionRequestID == nil
@@ -3315,12 +3403,15 @@ final class AppModel {
             configRequestID = nil
         }
         if requestID == sessionMutationRequestID {
-            if let sessionID = pendingDeletedSessionID, let accountID = selectedAccountID {
-                let owner = ComposerDraftOwner(accountID: accountID, sessionID: sessionID)
-                invalidateComposerEditRecovery(for: owner)
-                enqueueComposerDraftSave("", owner: owner)
-                enqueueComposerEditRecoveryRemoval(owner: owner)
-                if composerDraftOwner == owner { discardComposerDraft() }
+            if let sessionID = pendingDeletedSessionID {
+                cancelChatTitle(sessionID)
+                if let accountID = selectedAccountID {
+                    let owner = ComposerDraftOwner(accountID: accountID, sessionID: sessionID)
+                    invalidateComposerEditRecovery(for: owner)
+                    enqueueComposerDraftSave("", owner: owner)
+                    enqueueComposerEditRecoveryRemoval(owner: owner)
+                    if composerDraftOwner == owner { discardComposerDraft() }
+                }
             }
             pendingDeletedSessionID = nil
             transmit(.listSessions(requestID: requestID)) { [weak self] _ in
@@ -3347,12 +3438,13 @@ final class AppModel {
         }
         if rejection.requestId == sessionMutationRequestID {
             pendingDeletedSessionID = nil
-            if pendingChatTitleRename?.requestID == rejection.requestId,
-               let attempt = pendingChatTitleRename?.attempt {
-                if attemptedChatTitle == attempt { attemptedChatTitle = nil }
-                pendingChatTitleRename = nil
+            if let sessionID = pendingChatTitles.first(where: {
+                $0.value.renameRequestID == rejection.requestId
+            })?.key {
+                cancelChatTitle(sessionID)
             }
         }
+        cancelChatTitle(submissionID: rejection.requestId, rearm: true)
         if rejection.requestId == sessionRequestID,
            rejection.code == "replay_unavailable",
            let sessionID = sessionOpeningID,
@@ -5123,10 +5215,10 @@ final class AppModel {
         pendingPresentedTranscript = nil
         sessionMutationRequestID = nil
         pendingDeletedSessionID = nil
-        chatTitleTask?.cancel()
-        chatTitleTask = nil
-        if pendingChatTitleRename == nil {
-            attemptedChatTitle = nil
+        if preservingSession {
+            for sessionID in Array(pendingChatTitles.keys) {
+                pendingChatTitles[sessionID]?.renameRequestID = nil
+            }
         }
         sessionToRestoreID = nil
         configRequestID = nil
@@ -5153,16 +5245,14 @@ final class AppModel {
             discardFilePresentation()
         }
         if !preservingSession {
+            chatTitleTasks.values.forEach { $0.cancel() }
+            chatTitleTasks.removeAll()
+            titleEligibleSessionIDs.removeAll()
+            pendingChatTitles.removeAll()
             sessions = []
             gatewayMachineName = ""
             selectedSessionID = nil
             unreadSessionIDs.removeAll()
-            pendingChatTitleSessionID = nil
-            pendingChatTitleRename = nil
-            attemptedChatTitle = nil
-            retitleAnimationTask?.cancel()
-            retitleAnimationTask = nil
-            retitledSessionID = nil
             profile = nil
             modelChoices = []
             modelProviders = [:]

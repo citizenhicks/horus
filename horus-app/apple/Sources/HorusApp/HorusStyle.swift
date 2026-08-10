@@ -209,46 +209,67 @@ struct HorusSpinner: View {
     }
 }
 
-/// A band of light crossing a label once, to mark text that just rewrote itself.
-///
-/// The chat title is renamed under the reader by the on-device model, and text that changes
-/// with no motion reads as a glitch rather than as a result. One pass, then nothing.
-private struct HorusShimmer: ViewModifier {
-    let active: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var phase: CGFloat = -1
+/// Reveals the final, already-laid-out title glyph by glyph. Keeping the complete `Text`
+/// in the layout avoids resizing the toolbar and sidebar on every character.
+private struct HorusTitleTypingRenderer: TextRenderer {
+    var progress: Double
 
-    func body(content: Content) -> some View {
-        content
-            .overlay {
-                if active, !reduceMotion {
-                    GeometryReader { proxy in
-                        LinearGradient(
-                            colors: [.clear, .white.opacity(0.9), .clear],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                        .frame(width: max(proxy.size.width * 0.45, 40))
-                        .offset(x: phase * (proxy.size.width + 80))
-                        .blendMode(.plusLighter)
-                    }
-                    // Masking by the same content keeps the light inside the glyphs.
-                    .mask(content)
-                    .allowsHitTesting(false)
-                }
-            }
-            .onChange(of: active, initial: true) { _, isActive in
-                guard isActive, !reduceMotion else { return }
-                phase = -1
-                withAnimation(.easeInOut(duration: 0.9)) { phase = 1 }
-            }
+    var animatableData: Double {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    func draw(layout: Text.Layout, in context: inout GraphicsContext) {
+        let slices = layout.flatMap { line in line.flatMap { run in run } }
+        let revealed = progress * Double(slices.count)
+        for (index, slice) in slices.enumerated() {
+            let opacity = min(max(revealed - Double(index), 0), 1)
+            guard opacity > 0 else { continue }
+            var copy = context
+            copy.opacity = opacity
+            copy.draw(slice)
+        }
     }
 }
 
-extension View {
-    /// Runs one shimmer pass over this view each time `active` turns true.
-    func horusShimmer(active: Bool) -> some View {
-        modifier(HorusShimmer(active: active))
+private struct HorusTitleTypingTransition: Transition {
+    static let duration: TimeInterval = 0.6
+
+    static var properties: TransitionProperties {
+        TransitionProperties(hasMotion: true)
+    }
+
+    func body(content: Content, phase: TransitionPhase) -> some View {
+        let renderer = HorusTitleTypingRenderer(progress: phase.isIdentity ? 1 : 0)
+        content.transaction { transaction in
+            if !transaction.disablesAnimations {
+                transaction.animation = .linear(duration: Self.duration)
+            }
+        } body: { view in
+            view.textRenderer(renderer)
+        }
+    }
+}
+
+struct HorusTitleText: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let title: String
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            if !reduceMotion {
+                Text(title)
+                    .id(title)
+                    .transition(HorusTitleTypingTransition())
+            } else {
+                Text(title)
+            }
+        }
+        .animation(
+            reduceMotion ? nil : .linear(duration: HorusTitleTypingTransition.duration),
+            value: title
+        )
+        .accessibilityRepresentation { Text(title) }
     }
 }
 

@@ -261,6 +261,26 @@ final class AppModelTests: XCTestCase {
             payload: sessionReady(latestSequence: 0, sessionID: sessionID)
         ))
         model.handle(.sessionReplayComplete(requestID: requestID, sessionID: sessionID))
+        try await Task.sleep(for: .milliseconds(100))
+    }
+
+    @discardableResult
+    private func submitMessage(
+        _ text: String,
+        in model: AppModel,
+        recorder: GatewayRequestRecorder,
+        sessionID: String = "chat-1"
+    ) async throws -> Submission {
+        model.composer = text
+        model.sendMessage()
+        try await Task.sleep(for: .milliseconds(30))
+        let submissions = await recorder.requests().compactMap { request -> Submission? in
+            guard case .submit(let submittedSessionID, let submission) = request,
+                  submittedSessionID == sessionID
+            else { return nil }
+            return submission
+        }
+        return try XCTUnwrap(submissions.last)
     }
 
     private func renderEvent(
@@ -2769,15 +2789,16 @@ final class AppModelTests: XCTestCase {
 
     func testFailedSessionSnapshotUsesGatewayMessage() throws {
         let model = try model()
-        model.applySessions([session(state: .idle)])
+        model.applySessions([session(state: .idle, title: "Review")])
         model.selectedSessionID = "chat-1"
         model.setChatVisible(false)
 
-        model.applySessions([session(state: .running, turnID: "turn-1")])
+        model.applySessions([session(state: .running, turnID: "turn-1", title: "Review")])
         model.applySessions([session(
             state: .idle,
             outcome: .failed,
-            message: "Provider failed"
+            message: "Provider failed",
+            title: "Review"
         )])
 
         XCTAssertEqual(model.toast?.message, "Review failed: Provider failed.")
@@ -3692,9 +3713,11 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(sessionID, "chat-1")
         XCTAssertEqual(cursor, 7)
         XCTAssertEqual(epoch, "epoch-1")
+        XCTAssertTrue(model.isLoadingTranscript)
 
         model.handle(.sessionOpened(requestID: requestID, payload: sessionReady(latestSequence: 7)))
         XCTAssertEqual(model.transcript.map(\.text), ["Already rendered"])
+        XCTAssertFalse(model.isLoadingTranscript)
         XCTAssertEqual(model.currentUsage.totalTokens, 55)
         XCTAssertEqual(model.contextTokens, 42)
         XCTAssertTrue(model.hasEarlierHistory)
@@ -3712,6 +3735,48 @@ final class AppModelTests: XCTestCase {
             preview: nil
         ))
         XCTAssertEqual(model.transcript.map(\.text), ["Already rendered"])
+    }
+
+    func testReconnectKeepsTheRetainedTranscriptVisibleWhileReplayLoads() throws {
+        let model = try model()
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.transcript = [TranscriptEntry(
+            id: "answer-1",
+            text: "Already rendered",
+            kind: .assistant,
+            format: "plain_text",
+            pending: false
+        )]
+
+        model.restoreSession("chat-1")
+
+        XCTAssertEqual(model.connectionState, .loading)
+        XCTAssertFalse(model.isLoadingTranscript)
+        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Already rendered"])
+    }
+
+    func testOpeningAnotherSessionStillHidesThePreviousTranscript() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.transcript = [TranscriptEntry(
+            id: "answer-1",
+            text: "Previous chat",
+            kind: .assistant,
+            format: "plain_text",
+            pending: false
+        )]
+
+        model.openSession("chat-2")
+        try await Task.sleep(for: .milliseconds(20))
+
+        XCTAssertTrue(model.isLoadingTranscript)
+        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Previous chat"])
     }
 
     func testAuthoritativeHistoryReplacesTheFrozenCachedTranscript() async throws {
@@ -4345,13 +4410,11 @@ final class AppModelTests: XCTestCase {
         let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
         try await openNewSession(in: model, recorder: recorder, account: account)
 
+        XCTAssertEqual(model.currentSessionTitle, "new conversation")
+
+        try await submitMessage("Review the gateway", in: model, recorder: recorder)
         model.applySessions([session(
-            state: .idle,
-            firstUserMessage: "Review the gateway"
-        )])
-        await Task.yield()
-        model.applySessions([session(
-            state: .idle,
+            state: .running,
             firstUserMessage: "Review the gateway",
             title: "Manual title"
         )])
@@ -4362,10 +4425,9 @@ final class AppModelTests: XCTestCase {
             if case .renameSession = $0 { return true }
             return false
         })
-        XCTAssertNil(model.retitledSessionID)
     }
 
-    func testGeneratedTitleShimmersOnlyAfterCatalogConfirmation() async throws {
+    func testGeneratedTitleAppearsDuringTheRunAndPersistsAfterCatalogConfirmation() async throws {
         let recorder = GatewayRequestRecorder()
         let writer = ChatTitleWriter { _ in "Generated title" }
         let model = try model(
@@ -4374,15 +4436,22 @@ final class AppModelTests: XCTestCase {
         )
         let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
         try await openNewSession(in: model, recorder: recorder, account: account)
-        let untitled = session(
-            state: .idle,
-            firstUserMessage: "Review the gateway"
-        )
 
-        model.applySessions([untitled])
+        try await submitMessage("Review the gateway", in: model, recorder: recorder)
+
+        XCTAssertEqual(model.currentSessionTitle, "Generated title")
+        let earlyRequests = await recorder.requests()
+        XCTAssertFalse(earlyRequests.contains {
+            if case .renameSession = $0 { return true }
+            return false
+        })
+
+        model.applySessions([session(
+            state: .running,
+            firstUserMessage: "Review the gateway"
+        )])
         try await Task.sleep(for: .milliseconds(30))
 
-        XCTAssertNil(model.retitledSessionID)
         let rename = await recorder.requests().first { request in
             guard case .renameSession(_, "chat-1", "Generated title") = request else {
                 return false
@@ -4392,12 +4461,179 @@ final class AppModelTests: XCTestCase {
         XCTAssertNotNil(rename)
 
         model.applySessions([session(
-            state: .idle,
+            state: .running,
             firstUserMessage: "Review the gateway",
             title: "Generated title"
         )])
 
-        XCTAssertEqual(model.retitledSessionID, "chat-1")
+        XCTAssertEqual(model.currentSessionTitle, "Generated title")
+    }
+
+    func testRejectedFirstMessageRearmsAutomaticTitleGeneration() async throws {
+        let recorder = GatewayRequestRecorder()
+        var prompts: [String] = []
+        let writer = ChatTitleWriter { prompt in
+            prompts.append(prompt)
+            return "Generated title"
+        }
+        let model = try model(
+            requestSender: { request in await recorder.record(request) },
+            titleWriter: writer
+        )
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        try await openNewSession(in: model, recorder: recorder, account: account)
+
+        let firstSubmission = try await submitMessage(
+            "Review the gateway",
+            in: model,
+            recorder: recorder
+        )
+        XCTAssertEqual(model.currentSessionTitle, "Generated title")
+
+        model.handle(.rejected(GatewayRejection(
+            requestId: firstSubmission.id,
+            code: "rejected",
+            message: "Try again",
+            fatal: false
+        )))
+        XCTAssertEqual(model.currentSessionTitle, "new conversation")
+        XCTAssertEqual(model.composer, "Review the gateway")
+
+        try await submitMessage("Review the gateway again", in: model, recorder: recorder)
+
+        XCTAssertEqual(prompts, ["Review the gateway", "Review the gateway again"])
+        XCTAssertEqual(model.currentSessionTitle, "Generated title")
+    }
+
+    func testRejectedFirstMessageRearmsAfterTitleGenerationReturnsNil() async throws {
+        let recorder = GatewayRequestRecorder()
+        var prompts: [String] = []
+        let writer = ChatTitleWriter { prompt in
+            prompts.append(prompt)
+            return nil
+        }
+        let model = try model(
+            requestSender: { request in await recorder.record(request) },
+            titleWriter: writer
+        )
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        try await openNewSession(in: model, recorder: recorder, account: account)
+
+        let firstSubmission = try await submitMessage(
+            "Review the gateway",
+            in: model,
+            recorder: recorder
+        )
+
+        model.handle(.rejected(GatewayRejection(
+            requestId: firstSubmission.id,
+            code: "rejected",
+            message: "Try again",
+            fatal: false
+        )))
+        try await submitMessage("Review the gateway again", in: model, recorder: recorder)
+
+        XCTAssertEqual(prompts, ["Review the gateway", "Review the gateway again"])
+        XCTAssertEqual(model.currentSessionTitle, "new conversation")
+    }
+
+    func testAcceptedDeleteCancelsPendingTitleGeneration() async throws {
+        let recorder = GatewayRequestRecorder()
+        let writer = ChatTitleWriter { _ in
+            try? await Task.sleep(for: .milliseconds(100))
+            return "Generated title"
+        }
+        let model = try model(
+            requestSender: { request in await recorder.record(request) },
+            titleWriter: writer
+        )
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        try await openNewSession(in: model, recorder: recorder, account: account)
+
+        try await submitMessage("Review the gateway", in: model, recorder: recorder)
+        let chat = session(state: .running, firstUserMessage: "Review the gateway")
+        model.applySessions([chat])
+        model.deleteSession(chat)
+        try await Task.sleep(for: .milliseconds(20))
+        let deleteIDs = await recorder.requests().compactMap { request -> String? in
+            guard case .deleteSession(let requestID, "chat-1") = request else { return nil }
+            return requestID
+        }
+        let deleteID = try XCTUnwrap(deleteIDs.last)
+
+        model.handle(.accepted(requestID: deleteID))
+        try await Task.sleep(for: .milliseconds(120))
+
+        let requests = await recorder.requests()
+        XCTAssertFalse(requests.contains {
+            if case .renameSession = $0 { return true }
+            return false
+        })
+    }
+
+    func testOpeningAnotherNewChatDoesNotCancelTheFirstTitle() async throws {
+        let recorder = GatewayRequestRecorder()
+        let writer = ChatTitleWriter { prompt in
+            if prompt == "First prompt" {
+                do {
+                    try await Task.sleep(for: .milliseconds(100))
+                } catch {
+                    return nil
+                }
+                return "First title"
+            }
+            return "Second title"
+        }
+        let model = try model(
+            requestSender: { request in await recorder.record(request) },
+            titleWriter: writer
+        )
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        try await openNewSession(
+            in: model,
+            recorder: recorder,
+            account: account,
+            sessionID: "chat-1"
+        )
+
+        let firstSubmission = try await submitMessage(
+            "First prompt",
+            in: model,
+            recorder: recorder,
+            sessionID: "chat-1"
+        )
+        model.reduce(
+            event: AgentEventRecord(submissionId: firstSubmission.id, msg: .object([
+                "type": .string("user_message"),
+                "message": .string("First prompt")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        try await openNewSession(
+            in: model,
+            recorder: recorder,
+            account: account,
+            sessionID: "chat-2"
+        )
+
+        try await submitMessage(
+            "Second prompt",
+            in: model,
+            recorder: recorder,
+            sessionID: "chat-2"
+        )
+        try await Task.sleep(for: .milliseconds(120))
+
+        XCTAssertEqual(
+            model.displayedTitle(for: session(
+                sessionID: "chat-1",
+                state: .running,
+                firstUserMessage: "First prompt"
+            )),
+            "First title"
+        )
+        XCTAssertEqual(model.currentSessionTitle, "Second title")
     }
 }
 
@@ -4479,13 +4715,15 @@ final class LiveActivitySnapshotTests: XCTestCase {
         XCTAssertEqual(tallies.attention, 2)
     }
 
-    func testTitleFallsBackToTheFirstPromptAndIsShortened() {
+    func testUntitledChatUsesTheSinglePlaceholderAndLongTitlesAreShortened() {
+        let untitled = session("a", state: .running, updatedAt: 1)
         let chats = HorusChatSnapshot.live(
-            sessions: [session("a", state: .running, updatedAt: 1)],
+            sessions: [untitled],
             unread: []
         )
 
-        XCTAssertEqual(chats.first?.title, "First prompt")
+        XCTAssertEqual(untitled.displayTitle, "new conversation")
+        XCTAssertEqual(chats.first?.title, "new conversation")
         XCTAssertEqual(chats.first?.workspace, "horus")
         XCTAssertEqual(
             HorusChatSnapshot.shortTitle("Refactor the gateway session store and retry logic"),

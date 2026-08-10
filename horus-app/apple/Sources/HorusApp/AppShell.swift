@@ -782,10 +782,15 @@ struct SidebarView: View {
             TextField("Chat name", text: $renameDraft)
             Button("Cancel", role: .cancel) { sessionToRename = nil }
             Button("Rename") {
-                if let sessionToRename { model.renameSession(sessionToRename, title: renameDraft) }
-                sessionToRename = nil
+                guard let sessionToRename,
+                      model.renameSession(sessionToRename, title: renameDraft) != nil
+                else { return }
+                self.sessionToRename = nil
             }
-            .disabled(renameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(
+                renameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || !model.canRenameSession
+            )
         }
         .confirmationDialog(
             "Delete this chat?",
@@ -990,6 +995,7 @@ struct SidebarView: View {
     private func sessionRow(_ session: SessionRecord) -> some View {
         let isSelected = session.sessionId == model.selectedSessionID
         let isUnread = model.unreadSessionIDs.contains(session.sessionId)
+        let title = model.displayedTitle(for: session)
         let activityValue: String
         switch session.activity.state {
         case .running:
@@ -1005,12 +1011,11 @@ struct SidebarView: View {
                 showDetail(.chat)
             } label: {
                 HStack(spacing: 8) {
-                    Text(session.displayTitle)
+                    HorusTitleText(title: title)
                         .fontWeight(isSelected ? .semibold : nil)
                         .lineLimit(1)
                         .foregroundStyle(isSelected ? palette.accent : .primary)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .horusShimmer(active: model.retitledSessionID == session.sessionId)
                     SessionActivityIndicator(
                         state: session.activity.state,
                         isUnread: isUnread
@@ -1039,7 +1044,7 @@ struct SidebarView: View {
                     )
                 }
                 Button {
-                    renameDraft = session.displayTitle
+                    renameDraft = model.displayedTitle(for: session)
                     sessionToRename = session
                 } label: {
                     HorusPlatformMenuLabel(
@@ -1267,11 +1272,5 @@ extension String {
     var nonEmpty: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-}
-
-private extension SessionRecord {
-    var displayTitle: String {
-        title?.nonEmpty ?? firstUserMessage?.nonEmpty ?? "Untitled chat"
     }
 }

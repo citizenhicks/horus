@@ -19,8 +19,17 @@ final class LiveActivityController {
     private var activity: Activity<HorusActivityAttributes>?
     private var operationTask: Task<Void, Never>?
 
-    func update(sessions: [SessionRecord], unread: Set<String>, gateway: String) {
-        let chats = HorusChatSnapshot.live(sessions: sessions, unread: unread)
+    func update(
+        sessions: [SessionRecord],
+        unread: Set<String>,
+        gateway: String,
+        titleOverrides: [String: String] = [:]
+    ) {
+        let chats = HorusChatSnapshot.live(
+            sessions: sessions,
+            unread: unread,
+            titleOverrides: titleOverrides
+        )
         let tallies = HorusChatSnapshot.tallies(sessions: sessions, unread: unread)
         let state = HorusActivityAttributes.ContentState(
             chats: chats,

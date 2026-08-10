@@ -59,14 +59,13 @@ struct ChatView: View {
         #endif
         .toolbar {
             #if os(iOS)
-            // A system title cannot shimmer, and the on-device rename happens under the
-            // reader; a principal item is the same title in a view this app owns.
+            // The on-device rewrite animates glyphs, so the principal title must be a view
+            // the app owns rather than the system's opaque navigation title.
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
-                    Text(chatTitle)
+                    HorusTitleText(title: chatTitle)
                         .font(.headline)
                         .lineLimit(1)
-                        .horusShimmer(active: isRetitling)
                     if !chatSubtitle.isEmpty {
                         Text(chatSubtitle)
                             .font(.caption)
@@ -103,11 +102,7 @@ struct ChatView: View {
     }
 
     private var chatTitle: String {
-        model.displayedTranscript.isEmpty ? "new chat" : model.currentSessionTitle
-    }
-
-    private var isRetitling: Bool {
-        model.retitledSessionID != nil && model.retitledSessionID == model.selectedSessionID
+        model.currentSessionTitle
     }
 
     private var chatSubtitle: String {
@@ -637,35 +632,30 @@ private struct QueuedMessageView: View {
     var body: some View {
         HStack {
             Spacer(minLength: 42)
-            VStack(alignment: .leading, spacing: 5) {
-                Text(header)
-                    .font(HorusStyle.metadataFont.weight(.semibold))
-                    .foregroundStyle(palette.muted)
-                Text(widget.widget.text)
-                    .font(HorusStyle.bodyFont)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            .background(palette.accentSoft.opacity(0.24), in: HorusStyle.cardShape)
-            .overlay {
-                HorusStyle.cardShape.stroke(
-                    palette.accent.opacity(0.42),
-                    style: StrokeStyle(lineWidth: 1.25, lineCap: .round, dash: [1, 4])
-                )
-            }
-            .contentShape(HorusStyle.cardShape)
-            .contextMenu {
-                if editAction != nil {
-                    Button("Edit", glyph: .pencilSimple) {
-                        model.editWidgetInputInComposer(widget)
-                    }
+            Text(widget.widget.text)
+                .font(HorusStyle.bodyFont)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .background(palette.accentSoft.opacity(0.24), in: HorusStyle.cardShape)
+                .overlay {
+                    HorusStyle.cardShape.stroke(
+                        palette.accent.opacity(0.42),
+                        style: StrokeStyle(lineWidth: 1.25, lineCap: .round, dash: [1, 4])
+                    )
                 }
-                Button("Copy", glyph: .copy) { copyToPasteboard(widget.widget.text) }
-            }
+                .contentShape(HorusStyle.cardShape)
+                .contextMenu {
+                    if editAction != nil {
+                        Button("Edit", glyph: .pencilSimple) {
+                            model.editWidgetInputInComposer(widget)
+                        }
+                    }
+                    Button("Copy", glyph: .copy) { copyToPasteboard(widget.widget.text) }
+                }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(header): \(widget.widget.text)")
+        .accessibilityLabel(widget.widget.text)
         .accessibilityValue(editAction == nil ? "Queued" : "Queued, editable until sent")
         .accessibilityActions {
             if editAction != nil {
@@ -675,17 +665,10 @@ private struct QueuedMessageView: View {
         }
     }
 
-    private var header: String {
-        let label = model.middlewareFeatures.first { $0.id == widget.capability }?.label
-            ?? widget.capability.replacingOccurrences(of: "_", with: " ").capitalized
-        return "\(label) message"
-    }
-
     private var editAction: AgentOperation? {
         guard let action = widget.widget.action, action.capabilityInput != nil else { return nil }
         return action
     }
-
 }
 
 private struct SessionFileCardLabel: View {

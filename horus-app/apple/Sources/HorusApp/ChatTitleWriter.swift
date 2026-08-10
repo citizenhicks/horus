@@ -5,10 +5,9 @@ import FoundationModels
 
 /// Renames a new chat from its first prompt using Apple's on-device model.
 ///
-/// The gateway names a chat after whatever the reader typed first, which is usually a
-/// paragraph. The system model shortens it to a few words without the prompt leaving the
-/// phone and without spending a gateway token on it. Every failure path — no Apple
-/// Intelligence, a guardrail, an empty answer — leaves the gateway's own title alone.
+/// New chats keep one neutral placeholder until the system model shortens their first prompt
+/// to a few words. The prompt never leaves the phone and spends no gateway tokens. Every
+/// failure path — no Apple Intelligence, a guardrail, an empty answer — keeps the placeholder.
 @MainActor
 final class ChatTitleWriter {
     typealias Generator = @MainActor @Sendable (String) async -> String?
