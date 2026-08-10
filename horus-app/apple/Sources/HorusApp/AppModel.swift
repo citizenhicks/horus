@@ -676,6 +676,14 @@ final class AppModel {
         didSet { gitDiffRevision &+= 1 }
     }
     var sessions: [SessionRecord] = []
+    /// Whether a Horus Cloud account is connected.
+    ///
+    /// Hard-coded until the cloud sign-in exists. Account-gated rows read this instead of
+    /// each deciding for itself, so connecting the cloud is one value to change. Horus is a
+    /// free app with an optional cloud, so the signed-out state hides account rows rather
+    /// than showing them disabled: a control nobody can enable from here teaches nothing.
+    var hasCloudAccount: Bool { false }
+
     var gatewayMachineName = ""
     @ObservationIgnored private let titleWriter: ChatTitleWriter
     @ObservationIgnored private var chatTitleTasks: [String: Task<Void, Never>] = [:]

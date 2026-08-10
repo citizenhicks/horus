@@ -15,8 +15,25 @@ struct ProfileView: View {
             detail: "",
             headerAccessory: SettingsInformationButton.init
         ) {
+            // Settings first, the dashboard last: this page is opened to change something,
+            // and usage is the one section here nobody comes to act on.
+            Section("Account") {
+                CloudAccountSettings()
+            }
+            .listRowSeparator(.hidden)
+            Section("Appearance") {
+                AppearanceSettings()
+            }
+            .listRowSeparator(.hidden)
+            Section("Security") {
+                AppLockSettings()
+            }
+            .listRowSeparator(.hidden)
+            Section("Data & Privacy") {
+                DataPrivacySettings()
+            }
+            .listRowSeparator(.hidden)
             Section("Usage") {
-                CloudAllowanceStatus()
                 ProfileUsageSection(days: usage)
                 DisclosureGroup("Usage history") {
                     ProfileUsageHistory(days: usage, providerLabels: providerLabels)
@@ -27,22 +44,6 @@ struct ProfileView: View {
                         ProfileRecentRuns(groups: model.profile?.recentRunGroups ?? [])
                     }
                 }
-            }
-            .listRowSeparator(.hidden)
-            Section("Account") {
-                CloudAccountSettings()
-            }
-            .listRowSeparator(.hidden)
-            Section("Data & Privacy") {
-                DataPrivacySettings()
-            }
-            .listRowSeparator(.hidden)
-            Section("Appearance") {
-                AppearanceSettings()
-            }
-            .listRowSeparator(.hidden)
-            Section("Security") {
-                AppLockSettings()
             }
             .listRowSeparator(.hidden)
         }
@@ -59,9 +60,17 @@ private struct SettingsInformationButton: View {
         Button {
             showsInformation = true
         } label: {
-            HorusIcon(.info, foreground: palette.muted)
+            // Bare, like the agent status dot and the per-setting info buttons: a toolbar
+            // accessory in this app carries no chrome, and a glass circle on this one alone
+            // read as a different kind of control.
+            HorusIcon(.info, size: 15, foreground: palette.muted)
+                .frame(
+                    minWidth: HorusStyle.iconButtonSize,
+                    minHeight: HorusStyle.iconButtonSize
+                )
+                .contentShape(Rectangle())
         }
-        .buttonStyle(HorusIconButtonStyle())
+        .buttonStyle(.horusPlain)
         .accessibilityLabel("About Horus")
         .accessibilityHint("Shows version, legal, and support information")
         .help("About Horus")
@@ -143,21 +152,17 @@ private struct SettingsInformationRow: View {
     }
 }
 
+/// The included-usage line. It belongs to the subscription, not to the usage dashboard,
+/// which counts what this device has spent against any provider.
 private struct CloudAllowanceStatus: View {
     @Environment(\.horusPalette) private var palette
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text("Included Luna usage")
-                    .font(HorusStyle.controlFont)
-                Spacer(minLength: 8)
-                HorusBadge(text: "Cloud required", glyph: .globe02)
-            }
-            Text("Cloud subscribers will see their remaining allowance and reset date here.")
-                .font(.footnote)
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text("Included Luna usage")
+            Spacer(minLength: 8)
+            Text("Cloud only")
                 .foregroundStyle(palette.muted)
-                .fixedSize(horizontal: false, vertical: true)
         }
         .accessibilityElement(children: .combine)
     }
@@ -169,37 +174,32 @@ private struct CloudAccountSettings: View {
     @State private var isRestoringPurchases = false
     @State private var showsSubscriptionManagement = false
 
+    /// Signed out, this is an offer; signed in, it is an account. The rows that only make
+    /// sense with an account are absent rather than greyed out — the one exception is
+    /// Restore Purchases, which has to stay reachable whether or not a purchase is known.
     var body: some View {
-        HStack(spacing: 12) {
-            HorusIcon(.userFocus, size: 20, foreground: palette.muted)
-            Text("Horus Cloud")
-                .font(HorusStyle.controlFont)
-            Spacer(minLength: 8)
-            HorusBadge(text: "Not signed in", glyph: .xCircle)
+        if model.hasCloudAccount {
+            CloudAllowanceStatus()
+            Button("Manage subscription", glyph: .sealCheck) {
+                showsSubscriptionManagement = true
+            }
+            .accessibilityHint("Opens App Store subscription management, where you can unsubscribe")
+            .manageSubscriptionsSheet(isPresented: $showsSubscriptionManagement)
+            Button("Delete account", glyph: .trash, role: .destructive) {}
+        } else {
+            Text("Horus works on its own with a gateway you run. Connect Horus Cloud to have one provisioned and managed for you.")
+                .font(HorusStyle.bodyFont)
+                .foregroundStyle(palette.muted)
+                .fixedSize(horizontal: false, vertical: true)
+            HorusCloudOfferButton()
         }
-        .accessibilityElement(children: .combine)
-
-        HorusCloudOfferButton()
 
         Button(
-            isRestoringPurchases ? "Restoring Purchases" : "Restore Purchases",
+            isRestoringPurchases ? "Restoring purchases…" : "Restore purchases",
             glyph: .arrowClockwise,
             action: restorePurchases
         )
         .disabled(isRestoringPurchases)
-
-        Button("Manage Subscription", glyph: .sealCheck) {
-            showsSubscriptionManagement = true
-        }
-        .accessibilityHint("Opens App Store subscription management, where you can unsubscribe")
-        .manageSubscriptionsSheet(isPresented: $showsSubscriptionManagement)
-
-        Button("Delete Account", glyph: .trash, role: .destructive) {}
-            .disabled(true)
-
-        Text("Account deletion and logout become available after a Horus Cloud account is connected.")
-            .font(.footnote)
-            .foregroundStyle(palette.muted)
     }
 
     private func restorePurchases() {
@@ -222,13 +222,11 @@ private struct DataPrivacySettings: View {
     @Environment(\.horusPalette) private var palette
 
     var body: some View {
-        Button("View Horus Cloud Data", glyph: .hardDrives) {}
-            .disabled(true)
-        Button("Delete Horus Cloud Data", glyph: .trash, role: .destructive) {}
-            .disabled(true)
-        Text("Connect a cloud account to review, export, or permanently delete its stored data.")
-            .font(.footnote)
-            .foregroundStyle(palette.muted)
+        // Cloud data rows describe data that only exists once there is a cloud account.
+        if model.hasCloudAccount {
+            Button("View cloud data", glyph: .hardDrives) {}
+            Button("Delete cloud data", glyph: .trash, role: .destructive) {}
+        }
 
         Toggle("Help improve Horus", isOn: Binding(
             get: { model.sharesHorusDiagnostics },
@@ -236,7 +234,7 @@ private struct DataPrivacySettings: View {
         ))
         .toggleStyle(.switch)
 
-        Text("Off by default. This preference is stored on this device; no diagnostics are sent until the cloud diagnostics pipeline is connected.")
+        Text("Off by default, and stored on this device.")
             .font(.footnote)
             .foregroundStyle(palette.muted)
             .fixedSize(horizontal: false, vertical: true)
@@ -256,17 +254,13 @@ private struct ProfileUsageSection: View {
             result.outputTokens += day.usage.outputTokens
             result.totalTokens += day.usage.totalTokens
         }
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Recorded totals")
-                .font(HorusStyle.controlFont)
-                .foregroundStyle(palette.muted)
-            // Four fixed columns: an adaptive grid drops to three and orphans the last metric.
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 16) {
-                UsageMetric(label: "TOKENS", value: compact(total.totalTokens))
-                UsageMetric(label: "INPUT", value: compact(total.inputTokens))
-                UsageMetric(label: "OUTPUT", value: compact(total.outputTokens))
-                UsageMetric(label: "CACHE", value: cacheHit(total))
-            }
+        // Four fixed columns: an adaptive grid drops to three and orphans the last metric.
+        // The section header already says "Usage", so the grid needs no heading of its own.
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 16) {
+            UsageMetric(label: "Tokens", value: compact(total.totalTokens))
+            UsageMetric(label: "Input", value: compact(total.inputTokens))
+            UsageMetric(label: "Output", value: compact(total.outputTokens))
+            UsageMetric(label: "Cached", value: cacheHit(total))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -307,11 +301,14 @@ private struct UsageMetric: View {
     let value: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 4) {
+            // Sentence case, not tracked-out monospace caps: the value is the number, and a
+            // shouted label competes with it at the same size the number is set in.
             Text(label)
-                .font(HorusStyle.metadataFont.weight(.bold))
-                .tracking(1)
+                .font(.footnote)
                 .foregroundStyle(palette.muted)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
             Text(value)
                 .font(.headline)
                 .monospacedDigit()
@@ -326,16 +323,16 @@ private struct ProfileRunStatsSection: View {
     var body: some View {
         VStack(spacing: 16) {
             HStack(spacing: 8) {
-                UsageMetric(label: "RUNS", value: compact(stats.runCount))
-                UsageMetric(label: "FAILED", value: compact(stats.failedRunCount))
-                UsageMetric(label: "ABORTED", value: compact(stats.abortedRunCount))
-                UsageMetric(label: "ELAPSED", value: formatMilliseconds(stats.elapsedMs))
+                UsageMetric(label: "Runs", value: compact(stats.runCount))
+                UsageMetric(label: "Failed", value: compact(stats.failedRunCount))
+                UsageMetric(label: "Aborted", value: compact(stats.abortedRunCount))
+                UsageMetric(label: "Elapsed", value: formatMilliseconds(stats.elapsedMs))
             }
             HStack(spacing: 8) {
-                UsageMetric(label: "MODEL CALLS", value: compact(stats.modelCalls))
-                UsageMetric(label: "TOOL CALLS", value: compact(stats.toolCalls))
-                UsageMetric(label: "TOOL ERRORS", value: compact(stats.failedToolCalls))
-                UsageMetric(label: "RUN TOKENS", value: compact(stats.usage.totalTokens))
+                UsageMetric(label: "Model calls", value: compact(stats.modelCalls))
+                UsageMetric(label: "Tool calls", value: compact(stats.toolCalls))
+                UsageMetric(label: "Tool errors", value: compact(stats.failedToolCalls))
+                UsageMetric(label: "Run tokens", value: compact(stats.usage.totalTokens))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
