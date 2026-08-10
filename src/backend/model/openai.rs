@@ -102,14 +102,13 @@ impl OpenAi {
         if model.trim().is_empty() {
             return Err(Error::Config("OPENAI_MODEL is empty".into()));
         }
-        let reasoning_summary = base_url == DEFAULT_BASE_URL;
         Ok(Self {
             client,
             auth,
             base_url,
             model,
             reasoning_effort: None,
-            reasoning_summary,
+            reasoning_summary: false,
             hosted_tools: Vec::new(),
             compaction_endpoint: false,
             image_input: true,
@@ -126,7 +125,7 @@ impl OpenAi {
         Ok(self)
     }
 
-    /// Enables automatic reasoning summaries for a compatible Responses endpoint.
+    /// Requests automatic reasoning summaries from an endpoint known to support them.
     #[must_use]
     pub fn with_reasoning_summary(mut self) -> Self {
         self.reasoning_summary = true;
@@ -244,12 +243,15 @@ impl OpenAi {
             "store": false,
             "stream": true
         });
-        if let Some(effort) = &self.reasoning_effort {
-            body["reasoning"] = if self.reasoning_summary {
-                serde_json::json!({"effort": effort, "summary": "auto"})
-            } else {
-                serde_json::json!({"effort": effort})
-            };
+        if self.reasoning_effort.is_some() || self.reasoning_summary {
+            let mut reasoning = serde_json::Map::new();
+            if let Some(effort) = &self.reasoning_effort {
+                reasoning.insert("effort".into(), Value::String(effort.clone()));
+            }
+            if self.reasoning_summary {
+                reasoning.insert("summary".into(), Value::String("auto".into()));
+            }
+            body["reasoning"] = Value::Object(reasoning);
         }
         Ok(body)
     }

@@ -1,7 +1,7 @@
 ## Highlights
 
-- Bundles `horus` 0.7.2 so native OpenAI HTTP Responses routes request automatic reasoning
-  summaries while compatible endpoints remain opt-in.
+- Bundles `horus` 0.7.2 with endpoint-owned HTTP reasoning-summary opt-in while compatible
+  endpoints remain summary-free by default.
 
 ## Upgrade
 

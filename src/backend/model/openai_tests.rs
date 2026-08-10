@@ -24,7 +24,7 @@ fn base_url_rejects_serializable_secret_locations() {
 }
 
 #[test]
-fn canonical_openai_endpoint_requests_automatic_reasoning_summaries() {
+fn endpoint_url_does_not_infer_reasoning_summary_support() {
     let provider = OpenAi::new("test-key", "https://api.openai.com/v1/", "test-model")
         .expect("provider")
         .with_reasoning_effort("medium")
@@ -34,7 +34,7 @@ fn canonical_openai_endpoint_requests_automatic_reasoning_summaries() {
         provider
             .response_body(model_request())
             .expect("response body")["reasoning"],
-        serde_json::json!({"effort": "medium", "summary": "auto"})
+        serde_json::json!({"effort": "medium"})
     );
 }
 
@@ -66,6 +66,20 @@ fn compatible_endpoint_can_opt_into_automatic_reasoning_summaries() {
             .response_body(model_request())
             .expect("response body")["reasoning"],
         serde_json::json!({"effort": "medium", "summary": "auto"})
+    );
+}
+
+#[test]
+fn reasoning_summary_opt_in_can_use_the_models_default_effort() {
+    let provider = OpenAi::new("test-key", "https://example.com/v1", "test-model")
+        .expect("provider")
+        .with_reasoning_summary();
+
+    assert_eq!(
+        provider
+            .response_body(model_request())
+            .expect("response body")["reasoning"],
+        serde_json::json!({"summary": "auto"})
     );
 }
 

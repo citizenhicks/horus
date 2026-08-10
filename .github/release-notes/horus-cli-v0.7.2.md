@@ -1,7 +1,7 @@
 ## Highlights
 
 - Bundles `horus-gateway` 0.7.2 and `horus` 0.7.2.
-- Receives the short reasoning-summary headings requested by native OpenAI HTTP Responses routes.
+- Supports the short reasoning-summary headings emitted by opted-in HTTP Responses routes.
 
 ## Install or upgrade
 
