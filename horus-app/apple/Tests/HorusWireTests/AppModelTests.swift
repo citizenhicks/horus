@@ -741,6 +741,31 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(defaults.string(forKey: "theme"), ThemePreference.light.rawValue)
     }
 
+    func testHorusDiagnosticsConsentDefaultsOffAndPersists() throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let model = AppModel(
+            client: GatewayClient(),
+            store: GatewayStore(defaults: defaults),
+            settingsDefaults: defaults
+        )
+
+        XCTAssertFalse(model.sharesHorusDiagnostics)
+
+        model.setSharesHorusDiagnostics(true)
+
+        let relaunched = AppModel(
+            client: GatewayClient(),
+            store: GatewayStore(defaults: defaults),
+            settingsDefaults: defaults
+        )
+        XCTAssertTrue(relaunched.sharesHorusDiagnostics)
+
+        relaunched.setSharesHorusDiagnostics(false)
+        XCTAssertFalse(defaults.bool(forKey: "shares-horus-diagnostics"))
+    }
+
     func testGitBranchSwitchUsesAnAdvertisedBranch() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in

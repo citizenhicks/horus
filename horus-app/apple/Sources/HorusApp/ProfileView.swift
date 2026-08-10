@@ -1,4 +1,5 @@
 import Foundation
+import StoreKit
 import SwiftUI
 
 struct ProfileView: View {
@@ -11,15 +12,27 @@ struct ProfileView: View {
         }
         PageScaffold(
             title: "Settings",
-            detail: ""
+            detail: "",
+            headerAccessory: SettingsInformationButton.init
         ) {
             Section("Usage") {
-                ProfileUsageSection(days: usage, providerLabels: providerLabels)
-            }
-            if let stats = model.profile?.runStats {
-                Section("Runs") {
-                    ProfileRunStatsSection(stats: stats)
+                CloudAllowanceStatus()
+                ProfileUsageSection(days: usage)
+                DisclosureGroup("Usage history") {
+                    ProfileUsageHistory(days: usage, providerLabels: providerLabels)
                 }
+                if let stats = model.profile?.runStats {
+                    DisclosureGroup("Run activity") {
+                        ProfileRunStatsSection(stats: stats)
+                        ProfileRecentRuns(groups: model.profile?.recentRunGroups ?? [])
+                    }
+                }
+            }
+            Section("Account") {
+                CloudAccountSettings()
+            }
+            Section("Data & Privacy") {
+                DataPrivacySettings()
             }
             Section("Appearance") {
                 AppearanceSettings()
@@ -27,11 +40,201 @@ struct ProfileView: View {
             Section("Security") {
                 AppLockSettings()
             }
-            Section("Recent runs") {
-                ProfileRecentRuns(groups: model.profile?.recentRunGroups ?? [])
-            }
         }
         .task(id: model.connectionState.isReady) { model.refreshProfile() }
+    }
+}
+
+private struct SettingsInformationButton: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+    @State private var showsInformation = false
+
+    var body: some View {
+        Button {
+            showsInformation = true
+        } label: {
+            HorusIcon(.info, foreground: palette.muted)
+        }
+        .buttonStyle(HorusIconButtonStyle())
+        .accessibilityLabel("About Horus")
+        .accessibilityHint("Shows version, legal, and support information")
+        .help("About Horus")
+        .popover(
+            isPresented: $showsInformation,
+            attachmentAnchor: .rect(.bounds),
+            arrowEdge: .top
+        ) {
+            VStack(alignment: .leading, spacing: 0) {
+                Text(versionDescription)
+                    .font(HorusStyle.controlFont)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.bottom, 16)
+                Divider()
+                SettingsInformationRow(
+                    title: "Acceptable Use Policy",
+                    glyph: .shieldCheck,
+                    action: { showPlaceholder("Acceptable Use Policy") }
+                )
+                SettingsInformationRow(
+                    title: "Terms of Service",
+                    glyph: .doc,
+                    action: { showPlaceholder("Terms of Service") }
+                )
+                SettingsInformationRow(
+                    title: "Privacy Policy",
+                    glyph: .shield02,
+                    action: { showPlaceholder("Privacy Policy") }
+                )
+                SettingsInformationRow(
+                    title: "Licenses",
+                    glyph: .fileText,
+                    action: { showPlaceholder("Licenses") }
+                )
+                Divider()
+                SettingsInformationRow(
+                    title: "Help & Support",
+                    glyph: .question,
+                    action: { showPlaceholder("Help & Support") }
+                )
+            }
+            .padding(18)
+            .frame(width: 320, alignment: .leading)
+            .presentationCompactAdaptation(.popover)
+        }
+    }
+
+    private var versionDescription: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+            as? String ?? "—"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
+        return "Horus v\(version) (\(build))"
+    }
+
+    private func showPlaceholder(_ title: String) {
+        showsInformation = false
+        model.showToast("\(title) will be available before the cloud release.")
+    }
+}
+
+private struct SettingsInformationRow: View {
+    @Environment(\.horusPalette) private var palette
+    let title: String
+    let glyph: HorusGlyph
+    let action: @MainActor () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                HorusIcon(glyph, size: 18, foreground: palette.muted)
+                Text(title)
+                Spacer(minLength: 12)
+                HorusIcon(.arrowUpRight01, size: 14, foreground: palette.muted)
+            }
+            .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.horusPlain)
+    }
+}
+
+private struct CloudAllowanceStatus: View {
+    @Environment(\.horusPalette) private var palette
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text("Included Luna usage")
+                    .font(HorusStyle.controlFont)
+                Spacer(minLength: 8)
+                HorusBadge(text: "Cloud required", glyph: .globe02)
+            }
+            Text("Cloud subscribers will see their remaining allowance and reset date here.")
+                .font(.footnote)
+                .foregroundStyle(palette.muted)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct CloudAccountSettings: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+    @State private var isRestoringPurchases = false
+    @State private var showsSubscriptionManagement = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            HorusIcon(.userFocus, size: 20, foreground: palette.muted)
+            Text("Horus Cloud")
+                .font(HorusStyle.controlFont)
+            Spacer(minLength: 8)
+            HorusBadge(text: "Not signed in", glyph: .xCircle)
+        }
+        .accessibilityElement(children: .combine)
+
+        HorusCloudOfferButton()
+
+        Button(
+            isRestoringPurchases ? "Restoring Purchases" : "Restore Purchases",
+            glyph: .arrowClockwise,
+            action: restorePurchases
+        )
+        .disabled(isRestoringPurchases)
+
+        Button("Manage Subscription", glyph: .sealCheck) {
+            showsSubscriptionManagement = true
+        }
+        .accessibilityHint("Opens App Store subscription management, where you can unsubscribe")
+        .manageSubscriptionsSheet(isPresented: $showsSubscriptionManagement)
+
+        Button("Delete Account", glyph: .trash, role: .destructive) {}
+            .disabled(true)
+
+        Text("Account deletion and logout become available after a Horus Cloud account is connected.")
+            .font(.footnote)
+            .foregroundStyle(palette.muted)
+    }
+
+    private func restorePurchases() {
+        guard !isRestoringPurchases else { return }
+        isRestoringPurchases = true
+        Task {
+            defer { isRestoringPurchases = false }
+            do {
+                try await AppStore.sync()
+                model.showToast("Purchase history refreshed.", tone: .success)
+            } catch {
+                model.showToast("Couldn’t restore purchases: \(error.localizedDescription)", tone: .error)
+            }
+        }
+    }
+}
+
+private struct DataPrivacySettings: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+
+    var body: some View {
+        Button("View Horus Cloud Data", glyph: .hardDrives) {}
+            .disabled(true)
+        Button("Delete Horus Cloud Data", glyph: .trash, role: .destructive) {}
+            .disabled(true)
+        Text("Connect a cloud account to review, export, or permanently delete its stored data.")
+            .font(.footnote)
+            .foregroundStyle(palette.muted)
+
+        Toggle("Help improve Horus", isOn: Binding(
+            get: { model.sharesHorusDiagnostics },
+            set: { model.setSharesHorusDiagnostics($0) }
+        ))
+        .toggleStyle(.switch)
+
+        Text("Off by default. This preference is stored on this device; no diagnostics are sent until the cloud diagnostics pipeline is connected.")
+            .font(.footnote)
+            .foregroundStyle(palette.muted)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -40,7 +243,6 @@ private let profileUsageWeekCount = 25
 private struct ProfileUsageSection: View {
     @Environment(\.horusPalette) private var palette
     let days: [DailyUsage]
-    let providerLabels: [String: String]
 
     var body: some View {
         let total = days.reduce(into: TokenUsage()) { result, day in
@@ -60,6 +262,18 @@ private struct ProfileUsageSection: View {
                 UsageMetric(label: "OUTPUT", value: compact(total.outputTokens))
                 UsageMetric(label: "CACHE", value: cacheHit(total))
             }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ProfileUsageHistory: View {
+    @Environment(\.horusPalette) private var palette
+    let days: [DailyUsage]
+    let providerLabels: [String: String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .firstTextBaseline) {
                 Text("Usage by provider")
                     .font(HorusStyle.controlFont)

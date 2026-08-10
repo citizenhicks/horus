@@ -433,6 +433,7 @@ struct AppLockAuthenticator {
 }
 
 private let appLockEnabledKey = "app-lock-enabled"
+private let sharesHorusDiagnosticsKey = "shares-horus-diagnostics"
 private let maximumAttachmentBytes = 25 * 1024 * 1024
 private let maximumComposerAttachmentBytes: Int64 = 100 * 1024 * 1024
 private let maximumPresentedFileBytes = 25 * 1024 * 1024
@@ -789,6 +790,7 @@ final class AppModel {
     var pairingCode = ""
     var pairingError: String?
     var theme: ThemePreference
+    private(set) var sharesHorusDiagnostics: Bool
     private(set) var appLockEnabled: Bool
     private(set) var isAppLocked: Bool
     private(set) var isAppLockAuthenticating = false
@@ -913,6 +915,7 @@ final class AppModel {
         self.accounts = store.loadAccounts()
         self.selectedAccountID = store.selectedAccountID()
         self.theme = ThemePreference(rawValue: settingsDefaults.string(forKey: "theme") ?? "") ?? .system
+        self.sharesHorusDiagnostics = settingsDefaults.bool(forKey: sharesHorusDiagnosticsKey)
         self.appLockEnabled = appLockEnabled
         self.isAppLocked = appLockEnabled
         self.appLockAuthenticationMethod = appLockAuthenticator.method
@@ -2739,6 +2742,11 @@ final class AppModel {
     func setTheme(_ theme: ThemePreference) {
         self.theme = theme
         settingsDefaults.set(theme.rawValue, forKey: "theme")
+    }
+
+    func setSharesHorusDiagnostics(_ sharesDiagnostics: Bool) {
+        sharesHorusDiagnostics = sharesDiagnostics
+        settingsDefaults.set(sharesDiagnostics, forKey: sharesHorusDiagnosticsKey)
     }
 
     func refreshAppLockAuthenticationMethod() {
