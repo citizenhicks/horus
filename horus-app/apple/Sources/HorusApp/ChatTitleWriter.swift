@@ -6,15 +6,24 @@ import Observation
 
 /// Renames a new chat from its first prompt using Apple's on-device model.
 ///
-/// New chats keep one neutral placeholder until the system model shortens their first prompt
-/// to a few words. The prompt never leaves the phone and spends no gateway tokens. Every
-/// failure path — no Apple Intelligence, a guardrail, an empty answer — keeps the placeholder.
+/// New chats immediately use a short preview of their first prompt while the system model
+/// rewrites it to a few words. The prompt never leaves the phone and spends no gateway tokens.
+/// Every failure path — no Apple Intelligence, a guardrail, an empty answer — keeps the preview.
 @MainActor
 final class ChatTitleWriter {
     typealias Generator = @MainActor @Sendable (String) async -> String?
+    typealias Diagnostic = @MainActor @Sendable (String) -> Void
+
+    enum Outcome {
+        case title(String)
+        case failed(String)
+        case cancelled
+    }
 
     /// Long enough to stay specific, short enough for a sidebar row.
     nonisolated static let limit = 42
+    /// Keeps the deterministic fallback compact enough for the sidebar and toolbar.
+    nonisolated private static let previewLimit = 21
     /// The model only needs the shape of the request, not the whole essay.
     nonisolated private static let promptLimit = 600
 
@@ -24,10 +33,48 @@ final class ChatTitleWriter {
         self.generator = generator
     }
 
-    func title(for prompt: String) async -> String? {
-        if let generator { return await generator(prompt) }
+    nonisolated static func preview(for prompt: String?) -> String? {
+        guard let prompt else { return nil }
+        var preview = ""
+        var pendingSpace = false
+        for character in prompt {
+            if character.isWhitespace {
+                pendingSpace = !preview.isEmpty
+                continue
+            }
+            if pendingSpace {
+                preview.append(" ")
+                pendingSpace = false
+            }
+            preview.append(character)
+            if preview.count >= Self.previewLimit { break }
+        }
+        preview = String(preview.prefix(Self.previewLimit))
+            .trimmingCharacters(in: .whitespaces)
+        guard !preview.isEmpty else { return nil }
+        return preview + "…"
+    }
+
+    func title(for prompt: String, diagnostic: Diagnostic? = nil) async -> Outcome {
+        if let generator {
+            let title = await generator(prompt)
+            return title.map(Outcome.title)
+                ?? .failed("Apple did not produce a chat title.")
+        }
         #if canImport(FoundationModels)
-        guard await systemModelBecomesAvailable() else { return nil }
+        switch SystemLanguageModel.default.availability {
+        case .available:
+            break
+        case .unavailable(.modelNotReady):
+            diagnostic?("Apple's chat title model is not ready yet; waiting.")
+            if let failure = await waitForSystemModel() { return .failed(failure) }
+        case .unavailable(.appleIntelligenceNotEnabled):
+            return .failed("Apple Intelligence is disabled, so the chat title was not rewritten.")
+        case .unavailable(.deviceNotEligible):
+            return .failed("This device does not support Apple's chat title model.")
+        @unknown default:
+            return .failed("Apple's chat title model is unavailable.")
+        }
         let session = LanguageModelSession {
             """
             You name chat threads in a coding assistant. Given the first message of a \
@@ -41,19 +88,24 @@ final class ChatTitleWriter {
                 to: String(prompt.prefix(Self.promptLimit)),
                 options: GenerationOptions(temperature: 0.3, maximumResponseTokens: 24)
             )
-            return Self.cleaned(response.content)
+            return Self.cleaned(response.content).map(Outcome.title)
+                ?? .failed("Apple returned an unusable chat title.")
+        } catch is CancellationError {
+            return .cancelled
+        } catch let error as LanguageModelSession.GenerationError {
+            return .failed("Apple chat title rewrite failed: \(error.localizedDescription)")
         } catch {
-            // A guardrail, an unloadable model, or a cancelled session. The chat keeps the
-            // title it already has, which is never worse than before.
-            return nil
+            return .failed("Apple chat title rewrite failed: \(error.localizedDescription)")
         }
         #else
-        return nil
+        return .failed("Apple's chat title model is unavailable on this device.")
         #endif
     }
 
     #if canImport(FoundationModels)
-    private func systemModelBecomesAvailable() async -> Bool {
+    /// A model download or warm-up is transient. Keep the deterministic preview visible while
+    /// this suspends, then continue the same rewrite when Foundation Models becomes ready.
+    private func waitForSystemModel() async -> String? {
         let model = SystemLanguageModel.default
         let availability = Observations<SystemLanguageModel.Availability, Never> {
             model.availability
@@ -61,14 +113,18 @@ final class ChatTitleWriter {
         for await state in availability {
             switch state {
             case .available:
-                return true
+                return nil
             case .unavailable(.modelNotReady):
                 continue
-            case .unavailable:
-                return false
+            case .unavailable(.appleIntelligenceNotEnabled):
+                return "Apple Intelligence was disabled before the chat title could be rewritten."
+            case .unavailable(.deviceNotEligible):
+                return "This device does not support Apple's chat title model."
+            @unknown default:
+                return "Apple's chat title model became unavailable."
             }
         }
-        return false
+        return "Apple's chat title model became unavailable."
     }
     #endif
 

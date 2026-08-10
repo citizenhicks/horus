@@ -4574,6 +4574,7 @@ final class AppModelTests: XCTestCase {
             in: model,
             recorder: recorder
         )
+        XCTAssertEqual(model.currentSessionTitle, "Review the gateway…")
 
         model.reduce(
             event: AgentEventRecord(submissionId: submission.id, msg: .object([
@@ -4785,7 +4786,46 @@ final class AppModelTests: XCTestCase {
         try await submitMessage("Review the gateway again", in: model, recorder: recorder)
 
         XCTAssertEqual(prompts, ["Review the gateway", "Review the gateway again"])
-        XCTAssertEqual(model.currentSessionTitle, "new conversation")
+        XCTAssertEqual(model.currentSessionTitle, "Review the gateway ag…")
+    }
+
+    func testPromptPreviewRemainsWhenAppleDoesNotProduceATitle() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(
+            requestSender: { request in await recorder.record(request) },
+            titleWriter: ChatTitleWriter { _ in nil }
+        )
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        try await openNewSession(in: model, recorder: recorder, account: account)
+
+        let submission = try await submitMessage(
+            "Review the gateway retry behavior",
+            in: model,
+            recorder: recorder
+        )
+        XCTAssertEqual(model.currentSessionTitle, "Review the gateway re…")
+        XCTAssertEqual(model.toast?.message, "Apple did not produce a chat title.")
+        XCTAssertEqual(model.toast?.tone, .warning)
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: submission.id, msg: .object([
+                "type": .string("user_message"),
+                "message": .string("Review the gateway retry behavior")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        model.applySessions([session(
+            state: .running,
+            firstUserMessage: "Review the gateway retry behavior"
+        )])
+
+        XCTAssertEqual(model.currentSessionTitle, "Review the gateway re…")
+        let requests = await recorder.requests()
+        XCTAssertFalse(requests.contains {
+            if case .renameSession = $0 { return true }
+            return false
+        })
     }
 
     func testAcceptedDeleteCancelsPendingTitleGeneration() async throws {
@@ -4889,6 +4929,19 @@ final class AppModelTests: XCTestCase {
 }
 
 final class ChatTitleWriterTests: XCTestCase {
+    func testBuildsACompactPromptPreview() {
+        XCTAssertEqual(
+            ChatTitleWriter.preview(for: "  Review\n the   gateway retry behavior"),
+            "Review the gateway re…"
+        )
+        XCTAssertEqual(
+            ChatTitleWriter.preview(for: String(repeating: "🧪", count: 22)),
+            String(repeating: "🧪", count: 21) + "…"
+        )
+        XCTAssertNil(ChatTitleWriter.preview(for: " \n "))
+        XCTAssertNil(ChatTitleWriter.preview(for: nil))
+    }
+
     func testStripsTheDressingSmallModelsAddToTitles() {
         XCTAssertEqual(ChatTitleWriter.cleaned("\"Fix the retry backoff\""), "Fix the retry backoff")
         XCTAssertEqual(ChatTitleWriter.cleaned("Title: Rename the gateway"), "Rename the gateway")
@@ -4966,8 +5019,13 @@ final class LiveActivitySnapshotTests: XCTestCase {
         XCTAssertEqual(tallies.attention, 2)
     }
 
-    func testUntitledChatUsesTheSinglePlaceholderAndLongTitlesAreShortened() {
-        let untitled = session("a", state: .running, updatedAt: 1)
+    func testChatTitleUsesExplicitThenPromptPreviewThenPlaceholder() {
+        let untitled = session(
+            "a",
+            state: .running,
+            updatedAt: 1,
+            firstUserMessage: ""
+        )
         let chats = HorusChatSnapshot.live(
             sessions: [untitled],
             unread: []
@@ -4976,6 +5034,14 @@ final class LiveActivitySnapshotTests: XCTestCase {
         XCTAssertEqual(untitled.displayTitle, "new conversation")
         XCTAssertEqual(chats.first?.title, "new conversation")
         XCTAssertEqual(chats.first?.workspace, "horus")
+        XCTAssertEqual(
+            session("b", state: .running, updatedAt: 1).displayTitle,
+            "First prompt…"
+        )
+        XCTAssertEqual(
+            session("c", state: .running, updatedAt: 1, title: "Manual title").displayTitle,
+            "Manual title"
+        )
         XCTAssertEqual(
             HorusChatSnapshot.shortTitle("Refactor the gateway session store and retry logic"),
             "Refactor the gateway session…"

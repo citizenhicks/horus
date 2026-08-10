@@ -59,12 +59,11 @@ struct ChatView: View {
         #endif
         .toolbar {
             #if os(iOS)
-            // The on-device rewrite animates glyphs, so the principal title must be a view
-            // the app owns rather than the system's opaque navigation title.
+            // Title changes animate glyphs, so the principal title must be a view the app
+            // owns rather than the system's opaque navigation title.
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
                     HorusTitleText(title: chatTitle)
-                        .id(model.selectedSessionID)
                         .font(.headline)
                         .lineLimit(1)
                     if !chatSubtitle.isEmpty {

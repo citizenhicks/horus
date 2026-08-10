@@ -225,7 +225,9 @@ extension SessionRecord {
     }
 
     var displayTitle: String {
-        explicitTitle ?? Self.untitledDisplayTitle
+        explicitTitle
+            ?? ChatTitleWriter.preview(for: firstUserMessage)
+            ?? Self.untitledDisplayTitle
     }
 }
 
@@ -661,9 +663,12 @@ private struct ChatTitleAttempt: Hashable {
 
 private struct PendingChatTitle {
     let attempt: ChatTitleAttempt
+    let previewTitle: String
     var generatedTitle: String?
     var renameRequestID: String?
     var submissionConfirmed: Bool
+
+    var displayTitle: String { generatedTitle ?? previewTitle }
 }
 
 @MainActor
@@ -1140,7 +1145,7 @@ final class AppModel {
         sessionID: String
     ) {
         let prompt = submittedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty,
+        guard let previewTitle = ChatTitleWriter.preview(for: prompt),
               titleEligibleSessionIDs.contains(sessionID),
               let accountID = selectedAccountID
         else { return }
@@ -1157,20 +1162,24 @@ final class AppModel {
         )
         pendingChatTitles[sessionID] = PendingChatTitle(
             attempt: attempt,
+            previewTitle: previewTitle,
             generatedTitle: nil,
             renameRequestID: nil,
             submissionConfirmed: false
         )
+        refreshLiveActivity()
         titleEligibleSessionIDs.remove(sessionID)
         let titleWriter = titleWriter
         chatTitleTasks[sessionID] = Task { [weak self] in
-            let title = await titleWriter.title(for: prompt)
+            let outcome = await titleWriter.title(for: prompt) { [weak self] message in
+                self?.showToast(message, tone: .warning)
+            }
             guard let self else { return }
-            self.finishChatTitle(title, attempt: attempt)
+            self.finishChatTitle(outcome, attempt: attempt)
         }
     }
 
-    private func finishChatTitle(_ title: String?, attempt: ChatTitleAttempt) {
+    private func finishChatTitle(_ outcome: ChatTitleWriter.Outcome, attempt: ChatTitleAttempt) {
         guard pendingChatTitles[attempt.sessionID]?.attempt == attempt else { return }
         chatTitleTasks.removeValue(forKey: attempt.sessionID)
         guard !Task.isCancelled, selectedAccountID == attempt.accountID
@@ -1178,15 +1187,16 @@ final class AppModel {
             pendingChatTitles.removeValue(forKey: attempt.sessionID)
             return
         }
-        guard let title else {
-            if pendingChatTitles[attempt.sessionID]?.submissionConfirmed == true {
-                completeChatTitle(attempt.sessionID)
-            }
-            return
+        switch outcome {
+        case .title(let title):
+            pendingChatTitles[attempt.sessionID]?.generatedTitle = title
+            refreshLiveActivity()
+        case .failed(let message):
+            showToast(message, tone: .warning)
+        case .cancelled:
+            break
         }
-        pendingChatTitles[attempt.sessionID]?.generatedTitle = title
-        refreshLiveActivity()
-        persistGeneratedChatTitles()
+        reconcileChatTitles()
     }
 
     private func confirmChatTitle(submissionID: String) {
@@ -1199,11 +1209,6 @@ final class AppModel {
     private func confirmChatTitle(sessionID: String) {
         guard pendingChatTitles[sessionID] != nil else { return }
         pendingChatTitles[sessionID]?.submissionConfirmed = true
-        if pendingChatTitles[sessionID]?.generatedTitle == nil,
-           chatTitleTasks[sessionID] == nil {
-            completeChatTitle(sessionID)
-            return
-        }
         persistGeneratedChatTitles()
     }
 
@@ -1224,15 +1229,23 @@ final class AppModel {
                     // An explicit user or another client always wins.
                     cancelChatTitle(sessionID)
                 }
-            } else if !pending.submissionConfirmed {
-                let catalogPrompt = (session.firstUserMessage ?? "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !catalogPrompt.isEmpty {
-                    if pending.attempt.prompt.hasPrefix(catalogPrompt) {
-                        confirmChatTitle(sessionID: sessionID)
-                    } else {
-                        cancelChatTitle(sessionID)
-                    }
+                continue
+            }
+
+            let catalogPrompt = (session.firstUserMessage ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !catalogPrompt.isEmpty {
+                guard pending.attempt.prompt.hasPrefix(catalogPrompt) else {
+                    cancelChatTitle(sessionID)
+                    continue
+                }
+                if !pending.submissionConfirmed {
+                    pendingChatTitles[sessionID]?.submissionConfirmed = true
+                }
+                if pending.generatedTitle == nil, chatTitleTasks[sessionID] == nil {
+                    // The catalog now owns the same deterministic preview, so the temporary
+                    // override is no longer needed.
+                    completeChatTitle(sessionID)
                 }
             } else if let requestID = pending.renameRequestID,
                       requestID != sessionMutationRequestID {
@@ -1304,7 +1317,7 @@ final class AppModel {
             sessions: sessions,
             unread: unreadSessionIDs,
             gateway: gatewayMachineName,
-            titleOverrides: pendingChatTitles.compactMapValues(\.generatedTitle)
+            titleOverrides: pendingChatTitles.mapValues(\.displayTitle)
         )
         #endif
     }
@@ -1322,12 +1335,12 @@ final class AppModel {
     }
 
     func displayedTitle(for session: SessionRecord) -> String {
-        pendingChatTitles[session.sessionId]?.generatedTitle ?? session.displayTitle
+        pendingChatTitles[session.sessionId]?.displayTitle ?? session.displayTitle
     }
 
     private func sessionTitle(_ sessionID: String) -> String {
-        if let generatedTitle = pendingChatTitles[sessionID]?.generatedTitle {
-            return generatedTitle
+        if let pendingTitle = pendingChatTitles[sessionID]?.displayTitle {
+            return pendingTitle
         }
         let session = sessions.first(where: { $0.sessionId == sessionID })
         return session.map { String($0.displayTitle.prefix(72)) }
