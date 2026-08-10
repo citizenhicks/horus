@@ -4719,18 +4719,6 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.transcript.last?.text, "Old error")
     }
 
-    func testChatsDeepLinkDoesNotEnterPairing() throws {
-        let model = try model()
-        model.destination = .profile
-        model.showsPairing = false
-
-        model.handleOpenURL(try XCTUnwrap(URL(string: "horus://chats")))
-
-        XCTAssertEqual(model.destination, .chat)
-        XCTAssertNil(model.pairingError)
-        XCTAssertFalse(model.showsPairing)
-    }
-
     func testDelayedGeneratedTitleDoesNotOverwriteAnExplicitRename() async throws {
         let recorder = GatewayRequestRecorder()
         let writer = ChatTitleWriter { _ in
@@ -5170,7 +5158,7 @@ final class AppModelTests: XCTestCase {
         await fulfillment(of: [secondTitleFinished], timeout: 1)
 
         XCTAssertEqual(prompts, ["Review the gateway", "Review the gateway again"])
-        XCTAssertEqual(model.currentSessionTitle, "Review the gateway ag…")
+        XCTAssertEqual(model.currentSessionTitle, "Review the gateway again…")
     }
 
     func testPromptPreviewRemainsWhenAppleDoesNotProduceATitle() async throws {
@@ -5187,7 +5175,7 @@ final class AppModelTests: XCTestCase {
             in: model,
             recorder: recorder
         )
-        XCTAssertEqual(model.currentSessionTitle, "Review the gateway re…")
+        XCTAssertEqual(model.currentSessionTitle, "Review the gateway retry behavior…")
         XCTAssertEqual(model.toast?.message, "Apple did not produce a chat title.")
         XCTAssertEqual(model.toast?.tone, .warning)
 
@@ -5204,7 +5192,7 @@ final class AppModelTests: XCTestCase {
             firstUserMessage: "Review the gateway retry behavior"
         )])
 
-        XCTAssertEqual(model.currentSessionTitle, "Review the gateway re…")
+        XCTAssertEqual(model.currentSessionTitle, "Review the gateway retry behavior…")
         let requests = await recorder.requests()
         XCTAssertFalse(requests.contains {
             if case .renameSession = $0 { return true }
@@ -5350,11 +5338,11 @@ final class ChatTitleWriterTests: XCTestCase {
     func testBuildsACompactPromptPreview() {
         XCTAssertEqual(
             ChatTitleWriter.preview(for: "  Review\n the   gateway retry behavior"),
-            "Review the gateway re…"
+            "Review the gateway retry behavior…"
         )
         XCTAssertEqual(
-            ChatTitleWriter.preview(for: String(repeating: "🧪", count: 22)),
-            String(repeating: "🧪", count: 21) + "…"
+            ChatTitleWriter.preview(for: String(repeating: "🧪", count: 43)),
+            String(repeating: "🧪", count: 42) + "…"
         )
         XCTAssertNil(ChatTitleWriter.preview(for: " \n "))
         XCTAssertNil(ChatTitleWriter.preview(for: nil))
@@ -5374,128 +5362,6 @@ final class ChatTitleWriterTests: XCTestCase {
         // A model that answered the prompt instead of naming it runs long; better to keep
         // the gateway's title than to show a paragraph.
         XCTAssertNil(ChatTitleWriter.cleaned(String(repeating: "long ", count: 20)))
-    }
-}
-
-final class LiveActivitySnapshotTests: XCTestCase {
-    private func session(
-        _ id: String,
-        state: SessionActivityState,
-        updatedAt: Int64,
-        title: String? = nil,
-        firstUserMessage: String = "First prompt",
-        workspaceLabel: String = "horus"
-    ) -> SessionRecord {
-        SessionRecord(
-            sessionId: id,
-            sessionContext: SessionContext(
-                tenantId: nil,
-                userId: nil,
-                userName: nil,
-                workspaceId: "w",
-                workspaceLabel: workspaceLabel,
-                originLabel: nil
-            ),
-            parentSessionId: nil,
-            parentSequence: nil,
-            sequence: 1,
-            catalogVisible: true,
-            firstUserMessage: firstUserMessage,
-            executionStats: ExecutionStats(),
-            title: title,
-            pinned: false,
-            activity: SessionActivity(
-                state: state,
-                turnId: nil,
-                startedAt: state == .idle ? nil : 100,
-                lastOutcome: nil,
-                message: nil
-            ),
-            createdAt: 1,
-            updatedAt: updatedAt
-        )
-    }
-
-    func testRanksApprovalsThenRunningThenUnreadAndCapsTheList() {
-        let sessions = [
-            session("unread", state: .idle, updatedAt: 10),
-            session("running-old", state: .running, updatedAt: 20),
-            session("approval", state: .awaitingApproval, updatedAt: 5),
-            session("running-new", state: .running, updatedAt: 30),
-            session("idle-read", state: .idle, updatedAt: 40)
-        ]
-
-        let chats = HorusChatSnapshot.live(sessions: sessions, unread: ["unread"])
-
-        // An idle chat nobody flagged as unread never appears, and the cap drops the tail.
-        XCTAssertEqual(chats.map(\.id), ["approval", "running-new", "running-old"])
-        XCTAssertEqual(chats.first?.standing, .awaitingApproval)
-        XCTAssertEqual(chats.first?.startedAt, Date(timeIntervalSince1970: 100))
-
-        let tallies = HorusChatSnapshot.tallies(sessions: sessions, unread: ["unread"])
-        XCTAssertEqual(tallies.running, 2)
-        XCTAssertEqual(tallies.attention, 2)
-    }
-
-    func testChatTitleUsesExplicitThenPromptPreviewThenPlaceholder() {
-        let untitled = session(
-            "a",
-            state: .running,
-            updatedAt: 1,
-            firstUserMessage: ""
-        )
-        let chats = HorusChatSnapshot.live(
-            sessions: [untitled],
-            unread: []
-        )
-
-        XCTAssertEqual(untitled.displayTitle, "new conversation")
-        XCTAssertEqual(chats.first?.title, "new conversation")
-        XCTAssertEqual(chats.first?.workspace, "horus")
-        XCTAssertEqual(
-            session("b", state: .running, updatedAt: 1).displayTitle,
-            "First prompt…"
-        )
-        XCTAssertEqual(
-            session("c", state: .running, updatedAt: 1, title: "Manual title").displayTitle,
-            "Manual title"
-        )
-        XCTAssertEqual(
-            HorusChatSnapshot.shortTitle("Refactor the gateway session store and retry logic"),
-            "Refactor the gateway session…"
-        )
-        XCTAssertEqual(HorusChatSnapshot.shortTitle("Short one"), "Short one")
-    }
-
-    func testRecencySortHandlesTheFullTimestampRange() {
-        let chats = HorusChatSnapshot.live(
-            sessions: [
-                session("old", state: .running, updatedAt: .min),
-                session("new", state: .running, updatedAt: .max)
-            ],
-            unread: []
-        )
-
-        XCTAssertEqual(chats.map(\.id), ["new", "old"])
-    }
-
-    func testSnapshotBoundsUntrustedPresentationText() throws {
-        let huge = String(repeating: "🧪", count: 2_000)
-        let chats = HorusChatSnapshot.live(
-            sessions: [session(
-                huge,
-                state: .running,
-                updatedAt: 1,
-                firstUserMessage: huge,
-                workspaceLabel: "/srv/\(huge)"
-            )],
-            unread: []
-        )
-        let chat = try XCTUnwrap(chats.first)
-
-        XCTAssertLessThanOrEqual(chat.id.utf8.count, 96)
-        XCTAssertLessThanOrEqual(chat.workspace.utf8.count, 48)
-        XCTAssertLessThan(try JSONEncoder().encode(chats).count, 4_096)
     }
 }
 

@@ -231,70 +231,6 @@ extension SessionRecord {
     }
 }
 
-extension HorusChatSnapshot {
-    /// The chats the island surfaces, most pressing first: an approval blocks its run, a
-    /// running chat is live, and a finished chat nobody has read is the quietest of the
-    /// three. Ties break on recency.
-    static func live(
-        sessions: [SessionRecord],
-        unread: Set<String>,
-        titleOverrides: [String: String] = [:],
-        limit: Int = 3
-    ) -> [HorusChatSnapshot] {
-        sessions
-            .compactMap { session -> (rank: Int, updatedAt: Int64, snapshot: HorusChatSnapshot)? in
-                let standing: Standing
-                switch session.activity.state {
-                case .awaitingApproval: standing = .awaitingApproval
-                case .running: standing = .running
-                case .idle:
-                    guard unread.contains(session.sessionId) else { return nil }
-                    standing = .unread
-                }
-                let rank = switch standing {
-                case .awaitingApproval: 0
-                case .running: 1
-                case .unread: 2
-                }
-                return (rank, session.updatedAt, HorusChatSnapshot(
-                    id: bounded(session.sessionId, utf8Limit: 96),
-                    title: shortTitle(titleOverrides[session.sessionId] ?? session.displayTitle),
-                    workspace: shortWorkspace(session.sessionContext.workspaceLabel),
-                    tokens: session.executionStats.usage.totalTokens,
-                    startedAt: session.activity.startedAt.map {
-                        Date(timeIntervalSince1970: TimeInterval($0))
-                    },
-                    standing: standing
-                ))
-            }
-            .sorted {
-                $0.rank == $1.rank
-                    ? $0.updatedAt > $1.updatedAt
-                    : $0.rank < $1.rank
-            }
-            .prefix(max(0, limit))
-            .map(\.snapshot)
-    }
-
-    /// Everything running, and everything waiting on the reader — including the chats that
-    /// did not fit in the list.
-    static func tallies(
-        sessions: [SessionRecord],
-        unread: Set<String>
-    ) -> (running: Int, attention: Int) {
-        var running = 0
-        var attention = 0
-        for session in sessions {
-            switch session.activity.state {
-            case .running: running += 1
-            case .awaitingApproval: attention += 1
-            case .idle: if unread.contains(session.sessionId) { attention += 1 }
-            }
-        }
-        return (running, attention)
-    }
-}
-
 /// One entry in the workspace file tree. `children` is nil for a file, which is how
 /// `List(children:)` decides a row gets no disclosure control.
 struct FileTreeNode: Identifiable, Hashable, Sendable {
@@ -689,7 +625,6 @@ final class AppModel {
     @ObservationIgnored private var chatTitleTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var titleEligibleSessionIDs: Set<String> = []
     private var pendingChatTitles: [String: PendingChatTitle] = [:]
-    @ObservationIgnored private let liveActivity = LiveActivityController()
     var selectedSessionID: String?
     private(set) var unreadSessionIDs: Set<String> = []
     var transcript: [TranscriptEntry] = []
@@ -1134,10 +1069,8 @@ final class AppModel {
 
     func setChatVisible(_ visible: Bool) {
         isChatVisible = visible
-        if visible,
-           let selectedSessionID,
-           unreadSessionIDs.remove(selectedSessionID) != nil {
-            refreshLiveActivity()
+        if visible, let selectedSessionID {
+            unreadSessionIDs.remove(selectedSessionID)
         }
     }
 
@@ -1171,7 +1104,6 @@ final class AppModel {
             renameRequestID: nil,
             submissionConfirmed: false
         )
-        refreshLiveActivity()
         titleEligibleSessionIDs.remove(sessionID)
         let titleWriter = titleWriter
         chatTitleTasks[sessionID] = Task { [weak self] in
@@ -1194,7 +1126,6 @@ final class AppModel {
         switch outcome {
         case .title(let title):
             pendingChatTitles[attempt.sessionID]?.generatedTitle = title
-            refreshLiveActivity()
         case .failed(let message):
             showToast(message, tone: .warning)
         case .cancelled:
@@ -1292,7 +1223,6 @@ final class AppModel {
         chatTitleTasks.removeValue(forKey: sessionID)?.cancel()
         pendingChatTitles.removeValue(forKey: sessionID)
         if rearm { titleEligibleSessionIDs.insert(sessionID) }
-        refreshLiveActivity()
     }
 
     private func cancelChatTitle(submissionID: String, rearm: Bool) {
@@ -1311,17 +1241,6 @@ final class AppModel {
     private func prepareChatTitle(for sessionID: String) {
         cancelChatTitle(sessionID)
         titleEligibleSessionIDs.insert(sessionID)
-    }
-
-    /// Hands the current chat list to the Live Activity. Called wherever the list or the
-    /// unread set changes, since the island shows both.
-    private func refreshLiveActivity() {
-        liveActivity.update(
-            sessions: sessions,
-            unread: unreadSessionIDs,
-            gateway: gatewayMachineName,
-            titleOverrides: pendingChatTitles.mapValues(\.displayTitle)
-        )
     }
 
     var capabilityReferences: [MountedReference] {
@@ -1499,11 +1418,6 @@ final class AppModel {
     }
 
     func handleOpenURL(_ url: URL) {
-        if url.scheme?.lowercased() == "horus",
-           url.host?.lowercased() == "chats" {
-            destination = .chat
-            return
-        }
         applyPairingURL(url)
     }
 
@@ -3335,9 +3249,8 @@ final class AppModel {
         showsWorkspaceBrowser = false
         selectedSessionID = payload.session.sessionId
         if createdByThisClient { prepareChatTitle(for: payload.session.sessionId) }
-        if isChatVisible,
-           unreadSessionIDs.remove(payload.session.sessionId) != nil {
-            refreshLiveActivity()
+        if isChatVisible {
+            unreadSessionIDs.remove(payload.session.sessionId)
         }
         selectedModelRoute = payload.session.model.route
         modelContextWindow = payload.session.model.modelContextWindow
@@ -3403,7 +3316,6 @@ final class AppModel {
         let visible = Set(sessions.map(\.sessionId))
         unreadSessionIDs.formIntersection(visible)
         reconcileChatTitles()
-        refreshLiveActivity()
         guard let selectedSessionID,
               !sessions.contains(where: { $0.sessionId == selectedSessionID }),
               sessionRequestID == nil
@@ -5386,7 +5298,6 @@ final class AppModel {
         pairingCodeInfo = nil
         pairingCode = ""
         pairingError = nil
-        if !preservingSession { refreshLiveActivity() }
         if !preservingSession { resetSessionState() }
         if preservingDrafts { restorePendingDrafts() }
         return connectionGeneration

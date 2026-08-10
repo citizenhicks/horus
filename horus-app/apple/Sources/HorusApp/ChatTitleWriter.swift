@@ -23,7 +23,7 @@ final class ChatTitleWriter {
     /// Long enough to stay specific, short enough for a sidebar row.
     nonisolated static let limit = 42
     /// Keeps the deterministic fallback compact enough for the sidebar and toolbar.
-    nonisolated private static let previewLimit = 21
+    nonisolated private static let previewLimit = limit
     /// The model only needs the shape of the request, not the whole essay.
     nonisolated private static let promptLimit = 600
 
