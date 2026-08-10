@@ -187,7 +187,7 @@ private struct ChatOptionsMenu: View {
                         glyph: .calendarDots
                     )
                 }
-                .disabled(!model.canModifySelectedSession || model.selectedSessionID == nil)
+                .disabled(!model.canStartCronSetup)
                 Button {
                     model.openWorkspaceBrowser()
                 } label: {
@@ -197,6 +197,22 @@ private struct ChatOptionsMenu: View {
                     )
                 }
                 .disabled(!model.canCreateSession)
+            }
+            if let session = model.selectedSession {
+                Section {
+                    Button {
+                        model.beginRenamingSession(session)
+                    } label: {
+                        HorusLabel(title: "Rename chat", glyph: .pencilSimple)
+                    }
+                    .disabled(!model.canRenameSession)
+                    Button(role: .destructive) {
+                        model.beginDeletingSession(session)
+                    } label: {
+                        HorusLabel(title: "Delete chat", glyph: .trash)
+                    }
+                    .disabled(!model.canRenameSession)
+                }
             }
         } label: {
             HorusIcon(.dotsThree)
@@ -1665,7 +1681,18 @@ private struct WidgetContentPopover: View {
 struct FrontendWidgetContentView: View {
     @Environment(\.horusPalette) private var palette
     let content: FrontendWidgetContent
+    let actionsEnabled: Bool
     let select: (FrontendPickerOption) -> Void
+
+    init(
+        content: FrontendWidgetContent,
+        actionsEnabled: Bool = true,
+        select: @escaping (FrontendPickerOption) -> Void
+    ) {
+        self.content = content
+        self.actionsEnabled = actionsEnabled
+        self.select = select
+    }
 
     var body: some View {
         switch content {
@@ -1685,6 +1712,7 @@ struct FrontendWidgetContentView: View {
                 .accessibilityLabel(option.label)
                 .accessibilityValue(option.detail)
                 .accessibilityHint(option.description)
+                .disabled(!actionsEnabled)
             }
         case .actionList(_, let items):
             if items.isEmpty {
@@ -1694,7 +1722,7 @@ struct FrontendWidgetContentView: View {
             } else {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(items) { item in
-                        FrontendActionListRow(item: item)
+                        FrontendActionListRow(item: item, actionsEnabled: actionsEnabled)
                     }
                 }
             }
@@ -1708,6 +1736,7 @@ private struct FrontendActionListRow: View {
     @State private var pendingAction: PendingAction?
     @State private var editedText = ""
     let item: FrontendActionListItem
+    let actionsEnabled: Bool
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -1745,6 +1774,7 @@ private struct FrontendActionListRow: View {
                 .accessibilityLabel("More actions")
                 .accessibilityHint("Shows available actions for this item")
                 .help("More actions")
+                .disabled(!actionsEnabled)
             }
         }
         .accessibilityElement(children: .contain)
@@ -1765,7 +1795,8 @@ private struct FrontendActionListRow: View {
                     pendingAction = nil
                 }
                 .disabled(
-                    editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    !actionsEnabled
+                        || editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         || editedText == pending.action.op.capabilityInput
                 )
             case .destructive:
@@ -1774,6 +1805,7 @@ private struct FrontendActionListRow: View {
                     model.submitFrontendOperation(pending.action.op)
                     pendingAction = nil
                 }
+                .disabled(!actionsEnabled)
             }
         } message: { pending in
             if pending.kind == .destructive {
@@ -1790,6 +1822,7 @@ private struct FrontendActionListRow: View {
     }
 
     private func activate(_ action: FrontendActionListAction) {
+        guard actionsEnabled else { return }
         if action.tone == "error" {
             pendingAction = PendingAction(kind: .destructive, itemText: item.text, action: action)
         } else if let input = action.op.capabilityInput {
@@ -1878,7 +1911,10 @@ struct FrontendWidgetSheet: View {
             List {
                 if let content = currentWidget?.widget.content {
                     Section {
-                        FrontendWidgetContentView(content: content) { option in
+                        FrontendWidgetContentView(
+                            content: content,
+                            actionsEnabled: model.isCapabilityEnabled(widget.capability)
+                        ) { option in
                             model.submitPickerOption(option)
                             dismiss()
                         }

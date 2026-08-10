@@ -11,7 +11,7 @@ use super::session_files::{SessionFileChunk, SessionFileStore};
 use super::tools::{
     Catalog, ExecutionMode, Tool, ToolContext, labeled_tool_heading, render_tool_event,
 };
-use super::{Middleware, ModelContext, RuntimeContext};
+use super::{Middleware, ModelContext, PromptSection, RuntimeContext};
 use crate::backend::model::{ToolDefinition, internal_user_message};
 use crate::protocol::{
     ATTACHMENTS_FIELD, EventMsg, FrontendBlock, FrontendContribution, INTERNAL_MESSAGE_FIELD,
@@ -67,8 +67,8 @@ impl Middleware for Attachments {
         }))
     }
 
-    fn prompt_fragment(&self, _runtime: &RuntimeContext) -> Result<Option<String>> {
-        Ok(Some(text::PROMPT_MAIN.into()))
+    fn prompt_section(&self, _runtime: &RuntimeContext) -> Result<Option<PromptSection>> {
+        Ok(Some(PromptSection::new(text::PROMPT_MAIN)))
     }
 
     fn frontend(&self) -> FrontendContribution {

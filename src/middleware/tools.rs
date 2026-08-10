@@ -11,8 +11,8 @@ use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::Middleware;
 use super::manifest::MiddlewareManifest;
+use super::{Middleware, PromptSection};
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
@@ -48,7 +48,7 @@ pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "tools",
     label: text::MANIFEST_LABEL,
     description: text::MANIFEST_DESCRIPTION,
-    required: false,
+    required: true,
     default_enabled: true,
     settings: &[],
 };
@@ -354,6 +354,10 @@ impl Tools {
             Arc::new(StopCommand),
         ])
     }
+
+    fn section(&self) -> PromptSection {
+        PromptSection::new(text::PROMPT_MAIN)
+    }
 }
 
 impl Middleware for Tools {
@@ -366,6 +370,10 @@ impl Middleware for Tools {
             catalog.register(Arc::clone(tool))?;
         }
         Ok(())
+    }
+
+    fn prompt_section(&self, _runtime: &super::RuntimeContext) -> Result<Option<PromptSection>> {
+        Ok(Some(self.section()))
     }
 
     fn frontend(&self) -> FrontendContribution {

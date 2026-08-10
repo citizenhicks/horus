@@ -229,6 +229,16 @@ impl Sandbox {
         }
     }
 
+    pub(crate) fn platform_prompt() -> &'static str {
+        if cfg!(target_os = "linux") {
+            text::PROMPT_LINUX
+        } else if cfg!(target_os = "macos") {
+            text::PROMPT_MACOS
+        } else {
+            text::PROMPT_OTHER
+        }
+    }
+
     /// Configures the isolated model reviewer used by automatic approval.
     #[must_use]
     pub fn approval_reviewer(mut self, reviewer: ApprovalReviewerConfig) -> Self {

@@ -9,7 +9,8 @@ Chats store enabled optional middleware IDs and generic scalar settings. The gat
 the ordered middleware catalog plus integer and select control schemas, so terminal and iOS
 clients render new middleware and settings without capability-specific code. Context offloading
 is enabled by default and masks successful tool output after a 50,000-token trailing window. The
-gateway always installs scheduling and durable sessions.
+gateway always installs sandboxing, workspace tools, turn steering, and durable sessions.
+Scheduling is an optional capability and is enabled by default for new chats.
 
 Install `horus-cli` to get both the client and gateway commands:
 
@@ -130,7 +131,10 @@ runs use durable Horus sessions and never install system crontab entries or
 spawn a child CLI. A frontend starts assisted setup with the protocol's cron
 setup operation (`/cron new [task]` in the terminal client); ordinary chat is
 not authorized to create schedules. Model-confirmed task files are owner-only
-under the gateway state directory. With no clients and no registered cron tasks,
+under the gateway state directory. Disabling scheduling for a chat removes its setup tool and
+prompt but does not delete or pause existing schedules; history stays visible and the capability
+state remains available to management views while agent scheduling is off.
+With no clients and no registered cron tasks,
 the gateway exits after 72 hours; any scheduled task disables that idle timer.
 Stopping the gateway manually also stops scheduled work, and missed runs are not
 replayed after restart.

@@ -51,7 +51,7 @@ pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "steering",
     label: text::MANIFEST_LABEL,
     description: text::MANIFEST_DESCRIPTION,
-    required: false,
+    required: true,
     default_enabled: true,
     settings: SETTINGS,
 };

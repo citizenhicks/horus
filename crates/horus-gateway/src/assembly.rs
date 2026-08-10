@@ -716,10 +716,11 @@ fn build_middleware(
 ) -> Result<(MiddlewareStack, Option<Arc<OnceLock<AgentConfig>>>)> {
     let mut entries: Vec<Arc<dyn Middleware>> = Vec::new();
     let mut subagent_template = None;
-    for feature in MIDDLEWARE
-        .iter()
-        .filter(|feature| feature.manifest.required || settings.enabled(feature.manifest.id))
-    {
+    for feature in MIDDLEWARE.iter().filter(|feature| {
+        feature.manifest.required
+            || settings.enabled(feature.manifest.id)
+            || matches!(feature.kind, BuiltinMiddleware::Scratchpad)
+    }) {
         let middleware: Arc<dyn Middleware> = match feature.kind {
             BuiltinMiddleware::Sandbox => continue,
             BuiltinMiddleware::Attachments => Arc::new(Attachments::new(session_files.clone())),
@@ -734,7 +735,9 @@ fn build_middleware(
                         .map_err(|error| HorusError::Tool(error.to_string()))
                 }))
             }
-            BuiltinMiddleware::Scratchpad => Arc::new(Scratchpad::new(scratchpad.clone())),
+            BuiltinMiddleware::Scratchpad => Arc::new(
+                Scratchpad::new(scratchpad.clone()).agent_enabled(settings.enabled("scratchpad")),
+            ),
             BuiltinMiddleware::Skills => Arc::new(Skills::discover_installed([
                 workspace.join(".agents/skills"),
                 workspace.join(".codex/skills"),
@@ -1080,7 +1083,9 @@ mod tests {
             .await
             .expect("seed checkpoint");
         let mut composition = original.agent.config.clone();
-        composition.middleware.set_enabled("tools", false);
+        composition.middleware.set_enabled("cron", false);
+        composition.middleware.set_enabled("scratchpad", false);
+        composition.system_prompt = "updated instructions".into();
         let updated = original
             .replacing_agent(1, composition, &gateway, store.state_dir(), None)
             .expect("updated chat spec");
@@ -1101,6 +1106,15 @@ mod tests {
         )
         .await
         .expect("assemble chat");
+        let scratchpad = built
+            .agent
+            .frontend()
+            .contributions()
+            .iter()
+            .find(|contribution| contribution.capability == "scratchpad")
+            .expect("disabled scratchpad management surface");
+        assert!(scratchpad.commands.is_empty());
+        assert_eq!(scratchpad.widgets.len(), 2);
         let (sender, mut events) = built.agent.into_parts();
         drop(sender);
         while events.recv().await.is_some() {}
@@ -1117,6 +1131,7 @@ mod tests {
             serde_json::json!({"identity": "preserved"})
         );
         assert_eq!(saved.agent.revision, 2);
-        assert!(!saved.agent.config.middleware.enabled("tools"));
+        assert!(!saved.agent.config.middleware.enabled("cron"));
+        assert_eq!(saved.agent.config.system_prompt, "updated instructions");
     }
 }

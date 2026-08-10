@@ -214,11 +214,10 @@ extension View {
     }
 }
 
-/// The app's own pending mark: the loader glyph, turning once a second.
+/// A bright head chasing a fading tail around the app's accent-colored loading track.
 ///
 /// The angle comes off the clock rather than an `onAppear` animation because streaming turns
-/// rebuild these rows and would visibly restart a `repeatForever` animation. Canvas keeps the
-/// drawing asynchronous; TimelineView still schedules the lightweight view update.
+/// rebuild these rows and would visibly restart a `repeatForever` animation.
 struct HorusSpinner: View {
     @Environment(\.horusPalette) private var palette
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -228,27 +227,37 @@ struct HorusSpinner: View {
 
     var body: some View {
         let paused = reduceMotion || scenePhase != .active
-        let tint = foreground ?? palette.muted
+        let tint = foreground ?? palette.accent
         TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: paused)) { _ in
             let turn = paused
                 ? 0
-                : ProcessInfo.processInfo.systemUptime.truncatingRemainder(dividingBy: 1)
-            Canvas(rendersAsynchronously: true) { [tint, turn] context, canvasSize in
-                var glyph = context.resolve(
-                    Image(HorusGlyph.loading02.asset).renderingMode(.template)
-                )
-                glyph.shading = .color(tint)
-                context.translateBy(x: canvasSize.width / 2, y: canvasSize.height / 2)
-                context.rotate(by: .degrees(turn * 360))
-                context.draw(
-                    glyph,
-                    in: CGRect(
-                        x: -canvasSize.width / 2,
-                        y: -canvasSize.height / 2,
-                        width: canvasSize.width,
-                        height: canvasSize.height
+                : ProcessInfo.processInfo.systemUptime
+                    .truncatingRemainder(dividingBy: 0.9) / 0.9
+            let lineWidth = max(1.3, size * 0.1)
+            let headSize = max(2.4, size * 0.19)
+            let radius = max(0, (size - lineWidth) / 2)
+            ZStack {
+                Circle()
+                    .trim(from: 0.12, to: 0.86)
+                    .stroke(
+                        AngularGradient(
+                            gradient: Gradient(stops: [
+                                .init(color: tint.opacity(0), location: 0.12),
+                                .init(color: tint.opacity(0.04), location: 0.3),
+                                .init(color: tint.opacity(0.14), location: 0.52),
+                                .init(color: tint.opacity(0.38), location: 0.72),
+                                .init(color: tint.opacity(0.82), location: 0.86),
+                            ]),
+                            center: .center
+                        ),
+                        style: StrokeStyle(lineWidth: lineWidth, lineCap: .round)
                     )
-                )
+                    .rotationEffect(.degrees(turn * 360 - 90))
+                Circle()
+                    .fill(tint)
+                    .frame(width: headSize, height: headSize)
+                    .offset(y: -radius)
+                    .rotationEffect(.degrees(turn * 360 + 0.86 * 360))
             }
             .frame(width: size, height: size)
         }

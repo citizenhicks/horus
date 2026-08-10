@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::Middleware;
+use super::PromptSection;
 use super::manifest::MiddlewareManifest;
 use super::tools::Catalog;
 use super::tools::ExecutionMode;
@@ -90,6 +91,22 @@ impl Skills {
         }
         self.prompt = prompt;
         Ok(self)
+    }
+
+    fn section(&self) -> Option<PromptSection> {
+        if self.skills.is_empty() {
+            return None;
+        }
+        let skills = self
+            .skills
+            .values()
+            .map(|skill| format!("- {}: {}", skill.name, skill.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(PromptSection::new(format!(
+            "{}\n\n{skills}",
+            self.prompt.trim()
+        )))
     }
 }
 
@@ -202,16 +219,8 @@ impl Middleware for Skills {
         }))
     }
 
-    fn prompt_fragment(&self, _runtime: &super::RuntimeContext) -> Result<Option<String>> {
-        if self.skills.is_empty() {
-            return Ok(None);
-        }
-        let mut prompt = format!("<skills>\n{}\n", self.prompt.trim());
-        for skill in self.skills.values() {
-            prompt.push_str(&format!("- {}: {}\n", skill.name, skill.description));
-        }
-        prompt.push_str("</skills>");
-        Ok(Some(prompt))
+    fn prompt_section(&self, _runtime: &super::RuntimeContext) -> Result<Option<PromptSection>> {
+        Ok(self.section())
     }
 
     fn frontend(&self) -> FrontendContribution {
@@ -402,6 +411,31 @@ fn unquote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_section_is_absent_without_skills() {
+        let temporary = tempfile::tempdir().expect("temporary skills");
+        let skills = Skills::discover([temporary.path().to_path_buf()]).expect("empty skills");
+
+        assert_eq!(skills.section(), None);
+    }
+
+    #[test]
+    fn prompt_section_uses_markdown_in_skill_name_order() {
+        let temporary = tempfile::tempdir().expect("temporary skills");
+        let root = temporary.path().join("skills");
+        write_skill(&root, "second", "zebra", "Last alphabetically");
+        write_skill(&root, "first", "alpha", "First alphabetically");
+        let skills = Skills::discover([root]).expect("skills");
+
+        assert_eq!(
+            skills.section(),
+            Some(PromptSection::new(format!(
+                "{}\n\n- alpha: First alphabetically\n- zebra: Last alphabetically",
+                text::PROMPT_DEFAULT
+            )))
+        );
+    }
 
     #[test]
     fn installed_skills_do_not_replace_explicit_skills() {

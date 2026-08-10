@@ -9,6 +9,7 @@ use cap_std::fs::Dir;
 use cap_std::fs::MetadataExt as _;
 
 use super::Middleware;
+use super::PromptSection;
 use super::manifest::MiddlewareManifest;
 use crate::{Error, Result};
 
@@ -35,7 +36,7 @@ pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
 
 /// Optional root workspace instructions composed into the system prompt once.
 pub struct Instructions {
-    fragment: Option<String>,
+    body: Option<String>,
 }
 
 impl Instructions {
@@ -48,14 +49,16 @@ impl Instructions {
             };
             let content = content.trim();
             return Ok(Self {
-                fragment: (!content.is_empty()).then(|| {
-                    format!(
-                        "<workspace_instructions source=\"{name}\">\n{content}\n</workspace_instructions>"
-                    )
-                }),
+                body: (!content.is_empty()).then(|| format!("Source: `{name}`\n\n{content}")),
             });
         }
-        Ok(Self { fragment: None })
+        Ok(Self { body: None })
+    }
+
+    fn section(&self) -> Option<PromptSection> {
+        self.body
+            .clone()
+            .map(|body| PromptSection::titled(text::PROMPT_TITLE, body))
     }
 }
 
@@ -64,8 +67,8 @@ impl Middleware for Instructions {
         MANIFEST.id
     }
 
-    fn prompt_fragment(&self, _runtime: &super::RuntimeContext) -> Result<Option<String>> {
-        Ok(self.fragment.clone())
+    fn prompt_section(&self, _runtime: &super::RuntimeContext) -> Result<Option<PromptSection>> {
+        Ok(self.section())
     }
 }
 
@@ -125,7 +128,7 @@ mod tests {
         assert!(
             Instructions::discover(workspace.path())
                 .expect("empty workspace")
-                .fragment
+                .body
                 .is_none()
         );
         std::fs::write(workspace.path().join(INSTRUCTIONS_FILE), "base").expect("base");
@@ -134,10 +137,11 @@ mod tests {
         let instructions = Instructions::discover(workspace.path()).expect("instructions");
 
         assert_eq!(
-            instructions.fragment.as_deref(),
-            Some(
-                "<workspace_instructions source=\"AGENTS.override.md\">\noverride\n</workspace_instructions>"
-            )
+            instructions.section(),
+            Some(PromptSection::titled(
+                "workspace instructions",
+                "Source: `AGENTS.override.md`\n\noverride"
+            ))
         );
     }
 

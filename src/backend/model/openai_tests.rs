@@ -502,7 +502,7 @@ fn responses_web_search_preserves_every_query() {
 }
 
 #[test]
-fn compaction_shape_is_provider_neutral_and_opt_in() {
+fn compaction_shape_contains_only_the_model_and_history() {
     let provider =
         OpenAi::new("test-key", "https://api.openai.com/v1", "test-model").expect("provider");
     assert!(!provider.compaction_endpoint());
@@ -511,22 +511,16 @@ fn compaction_shape_is_provider_neutral_and_opt_in() {
         "content": "hello",
         "_private": true
     })];
-    let tools = [ToolDefinition {
-        name: "read".into(),
-        description: "Read".into(),
-        parameters: serde_json::json!({"type": "object"}),
-    }];
     let body = provider
         .with_compaction_endpoint()
-        .compact_body(CompactRequest {
-            instructions: "compact",
-            input: &input,
-            tools: &tools,
-        })
+        .compact_body(CompactRequest { input: &input })
         .expect("compact body");
 
-    assert_eq!(body["instructions"], "compact");
-    assert_eq!(body["input"][0].get("_private"), None);
-    assert_eq!(body["tools"][0]["name"], "read");
-    assert_eq!(body["parallel_tool_calls"], true);
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "model": "test-model",
+            "input": [{"role": "user", "content": "hello"}]
+        })
+    );
 }

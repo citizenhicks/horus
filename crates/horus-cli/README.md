@@ -93,11 +93,11 @@ The selected chat workspace—not the CLI process—is the command and file boun
 prompt aborts a headless run, so scheduled work that edits files or runs commands needs an
 appropriate chat approval policy.
 
-Inside the TUI, `/cron new [task]` starts the model-assisted setup. The model asks for missing task
-or frequency details, then an approval-required gateway tool saves and registers the final task.
-Ordinary chat cannot create schedules. `/cron` also exposes list, reschedule, delete, run, and
-history operations for the selected chat; every scheduled execution creates a separate durable
-result chat.
+Inside the TUI, `/cron new [task]` starts the model-assisted setup when scheduling is enabled for
+the chat. The model asks for missing task or frequency details, then an approval-required gateway
+tool saves and registers the final task. Ordinary chat cannot create schedules. `/cron` also
+exposes list, reschedule, delete, run, and history operations for the selected chat; every
+scheduled execution creates a separate durable result chat.
 
 `/login` is the single provider setup path. It opens the guided provider screen, where API keys
 can be pasted into a masked field, the environment variable declared by the provider manifest is

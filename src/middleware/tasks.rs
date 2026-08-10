@@ -7,7 +7,9 @@ use serde_json::Value;
 
 use super::manifest::MiddlewareManifest;
 use super::tools::{Catalog, Tool, ToolContext, render_tool_event};
-use super::{Middleware, MiddlewareCommandContext, MiddlewareCommandOutput, RuntimeContext};
+use super::{
+    Middleware, MiddlewareCommandContext, MiddlewareCommandOutput, PromptSection, RuntimeContext,
+};
 use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::model::ToolDefinition;
 use crate::protocol::{
@@ -72,8 +74,8 @@ impl Middleware for Tasks {
         }))
     }
 
-    fn prompt_fragment(&self, _runtime: &RuntimeContext) -> Result<Option<String>> {
-        Ok(Some(text::PROMPT_MAIN.into()))
+    fn prompt_section(&self, _runtime: &RuntimeContext) -> Result<Option<PromptSection>> {
+        Ok(Some(PromptSection::new(text::PROMPT_MAIN)))
     }
 
     fn frontend(&self) -> FrontendContribution {

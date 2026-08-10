@@ -1005,6 +1005,13 @@ struct CronView: View {
             if let error = model.cronError {
                 StatusBanner(tone: .error, title: "Schedule rejected", detail: error)
             }
+            if !model.isSchedulingEnabled {
+                StatusBanner(
+                    tone: .neutral,
+                    title: "Scheduling is off",
+                    detail: "Saved tasks and run history remain visible. Enable Cron in this chat to change or run them."
+                )
+            }
 
             Section {
                 if model.cronTasks.isEmpty {
@@ -1062,6 +1069,7 @@ private struct CronTaskRow: View {
                 TextField("* * * * *", text: $schedule)
                     .font(HorusStyle.bodyFont.monospaced())
                     .settingsField()
+                    .disabled(!model.isSchedulingEnabled)
             }
             HorusActionRow(collapsesToIcons: true) {
                 Button("Run now", glyph: .playFill) { model.runCron(task) }
@@ -1074,6 +1082,7 @@ private struct CronTaskRow: View {
                     model.deleteCron(task)
                 }
             }
+            .disabled(!model.isSchedulingEnabled)
         }
         .onChange(of: task.schedule) { schedule = task.schedule }
     }

@@ -653,6 +653,9 @@ final class AppModel {
     @ObservationIgnored private var titleEligibleSessionIDs: Set<String> = []
     private var pendingChatTitles: [String: PendingChatTitle] = [:]
     var selectedSessionID: String?
+    var sessionToRename: SessionRecord?
+    var sessionRenameDraft = ""
+    var sessionToDelete: SessionRecord?
     private(set) var unreadSessionIDs: Set<String> = []
     var transcript: [TranscriptEntry] = []
     private var replayPresentedTranscript: [TranscriptEntry]?
@@ -962,6 +965,24 @@ final class AppModel {
 
     var canModifySelectedSession: Bool {
         canOpenSession && activeTurnID == nil && pendingApproval == nil
+    }
+
+    func isCapabilityEnabled(_ capability: String) -> Bool {
+        guard let snapshot = agentSnapshot else { return false }
+        guard let feature = middlewareFeatures.first(where: { $0.id == capability }) else {
+            return snapshot.config.middleware.enabled.contains(capability)
+                || contributions.contains { $0.capability == capability }
+        }
+        return feature.required
+            || snapshot.config.middleware.enabled.contains(capability)
+    }
+
+    var isSchedulingEnabled: Bool { isCapabilityEnabled("cron") }
+
+    var canStartCronSetup: Bool {
+        canModifySelectedSession
+            && selectedSessionID != nil
+            && isSchedulingEnabled
     }
 
     var isSwitchingGitBranch: Bool { gitBranchRequestID != nil }
@@ -1298,6 +1319,20 @@ final class AppModel {
 
     var currentSessionTitle: String {
         selectedSessionID.map(sessionTitle) ?? SessionRecord.untitledDisplayTitle
+    }
+
+    var selectedSession: SessionRecord? {
+        guard let selectedSessionID else { return nil }
+        return sessions.first { $0.sessionId == selectedSessionID }
+    }
+
+    func beginRenamingSession(_ session: SessionRecord) {
+        sessionRenameDraft = displayedTitle(for: session)
+        sessionToRename = session
+    }
+
+    func beginDeletingSession(_ session: SessionRecord) {
+        sessionToDelete = session
     }
 
     func displayedTitle(for session: SessionRecord) -> String {
@@ -2261,6 +2296,11 @@ final class AppModel {
 
     func submitFrontendOperation(_ operation: AgentOperation) {
         guard let sessionID = selectedSessionID else { return }
+        if case .capabilityCommand(let capability, _, _, _, _) = operation,
+           middlewareFeatures.contains(where: { $0.id == capability }),
+           !isCapabilityEnabled(capability) {
+            return
+        }
         transmit(.submit(
             sessionID: sessionID,
             submission: Submission(id: requestID("widget-action"), op: operation)
@@ -2636,7 +2676,7 @@ final class AppModel {
     }
 
     func startCronSetup() {
-        guard let sessionID = selectedSessionID else { return }
+        guard canStartCronSetup, let sessionID = selectedSessionID else { return }
         let task = cronTaskDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         let id = requestID("cron-setup")
         cronRequestIDs.insert(id)
@@ -2653,7 +2693,7 @@ final class AppModel {
     }
 
     func rescheduleCron(_ task: CronTask, schedule: String) {
-        guard let sessionID = selectedSessionID else { return }
+        guard isSchedulingEnabled, let sessionID = selectedSessionID else { return }
         let value = schedule.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
         let request = requestID("cron-reschedule")
@@ -2670,7 +2710,7 @@ final class AppModel {
     }
 
     func deleteCron(_ task: CronTask) {
-        guard let sessionID = selectedSessionID else { return }
+        guard isSchedulingEnabled, let sessionID = selectedSessionID else { return }
         let request = requestID("cron-delete")
         cronRequestIDs.insert(request)
         transmit(.deleteCron(requestID: request, sessionID: sessionID, id: task.id)) { [weak self] message in
@@ -2680,7 +2720,7 @@ final class AppModel {
     }
 
     func runCron(_ task: CronTask) {
-        guard let sessionID = selectedSessionID else { return }
+        guard isSchedulingEnabled, let sessionID = selectedSessionID else { return }
         let request = requestID("cron-run")
         cronRequestIDs.insert(request)
         transmit(.runCron(requestID: request, sessionID: sessionID, id: task.id)) { [weak self] message in
@@ -5474,6 +5514,9 @@ final class AppModel {
             sessions = []
             gatewayMachineName = ""
             selectedSessionID = nil
+            sessionToRename = nil
+            sessionRenameDraft = ""
+            sessionToDelete = nil
             unreadSessionIDs.removeAll()
             profile = nil
             modelChoices = []

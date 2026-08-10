@@ -129,15 +129,12 @@ impl Middleware for Compaction {
                 return Ok(());
             }
             let output = if context.model.compaction_endpoint(context.provider)? {
-                let tools = context.tools.definitions();
                 context
                     .model
                     .compact(
                         context.provider,
                         CompactRequest {
-                            instructions: context.instructions,
                             input: context.input(),
-                            tools: &tools,
                         },
                     )
                     .await?

@@ -262,20 +262,28 @@ mod tests {
         assert!(validate(&config).is_ok());
         assert!(!config.enabled("tasks"));
         assert!(config.enabled("artifacts"));
+        assert!(config.enabled("cron"));
         assert!(config.enabled("context_offloading"));
         assert_eq!(
             integer_setting(&config, "context_offloading", "stale_after_tokens")
                 .expect("context setting"),
             DEFAULT_STALE_AFTER_TOKENS,
         );
-        assert!(
+        assert_eq!(
             features
                 .iter()
-                .any(|feature| feature.id == "sessions" && feature.required)
+                .filter(|feature| feature.required)
+                .map(|feature| feature.id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["sandbox", "sessions", "steering", "tools"])
         );
 
+        let mut without_cron = config.clone();
+        without_cron.set_enabled("cron", false);
+        assert!(validate(&without_cron).is_ok());
+
         let mut invalid = config;
-        invalid.set_enabled("sessions", true);
+        invalid.set_enabled("tools", true);
         assert!(validate(&invalid).is_err());
     }
 

@@ -27,7 +27,7 @@ final class GatewayWireTests: XCTestCase {
     }
 
     private var configJSON: String {
-        #"{"revision":4,"config":{"provider":{"provider":"openai_socket","model":"gpt-5.6-sol","reasoning_effort":"high","web_search":"cached"},"middleware":{"enabled":["skills","subagents","tools"],"settings":{"context_offloading":{"stale_after_tokens":50000},"subagents":{"model_route":"openai_socket/gpt-5.6-sol"}}},"system_prompt":"Stay focused.","max_model_steps":256}}"#
+        #"{"revision":4,"config":{"provider":{"provider":"openai_socket","model":"gpt-5.6-sol","reasoning_effort":"high","web_search":"cached"},"middleware":{"enabled":["cron","skills","subagents"],"settings":{"context_offloading":{"stale_after_tokens":50000},"subagents":{"model_route":"openai_socket/gpt-5.6-sol"}}},"system_prompt":"Stay focused.","max_model_steps":256}}"#
     }
 
     private var usageJSON: String {
@@ -64,7 +64,7 @@ final class GatewayWireTests: XCTestCase {
                 webSearch: .cached
             ),
             middleware: MiddlewareConfig(
-                enabled: ["skills", "subagents", "tools"],
+                enabled: ["cron", "skills", "subagents"],
                 settings: [
                     "context_offloading": ["stale_after_tokens": .integer(50_000)],
                     "subagents": ["model_route": .string("openai_socket/gpt-5.6-sol")]
@@ -199,7 +199,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(encodedConfig["max_model_steps"] as? Int, 256)
         let middleware = try XCTUnwrap(encodedConfig["middleware"] as? [String: Any])
         let enabled = try XCTUnwrap(middleware["enabled"] as? [String])
-        XCTAssertEqual(Set(enabled), ["skills", "subagents", "tools"])
+        XCTAssertEqual(Set(enabled), ["cron", "skills", "subagents"])
         let settings = try XCTUnwrap(middleware["settings"] as? [String: Any])
         let subagents = try XCTUnwrap(settings["subagents"] as? [String: Any])
         XCTAssertEqual(subagents["model_route"] as? String, "openai_socket/gpt-5.6-sol")
@@ -496,7 +496,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(payload.runStats.elapsedMs, 9_000)
         XCTAssertEqual(payload.contributions.first?.count, 2)
         XCTAssertEqual(payload.contributions.first?.acceptsFileAttachments, false)
-        XCTAssertEqual(payload.config.config.middleware.enabled, ["skills", "subagents", "tools"])
+        XCTAssertEqual(payload.config.config.middleware.enabled, ["cron", "skills", "subagents"])
         XCTAssertEqual(payload.config.config.maxModelSteps, 256)
         guard let widget = payload.contributions.first?.widgets.first,
               case .picker(let title, let options) = widget.content,

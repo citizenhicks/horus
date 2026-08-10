@@ -1762,8 +1762,7 @@ mod tests {
                         },
                         "middleware": {
                             "enabled": [
-                                "compaction", "context_offloading", "skills", "steering",
-                                "subagents", "tools"
+                                "compaction", "context_offloading", "cron", "skills", "subagents"
                             ],
                             "settings": {
                                 "context_offloading": {"stale_after_tokens": 50000}

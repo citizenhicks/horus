@@ -533,8 +533,8 @@ pub trait Middleware: Send + Sync {
         Ok(())
     }
 
-    /// Contributes immutable system instructions once while the agent is created.
-    fn prompt_fragment(&self, _runtime: &RuntimeContext) -> Result<Option<String>> {
+    /// Contributes one immutable system-prompt section while the agent is created.
+    fn prompt_section(&self, _runtime: &RuntimeContext) -> Result<Option<PromptSection>> {
         Ok(None)
     }
 
@@ -632,6 +632,33 @@ pub trait Middleware: Send + Sync {
     }
 }
 
+/// One middleware-owned section of the assembled system prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSection {
+    title: Option<&'static str>,
+    body: String,
+}
+
+impl PromptSection {
+    /// Uses the contributing middleware's stable name as the Markdown heading.
+    #[must_use]
+    pub fn new(body: impl Into<String>) -> Self {
+        Self {
+            title: None,
+            body: body.into(),
+        }
+    }
+
+    /// Uses an explicit Markdown heading when the middleware name is ambiguous.
+    #[must_use]
+    pub fn titled(title: &'static str, body: impl Into<String>) -> Self {
+        Self {
+            title: Some(title),
+            body: body.into(),
+        }
+    }
+}
+
 impl Middleware for Sandbox {
     fn name(&self) -> &'static str {
         crate::backend::sandbox::MANIFEST.id
@@ -639,6 +666,10 @@ impl Middleware for Sandbox {
 
     fn frontend(&self) -> FrontendContribution {
         Sandbox::frontend(self)
+    }
+
+    fn prompt_section(&self, _runtime: &RuntimeContext) -> Result<Option<PromptSection>> {
+        Ok(Some(PromptSection::new(Sandbox::platform_prompt())))
     }
 
     fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
@@ -716,20 +747,29 @@ impl MiddlewareStack {
     }
 
     pub(crate) fn system_prompt(&self, base: &str, runtime: &RuntimeContext) -> Result<String> {
-        let mut prompt = base.trim().to_string();
+        let mut prompt = format!("**instructions**\n\n{}", base.trim());
         for entry in &self.entries {
-            let Some(fragment) = entry.prompt_fragment(runtime)? else {
+            let Some(section) = entry.prompt_section(runtime)? else {
                 continue;
             };
-            let fragment = fragment.trim();
-            if fragment.is_empty() {
+            let body = section.body.trim();
+            if body.is_empty() {
                 return Err(Error::Config(format!(
-                    "middleware `{}` returned an empty prompt fragment",
+                    "middleware `{}` returned an empty prompt section",
                     entry.name()
                 )));
             }
-            prompt.push_str("\n\n");
-            prompt.push_str(fragment);
+            let title = section.title.unwrap_or_else(|| entry.name()).trim();
+            if title.is_empty() || title.lines().count() != 1 {
+                return Err(Error::Config(format!(
+                    "middleware `{}` returned an invalid prompt section title",
+                    entry.name()
+                )));
+            }
+            prompt.push_str("\n\n**");
+            prompt.push_str(title);
+            prompt.push_str("**\n\n");
+            prompt.push_str(body);
         }
         Ok(prompt)
     }

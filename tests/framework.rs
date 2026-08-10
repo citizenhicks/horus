@@ -30,6 +30,7 @@ use horus::backend::model::ModelEventSink;
 use horus::backend::model::ModelOutput;
 use horus::backend::model::ModelRequest;
 use horus::backend::model::ModelRouter;
+use horus::backend::model::ToolDefinition;
 use horus::backend::sandbox::ApprovalPolicy;
 use horus::backend::sandbox::CommandOutputSink;
 use horus::backend::sandbox::NetworkAccess;
@@ -38,9 +39,11 @@ use horus::backend::sandbox::SandboxBackend;
 use horus::backend::sandbox::local::LocalSandbox;
 use horus::middleware::Middleware;
 use horus::middleware::MiddlewareStack;
+use horus::middleware::PromptSection;
 use horus::middleware::RuntimeContext;
 use horus::middleware::attachments::Attachments;
 use horus::middleware::compaction::Compaction;
+use horus::middleware::cron::Cron;
 use horus::middleware::session_files::{MAX_UPLOAD_CHUNK_BYTES, SessionFileStore};
 use horus::middleware::skills::Skills;
 use horus::middleware::steering::Steering;
@@ -128,14 +131,142 @@ async fn middleware_prompt_is_composed_once_per_agent() {
     }
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let platform = if cfg!(target_os = "linux") {
+        "Linux"
+    } else if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "an unsupported operating system"
+    };
+    let expected = format!(
+        "**instructions**\n\ntest system prompt\n\n**sandbox**\n\nHorus is running on {platform}.\n\n**prompt extension**\n\ncapability prompt"
+    );
     assert!(
         model
             .requests
             .lock()
             .expect("requests")
             .iter()
-            .all(|request| request.instructions == "test system prompt\n\ncapability prompt")
+            .all(|request| request.instructions == expected)
     );
+}
+
+#[tokio::test]
+async fn native_compaction_survives_recreation_with_current_prompt_and_tools() {
+    let workspace = TempDir::new().expect("create workspace");
+    let model = Arc::new(ScriptedModel::with_compaction(
+        vec![
+            text_response_with_usage("first done", usage(2_000)),
+            text_response("compacted done"),
+            text_response("second done"),
+        ],
+        vec![
+            CompactOutput::from_output(
+                vec![serde_json::json!({
+                    "type": "compaction",
+                    "encrypted_content": "opaque"
+                })],
+                usage(10),
+            )
+            .expect("compaction output"),
+        ],
+    ));
+    let route: Arc<dyn Model> = model.clone();
+    let router = Arc::new(ModelRouter::new("test", route));
+    let sandbox = Arc::new(Sandbox::new(
+        Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+        ApprovalPolicy::Ask,
+    ));
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(MemoryCheckpoints::default());
+    let config = |base: &str, section: &'static str, scheduling: bool| {
+        let mut middleware: Vec<Arc<dyn Middleware>> = vec![Arc::new(StaticPrompt(section))];
+        if scheduling {
+            middleware.push(Arc::new(Cron::new(|_, _, _| Ok("unused".into()))));
+        }
+        middleware.push(Arc::new(
+            Compaction::new(1_000).expect("compaction middleware"),
+        ));
+        AgentConfig::new(
+            Arc::clone(&router),
+            Arc::clone(&sandbox),
+            Arc::clone(&checkpoints),
+            MiddlewareStack::new(middleware).expect("middleware"),
+            base,
+        )
+        .session_id("prompt-refresh")
+    };
+
+    let mut first = create_agent(config("old base marker", "old section marker", true))
+        .await
+        .expect("first agent");
+    first
+        .sender()
+        .submit(Op::UserInput {
+            text: "first turn".into(),
+            attachments: Vec::new(),
+        })
+        .expect("first turn");
+    assert_eq!(final_message(&mut first).await, "first done");
+    first
+        .sender()
+        .submit(Op::UserInput {
+            text: "compact turn".into(),
+            attachments: Vec::new(),
+        })
+        .expect("compaction turn");
+    assert_eq!(final_message(&mut first).await, "compacted done");
+    let (sender, mut events) = first.into_parts();
+    drop(sender);
+    while events.recv().await.is_some() {}
+
+    let mut second = create_agent(config("new base marker", "new section marker", false))
+        .await
+        .expect("replacement agent");
+    second
+        .sender()
+        .submit(Op::UserInput {
+            text: "second turn".into(),
+            attachments: Vec::new(),
+        })
+        .expect("second turn");
+    assert_eq!(final_message(&mut second).await, "second done");
+
+    let requests = model.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].tools[0].name, "schedule_task");
+    assert!(requests[0].instructions.contains("**cron**"));
+    assert_eq!(requests[1].tools, requests[0].tools);
+    let replacement = &requests[2];
+    assert!(replacement.tools.is_empty());
+    assert!(!replacement.instructions.contains("**cron**"));
+    assert_eq!(
+        replacement.instructions.matches("new base marker").count(),
+        1
+    );
+    assert_eq!(
+        replacement
+            .instructions
+            .matches("new section marker")
+            .count(),
+        1
+    );
+    assert!(!replacement.instructions.contains("old base marker"));
+    assert!(!replacement.instructions.contains("old section marker"));
+    let history = serde_json::to_string(&replacement.input).expect("serialize history");
+    assert!(history.contains("opaque"));
+    assert!(history.contains("second turn"));
+    assert!(!history.contains("base marker"));
+    assert!(!history.contains("section marker"));
+    drop(requests);
+
+    let compact_requests = model.compact_requests.lock().expect("compact requests");
+    assert_eq!(compact_requests.len(), 1);
+    let compact_input = serde_json::to_string(&compact_requests[0]).expect("compact input");
+    assert!(compact_input.contains("first turn"));
+    assert!(compact_input.contains("compact turn"));
+    assert!(!compact_input.contains("old base marker"));
+    assert!(!compact_input.contains("old section marker"));
+    assert!(!compact_input.contains("schedule_task"));
 }
 
 #[tokio::test]
@@ -569,7 +700,7 @@ async fn steering_is_injected_before_native_compaction() {
     let requests = scripted.compact_requests.lock().expect("compact requests");
     assert_eq!(requests.len(), 1);
     assert!(
-        serde_json::to_string(&requests[0].input)
+        serde_json::to_string(&requests[0])
             .expect("serialize compact input")
             .contains("steered")
     );
@@ -835,6 +966,11 @@ async fn compaction_falls_back_to_a_model_summary_and_keeps_recent_context() {
     let requests = model.requests.lock().expect("requests");
     assert_eq!(requests.len(), 3);
     assert!(requests[1].instructions.contains("Summarize coding-agent"));
+    assert_eq!(requests[2].instructions, requests[0].instructions);
+    assert_eq!(
+        requests[2].instructions.matches("**instructions**").count(),
+        1
+    );
     let rebuilt = serde_json::to_string(&requests[2].input).expect("serialize rebuilt context");
     assert!(rebuilt.contains("<compacted_context>"));
     assert!(rebuilt.contains("continue"));
@@ -1255,7 +1391,7 @@ struct ScriptedModel {
     responses: Mutex<VecDeque<ModelOutput>>,
     compact_outputs: Mutex<VecDeque<CompactOutput>>,
     requests: Mutex<Vec<RecordedRequest>>,
-    compact_requests: Mutex<Vec<RecordedRequest>>,
+    compact_requests: Mutex<Vec<Vec<Value>>>,
     compaction_endpoint: bool,
     image_input: bool,
 }
@@ -1263,18 +1399,34 @@ struct ScriptedModel {
 struct RecordedRequest {
     instructions: String,
     input: Vec<Value>,
+    tools: Vec<ToolDefinition>,
 }
 
 struct PromptExtension(Arc<AtomicUsize>);
+
+struct StaticPrompt(&'static str);
 
 impl Middleware for PromptExtension {
     fn name(&self) -> &'static str {
         "prompt_extension"
     }
 
-    fn prompt_fragment(&self, _runtime: &RuntimeContext) -> Result<Option<String>> {
+    fn prompt_section(&self, _runtime: &RuntimeContext) -> Result<Option<PromptSection>> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(Some("capability prompt".into()))
+        Ok(Some(PromptSection::titled(
+            "prompt extension",
+            "capability prompt",
+        )))
+    }
+}
+
+impl Middleware for StaticPrompt {
+    fn name(&self) -> &'static str {
+        "dynamic"
+    }
+
+    fn prompt_section(&self, _runtime: &RuntimeContext) -> Result<Option<PromptSection>> {
+        Ok(Some(PromptSection::new(self.0)))
     }
 }
 
@@ -1318,6 +1470,7 @@ impl Model for ScriptedModel {
                 .push(RecordedRequest {
                     instructions: request.instructions.into(),
                     input: request.input.to_vec(),
+                    tools: request.tools.to_vec(),
                 });
             let output = self
                 .responses
@@ -1341,10 +1494,7 @@ impl Model for ScriptedModel {
             self.compact_requests
                 .lock()
                 .expect("compact requests")
-                .push(RecordedRequest {
-                    instructions: request.instructions.into(),
-                    input: request.input.to_vec(),
-                });
+                .push(request.input.to_vec());
             self.compact_outputs
                 .lock()
                 .expect("compact outputs")

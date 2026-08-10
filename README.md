@@ -158,11 +158,12 @@ do not dispatch tools or implement middleware behavior.
 | `crates/horus-cli/src/frontend/` | Terminal lifecycle, input, and rendering only |
 | `horus-app/apple/` | Apple lifecycle, platform storage, and SwiftUI rendering only |
 
-Middleware declaration order is observable hook and prompt-fragment order. Each
+Middleware declaration order is observable hook and prompt-section order. Each
 capability owns its complete vertical slice; adding one to the shipped runtime
 changes its module and the explicit gateway registry, not the agent loop or a
-frontend-specific dispatcher. Static prompt fragments are composed once at
-agent creation, while dynamic state enters through runtime hooks.
+frontend-specific dispatcher. Static prompt sections are composed once at
+agent creation. Changing a chat recipe recreates that agent, so enabled sections refresh without
+entering conversation history; dynamic turn state enters through runtime hooks.
 
 Checkpoint backends expose cursor-paginated session catalogs and
 sequence-bounded transcript pages. Context offloading and compaction remain

@@ -26,8 +26,8 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 
-const CONFIG_VERSION: u32 = 14;
-const CHAT_SPEC_VERSION: u32 = 6;
+const CONFIG_VERSION: u32 = 15;
+const CHAT_SPEC_VERSION: u32 = 7;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "horus_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
 const CLOUDFLARE_TOKEN_FILE: &str = "cloudflare-token";
@@ -1283,22 +1283,22 @@ mod tests {
     }
 
     #[test]
-    fn gateway_config_rejects_v13_without_migration() {
+    fn gateway_config_rejects_v14_without_migration() {
         let root = tempfile::tempdir().expect("temporary directory");
         let state = root.path().join("state");
         ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
         let path = state.join(CONFIG_FILE);
         let contents = fs::read_to_string(&path)
             .expect("read gateway config")
-            .replacen("version = 14", "version = 13", 1);
-        fs::write(&path, contents).expect("write v13 config");
+            .replacen("version = 15", "version = 14", 1);
+        fs::write(&path, contents).expect("write v14 config");
 
-        let error = ConfigStore::open(state).expect_err("v13 must be rejected");
+        let error = ConfigStore::open(state).expect_err("v14 must be rejected");
 
         assert!(
             error
                 .to_string()
-                .contains("unsupported gateway config version 13")
+                .contains("unsupported gateway config version 14")
         );
     }
 
@@ -1329,7 +1329,7 @@ mod tests {
         let contents = fs::read_to_string(state.join(CONFIG_FILE)).expect("read config");
         let (_, restored) = ConfigStore::open(state).expect("open config");
 
-        assert!(contents.starts_with("version = 14"));
+        assert!(contents.starts_with("version = 15"));
         assert!(contents.contains("max_model_steps = 256"));
         assert!(contents.contains("[default_agent.config.middleware.settings.context_offloading]"));
         assert!(contents.contains("[default_agent.config.middleware.settings.sessions]"));
@@ -1873,6 +1873,18 @@ mod tests {
         assert_eq!(
             ChatSpec::from_metadata(&metadata, &state, None).expect("restore chat spec"),
             spec
+        );
+        let mut previous = metadata.clone();
+        previous
+            .get_mut(CHAT_SPEC_METADATA_KEY)
+            .and_then(Value::as_object_mut)
+            .expect("chat metadata object")
+            .insert("version".into(), Value::from(6));
+        assert!(
+            ChatSpec::from_metadata(&previous, &state, None)
+                .expect_err("v6 chat specification must be rejected")
+                .to_string()
+                .contains("unsupported chat configuration version 6")
         );
         metadata
             .get_mut(CHAT_SPEC_METADATA_KEY)

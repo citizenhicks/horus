@@ -1476,6 +1476,13 @@ impl HostState {
 
     fn start_cron_setup(&mut self, task: Option<String>) -> std::result::Result<(), Rejection> {
         self.require_idle()?;
+        if !self.spec.agent.config.middleware.enabled("cron") {
+            return Err(Rejection {
+                code: "capability_disabled",
+                message: "scheduling is disabled for this chat".into(),
+                fatal: false,
+            });
+        }
         let input = self
             .cron
             .begin_setup(&self.running.session_id, task.as_deref())
@@ -3273,7 +3280,7 @@ mod tests {
             .expect("create session");
         let before = host.snapshot(None).await.expect("initial snapshot").ready;
         let mut composition = before.config.config.clone();
-        composition.middleware.set_enabled("tools", false);
+        composition.middleware.set_enabled("cron", false);
         let mut updates = host.subscribe();
 
         host.configure(before.config.revision, composition)
@@ -3574,9 +3581,13 @@ mod tests {
         let credentials =
             Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
         let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
-        let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+        let gateway =
+            GatewayHost::start(store, config, credentials, Arc::clone(&cron)).expect("gateway");
         let first_host = gateway.create_session(&first).await.expect("first chat");
         let second_host = gateway.create_session(&second).await.expect("second chat");
+        let scheduled = cron
+            .add_for_test(first_host.session_id(), "keep scheduled work", "0 9 * * *")
+            .expect("scheduled task");
         let first_before = first_host
             .snapshot(None)
             .await
@@ -3588,7 +3599,7 @@ mod tests {
             .expect("second snapshot")
             .ready;
         let mut composition = first_before.config.config.clone();
-        composition.middleware.set_enabled("tools", false);
+        composition.middleware.set_enabled("cron", false);
 
         first_host
             .configure(first_before.config.revision, composition)
@@ -3606,7 +3617,23 @@ mod tests {
             .ready;
 
         assert_ne!(first_after.workspace, second_after.workspace);
-        assert!(!first_after.config.config.middleware.enabled("tools"));
+        assert!(!first_after.config.config.middleware.enabled("cron"));
+        assert_eq!(first_after.tool_count + 1, first_before.tool_count);
+        assert_eq!(
+            first_host
+                .start_cron_setup(None)
+                .await
+                .expect_err("disabled scheduler must reject setup")
+                .code,
+            "capability_disabled"
+        );
+        assert_eq!(
+            cron.list(first_host.session_id())
+                .expect("existing schedules")
+                .first()
+                .map(|task| task.id.as_str()),
+            Some(scheduled.id.as_str())
+        );
         assert!(
             first_after
                 .contributions

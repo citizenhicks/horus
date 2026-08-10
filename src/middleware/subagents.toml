@@ -3,6 +3,7 @@ label = "Subagents"
 description = "Delegate independent work to durable child agents"
 
 [prompt]
+root = "Delegate independent work to subagents when it can run in parallel. They share your workspace; continue your own work while they run, and wait only when you need their results."
 default = "Complete the task and report concisely to your parent."
 
 [setting.model_route]

@@ -195,6 +195,100 @@ final class AppModelTests: XCTestCase {
         )
     }
 
+    func testCronSetupRequiresEnabledSchedulingCapability() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.middlewareFeatures = [MiddlewareFeature(
+            id: "cron",
+            label: "Cron",
+            description: "Scheduled work",
+            required: false,
+            settings: []
+        )]
+        var config = composition()
+        model.agentSnapshot = VersionedAgentConfig(revision: 1, config: config)
+
+        XCTAssertFalse(model.canStartCronSetup)
+        model.startCronSetup()
+        let task = CronTask(
+            id: "cron-1",
+            sessionId: "chat-1",
+            task: "Historical task",
+            schedule: "0 9 * * *"
+        )
+        model.runCron(task)
+        model.rescheduleCron(task, schedule: "0 10 * * *")
+        model.deleteCron(task)
+        let disabledRequestCount = await recorder.requestCount()
+        XCTAssertEqual(disabledRequestCount, 0)
+
+        model.refreshCron()
+        let readsArrived = await eventually { await recorder.requestCount() == 2 }
+        XCTAssertTrue(readsArrived)
+        let readRequests = await recorder.requests()
+        XCTAssertTrue(readRequests.contains { if case .listCron = $0 { true } else { false } })
+        XCTAssertTrue(readRequests.contains { if case .listCronHistory = $0 { true } else { false } })
+
+        config.middleware.enabled.insert("cron")
+        model.agentSnapshot = VersionedAgentConfig(revision: 2, config: config)
+
+        XCTAssertTrue(model.canStartCronSetup)
+        model.startCronSetup()
+        let request = await recorder.firstRequest(after: 2) {
+            if case .startCronSetup = $0 { return true }
+            return false
+        }
+        guard case .startCronSetup(_, let sessionID, let task) = try XCTUnwrap(request) else {
+            return XCTFail("Expected cron setup request")
+        }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertNil(task)
+    }
+
+    func testDisabledScratchpadActionDoesNotSubmitUntilEnabled() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.selectedSessionID = "chat-1"
+        model.middlewareFeatures = [MiddlewareFeature(
+            id: "scratchpad",
+            label: "Scratchpad",
+            description: "Durable notes",
+            required: false,
+            settings: []
+        )]
+        var config = composition()
+        model.agentSnapshot = VersionedAgentConfig(revision: 1, config: config)
+        let forget = AgentOperation.capabilityCommand(
+            capability: "scratchpad",
+            command: "scratchpad",
+            arguments: "forget session note-1",
+            input: nil,
+            target: nil
+        )
+
+        model.submitFrontendOperation(forget)
+        let disabledRequestCount = await recorder.requestCount()
+        XCTAssertEqual(disabledRequestCount, 0)
+
+        config.middleware.enabled.insert("scratchpad")
+        model.agentSnapshot = VersionedAgentConfig(revision: 2, config: config)
+        model.submitFrontendOperation(forget)
+        let request = await recorder.firstRequest(after: 0) {
+            if case .submit = $0 { return true }
+            return false
+        }
+        guard case .submit(let sessionID, _) = try XCTUnwrap(request) else {
+            return XCTFail("Expected scratchpad submission")
+        }
+        XCTAssertEqual(sessionID, "chat-1")
+    }
+
     private func providerStatus(
         for config: ProviderConfig,
         models: [ProviderModel] = [],

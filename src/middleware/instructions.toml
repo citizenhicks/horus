@@ -1,3 +1,6 @@
 [manifest]
 label = "Workspace instructions"
 description = "Load optional root AGENTS.md guidance"
+
+[prompt]
+title = "workspace instructions"

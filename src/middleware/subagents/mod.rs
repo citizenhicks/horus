@@ -16,6 +16,7 @@ use super::Middleware;
 use super::MiddlewareCommandContext;
 use super::MiddlewareCommandOutput;
 use super::ModelContext;
+use super::PromptSection;
 use super::RuntimeContext;
 use super::SessionEndContext;
 use super::manifest::{MiddlewareManifest, MiddlewareSettingChoices, MiddlewareSettingManifest};
@@ -365,6 +366,19 @@ impl Subagents {
         Ok(self)
     }
 
+    fn section(&self, identity: &AgentIdentity) -> PromptSection {
+        let body = if identity.depth == 0 {
+            text::PROMPT_ROOT.into()
+        } else {
+            format!(
+                "You are `{}`, a child agent.\n{}",
+                identity.agent_path,
+                self.prompt.trim()
+            )
+        };
+        PromptSection::new(body)
+    }
+
     async fn read_command(
         &self,
         session_id: &str,
@@ -443,15 +457,9 @@ impl Middleware for Subagents {
         }))
     }
 
-    fn prompt_fragment(&self, runtime: &RuntimeContext) -> Result<Option<String>> {
+    fn prompt_section(&self, runtime: &RuntimeContext) -> Result<Option<PromptSection>> {
         let identity = AgentIdentity::read(&runtime.session_id, &runtime.metadata)?;
-        Ok((identity.depth > 0).then(|| {
-            format!(
-                "<subagent_role>\nYou are {}.\n{}\n</subagent_role>",
-                identity.agent_path,
-                self.prompt.trim()
-            )
-        }))
+        Ok(Some(self.section(&identity)))
     }
 
     fn frontend(&self) -> FrontendContribution {
@@ -1109,6 +1117,61 @@ mod tests {
     use crate::middleware::QueuedInputBaseline;
     use crate::middleware::QueuedInputQueue;
     use crate::protocol::{ToolCallBeginEvent, ToolCallEndEvent};
+
+    fn test_middleware() -> Subagents {
+        Subagents::new(
+            1,
+            2,
+            2,
+            Arc::new(|_| Box::pin(async { Err(Error::Stopped("unused".into())) })),
+        )
+        .expect("subagents middleware")
+    }
+
+    #[test]
+    fn prompt_section_guides_root_to_delegate_parallel_work() {
+        let identity = AgentIdentity::read("root", &BTreeMap::new()).expect("root identity");
+        let section = test_middleware().section(&identity);
+
+        assert_eq!(
+            section.body,
+            "Delegate independent work to subagents when it can run in parallel. They share your workspace; continue your own work while they run, and wait only when you need their results."
+        );
+    }
+
+    #[test]
+    fn prompt_section_identifies_child_with_default_instruction() {
+        let identity = AgentIdentity {
+            root_session_id: "root".into(),
+            agent_path: "/root/reviewer".into(),
+            depth: 1,
+        };
+        let section = test_middleware().section(&identity);
+
+        assert_eq!(
+            section.body,
+            "You are `/root/reviewer`, a child agent.\nComplete the task and report concisely to your parent."
+        );
+    }
+
+    #[test]
+    fn prompt_section_uses_configured_child_instruction() {
+        let identity = AgentIdentity {
+            root_session_id: "root".into(),
+            agent_path: "/root/reviewer".into(),
+            depth: 1,
+        };
+        let middleware = test_middleware()
+            .prompt("Review the parser and report findings.")
+            .expect("custom child prompt");
+
+        let section = middleware.section(&identity);
+
+        assert_eq!(
+            section.body,
+            "You are `/root/reviewer`, a child agent.\nReview the parser and report findings."
+        );
+    }
 
     #[test]
     fn renders_every_subagent_tool_call() {

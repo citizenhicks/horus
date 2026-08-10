@@ -15,7 +15,7 @@ use super::tools::{
 };
 use super::{
     FrontendEventSink, Middleware, MiddlewareCommandContext, MiddlewareCommandOutput, ModelContext,
-    RuntimeContext,
+    PromptSection, RuntimeContext,
 };
 use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::model::{ToolDefinition, internal_user_message};
@@ -249,13 +249,24 @@ impl ScratchpadStore {
 #[derive(Clone)]
 pub struct Scratchpad {
     store: ScratchpadStore,
+    agent_enabled: bool,
 }
 
 impl Scratchpad {
     /// Creates scratchpad middleware backed by a shared concrete store.
     #[must_use]
     pub fn new(store: ScratchpadStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            agent_enabled: true,
+        }
+    }
+
+    /// Controls agent access while retaining the read-only management surface.
+    #[must_use]
+    pub fn agent_enabled(mut self, enabled: bool) -> Self {
+        self.agent_enabled = enabled;
+        self
     }
 }
 
@@ -265,6 +276,9 @@ impl Middleware for Scratchpad {
     }
 
     fn register(&self, catalog: &mut Catalog, runtime: &RuntimeContext) -> Result<()> {
+        if !self.agent_enabled {
+            return Ok(());
+        }
         catalog.register(Arc::new(WriteScratchpad {
             store: self.store.clone(),
             session_id: runtime.session_id.clone(),
@@ -277,8 +291,10 @@ impl Middleware for Scratchpad {
         }))
     }
 
-    fn prompt_fragment(&self, _runtime: &RuntimeContext) -> Result<Option<String>> {
-        Ok(Some(text::PROMPT_MAIN.into()))
+    fn prompt_section(&self, _runtime: &RuntimeContext) -> Result<Option<PromptSection>> {
+        Ok(self
+            .agent_enabled
+            .then(|| PromptSection::new(text::PROMPT_MAIN)))
     }
 
     fn frontend(&self) -> FrontendContribution {
@@ -286,11 +302,15 @@ impl Middleware for Scratchpad {
             capability: self.name().into(),
             accepts_file_attachments: false,
             count: None,
-            commands: vec![FrontendCommand {
-                name: "scratchpad".into(),
-                arguments: text::COMMAND_ARGUMENTS.into(),
-                description: text::COMMAND_DESCRIPTION.into(),
-            }],
+            commands: self
+                .agent_enabled
+                .then(|| FrontendCommand {
+                    name: "scratchpad".into(),
+                    arguments: text::COMMAND_ARGUMENTS.into(),
+                    description: text::COMMAND_DESCRIPTION.into(),
+                })
+                .into_iter()
+                .collect(),
             widgets: surface_widgets(&Snapshot::default()),
             references: Vec::new(),
             active_input: None,
@@ -332,7 +352,11 @@ impl Middleware for Scratchpad {
                 )));
             }
             let mut arguments = context.arguments.split_whitespace();
-            match arguments.next().unwrap_or("read") {
+            let operation = arguments.next().unwrap_or("read");
+            if !self.agent_enabled && !matches!(operation, "read" | "refresh") {
+                return Err(Error::Tool("scratchpad is disabled for this chat".into()));
+            }
+            match operation {
                 "read" if arguments.next().is_none() && context.input.is_none() => {
                     let snapshot = self.store.snapshot(context.session_id).await?;
                     Ok(MiddlewareCommandOutput::render(
@@ -412,6 +436,9 @@ impl Middleware for Scratchpad {
         context: &'a mut ModelContext<'_>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            if !self.agent_enabled {
+                return Ok(());
+            }
             let snapshot = self.store.snapshot(context.session_id).await?;
             if let Some(input) = refreshed_input(context.request_input(), &snapshot) {
                 context.replace_request_input(input);
@@ -1112,6 +1139,104 @@ mod tests {
                 .edit("session", Scope::Session, &after.id, "   ")
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_agent_keeps_read_only_surfaces_without_prompt_or_tools() {
+        let (_temporary, store) = store().await;
+        store
+            .write_session("session", "historical note")
+            .await
+            .expect("seed note");
+        let note_id = store.snapshot("session").await.expect("snapshot").session[0]
+            .id
+            .clone();
+        let middleware = Scratchpad::new(store.clone()).agent_enabled(false);
+        let frontend_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&frontend_events);
+        let runtime = RuntimeContext {
+            checkpoints: Arc::clone(&store.checkpoints),
+            session_id: "session".into(),
+            model_route: "model".into(),
+            session_context: crate::protocol::SessionContext::default(),
+            metadata: Default::default(),
+            queued_input: crate::middleware::QueuedInputSnapshot::default(),
+            frontend: Arc::new(move |event| {
+                captured_events.lock().expect("frontend events").push(event);
+                Ok(())
+            }),
+        };
+        let mut catalog = Catalog::default();
+
+        middleware
+            .register(&mut catalog, &runtime)
+            .expect("disabled catalog");
+        assert!(catalog.definitions().is_empty());
+        assert_eq!(middleware.prompt_section(&runtime).expect("prompt"), None);
+        let contribution = middleware.frontend();
+        assert!(contribution.commands.is_empty());
+        assert_eq!(contribution.widgets.len(), 2);
+        middleware.initialize(runtime).await.expect("initialize");
+        assert!(
+            frontend_events
+                .lock()
+                .expect("frontend events")
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    FrontendEvent::Widget { item, .. }
+                        if matches!(
+                            &item.content,
+                            Some(FrontendWidgetContent::ActionList { items, .. })
+                                if items.iter().any(|item| item.text == "historical note")
+                        )
+                )),
+            "initialize should restore historical notes in the management widget"
+        );
+
+        let checkpoint = crate::backend::checkpoint::Checkpoint::empty("session");
+        let session_context = crate::protocol::SessionContext::default();
+        assert_eq!(
+            middleware
+                .command(MiddlewareCommandContext {
+                    command: "scratchpad",
+                    arguments: "refresh",
+                    input: None,
+                    target: None,
+                    session_id: "session",
+                    session_context: &session_context,
+                    checkpoint: &checkpoint,
+                    checkpoints: Arc::clone(&store.checkpoints),
+                })
+                .await
+                .expect("refresh")
+                .events
+                .len(),
+            2
+        );
+        let forget = format!("forget session {note_id}");
+        assert_eq!(
+            middleware
+                .command(MiddlewareCommandContext {
+                    command: "scratchpad",
+                    arguments: &forget,
+                    input: None,
+                    target: None,
+                    session_id: "session",
+                    session_context: &session_context,
+                    checkpoint: &checkpoint,
+                    checkpoints: Arc::clone(&store.checkpoints),
+                })
+                .await
+                .err()
+                .expect("mutation must be disabled")
+                .to_string(),
+            "tool error: scratchpad is disabled for this chat"
+        );
+        assert_eq!(
+            store.snapshot("session").await.expect("retained").session[0].note,
+            "historical note"
         );
     }
 

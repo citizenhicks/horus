@@ -54,6 +54,43 @@ struct AppShell: View {
                 AppToastOverlay().zIndex(10)
             }
         }
+        .alert(
+            "Rename chat",
+            isPresented: Binding(
+                get: { model.sessionToRename != nil },
+                set: { if !$0 { model.sessionToRename = nil } }
+            )
+        ) {
+            TextField("Chat name", text: $model.sessionRenameDraft)
+            Button("Cancel", role: .cancel) { model.sessionToRename = nil }
+            Button("Rename") {
+                guard let session = model.sessionToRename,
+                      model.renameSession(session, title: model.sessionRenameDraft) != nil
+                else { return }
+                model.sessionToRename = nil
+            }
+            .disabled(
+                model.sessionRenameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || !model.canRenameSession
+            )
+        }
+        .confirmationDialog(
+            "Delete this chat?",
+            isPresented: Binding(
+                get: { model.sessionToDelete != nil },
+                set: { if !$0 { model.sessionToDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete chat", role: .destructive) {
+                if let session = model.sessionToDelete { model.deleteSession(session) }
+                model.sessionToDelete = nil
+            }
+            .disabled(!model.canRenameSession)
+            Button("Cancel", role: .cancel) { model.sessionToDelete = nil }
+        } message: {
+            Text("This removes the chat from the gateway history.")
+        }
         .quickLookPreview($model.previewURL)
         .sheet(item: $model.textFilePreview, onDismiss: model.discardFilePresentation) { preview in
             TextFilePreviewView(preview: preview)
@@ -463,7 +500,10 @@ private struct FrontendContributionPage: View {
         PageScaffold(title: widget.title, detail: detail) {
             if let content = widget.widget.content {
                 Section {
-                    FrontendWidgetContentView(content: content) { option in
+                    FrontendWidgetContentView(
+                        content: content,
+                        actionsEnabled: model.isCapabilityEnabled(widget.capability)
+                    ) { option in
                         model.submitPickerOption(option)
                     }
                 }
@@ -651,9 +691,6 @@ struct SidebarView: View {
     @Environment(\.horusPalette) private var palette
     let showDetail: (AppDestination) -> Void
     @State private var collapsedWorkspaces: Set<String> = []
-    @State private var sessionToRename: SessionRecord?
-    @State private var renameDraft = ""
-    @State private var sessionToDelete: SessionRecord?
     @State private var showsConnectionDetails = false
 
     var body: some View {
@@ -757,33 +794,6 @@ struct SidebarView: View {
             .padding(12)
         }
         .toolbarVisibility(.hidden, for: .navigationBar)
-        .alert("Rename chat", isPresented: renamePresented) {
-            TextField("Chat name", text: $renameDraft)
-            Button("Cancel", role: .cancel) { sessionToRename = nil }
-            Button("Rename") {
-                guard let sessionToRename,
-                      model.renameSession(sessionToRename, title: renameDraft) != nil
-                else { return }
-                self.sessionToRename = nil
-            }
-            .disabled(
-                renameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    || !model.canRenameSession
-            )
-        }
-        .confirmationDialog(
-            "Delete this chat?",
-            isPresented: deletePresented,
-            titleVisibility: .visible
-        ) {
-            Button("Delete chat", role: .destructive) {
-                if let sessionToDelete { model.deleteSession(sessionToDelete) }
-                sessionToDelete = nil
-            }
-            Button("Cancel", role: .cancel) { sessionToDelete = nil }
-        } message: {
-            Text("This removes the chat from the gateway history.")
-        }
     }
 
     private var connectionDetails: some View {
@@ -1025,8 +1035,7 @@ struct SidebarView: View {
                     )
                 }
                 Button {
-                    renameDraft = model.displayedTitle(for: session)
-                    sessionToRename = session
+                    model.beginRenamingSession(session)
                 } label: {
                     HorusLabel(
                         title: "Rename",
@@ -1035,7 +1044,7 @@ struct SidebarView: View {
                 }
                 Divider()
                 Button(role: .destructive) {
-                    sessionToDelete = session
+                    model.beginDeletingSession(session)
                 } label: {
                     HorusLabel(
                         title: "Delete",
@@ -1069,19 +1078,6 @@ struct SidebarView: View {
         }
     }
 
-    private var renamePresented: Binding<Bool> {
-        Binding(
-            get: { sessionToRename != nil },
-            set: { if !$0 { sessionToRename = nil } }
-        )
-    }
-
-    private var deletePresented: Binding<Bool> {
-        Binding(
-            get: { sessionToDelete != nil },
-            set: { if !$0 { sessionToDelete = nil } }
-        )
-    }
 }
 
 private struct SessionActivityIndicator: View {
@@ -1093,10 +1089,7 @@ private struct SessionActivityIndicator: View {
         Group {
             switch state {
             case .running:
-                ProgressView()
-                    .controlSize(.mini)
-                    .tint(palette.accent)
-                    .frame(width: 11, height: 11)
+                HorusSpinner(size: 11, foreground: palette.accent)
             case .awaitingApproval:
                 Circle()
                     .trim(from: 0.08, to: 0.76)

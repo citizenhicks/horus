@@ -1,5 +1,13 @@
 use super::*;
 
+#[test]
+fn every_tool_set_uses_the_tool_output_policy() {
+    let expected = PromptSection::new(text::PROMPT_MAIN);
+
+    assert_eq!(Tools::coding().section(), expected);
+    assert_eq!(Tools::new(Vec::new()).section(), expected);
+}
+
 struct PanickingTool;
 
 struct ApprovalRequiredTool;

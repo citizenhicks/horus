@@ -292,10 +292,7 @@ impl OpenAi {
     fn compact_body(&self, request: CompactRequest<'_>) -> Result<Value> {
         Ok(serde_json::json!({
             "model": self.model,
-            "instructions": request.instructions,
-            "input": wire_input(request.input, self.image_input)?,
-            "tools": wire_tools(request.tools, &self.hosted_tools, true),
-            "parallel_tool_calls": true
+            "input": wire_input(request.input, self.image_input)?
         }))
     }
 }

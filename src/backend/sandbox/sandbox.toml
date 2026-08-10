@@ -2,6 +2,11 @@
 label = "Sandbox"
 description = "Control mutation approval and sandbox network access"
 
+[prompt]
+linux = "Horus is running on Linux."
+macos = "Horus is running on macOS."
+other = "Horus is running on an unsupported operating system."
+
 [defaults]
 approval_policy = "auto_approve"
 reviewer_strictness = "strict"

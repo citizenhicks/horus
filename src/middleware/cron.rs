@@ -9,7 +9,7 @@ use super::manifest::MiddlewareManifest;
 use super::tools::{
     ApprovalRequirement, Catalog, Tool, ToolContext, labeled_tool_heading, render_tool_event,
 };
-use super::{Middleware, RuntimeContext};
+use super::{Middleware, PromptSection, RuntimeContext};
 use crate::backend::model::ToolDefinition;
 use crate::protocol::{EventMsg, FrontendBlock};
 use crate::{BoxFuture, Result};
@@ -23,7 +23,7 @@ pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "cron",
     label: text::MANIFEST_LABEL,
     description: text::MANIFEST_DESCRIPTION,
-    required: true,
+    required: false,
     default_enabled: true,
     settings: &[],
 };
@@ -42,6 +42,10 @@ impl Cron {
             write: Arc::new(write),
         }
     }
+
+    fn section(&self) -> PromptSection {
+        PromptSection::new(text::PROMPT_MAIN)
+    }
 }
 
 impl Middleware for Cron {
@@ -56,8 +60,8 @@ impl Middleware for Cron {
         }))
     }
 
-    fn prompt_fragment(&self, _runtime: &RuntimeContext) -> Result<Option<String>> {
-        Ok(Some(text::PROMPT_MAIN.into()))
+    fn prompt_section(&self, _runtime: &RuntimeContext) -> Result<Option<PromptSection>> {
+        Ok(Some(self.section()))
     }
 
     fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
@@ -132,6 +136,13 @@ mod tests {
     use super::*;
     use crate::backend::sandbox::local::LocalSandbox;
     use crate::backend::sandbox::{ApprovalPolicy, NetworkAccess, Sandbox, SandboxPermissions};
+
+    #[test]
+    fn scheduling_contributes_its_toml_backed_prompt() {
+        let middleware = Cron::new(|_, _, _| Ok("task".into()));
+
+        assert_eq!(middleware.section(), PromptSection::new(text::PROMPT_MAIN));
+    }
 
     #[test]
     fn schedule_task_events_render_as_cron_blocks() {
