@@ -1,6 +1,17 @@
 use super::*;
 use crate::backend::model::REPLAY_REASONING_FIELD;
 
+fn model_request() -> ModelRequest<'static> {
+    ModelRequest {
+        session_id: "test-session",
+        instructions: "Test instructions",
+        input: &[],
+        tools: &[],
+        allow_hosted_tools: false,
+        allow_continuation: false,
+    }
+}
+
 #[test]
 fn base_url_rejects_serializable_secret_locations() {
     for url in [
@@ -10,6 +21,52 @@ fn base_url_rejects_serializable_secret_locations() {
     ] {
         assert!(OpenAi::new("test-key", url, "test-model").is_err());
     }
+}
+
+#[test]
+fn canonical_openai_endpoint_requests_automatic_reasoning_summaries() {
+    let provider = OpenAi::new("test-key", "https://api.openai.com/v1/", "test-model")
+        .expect("provider")
+        .with_reasoning_effort("medium")
+        .expect("reasoning effort");
+
+    assert_eq!(
+        provider
+            .response_body(model_request())
+            .expect("response body")["reasoning"],
+        serde_json::json!({"effort": "medium", "summary": "auto"})
+    );
+}
+
+#[test]
+fn compatible_endpoint_does_not_assume_reasoning_summary_support() {
+    let provider = OpenAi::new("test-key", "https://example.com/v1", "test-model")
+        .expect("provider")
+        .with_reasoning_effort("medium")
+        .expect("reasoning effort");
+
+    assert_eq!(
+        provider
+            .response_body(model_request())
+            .expect("response body")["reasoning"],
+        serde_json::json!({"effort": "medium"})
+    );
+}
+
+#[test]
+fn compatible_endpoint_can_opt_into_automatic_reasoning_summaries() {
+    let provider = OpenAi::new("test-key", "https://example.com/v1", "test-model")
+        .expect("provider")
+        .with_reasoning_effort("medium")
+        .expect("reasoning effort")
+        .with_reasoning_summary();
+
+    assert_eq!(
+        provider
+            .response_body(model_request())
+            .expect("response body")["reasoning"],
+        serde_json::json!({"effort": "medium", "summary": "auto"})
+    );
 }
 
 #[test]
@@ -247,6 +304,33 @@ fn responses_emits_reasoning_text_deltas() {
     assert_eq!(
         *seen.lock().expect("events lock"),
         vec![ModelEvent::ReasoningDelta("Plan.".into())]
+    );
+}
+
+#[test]
+fn responses_emits_reasoning_summary_deltas() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_seen = Arc::clone(&seen);
+    let events: ModelEventSink = Arc::new(move |event| {
+        sink_seen.lock().expect("events lock").push(event);
+        Ok(())
+    });
+
+    assert!(
+        emit_reasoning_event(
+            &serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "**Checking the request**"
+            }),
+            &events,
+        )
+        .expect("reasoning summary event")
+    );
+    assert_eq!(
+        *seen.lock().expect("events lock"),
+        vec![ModelEvent::ReasoningDelta(
+            "**Checking the request**".into()
+        )]
     );
 }
 

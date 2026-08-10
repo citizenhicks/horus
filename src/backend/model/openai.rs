@@ -56,6 +56,7 @@ pub struct OpenAi {
     base_url: String,
     model: String,
     reasoning_effort: Option<String>,
+    reasoning_summary: bool,
     hosted_tools: Vec<Value>,
     compaction_endpoint: bool,
     image_input: bool,
@@ -101,12 +102,14 @@ impl OpenAi {
         if model.trim().is_empty() {
             return Err(Error::Config("OPENAI_MODEL is empty".into()));
         }
+        let reasoning_summary = base_url == DEFAULT_BASE_URL;
         Ok(Self {
             client,
             auth,
             base_url,
             model,
             reasoning_effort: None,
+            reasoning_summary,
             hosted_tools: Vec::new(),
             compaction_endpoint: false,
             image_input: true,
@@ -121,6 +124,13 @@ impl OpenAi {
         }
         self.reasoning_effort = Some(effort);
         Ok(self)
+    }
+
+    /// Enables automatic reasoning summaries for a compatible Responses endpoint.
+    #[must_use]
+    pub fn with_reasoning_summary(mut self) -> Self {
+        self.reasoning_summary = true;
+        self
     }
 
     /// Enables provider-hosted live web search.
@@ -164,24 +174,7 @@ impl OpenAi {
         request: ModelRequest<'_>,
         events: ModelEventSink,
     ) -> Result<ModelOutput> {
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "instructions": request.instructions,
-            "input": wire_input(request.input, self.image_input)?,
-            "tools": wire_tools(request.tools, &self.hosted_tools, request.allow_hosted_tools),
-            "tool_choice": "auto",
-            "parallel_tool_calls": true,
-            "include": ["reasoning.encrypted_content"],
-            "store": false,
-            "stream": true
-        });
-        if let Some(effort) = &self.reasoning_effort {
-            body["reasoning"] = if self.auth.reasoning_summary() {
-                serde_json::json!({"effort": effort, "summary": "auto"})
-            } else {
-                serde_json::json!({"effort": effort})
-            };
-        }
+        let body = self.response_body(request)?;
         let request = self
             .client
             .post(format!("{}/responses", self.base_url))
@@ -237,6 +230,28 @@ impl OpenAi {
         let response = completed
             .ok_or_else(|| Error::Provider("stream ended before response.completed".into()))?;
         decode_response(response)
+    }
+
+    fn response_body(&self, request: ModelRequest<'_>) -> Result<Value> {
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "instructions": request.instructions,
+            "input": wire_input(request.input, self.image_input)?,
+            "tools": wire_tools(request.tools, &self.hosted_tools, request.allow_hosted_tools),
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "include": ["reasoning.encrypted_content"],
+            "store": false,
+            "stream": true
+        });
+        if let Some(effort) = &self.reasoning_effort {
+            body["reasoning"] = if self.reasoning_summary {
+                serde_json::json!({"effort": effort, "summary": "auto"})
+            } else {
+                serde_json::json!({"effort": effort})
+            };
+        }
+        Ok(body)
     }
 
     async fn compact_response(&self, request: CompactRequest<'_>) -> Result<CompactOutput> {

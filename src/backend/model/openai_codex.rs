@@ -702,10 +702,6 @@ fn open_browser(_url: &str) -> io::Result<()> {
 }
 
 impl OpenAiAuthorization for ChatGptAuth {
-    fn reasoning_summary(&self) -> bool {
-        true
-    }
-
     fn authorize_http<'a>(
         &'a self,
         streaming: bool,

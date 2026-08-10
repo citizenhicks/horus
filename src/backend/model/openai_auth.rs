@@ -11,8 +11,6 @@ pub(super) struct ResolvedAuthorization {
 }
 
 pub(super) trait OpenAiAuthorization: Send + Sync {
-    fn reasoning_summary(&self) -> bool;
-
     fn authorize_http<'a>(
         &'a self,
         streaming: bool,
@@ -33,10 +31,6 @@ impl ApiKeyAuthorization {
 }
 
 impl OpenAiAuthorization for ApiKeyAuthorization {
-    fn reasoning_summary(&self) -> bool {
-        false
-    }
-
     fn authorize_http<'a>(
         &'a self,
         _streaming: bool,
