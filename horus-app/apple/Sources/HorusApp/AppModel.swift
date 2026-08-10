@@ -440,19 +440,9 @@ final class TranscriptEntry: Identifiable {
     }
 }
 
-struct TranscriptGroupIdentity: Equatable {
-    let capability: String
-    let group: String
-}
-
 /// Typed transcript presentation supplied by the framework.
 extension TranscriptEntry {
     var headline: String { title }
-
-    var renderedGroupIdentity: TranscriptGroupIdentity? {
-        guard let capability, let group else { return nil }
-        return TranscriptGroupIdentity(capability: capability, group: group)
-    }
 
     /// Everything under the heading — the tool output the one-line row hides.
     var eventDetail: String {
@@ -462,6 +452,41 @@ extension TranscriptEntry {
     /// Hosted web search is identified by its protocol role, independent of title or owner.
     var isWebSearch: Bool {
         role == .webSearch
+    }
+
+    /// Consecutive framework activity shares one visual row. Capability and protocol group
+    /// still describe each entry, but neither interrupts a continuous sequence for the reader.
+    static func groupedRows(
+        from entries: [TranscriptEntry],
+        breakBefore boundaryID: String? = nil
+    ) -> [[TranscriptEntry]] {
+        var rows: [[TranscriptEntry]] = []
+        var activity: [TranscriptEntry] = []
+
+        func flushActivity() {
+            guard !activity.isEmpty else { return }
+            rows.append(activity)
+            activity = []
+        }
+
+        for entry in entries {
+            if let boundaryID, entry.id == boundaryID {
+                flushActivity()
+            }
+
+            let hasActivityRole = switch entry.role {
+            case .activity, .tool, .webSearch: true
+            case .artifact, .approval, .notice, nil: false
+            }
+            if (entry.kind == .event || entry.kind == .error) && hasActivityRole {
+                activity.append(entry)
+            } else {
+                flushActivity()
+                rows.append([entry])
+            }
+        }
+        flushActivity()
+        return rows
     }
 
     /// "3 tool calls • 4 web searches • 2 events • 1 error", skipping the empty categories.

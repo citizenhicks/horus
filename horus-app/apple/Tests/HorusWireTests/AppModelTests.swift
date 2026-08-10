@@ -1931,7 +1931,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(replay.transcript.first?.tone, "warning")
     }
 
-    func testRenderedGroupIdentityIsScopedByCapability() throws {
+    func testRenderedBlocksPreserveCapabilityAndGroup() throws {
         let app = try model()
         for (sequence, capability) in [(UInt64(1), "tools"), (UInt64(2), "review")] {
             app.reduce(record: RecordedEvent(
@@ -1957,13 +1957,7 @@ final class AppModelTests: XCTestCase {
         }
 
         XCTAssertEqual(app.transcript.map(\.group), ["turn", "turn"])
-        XCTAssertEqual(
-            app.transcript.compactMap(\.renderedGroupIdentity),
-            [
-                TranscriptGroupIdentity(capability: "tools", group: "turn"),
-                TranscriptGroupIdentity(capability: "review", group: "turn")
-            ]
-        )
+        XCTAssertEqual(app.transcript.compactMap(\.capability), ["tools", "review"])
     }
 
     func testFrontendRenderCarriesFilesThroughReplacementAndAppend() throws {
@@ -5902,7 +5896,8 @@ final class TranscriptEventLineTests: XCTestCase {
         format: String = "plain_text",
         capability: String? = nil,
         role: FrontendBlockRole? = nil,
-        title: String = ""
+        title: String = "",
+        group: String? = nil
     ) -> TranscriptEntry {
         TranscriptEntry(
             id: id,
@@ -5911,6 +5906,7 @@ final class TranscriptEventLineTests: XCTestCase {
             capability: capability,
             role: role,
             title: title,
+            group: group,
             format: format,
             tone: tone,
             pending: false
@@ -5958,6 +5954,49 @@ final class TranscriptEventLineTests: XCTestCase {
         XCTAssertEqual(
             TranscriptEntry.summary(for: [entries[3], entries[3]]),
             "2 web searches"
+        )
+    }
+
+    func testGroupsSequentialMixedActivityAcrossCapabilitiesAndGroups() {
+        let tool = entry(
+            id: "tool",
+            text: "Read a file",
+            capability: "tools",
+            role: .tool,
+            group: "tools/turn"
+        )
+        let event = entry(
+            id: "event",
+            text: "Delegated a task",
+            capability: "subagents",
+            role: .activity,
+            group: "subagents/turn"
+        )
+        let search = entry(
+            id: "search",
+            text: "Searched the web",
+            capability: "web_search",
+            role: .webSearch,
+            group: "web_search/turn"
+        )
+        let reasoning = entry(id: "reasoning", text: "Thinking", kind: .reasoning)
+        let laterTool = entry(id: "later-tool", text: "Checked again", role: .tool)
+        let notice = entry(id: "notice", text: "Needs attention", role: .notice)
+
+        let rows = TranscriptEntry.groupedRows(
+            from: [tool, event, search, reasoning, laterTool, notice]
+        )
+        XCTAssertEqual(
+            rows.map { $0.map(\.id) },
+            [["tool", "event", "search"], ["reasoning"], ["later-tool"], ["notice"]]
+        )
+
+        XCTAssertEqual(
+            TranscriptEntry.groupedRows(
+                from: [tool, event],
+                breakBefore: event.id
+            ).map { $0.map(\.id) },
+            [["tool"], ["event"]]
         )
     }
 

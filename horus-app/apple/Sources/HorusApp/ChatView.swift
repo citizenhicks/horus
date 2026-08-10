@@ -372,49 +372,21 @@ private struct TranscriptView: View {
     // Spacing is resolved up front: a row body must never index back into the live
     // transcript, which can shrink between layout passes.
     //
-    // Only blocks that explicitly share a group collapse together. Capability prose and
-    // neighboring event types are not grouping signals.
+    // A continuous activity sequence collapses together even when its typed roles or owning
+    // capabilities differ. Messages, reasoning, and the history-page anchor remain boundaries.
     private var rows: [TranscriptRowLayout] {
         var result: [TranscriptRowLayout] = []
-        var run: [TranscriptEntry] = []
-        var runGroup: TranscriptGroupIdentity?
 
-        func append(_ entries: [TranscriptEntry]) {
+        // Keep the previous page boundary as a stable scroll target after prepending.
+        for entries in TranscriptEntry.groupedRows(
+            from: model.displayedTranscript,
+            breakBefore: historyAnchorID
+        ) {
             result.append(TranscriptRowLayout(
                 entries: entries,
                 topSpacing: result.isEmpty ? 0 : rowSpacing
             ))
         }
-
-        func flushRun() {
-            guard !run.isEmpty else { return }
-            if run.count >= 2 {
-                append(run)
-            } else {
-                for entry in run { append([entry]) }
-            }
-            run = []
-            runGroup = nil
-        }
-
-        for entry in model.displayedTranscript {
-            // Keep the previous page boundary as a stable scroll target after prepending.
-            if entry.id == historyAnchorID { flushRun() }
-            if (entry.kind == .event || entry.kind == .error),
-               let group = entry.renderedGroupIdentity {
-                if runGroup == group {
-                    run.append(entry)
-                } else {
-                    flushRun()
-                    runGroup = group
-                    run = [entry]
-                }
-            } else {
-                flushRun()
-                append([entry])
-            }
-        }
-        flushRun()
         return result
     }
 
@@ -493,7 +465,7 @@ private struct TranscriptRow: View {
         case .event, .error:
             VStack(alignment: .leading, spacing: 6) {
                 TranscriptFileCards(files: entry.files)
-                if !entry.text.isEmpty {
+                if !entry.title.isEmpty || !entry.text.isEmpty {
                     EventLine(entry: entry, isActive: isActive)
                 }
             }
