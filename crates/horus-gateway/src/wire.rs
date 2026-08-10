@@ -5,13 +5,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures_util::{Sink, SinkExt as _, Stream, StreamExt as _};
-use horus::backend::checkpoint::SessionSummary;
+use horus::backend::checkpoint::{SessionSummary, StreamMetrics};
 use horus::backend::model::ModelChoice;
 use horus::backend::model::provider::HostedWebSearch;
 use horus::protocol::{
     Event, EventMsg, FrontendBlock, FrontendContribution, FrontendSettingValue, FrontendSymbol,
-    FrontendWidget, MiddlewareFeature, SessionConfiguredEvent, SessionFileReference, Submission,
-    TokenUsage,
+    FrontendWidget, MiddlewareFeature, RenderedBlock, SessionConfiguredEvent, SessionFileReference,
+    Submission, TokenUsage,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ mod base64_bytes {
 }
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 23;
+pub const PROTOCOL_VERSION: u16 = 24;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 20 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -128,13 +128,12 @@ pub enum ClientMessage {
         request_id: String,
         session_id: String,
         last_sequence: Option<u64>,
-        replay_epoch: Option<String>,
     },
     GetSessionHistory {
         request_id: String,
         session_id: String,
         before_sequence: Option<u64>,
-        max_batches: usize,
+        max_events: usize,
     },
     RenameSession {
         request_id: String,
@@ -340,7 +339,7 @@ pub enum ServerMessage {
     SessionHistory {
         request_id: String,
         session_id: String,
-        events: Vec<RenderedEvent>,
+        records: Vec<RecordedEvent>,
         next_before_sequence: Option<u64>,
     },
     SessionChanged {
@@ -392,12 +391,7 @@ pub enum ServerMessage {
     },
     AgentEvent {
         session_id: String,
-        sequence: u64,
-        event: Event,
-        blocks: Vec<FrontendBlock>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        history: Option<Vec<RenderedEvent>>,
-        preview: Option<RenderedPreview>,
+        record: RecordedEvent,
     },
     Sessions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -498,7 +492,6 @@ pub struct ReadyPayload {
 /// Frontend-safe state for one opened session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionReadyPayload {
-    pub replay_epoch: String,
     pub latest_sequence: u64,
     pub next_before_sequence: Option<u64>,
     pub workspace: WorkspaceInfo,
@@ -800,7 +793,18 @@ pub struct RenderedPreview {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderedEvent {
     pub event: EventMsg,
-    pub blocks: Vec<FrontendBlock>,
+    pub blocks: Vec<RenderedBlock>,
+}
+
+/// One timestamped semantic event and its deterministic presentation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordedEvent {
+    pub sequence: u64,
+    pub recorded_at_ms: i64,
+    pub event: Event,
+    pub stream_metrics: Vec<StreamMetrics>,
+    pub blocks: Vec<RenderedBlock>,
+    pub preview: Option<RenderedPreview>,
 }
 
 /// Gateway-owned profile and aggregate usage information.
@@ -1351,13 +1355,12 @@ mod tests {
             request_id: "request-open".into(),
             session_id: "session-a".into(),
             last_sequence: Some(7),
-            replay_epoch: Some("epoch-a".into()),
         });
 
         let encoded = serde_json::to_value(frame).expect("encode session open");
 
         assert_eq!(encoded["last_sequence"], 7);
-        assert_eq!(encoded["replay_epoch"], "epoch-a");
+        assert!(encoded.get("replay_epoch").is_none());
     }
 
     #[test]
@@ -1505,19 +1508,56 @@ mod tests {
     fn agent_events_identify_their_session() {
         let frame = ServerFrame::new(ServerMessage::AgentEvent {
             session_id: "session-a".into(),
-            sequence: 1,
-            event: Event {
-                submission_id: None,
-                msg: EventMsg::ContextCompacted,
+            record: RecordedEvent {
+                sequence: 1,
+                recorded_at_ms: 1,
+                event: Event {
+                    submission_id: None,
+                    msg: EventMsg::ContextCompacted,
+                },
+                stream_metrics: Vec::new(),
+                blocks: Vec::new(),
+                preview: None,
             },
-            blocks: Vec::new(),
-            history: None,
-            preview: None,
         });
 
         let encoded = serde_json::to_value(frame).expect("encode agent event");
 
         assert_eq!(encoded["session_id"], "session-a");
+        assert_eq!(encoded["record"]["sequence"], 1);
+    }
+
+    #[test]
+    fn agent_events_preserve_every_web_search_query() {
+        let frame = ServerFrame::new(ServerMessage::AgentEvent {
+            session_id: "session-a".into(),
+            record: RecordedEvent {
+                sequence: 2,
+                recorded_at_ms: 1,
+                event: Event {
+                    submission_id: None,
+                    msg: EventMsg::WebSearchEnd(horus::protocol::WebSearchEndEvent {
+                        session_id: "session-a".into(),
+                        turn_id: "turn-a".into(),
+                        model_step_id: "step-a".into(),
+                        call_id: "search-a".into(),
+                        action: horus::protocol::WebSearchAction::Search {
+                            queries: vec!["Horus framework".into(), "Horus gateway".into()],
+                        },
+                    }),
+                },
+                stream_metrics: Vec::new(),
+                blocks: Vec::new(),
+                preview: None,
+            },
+        });
+
+        let encoded = serde_json::to_value(frame).expect("encode agent event");
+
+        assert_eq!(
+            encoded["record"]["event"]["msg"]["action"]["queries"],
+            serde_json::json!(["Horus framework", "Horus gateway"])
+        );
     }
 
     #[test]
@@ -1652,7 +1692,6 @@ mod tests {
             "type": "session_opened",
             "request_id": "request-open",
             "payload": {
-                "replay_epoch": "epoch-a",
                 "latest_sequence": 4,
                 "next_before_sequence": 2,
                 "workspace": { "id": "workspace-a", "path": "/workspace" },
@@ -1778,15 +1817,22 @@ mod tests {
             request_id: "request-history".into(),
             session_id: "session-a".into(),
             before_sequence: Some(9),
-            max_batches: 20,
+            max_events: 20,
         }))
         .expect("encode history request");
         let response = serde_json::to_value(ServerFrame::new(ServerMessage::SessionHistory {
             request_id: "request-history".into(),
             session_id: "session-a".into(),
-            events: vec![RenderedEvent {
-                event: EventMsg::ContextCompacted,
+            records: vec![RecordedEvent {
+                sequence: 8,
+                recorded_at_ms: 1,
+                event: Event {
+                    submission_id: None,
+                    msg: EventMsg::ContextCompacted,
+                },
+                stream_metrics: Vec::new(),
                 blocks: Vec::new(),
+                preview: None,
             }],
             next_before_sequence: Some(4),
         }))
@@ -1796,10 +1842,10 @@ mod tests {
             (
                 request["type"].as_str(),
                 request["before_sequence"].as_u64(),
-                request["max_batches"].as_u64(),
+                request["max_events"].as_u64(),
                 response["type"].as_str(),
                 response["next_before_sequence"].as_u64(),
-                response["events"][0]["event"]["type"].as_str(),
+                response["records"][0]["event"]["msg"]["type"].as_str(),
             ),
             (
                 Some("get_session_history"),

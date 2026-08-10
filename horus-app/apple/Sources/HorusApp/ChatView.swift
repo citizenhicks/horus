@@ -372,11 +372,12 @@ private struct TranscriptView: View {
     // Spacing is resolved up front: a row body must never index back into the live
     // transcript, which can shrink between layout passes.
     //
-    // Consecutive events collapse into one row. A lone event is left alone: hiding a single
-    // step behind a disclosure costs a tap and saves nothing.
+    // Only blocks that explicitly share a group collapse together. Capability prose and
+    // neighboring event types are not grouping signals.
     private var rows: [TranscriptRowLayout] {
         var result: [TranscriptRowLayout] = []
         var run: [TranscriptEntry] = []
+        var runGroup: TranscriptGroupIdentity?
 
         func append(_ entries: [TranscriptEntry]) {
             result.append(TranscriptRowLayout(
@@ -393,13 +394,21 @@ private struct TranscriptView: View {
                 for entry in run { append([entry]) }
             }
             run = []
+            runGroup = nil
         }
 
         for entry in model.displayedTranscript {
             // Keep the previous page boundary as a stable scroll target after prepending.
             if entry.id == historyAnchorID { flushRun() }
-            if entry.kind == .event || entry.kind == .error {
-                run.append(entry)
+            if (entry.kind == .event || entry.kind == .error),
+               let group = entry.renderedGroupIdentity {
+                if runGroup == group {
+                    run.append(entry)
+                } else {
+                    flushRun()
+                    runGroup = group
+                    run = [entry]
+                }
             } else {
                 flushRun()
                 append([entry])
@@ -814,7 +823,7 @@ private struct EventGroupView: View {
     }
 
     private var lines: [TranscriptEntry] {
-        entries.filter { !$0.text.isEmpty }
+        entries.filter { !$0.title.isEmpty || !$0.text.isEmpty }
     }
 
     /// Two events in a run can carry the same file, and `ForEach` needs the ids unique.
@@ -882,8 +891,7 @@ private struct ReasoningLine: View {
     }
 }
 
-/// One event on one line: which middleware raised it, what it was doing, and the transfer
-/// arrow that opens the rest.
+/// One typed event on one line: its semantic owner, title, and optional detail.
 private struct EventLine: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
@@ -961,8 +969,15 @@ private struct EventLine: View {
     private var glyph: HorusGlyph {
         if entry.kind == .error || entry.tone == "error" { return .xCircle }
         if entry.format == "unified_diff" { return .fileMagnifyingGlass }
-        if entry.isWebSearch { return .globe02 }
-        return .typeCursor
+        if let symbol = entry.symbol, let glyph = HorusSymbol.knownGlyph(for: symbol) {
+            return glyph
+        }
+        return switch entry.role {
+        case .webSearch: .globe02
+        case .artifact: .fileMagnifyingGlass
+        case .approval: .checkCircle
+        case .activity, .tool, .notice, nil: .typeCursor
+        }
     }
 
     private var middlewareLabel: String {

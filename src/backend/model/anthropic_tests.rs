@@ -26,6 +26,56 @@ fn hosted_search_can_be_disabled_per_request() {
 }
 
 #[test]
+fn anthropic_web_search_normalizes_query_to_a_singleton() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_seen = Arc::clone(&seen);
+    let events: ModelEventSink = Arc::new(move |event| {
+        sink_seen.lock().expect("events lock").push(event);
+        Ok(())
+    });
+    let mut stream = StreamState::default();
+
+    for event in [
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": "search-1",
+                "name": "web_search",
+                "input": {"query": "Horus framework"}
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "web_search_tool_result",
+                "tool_use_id": "search-1",
+                "content": []
+            }
+        }),
+    ] {
+        stream.apply(event, &events).expect("stream event");
+    }
+
+    assert_eq!(
+        *seen.lock().expect("events lock"),
+        vec![
+            ModelEvent::WebSearchStarted {
+                call_id: "search-1".into()
+            },
+            ModelEvent::WebSearchCompleted {
+                call_id: "search-1".into(),
+                action: WebSearchAction::Search {
+                    queries: vec!["Horus framework".into()]
+                }
+            }
+        ]
+    );
+}
+
+#[test]
 fn responses_history_translates_to_anthropic_tool_messages() {
     let messages = translate_messages(&[
         user_message("inspect it"),
@@ -102,6 +152,165 @@ fn neutral_image_becomes_anthropic_base64_source() {
             }
         })
     );
+}
+
+#[test]
+fn stream_preserves_text_part_boundaries_and_every_citation_location() {
+    let stream = StreamState {
+        blocks: BTreeMap::from([
+            (
+                1,
+                serde_json::json!({"type": "thinking", "thinking": "Check sources."}),
+            ),
+            (
+                3,
+                serde_json::json!({
+                    "type": "text",
+                    "text": "Cited answer.",
+                    "citations": [
+                        {
+                            "type": "char_location",
+                            "cited_text": "characters",
+                            "document_index": 0,
+                            "document_title": "Notes",
+                            "file_id": "file-1",
+                            "start_char_index": 2,
+                            "end_char_index": 12
+                        },
+                        {
+                            "type": "page_location",
+                            "cited_text": "pages",
+                            "document_index": 1,
+                            "document_title": null,
+                            "file_id": "file-2",
+                            "start_page_number": 5,
+                            "end_page_number": 7
+                        },
+                        {
+                            "type": "content_block_location",
+                            "cited_text": "blocks",
+                            "document_index": 2,
+                            "document_title": "Chunks",
+                            "file_id": null,
+                            "start_block_index": 4,
+                            "end_block_index": 6
+                        },
+                        {
+                            "type": "search_result_location",
+                            "cited_text": "search result",
+                            "search_result_index": 3,
+                            "source": "urn:source:3",
+                            "title": "Result",
+                            "start_block_index": 1,
+                            "end_block_index": 2
+                        },
+                        {
+                            "type": "web_search_result_location",
+                            "cited_text": "web result",
+                            "encrypted_index": "opaque-index",
+                            "title": null,
+                            "url": "https://example.com/web"
+                        }
+                    ]
+                }),
+            ),
+        ]),
+        ..StreamState::default()
+    };
+
+    let output = stream.finish().expect("normalized output");
+
+    assert_eq!(
+        serde_json::to_value(output.content()).expect("serialize normalized content"),
+        serde_json::json!([
+            {
+                "output_index": 0,
+                "part_index": 1,
+                "phase": "reasoning",
+                "text": "Check sources.",
+                "annotations": []
+            },
+            {
+                "output_index": 0,
+                "part_index": 3,
+                "phase": "final_answer",
+                "text": "Cited answer.",
+                "annotations": [
+                    {
+                        "type": "document_character_citation",
+                        "cited_text": "characters",
+                        "document_index": 0,
+                        "document_title": "Notes",
+                        "file_id": "file-1",
+                        "start_char_index": 2,
+                        "end_char_index": 12
+                    },
+                    {
+                        "type": "document_page_citation",
+                        "cited_text": "pages",
+                        "document_index": 1,
+                        "document_title": null,
+                        "file_id": "file-2",
+                        "start_page_number": 5,
+                        "end_page_number": 7
+                    },
+                    {
+                        "type": "document_content_block_citation",
+                        "cited_text": "blocks",
+                        "document_index": 2,
+                        "document_title": "Chunks",
+                        "file_id": null,
+                        "start_block_index": 4,
+                        "end_block_index": 6
+                    },
+                    {
+                        "type": "search_result_citation",
+                        "cited_text": "search result",
+                        "search_result_index": 3,
+                        "source": "urn:source:3",
+                        "title": "Result",
+                        "start_block_index": 1,
+                        "end_block_index": 2
+                    },
+                    {
+                        "type": "web_search_result_citation",
+                        "cited_text": "web result",
+                        "encrypted_index": "opaque-index",
+                        "title": null,
+                        "url": "https://example.com/web"
+                    }
+                ]
+            }
+        ])
+    );
+}
+
+#[test]
+fn stream_rejects_unmodeled_citation_fields() {
+    let stream = StreamState {
+        blocks: BTreeMap::from([(
+            0,
+            serde_json::json!({
+                "type": "text",
+                "text": "Cited answer.",
+                "citations": [{
+                    "type": "web_search_result_location",
+                    "cited_text": "web result",
+                    "encrypted_index": "opaque-index",
+                    "title": null,
+                    "url": "https://example.com/web",
+                    "unmodeled": true
+                }]
+            }),
+        )]),
+        ..StreamState::default()
+    };
+
+    let error = stream
+        .finish()
+        .expect_err("unmodeled citation fields must fail");
+
+    assert!(error.to_string().contains("unknown field"));
 }
 
 #[test]

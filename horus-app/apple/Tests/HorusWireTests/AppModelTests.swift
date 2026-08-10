@@ -79,6 +79,59 @@ private actor GatewayConnectionHarness {
     func attemptCount() -> Int { attempts }
 }
 
+private extension AppModel {
+    func reduce(
+        event: AgentEventRecord,
+        blocks: [FrontendBlock],
+        history: [RenderedEventRecord]? = nil,
+        preview: RenderedPreview?
+    ) {
+        _ = history
+        let renderedBlocks: [RenderedBlock]
+        if blocks.isEmpty,
+           event.msg["frontendType"]?.stringValue == "render",
+           let capability = event.msg["capability"]?.stringValue,
+           let value = event.msg["block"],
+           let block = try? FrontendBlock(json: value) {
+            renderedBlocks = [RenderedBlock(capability: capability, block: block)]
+        } else {
+            renderedBlocks = blocks.map { RenderedBlock(capability: "test", block: $0) }
+        }
+        reduce(record: RecordedEvent(
+            sequence: 1,
+            recordedAtMs: 1_000,
+            event: event,
+            streamMetrics: [],
+            blocks: renderedBlocks,
+            preview: preview
+        ))
+    }
+}
+
+private extension GatewayEnvelope {
+    static func agentEvent(
+        sessionID: String,
+        sequence: UInt64,
+        event: AgentEventRecord,
+        blocks: [FrontendBlock],
+        history: [RenderedEventRecord]? = nil,
+        preview: RenderedPreview?
+    ) -> Self {
+        _ = history
+        return .agentEvent(
+            sessionID: sessionID,
+            record: RecordedEvent(
+                sequence: sequence,
+                recordedAtMs: 1_000,
+                event: event,
+                streamMetrics: [],
+                blocks: blocks.map { RenderedBlock(capability: "test", block: $0) },
+                preview: preview
+            )
+        )
+    }
+}
+
 @MainActor
 final class AppModelTests: XCTestCase {
     private func model(
@@ -257,7 +310,6 @@ final class AppModelTests: XCTestCase {
 
     private func sessionReady(
         latestSequence: UInt64,
-        replayEpoch: String = "epoch-1",
         nextBeforeSequence: UInt64? = nil,
         sessionID: String = "chat-1",
         contributions: [FrontendContribution] = [],
@@ -265,7 +317,6 @@ final class AppModelTests: XCTestCase {
         runStats: RunStats = RunStats()
     ) -> SessionReadyPayload {
         SessionReadyPayload(
-            replayEpoch: replayEpoch,
             latestSequence: latestSequence,
             nextBeforeSequence: nextBeforeSequence,
             workspace: WorkspaceInfo(id: "workspace-1", path: "/srv/horus"),
@@ -371,9 +422,12 @@ final class AppModelTests: XCTestCase {
             "block": .object([
                 "id": .string(id),
                 "group": group.map(JSONValue.string) ?? .null,
-                "append": .bool(append),
-                "pending": .bool(pending),
+                "update": .string(append ? "append" : "replace"),
+                "state": .string(pending ? "pending" : "complete"),
+                "role": .string("tool"),
+                "title": .string("Tool"),
                 "text": .string(text),
+                "symbol": .null,
                 "format": .string(format),
                 "tone": .string(tone),
                 "files": .array(files.map { file in
@@ -386,6 +440,21 @@ final class AppModelTests: XCTestCase {
                 })
             ])
         ]))
+    }
+
+    private func recorded(
+        _ sequence: UInt64,
+        _ msg: JSONValue,
+        blocks: [RenderedBlock] = []
+    ) -> RecordedEvent {
+        RecordedEvent(
+            sequence: sequence,
+            recordedAtMs: Int64(sequence * 100),
+            event: AgentEventRecord(submissionId: nil, msg: msg),
+            streamMetrics: [],
+            blocks: blocks,
+            preview: nil
+        )
     }
 
     private func session(
@@ -537,7 +606,8 @@ final class AppModelTests: XCTestCase {
             model.reduce(
                 event: AgentEventRecord(submissionId: nil, msg: .object([
                     "type": .string("agent_message_content_delta"),
-                    "itemId": .string("answer-1"),
+                    "modelStepId": .string("answer-1"),
+                    "phase": .string("final_answer"),
                     "delta": .string("x")
                 ])),
                 blocks: [],
@@ -574,7 +644,7 @@ final class AppModelTests: XCTestCase {
             model.reduce(
                 event: AgentEventRecord(submissionId: nil, msg: .object([
                     "type": .string("agent_message_content_delta"),
-                    "itemId": .string("response-1"),
+                    "modelStepId": .string("response-1"),
                     "phase": .string(phase),
                     "delta": .string(delta)
                 ])),
@@ -598,6 +668,109 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.transcript.map(\.text), ["Checking **the workspace**", "Done"])
         XCTAssertEqual(model.transcript.map(\.kind), [.commentary, .assistant])
         XCTAssertTrue(model.transcript.allSatisfy { !$0.pending })
+    }
+
+    func testCompletedModelStepSnapshotMatchesReplayWithoutDeltas() throws {
+        let live = try model()
+        let replay = try model()
+        let stepID = "step-1"
+        let deltas: [(String, String, String?)] = [
+            ("agent_reasoning_content_delta", "Reason", nil),
+            ("agent_message_content_delta", "Checking", "commentary"),
+            ("agent_message_content_delta", "Done", "final_answer"),
+        ]
+        for (offset, delta) in deltas.enumerated() {
+            var fields: [String: JSONValue] = [
+                "type": .string(delta.0),
+                "sessionId": .string("chat-1"),
+                "turnId": .string("turn-1"),
+                "modelStepId": .string(stepID),
+                "delta": .string(delta.1),
+            ]
+            if let phase = delta.2 { fields["phase"] = .string(phase) }
+            live.reduce(record: recorded(UInt64(offset + 1), .object(fields)))
+        }
+        let completion = recorded(4, .object([
+            "type": .string("model_step_completed"),
+            "sessionId": .string("chat-1"),
+            "turnId": .string("turn-1"),
+            "modelStepId": .string(stepID),
+            "stepIndex": .number(0),
+            "startedAtMs": .number(100),
+            "completedAtMs": .number(400),
+            "outcome": .object([
+                "status": .string("completed"),
+                "endTurn": .bool(true),
+                "toolCallIds": .array([]),
+                "usage": .object([
+                    "inputTokens": .number(10),
+                    "cachedInputTokens": .number(2),
+                    "cacheWriteInputTokens": .number(0),
+                    "outputTokens": .number(3),
+                    "reasoningOutputTokens": .number(1),
+                    "totalTokens": .number(13),
+                ]),
+                "content": .array([
+                    .object([
+                        "outputIndex": .number(0),
+                        "partIndex": .number(0),
+                        "phase": .string("reasoning"),
+                        "text": .string("Reason"),
+                        "annotations": .array([]),
+                    ]),
+                    .object([
+                        "outputIndex": .number(1),
+                        "partIndex": .number(0),
+                        "phase": .string("commentary"),
+                        "text": .string("Checking"),
+                        "annotations": .array([]),
+                    ]),
+                    .object([
+                        "outputIndex": .number(1),
+                        "partIndex": .number(1),
+                        "phase": .string("final_answer"),
+                        "text": .string("Done"),
+                        "annotations": .array([]),
+                    ]),
+                ]),
+            ]),
+        ]))
+
+        live.reduce(record: completion)
+        replay.reduce(record: completion)
+
+        let liveProjection = live.transcript.map {
+            [$0.id, $0.kind.rawValue, $0.text, String($0.pending), $0.modelStepID ?? ""]
+        }
+        let replayProjection = replay.transcript.map {
+            [$0.id, $0.kind.rawValue, $0.text, String($0.pending), $0.modelStepID ?? ""]
+        }
+        XCTAssertEqual(liveProjection, replayProjection)
+        XCTAssertEqual(live.transcript.map(\.text), ["Reason", "Checking", "Done"])
+    }
+
+    func testFailedModelStepKeepsItsPartialDelta() throws {
+        let model = try model()
+        model.reduce(record: recorded(1, .object([
+            "type": .string("agent_reasoning_content_delta"),
+            "sessionId": .string("chat-1"),
+            "turnId": .string("turn-1"),
+            "modelStepId": .string("step-1"),
+            "delta": .string("Partial reasoning"),
+        ])))
+        model.reduce(record: recorded(2, .object([
+            "type": .string("model_step_completed"),
+            "sessionId": .string("chat-1"),
+            "turnId": .string("turn-1"),
+            "modelStepId": .string("step-1"),
+            "stepIndex": .number(0),
+            "startedAtMs": .number(100),
+            "completedAtMs": .number(200),
+            "outcome": .object(["status": .string("failed")]),
+        ])))
+
+        XCTAssertEqual(model.transcript.map(\.text), ["Partial reasoning"])
+        XCTAssertFalse(try XCTUnwrap(model.transcript.first).pending)
     }
 
     func testActiveRunAllowsSessionNavigationButNotSelectedSessionMutation() async throws {
@@ -627,7 +800,7 @@ final class AppModelTests: XCTestCase {
             return false
         })
         XCTAssertTrue(requests.contains { request in
-            guard case .openSession(_, "chat-2", _, _) = request else { return false }
+            guard case .openSession(_, "chat-2", _) = request else { return false }
             return true
         })
     }
@@ -656,7 +829,7 @@ final class AppModelTests: XCTestCase {
             model.reduce(
                 event: AgentEventRecord(submissionId: nil, msg: .object([
                     "type": .string("agent_reasoning_content_delta"),
-                    "itemId": .string("reasoning-1"),
+                    "modelStepId": .string("reasoning-1"),
                     "delta": .string(delta)
                 ])),
                 blocks: [],
@@ -702,7 +875,7 @@ final class AppModelTests: XCTestCase {
                 kind: .event,
                 group: "tools/turn-1",
                 format: "plain_text",
-                pending: false
+                pending: true
             ),
         ]
 
@@ -1164,7 +1337,7 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(30))
         let openRequests = await recorder.requests()
         let openRequest = try XCTUnwrap(openRequests.last)
-        guard case .openSession(let openID, _, _, _) = openRequest else {
+        guard case .openSession(let openID, _, _) = openRequest else {
             return XCTFail("Expected session open")
         }
         model.handle(.sessionOpened(
@@ -1237,10 +1410,10 @@ final class AppModelTests: XCTestCase {
         let openRequestCount = await recorder.requestCount()
         model.openSession("chat-1")
         let openRequest = await recorder.firstRequest(after: openRequestCount) { request in
-            guard case .openSession(_, "chat-1", _, _) = request else { return false }
+            guard case .openSession(_, "chat-1", _) = request else { return false }
             return true
         }
-        guard case .openSession(let openID, _, _, _) = try XCTUnwrap(openRequest) else {
+        guard case .openSession(let openID, _, _) = try XCTUnwrap(openRequest) else {
             return XCTFail("Expected session open")
         }
 
@@ -1252,11 +1425,6 @@ final class AppModelTests: XCTestCase {
             sessionID: "chat-1",
             sequence: 11,
             event: AgentEventRecord(submissionId: nil, msg: .object([
-                "type": .string("session_history"),
-                "events": .array([])
-            ])),
-            blocks: [],
-            history: [RenderedEventRecord(event: .object([
                 "type": .string("user_message"),
                 "message": .string("Edited input"),
                 "attachments": .array([]),
@@ -1264,7 +1432,9 @@ final class AppModelTests: XCTestCase {
                     "checkpointSequence": .number(11),
                     "batchItemCount": .number(1)
                 ])
-            ]), blocks: [])],
+            ])),
+            blocks: [],
+            history: nil,
             preview: nil
         ))
         model.handle(.sessionReplayComplete(requestID: openID, sessionID: "chat-1"))
@@ -1453,10 +1623,10 @@ final class AppModelTests: XCTestCase {
         let openRequestCount = await recorder.requestCount()
         model.openSession("chat-1")
         let openRequest = await recorder.firstRequest(after: openRequestCount) { request in
-            guard case .openSession(_, "chat-1", _, _) = request else { return false }
+            guard case .openSession(_, "chat-1", _) = request else { return false }
             return true
         }
-        guard case .openSession(let openID, _, _, _) = try XCTUnwrap(openRequest) else {
+        guard case .openSession(let openID, _, _) = try XCTUnwrap(openRequest) else {
             return XCTFail("Expected session open")
         }
         model.handle(.sessionOpened(
@@ -1636,7 +1806,7 @@ final class AppModelTests: XCTestCase {
             if case .openSession = $0 { return true }
             return false
         }))
-        guard case .openSession(let openRequestID, _, _, _) = openRequest else {
+        guard case .openSession(let openRequestID, _, _) = openRequest else {
             return XCTFail("Expected session open")
         }
         await harness.yield(.sessionOpened(
@@ -1690,39 +1860,110 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.toast?.tone, .error)
     }
 
-    func testFrontendRenderIsNamespacedAndReplayedFromHistory() throws {
+    func testCanonicalFrontendRenderIsCapabilityScopedAndAppliedOnce() throws {
         let app = try model()
         let first = renderEvent(
             pending: true,
             text: "Started",
             tone: "warning"
         )
-        app.reduce(event: first, blocks: [], preview: nil)
-        app.reduce(
-            event: renderEvent(group: nil, append: true, text: " and finished", tone: "success"),
-            blocks: [],
+        let started = RenderedBlock(capability: "tools", block: FrontendBlock(
+            id: "result",
+            group: "turn",
+            update: .replace,
+            state: .pending,
+            role: .tool,
+            title: "Tool",
+            text: "Started",
+            symbol: nil,
+            format: "plain_text",
+            tone: "warning",
+            files: []
+        ))
+        let finishedEvent = renderEvent(
+            group: nil,
+            append: true,
+            text: " and finished",
+            tone: "success"
+        )
+        let finished = RenderedBlock(capability: "tools", block: FrontendBlock(
+            id: "result",
+            group: nil,
+            update: .append,
+            state: .complete,
+            role: .tool,
+            title: "Tool",
+            text: " and finished",
+            symbol: nil,
+            format: "plain_text",
+            tone: "success",
+            files: []
+        ))
+        let firstRecord = RecordedEvent(
+            sequence: 1,
+            recordedAtMs: 1_000,
+            event: first,
+            streamMetrics: [],
+            blocks: [started],
             preview: nil
         )
+        app.reduce(record: firstRecord)
+        app.reduce(record: RecordedEvent(
+            sequence: 2,
+            recordedAtMs: 1_001,
+            event: finishedEvent,
+            streamMetrics: [],
+            blocks: [finished],
+            preview: nil
+        ))
 
         let entry = try XCTUnwrap(app.transcript.first)
-        XCTAssertEqual(entry.id, "tools/result")
-        XCTAssertEqual(entry.group, "tools/turn")
+        XCTAssertEqual(app.transcript.count, 1)
+        XCTAssertEqual(entry.id, "block:5:toolsresult")
+        XCTAssertEqual(entry.group, "turn")
         XCTAssertEqual(entry.text, "Started and finished")
         XCTAssertEqual(entry.tone, "success")
         XCTAssertFalse(entry.pending)
 
         let replay = try model()
-        replay.reduce(
-            event: AgentEventRecord(submissionId: nil, msg: .object([
-                "type": .string("session_history"),
-                "events": .array([])
-            ])),
-            blocks: [],
-            history: [RenderedEventRecord(event: first.msg, blocks: [])],
-            preview: nil
-        )
-        XCTAssertEqual(replay.transcript.first?.id, "tools/result")
+        replay.reduce(record: firstRecord)
+        XCTAssertEqual(replay.transcript.first?.id, "block:5:toolsresult")
         XCTAssertEqual(replay.transcript.first?.tone, "warning")
+    }
+
+    func testRenderedGroupIdentityIsScopedByCapability() throws {
+        let app = try model()
+        for (sequence, capability) in [(UInt64(1), "tools"), (UInt64(2), "review")] {
+            app.reduce(record: RecordedEvent(
+                sequence: sequence,
+                recordedAtMs: Int64(sequence),
+                event: renderEvent(group: "turn", text: capability),
+                streamMetrics: [],
+                blocks: [RenderedBlock(capability: capability, block: FrontendBlock(
+                    id: "result",
+                    group: "turn",
+                    update: .replace,
+                    state: .complete,
+                    role: .tool,
+                    title: capability,
+                    text: capability,
+                    symbol: nil,
+                    format: "plain_text",
+                    tone: "neutral",
+                    files: []
+                ))],
+                preview: nil
+            ))
+        }
+
+        XCTAssertEqual(app.transcript.map(\.group), ["turn", "turn"])
+        XCTAssertEqual(
+            app.transcript.compactMap(\.renderedGroupIdentity),
+            [
+                TranscriptGroupIdentity(capability: "tools", group: "turn"),
+                TranscriptGroupIdentity(capability: "review", group: "turn")
+            ]
+        )
     }
 
     func testFrontendRenderCarriesFilesThroughReplacementAndAppend() throws {
@@ -1765,9 +2006,12 @@ final class AppModelTests: XCTestCase {
         let outer = FrontendBlock(
             id: "tools/call",
             group: "tools/turn",
-            append: false,
-            pending: false,
+            update: .replace,
+            state: .complete,
+            role: .tool,
+            title: "Read file",
             text: "Read file",
+            symbol: "task",
             format: "plain_text",
             tone: "neutral",
             files: []
@@ -1781,8 +2025,26 @@ final class AppModelTests: XCTestCase {
             tone: "success"
         )
         let preview = RenderedPreview(title: "worker", events: [
-            RenderedEventRecord(event: .object(["type": .string("tool_call_end")]), blocks: [outer]),
-            RenderedEventRecord(event: rendered.msg, blocks: [])
+            RenderedEventRecord(
+                event: .object(["type": .string("tool_call_end")]),
+                blocks: [RenderedBlock(capability: "tools", block: outer)]
+            ),
+            RenderedEventRecord(
+                event: rendered.msg,
+                blocks: [RenderedBlock(capability: "reviewer", block: FrontendBlock(
+                    id: "change",
+                    group: "work",
+                    update: .replace,
+                    state: .complete,
+                    role: .artifact,
+                    title: "Code change",
+                    text: "@@ -1 +1 @@",
+                    symbol: nil,
+                    format: "unified_diff",
+                    tone: "success",
+                    files: []
+                ))]
+            )
         ])
 
         model.reduce(
@@ -1799,8 +2061,8 @@ final class AppModelTests: XCTestCase {
         let snapshot = try XCTUnwrap(model.previews.first)
         XCTAssertEqual(snapshot.title, "worker")
         XCTAssertEqual(snapshot.blocks.map(\.block.text), ["Read file", "@@ -1 +1 @@"])
-        XCTAssertEqual(snapshot.blocks.last?.block.id, "reviewer/change")
-        XCTAssertEqual(snapshot.blocks.last?.block.group, "reviewer/work")
+        XCTAssertEqual(snapshot.blocks.last?.block.id, "change")
+        XCTAssertEqual(snapshot.blocks.last?.block.group, "work")
         XCTAssertEqual(snapshot.blocks.last?.block.format, "unified_diff")
         XCTAssertEqual(snapshot.blocks.last?.block.tone, "success")
         XCTAssertNil(model.presentedPreview)
@@ -1837,9 +2099,12 @@ final class AppModelTests: XCTestCase {
         let block = FrontendBlock(
             id: "worker/message",
             group: nil,
-            append: false,
-            pending: false,
+            update: .replace,
+            state: .complete,
+            role: .notice,
+            title: "Done",
             text: "Done",
+            symbol: nil,
             format: "plain_text",
             tone: "success",
             files: []
@@ -1853,7 +2118,10 @@ final class AppModelTests: XCTestCase {
             ])),
             blocks: [],
             preview: RenderedPreview(title: "reviewer", events: [
-                RenderedEventRecord(event: .object(["type": .string("agent_message")]), blocks: [block])
+                RenderedEventRecord(
+                    event: .object(["type": .string("agent_message")]),
+                    blocks: [RenderedBlock(capability: "worker", block: block)]
+                )
             ])
         )
 
@@ -2423,9 +2691,12 @@ final class AppModelTests: XCTestCase {
             block: FrontendBlock(
                 id: "artifacts/file-1",
                 group: nil,
-                append: false,
-                pending: false,
+                update: .replace,
+                state: .complete,
+                role: .artifact,
+                title: "Architecture diagram",
                 text: "",
+                symbol: "storage",
                 format: "plain_text",
                 tone: "neutral",
                 files: [file]
@@ -2950,18 +3221,16 @@ final class AppModelTests: XCTestCase {
         model.selectedSessionID = "chat-1"
         model.reduce(
             event: AgentEventRecord(submissionId: nil, msg: .object([
-                "type": .string("session_history"),
-                "events": .array([])
-            ])),
-            blocks: [],
-            history: [RenderedEventRecord(event: .object([
                 "type": .string("user_message"),
                 "message": .string("Fork here"),
+                "attachments": .array([]),
                 "messageTarget": .object([
                     "checkpointSequence": .number(12),
                     "batchItemCount": .number(3)
                 ])
-            ]), blocks: [])],
+            ])),
+            blocks: [],
+            history: nil,
             preview: nil
         )
         let target = try XCTUnwrap(model.transcript.first?.messageTarget)
@@ -3013,55 +3282,116 @@ final class AppModelTests: XCTestCase {
 
     func testWebSearchAbortAndLiveUsageMatchCLI() throws {
         let model = try model()
-        for msg: JSONValue in [
-            .object(["type": .string("web_search_begin"), "callId": .string("search-1")]),
-            .object([
-                "type": .string("web_search_end"),
-                "callId": .string("search-1"),
-                "query": .string("Horus"),
-                "action": .string("search")
-            ]),
-            .object([
-                "type": .string("turn_aborted"),
-                "turnId": .string("turn-1"),
-                "reason": .string("Stopped")
-            ]),
-            .object([
-                "type": .string("token_count"),
-                "info": .object([
-                    "totalTokenUsage": .object([
-                        "inputTokens": .number(1_000),
-                        "cachedInputTokens": .number(100),
-                        "cacheWriteInputTokens": .number(25),
-                        "outputTokens": .number(100),
-                        "reasoningOutputTokens": .number(50),
-                        "totalTokens": .number(1_100)
-                    ]),
-                    "lastTokenUsage": .object([
-                        "inputTokens": .number(40),
-                        "cachedInputTokens": .number(20),
-                        "cacheWriteInputTokens": .number(5),
-                        "outputTokens": .number(10),
-                        "reasoningOutputTokens": .number(3),
-                        "totalTokens": .number(99)
-                    ]),
-                    "modelContextWindow": .number(200)
-                ])
-            ])
-        ] {
-            model.reduce(
-                event: AgentEventRecord(submissionId: nil, msg: msg),
-                blocks: [],
+        let events: [(JSONValue, [RenderedBlock])] = [
+            (
+                .object([
+                    "type": .string("web_search_begin"),
+                    "sessionId": .string("chat-1"),
+                    "turnId": .string("turn-1"),
+                    "modelStepId": .string("step-1"),
+                    "callId": .string("search-1")
+                ]),
+                [RenderedBlock(capability: "web_search", block: FrontendBlock(
+                    id: "step-1/search-1",
+                    group: "turn-1",
+                    update: .replace,
+                    state: .pending,
+                    role: .webSearch,
+                    title: "Searching the web",
+                    text: "",
+                    symbol: "search",
+                    format: "plain_text",
+                    tone: "neutral",
+                    files: []
+                ))]
+            ),
+            (
+                .object([
+                    "type": .string("web_search_end"),
+                    "sessionId": .string("chat-1"),
+                    "turnId": .string("turn-1"),
+                    "modelStepId": .string("step-1"),
+                    "callId": .string("search-1"),
+                    "action": .object([
+                        "type": .string("search"),
+                        "query": .string("Horus")
+                    ])
+                ]),
+                [RenderedBlock(capability: "web_search", block: FrontendBlock(
+                    id: "step-1/search-1",
+                    group: "turn-1",
+                    update: .replace,
+                    state: .complete,
+                    role: .webSearch,
+                    title: "Searched the web",
+                    text: "Horus",
+                    symbol: "search",
+                    format: "plain_text",
+                    tone: "success",
+                    files: []
+                ))]
+            ),
+            (
+                .object([
+                    "type": .string("turn_aborted"),
+                    "turnId": .string("turn-1"),
+                    "reason": .string("Stopped")
+                ]),
+                [RenderedBlock(capability: "agent", block: FrontendBlock(
+                    id: nil,
+                    group: "turn-1",
+                    update: .replace,
+                    state: .complete,
+                    role: .notice,
+                    title: "Turn aborted",
+                    text: "Stopped",
+                    symbol: nil,
+                    format: "plain_text",
+                    tone: "warning",
+                    files: []
+                ))]
+            ),
+            (
+                .object([
+                    "type": .string("token_count"),
+                    "info": .object([
+                        "totalTokenUsage": .object([
+                            "inputTokens": .number(1_000),
+                            "cachedInputTokens": .number(100),
+                            "cacheWriteInputTokens": .number(25),
+                            "outputTokens": .number(100),
+                            "reasoningOutputTokens": .number(50),
+                            "totalTokens": .number(1_100)
+                        ]),
+                        "lastTokenUsage": .object([
+                            "inputTokens": .number(40),
+                            "cachedInputTokens": .number(20),
+                            "cacheWriteInputTokens": .number(5),
+                            "outputTokens": .number(10),
+                            "reasoningOutputTokens": .number(3),
+                            "totalTokens": .number(99)
+                        ]),
+                        "modelContextWindow": .number(200)
+                    ])
+                ]),
+                []
+            ),
+        ]
+        for (offset, item) in events.enumerated() {
+            model.reduce(record: RecordedEvent(
+                sequence: UInt64(offset + 1),
+                recordedAtMs: Int64(1_000 + offset),
+                event: AgentEventRecord(submissionId: nil, msg: item.0),
+                streamMetrics: [],
+                blocks: item.1,
                 preview: nil
-            )
+            ))
         }
 
-        XCTAssertEqual(model.transcript.map(\.text), [
-            "Searching the web",
-            "Searched: Horus",
-            "Turn aborted: Stopped"
-        ])
-        XCTAssertEqual(model.transcript.map(\.tone), ["warning", "success", "warning"])
+        XCTAssertEqual(model.transcript.map(\.title), ["Searched the web", "Turn aborted"])
+        XCTAssertEqual(model.transcript.map(\.text), ["Horus", "Stopped"])
+        XCTAssertEqual(model.transcript.map(\.role), [.webSearch, .notice])
+        XCTAssertEqual(model.transcript.map(\.tone), ["success", "warning"])
         XCTAssertEqual(model.currentUsage.inputTokens, 1_000)
         XCTAssertEqual(model.lastUsage.cachedInputTokens, 20)
         XCTAssertEqual(model.lastUsage.cacheWriteInputTokens, 5)
@@ -3144,7 +3474,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.runningSessionIDs.contains("chat-1"))
         XCTAssertTrue(model.unreadSessionIDs.isEmpty)
         XCTAssertNil(model.toast)
-        XCTAssertEqual(model.transcript.last?.text, "Provider failed")
+        XCTAssertTrue(model.transcript.isEmpty)
     }
 
     func testSetupValidationUsesGlobalToast() throws {
@@ -3783,11 +4113,11 @@ final class AppModelTests: XCTestCase {
         let openRequestCount = await recorder.requestCount()
         model.openSession("chat-1")
         let openRequest = await recorder.firstRequest(after: openRequestCount) {
-            guard case .openSession(_, "chat-1", nil, nil) = $0 else { return false }
+            guard case .openSession(_, "chat-1", nil) = $0 else { return false }
             return true
         }
         let request = try XCTUnwrap(openRequest)
-        guard case .openSession(let requestID, _, nil, nil) = request else {
+        guard case .openSession(let requestID, _, nil) = request else {
             return XCTFail("Expected an uncached session open")
         }
         XCTAssertTrue(model.isLoadingTranscript)
@@ -3799,7 +4129,8 @@ final class AppModelTests: XCTestCase {
             sequence: 1,
             event: AgentEventRecord(submissionId: nil, msg: .object([
                 "type": .string("agent_message_content_delta"),
-                "itemId": .string("answer-1"),
+                "modelStepId": .string("answer-1"),
+                "phase": .string("final_answer"),
                 "delta": .string("Hel")
             ])),
             blocks: [],
@@ -3848,23 +4179,32 @@ final class AppModelTests: XCTestCase {
         let openRequestCount = await recorder.requestCount()
         model.openSession("chat-1")
         let openRequest = await recorder.firstRequest(after: openRequestCount) { request in
-            guard case .openSession(_, "chat-1", _, _) = request else { return false }
+            guard case .openSession(_, "chat-1", _) = request else { return false }
             return true
         }
-        guard case .openSession(let openID, _, _, _) = try XCTUnwrap(openRequest)
+        guard case .openSession(let openID, _, _) = try XCTUnwrap(openRequest)
         else { return XCTFail("Expected session open") }
         model.handle(.sessionOpened(
             requestID: openID,
             payload: sessionReady(latestSequence: 8, nextBeforeSequence: 40)
         ))
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            sequence: 8,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("agent_message"),
+                "sessionId": .string("chat-1"),
+                "turnId": .string("turn-current"),
+                "modelStepId": .string("step-current"),
+                "phase": .string("final_answer"),
+                "message": .string("Current"),
+                "messageTarget": .null
+            ])),
+            blocks: [],
+            history: nil,
+            preview: nil
+        ))
         model.handle(.sessionReplayComplete(requestID: openID, sessionID: "chat-1"))
-        model.transcript = [TranscriptEntry(
-            id: "current",
-            text: "Current",
-            kind: .assistant,
-            format: "plain_text",
-            pending: false
-        )]
         model.selectedModelRoute = "current-route"
 
         let initialRequests = await recorder.requests()
@@ -3903,7 +4243,7 @@ final class AppModelTests: XCTestCase {
             let historyID,
             "chat-1",
             40,
-            20
+            300
         ) = try XCTUnwrap(historyRequest) else {
             return XCTFail("Expected paged history request")
         }
@@ -3927,10 +4267,20 @@ final class AppModelTests: XCTestCase {
                 "message": .string("Older answer")
             ]), blocks: []),
         ]
+        let records = events.enumerated().map { index, rendered in
+            RecordedEvent(
+                sequence: UInt64(index + 1),
+                recordedAtMs: Int64(1_000 + index),
+                event: AgentEventRecord(submissionId: nil, msg: rendered.event),
+                streamMetrics: [],
+                blocks: rendered.blocks,
+                preview: nil
+            )
+        }
         model.handle(.sessionHistory(
             requestID: "stale",
             sessionID: "chat-1",
-            events: events,
+            records: records,
             nextBeforeSequence: nil
         ))
         XCTAssertEqual(model.displayedTranscript.map(\.text), ["Current"])
@@ -3938,7 +4288,7 @@ final class AppModelTests: XCTestCase {
         model.handle(.sessionHistory(
             requestID: historyID,
             sessionID: "chat-1",
-            events: events,
+            records: records,
             nextBeforeSequence: nil
         ))
 
@@ -3956,7 +4306,7 @@ final class AppModelTests: XCTestCase {
         model.restoreSession("chat-1")
         try await Task.sleep(for: .milliseconds(30))
         let reconnectRequests = await recorder.requests()
-        guard case .openSession(let reconnectID, _, _, _) = try XCTUnwrap(
+        guard case .openSession(let reconnectID, _, _) = try XCTUnwrap(
             reconnectRequests.last
         ) else { return XCTFail("Expected reconnect session open") }
         model.handle(.sessionOpened(
@@ -3965,6 +4315,128 @@ final class AppModelTests: XCTestCase {
         ))
         model.handle(.sessionReplayComplete(requestID: reconnectID, sessionID: "chat-1"))
         XCTAssertFalse(model.hasEarlierHistory)
+    }
+
+    func testHistoryPagesRebuildCrossPageAppendsAndFailedStepDeltas() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+
+        let openRequestCount = await recorder.requestCount()
+        model.openSession("chat-1")
+        let open = await recorder.firstRequest(after: openRequestCount) {
+            guard case .openSession(_, "chat-1", nil) = $0 else { return false }
+            return true
+        }
+        guard case .openSession(let openID, _, _) = try XCTUnwrap(open) else {
+            return XCTFail("Expected session open")
+        }
+        model.handle(.sessionOpened(
+            requestID: openID,
+            payload: sessionReady(latestSequence: 8, nextBeforeSequence: 7)
+        ))
+
+        let toolEnd = recorded(7, .object([
+            "type": .string("tool_call_end"),
+            "turnId": .string("turn-1"),
+            "callId": .string("call-1"),
+            "name": .string("shell"),
+            "output": .string("Output"),
+            "isError": .bool(false),
+        ]), blocks: [RenderedBlock(capability: "tools", block: FrontendBlock(
+            id: "turn-1/call-1",
+            group: nil,
+            update: .append,
+            state: .complete,
+            role: .tool,
+            title: "Run command",
+            text: "\nOutput",
+            symbol: nil,
+            format: "plain_text",
+            tone: "success",
+            files: []
+        ))])
+        let failed = recorded(8, .object([
+            "type": .string("model_step_completed"),
+            "sessionId": .string("chat-1"),
+            "turnId": .string("turn-1"),
+            "modelStepId": .string("step-1"),
+            "stepIndex": .number(0),
+            "startedAtMs": .number(100),
+            "completedAtMs": .number(200),
+            "outcome": .object(["status": .string("failed")]),
+        ]))
+        model.handle(.agentEvent(sessionID: "chat-1", record: toolEnd))
+        model.handle(.agentEvent(sessionID: "chat-1", record: failed))
+        model.handle(.sessionReplayComplete(requestID: openID, sessionID: "chat-1"))
+        XCTAssertEqual(model.transcript.map(\.text), ["Output"])
+
+        var requestCount = await recorder.requestCount()
+        model.loadEarlierHistory()
+        let firstHistory = await recorder.firstRequest(after: requestCount) {
+            guard case .getSessionHistory = $0 else { return false }
+            return true
+        }
+        guard case .getSessionHistory(let firstID, _, 7, _) = try XCTUnwrap(firstHistory) else {
+            return XCTFail("Expected first history page")
+        }
+        let partial = recorded(6, .object([
+            "type": .string("agent_reasoning_content_delta"),
+            "sessionId": .string("chat-1"),
+            "turnId": .string("turn-1"),
+            "modelStepId": .string("step-1"),
+            "delta": .string("Partial reasoning"),
+        ]))
+        model.handle(.sessionHistory(
+            requestID: firstID,
+            sessionID: "chat-1",
+            records: [partial],
+            nextBeforeSequence: 6
+        ))
+        XCTAssertEqual(model.transcript.map(\.text), ["Partial reasoning", "Output"])
+        XCTAssertFalse(try XCTUnwrap(model.transcript.first).pending)
+
+        requestCount = await recorder.requestCount()
+        model.loadEarlierHistory()
+        let secondHistory = await recorder.firstRequest(after: requestCount) {
+            guard case .getSessionHistory = $0 else { return false }
+            return true
+        }
+        guard case .getSessionHistory(let secondID, _, 6, _) = try XCTUnwrap(secondHistory) else {
+            return XCTFail("Expected second history page")
+        }
+        let toolBegin = recorded(5, .object([
+            "type": .string("tool_call_begin"),
+            "turnId": .string("turn-1"),
+            "callId": .string("call-1"),
+            "name": .string("shell"),
+            "arguments": .object(["cmd": .string("pwd")]),
+        ]), blocks: [RenderedBlock(capability: "tools", block: FrontendBlock(
+            id: "turn-1/call-1",
+            group: nil,
+            update: .replace,
+            state: .pending,
+            role: .tool,
+            title: "Run command",
+            text: "Arguments",
+            symbol: nil,
+            format: "plain_text",
+            tone: "neutral",
+            files: []
+        ))])
+        model.handle(.sessionHistory(
+            requestID: secondID,
+            sessionID: "chat-1",
+            records: [toolBegin],
+            nextBeforeSequence: nil
+        ))
+
+        XCTAssertEqual(model.transcript.map(\.text), ["Arguments\nOutput", "Partial reasoning"])
+        XCTAssertEqual(model.transcript.map(\.role), [.tool, nil])
+        XCTAssertTrue(model.transcript.allSatisfy { !$0.pending })
     }
 
     func testTranscriptStartsWithABoundedVisibleTail() throws {
@@ -4010,7 +4482,6 @@ final class AppModelTests: XCTestCase {
         await store.saveTranscript(
             accountID: account.id,
             sessionID: "chat-1",
-            replayEpoch: "epoch-1",
             sequence: 7,
             nextBeforeSequence: 40,
             transcript: [TranscriptEntry(
@@ -4036,12 +4507,11 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(20))
         let requests = await recorder.requests()
         let request = try XCTUnwrap(requests.first)
-        guard case .openSession(let requestID, let sessionID, let cursor, let epoch) = request else {
+        guard case .openSession(let requestID, let sessionID, let cursor) = request else {
             return XCTFail("Expected a cached session open")
         }
         XCTAssertEqual(sessionID, "chat-1")
         XCTAssertEqual(cursor, 7)
-        XCTAssertEqual(epoch, "epoch-1")
         XCTAssertTrue(model.isLoadingTranscript)
 
         model.handle(.sessionOpened(requestID: requestID, payload: sessionReady(latestSequence: 7)))
@@ -4104,7 +4574,7 @@ final class AppModelTests: XCTestCase {
         let requestCount = await recorder.requestCount()
         model.openSession("chat-2")
         let request = await recorder.firstRequest(after: requestCount) { request in
-            guard case .openSession(_, "chat-2", _, _) = request else { return false }
+            guard case .openSession(_, "chat-2", _) = request else { return false }
             return true
         }
 
@@ -4113,7 +4583,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.displayedTranscript.map(\.text), ["Previous chat"])
     }
 
-    func testAuthoritativeHistoryReplacesTheFrozenCachedTranscript() async throws {
+    func testCanonicalReplayCompletesAfterTheFrozenCachedTranscript() async throws {
         let suiteName = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         let directory = FileManager.default.temporaryDirectory
@@ -4128,14 +4598,14 @@ final class AppModelTests: XCTestCase {
         await store.saveTranscript(
             accountID: account.id,
             sessionID: "chat-1",
-            replayEpoch: "epoch-1",
             sequence: 7,
             transcript: [TranscriptEntry(
-                id: "answer-1",
+                id: "model-stream:8:answer-1final_answer",
                 text: "Cached",
                 kind: .assistant,
                 format: "plain_text",
-                pending: false
+                pending: false,
+                modelStepID: "answer-1"
             )],
             currentUsage: TokenUsage(),
             lastUsage: TokenUsage()
@@ -4152,7 +4622,7 @@ final class AppModelTests: XCTestCase {
         model.openSession("chat-1")
         try await Task.sleep(for: .milliseconds(20))
         let requests = await recorder.requests()
-        guard case .openSession(let requestID, _, _, _) = try XCTUnwrap(requests.first) else {
+        guard case .openSession(let requestID, _, _) = try XCTUnwrap(requests.first) else {
             return XCTFail("Expected a session open")
         }
         model.handle(.sessionOpened(
@@ -4164,7 +4634,8 @@ final class AppModelTests: XCTestCase {
             sequence: 8,
             event: AgentEventRecord(submissionId: nil, msg: .object([
                 "type": .string("agent_message_content_delta"),
-                "itemId": .string("answer-1"),
+                "modelStepId": .string("answer-2"),
+                "phase": .string("final_answer"),
                 "delta": .string(" updated")
             ])),
             blocks: [],
@@ -4176,21 +4647,21 @@ final class AppModelTests: XCTestCase {
             sessionID: "chat-1",
             sequence: 9,
             event: AgentEventRecord(submissionId: nil, msg: .object([
-                "type": .string("session_history"),
-                "events": .array([])
+                "type": .string("agent_message"),
+                "modelStepId": .string("answer-2"),
+                "phase": .string("final_answer"),
+                "message": .string("Canonical"),
+                "messageTarget": .null
             ])),
             blocks: [],
-            history: [RenderedEventRecord(event: .object([
-                "type": .string("user_message"),
-                "message": .string("Canonical")
-            ]), blocks: [])],
+            history: nil,
             preview: nil
         ))
         XCTAssertEqual(model.displayedTranscript.map(\.text), ["Cached"])
 
         model.handle(.sessionReplayComplete(requestID: requestID, sessionID: "chat-1"))
 
-        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Canonical"])
+        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Cached", "Canonical"])
     }
 
     func testCursorRestoreKeepsTheReplayBaseAndFrozenPresentation() async throws {
@@ -4208,14 +4679,14 @@ final class AppModelTests: XCTestCase {
         await store.saveTranscript(
             accountID: account.id,
             sessionID: "chat-1",
-            replayEpoch: "epoch-1",
             sequence: 7,
             transcript: [TranscriptEntry(
-                id: "answer-1",
+                id: "model-stream:8:answer-1final_answer",
                 text: "Cached",
                 kind: .assistant,
                 format: "plain_text",
-                pending: false
+                pending: false,
+                modelStepID: "answer-1"
             )],
             currentUsage: TokenUsage(),
             lastUsage: TokenUsage()
@@ -4232,7 +4703,7 @@ final class AppModelTests: XCTestCase {
         model.openSession("chat-1")
         try await Task.sleep(for: .milliseconds(20))
         var requests = await recorder.requests()
-        guard case .openSession(let firstRequestID, _, _, _) = try XCTUnwrap(requests.first) else {
+        guard case .openSession(let firstRequestID, _, _) = try XCTUnwrap(requests.first) else {
             return XCTFail("Expected the first session open")
         }
         model.handle(.sessionOpened(
@@ -4244,7 +4715,8 @@ final class AppModelTests: XCTestCase {
             sequence: 8,
             event: AgentEventRecord(submissionId: nil, msg: .object([
                 "type": .string("agent_message_content_delta"),
-                "itemId": .string("answer-1"),
+                "modelStepId": .string("answer-1"),
+                "phase": .string("final_answer"),
                 "delta": .string(" updated")
             ])),
             blocks: [],
@@ -4255,7 +4727,7 @@ final class AppModelTests: XCTestCase {
         model.restoreSession("chat-1")
         try await Task.sleep(for: .milliseconds(20))
         requests = await recorder.requests()
-        guard case .openSession(let secondRequestID, _, 8, "epoch-1") = try XCTUnwrap(
+        guard case .openSession(let secondRequestID, _, 8) = try XCTUnwrap(
             requests.last
         ) else { return XCTFail("Expected the replay cursor to resume at sequence 8") }
         model.handle(.sessionOpened(
@@ -4268,7 +4740,8 @@ final class AppModelTests: XCTestCase {
             sequence: 9,
             event: AgentEventRecord(submissionId: nil, msg: .object([
                 "type": .string("agent_message_content_delta"),
-                "itemId": .string("answer-1"),
+                "modelStepId": .string("answer-1"),
+                "phase": .string("final_answer"),
                 "delta": .string(" again")
             ])),
             blocks: [],
@@ -4298,7 +4771,6 @@ final class AppModelTests: XCTestCase {
             await store.saveTranscript(
                 accountID: accountID,
                 sessionID: "chat-\(index)",
-                replayEpoch: "epoch-1",
                 sequence: UInt64(index),
                 transcript: [TranscriptEntry(
                     id: "answer-1",
@@ -4334,7 +4806,6 @@ final class AppModelTests: XCTestCase {
         await store.saveTranscript(
             accountID: accountID,
             sessionID: "chat-20",
-            replayEpoch: "epoch-1",
             sequence: 20,
             transcript: [TranscriptEntry(
                 id: "answer-1",
@@ -4375,7 +4846,6 @@ final class AppModelTests: XCTestCase {
         await store.saveTranscript(
             accountID: oversizedAccountID,
             sessionID: "large",
-            replayEpoch: "epoch-1",
             sequence: 1,
             transcript: [TranscriptEntry(
                 id: "answer-1",
@@ -4396,7 +4866,6 @@ final class AppModelTests: XCTestCase {
         await store.saveTranscript(
             accountID: oversizedAccountID,
             sessionID: "corrupt",
-            replayEpoch: "epoch-1",
             sequence: 1,
             transcript: [TranscriptEntry(
                 id: "answer-1",
@@ -4457,10 +4926,10 @@ final class AppModelTests: XCTestCase {
         var requestCount = await recorder.requestCount()
         model.openSession("chat-1")
         let firstRequest = await recorder.firstRequest(after: requestCount) { request in
-            guard case .openSession(_, "chat-1", _, _) = request else { return false }
+            guard case .openSession(_, "chat-1", _) = request else { return false }
             return true
         }
-        guard case .openSession(let firstID, "chat-1", _, _) = try XCTUnwrap(firstRequest)
+        guard case .openSession(let firstID, "chat-1", _) = try XCTUnwrap(firstRequest)
         else { return XCTFail("Expected first session open") }
         model.composer = "Typed while opening"
         model.handle(.sessionOpened(
@@ -4476,11 +4945,11 @@ final class AppModelTests: XCTestCase {
         requestCount = await recorder.requestCount()
         model.openSession("chat-2")
         let secondRequest = await recorder.firstRequest(after: requestCount) { request in
-            guard case .openSession(_, "chat-2", _, _) = request else { return false }
+            guard case .openSession(_, "chat-2", _) = request else { return false }
             return true
         }
         let secondOpen = try XCTUnwrap(secondRequest)
-        guard case .openSession(let secondID, _, _, _) = secondOpen else {
+        guard case .openSession(let secondID, _, _) = secondOpen else {
             return XCTFail("Expected second session open")
         }
         model.handle(.sessionOpened(
@@ -4687,7 +5156,6 @@ final class AppModelTests: XCTestCase {
         await store.saveTranscript(
             accountID: account.id,
             sessionID: "chat-1",
-            replayEpoch: "epoch-1",
             sequence: 7,
             transcript: [TranscriptEntry(
                 id: "answer-1",
@@ -4710,13 +5178,13 @@ final class AppModelTests: XCTestCase {
 
         model.openSession("chat-1")
         let firstRequest = await recorder.firstRequest(after: 0) { request in
-            guard case .openSession(_, "chat-1", 7, "epoch-1") = request else {
+            guard case .openSession(_, "chat-1", 7) = request else {
                 return false
             }
             return true
         }
         let first = try XCTUnwrap(firstRequest)
-        guard case .openSession(let requestID, _, 7, "epoch-1") = first else {
+        guard case .openSession(let requestID, _, 7) = first else {
             return XCTFail("Expected the cached cursor")
         }
         let requestCount = await recorder.requestCount()
@@ -4727,13 +5195,13 @@ final class AppModelTests: XCTestCase {
             fatal: false
         )))
         let retryRequest = await recorder.firstRequest(after: requestCount) { request in
-            guard case .openSession(_, "chat-1", nil, nil) = request else { return false }
+            guard case .openSession(_, "chat-1", nil) = request else { return false }
             return true
         }
         _ = try XCTUnwrap(retryRequest)
 
         let opens = await recorder.requests().compactMap { request -> (String, UInt64?)? in
-            guard case .openSession(_, let sessionID, let cursor, _) = request else { return nil }
+            guard case .openSession(_, let sessionID, let cursor) = request else { return nil }
             return (sessionID, cursor)
         }
         XCTAssertEqual(opens.count, 2)
@@ -4761,7 +5229,7 @@ final class AppModelTests: XCTestCase {
         )
 
         XCTAssertNil(model.toast)
-        XCTAssertEqual(model.transcript.last?.text, "Old error")
+        XCTAssertTrue(model.transcript.isEmpty)
     }
 
     func testDelayedGeneratedTitleDoesNotOverwriteAnExplicitRename() async throws {
@@ -4994,10 +5462,10 @@ final class AppModelTests: XCTestCase {
         let requestCount = await recorder.requestCount()
         model.restoreSession("chat-1")
         let open = await recorder.firstRequest(after: requestCount) { request in
-            guard case .openSession(_, "chat-1", _, _) = request else { return false }
+            guard case .openSession(_, "chat-1", _) = request else { return false }
             return true
         }
-        guard case .openSession(let requestID, _, _, _) = try XCTUnwrap(open) else {
+        guard case .openSession(let requestID, _, _) = try XCTUnwrap(open) else {
             return XCTFail("Expected the selected chat to reopen")
         }
         model.handle(.sessionOpened(
@@ -5008,18 +5476,16 @@ final class AppModelTests: XCTestCase {
             sessionID: "chat-1",
             sequence: 1,
             event: AgentEventRecord(submissionId: nil, msg: .object([
-                "type": .string("session_history"),
-                "events": .array([])
-            ])),
-            blocks: [],
-            history: [RenderedEventRecord(event: .object([
                 "type": .string("user_message"),
                 "message": .string("Review the gateway"),
+                "attachments": .array([]),
                 "messageTarget": .object([
                     "checkpointSequence": .number(1),
                     "batchItemCount": .number(1)
                 ])
-            ]), blocks: [])],
+            ])),
+            blocks: [],
+            history: nil,
             preview: nil
         ))
         let replayRequestCount = await recorder.requestCount()
@@ -5102,11 +5568,11 @@ final class AppModelTests: XCTestCase {
         let reconnectRequest = await recorder.firstRequest(
             after: reconnectRequestCount
         ) { request in
-            guard case .openSession(_, "chat-1", _, _) = request else { return false }
+            guard case .openSession(_, "chat-1", _) = request else { return false }
             return true
         }
         let reconnectOpen = try XCTUnwrap(reconnectRequest)
-        guard case .openSession(let requestID, _, _, _) = reconnectOpen else {
+        guard case .openSession(let requestID, _, _) = reconnectOpen else {
             return XCTFail("Expected the selected chat to reopen")
         }
         await harness.yield(.sessionOpened(
@@ -5405,24 +5871,25 @@ final class ChatTitleWriterTests: XCTestCase {
         XCTAssertEqual(ChatTitleWriter.cleaned("  Trim whitespace \n and drop the rest"), "Trim whitespace")
     }
 
-    func testRejectsAnythingUnusableSoTheGatewayTitleStands() {
+    func testRejectsOnlyEmptyOutputAndFitsVerboseTitles() {
         XCTAssertNil(ChatTitleWriter.cleaned(""))
         XCTAssertNil(ChatTitleWriter.cleaned("   \n  "))
         XCTAssertNil(ChatTitleWriter.cleaned("\"\""))
-        XCTAssertNil(ChatTitleWriter.cleaned("One two three four five"))
-        // A model that answered the prompt instead of naming it runs long; better to keep
-        // the gateway's title than to show a paragraph.
-        XCTAssertNil(ChatTitleWriter.cleaned(String(repeating: "long ", count: 20)))
+        XCTAssertEqual(ChatTitleWriter.cleaned("One two three four five"), "One two three four")
+        XCTAssertEqual(
+            ChatTitleWriter.cleaned("Extraordinarilylongword anotherlongword useful title"),
+            "Extraordinarilylongword anotherlongword…"
+        )
     }
 
     @MainActor
     func testInjectedGeneratorUsesTheProductionValidationPath() async {
         let writer = ChatTitleWriter { _ in "One two three four five" }
 
-        guard case .failed(let message) = await writer.title(for: "Review the gateway") else {
-            return XCTFail("Expected the overlong generated title to be rejected")
+        guard case .title(let title) = await writer.title(for: "Review the gateway") else {
+            return XCTFail("Expected the generated title to be fitted")
         }
-        XCTAssertEqual(message, "Apple returned an unusable chat title.")
+        XCTAssertEqual(title, "One two three four")
     }
 }
 
@@ -5432,36 +5899,54 @@ final class TranscriptEventLineTests: XCTestCase {
         text: String,
         kind: TranscriptEntry.Kind = .event,
         tone: String = "neutral",
-        format: String = "plain_text"
+        format: String = "plain_text",
+        capability: String? = nil,
+        role: FrontendBlockRole? = nil,
+        title: String = ""
     ) -> TranscriptEntry {
-        TranscriptEntry(id: id, text: text, kind: kind, format: format, tone: tone, pending: false)
+        TranscriptEntry(
+            id: id,
+            text: text,
+            kind: kind,
+            capability: capability,
+            role: role,
+            title: title,
+            format: format,
+            tone: tone,
+            pending: false
+        )
     }
 
-    func testSplitsHeadingFromOutput() {
-        let call = entry(id: "tools/turn-1/call-1", text: "◉ Bash ls -la\ntotal 8\ndrwxr-xr-x")
+    func testUsesTypedPresentationWithoutParsingIDOrProse() {
+        let call = entry(
+            id: "misleading/legacy/id",
+            text: "◉ This remains body text\ntotal 8",
+            capability: "tools",
+            role: .tool,
+            title: "Run command"
+        )
 
         XCTAssertEqual(call.capability, "tools")
-        XCTAssertEqual(call.headline, "Bash ls -la")
-        XCTAssertEqual(call.eventDetail, "total 8\ndrwxr-xr-x")
+        XCTAssertEqual(call.headline, "Run command")
+        XCTAssertEqual(call.eventDetail, "◉ This remains body text\ntotal 8")
     }
 
-    func testFallsBackWhenTheBlockCarriesNoHeadingOrNamespace() {
+    func testDoesNotInferMissingMetadata() {
         let bare = entry(id: "9C4F-2B", text: "")
 
         XCTAssertNil(bare.capability)
-        XCTAssertNil(entry(id: "x", text: "").capability)
-        XCTAssertEqual(bare.headline, "Event")
+        XCTAssertNil(bare.role)
+        XCTAssertEqual(bare.headline, "")
         XCTAssertEqual(bare.eventDetail, "")
-        XCTAssertEqual(entry(id: "x", text: "", tone: "error").headline, "Error")
     }
 
     func testSummaryCountsAndPluralisesByCategory() {
         let entries = [
-            entry(id: "tools/t/1", text: "◉ Bash ls"),
-            entry(id: "tools/t/2", text: "◉ Read a.swift"),
-            entry(id: "skills/t/3", text: "◉ Read skill review"),
-            entry(id: "tools/t/4", text: "◉ searching the web"),
-            entry(id: "tools/t/5", text: "◉ Bash boom", kind: .error, tone: "error")
+            entry(id: "a", text: "", role: .tool),
+            entry(id: "b", text: "", role: .tool),
+            entry(id: "c", text: "", role: .activity),
+            entry(id: "d", text: "", role: .webSearch),
+            entry(id: "e", text: "", kind: .error, tone: "error", role: .tool)
         ]
 
         XCTAssertEqual(
@@ -5476,10 +5961,14 @@ final class TranscriptEventLineTests: XCTestCase {
         )
     }
 
-    func testWebSearchIsRecognisedFromTheHeadingOrCapability() {
-        XCTAssertTrue(entry(id: "tools/t/1", text: "◉ Search web nord palette").isWebSearch)
-        XCTAssertTrue(entry(id: "web_search/t/1", text: "◉ Anything").isWebSearch)
-        XCTAssertFalse(entry(id: "tools/t/1", text: "◉ Bash grep -r search .").isWebSearch)
+    func testWebSearchUsesOnlyTheTypedRole() {
+        XCTAssertTrue(entry(id: "anything", text: "not search prose", role: .webSearch).isWebSearch)
+        XCTAssertFalse(entry(
+            id: "web_search/deceptive",
+            text: "Search the web",
+            capability: "web_search",
+            role: .tool
+        ).isWebSearch)
     }
 }
 

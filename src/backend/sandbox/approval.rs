@@ -196,9 +196,12 @@ impl Approval {
         Some(FrontendBlock {
             id: None,
             group: None,
-            append: false,
-            pending: false,
-            text: format!("approval required\n{}\n  {tools}", request.reason),
+            update: crate::protocol::FrontendBlockUpdate::Replace,
+            state: crate::protocol::FrontendBlockState::Complete,
+            role: crate::protocol::FrontendBlockRole::Approval,
+            title: "Approval required".into(),
+            text: format!("{}\n{tools}", request.reason),
+            symbol: None,
             files: Vec::new(),
             format: crate::protocol::FrontendBlockFormat::PlainText,
             tone: FrontendTone::Warning,
@@ -423,11 +426,8 @@ mod tests {
             ))
             .expect("approval block");
 
-        assert!(
-            block
-                .text
-                .starts_with("approval required\ncommand execution\n")
-        );
+        assert_eq!(block.title, "Approval required");
+        assert!(block.text.starts_with("command execution\n"));
         assert!(!block.text.contains('[') && !block.text.contains(']'));
     }
 

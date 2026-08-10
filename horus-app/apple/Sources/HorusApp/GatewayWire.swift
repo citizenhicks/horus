@@ -1,7 +1,7 @@
 import Foundation
 import UIKit
 
-let gatewayProtocolVersion = 23
+let gatewayProtocolVersion = 24
 let maximumGatewayFrameBytes = 20 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 let maximumSessionFileReferences = 16
@@ -458,14 +458,13 @@ enum GatewayRequest: Encodable, Sendable {
     case openSession(
         requestID: String,
         sessionID: String,
-        lastSequence: UInt64?,
-        replayEpoch: String?
+        lastSequence: UInt64?
     )
     case getSessionHistory(
         requestID: String,
         sessionID: String,
         beforeSequence: UInt64?,
-        maxBatches: Int
+        maxEvents: Int
     )
     case renameSession(requestID: String, sessionID: String, title: String)
     case setSessionPinned(requestID: String, sessionID: String, pinned: Bool)
@@ -567,18 +566,17 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode("create_session", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(workspace, forKey: "workspace")
-        case .openSession(let requestID, let sessionID, let lastSequence, let replayEpoch):
+        case .openSession(let requestID, let sessionID, let lastSequence):
             try container.encode("open_session", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
             try container.encode(lastSequence, forKey: "lastSequence")
-            try container.encode(replayEpoch, forKey: "replayEpoch")
-        case .getSessionHistory(let requestID, let sessionID, let beforeSequence, let maxBatches):
+        case .getSessionHistory(let requestID, let sessionID, let beforeSequence, let maxEvents):
             try container.encode("get_session_history", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
             try container.encode(beforeSequence, forKey: "beforeSequence")
-            try container.encode(maxBatches, forKey: "maxBatches")
+            try container.encode(maxEvents, forKey: "maxEvents")
         case .renameSession(let requestID, let sessionID, let title):
             try container.encode("rename_session", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -739,7 +737,7 @@ enum GatewayEnvelope: Decodable, Sendable {
     case sessionHistory(
         requestID: String,
         sessionID: String,
-        events: [RenderedEventRecord],
+        records: [RecordedEvent],
         nextBeforeSequence: UInt64?
     )
     case sessionChanged(SessionReadyPayload)
@@ -748,11 +746,7 @@ enum GatewayEnvelope: Decodable, Sendable {
     case rejected(GatewayRejection)
     case agentEvent(
         sessionID: String,
-        sequence: UInt64,
-        event: AgentEventRecord,
-        blocks: [FrontendBlock],
-        history: [RenderedEventRecord]?,
-        preview: RenderedPreview?
+        record: RecordedEvent
     )
     case sessions(requestID: String?, sessions: [SessionRecord])
     case clients(requestID: String, currentClientID: String, clients: [ClientStatus])
@@ -848,7 +842,7 @@ enum GatewayEnvelope: Decodable, Sendable {
             self = .sessionHistory(
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 sessionID: try container.decode(String.self, forKey: "sessionId"),
-                events: try container.decode([RenderedEventRecord].self, forKey: "events"),
+                records: try container.decode([RecordedEvent].self, forKey: "records"),
                 nextBeforeSequence: try container.decodeIfPresent(
                     UInt64.self,
                     forKey: "nextBeforeSequence"
@@ -873,11 +867,7 @@ enum GatewayEnvelope: Decodable, Sendable {
         case "agent_event":
             self = .agentEvent(
                 sessionID: try container.decode(String.self, forKey: "sessionId"),
-                sequence: try container.decode(UInt64.self, forKey: "sequence"),
-                event: try container.decode(AgentEventRecord.self, forKey: "event"),
-                blocks: try container.decode([FrontendBlock].self, forKey: "blocks"),
-                history: try container.decodeIfPresent([RenderedEventRecord].self, forKey: "history"),
-                preview: try container.decodeIfPresent(RenderedPreview.self, forKey: "preview")
+                record: try container.decode(RecordedEvent.self, forKey: "record")
             )
         case "sessions":
             self = .sessions(
@@ -1050,7 +1040,6 @@ private extension ReadyPayload {
 }
 
 struct SessionReadyPayload: Decodable, Sendable {
-    let replayEpoch: String
     let latestSequence: UInt64
     let nextBeforeSequence: UInt64?
     let workspace: WorkspaceInfo
@@ -1512,15 +1501,39 @@ struct FrontendActiveInput: Codable, Hashable, Sendable {
     let operation: String
 }
 
+enum FrontendBlockUpdate: String, Codable, Hashable, Sendable {
+    case replace
+    case append
+}
+
+enum FrontendBlockState: String, Codable, Hashable, Sendable {
+    case pending
+    case complete
+}
+
+enum FrontendBlockRole: String, Codable, Hashable, Sendable {
+    case activity
+    case tool
+    case webSearch = "web_search"
+    case artifact
+    case approval
+    case notice
+}
+
 struct FrontendBlock: Codable, Hashable, Sendable {
     let id: String?
     let group: String?
-    let append: Bool
-    let pending: Bool
+    let update: FrontendBlockUpdate
+    let state: FrontendBlockState
+    let role: FrontendBlockRole
+    let title: String
     let text: String
+    let symbol: String?
     let format: String
     let tone: String
     let files: [SessionFileReference]
+
+    var pending: Bool { state == .pending }
 }
 
 extension FrontendBlock {
@@ -1537,8 +1550,13 @@ extension FrontendBlock {
             }
         }
 
-        guard let append = json["append"]?.boolValue,
-              let pending = json["pending"]?.boolValue,
+        guard let encodedUpdate = json["update"]?.stringValue,
+              let update = FrontendBlockUpdate(rawValue: encodedUpdate),
+              let encodedState = json["state"]?.stringValue,
+              let state = FrontendBlockState(rawValue: encodedState),
+              let encodedRole = json["role"]?.stringValue,
+              let role = FrontendBlockRole(rawValue: encodedRole),
+              let title = json["title"]?.stringValue,
               let text = json["text"]?.stringValue,
               let format = json["format"]?.stringValue,
               ["plain_text", "unified_diff"].contains(format),
@@ -1551,26 +1569,21 @@ extension FrontendBlock {
         }
         id = try optionalString("id")
         group = try optionalString("group")
-        self.append = append
-        self.pending = pending
+        self.update = update
+        self.state = state
+        self.role = role
+        self.title = title
         self.text = text
+        symbol = try optionalString("symbol")
         self.format = format
         self.tone = tone
         self.files = try files.map(SessionFileReference.init(json:))
     }
+}
 
-    func namespaced(to capability: String) -> Self {
-        Self(
-            id: id.map { "\(capability)/\($0)" },
-            group: group.map { "\(capability)/\($0)" },
-            append: append,
-            pending: pending,
-            text: text,
-            format: format,
-            tone: tone,
-            files: files
-        )
-    }
+struct RenderedBlock: Decodable, Sendable {
+    let capability: String
+    let block: FrontendBlock
 }
 
 struct RenderedPreview: Decodable, Sendable {
@@ -1580,10 +1593,16 @@ struct RenderedPreview: Decodable, Sendable {
 
 struct RenderedEventRecord: Decodable, Sendable {
     let event: JSONValue
-    let blocks: [FrontendBlock]
+    let blocks: [RenderedBlock]
 
     var previewText: [String] {
-        if !blocks.isEmpty { return blocks.map(\.text) }
+        if !blocks.isEmpty {
+            return blocks.map { block in
+                [block.block.title, block.block.text]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "\n")
+            }
+        }
         let type = event["type"]?.stringValue
         let value = type == "agent_reasoning_content_delta"
             ? event["delta"]?.stringValue
@@ -1606,8 +1625,32 @@ extension RenderedEventRecord {
         let event = try container.decode(JSONValue.self, forKey: "event")
         try AgentEventRecord.validate(event)
         self.event = event
-        blocks = try container.decode([FrontendBlock].self, forKey: "blocks")
+        blocks = try container.decode([RenderedBlock].self, forKey: "blocks")
     }
+}
+
+struct RecordedEvent: Decodable, Sendable {
+    let sequence: UInt64
+    let recordedAtMs: Int64
+    let event: AgentEventRecord
+    let streamMetrics: [StreamMetrics]
+    let blocks: [RenderedBlock]
+    let preview: RenderedPreview?
+}
+
+enum ModelStepContentPhase: String, Decodable, Sendable {
+    case reasoning
+    case commentary
+    case finalAnswer = "final_answer"
+}
+
+struct StreamMetrics: Decodable, Sendable {
+    let phase: ModelStepContentPhase
+    let firstDeltaAtMs: Int64
+    let lastDeltaAtMs: Int64
+    let chunkCount: UInt64
+    let utf8Bytes: UInt64
+    let longestGapMs: UInt64
 }
 
 struct FrontendPickerOption: Identifiable, Sendable {
@@ -1702,10 +1745,9 @@ extension AgentEventRecord {
             try optionalInteger("modelContextWindow", in: value)
         }
 
-        func validatePhase() throws {
-            guard let phase = msg["phase"], phase != .null else { return }
-            guard let value = phase.stringValue,
-                  ["commentary", "final_answer"].contains(value)
+        func validatePhase(in value: JSONValue = msg) throws {
+            guard let phase = value["phase"]?.stringValue,
+                  ["commentary", "final_answer"].contains(phase)
             else {
                 throw GatewayWireError.invalidFrame("\(type) has invalid phase")
             }
@@ -1740,8 +1782,84 @@ extension AgentEventRecord {
             try attachments.forEach { _ = try SessionFileReference(json: $0) }
         }
 
+        func validateModelStepAnnotation(_ annotation: JSONValue) throws {
+            guard annotation.objectValue != nil,
+                  let annotationType = annotation["type"]?.stringValue
+            else {
+                throw GatewayWireError.invalidFrame(
+                    "model_step_completed has invalid content annotation"
+                )
+            }
+            switch annotationType {
+            case "url_citation":
+                for key in ["url", "title"] { try requireString(key, in: annotation) }
+                for key in ["startIndex", "endIndex"] {
+                    try requireInteger(key, in: annotation)
+                }
+            case "file_citation":
+                for key in ["fileId", "filename"] { try requireString(key, in: annotation) }
+                try requireInteger("index", in: annotation)
+            case "container_file_citation":
+                for key in ["containerId", "fileId", "filename"] {
+                    try requireString(key, in: annotation)
+                }
+                for key in ["startIndex", "endIndex"] {
+                    try requireInteger(key, in: annotation)
+                }
+            case "file_path":
+                try requireString("fileId", in: annotation)
+                try requireInteger("index", in: annotation)
+            case "document_character_citation":
+                try requireString("citedText", in: annotation)
+                try requireInteger("documentIndex", in: annotation)
+                try optionalString("documentTitle", in: annotation)
+                try optionalString("fileId", in: annotation)
+                for key in ["startCharIndex", "endCharIndex"] {
+                    try requireInteger(key, in: annotation)
+                }
+            case "document_page_citation":
+                try requireString("citedText", in: annotation)
+                try requireInteger("documentIndex", in: annotation)
+                try optionalString("documentTitle", in: annotation)
+                try optionalString("fileId", in: annotation)
+                for key in ["startPageNumber", "endPageNumber"] {
+                    try requireInteger(key, in: annotation)
+                }
+            case "document_content_block_citation":
+                try requireString("citedText", in: annotation)
+                try requireInteger("documentIndex", in: annotation)
+                try optionalString("documentTitle", in: annotation)
+                try optionalString("fileId", in: annotation)
+                for key in ["startBlockIndex", "endBlockIndex"] {
+                    try requireInteger(key, in: annotation)
+                }
+            case "search_result_citation":
+                for key in ["citedText", "source"] { try requireString(key, in: annotation) }
+                try requireInteger("searchResultIndex", in: annotation)
+                try optionalString("title", in: annotation)
+                for key in ["startBlockIndex", "endBlockIndex"] {
+                    try requireInteger(key, in: annotation)
+                }
+            case "web_search_result_citation":
+                for key in ["citedText", "encryptedIndex", "url"] {
+                    try requireString(key, in: annotation)
+                }
+                try optionalString("title", in: annotation)
+            default:
+                throw GatewayWireError.invalidFrame(
+                    "model_step_completed has unknown content annotation \(annotationType)"
+                )
+            }
+        }
+
         switch type {
-        case "error", "warning":
+        case "error":
+            try requireString("kind")
+            try requireString("message")
+            try requireBool("retryable")
+            try optionalInteger("status")
+            try optionalString("retryAfter")
+        case "warning":
             try requireString("message")
         case "user_message":
             try requireString("message")
@@ -1759,24 +1877,75 @@ extension AgentEventRecord {
             try optionalInteger("modelContextWindow")
         case "task_complete":
             try requireString("turnId")
-            try optionalString("lastAgentMessage")
         case "turn_aborted":
             try requireString("turnId")
             try requireString("reason")
         case "agent_message":
+            for key in ["sessionId", "turnId", "modelStepId"] { try requireString(key) }
             try requireString("message")
             try validatePhase()
             try validateMessageTarget()
         case "agent_message_content_delta":
-            for key in ["threadId", "turnId", "itemId", "delta"] { try requireString(key) }
+            for key in ["sessionId", "turnId", "modelStepId", "delta"] {
+                try requireString(key)
+            }
             try validatePhase()
         case "agent_reasoning_content_delta":
-            for key in ["threadId", "turnId", "itemId", "delta"] { try requireString(key) }
-        case "session_history":
-            guard let events = msg["events"]?.arrayValue else {
-                throw GatewayWireError.invalidFrame("session history is missing events")
+            for key in ["sessionId", "turnId", "modelStepId", "delta"] {
+                try requireString(key)
             }
-            try events.forEach(validate)
+        case "model_step_started":
+            for key in ["sessionId", "turnId", "modelStepId"] { try requireString(key) }
+            try requireInteger("stepIndex")
+            try requireInteger("startedAtMs")
+        case "model_step_completed":
+            for key in ["sessionId", "turnId", "modelStepId"] { try requireString(key) }
+            for key in ["stepIndex", "startedAtMs", "completedAtMs"] {
+                try requireInteger(key)
+            }
+            guard let outcome = msg["outcome"], outcome.objectValue != nil else {
+                throw GatewayWireError.invalidFrame("model_step_completed has invalid outcome")
+            }
+            switch outcome["status"]?.stringValue {
+            case "completed":
+                try requireBool("endTurn", in: outcome)
+                guard let usage = outcome["usage"],
+                      let content = outcome["content"]?.arrayValue,
+                      let toolCallIDs = outcome["toolCallIds"]?.arrayValue,
+                      toolCallIDs.allSatisfy({ $0.stringValue != nil })
+                else {
+                    throw GatewayWireError.invalidFrame(
+                        "model_step_completed has incomplete output"
+                    )
+                }
+                try validateUsage(usage)
+                for item in content {
+                    try requireInteger("outputIndex", in: item)
+                    try requireInteger("partIndex", in: item)
+                    guard let phase = item["phase"]?.stringValue,
+                          ["reasoning", "commentary", "final_answer"].contains(phase)
+                    else {
+                        throw GatewayWireError.invalidFrame(
+                            "model_step_completed has invalid content phase"
+                        )
+                    }
+                    try requireString("text", in: item)
+                    guard let annotations = item["annotations"]?.arrayValue else {
+                        throw GatewayWireError.invalidFrame(
+                            "model_step_completed has invalid content annotations"
+                        )
+                    }
+                    try annotations.forEach(validateModelStepAnnotation)
+                }
+            case "failed", "interrupted":
+                break
+            default:
+                throw GatewayWireError.invalidFrame(
+                    "model_step_completed has invalid outcome status"
+                )
+            }
+        case "session_history":
+            throw GatewayWireError.invalidFrame("session_history cannot cross the gateway")
         case "model_changed":
             try validateModel(msg)
         case "session_resume_requested":
@@ -1820,11 +1989,36 @@ extension AgentEventRecord {
         case "context_compacted":
             break
         case "web_search_begin":
-            try requireString("callId")
+            for key in ["sessionId", "turnId", "modelStepId", "callId"] {
+                try requireString(key)
+            }
         case "web_search_end":
-            try requireString("callId")
-            try optionalString("query")
-            try requireString("action")
+            for key in ["sessionId", "turnId", "modelStepId", "callId"] {
+                try requireString(key)
+            }
+            guard let action = msg["action"], action.objectValue != nil else {
+                throw GatewayWireError.invalidFrame("web_search_end has invalid action")
+            }
+            switch action["type"]?.stringValue {
+            case "search":
+                guard let queries = action["queries"]?.arrayValue,
+                      !queries.isEmpty,
+                      queries.allSatisfy({ query in
+                          query.stringValue?.isEmpty == false
+                      })
+                else {
+                    throw GatewayWireError.invalidFrame("web_search_end has invalid queries")
+                }
+            case "open_page":
+                try optionalString("url", in: action)
+            case "find_in_page":
+                try optionalString("url", in: action)
+                try optionalString("pattern", in: action)
+            case "other":
+                break
+            default:
+                throw GatewayWireError.invalidFrame("web_search_end has unknown action")
+            }
         case "frontend":
             guard let frontendType = msg["frontendType"]?.stringValue else {
                 throw GatewayWireError.invalidFrame("frontend event has no frontend_type")
@@ -2177,7 +2371,7 @@ struct RunSummary: Identifiable, Codable, Equatable, Sendable {
     let finishedAtMs: Int64?
     let elapsedMs: UInt64
     let outcome: SessionOutcome?
-    let modelCalls: UInt64
+    var modelCalls: UInt64
     var toolCalls: UInt64
     var failedToolCalls: UInt64
     let usage: TokenUsage

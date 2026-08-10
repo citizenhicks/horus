@@ -421,7 +421,6 @@ async fn open_selected_session(sender: &GatewaySender, state: &mut DashboardStat
             request_id: request_id.clone(),
             session_id: session_id.clone(),
             last_sequence: None,
-            replay_epoch: None,
         })
         .await
         .map_err(gateway_error)?;
@@ -894,14 +893,12 @@ fn handle_frame(state: &mut DashboardState, message: ServerMessage) -> Result<()
             }
             state.pending_open = None;
         }
-        ServerMessage::AgentEvent {
-            session_id, event, ..
-        } => {
+        ServerMessage::AgentEvent { session_id, record } => {
             if let Some(overlay) = state
                 .overlay
                 .as_mut()
                 .filter(|overlay| overlay.session_id == session_id)
-                && let EventMsg::Frontend(event) = event.msg
+                && let EventMsg::Frontend(event) = record.event.msg
             {
                 overlay.apply(event);
             }
@@ -1664,7 +1661,8 @@ fn gateway_error(error: horus_gateway::Error) -> Error {
 mod tests {
     use horus::backend::checkpoint::SessionSummary;
     use horus::protocol::{
-        FrontendAction, FrontendActionListItem, FrontendBlock, FrontendBlockFormat, FrontendEvent,
+        FrontendAction, FrontendActionListItem, FrontendBlock, FrontendBlockFormat,
+        FrontendBlockRole, FrontendBlockState, FrontendBlockUpdate, FrontendEvent,
         FrontendListItemState, FrontendPickerOption, FrontendSlot, FrontendSymbol, FrontendTone,
         FrontendWidget, FrontendWidgetContent, Op, SessionContext, TokenUsage,
     };
@@ -1922,9 +1920,12 @@ mod tests {
             blocks: vec![FrontendBlock {
                 id: None,
                 group: None,
-                append: false,
-                pending: false,
+                update: FrontendBlockUpdate::Replace,
+                state: FrontendBlockState::Complete,
+                role: FrontendBlockRole::Notice,
+                title: String::new(),
                 text: text.into(),
+                symbol: None,
                 format: FrontendBlockFormat::PlainText,
                 tone: FrontendTone::Neutral,
                 files: Vec::new(),

@@ -10,10 +10,17 @@ struct CachedTranscript: Codable, Sendable {
         let id: String
         let text: String
         let kind: TranscriptEntry.Kind
+        let capability: String?
+        let role: FrontendBlockRole?
+        let title: String
+        let symbol: String?
         let group: String?
         let format: String
         let tone: String
         let pending: Bool
+        let modelStepID: String?
+        let sourceSequence: UInt64?
+        let recordedAtMs: Int64?
         let messageTarget: MessageTarget?
         let files: [SessionFileReference]
 
@@ -21,10 +28,17 @@ struct CachedTranscript: Codable, Sendable {
             id = entry.id
             text = entry.text
             kind = entry.kind
+            capability = entry.capability
+            role = entry.role
+            title = entry.title
+            symbol = entry.symbol
             group = entry.group
             format = entry.format
             tone = entry.tone
             pending = entry.pending
+            modelStepID = entry.modelStepID
+            sourceSequence = entry.sourceSequence
+            recordedAtMs = entry.recordedAtMs
             messageTarget = entry.messageTarget
             files = entry.files
         }
@@ -34,17 +48,23 @@ struct CachedTranscript: Codable, Sendable {
                 id: id,
                 text: text,
                 kind: kind,
+                capability: capability,
+                role: role,
+                title: title,
+                symbol: symbol,
                 group: group,
                 format: format,
                 tone: tone,
                 pending: pending,
+                modelStepID: modelStepID,
+                sourceSequence: sourceSequence,
+                recordedAtMs: recordedAtMs,
                 messageTarget: messageTarget,
                 files: files
             )
         }
     }
 
-    let replayEpoch: String
     let sequence: UInt64
     let currentUsage: TokenUsage
     let lastUsage: TokenUsage
@@ -52,14 +72,12 @@ struct CachedTranscript: Codable, Sendable {
     private let entries: [Entry]
 
     init(
-        replayEpoch: String,
         sequence: UInt64,
         nextBeforeSequence: UInt64?,
         transcript: [TranscriptEntry],
         currentUsage: TokenUsage,
         lastUsage: TokenUsage
     ) {
-        self.replayEpoch = replayEpoch
         self.sequence = sequence
         self.currentUsage = currentUsage
         self.lastUsage = lastUsage
@@ -83,6 +101,9 @@ struct CachedTranscript: Codable, Sendable {
         for entry in entries {
             guard consume(entry.id),
                   consume(entry.text),
+                  consume(entry.capability),
+                  consume(entry.title),
+                  consume(entry.symbol),
                   consume(entry.group),
                   consume(entry.format),
                   consume(entry.tone),
@@ -453,7 +474,6 @@ final class GatewayStore {
     func saveTranscript(
         accountID: UUID,
         sessionID: String,
-        replayEpoch: String,
         sequence: UInt64,
         nextBeforeSequence: UInt64? = nil,
         transcript: [TranscriptEntry],
@@ -462,7 +482,6 @@ final class GatewayStore {
     ) async {
         guard !transcript.isEmpty else { return }
         await saveTranscript(CachedTranscript(
-            replayEpoch: replayEpoch,
             sequence: sequence,
             nextBeforeSequence: nextBeforeSequence,
             transcript: transcript,

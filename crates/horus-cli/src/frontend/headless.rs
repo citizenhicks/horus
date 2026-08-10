@@ -28,6 +28,7 @@ pub async fn run(
     let mut turn_id = None;
     let mut first_error = None;
     let mut approval_error = None;
+    let mut last_agent_message = None;
     loop {
         let frame =
             events.next().await.map_err(gateway_error)?.ok_or_else(|| {
@@ -36,9 +37,9 @@ pub async fn run(
         let event = match frame.message {
             ServerMessage::AgentEvent {
                 session_id: actual,
-                event,
+                record,
                 ..
-            } if actual == session_id => event,
+            } if actual == session_id => record.event,
             ServerMessage::Rejected {
                 request_id,
                 message,
@@ -79,6 +80,11 @@ pub async fn run(
             {
                 first_error.get_or_insert(error.message);
             }
+            EventMsg::AgentMessage(message)
+                if turn_id.as_deref() == Some(message.turn_id.as_str()) =>
+            {
+                last_agent_message = Some(message.message);
+            }
             EventMsg::TurnComplete(turn) if turn_id.as_deref() == Some(turn.turn_id.as_str()) => {
                 if let Some(error) = approval_error {
                     return Err(error);
@@ -86,7 +92,7 @@ pub async fn run(
                 if let Some(error) = first_error {
                     return Err(Error::Stopped(error));
                 }
-                return Ok(turn.last_agent_message);
+                return Ok(last_agent_message);
             }
             EventMsg::TurnAborted(turn) if turn_id.as_deref() == Some(turn.turn_id.as_str()) => {
                 return Err(approval_error

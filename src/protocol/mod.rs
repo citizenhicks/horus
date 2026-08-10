@@ -143,6 +143,8 @@ pub enum EventMsg {
     AgentMessage(AgentMessageEvent),
     AgentMessageContentDelta(AgentMessageContentDeltaEvent),
     AgentReasoningContentDelta(AgentReasoningContentDeltaEvent),
+    ModelStepStarted(ModelStepStartedEvent),
+    ModelStepCompleted(ModelStepCompletedEvent),
     SessionHistory(SessionHistoryEvent),
     ModelChanged(ModelChangedEvent),
     SessionResumeRequested(SessionResumeRequestedEvent),
@@ -172,10 +174,11 @@ pub enum ModelEvent {
 }
 
 /// Provider-neutral action reported by hosted web search.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum WebSearchAction {
     Search {
-        query: Option<String>,
+        queries: Vec<String>,
     },
     OpenPage {
         url: Option<String>,
@@ -190,50 +193,47 @@ pub enum WebSearchAction {
 impl ModelEvent {
     /// Converts one normalized provider event into the frontend protocol.
     #[must_use]
-    pub fn into_event(self, thread_id: &str, turn_id: &str, item_id: &str) -> EventMsg {
+    pub fn into_event(self, session_id: &str, turn_id: &str, model_step_id: &str) -> EventMsg {
         match self {
             Self::TextDelta(delta) => {
                 EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
-                    thread_id: thread_id.into(),
+                    session_id: session_id.into(),
                     turn_id: turn_id.into(),
-                    item_id: item_id.into(),
+                    model_step_id: model_step_id.into(),
                     delta,
-                    phase: Some(AgentMessagePhase::FinalAnswer),
+                    phase: AgentMessagePhase::FinalAnswer,
                 })
             }
             Self::CommentaryDelta(delta) => {
                 EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
-                    thread_id: thread_id.into(),
+                    session_id: session_id.into(),
                     turn_id: turn_id.into(),
-                    item_id: item_id.into(),
+                    model_step_id: model_step_id.into(),
                     delta,
-                    phase: Some(AgentMessagePhase::Commentary),
+                    phase: AgentMessagePhase::Commentary,
                 })
             }
             Self::ReasoningDelta(delta) => {
                 EventMsg::AgentReasoningContentDelta(AgentReasoningContentDeltaEvent {
-                    thread_id: thread_id.into(),
+                    session_id: session_id.into(),
                     turn_id: turn_id.into(),
-                    item_id: item_id.into(),
+                    model_step_id: model_step_id.into(),
                     delta,
                 })
             }
-            Self::WebSearchStarted { call_id } => {
-                EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id })
-            }
+            Self::WebSearchStarted { call_id } => EventMsg::WebSearchBegin(WebSearchBeginEvent {
+                session_id: session_id.into(),
+                turn_id: turn_id.into(),
+                model_step_id: model_step_id.into(),
+                call_id,
+            }),
             Self::WebSearchCompleted { call_id, action } => {
-                let (action, query) = match action {
-                    WebSearchAction::Search { query } => ("search", query),
-                    WebSearchAction::OpenPage { url } => ("open_page", url),
-                    WebSearchAction::FindInPage { url, pattern } => {
-                        ("find_in_page", pattern.or(url))
-                    }
-                    WebSearchAction::Other => ("other", None),
-                };
                 EventMsg::WebSearchEnd(WebSearchEndEvent {
+                    session_id: session_id.into(),
+                    turn_id: turn_id.into(),
+                    model_step_id: model_step_id.into(),
                     call_id,
-                    query,
-                    action: action.into(),
+                    action,
                 })
             }
         }
@@ -390,28 +390,53 @@ pub enum FrontendSlot {
 pub struct FrontendBlock {
     pub id: Option<String>,
     pub group: Option<String>,
-    pub append: bool,
-    /// Whether this block represents work that has not completed yet.
-    pub pending: bool,
+    pub update: FrontendBlockUpdate,
+    pub state: FrontendBlockState,
+    pub role: FrontendBlockRole,
+    /// Compact, standalone row label. Frontends must not derive this from `text`.
+    pub title: String,
+    /// Expandable body or artifact content.
     pub text: String,
+    pub symbol: Option<FrontendSymbol>,
     /// Downloadable files owned by the session rendering this block.
     pub files: Vec<SessionFileReference>,
     pub format: FrontendBlockFormat,
     pub tone: FrontendTone,
 }
 
-impl FrontendBlock {
-    /// Scopes replacement and grouping IDs to one capability.
-    #[must_use]
-    pub fn namespaced(mut self, capability: &str) -> Self {
-        if let Some(id) = self.id.take() {
-            self.id = Some(format!("{capability}/{id}"));
-        }
-        if let Some(group) = self.group.take() {
-            self.group = Some(format!("{capability}/{group}"));
-        }
-        self
-    }
+/// A block together with its explicit semantic owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderedBlock {
+    pub capability: String,
+    pub block: FrontendBlock,
+}
+
+/// How a block changes the matching capability-scoped ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendBlockUpdate {
+    Replace,
+    Append,
+}
+
+/// Lifecycle state of one rendered transcript block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendBlockState {
+    Pending,
+    Complete,
+}
+
+/// Semantic category used for grouping, summaries, filtering, and icons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendBlockRole {
+    Activity,
+    Tool,
+    WebSearch,
+    Artifact,
+    Approval,
+    Notice,
 }
 
 /// Frontend-neutral structure carried by a transcript block.
@@ -494,6 +519,113 @@ pub enum FrontendTone {
     Success,
     Warning,
     Error,
+}
+
+impl EventMsg {
+    /// Renders framework-owned semantic events without frontend prose parsing.
+    #[must_use]
+    pub fn presentation(&self) -> Option<RenderedBlock> {
+        let block = match self {
+            Self::Error(error) => FrontendBlock {
+                id: None,
+                group: None,
+                update: FrontendBlockUpdate::Replace,
+                state: FrontendBlockState::Complete,
+                role: FrontendBlockRole::Notice,
+                title: "Error".into(),
+                text: error.message.clone(),
+                symbol: None,
+                files: Vec::new(),
+                format: FrontendBlockFormat::PlainText,
+                tone: FrontendTone::Error,
+            },
+            Self::Warning(warning) => FrontendBlock {
+                id: None,
+                group: None,
+                update: FrontendBlockUpdate::Replace,
+                state: FrontendBlockState::Complete,
+                role: FrontendBlockRole::Notice,
+                title: "Warning".into(),
+                text: warning.message.clone(),
+                symbol: None,
+                files: Vec::new(),
+                format: FrontendBlockFormat::PlainText,
+                tone: FrontendTone::Warning,
+            },
+            Self::TurnAborted(turn) => FrontendBlock {
+                id: None,
+                group: Some(turn.turn_id.clone()),
+                update: FrontendBlockUpdate::Replace,
+                state: FrontendBlockState::Complete,
+                role: FrontendBlockRole::Notice,
+                title: "Turn aborted".into(),
+                text: turn.reason.clone(),
+                symbol: None,
+                files: Vec::new(),
+                format: FrontendBlockFormat::PlainText,
+                tone: FrontendTone::Warning,
+            },
+            Self::WebSearchBegin(search) => FrontendBlock {
+                id: Some(format!("{}/{}", search.model_step_id, search.call_id)),
+                group: Some(search.turn_id.clone()),
+                update: FrontendBlockUpdate::Replace,
+                state: FrontendBlockState::Pending,
+                role: FrontendBlockRole::WebSearch,
+                title: "Searching the web".into(),
+                text: String::new(),
+                symbol: Some(FrontendSymbol::Search),
+                files: Vec::new(),
+                format: FrontendBlockFormat::PlainText,
+                tone: FrontendTone::Neutral,
+            },
+            Self::WebSearchEnd(search) => {
+                let (title, text) = match &search.action {
+                    WebSearchAction::Search { queries } => ("Searched the web", queries.join("\n")),
+                    WebSearchAction::OpenPage { url } => {
+                        ("Opened a web page", url.clone().unwrap_or_default())
+                    }
+                    WebSearchAction::FindInPage { url, pattern } => {
+                        let text = match (url, pattern) {
+                            (Some(url), Some(pattern)) => format!("{pattern}\n{url}"),
+                            (Some(url), None) => url.clone(),
+                            (None, Some(pattern)) => pattern.clone(),
+                            (None, None) => String::new(),
+                        };
+                        ("Searched a web page", text)
+                    }
+                    WebSearchAction::Other => ("Web search complete", String::new()),
+                };
+                FrontendBlock {
+                    id: Some(format!("{}/{}", search.model_step_id, search.call_id)),
+                    group: Some(search.turn_id.clone()),
+                    update: FrontendBlockUpdate::Replace,
+                    state: FrontendBlockState::Complete,
+                    role: FrontendBlockRole::WebSearch,
+                    title: title.into(),
+                    text,
+                    symbol: Some(FrontendSymbol::Search),
+                    files: Vec::new(),
+                    format: FrontendBlockFormat::PlainText,
+                    tone: FrontendTone::Success,
+                }
+            }
+            Self::Frontend(FrontendEvent::Render { capability, block }) => {
+                return Some(RenderedBlock {
+                    capability: capability.clone(),
+                    block: block.clone(),
+                });
+            }
+            _ => return None,
+        };
+        Some(RenderedBlock {
+            capability: match self {
+                Self::WebSearchBegin(_) | Self::WebSearchEnd(_) => "web_search",
+                _ => "agent",
+            }
+            .into(),
+            block,
+        })
+    }
 }
 
 /// A presentation hint rather than a name from any one icon set, the same way
@@ -604,7 +736,66 @@ impl<'de> Deserialize<'de> for FrontendSymbol {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorEvent {
+    pub kind: ErrorKind,
     pub message: String,
+    pub retryable: bool,
+    pub status: Option<u16>,
+    pub retry_after: Option<String>,
+}
+
+impl ErrorEvent {
+    pub(crate) fn from_error(error: &crate::Error) -> Self {
+        let (kind, retryable, status, retry_after) = match error {
+            crate::Error::Config(_) => (ErrorKind::Configuration, false, None, None),
+            crate::Error::Duplicate(_) => (ErrorKind::DuplicateRegistration, false, None, None),
+            crate::Error::Unknown(_) => (ErrorKind::UnknownRegistration, false, None, None),
+            crate::Error::Provider(error) => (
+                ErrorKind::Provider,
+                error.is_retryable(),
+                error.status(),
+                error.retry_after().map(str::to_owned),
+            ),
+            crate::Error::Auth(_) => (ErrorKind::Authentication, false, None, None),
+            crate::Error::Sandbox(_) => (ErrorKind::Sandbox, false, None, None),
+            crate::Error::Tool(_) => (ErrorKind::Tool, false, None, None),
+            crate::Error::Checkpoint(_) => (ErrorKind::Checkpoint, false, None, None),
+            crate::Error::Busy(_) => (ErrorKind::Busy, false, None, None),
+            crate::Error::Stopped(_) => (ErrorKind::Stopped, false, None, None),
+            crate::Error::Rollback { .. } => (ErrorKind::Rollback, false, None, None),
+            crate::Error::Io(_) => (ErrorKind::Io, false, None, None),
+            crate::Error::Http(_) => (ErrorKind::Http, false, None, None),
+            crate::Error::Json(_) => (ErrorKind::Json, false, None, None),
+            crate::Error::Sqlite(_) => (ErrorKind::Storage, false, None, None),
+        };
+        Self {
+            kind,
+            message: error.to_string(),
+            retryable,
+            status,
+            retry_after,
+        }
+    }
+}
+
+/// Stable frontend classification for framework failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    Configuration,
+    DuplicateRegistration,
+    UnknownRegistration,
+    Provider,
+    Authentication,
+    Sandbox,
+    Tool,
+    Checkpoint,
+    Busy,
+    Stopped,
+    Rollback,
+    Io,
+    Http,
+    Json,
+    Storage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -629,7 +820,6 @@ pub struct TurnStartedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnCompleteEvent {
     pub turn_id: String,
-    pub last_agent_message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -671,27 +861,151 @@ pub struct UserMessageEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentMessageEvent {
+    pub session_id: String,
+    pub turn_id: String,
+    pub model_step_id: String,
     pub message: String,
-    pub phase: Option<AgentMessagePhase>,
+    pub phase: AgentMessagePhase,
     #[serde(deserialize_with = "required_option")]
     pub message_target: Option<MessageTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentMessageContentDeltaEvent {
-    pub thread_id: String,
+    pub session_id: String,
     pub turn_id: String,
-    pub item_id: String,
+    pub model_step_id: String,
     pub delta: String,
-    pub phase: Option<AgentMessagePhase>,
+    pub phase: AgentMessagePhase,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentReasoningContentDeltaEvent {
-    pub thread_id: String,
+    pub session_id: String,
     pub turn_id: String,
-    pub item_id: String,
+    pub model_step_id: String,
     pub delta: String,
+}
+
+/// One provider request becoming active within a turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelStepStartedEvent {
+    pub session_id: String,
+    pub turn_id: String,
+    pub model_step_id: String,
+    pub step_index: usize,
+    pub started_at_ms: i64,
+}
+
+/// The terminal record for one provider request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelStepCompletedEvent {
+    pub session_id: String,
+    pub turn_id: String,
+    pub model_step_id: String,
+    pub step_index: usize,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+    pub outcome: ModelStepOutcome,
+}
+
+/// Provider-neutral outcome of a completed model step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ModelStepOutcome {
+    Completed {
+        end_turn: bool,
+        tool_call_ids: Vec<String>,
+        usage: TokenUsage,
+        content: Vec<ModelStepContent>,
+    },
+    Failed,
+    Interrupted,
+}
+
+/// One complete normalized text item produced by a model step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelStepContent {
+    pub output_index: usize,
+    pub part_index: usize,
+    pub phase: ModelStepContentPhase,
+    pub text: String,
+    pub annotations: Vec<ModelStepAnnotation>,
+}
+
+/// A provider-neutral annotation attached to one complete text part.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelStepAnnotation {
+    UrlCitation {
+        url: String,
+        title: String,
+        start_index: usize,
+        end_index: usize,
+    },
+    FileCitation {
+        file_id: String,
+        filename: String,
+        index: usize,
+    },
+    ContainerFileCitation {
+        container_id: String,
+        file_id: String,
+        filename: String,
+        start_index: usize,
+        end_index: usize,
+    },
+    FilePath {
+        file_id: String,
+        index: usize,
+    },
+    DocumentCharacterCitation {
+        cited_text: String,
+        document_index: usize,
+        document_title: Option<String>,
+        file_id: Option<String>,
+        start_char_index: usize,
+        end_char_index: usize,
+    },
+    DocumentPageCitation {
+        cited_text: String,
+        document_index: usize,
+        document_title: Option<String>,
+        file_id: Option<String>,
+        start_page_number: usize,
+        end_page_number: usize,
+    },
+    DocumentContentBlockCitation {
+        cited_text: String,
+        document_index: usize,
+        document_title: Option<String>,
+        file_id: Option<String>,
+        start_block_index: usize,
+        end_block_index: usize,
+    },
+    SearchResultCitation {
+        cited_text: String,
+        search_result_index: usize,
+        source: String,
+        title: Option<String>,
+        start_block_index: usize,
+        end_block_index: usize,
+    },
+    WebSearchResultCitation {
+        cited_text: String,
+        encrypted_index: String,
+        title: Option<String>,
+        url: String,
+    },
+}
+
+/// Semantic role of text preserved in a completed model step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelStepContentPhase {
+    Reasoning,
+    Commentary,
+    FinalAnswer,
 }
 
 /// A restored transcript kept distinct from live turn lifecycle events.
@@ -816,14 +1130,19 @@ pub struct TokenCountEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebSearchBeginEvent {
+    pub session_id: String,
+    pub turn_id: String,
+    pub model_step_id: String,
     pub call_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebSearchEndEvent {
+    pub session_id: String,
+    pub turn_id: String,
+    pub model_step_id: String,
     pub call_id: String,
-    pub query: Option<String>,
-    pub action: String,
+    pub action: WebSearchAction,
 }
 
 #[cfg(test)]
@@ -831,6 +1150,48 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn model_events_keep_typed_correlation_and_web_search_fields() {
+        let delta = ModelEvent::CommentaryDelta("Checking".into()).into_event(
+            "session-1",
+            "turn-1",
+            "step-1",
+        );
+        let search = ModelEvent::WebSearchCompleted {
+            call_id: "search-1".into(),
+            action: WebSearchAction::Search {
+                queries: vec!["Horus framework".into(), "Horus gateway".into()],
+            },
+        }
+        .into_event("session-1", "turn-1", "step-1");
+
+        assert_eq!(
+            serde_json::to_value(delta).expect("serialize delta"),
+            json!({
+                "type": "agent_message_content_delta",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "model_step_id": "step-1",
+                "delta": "Checking",
+                "phase": "commentary"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(search).expect("serialize web search"),
+            json!({
+                "type": "web_search_end",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "model_step_id": "step-1",
+                "call_id": "search-1",
+                "action": {
+                    "type": "search",
+                    "queries": ["Horus framework", "Horus gateway"]
+                }
+            })
+        );
+    }
 
     #[test]
     fn middleware_settings_have_a_generic_wire_shape() {

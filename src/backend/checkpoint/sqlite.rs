@@ -19,23 +19,34 @@ use serde_json::Value;
 use super::CHECKPOINT_VERSION;
 use super::Checkpoint;
 use super::CheckpointStore;
+use super::EventPage;
+use super::EventPageRequest;
 use super::ExecutionPage;
 use super::ExecutionPageRequest;
 use super::ExecutionRecord;
 use super::ExecutionStats;
+use super::JournalEvent;
 use super::SessionCursor;
 use super::SessionPage;
 use super::SessionPageRequest;
 use super::SessionSummary;
+use super::StreamMetrics;
+use super::TimestampedEvent;
 use super::TranscriptBatch;
 use super::TranscriptPage;
 use super::TranscriptPageRequest;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
+use crate::protocol::AgentMessagePhase;
+use crate::protocol::Event;
+use crate::protocol::EventMsg;
+use crate::protocol::FrontendEvent;
+use crate::protocol::ModelStepContentPhase;
+use crate::protocol::ModelStepOutcome;
 use crate::protocol::SessionContext;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SCHEMA: &str = "
@@ -51,6 +62,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     parent_session_id TEXT REFERENCES sessions(session_id),
     parent_sequence INTEGER CHECK (parent_sequence IS NULL OR parent_sequence >= 0),
     latest_sequence INTEGER NOT NULL CHECK (latest_sequence >= 0),
+    latest_event_sequence INTEGER NOT NULL DEFAULT 0 CHECK (latest_event_sequence >= 0),
     latest_checkpoint_json TEXT NOT NULL,
     session_context_json TEXT NOT NULL,
     execution_stats_json TEXT NOT NULL,
@@ -74,11 +86,25 @@ CREATE TABLE IF NOT EXISTS execution_journal (
     started_at_ms INTEGER NOT NULL CHECK (started_at_ms >= 0),
     PRIMARY KEY (session_id, sequence)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS event_journal (
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence > 0),
+    recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+    event_kind TEXT NOT NULL,
+    model_step_id TEXT,
+    stream_phase TEXT,
+    delta_bytes INTEGER CHECK (delta_bytes IS NULL OR delta_bytes >= 0),
+    event_json TEXT NOT NULL,
+    stream_metrics_json TEXT NOT NULL,
+    PRIMARY KEY (session_id, sequence)
+) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS sessions_recent_idx
     ON sessions(updated_at DESC, latest_sequence DESC, session_id DESC);
 CREATE INDEX IF NOT EXISTS execution_journal_recent_idx
     ON execution_journal(started_at_ms DESC, session_id DESC, sequence DESC);
-PRAGMA user_version = 4;
+CREATE INDEX IF NOT EXISTS event_journal_step_idx
+    ON event_journal(session_id, model_step_id, event_kind);
+PRAGMA user_version = 5;
 COMMIT;
 ";
 
@@ -181,15 +207,80 @@ impl CheckpointStore for SqliteCheckpoint {
         }))
     }
 
+    fn delete_session<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<bool>> {
+        let session_id = session_id.to_string();
+        Box::pin(self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let session_ids = {
+                let mut statement = transaction.prepare(
+                    "WITH RECURSIVE session_tree(session_id) AS (
+                         SELECT session_id FROM sessions WHERE session_id = ?1
+                         UNION ALL
+                         SELECT child.session_id
+                         FROM sessions AS child
+                         JOIN session_tree AS parent
+                           ON child.parent_session_id = parent.session_id
+                     )
+                     SELECT session_id FROM session_tree",
+                )?;
+                statement
+                    .query_map([&session_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            if session_ids.is_empty() {
+                return Ok(false);
+            }
+            for id in &session_ids {
+                transaction.execute("DELETE FROM middleware_state WHERE scope = ?1", [id])?;
+            }
+            let deleted = transaction.execute(
+                "WITH RECURSIVE session_tree(session_id) AS (
+                     SELECT session_id FROM sessions WHERE session_id = ?1
+                     UNION ALL
+                     SELECT child.session_id
+                     FROM sessions AS child
+                     JOIN session_tree AS parent
+                       ON child.parent_session_id = parent.session_id
+                 )
+                 DELETE FROM sessions
+                 WHERE session_id IN (SELECT session_id FROM session_tree)",
+                [&session_id],
+            )?;
+            if deleted != session_ids.len() {
+                return Err(Error::Checkpoint(
+                    "session tree changed during deletion".into(),
+                ));
+            }
+            transaction.commit()?;
+            Ok(true)
+        }))
+    }
+
     fn save<'a>(
         &'a self,
         checkpoint: &'a Checkpoint,
         transcript_delta: &'a [Value],
         execution: Option<&'a ExecutionRecord>,
     ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.save_with_events(checkpoint, transcript_delta, execution, &[])
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn save_with_events<'a>(
+        &'a self,
+        checkpoint: &'a Checkpoint,
+        transcript_delta: &'a [Value],
+        execution: Option<&'a ExecutionRecord>,
+        events: &'a [TimestampedEvent],
+    ) -> BoxFuture<'a, Result<Vec<JournalEvent>>> {
         let checkpoint = checkpoint.clone();
         let transcript_delta = transcript_delta.to_vec();
         let execution = execution.cloned();
+        let events = events.to_vec();
         Box::pin(self.run(move |connection| {
             validate_checkpoint(&checkpoint)?;
             if let Some(execution) = &execution {
@@ -222,9 +313,119 @@ impl CheckpointStore for SqliteCheckpoint {
                         .map(|(record, json)| (record.started_at_ms, json)),
                 },
             )?;
+            let records = events
+                .into_iter()
+                .map(|event| store_event(&transaction, &checkpoint.session_id, event))
+                .collect::<Result<Vec<_>>>()?;
             transaction.commit()?;
-            Ok(())
+            Ok(records)
         }))
+    }
+
+    fn append_event<'a>(
+        &'a self,
+        session_id: &'a str,
+        recorded_at_ms: i64,
+        event: &'a Event,
+    ) -> BoxFuture<'a, Result<JournalEvent>> {
+        let session_id = session_id.to_string();
+        let event = TimestampedEvent {
+            recorded_at_ms,
+            event: event.clone(),
+        };
+        Box::pin(self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let record = store_event(&transaction, &session_id, event)?;
+            transaction.commit()?;
+            Ok(record)
+        }))
+    }
+
+    fn event_page<'a>(
+        &'a self,
+        session_id: &'a str,
+        request: EventPageRequest,
+    ) -> BoxFuture<'a, Result<EventPage>> {
+        let session_id = session_id.to_string();
+        Box::pin(async move {
+            if request.limit == 0 {
+                return Err(Error::Checkpoint(
+                    "event journal page limit must be positive".into(),
+                ));
+            }
+            let query_limit = request
+                .limit
+                .checked_add(1)
+                .and_then(|limit| i64::try_from(limit).ok())
+                .ok_or_else(|| Error::Checkpoint("event journal page limit is too large".into()))?;
+            let before_sequence = request
+                .before_sequence
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    Error::Checkpoint("event journal cursor exceeds SQLite INTEGER".into())
+                })?;
+            self.run(move |connection| {
+                let latest_sequence = connection
+                    .query_row(
+                        "SELECT latest_event_sequence FROM sessions WHERE session_id = ?1",
+                        [&session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        Error::Checkpoint("event journal session does not exist".into())
+                    })?;
+                let latest_sequence = u64::try_from(latest_sequence).map_err(|_| {
+                    Error::Checkpoint("event journal sequence became negative".into())
+                })?;
+                let mut statement = connection.prepare(
+                    "SELECT sequence, recorded_at_ms, event_json, stream_metrics_json
+                     FROM event_journal
+                     WHERE session_id = ?1
+                       AND (?2 IS NULL OR sequence < ?2)
+                     ORDER BY sequence DESC
+                     LIMIT ?3",
+                )?;
+                let mut rows = statement
+                    .query_map(params![session_id, before_sequence, query_limit], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let has_more = rows.len() > request.limit;
+                rows.truncate(request.limit);
+                let events = rows
+                    .into_iter()
+                    .map(|(sequence, recorded_at_ms, json, metrics_json)| {
+                        Ok(JournalEvent {
+                            sequence: u64::try_from(sequence).map_err(|_| {
+                                Error::Checkpoint(
+                                    "event journal row has a negative sequence".into(),
+                                )
+                            })?,
+                            recorded_at_ms,
+                            event: serde_json::from_str(&json)?,
+                            stream_metrics: serde_json::from_str(&metrics_json)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let next_before_sequence = has_more
+                    .then(|| events.last().map(|event| event.sequence))
+                    .flatten();
+                Ok(EventPage {
+                    latest_sequence,
+                    events,
+                    next_before_sequence,
+                })
+            })
+            .await
+        })
     }
 
     fn list_sessions_page(
@@ -742,6 +943,286 @@ fn decode_execution(json: &str) -> Result<ExecutionRecord> {
     Ok(execution)
 }
 
+fn store_event(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    timestamped: TimestampedEvent,
+) -> Result<JournalEvent> {
+    let TimestampedEvent {
+        recorded_at_ms,
+        event,
+    } = timestamped;
+    if recorded_at_ms < 0 {
+        return Err(Error::Checkpoint(
+            "event journal timestamp cannot be negative".into(),
+        ));
+    }
+    let has_authoritative_snapshot = matches!(
+        &event.msg,
+        EventMsg::ModelStepCompleted(step)
+            if matches!(&step.outcome, ModelStepOutcome::Completed { .. })
+    );
+    let discard_after_delivery = is_transient_event(&event.msg);
+    let index = event_index(&event.msg)?;
+    let event_json = serde_json::to_string(&event)?;
+    let latest = transaction
+        .query_row(
+            "SELECT latest_event_sequence FROM sessions WHERE session_id = ?1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or_else(|| Error::Checkpoint("event journal session does not exist".into()))?;
+    let sequence = latest
+        .checked_add(1)
+        .ok_or_else(|| Error::Checkpoint("event journal sequence overflow".into()))?;
+    let stream_metrics = if index.kind == "model_step_completed" {
+        index
+            .model_step_id
+            .map(|model_step_id| load_stream_metrics(transaction, session_id, model_step_id))
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let stream_metrics_json = serde_json::to_string(&stream_metrics)?;
+    transaction.execute(
+        "INSERT INTO event_journal (
+             session_id, sequence, recorded_at_ms, event_kind, model_step_id,
+             stream_phase, delta_bytes, event_json, stream_metrics_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            session_id,
+            sequence,
+            recorded_at_ms,
+            index.kind,
+            index.model_step_id,
+            index.stream_phase.map(stream_phase_name),
+            index.delta_bytes,
+            event_json,
+            stream_metrics_json,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE sessions SET latest_event_sequence = ?2 WHERE session_id = ?1",
+        params![session_id, sequence],
+    )?;
+    if has_authoritative_snapshot && let Some(model_step_id) = index.model_step_id {
+        transaction.execute(
+            "DELETE FROM event_journal
+             WHERE session_id = ?1 AND model_step_id = ?2
+               AND event_kind IN (
+                   'agent_message_content_delta',
+                   'agent_reasoning_content_delta'
+               )",
+            params![session_id, model_step_id],
+        )?;
+    } else if index.kind == "token_count" {
+        transaction.execute(
+            "DELETE FROM event_journal
+             WHERE session_id = ?1 AND event_kind = 'token_count' AND sequence < ?2",
+            params![session_id, sequence],
+        )?;
+    }
+    if discard_after_delivery {
+        transaction.execute(
+            "DELETE FROM event_journal WHERE session_id = ?1 AND sequence = ?2",
+            params![session_id, sequence],
+        )?;
+    }
+    Ok(JournalEvent {
+        sequence: u64::try_from(sequence)
+            .map_err(|_| Error::Checkpoint("event journal sequence became negative".into()))?,
+        recorded_at_ms,
+        event,
+        stream_metrics,
+    })
+}
+
+struct EventIndex<'a> {
+    kind: &'static str,
+    model_step_id: Option<&'a str>,
+    stream_phase: Option<ModelStepContentPhase>,
+    delta_bytes: Option<i64>,
+}
+
+fn event_index(event: &EventMsg) -> Result<EventIndex<'_>> {
+    let plain = |kind| EventIndex {
+        kind,
+        model_step_id: None,
+        stream_phase: None,
+        delta_bytes: None,
+    };
+    let step = |kind, model_step_id| EventIndex {
+        kind,
+        model_step_id: Some(model_step_id),
+        stream_phase: None,
+        delta_bytes: None,
+    };
+    Ok(match event {
+        EventMsg::Error(_) => plain("error"),
+        EventMsg::Warning(_) => plain("warning"),
+        EventMsg::SessionConfigured(_) => plain("session_configured"),
+        EventMsg::TurnStarted(_) => plain("task_started"),
+        EventMsg::TurnComplete(_) => plain("task_complete"),
+        EventMsg::TurnAborted(_) => plain("turn_aborted"),
+        EventMsg::UserMessage(_) => plain("user_message"),
+        EventMsg::AgentMessage(message) => step("agent_message", &message.model_step_id),
+        EventMsg::AgentMessageContentDelta(delta) => EventIndex {
+            kind: "agent_message_content_delta",
+            model_step_id: Some(&delta.model_step_id),
+            stream_phase: Some(match delta.phase {
+                AgentMessagePhase::Commentary => ModelStepContentPhase::Commentary,
+                AgentMessagePhase::FinalAnswer => ModelStepContentPhase::FinalAnswer,
+            }),
+            delta_bytes: Some(i64::try_from(delta.delta.len()).map_err(|_| {
+                Error::Checkpoint("stream delta length exceeds SQLite INTEGER".into())
+            })?),
+        },
+        EventMsg::AgentReasoningContentDelta(delta) => EventIndex {
+            kind: "agent_reasoning_content_delta",
+            model_step_id: Some(&delta.model_step_id),
+            stream_phase: Some(ModelStepContentPhase::Reasoning),
+            delta_bytes: Some(i64::try_from(delta.delta.len()).map_err(|_| {
+                Error::Checkpoint("stream delta length exceeds SQLite INTEGER".into())
+            })?),
+        },
+        EventMsg::ModelStepStarted(model_step) => {
+            step("model_step_started", &model_step.model_step_id)
+        }
+        EventMsg::ModelStepCompleted(model_step) => {
+            step("model_step_completed", &model_step.model_step_id)
+        }
+        EventMsg::SessionHistory(_) => plain("session_history"),
+        EventMsg::ModelChanged(_) => plain("model_changed"),
+        EventMsg::SessionResumeRequested(_) => plain("session_resume_requested"),
+        EventMsg::ToolCallBegin(_) => plain("tool_call_begin"),
+        EventMsg::ToolCallEnd(_) => plain("tool_call_end"),
+        EventMsg::ExecApprovalRequest(_) => plain("exec_approval_request"),
+        EventMsg::TokenCount(_) => plain("token_count"),
+        EventMsg::ContextCompacted => plain("context_compacted"),
+        EventMsg::WebSearchBegin(search) => step("web_search_begin", &search.model_step_id),
+        EventMsg::WebSearchEnd(search) => step("web_search_end", &search.model_step_id),
+        EventMsg::Frontend(_) => plain("frontend"),
+    })
+}
+
+fn is_transient_event(event: &EventMsg) -> bool {
+    matches!(
+        event,
+        EventMsg::SessionHistory(_)
+            | EventMsg::SessionResumeRequested(_)
+            | EventMsg::Frontend(
+                FrontendEvent::Picker { .. }
+                    | FrontendEvent::Preview { .. }
+                    | FrontendEvent::Widget { .. }
+                    | FrontendEvent::RemoveWidget { .. }
+            )
+    )
+}
+
+fn stream_phase_name(phase: ModelStepContentPhase) -> &'static str {
+    match phase {
+        ModelStepContentPhase::Reasoning => "reasoning",
+        ModelStepContentPhase::Commentary => "commentary",
+        ModelStepContentPhase::FinalAnswer => "final_answer",
+    }
+}
+
+#[derive(Default)]
+struct StreamMetricAccumulator {
+    first_delta_at_ms: Option<i64>,
+    last_delta_at_ms: Option<i64>,
+    chunk_count: u64,
+    utf8_bytes: u64,
+    longest_gap_ms: u64,
+}
+
+impl StreamMetricAccumulator {
+    fn observe(&mut self, recorded_at_ms: i64, bytes: i64) -> Result<()> {
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| Error::Checkpoint("stream delta has a negative length".into()))?;
+        if let Some(previous) = self.last_delta_at_ms {
+            let recorded_at_ms = recorded_at_ms.max(previous);
+            let gap = recorded_at_ms - previous;
+            self.longest_gap_ms =
+                self.longest_gap_ms
+                    .max(u64::try_from(gap).map_err(|_| {
+                        Error::Checkpoint("stream delta gap is unsupported".into())
+                    })?);
+            self.last_delta_at_ms = Some(recorded_at_ms);
+        } else {
+            self.first_delta_at_ms = Some(recorded_at_ms);
+            self.last_delta_at_ms = Some(recorded_at_ms);
+        }
+        self.chunk_count = self
+            .chunk_count
+            .checked_add(1)
+            .ok_or_else(|| Error::Checkpoint("stream chunk count overflow".into()))?;
+        self.utf8_bytes = self
+            .utf8_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Checkpoint("stream byte count overflow".into()))?;
+        Ok(())
+    }
+
+    fn finish(self, phase: ModelStepContentPhase) -> Option<StreamMetrics> {
+        Some(StreamMetrics {
+            phase,
+            first_delta_at_ms: self.first_delta_at_ms?,
+            last_delta_at_ms: self.last_delta_at_ms?,
+            chunk_count: self.chunk_count,
+            utf8_bytes: self.utf8_bytes,
+            longest_gap_ms: self.longest_gap_ms,
+        })
+    }
+}
+
+fn load_stream_metrics(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    model_step_id: &str,
+) -> Result<Vec<StreamMetrics>> {
+    let mut statement = transaction.prepare(
+        "SELECT stream_phase, recorded_at_ms, delta_bytes
+         FROM event_journal
+         WHERE session_id = ?1 AND model_step_id = ?2 AND stream_phase IS NOT NULL
+         ORDER BY sequence",
+    )?;
+    let rows = statement
+        .query_map(params![session_id, model_step_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut reasoning = StreamMetricAccumulator::default();
+    let mut commentary = StreamMetricAccumulator::default();
+    let mut final_answer = StreamMetricAccumulator::default();
+    for (phase, recorded_at_ms, bytes) in rows {
+        match phase.as_str() {
+            "reasoning" => reasoning.observe(recorded_at_ms, bytes)?,
+            "commentary" => commentary.observe(recorded_at_ms, bytes)?,
+            "final_answer" => final_answer.observe(recorded_at_ms, bytes)?,
+            _ => {
+                return Err(Error::Checkpoint(
+                    "event journal contains an unknown stream phase".into(),
+                ));
+            }
+        }
+    }
+    Ok([
+        reasoning.finish(ModelStepContentPhase::Reasoning),
+        commentary.finish(ModelStepContentPhase::Commentary),
+        final_answer.finish(ModelStepContentPhase::FinalAnswer),
+    ]
+    .into_iter()
+    .flatten()
+    .collect())
+}
+
 fn validate_checkpoint(checkpoint: &Checkpoint) -> Result<()> {
     if checkpoint.version != CHECKPOINT_VERSION {
         return Err(Error::Checkpoint(format!(
@@ -763,6 +1244,22 @@ fn validate_checkpoint(checkpoint: &Checkpoint) -> Result<()> {
         if active.failed_tool_calls > active.tool_calls {
             return Err(Error::Checkpoint(
                 "active execution failed-tool count exceeds tool count".into(),
+            ));
+        }
+    }
+    if let Some(step) = &checkpoint.active_model_step {
+        let execution = checkpoint
+            .active_execution
+            .as_ref()
+            .ok_or_else(|| Error::Checkpoint("active model step has no active execution".into()))?;
+        if step.model_step_id.trim().is_empty() {
+            return Err(Error::Checkpoint(
+                "active model-step identifier cannot be empty".into(),
+            ));
+        }
+        if step.started_at_ms < execution.started_at_ms {
+            return Err(Error::Checkpoint(
+                "active model step predates its execution".into(),
             ));
         }
     }
@@ -886,6 +1383,25 @@ mod tests {
     }
 
     #[test]
+    fn stream_metrics_tolerate_wall_clock_regression() {
+        let mut metrics = StreamMetricAccumulator::default();
+        metrics.observe(20, 2).expect("first chunk");
+        metrics.observe(10, 3).expect("regressed clock chunk");
+
+        assert_eq!(
+            metrics.finish(ModelStepContentPhase::Reasoning),
+            Some(StreamMetrics {
+                phase: ModelStepContentPhase::Reasoning,
+                first_delta_at_ms: 20,
+                last_delta_at_ms: 20,
+                chunk_count: 2,
+                utf8_bytes: 5,
+                longest_gap_ms: 0,
+            })
+        );
+    }
+
+    #[test]
     fn open_rejects_a_nonempty_unversioned_database() {
         let workspace = tempfile::tempdir().expect("create workspace");
         let path = workspace.path().join("checkpoints.sqlite3");
@@ -902,7 +1418,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "checkpoint error: unversioned SQLite database is not empty; expected schema version \
-             4 (start with a fresh database)"
+             5 (start with a fresh database)"
         );
     }
 
@@ -1019,6 +1535,91 @@ mod tests {
                     .collect::<Vec<_>>(),
             ),
             (context.clone(), context.clone(), vec![&context, &context])
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_the_complete_session_tree() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+        let mut parent = Checkpoint::empty("parent");
+        parent.sequence = 1;
+        store
+            .save(
+                &parent,
+                &[json!({"role": "user", "content": "hello"})],
+                None,
+            )
+            .await
+            .expect("save parent");
+        store
+            .fork("parent", 1, &Checkpoint::empty("child"))
+            .await
+            .expect("fork child");
+        store
+            .fork("child", 0, &Checkpoint::empty("grandchild"))
+            .await
+            .expect("fork grandchild");
+        for session_id in ["parent", "child", "grandchild"] {
+            store
+                .append_event(
+                    session_id,
+                    1,
+                    &Event {
+                        submission_id: None,
+                        msg: EventMsg::Warning(crate::protocol::WarningEvent {
+                            message: session_id.into(),
+                        }),
+                    },
+                )
+                .await
+                .expect("append event");
+            store
+                .save_state(session_id, "owned", &json!(session_id))
+                .await
+                .expect("save session state");
+        }
+        store
+            .save_state("global", "retained", &json!(true))
+            .await
+            .expect("save global state");
+
+        assert!(store.delete_session("parent").await.expect("delete tree"));
+
+        let counts = store
+            .run(|connection| {
+                let sessions =
+                    connection.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
+                let transcripts =
+                    connection.query_row("SELECT COUNT(*) FROM transcript_delta", [], |row| {
+                        row.get(0)
+                    })?;
+                let events =
+                    connection
+                        .query_row("SELECT COUNT(*) FROM event_journal", [], |row| row.get(0))?;
+                let session_state = connection.query_row(
+                    "SELECT COUNT(*) FROM middleware_state WHERE scope != 'global'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((sessions, transcripts, events, session_state))
+            })
+            .await
+            .expect("count remaining rows");
+        assert_eq!(counts, (0_i64, 0_i64, 0_i64, 0_i64));
+        assert_eq!(
+            store
+                .load_state("global", "retained")
+                .await
+                .expect("load global state"),
+            Some(json!(true))
+        );
+        assert!(
+            !store
+                .delete_session("parent")
+                .await
+                .expect("delete absent tree")
         );
     }
 
@@ -1201,6 +1802,373 @@ mod tests {
             ),
             (vec!["c", "b"], Some("b"), vec!["a"], None)
         );
+    }
+
+    #[tokio::test]
+    async fn event_journal_sequences_and_pages_normalized_events() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+        store
+            .save(&Checkpoint::empty("session"), &[], None)
+            .await
+            .expect("save session");
+
+        for (recorded_at_ms, message) in [(10, "first"), (20, "second")] {
+            store
+                .append_event(
+                    "session",
+                    recorded_at_ms,
+                    &Event {
+                        submission_id: None,
+                        msg: EventMsg::Warning(crate::protocol::WarningEvent {
+                            message: message.into(),
+                        }),
+                    },
+                )
+                .await
+                .expect("append event");
+        }
+
+        let newest = store
+            .event_page(
+                "session",
+                EventPageRequest {
+                    before_sequence: None,
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("newest event");
+        let older = store
+            .event_page(
+                "session",
+                EventPageRequest {
+                    before_sequence: newest.next_before_sequence,
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("older event");
+
+        assert_eq!(newest.events[0].sequence, 2);
+        assert_eq!(newest.latest_sequence, 2);
+        assert_eq!(newest.events[0].recorded_at_ms, 20);
+        assert_eq!(newest.next_before_sequence, Some(2));
+        assert_eq!(older.events[0].sequence, 1);
+        assert_eq!(older.next_before_sequence, None);
+    }
+
+    #[tokio::test]
+    async fn transient_controls_advance_sequence_without_entering_history() {
+        use crate::protocol::FrontendEvent;
+        use crate::protocol::SessionContext;
+        use crate::protocol::SessionResumeRequestedEvent;
+
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+        store
+            .save(&Checkpoint::empty("session"), &[], None)
+            .await
+            .expect("save session");
+        let events = [
+            EventMsg::Warning(crate::protocol::WarningEvent {
+                message: "durable".into(),
+            }),
+            EventMsg::SessionResumeRequested(SessionResumeRequestedEvent {
+                session_id: "session".into(),
+                context: SessionContext::default(),
+            }),
+            EventMsg::Frontend(FrontendEvent::Picker {
+                title: "Choose".into(),
+                options: Vec::new(),
+            }),
+            EventMsg::Frontend(FrontendEvent::Preview {
+                title: "Preview".into(),
+                events: Vec::new(),
+            }),
+            EventMsg::Frontend(FrontendEvent::Widget {
+                capability: "test".into(),
+                item: crate::protocol::FrontendWidget {
+                    id: "status".into(),
+                    slot: crate::protocol::FrontendSlot::Header,
+                    text: "Current".into(),
+                    tone: crate::protocol::FrontendTone::Neutral,
+                    symbol: None,
+                    icon_only: false,
+                    progress: None,
+                    content: None,
+                    action: None,
+                },
+            }),
+            EventMsg::Frontend(FrontendEvent::RemoveWidget {
+                capability: "test".into(),
+                id: "status".into(),
+            }),
+        ];
+        for (index, msg) in events.into_iter().enumerate() {
+            store
+                .append_event(
+                    "session",
+                    i64::try_from(index).expect("timestamp"),
+                    &Event {
+                        submission_id: None,
+                        msg,
+                    },
+                )
+                .await
+                .expect("append event");
+        }
+
+        let page = store
+            .event_page(
+                "session",
+                EventPageRequest {
+                    before_sequence: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("event page");
+
+        assert_eq!(page.latest_sequence, 6);
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_model_step_compacts_progressive_deltas() {
+        use crate::protocol::AgentMessageContentDeltaEvent;
+        use crate::protocol::AgentMessagePhase;
+        use crate::protocol::AgentReasoningContentDeltaEvent;
+        use crate::protocol::ModelStepAnnotation;
+        use crate::protocol::ModelStepCompletedEvent;
+        use crate::protocol::ModelStepContent;
+        use crate::protocol::ModelStepContentPhase;
+        use crate::protocol::ModelStepOutcome;
+        use crate::protocol::ModelStepStartedEvent;
+
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+        store
+            .save(&Checkpoint::empty("session"), &[], None)
+            .await
+            .expect("save session");
+        let event = |msg| Event {
+            submission_id: Some("submission".into()),
+            msg,
+        };
+        let events = [
+            event(EventMsg::ModelStepStarted(ModelStepStartedEvent {
+                session_id: "session".into(),
+                turn_id: "turn".into(),
+                model_step_id: "step".into(),
+                step_index: 0,
+                started_at_ms: 10,
+            })),
+            event(EventMsg::AgentReasoningContentDelta(
+                AgentReasoningContentDeltaEvent {
+                    session_id: "session".into(),
+                    turn_id: "turn".into(),
+                    model_step_id: "step".into(),
+                    delta: "Plan".into(),
+                },
+            )),
+            event(EventMsg::AgentMessageContentDelta(
+                AgentMessageContentDeltaEvent {
+                    session_id: "session".into(),
+                    turn_id: "turn".into(),
+                    model_step_id: "step".into(),
+                    delta: "Done".into(),
+                    phase: AgentMessagePhase::FinalAnswer,
+                },
+            )),
+            event(EventMsg::ModelStepCompleted(ModelStepCompletedEvent {
+                session_id: "session".into(),
+                turn_id: "turn".into(),
+                model_step_id: "step".into(),
+                step_index: 0,
+                started_at_ms: 10,
+                completed_at_ms: 20,
+                outcome: ModelStepOutcome::Completed {
+                    end_turn: true,
+                    tool_call_ids: Vec::new(),
+                    usage: crate::protocol::TokenUsage::default(),
+                    content: vec![
+                        ModelStepContent {
+                            output_index: 0,
+                            part_index: 0,
+                            phase: ModelStepContentPhase::Reasoning,
+                            text: "Plan".into(),
+                            annotations: Vec::new(),
+                        },
+                        ModelStepContent {
+                            output_index: 1,
+                            part_index: 0,
+                            phase: ModelStepContentPhase::FinalAnswer,
+                            text: "Done".into(),
+                            annotations: vec![ModelStepAnnotation::UrlCitation {
+                                url: "https://example.com".into(),
+                                title: "Example".into(),
+                                start_index: 0,
+                                end_index: 4,
+                            }],
+                        },
+                    ],
+                },
+            })),
+        ];
+        for (index, event) in events.iter().enumerate() {
+            store
+                .append_event(
+                    "session",
+                    10 + i64::try_from(index).expect("timestamp"),
+                    event,
+                )
+                .await
+                .expect("append event");
+        }
+
+        let page = store
+            .event_page(
+                "session",
+                EventPageRequest {
+                    before_sequence: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("event page")
+            .into_chronological();
+
+        assert_eq!(
+            page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            [1, 4]
+        );
+        let EventMsg::ModelStepCompleted(ModelStepCompletedEvent {
+            outcome: ModelStepOutcome::Completed { content, .. },
+            ..
+        }) = &page[1].event.msg
+        else {
+            panic!("expected completed model step");
+        };
+        assert_eq!(
+            content,
+            &[
+                ModelStepContent {
+                    output_index: 0,
+                    part_index: 0,
+                    phase: ModelStepContentPhase::Reasoning,
+                    text: "Plan".into(),
+                    annotations: Vec::new(),
+                },
+                ModelStepContent {
+                    output_index: 1,
+                    part_index: 0,
+                    phase: ModelStepContentPhase::FinalAnswer,
+                    text: "Done".into(),
+                    annotations: vec![ModelStepAnnotation::UrlCitation {
+                        url: "https://example.com".into(),
+                        title: "Example".into(),
+                        start_index: 0,
+                        end_index: 4,
+                    }],
+                },
+            ]
+        );
+        assert_eq!(
+            page[1]
+                .stream_metrics
+                .iter()
+                .map(|metrics| (metrics.phase, metrics.chunk_count, metrics.utf8_bytes))
+                .collect::<Vec<_>>(),
+            [
+                (ModelStepContentPhase::Reasoning, 1, 4),
+                (ModelStepContentPhase::FinalAnswer, 1, 4),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_model_steps_retain_progressive_deltas() {
+        use crate::protocol::AgentMessageContentDeltaEvent;
+        use crate::protocol::AgentMessagePhase;
+        use crate::protocol::ModelStepCompletedEvent;
+
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+        store
+            .save(&Checkpoint::empty("session"), &[], None)
+            .await
+            .expect("save session");
+        for (model_step_id, outcome) in [
+            ("failed", ModelStepOutcome::Failed),
+            ("interrupted", ModelStepOutcome::Interrupted),
+        ] {
+            let delta = Event {
+                submission_id: Some("submission".into()),
+                msg: EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                    session_id: "session".into(),
+                    turn_id: "turn".into(),
+                    model_step_id: model_step_id.into(),
+                    delta: format!("partial {model_step_id}"),
+                    phase: AgentMessagePhase::FinalAnswer,
+                }),
+            };
+            let completed = Event {
+                submission_id: Some("submission".into()),
+                msg: EventMsg::ModelStepCompleted(ModelStepCompletedEvent {
+                    session_id: "session".into(),
+                    turn_id: "turn".into(),
+                    model_step_id: model_step_id.into(),
+                    step_index: 0,
+                    started_at_ms: 10,
+                    completed_at_ms: 20,
+                    outcome,
+                }),
+            };
+            store
+                .append_event("session", 10, &delta)
+                .await
+                .expect("append partial delta");
+            store
+                .append_event("session", 20, &completed)
+                .await
+                .expect("append incomplete terminal event");
+        }
+
+        let page = store
+            .event_page(
+                "session",
+                EventPageRequest {
+                    before_sequence: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("event page")
+            .into_chronological();
+
+        assert_eq!(
+            page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert!(matches!(
+            page[0].event.msg,
+            EventMsg::AgentMessageContentDelta(_)
+        ));
+        assert!(matches!(
+            page[2].event.msg,
+            EventMsg::AgentMessageContentDelta(_)
+        ));
     }
 
     #[tokio::test]
@@ -1397,6 +2365,56 @@ mod tests {
                 .expect("load transcript")
                 .batches
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn event_insert_failure_rolls_back_checkpoint_and_event_batch() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+        let original = Checkpoint::empty("session");
+        store
+            .save(&original, &[], None)
+            .await
+            .expect("save session");
+        let mut next = original.clone();
+        next.sequence = 1;
+        let warning = |recorded_at_ms, message: &str| TimestampedEvent {
+            recorded_at_ms,
+            event: Event {
+                submission_id: None,
+                msg: EventMsg::Warning(crate::protocol::WarningEvent {
+                    message: message.into(),
+                }),
+            },
+        };
+
+        let error = store
+            .save_with_events(
+                &next,
+                &[json!({"role": "assistant"})],
+                None,
+                &[warning(10, "first"), warning(-1, "invalid")],
+            )
+            .await
+            .expect_err("invalid event must roll back the transaction");
+        let saved = store.load("session").await.expect("load session");
+        let events = store
+            .event_page(
+                "session",
+                EventPageRequest {
+                    before_sequence: None,
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("load event page");
+
+        assert!(matches!(error, Error::Checkpoint(_)));
+        assert_eq!(
+            (saved, events.latest_sequence, events.events),
+            (Some(original), 0, Vec::new())
         );
     }
 }

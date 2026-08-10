@@ -86,8 +86,11 @@ pub fn events(context: &[(MessageTarget, Value)], session_id: &str) -> Vec<Event
                     AgentMessagePhase::FinalAnswer
                 };
                 events.push(EventMsg::AgentMessage(AgentMessageEvent {
+                    session_id: session_id.into(),
+                    turn_id: item_id.clone(),
+                    model_step_id: item_id.clone(),
                     message,
-                    phase: Some(phase),
+                    phase,
                     message_target,
                 }));
             }
@@ -155,9 +158,9 @@ fn push_reasoning(
     };
     events.push(EventMsg::AgentReasoningContentDelta(
         AgentReasoningContentDeltaEvent {
-            thread_id: session_id.into(),
+            session_id: session_id.into(),
             turn_id: item_id.into(),
-            item_id: item_id.into(),
+            model_step_id: item_id.into(),
             delta,
         },
     ));
@@ -261,7 +264,7 @@ mod tests {
             EventMsg::AgentReasoningContentDelta(event)
                 if event.delta == "neutral"
                     && event.turn_id == "history-4-2"
-                    && event.item_id == "history-4-2"
+                    && event.model_step_id == "history-4-2"
         ));
         assert!(matches!(
             &replayed[2],
@@ -366,7 +369,7 @@ mod tests {
             replayed.as_slice(),
             [EventMsg::AgentMessage(message)]
                 if message.message == "Checking the workspace."
-                    && message.phase == Some(AgentMessagePhase::Commentary)
+                    && message.phase == AgentMessagePhase::Commentary
         ));
     }
 

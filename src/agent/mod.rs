@@ -17,6 +17,7 @@ use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::checkpoint::ExecutionOutcome;
 use crate::backend::checkpoint::ExecutionRecord;
+use crate::backend::checkpoint::JournalEvent;
 use crate::backend::model::ModelChoice;
 use crate::backend::model::ModelInfo;
 use crate::backend::model::ModelRouter;
@@ -37,11 +38,14 @@ use crate::protocol::TokenUsage;
 use crate::protocol::WarningEvent;
 
 mod input;
+mod recorder;
 mod startup;
 mod tool_step;
 mod turn;
 
 pub use self::startup::create_agent;
+
+use self::recorder::EventRecorder;
 
 const COMMAND_QUEUE_CAPACITY: usize = 64;
 const EVENT_QUEUE_CAPACITY: usize = 256;
@@ -131,6 +135,7 @@ impl AgentConfig {
     }
 
     /// Sets the maximum durable transcript batches rendered when a session opens.
+    /// Zero disables checkpoint-derived presentation replay.
     #[must_use]
     pub fn initial_replay_batches(mut self, max_batches: usize) -> Self {
         self.initial_replay_batches = max_batches;
@@ -327,7 +332,7 @@ fn validate_identifier(name: &str, value: &str, limit: usize) -> Result<()> {
 /// Bidirectional handle consumed by a frontend.
 pub struct Agent {
     sender: AgentSender,
-    events: mpsc::Receiver<Event>,
+    events: mpsc::Receiver<JournalEvent>,
     frontend: FrontendExtensions,
     session: SessionConfiguredEvent,
     model: ModelInfo,
@@ -345,10 +350,9 @@ impl Agent {
 
     /// Receives the next agent event.
     ///
-    /// Frontends must keep draining events while the agent is running. Durable
-    /// lifecycle events apply backpressure when this receiver is not polled.
+    /// Frontends must keep draining events while the agent is running.
     pub async fn next_event(&mut self) -> Option<Event> {
-        self.events.recv().await
+        self.events.recv().await.map(|record| record.event)
     }
 
     /// Returns the commands and status data exported by installed middleware.
@@ -397,8 +401,31 @@ impl Agent {
     ///
     /// The returned event receiver must be drained while commands are active.
     #[must_use]
-    pub fn into_parts(self) -> (AgentSender, mpsc::Receiver<Event>) {
+    pub fn into_parts(self) -> (AgentSender, AgentEvents) {
+        (self.sender, AgentEvents { inner: self.events })
+    }
+
+    /// Separates command and durably recorded event halves.
+    #[must_use]
+    pub fn into_recorded_parts(self) -> (AgentSender, mpsc::Receiver<JournalEvent>) {
         (self.sender, self.events)
+    }
+}
+
+/// Event receiver for frontends that do not own durable event recording.
+pub struct AgentEvents {
+    inner: mpsc::Receiver<JournalEvent>,
+}
+
+impl AgentEvents {
+    /// Receives the next event.
+    pub async fn recv(&mut self) -> Option<Event> {
+        self.inner.recv().await.map(|record| record.event)
+    }
+
+    /// Attempts to receive the next event without waiting.
+    pub fn try_recv(&mut self) -> std::result::Result<Event, mpsc::error::TryRecvError> {
+        self.inner.try_recv().map(|record| record.event)
     }
 }
 
@@ -410,7 +437,7 @@ struct Runner {
     review_session_id: String,
     transcript_delta: Vec<Value>,
     deferred: VecDeque<Submission>,
-    events: mpsc::Sender<Event>,
+    events: EventRecorder,
 }
 
 impl Runner {
@@ -509,15 +536,17 @@ impl Runner {
             }
         };
         self.state.model_route = Some(choice.route.clone());
-        self.save().await?;
-        self.emit(
-            submission_id,
-            EventMsg::ModelChanged(ModelChangedEvent {
-                route: choice.route,
-                model: choice.model,
-                reasoning_effort: choice.reasoning_effort,
-                model_context_window: Some(self.config.context_window),
-            }),
+        self.persist_with_events(
+            vec![Event {
+                submission_id: Some(submission_id),
+                msg: EventMsg::ModelChanged(ModelChangedEvent {
+                    route: choice.route,
+                    model: choice.model,
+                    reasoning_effort: choice.reasoning_effort,
+                    model_context_window: Some(self.config.context_window),
+                }),
+            }],
+            None,
         )
         .await?;
         Ok(())
@@ -610,17 +639,24 @@ impl Runner {
         self.persist(None).await
     }
 
-    async fn save_execution(&mut self, execution: &ExecutionRecord) -> Result<u64> {
-        self.persist(Some(execution)).await
+    async fn persist(&mut self, execution: Option<&ExecutionRecord>) -> Result<u64> {
+        self.persist_with_events(Vec::new(), execution).await
     }
 
-    async fn persist(&mut self, execution: Option<&ExecutionRecord>) -> Result<u64> {
+    pub(super) async fn persist_with_events(
+        &mut self,
+        events: Vec<Event>,
+        execution: Option<&ExecutionRecord>,
+    ) -> Result<u64> {
         let previous_sequence = self.state.sequence;
-        self.state.sequence += 1;
+        self.state.sequence = self
+            .state
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Checkpoint("checkpoint sequence overflow".into()))?;
         if let Err(error) = self
-            .config
-            .checkpoints
-            .save(&self.state, &self.transcript_delta, execution)
+            .events
+            .save(&self.state, &self.transcript_delta, execution, events)
             .await
         {
             self.state.sequence = previous_sequence;
@@ -681,11 +717,15 @@ impl Runner {
         self.state.finish_execution(outcome, unix_timestamp_ms()?)
     }
 
-    async fn finish_and_save_execution(&mut self, outcome: ExecutionOutcome) -> Result<u64> {
+    async fn finish_and_persist_execution(
+        &mut self,
+        outcome: ExecutionOutcome,
+        events: Vec<Event>,
+    ) -> Result<u64> {
         let active_execution = self.state.active_execution.clone();
         let execution_stats = self.state.execution_stats.clone();
         let execution = self.finish_execution(outcome)?;
-        match self.save_execution(&execution).await {
+        match self.persist_with_events(events, Some(&execution)).await {
             Ok(sequence) => Ok(sequence),
             Err(error) => {
                 self.state.active_execution = active_execution;
@@ -725,20 +765,12 @@ fn unix_timestamp_ms() -> Result<i64> {
         .map_err(|_| Error::Checkpoint("system clock exceeds the supported range".into()))
 }
 
-async fn send_event(events: &mpsc::Sender<Event>, event: Event) -> Result<()> {
-    events
-        .send(event)
-        .await
-        .map_err(|_| Error::Stopped("frontend event channel closed".into()))
+async fn send_event(events: &EventRecorder, event: Event) -> Result<()> {
+    events.record(event).await
 }
 
-fn try_send_event(events: &mpsc::Sender<Event>, event: Event) -> Result<()> {
-    events.try_send(event).map_err(|error| match error {
-        mpsc::error::TrySendError::Full(_) => Error::Stopped("frontend event queue is full".into()),
-        mpsc::error::TrySendError::Closed(_) => {
-            Error::Stopped("frontend event channel closed".into())
-        }
-    })
+fn try_send_event(events: &EventRecorder, event: Event) -> Result<()> {
+    events.try_record(event)
 }
 
 #[cfg(test)]

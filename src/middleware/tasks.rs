@@ -97,7 +97,10 @@ impl Middleware for Tasks {
                     .get("todos")
                     .and_then(Value::as_array)
                     .map_or(0, Vec::len);
-                format!("◉ {} {count}", text::RENDER_HEADING)
+                super::tools::ToolHeading {
+                    title: text::RENDER_HEADING.into(),
+                    detail: count.to_string(),
+                }
             },
         )
     }

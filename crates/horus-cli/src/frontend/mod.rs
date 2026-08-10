@@ -25,7 +25,13 @@ pub use dashboard::{run as run_gateway_dashboard, run_provider as run_gateway_pr
 pub use reinitialize::confirm as confirm_gateway_reinitialize;
 
 fn block_text(block: &FrontendBlock) -> String {
-    let mut text = block.text.clone();
+    let mut text = block.title.clone();
+    if !block.text.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&block.text);
+    }
     for file in &block.files {
         if !text.is_empty() {
             text.push('\n');

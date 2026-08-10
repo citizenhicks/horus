@@ -21,12 +21,16 @@ use crate::backend::sandbox::Sandbox;
 use crate::protocol::EventMsg;
 use crate::protocol::FrontendActionListItem;
 use crate::protocol::FrontendBlock;
+use crate::protocol::FrontendBlockRole;
+use crate::protocol::FrontendBlockState;
+use crate::protocol::FrontendBlockUpdate;
 use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendEvent;
 use crate::protocol::FrontendSlot;
 use crate::protocol::FrontendTone;
 use crate::protocol::FrontendWidgetContent;
 use crate::protocol::MessageTarget;
+use crate::protocol::RenderedBlock;
 use crate::protocol::SessionContext;
 use crate::protocol::TokenUsage;
 use crate::protocol::ToolCallBeginEvent;
@@ -469,15 +473,18 @@ impl FrontendExtensions {
 
     /// Lets installed middleware render capability-specific events.
     #[must_use]
-    pub fn render(&self, event: &EventMsg) -> Vec<FrontendBlock> {
-        self.stack
-            .entries
-            .iter()
-            .filter_map(|entry| {
+    pub fn render(&self, event: &EventMsg) -> Vec<RenderedBlock> {
+        event
+            .presentation()
+            .into_iter()
+            .chain(self.stack.entries.iter().filter_map(|entry| {
                 entry
                     .render(event, &self.session_id)
-                    .map(|block| block.namespaced(entry.name()))
-            })
+                    .map(|block| RenderedBlock {
+                        capability: entry.name().into(),
+                        block,
+                    })
+            }))
             .collect()
     }
 }
@@ -496,14 +503,18 @@ impl MiddlewareCommandOutput {
         text: impl Into<String>,
         tone: FrontendTone,
     ) -> Self {
+        let title = text.into();
         Self::events(vec![FrontendEvent::Render {
             capability: capability.into(),
             block: FrontendBlock {
                 id: None,
                 group: None,
-                append: false,
-                pending: false,
-                text: text.into(),
+                update: FrontendBlockUpdate::Replace,
+                state: FrontendBlockState::Complete,
+                role: FrontendBlockRole::Notice,
+                title,
+                text: String::new(),
+                symbol: None,
                 files: Vec::new(),
                 format: crate::protocol::FrontendBlockFormat::PlainText,
                 tone,
@@ -1240,9 +1251,12 @@ mod tests {
             Some(FrontendBlock {
                 id: None,
                 group: None,
-                append: false,
-                pending: false,
+                update: crate::protocol::FrontendBlockUpdate::Replace,
+                state: crate::protocol::FrontendBlockState::Complete,
+                role: crate::protocol::FrontendBlockRole::Notice,
+                title: String::new(),
                 text: String::new(),
+                symbol: None,
                 files: Vec::new(),
                 format: crate::protocol::FrontendBlockFormat::PlainText,
                 tone: FrontendTone::Neutral,

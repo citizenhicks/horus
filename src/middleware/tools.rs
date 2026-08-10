@@ -26,6 +26,9 @@ use crate::preview_json;
 use crate::protocol::EventMsg;
 use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendBlockFormat;
+use crate::protocol::FrontendBlockRole;
+use crate::protocol::FrontendBlockState;
+use crate::protocol::FrontendBlockUpdate;
 use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendTone;
 
@@ -386,7 +389,8 @@ impl Middleware for Tools {
                     && result.name == "apply_patch"
                     && Patch::from_str(&result.output).is_ok() =>
             {
-                block.append = false;
+                block.update = FrontendBlockUpdate::Replace;
+                block.title = tool_heading(&result.name, &Value::Null).title;
                 block.text = result.output.clone();
                 block.format = FrontendBlockFormat::UnifiedDiff;
             }
@@ -399,31 +403,36 @@ impl Middleware for Tools {
 pub(crate) fn render_tool_event(
     event: &EventMsg,
     owns: impl Fn(&str) -> bool,
-    heading: impl Fn(&str, &Value) -> String,
+    heading: impl Fn(&str, &Value) -> ToolHeading,
 ) -> Option<FrontendBlock> {
     match event {
-        EventMsg::ToolCallBegin(call) if owns(&call.name) => Some(FrontendBlock {
-            id: Some(format!("{}/{}", call.turn_id, call.call_id)),
-            group: None,
-            append: false,
-            pending: true,
-            text: heading(&call.name, &call.arguments),
-            files: Vec::new(),
-            format: FrontendBlockFormat::PlainText,
-            tone: FrontendTone::Neutral,
-        }),
+        EventMsg::ToolCallBegin(call) if owns(&call.name) => {
+            let heading = heading(&call.name, &call.arguments);
+            Some(FrontendBlock {
+                id: Some(format!("{}/{}", call.turn_id, call.call_id)),
+                group: None,
+                update: FrontendBlockUpdate::Replace,
+                state: FrontendBlockState::Pending,
+                role: FrontendBlockRole::Tool,
+                title: heading.title,
+                text: heading.detail,
+                symbol: None,
+                files: Vec::new(),
+                format: FrontendBlockFormat::PlainText,
+                tone: FrontendTone::Neutral,
+            })
+        }
         EventMsg::ToolCallEnd(result) if owns(&result.name) => {
             let output = compact_output(&result.output);
             Some(FrontendBlock {
                 id: Some(format!("{}/{}", result.turn_id, result.call_id)),
                 group: None,
-                append: true,
-                pending: false,
-                text: if output.is_empty() {
-                    String::new()
-                } else {
-                    format!("\n  {}", output.replace('\n', "\n  "))
-                },
+                update: FrontendBlockUpdate::Append,
+                state: FrontendBlockState::Complete,
+                role: FrontendBlockRole::Tool,
+                title: tool_heading(&result.name, &Value::Null).title,
+                text: output,
+                symbol: None,
                 files: Vec::new(),
                 format: FrontendBlockFormat::PlainText,
                 tone: if result.is_error {
@@ -437,7 +446,30 @@ pub(crate) fn render_tool_event(
     }
 }
 
-fn tool_heading(name: &str, arguments: &Value) -> String {
+pub(crate) struct ToolHeading {
+    pub(crate) title: String,
+    pub(crate) detail: String,
+}
+
+impl From<&str> for ToolHeading {
+    fn from(title: &str) -> Self {
+        Self {
+            title: title.into(),
+            detail: String::new(),
+        }
+    }
+}
+
+impl From<String> for ToolHeading {
+    fn from(title: String) -> Self {
+        Self {
+            title,
+            detail: String::new(),
+        }
+    }
+}
+
+fn tool_heading(name: &str, arguments: &Value) -> ToolHeading {
     let (label, detail) = match name {
         "read_file" => (text::RENDER_READ_FILE, "path"),
         "write_file" => (text::RENDER_WRITE_FILE, "path"),
@@ -446,20 +478,26 @@ fn tool_heading(name: &str, arguments: &Value) -> String {
         "start_command" => (text::RENDER_START_COMMAND, "command"),
         "poll_command" => (text::RENDER_POLL_COMMAND, "command_id"),
         "stop_command" => (text::RENDER_STOP_COMMAND, "command_id"),
-        _ => return format!("◉ {name} {}", preview_json(arguments)),
+        _ => {
+            return ToolHeading {
+                title: name.into(),
+                detail: preview_json(arguments),
+            };
+        }
     };
     labeled_tool_heading(label, detail, arguments)
 }
 
-pub(crate) fn labeled_tool_heading(label: &str, detail: &str, arguments: &Value) -> String {
-    arguments
-        .get(detail)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map_or_else(
-            || format!("◉ {label}"),
-            |value| format!("◉ {label} {value}"),
-        )
+pub(crate) fn labeled_tool_heading(label: &str, detail: &str, arguments: &Value) -> ToolHeading {
+    ToolHeading {
+        title: label.into(),
+        detail: arguments
+            .get(detail)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+            .into(),
+    }
 }
 
 #[derive(Deserialize)]

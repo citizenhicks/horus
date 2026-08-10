@@ -47,7 +47,6 @@ use crate::{Error, Result};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_MODEL_ROUTE_BYTES: usize = 4 * 1024;
-pub(crate) const INITIAL_REPLAY_BATCHES: usize = 20;
 
 pub(crate) struct BuiltAgent {
     pub(crate) agent: Agent,
@@ -154,7 +153,7 @@ pub(crate) async fn assemble(
         chat.agent.config.system_prompt.clone(),
     )
     .context_window(context_window)
-    .initial_replay_batches(INITIAL_REPLAY_BATCHES)
+    .initial_replay_batches(0)
     .max_model_steps(max_model_steps)
     .metadata(metadata)
     .usage_observer(move |route, usage| {

@@ -14,8 +14,12 @@ use horus::agent::AgentConfig;
 use horus::agent::create_agent;
 use horus::backend::checkpoint::Checkpoint;
 use horus::backend::checkpoint::CheckpointStore;
+use horus::backend::checkpoint::EventPage;
+use horus::backend::checkpoint::EventPageRequest;
 use horus::backend::checkpoint::ExecutionRecord;
+use horus::backend::checkpoint::JournalEvent;
 use horus::backend::checkpoint::SessionPageRequest;
+use horus::backend::checkpoint::TimestampedEvent;
 use horus::backend::checkpoint::TranscriptPageRequest;
 use horus::backend::checkpoint::sqlite::SqliteCheckpoint;
 use horus::backend::model::CompactOutput;
@@ -44,6 +48,7 @@ use horus::middleware::subagents::SubagentLaunch;
 use horus::middleware::subagents::SubagentLauncher;
 use horus::middleware::subagents::Subagents;
 use horus::middleware::tools::Tools;
+use horus::protocol::Event;
 use horus::protocol::EventMsg;
 use horus::protocol::MessageTarget;
 use horus::protocol::ModelEvent;
@@ -167,7 +172,7 @@ async fn live_messages_expose_their_durable_transcript_boundaries() {
                 batch_item_count: 1,
             }),
             Some(MessageTarget {
-                checkpoint_sequence: 2,
+                checkpoint_sequence: 3,
                 batch_item_count: 1,
             }),
         ]
@@ -557,7 +562,7 @@ async fn steering_is_injected_before_native_compaction() {
     assert_eq!(
         steered_target,
         Some(MessageTarget {
-            checkpoint_sequence: 4,
+            checkpoint_sequence: 5,
             batch_item_count: 1,
         })
     );
@@ -1402,6 +1407,17 @@ impl CheckpointStore for MemoryCheckpoints {
         })
     }
 
+    fn delete_session<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            Ok(self
+                .sessions
+                .lock()
+                .expect("checkpoint store")
+                .remove(session_id)
+                .is_some())
+        })
+    }
+
     fn save<'a>(
         &'a self,
         checkpoint: &'a Checkpoint,
@@ -1415,6 +1431,51 @@ impl CheckpointStore for MemoryCheckpoints {
                 .insert(checkpoint.session_id.clone(), checkpoint.clone());
             Ok(())
         })
+    }
+
+    fn save_with_events<'a>(
+        &'a self,
+        checkpoint: &'a Checkpoint,
+        transcript_delta: &'a [Value],
+        execution: Option<&'a ExecutionRecord>,
+        events: &'a [TimestampedEvent],
+    ) -> BoxFuture<'a, Result<Vec<JournalEvent>>> {
+        Box::pin(async move {
+            self.save(checkpoint, transcript_delta, execution).await?;
+            let mut records = Vec::with_capacity(events.len());
+            for event in events {
+                records.push(
+                    self.append_event(&checkpoint.session_id, event.recorded_at_ms, &event.event)
+                        .await?,
+                );
+            }
+            Ok(records)
+        })
+    }
+
+    fn append_event<'a>(
+        &'a self,
+        _session_id: &'a str,
+        recorded_at_ms: i64,
+        event: &'a Event,
+    ) -> BoxFuture<'a, Result<JournalEvent>> {
+        let event = event.clone();
+        Box::pin(async move {
+            Ok(JournalEvent {
+                sequence: 1,
+                recorded_at_ms,
+                event,
+                stream_metrics: Vec::new(),
+            })
+        })
+    }
+
+    fn event_page<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _request: EventPageRequest,
+    ) -> BoxFuture<'a, Result<EventPage>> {
+        Box::pin(async { Ok(EventPage::default()) })
     }
 
     fn load_state<'a>(

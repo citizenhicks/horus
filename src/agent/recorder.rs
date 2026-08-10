@@ -1,0 +1,257 @@
+use std::sync::Arc;
+
+use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+
+use super::EVENT_QUEUE_CAPACITY;
+use super::unix_timestamp_ms;
+use crate::Error;
+use crate::Result;
+use crate::backend::checkpoint::Checkpoint;
+use crate::backend::checkpoint::CheckpointStore;
+use crate::backend::checkpoint::ExecutionRecord;
+use crate::backend::checkpoint::JournalEvent;
+use crate::backend::checkpoint::TimestampedEvent;
+use crate::protocol::Event;
+
+#[derive(Clone)]
+pub(super) struct EventRecorder {
+    commands: mpsc::Sender<RecorderCommand>,
+}
+
+enum RecorderCommand {
+    Append(Box<AppendCommand>),
+    Save(Box<SaveCommand>),
+    Flush(oneshot::Sender<Result<()>>),
+}
+
+struct AppendCommand {
+    event: TimestampedEvent,
+    result: Option<oneshot::Sender<Result<()>>>,
+}
+
+struct SaveCommand {
+    checkpoint: Checkpoint,
+    transcript_delta: Vec<Value>,
+    execution: Option<ExecutionRecord>,
+    events: Vec<TimestampedEvent>,
+    result: oneshot::Sender<Result<()>>,
+}
+
+impl EventRecorder {
+    pub(super) fn spawn(
+        checkpoints: Arc<dyn CheckpointStore>,
+        session_id: String,
+    ) -> (Self, mpsc::Receiver<JournalEvent>) {
+        let (commands, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        let (events, event_receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        tokio::spawn(run_recorder(checkpoints, session_id, receiver, events));
+        (Self { commands }, event_receiver)
+    }
+
+    pub(super) async fn record(&self, event: Event) -> Result<()> {
+        let (result, recorded) = oneshot::channel();
+        self.commands
+            .send(RecorderCommand::Append(Box::new(AppendCommand {
+                event: timestamp(event)?,
+                result: Some(result),
+            })))
+            .await
+            .map_err(|_| Error::Stopped("event recorder stopped".into()))?;
+        recorded
+            .await
+            .map_err(|_| Error::Stopped("event recorder stopped".into()))?
+    }
+
+    pub(super) fn try_record(&self, event: Event) -> Result<()> {
+        self.commands
+            .try_send(RecorderCommand::Append(Box::new(AppendCommand {
+                event: timestamp(event)?,
+                result: None,
+            })))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    Error::Stopped("event recorder queue is full".into())
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    Error::Stopped("event recorder stopped".into())
+                }
+            })
+    }
+
+    pub(super) async fn save(
+        &self,
+        checkpoint: &Checkpoint,
+        transcript_delta: &[Value],
+        execution: Option<&ExecutionRecord>,
+        events: Vec<Event>,
+    ) -> Result<()> {
+        let events = events
+            .into_iter()
+            .map(timestamp)
+            .collect::<Result<Vec<_>>>()?;
+        let (result, saved) = oneshot::channel();
+        self.commands
+            .send(RecorderCommand::Save(Box::new(SaveCommand {
+                checkpoint: checkpoint.clone(),
+                transcript_delta: transcript_delta.to_vec(),
+                execution: execution.cloned(),
+                events,
+                result,
+            })))
+            .await
+            .map_err(|_| Error::Stopped("event recorder stopped".into()))?;
+        saved
+            .await
+            .map_err(|_| Error::Stopped("event recorder stopped".into()))?
+    }
+
+    pub(super) async fn flush(&self) -> Result<()> {
+        let (flushed, result) = oneshot::channel();
+        self.commands
+            .send(RecorderCommand::Flush(flushed))
+            .await
+            .map_err(|_| Error::Stopped("event recorder stopped".into()))?;
+        result
+            .await
+            .map_err(|_| Error::Stopped("event recorder stopped".into()))?
+    }
+}
+
+fn timestamp(event: Event) -> Result<TimestampedEvent> {
+    Ok(TimestampedEvent {
+        recorded_at_ms: unix_timestamp_ms()?,
+        event,
+    })
+}
+
+async fn run_recorder(
+    checkpoints: Arc<dyn CheckpointStore>,
+    session_id: String,
+    mut commands: mpsc::Receiver<RecorderCommand>,
+    events: mpsc::Sender<JournalEvent>,
+) {
+    let mut terminal_error = None;
+    while let Some(command) = commands.recv().await {
+        if let Some(error) = &terminal_error {
+            if reject(command, error) {
+                return;
+            }
+            continue;
+        }
+        terminal_error = match command {
+            RecorderCommand::Append(command) => {
+                let AppendCommand { event, result } = *command;
+                let recorded = checkpoints
+                    .append_event(&session_id, event.recorded_at_ms, &event.event)
+                    .await;
+                match publish(recorded, &events) {
+                    Ok(()) => {
+                        if let Some(result) = result {
+                            let _ = result.send(Ok(()));
+                        }
+                        None
+                    }
+                    Err(error) => {
+                        let terminal = RecorderFailure::from(&error);
+                        if let Some(result) = result {
+                            let _ = result.send(Err(error));
+                            return;
+                        }
+                        Some(terminal)
+                    }
+                }
+            }
+            RecorderCommand::Save(command) => {
+                let SaveCommand {
+                    checkpoint,
+                    transcript_delta,
+                    execution,
+                    events: pending,
+                    result,
+                } = *command;
+                let recorded = checkpoints
+                    .save_with_events(&checkpoint, &transcript_delta, execution.as_ref(), &pending)
+                    .await;
+                let saved = publish_all(recorded, &events);
+                match saved {
+                    Ok(()) => {
+                        let _ = result.send(Ok(()));
+                        None
+                    }
+                    Err(error) => {
+                        let _ = result.send(Err(error));
+                        return;
+                    }
+                }
+            }
+            RecorderCommand::Flush(result) => {
+                let _ = result.send(Ok(()));
+                None
+            }
+        };
+    }
+}
+
+struct RecorderFailure {
+    message: String,
+}
+
+impl From<&Error> for RecorderFailure {
+    fn from(error: &Error) -> Self {
+        let message = match error {
+            Error::Stopped(message) => message.clone(),
+            error => error.to_string(),
+        };
+        Self { message }
+    }
+}
+
+impl RecorderFailure {
+    fn error(&self) -> Error {
+        Error::Stopped(self.message.clone())
+    }
+}
+
+fn reject(command: RecorderCommand, failure: &RecorderFailure) -> bool {
+    match command {
+        RecorderCommand::Append(command) => {
+            if let Some(result) = command.result {
+                let _ = result.send(Err(failure.error()));
+            }
+            false
+        }
+        RecorderCommand::Save(command) => {
+            let _ = command.result.send(Err(failure.error()));
+            false
+        }
+        RecorderCommand::Flush(result) => {
+            let _ = result.send(Err(failure.error()));
+            true
+        }
+    }
+}
+
+fn publish(record: Result<JournalEvent>, events: &mpsc::Sender<JournalEvent>) -> Result<()> {
+    events.try_send(record?).map_err(event_delivery_error)
+}
+
+fn publish_all(
+    records: Result<Vec<JournalEvent>>,
+    events: &mpsc::Sender<JournalEvent>,
+) -> Result<()> {
+    for record in records? {
+        events.try_send(record).map_err(event_delivery_error)?;
+    }
+    Ok(())
+}
+
+fn event_delivery_error(error: mpsc::error::TrySendError<JournalEvent>) -> Error {
+    match error {
+        mpsc::error::TrySendError::Full(_) => Error::Stopped("event delivery queue is full".into()),
+        mpsc::error::TrySendError::Closed(_) => {
+            Error::Stopped("frontend event channel closed".into())
+        }
+    }
+}

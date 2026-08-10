@@ -48,7 +48,7 @@ const MAX_CONNECTIONS: usize = 32;
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(72 * 60 * 60);
 const SCHEDULER_TICK: Duration = Duration::from_secs(15);
 const MAX_DIRECTORY_ENTRIES: usize = 512;
-const MAX_HISTORY_BATCHES: usize = 100;
+const MAX_HISTORY_EVENTS: usize = 100;
 const MAX_PENDING_UPLOADS: usize = 8;
 const WEBSOCKET_BRIDGE_BYTES: usize = 16 * 1024;
 
@@ -823,39 +823,28 @@ async fn handle_message(
             request_id,
             workspace,
         } => match gateway.create_session(&workspace).await {
-            Ok(host) => open_selected(writer, selected, request_id, host, None, None).await,
+            Ok(host) => open_selected(writer, selected, request_id, host, None).await,
             Err(rejection) => write_rejection(writer, request_id, rejection).await,
         },
         ClientMessage::OpenSession {
             request_id,
             session_id,
             last_sequence,
-            replay_epoch,
         } => match gateway.open_session(&session_id).await {
-            Ok(host) => {
-                open_selected(
-                    writer,
-                    selected,
-                    request_id,
-                    host,
-                    last_sequence,
-                    replay_epoch,
-                )
-                .await
-            }
+            Ok(host) => open_selected(writer, selected, request_id, host, last_sequence).await,
             Err(rejection) => write_rejection(writer, request_id, rejection).await,
         },
         ClientMessage::GetSessionHistory {
             request_id,
             session_id,
             before_sequence,
-            max_batches,
+            max_events,
         } => {
             let host = match require_selected(selected, &session_id) {
                 Ok(host) => host,
                 Err(rejection) => return write_rejection(writer, request_id, rejection).await,
             };
-            if let Err(rejection) = validate_history_page_size(max_batches) {
+            if let Err(rejection) = validate_history_page_size(max_events) {
                 return write_rejection(writer, request_id, rejection).await;
             }
             write_session_history(
@@ -864,7 +853,7 @@ async fn handle_message(
                 request_id,
                 session_id,
                 before_sequence,
-                max_batches,
+                max_events,
             )
             .await
         }
@@ -904,11 +893,15 @@ async fn handle_message(
             request_id,
             session_id,
         } => {
-            let host = match require_selected(selected, &session_id) {
-                Ok(host) => host,
-                Err(rejection) => return write_rejection(writer, request_id, rejection).await,
-            };
-            write_result(writer, request_id, host.delete_session(session_id).await).await
+            if let Err(rejection) = require_selected(selected, &session_id) {
+                return write_rejection(writer, request_id, rejection).await;
+            }
+            uploads.retain(|(upload_session_id, _), _| upload_session_id != &session_id);
+            let result = gateway.delete_session(&session_id).await;
+            if result.is_ok() {
+                *selected = None;
+            }
+            write_result(writer, request_id, result).await
         }
         ClientMessage::Submit {
             session_id,
@@ -1475,13 +1468,13 @@ async fn handle_message(
     }
 }
 
-fn validate_history_page_size(max_batches: usize) -> std::result::Result<(), Rejection> {
-    if (1..=MAX_HISTORY_BATCHES).contains(&max_batches) {
+fn validate_history_page_size(max_events: usize) -> std::result::Result<(), Rejection> {
+    if (1..=MAX_HISTORY_EVENTS).contains(&max_events) {
         return Ok(());
     }
     Err(Rejection {
         code: "invalid_history_page",
-        message: format!("history page size must be between 1 and {MAX_HISTORY_BATCHES} batches"),
+        message: format!("history page size must be between 1 and {MAX_HISTORY_EVENTS} events"),
         fatal: false,
     })
 }
@@ -1492,28 +1485,28 @@ async fn write_session_history(
     request_id: String,
     session_id: String,
     before_sequence: Option<u64>,
-    max_batches: usize,
+    max_events: usize,
 ) -> Result<()> {
     let mut lower = 1;
-    let mut upper = max_batches;
+    let mut upper = max_events;
     let mut selected = None;
     while lower <= upper {
-        let batches = lower + (upper - lower) / 2;
-        let page = match host.history_page(before_sequence, batches).await {
+        let events = lower + (upper - lower) / 2;
+        let page = match host.history_page(before_sequence, events).await {
             Ok(page) => page,
             Err(rejection) => return write_rejection(writer, request_id, rejection).await,
         };
         let frame = ServerFrame::new(ServerMessage::SessionHistory {
             request_id: request_id.clone(),
             session_id: session_id.clone(),
-            events: page.events,
+            records: page.records,
             next_before_sequence: page.next_before_sequence,
         });
         if encoded_frame_fits(&frame)? {
             selected = Some(frame);
-            lower = batches + 1;
+            lower = events + 1;
         } else {
-            upper = batches.saturating_sub(1);
+            upper = events.saturating_sub(1);
         }
     }
     match selected {
@@ -1523,8 +1516,8 @@ async fn write_session_history(
                 writer,
                 request_id,
                 Rejection {
-                    code: "history_batch_too_large",
-                    message: "the next durable history batch exceeds the gateway frame limit"
+                    code: "history_event_too_large",
+                    message: "the next durable history event exceeds the gateway frame limit"
                         .into(),
                     fatal: false,
                 },
@@ -1604,10 +1597,9 @@ async fn open_selected(
     request_id: String,
     host: HostHandle,
     last_sequence: Option<u64>,
-    replay_epoch: Option<String>,
 ) -> Result<()> {
     let broadcasts = host.subscribe();
-    let snapshot = match host.snapshot(last_sequence, replay_epoch).await {
+    let snapshot = match host.snapshot(last_sequence).await {
         Ok(snapshot) => snapshot,
         Err(rejection) => return write_rejection(writer, request_id, rejection).await,
     };
@@ -1803,7 +1795,7 @@ fn directory_rejection(error: impl std::fmt::Display) -> Rejection {
 
 fn sequence(frame: &ServerFrame) -> Option<u64> {
     match frame.message {
-        ServerMessage::AgentEvent { sequence, .. } => Some(sequence),
+        ServerMessage::AgentEvent { ref record, .. } => Some(record.sequence),
         _ => None,
     }
 }
@@ -1837,8 +1829,8 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 mod tests {
     use futures_util::SinkExt as _;
     use horus::protocol::{
-        EventMsg, FrontendBlock, FrontendBlockFormat, FrontendTone, Op, SessionFileReference,
-        Submission,
+        Event, EventMsg, FrontendBlock, FrontendBlockFormat, FrontendBlockRole, FrontendBlockState,
+        FrontendBlockUpdate, FrontendTone, Op, SessionFileReference, Submission,
     };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_tungstenite::WebSocketStream;
@@ -2120,7 +2112,6 @@ mod tests {
                 request_id: request_id.clone(),
                 session_id: session_id.into(),
                 last_sequence: None,
-                replay_epoch: None,
             })
             .await
             .expect("open chat");
@@ -2148,8 +2139,8 @@ mod tests {
                 .expect("gateway open");
             if matches!(
                 frame.message,
-                ServerMessage::AgentEvent { event, .. }
-                    if event.submission_id.as_deref() == Some(submission_id)
+                ServerMessage::AgentEvent { record, .. }
+                    if record.event.submission_id.as_deref() == Some(submission_id)
             ) {
                 return;
             }
@@ -2629,18 +2620,18 @@ mod tests {
         let model_error = loop {
             let ServerMessage::AgentEvent {
                 session_id: actual_session,
-                event,
+                record,
                 ..
             } = next_gateway_message(&mut events).await
             else {
                 continue;
             };
             if actual_session != session_id
-                || event.submission_id.as_deref() != Some(&submission_id)
+                || record.event.submission_id.as_deref() != Some(&submission_id)
             {
                 continue;
             }
-            match event.msg {
+            match record.event.msg {
                 EventMsg::UserMessage(message) => {
                     assert_eq!(message.attachments, std::slice::from_ref(&file));
                     saw_user_message = true;
@@ -3023,26 +3014,29 @@ mod tests {
 
     #[test]
     fn history_page_size_rejects_values_outside_the_wire_bound() {
-        assert!([0, MAX_HISTORY_BATCHES + 1].into_iter().all(|limit| {
+        assert!([0, MAX_HISTORY_EVENTS + 1].into_iter().all(|limit| {
             validate_history_page_size(limit)
                 .is_err_and(|rejection| rejection.code == "invalid_history_page")
         }));
     }
 
     #[test]
-    fn history_frame_bound_rejects_one_oversized_batch() {
+    fn history_frame_bound_rejects_one_oversized_event() {
         let frame = ServerFrame::new(ServerMessage::SessionHistory {
             request_id: "history".into(),
             session_id: "session".into(),
-            events: vec![crate::wire::RenderedEvent {
-                event: horus::protocol::EventMsg::AgentMessage(
-                    horus::protocol::AgentMessageEvent {
+            records: vec![crate::wire::RecordedEvent {
+                sequence: 1,
+                recorded_at_ms: 1,
+                event: Event {
+                    submission_id: None,
+                    msg: EventMsg::Warning(horus::protocol::WarningEvent {
                         message: "x".repeat(MAX_FRAME_BYTES),
-                        phase: None,
-                        message_target: None,
-                    },
-                ),
+                    }),
+                },
+                stream_metrics: Vec::new(),
                 blocks: Vec::new(),
+                preview: None,
             }],
             next_before_sequence: None,
         });
@@ -3106,9 +3100,12 @@ mod tests {
             block: FrontendBlock {
                 id: Some(id),
                 group: None,
-                append: false,
-                pending: false,
+                update: FrontendBlockUpdate::Replace,
+                state: FrontendBlockState::Complete,
+                role: FrontendBlockRole::Artifact,
+                title: "Code diff".into(),
                 text: "x".repeat(text_bytes),
+                symbol: None,
                 files: Vec::new(),
                 format: FrontendBlockFormat::UnifiedDiff,
                 tone: FrontendTone::Neutral,

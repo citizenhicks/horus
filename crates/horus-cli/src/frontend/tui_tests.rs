@@ -9,10 +9,36 @@ use crate::frontend::catalog::UiCatalog;
 use crate::frontend::theme::{Role, current};
 use horus::backend::model::ModelChoice;
 use horus::protocol::{
-    FrontendActiveInput, FrontendBlockFormat, FrontendContribution, FrontendSlot, FrontendTone,
-    FrontendWidget, ReviewDecision,
+    Event, FrontendActiveInput, FrontendBlock, FrontendBlockFormat, FrontendBlockRole,
+    FrontendBlockState, FrontendBlockUpdate, FrontendContribution, FrontendSlot, FrontendTone,
+    FrontendWidget, RenderedBlock, ReviewDecision,
 };
-use horus_gateway::wire::{RenderedEvent, RenderedPreview};
+use horus_gateway::wire::{RecordedEvent, RenderedEvent, RenderedPreview};
+
+fn rendered(block: FrontendBlock) -> RenderedBlock {
+    RenderedBlock {
+        capability: "test".into(),
+        block,
+    }
+}
+
+fn recorded(
+    event: EventMsg,
+    blocks: Vec<RenderedBlock>,
+    preview: Option<RenderedPreview>,
+) -> RecordedEvent {
+    RecordedEvent {
+        sequence: 1,
+        recorded_at_ms: 0,
+        event: Event {
+            submission_id: None,
+            msg: event,
+        },
+        stream_metrics: Vec::new(),
+        blocks,
+        preview,
+    }
+}
 
 fn catalog(workspace: &std::path::Path) -> UiCatalog {
     let steering = FrontendContribution {
@@ -199,16 +225,19 @@ fn generic_picker_submits_the_selected_operation() {
 fn completed_diff_replaces_the_pending_block_with_a_styled_diff() {
     let mut state = state();
     state.transcript.clear();
-    state.apply_block(FrontendBlock {
+    state.apply_block(rendered(FrontendBlock {
         id: Some("turn/patch".into()),
         group: None,
-        append: false,
-        pending: true,
-        text: "◉ Edit note.rs".into(),
+        update: FrontendBlockUpdate::Replace,
+        state: FrontendBlockState::Pending,
+        role: FrontendBlockRole::Tool,
+        title: "Edit note.rs".into(),
+        text: String::new(),
+        symbol: None,
         format: FrontendBlockFormat::PlainText,
         tone: FrontendTone::Neutral,
         files: Vec::new(),
-    });
+    }));
     view::live_transcript_lines(&mut state, 0, 80);
     assert_eq!(
         state
@@ -218,16 +247,19 @@ fn completed_diff_replaces_the_pending_block_with_a_styled_diff() {
             .map(|(width, _)| *width),
         Some(80)
     );
-    state.apply_block(FrontendBlock {
+    state.apply_block(rendered(FrontendBlock {
         id: Some("turn/patch".into()),
         group: None,
-        append: false,
-        pending: false,
+        update: FrontendBlockUpdate::Replace,
+        state: FrontendBlockState::Complete,
+        role: FrontendBlockRole::Tool,
+        title: "Edit note.rs".into(),
         text: "--- note.rs\n+++ note.rs\n@@ -1,5 +1,5 @@\n-fn old_name() {}\n+fn new_name() {}\n keep_one();\n-let removed = false;\n keep_two();\n+let added = true;\n keep_three();\n".into(),
+        symbol: None,
         format: FrontendBlockFormat::UnifiedDiff,
         tone: FrontendTone::Success,
         files: Vec::new(),
-    });
+    }));
     assert!(
         state
             .transcript
@@ -563,22 +595,23 @@ fn snapshot_preview_scrolls_with_the_mouse_wheel() {
     let mut state = state();
     events::handle_gateway_event(
         &mut state,
-        EventMsg::ContextCompacted,
-        Vec::new(),
-        None,
-        Some(RenderedPreview {
-            title: "subagent".into(),
-            events: (0..30)
-                .map(|index| RenderedEvent {
-                    event: EventMsg::UserMessage(horus::protocol::UserMessageEvent {
-                        message: format!("subagent row {index}"),
-                        attachments: Vec::new(),
-                        message_target: None,
-                    }),
-                    blocks: Vec::new(),
-                })
-                .collect(),
-        }),
+        recorded(
+            EventMsg::ContextCompacted,
+            Vec::new(),
+            Some(RenderedPreview {
+                title: "subagent".into(),
+                events: (0..30)
+                    .map(|index| RenderedEvent {
+                        event: EventMsg::UserMessage(horus::protocol::UserMessageEvent {
+                            message: format!("subagent row {index}"),
+                            attachments: Vec::new(),
+                            message_target: None,
+                        }),
+                        blocks: Vec::new(),
+                    })
+                    .collect(),
+            }),
+        ),
     );
     let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("terminal");
     terminal
@@ -743,11 +776,11 @@ fn commentary_and_final_output_are_separate_assistant_messages() {
     state.active_turn = Some("turn".into());
     state.handle_agent_event(
         EventMsg::AgentMessageContentDelta(horus::protocol::AgentMessageContentDeltaEvent {
-            thread_id: "thread".into(),
+            session_id: "session".into(),
             turn_id: "turn".into(),
-            item_id: "commentary".into(),
+            model_step_id: "commentary".into(),
             delta: "Checking the workspace".into(),
-            phase: Some(AgentMessagePhase::Commentary),
+            phase: AgentMessagePhase::Commentary,
         }),
         Vec::new(),
     );
@@ -757,8 +790,11 @@ fn commentary_and_final_output_are_separate_assistant_messages() {
 
     state.handle_agent_event(
         EventMsg::AgentMessage(horus::protocol::AgentMessageEvent {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            model_step_id: "final".into(),
             message: "Done".into(),
-            phase: Some(AgentMessagePhase::FinalAnswer),
+            phase: AgentMessagePhase::FinalAnswer,
             message_target: None,
         }),
         Vec::new(),
@@ -787,11 +823,11 @@ fn commentary_is_committed_before_a_tool_block() {
     let mut state = state();
     state.handle_agent_event(
         EventMsg::AgentMessageContentDelta(horus::protocol::AgentMessageContentDeltaEvent {
-            thread_id: "thread".into(),
+            session_id: "session".into(),
             turn_id: "turn".into(),
-            item_id: "response".into(),
+            model_step_id: "response".into(),
             delta: "I’ll inspect the file first.".into(),
-            phase: Some(AgentMessagePhase::Commentary),
+            phase: AgentMessagePhase::Commentary,
         }),
         Vec::new(),
     );
@@ -803,16 +839,19 @@ fn commentary_is_committed_before_a_tool_block() {
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "src/lib.rs"}),
         }),
-        vec![FrontendBlock {
+        vec![rendered(FrontendBlock {
             id: Some("tool-call".into()),
             group: None,
-            append: false,
-            pending: true,
-            text: "Read src/lib.rs".into(),
+            update: FrontendBlockUpdate::Replace,
+            state: FrontendBlockState::Pending,
+            role: FrontendBlockRole::Tool,
+            title: "Read src/lib.rs".into(),
+            text: String::new(),
+            symbol: None,
             format: FrontendBlockFormat::PlainText,
             tone: FrontendTone::Neutral,
             files: Vec::new(),
-        }],
+        })],
     );
 
     assert_eq!(
@@ -830,8 +869,11 @@ fn durable_commentary_is_an_assistant_message() {
     let mut state = state();
     state.handle_agent_event(
         EventMsg::AgentMessage(horus::protocol::AgentMessageEvent {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            model_step_id: "commentary".into(),
             message: "The first check passed.".into(),
-            phase: Some(AgentMessagePhase::Commentary),
+            phase: AgentMessagePhase::Commentary,
             message_target: None,
         }),
         Vec::new(),
@@ -853,8 +895,11 @@ fn final_message_replaces_an_incomplete_stream() {
 
     state.handle_agent_event(
         EventMsg::AgentMessage(horus::protocol::AgentMessageEvent {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            model_step_id: "final".into(),
             message: "complete answer".into(),
-            phase: Some(AgentMessagePhase::FinalAnswer),
+            phase: AgentMessagePhase::FinalAnswer,
             message_target: None,
         }),
         Vec::new(),
@@ -869,35 +914,185 @@ fn final_message_replaces_an_incomplete_stream() {
 }
 
 #[test]
+fn completed_model_step_is_authoritative_for_replay_and_summary_events() {
+    use horus::protocol::{
+        ModelStepCompletedEvent, ModelStepContent, ModelStepContentPhase, ModelStepOutcome,
+        TokenUsage,
+    };
+
+    let mut state = state();
+    state.handle_agent_event(
+        EventMsg::ModelStepCompleted(ModelStepCompletedEvent {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            model_step_id: "step".into(),
+            step_index: 0,
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            outcome: ModelStepOutcome::Completed {
+                end_turn: true,
+                tool_call_ids: Vec::new(),
+                usage: TokenUsage::default(),
+                content: vec![
+                    ModelStepContent {
+                        output_index: 0,
+                        part_index: 0,
+                        phase: ModelStepContentPhase::Reasoning,
+                        text: "Checked the state".into(),
+                        annotations: Vec::new(),
+                    },
+                    ModelStepContent {
+                        output_index: 1,
+                        part_index: 0,
+                        phase: ModelStepContentPhase::FinalAnswer,
+                        text: "Everything is ready".into(),
+                        annotations: Vec::new(),
+                    },
+                ],
+            },
+        }),
+        Vec::new(),
+    );
+    state.handle_agent_event(
+        EventMsg::AgentMessage(horus::protocol::AgentMessageEvent {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            model_step_id: "step".into(),
+            message: "Everything is ready".into(),
+            phase: AgentMessagePhase::FinalAnswer,
+            message_target: None,
+        }),
+        Vec::new(),
+    );
+
+    assert_eq!(
+        state
+            .transcript
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>(),
+        ["Checked the state", "Everything is ready"]
+    );
+}
+
+#[test]
+fn completed_model_step_does_not_duplicate_live_streams() {
+    use horus::protocol::{
+        ModelStepCompletedEvent, ModelStepContent, ModelStepContentPhase, ModelStepOutcome,
+        TokenUsage,
+    };
+
+    let mut state = state();
+    state.handle_agent_event(
+        EventMsg::AgentMessageContentDelta(horus::protocol::AgentMessageContentDeltaEvent {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            model_step_id: "step".into(),
+            delta: "Everything is ready".into(),
+            phase: AgentMessagePhase::FinalAnswer,
+        }),
+        Vec::new(),
+    );
+    state.handle_agent_event(
+        EventMsg::ModelStepCompleted(ModelStepCompletedEvent {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            model_step_id: "step".into(),
+            step_index: 0,
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            outcome: ModelStepOutcome::Completed {
+                end_turn: true,
+                tool_call_ids: Vec::new(),
+                usage: TokenUsage::default(),
+                content: vec![ModelStepContent {
+                    output_index: 0,
+                    part_index: 0,
+                    phase: ModelStepContentPhase::FinalAnswer,
+                    text: "Everything is ready".into(),
+                    annotations: Vec::new(),
+                }],
+            },
+        }),
+        Vec::new(),
+    );
+
+    assert_eq!(state.transcript.len(), 1);
+    assert_eq!(
+        state.transcript.back().map(|entry| entry.text.as_str()),
+        Some("Everything is ready")
+    );
+}
+
+#[test]
+fn block_identity_is_scoped_by_explicit_capability() {
+    let block = |title: &str| FrontendBlock {
+        id: Some("same-id".into()),
+        group: None,
+        update: FrontendBlockUpdate::Replace,
+        state: FrontendBlockState::Complete,
+        role: FrontendBlockRole::Notice,
+        title: title.into(),
+        text: String::new(),
+        symbol: None,
+        files: Vec::new(),
+        format: FrontendBlockFormat::PlainText,
+        tone: FrontendTone::Neutral,
+    };
+    let mut state = state();
+    state.apply_block(RenderedBlock {
+        capability: "alpha".into(),
+        block: block("Alpha"),
+    });
+    state.apply_block(RenderedBlock {
+        capability: "beta".into(),
+        block: block("Beta"),
+    });
+    state.apply_block(RenderedBlock {
+        capability: "alpha".into(),
+        block: block("Alpha updated"),
+    });
+
+    assert_eq!(
+        state
+            .transcript
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>(),
+        ["Alpha updated", "Beta"]
+    );
+}
+
+#[test]
 fn gateway_history_preserves_child_diff_rendering() {
     let mut state = state();
     let message = EventMsg::AgentMessage(horus::protocol::AgentMessageEvent {
+        session_id: "session".into(),
+        turn_id: "turn".into(),
+        model_step_id: "step".into(),
         message: "changed the file".into(),
-        phase: Some(AgentMessagePhase::FinalAnswer),
+        phase: AgentMessagePhase::FinalAnswer,
         message_target: None,
     });
-    let history_event = EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent {
-        events: vec![message.clone()],
-    });
-
-    events::handle_gateway_event(
+    events::handle_gateway_history(
         &mut state,
-        history_event,
-        Vec::new(),
-        Some(vec![RenderedEvent {
-            event: message,
-            blocks: vec![FrontendBlock {
+        vec![recorded(
+            message,
+            vec![rendered(FrontendBlock {
                 id: None,
                 group: None,
-                append: false,
-                pending: false,
+                update: FrontendBlockUpdate::Replace,
+                state: FrontendBlockState::Complete,
+                role: FrontendBlockRole::Artifact,
+                title: String::new(),
                 text: "--- a/file\n+++ b/file\n-old\n+new".into(),
+                symbol: None,
                 format: FrontendBlockFormat::UnifiedDiff,
                 tone: FrontendTone::Neutral,
                 files: Vec::new(),
-            }],
-        }]),
-        None,
+            })],
+            None,
+        )],
     );
 
     let entry = state.transcript.back().expect("rendered history entry");
@@ -909,12 +1104,15 @@ fn gateway_history_preserves_child_diff_rendering() {
 fn session_file_block_renders_download_metadata_as_plain_text() {
     let mut state = state();
     state.transcript.clear();
-    state.apply_block(FrontendBlock {
+    state.apply_block(rendered(FrontendBlock {
         id: Some("artifacts/turn/file".into()),
         group: None,
-        append: false,
-        pending: false,
-        text: "Sent report.xlsx".into(),
+        update: FrontendBlockUpdate::Replace,
+        state: FrontendBlockState::Complete,
+        role: FrontendBlockRole::Artifact,
+        title: "Sent report.xlsx".into(),
+        text: String::new(),
+        symbol: None,
         format: FrontendBlockFormat::PlainText,
         tone: FrontendTone::Success,
         files: vec![horus::protocol::SessionFileReference {
@@ -923,7 +1121,7 @@ fn session_file_block_renders_download_metadata_as_plain_text() {
             size: 42,
             media_type: "application/octet-stream".into(),
         }],
-    });
+    }));
 
     assert_eq!(
         state.transcript.front().map(|entry| entry.text.as_str()),

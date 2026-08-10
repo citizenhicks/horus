@@ -6,16 +6,20 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use super::Agent;
 use super::AgentConfig;
 use super::AgentSender;
 use super::EVENT_QUEUE_CAPACITY;
+use super::EventRecorder;
 use super::create_agent;
+use super::send_event;
 use super::try_send_event;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
 use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::CheckpointStore;
+use crate::backend::checkpoint::EventPageRequest;
 use crate::backend::checkpoint::ExecutionOutcome;
 use crate::backend::checkpoint::ExecutionPageRequest;
 use crate::backend::checkpoint::QueuedInput;
@@ -48,6 +52,7 @@ use crate::middleware::tools::Catalog;
 use crate::middleware::tools::Tool;
 use crate::middleware::tools::ToolContext;
 use crate::middleware::tools::Tools;
+use crate::protocol::ErrorKind;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::FrontendEvent;
@@ -55,16 +60,32 @@ use crate::protocol::FrontendSlot;
 use crate::protocol::FrontendTone;
 use crate::protocol::FrontendWidget;
 use crate::protocol::MAX_USER_INPUT_BYTES;
+use crate::protocol::ModelStepContent;
+use crate::protocol::ModelStepContentPhase;
+use crate::protocol::ModelStepOutcome;
 use crate::protocol::Op;
 use crate::protocol::SessionContext;
 use crate::protocol::TokenUsage;
 use crate::protocol::ToolCallEndEvent;
 use crate::protocol::WarningEvent;
+
+async fn drain_until_notified(agent: &mut Agent, notification: &Notify) {
+    loop {
+        tokio::select! {
+            () = notification.notified() => return,
+            event = agent.next_event() => {
+                event.expect("agent event while waiting");
+            }
+        }
+    }
+}
 use crate::protocol::internal_message_kind;
 use serde_json::Value;
 use tokio::sync::Notify;
 
 struct TestModel;
+
+struct RetryableModel;
 
 struct NativeCompactionModel;
 
@@ -334,40 +355,179 @@ fn sender_reports_a_full_live_queue_as_busy() {
     assert!(matches!(error, Error::Busy(_)));
 }
 
-#[test]
-fn event_queue_saturation_returns_an_error_without_reordering_queued_events() {
-    let (events, mut receiver) = tokio::sync::mpsc::channel(1);
+#[tokio::test]
+async fn recorder_persists_an_event_before_delivery() {
+    let directory = tempfile::tempdir().expect("checkpoint directory");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(directory.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    checkpoints
+        .save(&Checkpoint::empty("session"), &[], None)
+        .await
+        .expect("initial checkpoint");
+    let store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let (events, mut receiver) = EventRecorder::spawn(store, "session".into());
+    let event = Event {
+        submission_id: Some("submission".into()),
+        msg: EventMsg::Warning(WarningEvent {
+            message: "durable".into(),
+        }),
+    };
+
+    send_event(&events, event.clone())
+        .await
+        .expect("record event");
+    let page = checkpoints
+        .event_page(
+            "session",
+            EventPageRequest {
+                before_sequence: None,
+                limit: 1,
+            },
+        )
+        .await
+        .expect("event page");
+    let delivered = receiver.recv().await.expect("recorded event");
+
+    assert_eq!(page.events, vec![delivered]);
+    assert_eq!(page.events[0].event, event);
+}
+
+#[tokio::test]
+async fn recorder_stops_without_delivering_when_persistence_fails() {
+    let directory = tempfile::tempdir().expect("checkpoint directory");
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+        SqliteCheckpoint::new(directory.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let (events, mut receiver) = EventRecorder::spawn(checkpoints, "missing".into());
+
+    let error = send_event(
+        &events,
+        Event {
+            submission_id: None,
+            msg: EventMsg::Warning(WarningEvent {
+                message: "durable".into(),
+            }),
+        },
+    )
+    .await
+    .expect_err("missing session");
+
+    assert!(matches!(error, Error::Checkpoint(_)));
+    assert!(receiver.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn recorder_flush_waits_for_prior_unacknowledged_events() {
+    let directory = tempfile::tempdir().expect("checkpoint directory");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(directory.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    checkpoints
+        .save(&Checkpoint::empty("session"), &[], None)
+        .await
+        .expect("initial checkpoint");
+    let store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let (events, mut receiver) = EventRecorder::spawn(store, "session".into());
+    let event = Event {
+        submission_id: None,
+        msg: EventMsg::Warning(WarningEvent {
+            message: "queued".into(),
+        }),
+    };
+
+    try_send_event(&events, event.clone()).expect("queue event");
+    events.flush().await.expect("flush event recorder");
+
+    let page = checkpoints
+        .event_page(
+            "session",
+            EventPageRequest {
+                before_sequence: None,
+                limit: 1,
+            },
+        )
+        .await
+        .expect("event page");
+    assert_eq!(page.events[0].event, event);
+    assert_eq!(
+        receiver.try_recv().expect("delivered event"),
+        page.events[0]
+    );
+}
+
+#[tokio::test]
+async fn recorder_flush_reports_a_prior_unacknowledged_failure() {
+    let directory = tempfile::tempdir().expect("checkpoint directory");
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+        SqliteCheckpoint::new(directory.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let (events, mut receiver) = EventRecorder::spawn(checkpoints, "missing".into());
+
     try_send_event(
         &events,
         Event {
             submission_id: None,
             msg: EventMsg::Warning(WarningEvent {
-                message: "first".into(),
+                message: "queued".into(),
             }),
         },
     )
-    .expect("queue first event");
+    .expect("queue event");
 
-    let error = try_send_event(
+    let error = events.flush().await.expect_err("flush should fail");
+    assert!(matches!(error, Error::Stopped(_)));
+    assert!(receiver.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn recorder_flush_fails_instead_of_blocking_on_a_full_delivery_queue() {
+    let directory = tempfile::tempdir().expect("checkpoint directory");
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+        SqliteCheckpoint::new(directory.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    checkpoints
+        .save(&Checkpoint::empty("session"), &[], None)
+        .await
+        .expect("initial checkpoint");
+    let (events, _receiver) = EventRecorder::spawn(checkpoints, "session".into());
+
+    for index in 0..EVENT_QUEUE_CAPACITY {
+        send_event(
+            &events,
+            Event {
+                submission_id: None,
+                msg: EventMsg::Warning(WarningEvent {
+                    message: index.to_string(),
+                }),
+            },
+        )
+        .await
+        .expect("fill delivery queue");
+    }
+    try_send_event(
         &events,
         Event {
             submission_id: None,
             msg: EventMsg::Warning(WarningEvent {
-                message: "second".into(),
+                message: "overflow".into(),
             }),
         },
     )
-    .expect_err("full queue must fail");
-    let EventMsg::Warning(queued) = receiver.try_recv().expect("first queued event").msg else {
-        panic!("expected queued warning");
-    };
+    .expect("queue overflow event");
 
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), events.flush())
+        .await
+        .expect("flush must not block")
+        .expect_err("full delivery queue must fail");
     assert_eq!(
-        (error.to_string(), queued.message.as_str()),
-        (
-            "agent stopped: frontend event queue is full".to_string(),
-            "first"
-        )
+        error.to_string(),
+        "agent stopped: event delivery queue is full"
     );
 }
 
@@ -414,9 +574,12 @@ async fn active_input_is_durable_before_a_blocked_model_completes() {
             break started.turn_id;
         }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
-        .await
-        .expect("model started");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        drain_until_notified(&mut agent, &started),
+    )
+    .await
+    .expect("model started");
 
     let queued_submission = agent
         .sender()
@@ -442,6 +605,7 @@ async fn active_input_is_durable_before_a_blocked_model_completes() {
     assert!(saved.pending_input.iter().any(|item| {
         item.owner() == "queueing" && item.id() == queued_submission && item.text() == "persist me"
     }));
+    assert!(saved.active_model_step.is_some());
 }
 
 #[tokio::test]
@@ -487,9 +651,12 @@ async fn active_input_is_durable_while_before_model_is_blocked() {
             break started.turn_id;
         }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
-        .await
-        .expect("before-model hook started");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        drain_until_notified(&mut agent, &started),
+    )
+    .await
+    .expect("before-model hook started");
 
     let queued_submission = agent
         .sender()
@@ -518,13 +685,17 @@ async fn active_input_is_durable_while_before_model_is_blocked() {
     })
     .await
     .expect("active input persisted while hook was blocked");
-    release.notify_one();
-    loop {
-        let event = agent.next_event().await.expect("queue event");
-        if event.submission_id.as_deref() == Some(queued_submission.as_str()) {
-            break;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let event = agent.next_event().await.expect("queue event");
+            if event.submission_id.as_deref() == Some(queued_submission.as_str()) {
+                break;
+            }
         }
-    }
+    })
+    .await
+    .expect("active input event delivered while hook was blocked");
+    release.notify_one();
 
     assert!(saved.pending_input.iter().any(|item| {
         item.owner() == "queueing"
@@ -534,7 +705,7 @@ async fn active_input_is_durable_while_before_model_is_blocked() {
 }
 
 #[tokio::test]
-async fn before_model_events_and_targets_precede_active_changes_during_the_hook() {
+async fn active_changes_precede_later_hook_events_in_recorded_order() {
     let workspace = tempfile::tempdir().expect("workspace");
     let checkpoints = Arc::new(
         SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
@@ -559,7 +730,7 @@ async fn before_model_events_and_targets_precede_active_changes_during_the_hook(
         }),
     ])
     .expect("middleware");
-    let mut agent = create_agent(
+    let agent = create_agent(
         AgentConfig::new(
             Arc::new(ModelRouter::new("test", Arc::new(TestModel))),
             Arc::new(Sandbox::new(
@@ -574,25 +745,33 @@ async fn before_model_events_and_targets_precede_active_changes_during_the_hook(
     )
     .await
     .expect("create agent");
-    agent
-        .sender()
+    let (sender, mut events) = agent.into_recorded_parts();
+    sender
         .submit(Op::UserInput {
             text: "start".into(),
             attachments: Vec::new(),
         })
         .expect("start turn");
     let turn_id = loop {
-        let event = agent.next_event().await.expect("turn event");
-        if let EventMsg::TurnStarted(started) = event.msg {
+        let event = events.recv().await.expect("turn event");
+        if let EventMsg::TurnStarted(started) = event.event.msg {
             break started.turn_id;
         }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
-        .await
-        .expect("tail hook started");
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            tokio::select! {
+                () = started.notified() => break,
+                event = events.recv() => {
+                    event.expect("agent event while waiting");
+                }
+            }
+        }
+    })
+    .await
+    .expect("tail hook started");
 
-    let queued_submission = agent
-        .sender()
+    let queued_submission = sender
         .submit(Op::ActiveInput {
             operation: "steer".into(),
             turn_id,
@@ -620,34 +799,40 @@ async fn before_model_events_and_targets_precede_active_changes_during_the_hook(
     .expect("new input persisted");
     release.notify_one();
 
-    let (order, live_target) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        let mut order = Vec::new();
-        let mut live_target = None;
-        while order.len() < 2 || live_target.is_none() {
-            let event = agent.next_event().await.expect("frontend event");
-            match event.msg {
-                EventMsg::Frontend(FrontendEvent::RemoveWidget { capability, id })
-                    if capability == "steering" && id == "queued" =>
-                {
-                    order.push("remove")
+    let (order, sequences, live_target) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut order = Vec::new();
+            let mut sequences = Vec::new();
+            let mut live_target = None;
+            while order.len() < 2 || live_target.is_none() {
+                let record = events.recv().await.expect("frontend event");
+                let sequence = record.sequence;
+                let event = record.event;
+                match event.msg {
+                    EventMsg::Frontend(FrontendEvent::RemoveWidget { capability, id })
+                        if capability == "steering" && id == "queued" =>
+                    {
+                        order.push("remove");
+                        sequences.push(sequence);
+                    }
+                    EventMsg::Frontend(FrontendEvent::Widget { capability, item })
+                        if capability == "steering"
+                            && item.id == "queued"
+                            && event.submission_id.as_deref() == Some(&queued_submission) =>
+                    {
+                        order.push("widget");
+                        sequences.push(sequence);
+                    }
+                    EventMsg::UserMessage(message) if message.message == "old input" => {
+                        live_target = message.message_target;
+                    }
+                    _ => {}
                 }
-                EventMsg::Frontend(FrontendEvent::Widget { capability, item })
-                    if capability == "steering"
-                        && item.id == "queued"
-                        && event.submission_id.as_deref() == Some(&queued_submission) =>
-                {
-                    order.push("widget")
-                }
-                EventMsg::UserMessage(message) if message.message == "old input" => {
-                    live_target = message.message_target;
-                }
-                _ => {}
             }
-        }
-        (order, live_target.expect("live message target"))
-    })
-    .await
-    .expect("ordered frontend events");
+            (order, sequences, live_target.expect("live message target"))
+        })
+        .await
+        .expect("ordered frontend events");
     let replay_target = checkpoints
         .transcript_page(
             "ordered-hook-events",
@@ -662,8 +847,8 @@ async fn before_model_events_and_targets_precede_active_changes_during_the_hook(
         .into_iter()
         .find_map(|(target, item)| (item == user_message("old input")).then_some(target))
         .expect("replayed message target");
-
-    assert_eq!(order, ["remove", "widget"]);
+    assert_eq!(order, ["widget", "remove"]);
+    assert!(sequences[0] < sequences[1]);
     assert_eq!(live_target, replay_target);
 }
 
@@ -674,6 +859,22 @@ impl Model for TestModel {
         _events: ModelEventSink,
     ) -> BoxFuture<'a, Result<ModelOutput>> {
         Box::pin(async { Err(Error::Provider("response was not expected".into())) })
+    }
+}
+
+impl Model for RetryableModel {
+    fn respond<'a>(
+        &'a self,
+        _request: ModelRequest,
+        _events: ModelEventSink,
+    ) -> BoxFuture<'a, Result<ModelOutput>> {
+        Box::pin(async {
+            Err(Error::Provider(crate::ProviderError::http(
+                "quota exceeded",
+                429,
+                Some("5".into()),
+            )))
+        })
     }
 }
 
@@ -860,8 +1061,24 @@ fn config_with_route(
     session_id: &str,
     route: &str,
 ) -> AgentConfig {
+    config_with_model(
+        workspace,
+        checkpoints,
+        session_id,
+        route,
+        Arc::new(TestModel),
+    )
+}
+
+fn config_with_model(
+    workspace: &Path,
+    checkpoints: Arc<dyn CheckpointStore>,
+    session_id: &str,
+    route: &str,
+    model: Arc<dyn Model>,
+) -> AgentConfig {
     AgentConfig::new(
-        Arc::new(ModelRouter::new(route, Arc::new(TestModel))),
+        Arc::new(ModelRouter::new(route, model)),
         Arc::new(Sandbox::new(
             Arc::new(LocalSandbox::new(workspace).expect("local sandbox")),
             ApprovalPolicy::Ask,
@@ -871,6 +1088,186 @@ fn config_with_route(
         "test prompt",
     )
     .session_id(session_id)
+}
+
+#[tokio::test]
+async fn model_step_lifecycle_preserves_correlation_usage_and_content() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let model = Arc::new(ScriptedModel {
+        outputs: Mutex::new(VecDeque::from([scripted_message("Done.")])),
+        tool_counts: Mutex::new(Vec::new()),
+        inputs: Mutex::new(Vec::new()),
+    });
+    let mut agent = create_agent(config_with_model(
+        workspace.path(),
+        checkpoints,
+        "step-lifecycle",
+        "test",
+        model,
+    ))
+    .await
+    .expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "hello".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit input");
+
+    let mut started = None;
+    let mut completed = None;
+    let mut message = None;
+    while let Some(event) = agent.next_event().await {
+        match event.msg {
+            EventMsg::ModelStepStarted(event) => started = Some(event),
+            EventMsg::ModelStepCompleted(event) => completed = Some(event),
+            EventMsg::AgentMessage(event) => message = Some(event),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    let started = started.expect("model step started");
+    let completed = completed.expect("model step completed");
+    let message = message.expect("agent message");
+    assert_eq!(started.session_id, "step-lifecycle");
+    assert_eq!(started.step_index, 0);
+    assert!(started.started_at_ms >= 0);
+    assert_eq!(completed.session_id, started.session_id);
+    assert_eq!(completed.turn_id, started.turn_id);
+    assert_eq!(completed.model_step_id, started.model_step_id);
+    assert_eq!(completed.started_at_ms, started.started_at_ms);
+    assert!(completed.completed_at_ms >= completed.started_at_ms);
+    assert_eq!(
+        completed.outcome,
+        ModelStepOutcome::Completed {
+            end_turn: true,
+            tool_call_ids: Vec::new(),
+            usage: scripted_usage(),
+            content: vec![ModelStepContent {
+                output_index: 0,
+                part_index: 0,
+                phase: ModelStepContentPhase::FinalAnswer,
+                text: "Done.".into(),
+                annotations: Vec::new(),
+            }],
+        }
+    );
+    assert_eq!(message.session_id, started.session_id);
+    assert_eq!(message.turn_id, started.turn_id);
+    assert_eq!(message.model_step_id, started.model_step_id);
+}
+
+#[tokio::test]
+async fn failed_model_step_retains_provider_retry_metadata() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let mut agent = create_agent(config_with_model(
+        workspace.path(),
+        checkpoints,
+        "failed-step",
+        "test",
+        Arc::new(RetryableModel),
+    ))
+    .await
+    .expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "hello".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit input");
+
+    let mut terminal = None;
+    let mut failure = None;
+    while let Some(event) = agent.next_event().await {
+        match event.msg {
+            EventMsg::ModelStepCompleted(event) => terminal = Some(event),
+            EventMsg::Error(event) => failure = Some(event),
+            EventMsg::TurnAborted(_) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        terminal.expect("terminal step").outcome,
+        ModelStepOutcome::Failed
+    );
+    let failure = failure.expect("structured provider error");
+    assert_eq!(failure.kind, ErrorKind::Provider);
+    assert!(failure.retryable);
+    assert_eq!(failure.status, Some(429));
+    assert_eq!(failure.retry_after.as_deref(), Some("5"));
+    assert!(failure.message.contains("quota exceeded"));
+}
+
+#[tokio::test]
+async fn interrupted_model_request_emits_one_terminal_step() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let entered = Arc::new(Notify::new());
+    let model = Arc::new(BlockingModel {
+        started: Arc::clone(&entered),
+        release: Arc::new(Notify::new()),
+        calls: AtomicUsize::new(0),
+    });
+    let mut agent = create_agent(config_with_model(
+        workspace.path(),
+        checkpoints,
+        "interrupted-step",
+        "test",
+        model,
+    ))
+    .await
+    .expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "hello".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit input");
+    let started = loop {
+        if let EventMsg::ModelStepStarted(started) =
+            agent.next_event().await.expect("model step started").msg
+        {
+            break started;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+        .await
+        .expect("model entered");
+    agent
+        .sender()
+        .submit(Op::Interrupt {
+            turn_id: started.turn_id.clone(),
+        })
+        .expect("interrupt turn");
+
+    let mut terminal = Vec::new();
+    while let Some(event) = agent.next_event().await {
+        match event.msg {
+            EventMsg::ModelStepCompleted(event) => terminal.push(event),
+            EventMsg::TurnAborted(_) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(terminal.len(), 1);
+    assert_eq!(terminal[0].model_step_id, started.model_step_id);
+    assert_eq!(terminal[0].outcome, ModelStepOutcome::Interrupted);
 }
 
 fn config_with_two_routes(
@@ -938,7 +1335,7 @@ async fn middleware_event_saturation_fails_agent_creation_instead_of_dropping_up
 
     assert_eq!(
         error.to_string(),
-        "agent stopped: frontend event queue is full"
+        "agent stopped: event recorder queue is full"
     );
 }
 
@@ -1606,12 +2003,29 @@ async fn malformed_automatic_review_durably_asks_without_dropping_network_access
         .expect("load checkpoint")
         .expect("saved checkpoint");
     let pending = saved.pending_approval.expect("pending approval");
+    let recorded = checkpoints
+        .event_page(
+            "review-escalation",
+            EventPageRequest {
+                before_sequence: None,
+                limit: 1,
+            },
+        )
+        .await
+        .expect("event journal")
+        .events
+        .pop()
+        .expect("recorded approval request");
 
     assert_eq!(
         pending.network_access,
         crate::backend::sandbox::NetworkAccess::Allowed
     );
     assert_eq!(saved.total_usage.total_tokens, 2);
+    assert!(matches!(
+        recorded.event.msg,
+        EventMsg::ExecApprovalRequest(request) if request.id == pending.request_id
+    ));
     assert_eq!(
         model
             .tool_counts
@@ -1719,6 +2133,68 @@ async fn explicit_model_route_replaces_a_saved_route_that_is_still_registered() 
 
     assert_eq!(configured.model.route, "kimi-k2.7");
     assert_eq!(saved.model_route.as_deref(), Some("kimi-k2.7"));
+}
+
+#[tokio::test]
+async fn model_route_change_is_recorded_with_its_checkpoint() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let mut agent = create_agent(config_with_two_routes(
+        workspace.path(),
+        checkpoint_store,
+        "route-change",
+        "kimi-k3",
+        "kimi-k2.7",
+    ))
+    .await
+    .expect("create agent");
+    agent.next_event().await.expect("configured event");
+    let submission_id = agent
+        .sender()
+        .submit(Op::SetModel {
+            route: "kimi-k2.7".into(),
+        })
+        .expect("change route");
+
+    let changed = loop {
+        let event = agent.next_event().await.expect("model changed event");
+        if event.submission_id.as_deref() == Some(&submission_id) {
+            break event;
+        }
+    };
+    let saved = checkpoints
+        .load("route-change")
+        .await
+        .expect("load checkpoint")
+        .expect("saved checkpoint");
+    let recorded = checkpoints
+        .event_page(
+            "route-change",
+            EventPageRequest {
+                before_sequence: None,
+                limit: 1,
+            },
+        )
+        .await
+        .expect("event journal")
+        .events
+        .pop()
+        .expect("recorded model change");
+
+    assert!(matches!(
+        changed.msg,
+        EventMsg::ModelChanged(event) if event.route == "kimi-k2.7"
+    ));
+    assert_eq!(saved.model_route.as_deref(), Some("kimi-k2.7"));
+    assert_eq!(recorded.event.submission_id, Some(submission_id));
+    assert!(matches!(
+        recorded.event.msg,
+        EventMsg::ModelChanged(event) if event.route == "kimi-k2.7"
+    ));
 }
 
 #[tokio::test]
@@ -1985,7 +2461,7 @@ async fn resume_request_carries_the_target_session_context() {
 }
 
 #[tokio::test]
-async fn restart_closes_uncertain_tool_calls_without_replaying_them() {
+async fn zero_replay_mode_emits_uncertain_tool_recovery_as_individual_events() {
     let workspace = tempfile::tempdir().expect("workspace");
     let checkpoints = Arc::new(
         SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
@@ -2022,21 +2498,22 @@ async fn restart_closes_uncertain_tool_calls_without_replaying_them() {
         .expect("save target");
     let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
 
-    let mut agent = create_agent(config(workspace.path(), checkpoint_store, "target"))
-        .await
-        .expect("resume agent");
+    let mut agent = create_agent(
+        config(workspace.path(), checkpoint_store, "target").initial_replay_batches(0),
+    )
+    .await
+    .expect("resume agent");
     assert!(matches!(
         agent.next_event().await.expect("session event").msg,
         EventMsg::SessionConfigured(_)
     ));
-    let EventMsg::SessionHistory(history) = agent.next_event().await.expect("history event").msg
-    else {
-        panic!("expected atomic session history");
-    };
+    let history = [
+        agent.next_event().await.expect("tool end").msg,
+        agent.next_event().await.expect("queued user message").msg,
+    ];
     assert!(matches!(
-        history.events.as_slice(),
+        history.as_slice(),
         [
-            EventMsg::ToolCallBegin(begin),
             EventMsg::ToolCallEnd(ToolCallEndEvent {
                 turn_id,
                 call_id,
@@ -2045,10 +2522,8 @@ async fn restart_closes_uncertain_tool_calls_without_replaying_them() {
                 ..
             }),
             EventMsg::UserMessage(user)
-        ] if begin.turn_id == "turn-1"
-            && begin.call_id == "call-1"
-            && turn_id == &begin.turn_id
-            && call_id == &begin.call_id
+        ] if turn_id == "turn-1"
+            && call_id == "call-1"
             && output == "execution interrupted; result unknown after restart"
             && user.message == "queued after restart"
     ));
@@ -2089,4 +2564,61 @@ async fn restart_closes_uncertain_tool_calls_without_replaying_them() {
         ),
         (ExecutionOutcome::Aborted, 1, 1, 1)
     );
+}
+
+#[tokio::test]
+async fn restart_closes_an_active_model_step_with_the_recovery_checkpoint() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let mut checkpoint = Checkpoint::empty("recover-step");
+    checkpoint.active_execution = Some(crate::backend::checkpoint::ActiveExecution {
+        submission_id: "submission-1".into(),
+        turn_id: "turn-1".into(),
+        started_at_ms: 10,
+        model_calls: 1,
+        tool_calls: 0,
+        failed_tool_calls: 0,
+        usage: TokenUsage::default(),
+    });
+    checkpoint.active_model_step = Some(crate::backend::checkpoint::ActiveModelStep {
+        model_step_id: "step-1".into(),
+        step_index: 0,
+        started_at_ms: 20,
+    });
+    checkpoints
+        .save(&checkpoint, &[], None)
+        .await
+        .expect("save active step");
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+
+    let mut agent = create_agent(
+        config(workspace.path(), checkpoint_store, "recover-step").initial_replay_batches(0),
+    )
+    .await
+    .expect("recover agent");
+    let configured = agent.next_event().await.expect("session event");
+    let completed = agent.next_event().await.expect("step completion");
+    let aborted = agent.next_event().await.expect("turn abort");
+    let saved = checkpoints
+        .load("recover-step")
+        .await
+        .expect("load checkpoint")
+        .expect("recovered checkpoint");
+
+    assert!(matches!(configured.msg, EventMsg::SessionConfigured(_)));
+    assert!(matches!(
+        completed.msg,
+        EventMsg::ModelStepCompleted(event)
+            if event.model_step_id == "step-1"
+                && event.outcome == ModelStepOutcome::Interrupted
+    ));
+    assert!(matches!(
+        aborted.msg,
+        EventMsg::TurnAborted(event) if event.turn_id == "turn-1"
+    ));
+    assert!(saved.active_execution.is_none());
+    assert!(saved.active_model_step.is_none());
 }

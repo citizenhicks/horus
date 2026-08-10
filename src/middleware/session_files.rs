@@ -139,6 +139,37 @@ impl SessionFileStore {
             .await
     }
 
+    /// Permanently removes every upload and artifact owned by one idle session.
+    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        validate_session_id(session_id)?;
+        self.ensure_initialized().await?;
+        let _commit = self.commits.lock().await;
+        if self
+            .reservations
+            .lock()
+            .map_err(|_| Error::Tool("session file reservation lock is poisoned".into()))?
+            .contains_key(session_id)
+        {
+            return Err(Error::Tool(
+                "session files cannot be deleted while an upload is active".into(),
+            ));
+        }
+        let directory = self.session_dir(session_id);
+        match tokio::fs::symlink_metadata(&directory).await {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                tokio::fs::remove_dir_all(directory).await?;
+            }
+            Ok(_) => {
+                return Err(Error::Tool(
+                    "session file directory is not a protected directory".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     /// Reads one bounded byte range from either kind of stored session file.
     pub async fn read_chunk(
         &self,
@@ -814,6 +845,62 @@ mod tests {
                 assert_eq!(mode & 0o777, 0o600);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_only_that_sessions_files() {
+        let state = tempfile::tempdir().expect("state");
+        let store = SessionFileStore::new(state.path());
+        for session_id in ["deleted", "retained"] {
+            store
+                .publish_artifact(
+                    session_id,
+                    "result.txt".into(),
+                    "text/plain".into(),
+                    b"result",
+                )
+                .await
+                .expect("publish artifact");
+        }
+
+        store
+            .delete_session("deleted")
+            .await
+            .expect("delete session files");
+
+        assert!(
+            store
+                .list_artifacts("deleted")
+                .await
+                .expect("deleted artifacts")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .list_artifacts("retained")
+                .await
+                .expect("retained artifacts")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_rejects_an_active_upload() {
+        let state = tempfile::tempdir().expect("state");
+        let store = SessionFileStore::new(state.path());
+        let pending = store
+            .begin_upload("session", "pending.txt".into(), 1, "text/plain".into())
+            .await
+            .expect("begin upload");
+
+        assert!(store.delete_session("session").await.is_err());
+
+        drop(pending);
+        store
+            .delete_session("session")
+            .await
+            .expect("delete released session files");
     }
 
     #[tokio::test]

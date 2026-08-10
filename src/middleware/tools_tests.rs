@@ -400,7 +400,7 @@ fn coding_renderer_preserves_patch_diff_blocks() {
         .expect("patch rendering");
 
     assert_eq!(block.format, FrontendBlockFormat::UnifiedDiff);
-    assert!(!block.append);
+    assert_eq!(block.update, crate::protocol::FrontendBlockUpdate::Replace);
     assert_eq!(block.text, diff);
 }
 
@@ -447,13 +447,13 @@ fn generic_tool_renderer_does_not_infer_coding_presentation() {
             is_error: false,
         }),
         |name| name == "load_skill",
-        |_, _| String::new(),
+        |_, _| String::new().into(),
     )
     .expect("generic rendering");
 
     assert_eq!(block.format, FrontendBlockFormat::PlainText);
     assert_eq!(block.group, None);
-    assert!(block.append);
+    assert_eq!(block.update, crate::protocol::FrontendBlockUpdate::Append);
 }
 
 #[test]

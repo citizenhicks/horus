@@ -1,6 +1,7 @@
 //! Native Anthropic Messages API provider.
 
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -30,6 +31,9 @@ use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
 use crate::protocol::FrontendSymbol;
+use crate::protocol::ModelStepAnnotation;
+use crate::protocol::ModelStepContent;
+use crate::protocol::ModelStepContentPhase;
 
 mod manifest {
     include!(concat!(
@@ -276,10 +280,16 @@ impl StreamState {
         }
         if block.get("type").and_then(Value::as_str) == Some("web_search_tool_result") {
             let call_id = required_string(&block, "tool_use_id")?.to_string();
-            let query = self.web_queries.get(&call_id).cloned().flatten();
+            let queries = self
+                .web_queries
+                .get(&call_id)
+                .cloned()
+                .flatten()
+                .into_iter()
+                .collect();
             events(ModelEvent::WebSearchCompleted {
                 call_id,
-                action: WebSearchAction::Search { query },
+                action: WebSearchAction::Search { queries },
             })?;
         }
         self.blocks.insert(index, block);
@@ -362,6 +372,7 @@ impl StreamState {
     }
 
     fn finish(self) -> Result<ModelOutput> {
+        let step_content = normalized_step_content(&self.blocks)?;
         let content = self.blocks.into_values().collect::<Vec<_>>();
         let calls = content
             .iter()
@@ -406,11 +417,180 @@ impl StreamState {
         message[RAW_CONTENT] = Value::Array(content);
         let mut output = vec![message];
         output.extend(calls);
-        ModelOutput::from_output(
+        ModelOutput::from_output_with_content(
             output,
             self.stop_reason.as_deref() != Some("pause_turn"),
             self.usage.finish()?,
+            step_content,
         )
+    }
+}
+
+fn normalized_step_content(blocks: &BTreeMap<usize, Value>) -> Result<Vec<ModelStepContent>> {
+    let mut content = Vec::new();
+    for (&part_index, block) in blocks {
+        let (phase, text, annotations) = match block.get("type").and_then(Value::as_str) {
+            Some("thinking") => (
+                ModelStepContentPhase::Reasoning,
+                block.get("thinking").and_then(Value::as_str),
+                Vec::new(),
+            ),
+            Some("text") => (
+                ModelStepContentPhase::FinalAnswer,
+                block.get("text").and_then(Value::as_str),
+                normalize_citations(block)?,
+            ),
+            None | Some(_) => continue,
+        };
+        let Some(text) = text.filter(|text| !text.is_empty()) else {
+            continue;
+        };
+        content.push(ModelStepContent {
+            output_index: 0,
+            part_index,
+            phase,
+            text: text.into(),
+            annotations,
+        });
+    }
+    Ok(content)
+}
+
+fn normalize_citations(block: &Value) -> Result<Vec<ModelStepAnnotation>> {
+    let Some(citations) = block.get("citations") else {
+        return Ok(Vec::new());
+    };
+    if citations.is_null() {
+        return Ok(Vec::new());
+    }
+    let citations: Vec<AnthropicCitation> = serde_json::from_value(citations.clone())
+        .map_err(|error| Error::Provider(format!("invalid Anthropic citation: {error}").into()))?;
+    Ok(citations.into_iter().map(Into::into).collect())
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum AnthropicCitation {
+    #[serde(rename = "char_location")]
+    Character {
+        cited_text: String,
+        document_index: usize,
+        document_title: Option<String>,
+        file_id: Option<String>,
+        start_char_index: usize,
+        end_char_index: usize,
+    },
+    #[serde(rename = "page_location")]
+    Page {
+        cited_text: String,
+        document_index: usize,
+        document_title: Option<String>,
+        file_id: Option<String>,
+        start_page_number: usize,
+        end_page_number: usize,
+    },
+    #[serde(rename = "content_block_location")]
+    ContentBlock {
+        cited_text: String,
+        document_index: usize,
+        document_title: Option<String>,
+        file_id: Option<String>,
+        start_block_index: usize,
+        end_block_index: usize,
+    },
+    #[serde(rename = "search_result_location")]
+    SearchResult {
+        cited_text: String,
+        search_result_index: usize,
+        source: String,
+        title: Option<String>,
+        start_block_index: usize,
+        end_block_index: usize,
+    },
+    #[serde(rename = "web_search_result_location")]
+    WebSearchResult {
+        cited_text: String,
+        encrypted_index: String,
+        title: Option<String>,
+        url: String,
+    },
+}
+
+impl From<AnthropicCitation> for ModelStepAnnotation {
+    fn from(citation: AnthropicCitation) -> Self {
+        match citation {
+            AnthropicCitation::Character {
+                cited_text,
+                document_index,
+                document_title,
+                file_id,
+                start_char_index,
+                end_char_index,
+            } => Self::DocumentCharacterCitation {
+                cited_text,
+                document_index,
+                document_title,
+                file_id,
+                start_char_index,
+                end_char_index,
+            },
+            AnthropicCitation::Page {
+                cited_text,
+                document_index,
+                document_title,
+                file_id,
+                start_page_number,
+                end_page_number,
+            } => Self::DocumentPageCitation {
+                cited_text,
+                document_index,
+                document_title,
+                file_id,
+                start_page_number,
+                end_page_number,
+            },
+            AnthropicCitation::ContentBlock {
+                cited_text,
+                document_index,
+                document_title,
+                file_id,
+                start_block_index,
+                end_block_index,
+            } => Self::DocumentContentBlockCitation {
+                cited_text,
+                document_index,
+                document_title,
+                file_id,
+                start_block_index,
+                end_block_index,
+            },
+            AnthropicCitation::SearchResult {
+                cited_text,
+                search_result_index,
+                source,
+                title,
+                start_block_index,
+                end_block_index,
+            } => Self::SearchResultCitation {
+                cited_text,
+                search_result_index,
+                source,
+                title,
+                start_block_index,
+                end_block_index,
+            },
+            AnthropicCitation::WebSearchResult {
+                cited_text,
+                encrypted_index,
+                title,
+                url,
+            } => Self::WebSearchResultCitation {
+                cited_text,
+                encrypted_index,
+                title,
+                url,
+            },
+        }
     }
 }
 

@@ -51,7 +51,7 @@ final class GatewayWireTests: XCTestCase {
     }
 
     private var sessionReadyPayloadJSON: String {
-        #"{"replay_epoch":"epoch-1","latest_sequence":7,"next_before_sequence":2,"workspace":{"id":"workspace-1","path":"/srv/horus"},"git":{"current_branch":"main","branches":["feature","main"]},"session":{"session_id":"chat-1","context":{"workspace_id":"workspace-1"},"model":{"route":"openai_socket/gpt-5.6-sol","model":"gpt-5.6-sol","reasoning_effort":"high","model_context_window":200000}},"contributions":[{"capability":"subagents","accepts_file_attachments":false,"count":2,"commands":[],"widgets":[{"id":"subagents","slot":"composer_footer","text":"Subagents","tone":"neutral","symbol":"agent","icon_only":true,"progress":null,"content":{"type":"picker","title":"Subagents","options":[{"label":"reviewer","description":"running","detail":"gpt-5.6-sol","op":{"type":"capability_command","capability":"subagents","command":"subagents","arguments":"reviewer","input":null,"target":null}}]},"action":null}],"references":[],"active_input":null}],"widgets":[],"tool_count":7,"run_stats":\#(runStatsJSON),"config":\#(configJSON)}"#
+        #"{"latest_sequence":7,"next_before_sequence":2,"workspace":{"id":"workspace-1","path":"/srv/horus"},"git":{"current_branch":"main","branches":["feature","main"]},"session":{"session_id":"chat-1","context":{"workspace_id":"workspace-1"},"model":{"route":"openai_socket/gpt-5.6-sol","model":"gpt-5.6-sol","reasoning_effort":"high","model_context_window":200000}},"contributions":[{"capability":"subagents","accepts_file_attachments":false,"count":2,"commands":[],"widgets":[{"id":"subagents","slot":"composer_footer","text":"Subagents","tone":"neutral","symbol":"agent","icon_only":true,"progress":null,"content":{"type":"picker","title":"Subagents","options":[{"label":"reviewer","description":"running","detail":"gpt-5.6-sol","op":{"type":"capability_command","capability":"subagents","command":"subagents","arguments":"reviewer","input":null,"target":null}}]},"action":null}],"references":[],"active_input":null}],"widgets":[],"tool_count":7,"run_stats":\#(runStatsJSON),"config":\#(configJSON)}"#
     }
 
     private var composition: AgentComposition {
@@ -75,7 +75,7 @@ final class GatewayWireTests: XCTestCase {
         )
     }
 
-    func testProtocolV23PairAndAuthenticateRequireClientKind() throws {
+    func testProtocolV24PairAndAuthenticateRequireClientKind() throws {
         let pair = try requestObject(.pair(
             code: "123456",
             clientLabel: "Phone",
@@ -93,7 +93,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertNil(authenticate["last_sequence"])
     }
 
-    func testProtocolV23ClientInventoryRoundTrip() throws {
+    func testProtocolV24ClientInventoryRoundTrip() throws {
         let request = try requestObject(.listClients(requestID: "clients-1"))
         XCTAssertEqual(request["type"] as? String, "list_clients")
         XCTAssertEqual(request["request_id"] as? String, "clients-1")
@@ -104,7 +104,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(unpair["type"] as? String, "unpair_client")
         XCTAssertEqual(unpair["client_id"] as? String, "phone-7")
 
-        let fixture = #"{"version":23,"type":"clients","request_id":"clients-1","current_client_id":"mac-2","clients":[{"client_id":"phone-7","label":"Phone","kinds":["ios"],"connections":1},{"client_id":"mac-2","label":"Mac","kinds":[],"connections":0}]}"#
+        let fixture = #"{"version":24,"type":"clients","request_id":"clients-1","current_client_id":"mac-2","clients":[{"client_id":"phone-7","label":"Phone","kinds":["ios"],"connections":1},{"client_id":"mac-2","label":"Mac","kinds":[],"connections":0}]}"#
         guard case .clients(let requestID, let currentClientID, let clients) = try decodeEnvelope(fixture) else {
             return XCTFail("Expected client inventory envelope")
         }
@@ -115,7 +115,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(clients.last?.connections, 0)
     }
 
-    func testSessionCatalogRequestsMatchV23() throws {
+    func testSessionCatalogRequestsMatchV24() throws {
         let list = try requestObject(.listSessions(requestID: "list-1"))
         XCTAssertEqual(list["type"] as? String, "list_sessions")
         XCTAssertEqual(list["request_id"] as? String, "list-1")
@@ -130,22 +130,20 @@ final class GatewayWireTests: XCTestCase {
         let open = try requestObject(.openSession(
             requestID: "open-1",
             sessionID: "chat-1",
-            lastSequence: 41,
-            replayEpoch: "epoch-1"
+            lastSequence: 41
         ))
         XCTAssertEqual(open["type"] as? String, "open_session")
         XCTAssertEqual(open["session_id"] as? String, "chat-1")
         XCTAssertEqual(open["last_sequence"] as? Int, 41)
-        XCTAssertEqual(open["replay_epoch"] as? String, "epoch-1")
+        XCTAssertNil(open["replay_epoch"])
 
         let freshOpen = try requestObject(.openSession(
             requestID: "open-2",
             sessionID: "chat-1",
-            lastSequence: nil,
-            replayEpoch: nil
+            lastSequence: nil
         ))
         XCTAssertTrue(freshOpen["last_sequence"] is NSNull)
-        XCTAssertTrue(freshOpen["replay_epoch"] is NSNull)
+        XCTAssertNil(freshOpen["replay_epoch"])
     }
 
     func testSessionScopedRequestsEncodeSessionID() throws {
@@ -174,7 +172,7 @@ final class GatewayWireTests: XCTestCase {
                 requestID: "history-1",
                 sessionID: "chat-1",
                 beforeSequence: 40,
-                maxBatches: 25
+                maxEvents: 25
             ), "get_session_history"),
             (.startCronSetup(requestID: "setup-1", sessionID: "chat-1", task: "Review nightly"), "start_cron_setup"),
             (.listCron(requestID: "cron-1", sessionID: "chat-1"), "list_cron"),
@@ -227,7 +225,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertTrue(history["id"] is NSNull)
     }
 
-    func testSessionFileRequestsMatchV23() throws {
+    func testSessionFileRequestsMatchV24() throws {
         let file = SessionFileReference(
             id: "file-1",
             name: "scan.png",
@@ -297,7 +295,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(artifacts["type"] as? String, "list_artifacts")
     }
 
-    func testWorkspaceViewerRequestsMatchV23() throws {
+    func testWorkspaceViewerRequestsMatchV24() throws {
         let diff = try requestObject(.getGitDiff(
             requestID: "diff-1",
             sessionID: "chat-1",
@@ -325,7 +323,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(read["offset"] as? Int, 4)
     }
 
-    func testProviderAndUtilityRequestsMatchV23() throws {
+    func testProviderAndUtilityRequestsMatchV24() throws {
         let credential = try requestObject(.setProviderCredential(
             requestID: "credential-1",
             provider: "openai_socket",
@@ -396,9 +394,9 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertNil(inheritedSettings["subagents"])
     }
 
-    func testGatewayWideReadyPayloadDecodesV23State() throws {
+    func testGatewayWideReadyPayloadDecodesV24State() throws {
         let envelope = try decodeEnvelope(
-            #"{"version":23,"type":"ready","payload":\#(readyPayloadJSON)}"#
+            #"{"version":24,"type":"ready","payload":\#(readyPayloadJSON)}"#
         )
         guard case .ready(let payload) = envelope else {
             return XCTFail("Expected ready envelope")
@@ -441,7 +439,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(unsetLabel, "Inherit")
 
         let configured = try decodeEnvelope(
-            #"{"version":23,"type":"gateway_configured","request_id":"gateway-1","payload":\#(readyPayloadJSON)}"#
+            #"{"version":24,"type":"gateway_configured","request_id":"gateway-1","payload":\#(readyPayloadJSON)}"#
         )
         guard case .gatewayConfigured(let requestID, let refreshed) = configured else {
             return XCTFail("Expected gateway configured envelope")
@@ -456,39 +454,38 @@ final class GatewayWireTests: XCTestCase {
             with: #"snowwhite\nlocal"#
         )
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":23,"type":"ready","payload":\#(payload)}"#
+            #"{"version":24,"type":"ready","payload":\#(payload)}"#
         ))
     }
 
-    func testV23RejectsLegacyProviderMetadata() {
+    func testV24RejectsLegacyProviderMetadata() {
         let legacyProvider = #"{"provider":"openai_socket","label":"OpenAI","configured":true,"auth":"api_key","default_model":"gpt-5.6-sol","default_base_url":null,"default_api_key_env":"OPENAI_API_KEY","default_reasoning_effort":"medium","default_web_search":"off"}"#
         let payload = #"{"sessions":[],"providers":[\#(legacyProvider)],"default_config":\#(configJSON),"models":[],"middleware_features":[],"max_active_sessions":4}"#
 
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":23,"type":"ready","payload":\#(payload)}"#
+            #"{"version":24,"type":"ready","payload":\#(payload)}"#
         ))
     }
 
-    func testV23RequiresProviderReasoningCatalogMetadata() {
+    func testV24RequiresProviderReasoningCatalogMetadata() {
         let payload = readyPayloadJSON.replacingOccurrences(
             of: #""reasoning_efforts":[],"#,
             with: ""
         )
 
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":23,"type":"ready","payload":\#(payload)}"#
+            #"{"version":24,"type":"ready","payload":\#(payload)}"#
         ))
     }
 
     func testSessionOpenedAndChangedDecodeSessionReadyPayload() throws {
         let opened = try decodeEnvelope(
-            #"{"version":23,"type":"session_opened","request_id":"open-1","payload":\#(sessionReadyPayloadJSON)}"#
+            #"{"version":24,"type":"session_opened","request_id":"open-1","payload":\#(sessionReadyPayloadJSON)}"#
         )
         guard case .sessionOpened(let requestID, let payload) = opened else {
             return XCTFail("Expected session opened envelope")
         }
         XCTAssertEqual(requestID, "open-1")
-        XCTAssertEqual(payload.replayEpoch, "epoch-1")
         XCTAssertEqual(payload.latestSequence, 7)
         XCTAssertEqual(payload.nextBeforeSequence, 2)
         XCTAssertEqual(payload.workspace.path, "/srv/horus")
@@ -519,7 +516,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertNil(target)
 
         let changed = try decodeEnvelope(
-            #"{"version":23,"type":"session_changed","payload":\#(sessionReadyPayloadJSON)}"#
+            #"{"version":24,"type":"session_changed","payload":\#(sessionReadyPayloadJSON)}"#
         )
         guard case .sessionChanged(let changedPayload) = changed else {
             return XCTFail("Expected session changed envelope")
@@ -527,7 +524,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(changedPayload.workspace.id, "workspace-1")
 
         let replayComplete = try decodeEnvelope(
-            #"{"version":23,"type":"session_replay_complete","request_id":"open-1","session_id":"chat-1"}"#
+            #"{"version":24,"type":"session_replay_complete","request_id":"open-1","session_id":"chat-1"}"#
         )
         guard case .sessionReplayComplete(let completedRequestID, let sessionID) = replayComplete else {
             return XCTFail("Expected session replay completion envelope")
@@ -536,22 +533,24 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(sessionID, "chat-1")
 
         let history = try decodeEnvelope(
-            #"{"version":23,"type":"session_history","request_id":"history-1","session_id":"chat-1","events":[{"event":{"type":"context_compacted"},"blocks":[]}],"next_before_sequence":4}"#
+            #"{"version":24,"type":"session_history","request_id":"history-1","session_id":"chat-1","records":[{"sequence":3,"recorded_at_ms":1000,"event":{"submission_id":null,"msg":{"type":"context_compacted"}},"stream_metrics":[],"blocks":[],"preview":null}],"next_before_sequence":4}"#
         )
         guard case .sessionHistory(
             let historyRequestID,
             let historySessionID,
-            let events,
+            let records,
             let nextBeforeSequence
         ) = history else { return XCTFail("Expected session history page") }
         XCTAssertEqual(historyRequestID, "history-1")
         XCTAssertEqual(historySessionID, "chat-1")
-        XCTAssertEqual(events.first?.event["type"]?.stringValue, "context_compacted")
+        XCTAssertEqual(records.first?.sequence, 3)
+        XCTAssertEqual(records.first?.recordedAtMs, 1_000)
+        XCTAssertEqual(records.first?.event.msg["type"]?.stringValue, "context_compacted")
         XCTAssertEqual(nextBeforeSequence, 4)
     }
 
-    func testV23RequiresSessionActivityAndToolCount() {
-        let sessionWithoutActivity = #"{"version":23,"type":"sessions","sessions":[{"session_id":"chat-1","session_context":{},"parent_session_id":null,"parent_sequence":null,"sequence":0,"catalog_visible":true,"first_user_message":null,"created_at":100,"updated_at":100,"title":null,"pinned":false}]}"#
+    func testV24RequiresSessionActivityAndToolCount() {
+        let sessionWithoutActivity = #"{"version":24,"type":"sessions","sessions":[{"session_id":"chat-1","session_context":{},"parent_session_id":null,"parent_sequence":null,"sequence":0,"catalog_visible":true,"first_user_message":null,"created_at":100,"updated_at":100,"title":null,"pinned":false}]}"#
         XCTAssertThrowsError(try decodeEnvelope(sessionWithoutActivity))
 
         let payloadWithoutToolCount = sessionReadyPayloadJSON.replacingOccurrences(
@@ -559,7 +558,7 @@ final class GatewayWireTests: XCTestCase {
             with: ""
         )
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":23,"type":"session_opened","request_id":"open-1","payload":\#(payloadWithoutToolCount)}"#
+            #"{"version":24,"type":"session_opened","request_id":"open-1","payload":\#(payloadWithoutToolCount)}"#
         ))
 
         let payloadWithoutContributionCount = sessionReadyPayloadJSON.replacingOccurrences(
@@ -567,11 +566,11 @@ final class GatewayWireTests: XCTestCase {
             with: ""
         )
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":23,"type":"session_opened","request_id":"open-1","payload":\#(payloadWithoutContributionCount)}"#
+            #"{"version":24,"type":"session_opened","request_id":"open-1","payload":\#(payloadWithoutContributionCount)}"#
         ))
     }
 
-    func testV23RequiresGenericSettingsAndScalarValues() {
+    func testV24RequiresGenericSettingsAndScalarValues() {
         let withoutSettings = configJSON.replacingOccurrences(
             of: #","settings":{"context_offloading":{"stale_after_tokens":50000},"subagents":{"model_route":"openai_socket/gpt-5.6-sol"}}"#,
             with: ""
@@ -581,7 +580,7 @@ final class GatewayWireTests: XCTestCase {
             with: withoutSettings
         )
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":23,"type":"ready","payload":\#(payloadWithoutSettings)}"#
+            #"{"version":24,"type":"ready","payload":\#(payloadWithoutSettings)}"#
         ))
 
         let invalidScalar = configJSON.replacingOccurrences(
@@ -593,11 +592,11 @@ final class GatewayWireTests: XCTestCase {
             with: invalidScalar
         )
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":23,"type":"ready","payload":\#(payloadWithInvalidScalar)}"#
+            #"{"version":24,"type":"ready","payload":\#(payloadWithInvalidScalar)}"#
         ))
     }
 
-    func testV23RequiresTheModelStepLimit() {
+    func testV24RequiresTheModelStepLimit() {
         let withoutLimit = configJSON.replacingOccurrences(
             of: #","max_model_steps":256"#,
             with: ""
@@ -608,11 +607,11 @@ final class GatewayWireTests: XCTestCase {
         )
 
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":23,"type":"ready","payload":\#(payload)}"#
+            #"{"version":24,"type":"ready","payload":\#(payload)}"#
         ))
     }
 
-    func testV23RequiresAPositiveModelStepLimitWithoutAnUpperPolicyBound() throws {
+    func testV24RequiresAPositiveModelStepLimitWithoutAnUpperPolicyBound() throws {
         let zeroLimit = configJSON.replacingOccurrences(
             of: #""max_model_steps":256"#,
             with: #""max_model_steps":0"#
@@ -622,7 +621,7 @@ final class GatewayWireTests: XCTestCase {
             with: zeroLimit
         )
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":23,"type":"ready","payload":\#(zeroPayload)}"#
+            #"{"version":24,"type":"ready","payload":\#(zeroPayload)}"#
         ))
 
         let maximumLimit = configJSON.replacingOccurrences(
@@ -634,7 +633,7 @@ final class GatewayWireTests: XCTestCase {
             with: maximumLimit
         )
         guard case .ready(let payload) = try decodeEnvelope(
-            #"{"version":23,"type":"ready","payload":\#(maximumPayload)}"#
+            #"{"version":24,"type":"ready","payload":\#(maximumPayload)}"#
         ) else { return XCTFail("Expected ready envelope") }
         XCTAssertEqual(payload.defaultConfig?.config.maxModelSteps, UInt64.max)
     }
@@ -677,31 +676,90 @@ final class GatewayWireTests: XCTestCase {
         }
     }
 
-    func testV23RequiresCacheWriteInputTokens() {
+    func testV24RequiresCacheWriteInputTokens() {
         let usage = #"{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2}"#
-        let fixture = #"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"token_count","info":{"total_token_usage":\#(usage),"last_token_usage":\#(usage),"model_context_window":200}}},"blocks":[]}"#
+        let fixture = #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"token_count","info":{"total_token_usage":\#(usage),"last_token_usage":\#(usage),"model_context_window":200}}},"stream_metrics":[],"blocks":[],"preview":null}}"#
 
         XCTAssertThrowsError(try decodeEnvelope(fixture))
     }
 
     func testAgentEventFixtureIncludesSessionScope() throws {
-        let fixture = #"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"submission_id":"input-1","msg":{"type":"session_history","events":[]}},"blocks":[],"history":[{"event":{"type":"frontend","frontend_type":"render","capability":"tools","block":{"id":null,"group":null,"append":false,"pending":false,"text":"Done","format":"plain_text","tone":"neutral","files":[]}},"blocks":[]}],"preview":null}"#
+        let fixture = #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1234,"event":{"submission_id":"input-1","msg":{"type":"context_compacted"}},"stream_metrics":[{"phase":"reasoning","first_delta_at_ms":1000,"last_delta_at_ms":1200,"chunk_count":3,"utf8_bytes":12,"longest_gap_ms":150}],"blocks":[],"preview":null}}"#
         let envelope = try decodeEnvelope(fixture)
 
-        guard case .agentEvent(let sessionID, let sequence, let event, let blocks, let history, let preview) = envelope else {
+        guard case .agentEvent(let sessionID, let record) = envelope else {
             return XCTFail("Expected agent event envelope")
         }
         XCTAssertEqual(sessionID, "chat-1")
-        XCTAssertEqual(sequence, 8)
-        XCTAssertEqual(event.submissionId, "input-1")
-        XCTAssertEqual(event.msg["type"]?.stringValue, "session_history")
-        XCTAssertTrue(blocks.isEmpty)
-        XCTAssertEqual(history?.first?.event["frontendType"]?.stringValue, "render")
-        XCTAssertNil(preview)
+        XCTAssertEqual(record.sequence, 8)
+        XCTAssertEqual(record.recordedAtMs, 1_234)
+        XCTAssertEqual(record.event.submissionId, "input-1")
+        XCTAssertEqual(record.event.msg["type"]?.stringValue, "context_compacted")
+        XCTAssertEqual(record.streamMetrics.first?.phase, .reasoning)
+        XCTAssertEqual(record.streamMetrics.first?.chunkCount, 3)
+        XCTAssertTrue(record.blocks.isEmpty)
+        XCTAssertNil(record.preview)
+    }
+
+    func testTypedModelCompletionAndWebActionDecode() throws {
+        let completion = try decodeEnvelope(
+            #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1400,"event":{"msg":{"type":"model_step_completed","session_id":"chat-1","turn_id":"turn-1","model_step_id":"step-1","step_index":0,"started_at_ms":1000,"completed_at_ms":1400,"outcome":{"status":"completed","end_turn":true,"tool_call_ids":["call-1"],"usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"content":[{"output_index":0,"part_index":0,"phase":"reasoning","text":"Checked","annotations":[]},{"output_index":1,"part_index":0,"phase":"final_answer","text":"Done","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":4}]}]}}},"stream_metrics":[{"phase":"reasoning","first_delta_at_ms":1100,"last_delta_at_ms":1200,"chunk_count":2,"utf8_bytes":7,"longest_gap_ms":100},{"phase":"final_answer","first_delta_at_ms":1300,"last_delta_at_ms":1350,"chunk_count":1,"utf8_bytes":4,"longest_gap_ms":0}],"blocks":[],"preview":null}}"#
+        )
+        guard case .agentEvent(_, let completionRecord) = completion else {
+            return XCTFail("Expected model completion")
+        }
+        XCTAssertEqual(
+            completionRecord.event.msg["outcome"]?["toolCallIds"]?.arrayValue?.first?.stringValue,
+            "call-1"
+        )
+        XCTAssertEqual(completionRecord.streamMetrics.map(\.phase), [.reasoning, .finalAnswer])
+        XCTAssertEqual(completionRecord.streamMetrics.last?.utf8Bytes, 4)
+
+        let unknownCitation = #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1400,"event":{"msg":{"type":"model_step_completed","session_id":"chat-1","turn_id":"turn-1","model_step_id":"step-1","step_index":0,"started_at_ms":1000,"completed_at_ms":1400,"outcome":{"status":"completed","end_turn":true,"tool_call_ids":[],"usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2},"content":[{"output_index":0,"part_index":0,"phase":"final_answer","text":"Done","annotations":[{"type":"future"}]}]}}},"stream_metrics":[],"blocks":[],"preview":null}}"#
+        XCTAssertThrowsError(try decodeEnvelope(unknownCitation)) { error in
+            XCTAssertEqual(
+                error as? GatewayWireError,
+                .invalidFrame(
+                    "model_step_completed has unknown content annotation future"
+                )
+            )
+        }
+
+        let search = try decodeEnvelope(
+            #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":9,"recorded_at_ms":1500,"event":{"msg":{"type":"web_search_end","session_id":"chat-1","turn_id":"turn-1","model_step_id":"step-1","call_id":"search-1","action":{"type":"find_in_page","url":"https://example.com","pattern":"answer"}}},"stream_metrics":[],"blocks":[],"preview":null}}"#
+        )
+        guard case .agentEvent(_, let searchRecord) = search else {
+            return XCTFail("Expected web search event")
+        }
+        XCTAssertEqual(searchRecord.event.msg["action"]?["type"]?.stringValue, "find_in_page")
+        XCTAssertEqual(searchRecord.event.msg["action"]?["url"]?.stringValue, "https://example.com")
+        XCTAssertEqual(searchRecord.event.msg["action"]?["pattern"]?.stringValue, "answer")
+
+        let query = try decodeEnvelope(
+            #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":10,"recorded_at_ms":1600,"event":{"msg":{"type":"web_search_end","session_id":"chat-1","turn_id":"turn-1","model_step_id":"step-1","call_id":"search-2","action":{"type":"search","queries":["first query","second query"]}}},"stream_metrics":[],"blocks":[],"preview":null}}"#
+        )
+        guard case .agentEvent(_, let queryRecord) = query else {
+            return XCTFail("Expected web query event")
+        }
+        XCTAssertEqual(
+            queryRecord.event.msg["action"]?["queries"]?.arrayValue?.compactMap(\.stringValue),
+            ["first query", "second query"]
+        )
+    }
+
+    func testGatewayOnlyEventInvariantsAreRejected() {
+        let fixtures = [
+            #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"session_history","events":[]}},"stream_metrics":[],"blocks":[],"preview":null}}"#,
+            #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"agent_message_content_delta","session_id":"chat-1","turn_id":"turn-1","item_id":"old","delta":"x","phase":"final_answer"}},"stream_metrics":[],"blocks":[],"preview":null}}"#,
+        ]
+
+        for fixture in fixtures {
+            XCTAssertThrowsError(try decodeEnvelope(fixture))
+        }
     }
 
     func testUnknownAgentEventIsRejected() {
-        let fixture = #"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"future_event"}},"blocks":[]}"#
+        let fixture = #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"future_event"}},"stream_metrics":[],"blocks":[],"preview":null}}"#
         XCTAssertThrowsError(try decodeEnvelope(fixture)) { error in
             XCTAssertEqual(
                 error as? GatewayWireError,
@@ -712,8 +770,8 @@ final class GatewayWireTests: XCTestCase {
 
     func testInvalidFrontendEventSubtypeIsRejected() {
         let fixtures = [
-            (#"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"frontend"}},"blocks":[]}"#, "frontend event has no frontend_type"),
-            (#"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"frontend","frontend_type":"future_frontend"}},"blocks":[]}"#, "unknown frontend event future_frontend")
+            (#"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"frontend"}},"stream_metrics":[],"blocks":[],"preview":null}}"#, "frontend event has no frontend_type"),
+            (#"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"frontend","frontend_type":"future_frontend"}},"stream_metrics":[],"blocks":[],"preview":null}}"#, "unknown frontend event future_frontend")
         ]
 
         for (fixture, message) in fixtures {
@@ -725,8 +783,8 @@ final class GatewayWireTests: XCTestCase {
 
     func testMalformedFrontendEventPayloadIsRejected() {
         let fixtures = [
-            (#"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"frontend","frontend_type":"render","capability":"tools"}},"blocks":[]}"#, "frontend render is missing a required field"),
-            (#"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"frontend","frontend_type":"picker","title":"Choose","options":[{"label":"One","description":"First"}]}},"blocks":[]}"#, "frontend picker option is missing a required field")
+            (#"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"frontend","frontend_type":"render","capability":"tools"}},"stream_metrics":[],"blocks":[],"preview":null}}"#, "frontend render is missing a required field"),
+            (#"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"frontend","frontend_type":"picker","title":"Choose","options":[{"label":"One","description":"First"}]}},"stream_metrics":[],"blocks":[],"preview":null}}"#, "frontend picker option is missing a required field")
         ]
 
         for (fixture, message) in fixtures {
@@ -737,7 +795,7 @@ final class GatewayWireTests: XCTestCase {
     }
 
     func testUnknownRenderedPresentationValuesAreRejected() {
-        let outerBlock = #"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"task_complete","turn_id":"turn-1","last_agent_message":null}},"blocks":[{"id":null,"group":null,"append":false,"pending":false,"text":"Done","format":"future_format","tone":"neutral","files":[]}]}"#
+        let outerBlock = #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"task_complete","turn_id":"turn-1"}},"stream_metrics":[],"blocks":[{"capability":"tools","block":{"id":null,"group":null,"update":"replace","state":"complete","role":"tool","title":"Done","text":"","symbol":null,"format":"future_format","tone":"neutral","files":[]}}],"preview":null}}"#
         XCTAssertThrowsError(try decodeEnvelope(outerBlock))
 
         let invalidWidgetPayload = sessionReadyPayloadJSON.replacingOccurrences(
@@ -745,7 +803,7 @@ final class GatewayWireTests: XCTestCase {
             with: #""slot":"future_slot""#
         )
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":23,"type":"session_opened","request_id":"open-1","payload":\#(invalidWidgetPayload)}"#
+            #"{"version":24,"type":"session_opened","request_id":"open-1","payload":\#(invalidWidgetPayload)}"#
         ))
     }
 
@@ -761,7 +819,7 @@ final class GatewayWireTests: XCTestCase {
                 with: #""slot":"\#(rawSlot)""#
             )
             let envelope = try decodeEnvelope(
-                #"{"version":23,"type":"session_opened","request_id":"open-1","payload":\#(payload)}"#
+                #"{"version":24,"type":"session_opened","request_id":"open-1","payload":\#(payload)}"#
             )
             guard case .sessionOpened(_, let ready) = envelope else {
                 return XCTFail("Expected session opened envelope")
@@ -825,7 +883,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(edited, "Use one row.")
     }
 
-    func testV23MessageTargetsAreStrict() throws {
+    func testV24MessageTargetsAreStrict() throws {
         let operation = try decoder().decode(
             AgentOperation.self,
             from: Data(
@@ -858,46 +916,46 @@ final class GatewayWireTests: XCTestCase {
         }
 
         let untargeted = try decodeEnvelope(
-            #"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"user_message","message":"Hello","attachments":[],"message_target":null}},"blocks":[]}"#
+            #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"user_message","message":"Hello","attachments":[],"message_target":null}},"stream_metrics":[],"blocks":[],"preview":null}}"#
         )
-        guard case .agentEvent(_, _, let event, _, _, _) = untargeted else {
+        guard case .agentEvent(_, let record) = untargeted else {
             return XCTFail("Expected an agent event")
         }
-        XCTAssertEqual(event.msg["messageTarget"], .null)
+        XCTAssertEqual(record.event.msg["messageTarget"], JSONValue.null)
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"user_message","message":"Hello","attachments":[]}},"blocks":[]}"#
+            #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"user_message","message":"Hello","attachments":[]}},"stream_metrics":[],"blocks":[],"preview":null}}"#
         ))
     }
 
-    func testSessionFileResponsesMatchV23() throws {
+    func testSessionFileResponsesMatchV24() throws {
         let record = #"{"id":"file-1","name":"scan.png","size":3,"media_type":"image/png"}"#
 
-        let started = try decodeEnvelope(#"{"version":23,"type":"session_file_upload_ready","request_id":"begin-1","session_id":"chat-1","upload_id":"upload-1","max_chunk_bytes":262144}"#)
+        let started = try decodeEnvelope(#"{"version":24,"type":"session_file_upload_ready","request_id":"begin-1","session_id":"chat-1","upload_id":"upload-1","max_chunk_bytes":262144}"#)
         guard case .sessionFileUploadReady(let requestID, let sessionID, let uploadID, let limit) = started else {
             return XCTFail("Expected session file upload start")
         }
         XCTAssertEqual([requestID, sessionID, uploadID], ["begin-1", "chat-1", "upload-1"])
         XCTAssertEqual(limit, 262_144)
 
-        let accepted = try decodeEnvelope(#"{"version":23,"type":"session_file_upload_chunk_accepted","request_id":"chunk-1","session_id":"chat-1","upload_id":"upload-1","next_offset":3}"#)
+        let accepted = try decodeEnvelope(#"{"version":24,"type":"session_file_upload_chunk_accepted","request_id":"chunk-1","session_id":"chat-1","upload_id":"upload-1","next_offset":3}"#)
         guard case .sessionFileUploadChunkAccepted(_, _, _, let nextOffset) = accepted else {
             return XCTFail("Expected session file chunk acknowledgement")
         }
         XCTAssertEqual(nextOffset, 3)
 
-        let uploaded = try decodeEnvelope(#"{"version":23,"type":"session_file_upload_completed","request_id":"finish-1","session_id":"chat-1","file":\#(record)}"#)
+        let uploaded = try decodeEnvelope(#"{"version":24,"type":"session_file_upload_completed","request_id":"finish-1","session_id":"chat-1","file":\#(record)}"#)
         guard case .sessionFileUploadCompleted(_, _, let file) = uploaded else {
             return XCTFail("Expected uploaded session file")
         }
         XCTAssertEqual(file.mediaType, "image/png")
 
-        let listed = try decodeEnvelope(#"{"version":23,"type":"session_uploads","request_id":"list-1","session_id":"chat-1","uploads":[\#(record)]}"#)
+        let listed = try decodeEnvelope(#"{"version":24,"type":"session_uploads","request_id":"list-1","session_id":"chat-1","uploads":[\#(record)]}"#)
         guard case .sessionUploads(_, _, let uploads) = listed else {
             return XCTFail("Expected session upload list")
         }
         XCTAssertEqual(uploads.first?.name, "scan.png")
 
-        let chunk = try decodeEnvelope(#"{"version":23,"type":"session_file_chunk","request_id":"read-1","session_id":"chat-1","file_id":"file-1","offset":0,"data":"AQID","next_offset":null}"#)
+        let chunk = try decodeEnvelope(#"{"version":24,"type":"session_file_chunk","request_id":"read-1","session_id":"chat-1","file_id":"file-1","offset":0,"data":"AQID","next_offset":null}"#)
         guard case .sessionFileChunk(_, _, _, let offset, let data, let finalOffset) = chunk else {
             return XCTFail("Expected session file chunk")
         }
@@ -906,7 +964,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertNil(finalOffset)
 
         let artifact = try decodeEnvelope(
-            #"{"version":23,"type":"artifacts","request_id":"artifacts-1","session_id":"chat-1","artifacts":[{"id":"artifact-1","session_id":"chat-1","kind":"file","title":"Scan","block":{"id":"artifacts/file-1","group":null,"append":false,"pending":false,"text":"","files":[\#(record)],"format":"plain_text","tone":"neutral"}}],"truncated":true}"#
+            #"{"version":24,"type":"artifacts","request_id":"artifacts-1","session_id":"chat-1","artifacts":[{"id":"artifact-1","session_id":"chat-1","kind":"file","title":"Scan","block":{"id":"artifacts/file-1","group":null,"update":"replace","state":"complete","role":"artifact","title":"Scan","text":"","symbol":"storage","files":[\#(record)],"format":"plain_text","tone":"neutral"}}],"truncated":true}"#
         )
         guard case .artifacts(
             let artifactRequestID,
@@ -923,8 +981,8 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertTrue(truncated)
     }
 
-    func testFrontendBlockRequiresFilesInV23() {
-        let fixture = #"{"id":null,"group":null,"append":false,"pending":false,"text":"Done","format":"plain_text","tone":"neutral"}"#
+    func testFrontendBlockRequiresFilesInV24() {
+        let fixture = #"{"id":null,"group":null,"update":"replace","state":"complete","role":"notice","title":"Done","text":"","symbol":null,"format":"plain_text","tone":"neutral"}"#
 
         XCTAssertThrowsError(
             try decoder().decode(FrontendBlock.self, from: Data(fixture.utf8))
@@ -936,14 +994,14 @@ final class GatewayWireTests: XCTestCase {
         }
     }
 
-    func testWorkspaceViewerResponsesMatchV23() throws {
-        let files = try decodeEnvelope(#"{"version":23,"type":"workspace_files","request_id":"files-1","session_id":"chat-1","files":[{"path":"Sources/App.swift","size":3}]}"#)
+    func testWorkspaceViewerResponsesMatchV24() throws {
+        let files = try decodeEnvelope(#"{"version":24,"type":"workspace_files","request_id":"files-1","session_id":"chat-1","files":[{"path":"Sources/App.swift","size":3}]}"#)
         guard case .workspaceFiles(_, _, let records) = files else {
             return XCTFail("Expected workspace files")
         }
         XCTAssertEqual(records.first, WorkspaceFileRecord(path: "Sources/App.swift", size: 3))
 
-        let chunk = try decodeEnvelope(#"{"version":23,"type":"workspace_file_chunk","request_id":"read-1","session_id":"chat-1","path":"Sources/App.swift","offset":0,"data":"AQID","next_offset":null}"#)
+        let chunk = try decodeEnvelope(#"{"version":24,"type":"workspace_file_chunk","request_id":"read-1","session_id":"chat-1","path":"Sources/App.swift","offset":0,"data":"AQID","next_offset":null}"#)
         guard case .workspaceFileChunk(_, _, let path, let offset, let data, let nextOffset) = chunk else {
             return XCTFail("Expected workspace file chunk")
         }
@@ -955,8 +1013,8 @@ final class GatewayWireTests: XCTestCase {
 
     func testMalformedKnownAgentEventIsRejected() {
         let fixtures = [
-            #"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"turn_aborted","turn_id":"turn-1"}},"blocks":[]}"#,
-            #"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"agent_message","message":"Working","phase":"future_phase"}},"blocks":[]}"#
+            #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"turn_aborted","turn_id":"turn-1"}},"stream_metrics":[],"blocks":[],"preview":null}}"#,
+            #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"agent_message","session_id":"chat-1","turn_id":"turn-1","model_step_id":"step-1","message":"Working","phase":"future_phase","message_target":null}},"stream_metrics":[],"blocks":[],"preview":null}}"#
         ]
 
         for fixture in fixtures {
@@ -966,8 +1024,7 @@ final class GatewayWireTests: XCTestCase {
 
     func testUnknownAuxiliaryRenderedEventsAreRejected() {
         let fixtures = [
-            #"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"session_history","events":[]}},"blocks":[],"history":[{"event":{"type":"future_event"},"blocks":[]}]}"#,
-            #"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"msg":{"type":"frontend","frontend_type":"preview","title":"Worker","events":[]}},"blocks":[],"preview":{"title":"Worker","events":[{"event":{"type":"future_event"},"blocks":[]}]}}"#
+            #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"frontend","frontend_type":"preview","title":"Worker","events":[]}},"stream_metrics":[],"blocks":[],"preview":{"title":"Worker","events":[{"event":{"type":"future_event"},"blocks":[]}]}}}"#
         ]
 
         for fixture in fixtures {
@@ -981,19 +1038,22 @@ final class GatewayWireTests: XCTestCase {
     }
 
     func testFrontendRenderAgentEventIsAccepted() throws {
-        let fixture = #"{"version":23,"type":"agent_event","session_id":"chat-1","sequence":8,"event":{"submission_id":"input-1","msg":{"type":"frontend","frontend_type":"render","capability":"tools","block":{"id":null,"group":null,"append":false,"pending":false,"text":"Done","format":"plain_text","tone":"neutral","files":[]}}},"blocks":[{"id":null,"group":null,"append":false,"pending":false,"text":"Done","format":"plain_text","tone":"neutral","files":[]}]}"#
+        let fixture = #"{"version":24,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"submission_id":"input-1","msg":{"type":"frontend","frontend_type":"render","capability":"tools","block":{"id":"call-1","group":"turn-1","update":"replace","state":"complete","role":"tool","title":"Read file","text":"Done","symbol":"task","format":"plain_text","tone":"neutral","files":[]}}},"stream_metrics":[],"blocks":[{"capability":"tools","block":{"id":"call-1","group":"turn-1","update":"replace","state":"complete","role":"tool","title":"Read file","text":"Done","symbol":"task","format":"plain_text","tone":"neutral","files":[]}}],"preview":null}}"#
         let envelope = try decodeEnvelope(fixture)
 
-        guard case .agentEvent(_, _, let event, let blocks, _, _) = envelope else {
+        guard case .agentEvent(_, let record) = envelope else {
             return XCTFail("Expected agent event envelope")
         }
-        XCTAssertEqual(event.msg["frontendType"]?.stringValue, "render")
-        XCTAssertEqual(blocks.first?.text, "Done")
+        XCTAssertEqual(record.event.msg["frontendType"]?.stringValue, "render")
+        XCTAssertEqual(record.blocks.first?.capability, "tools")
+        XCTAssertEqual(record.blocks.first?.block.role, .tool)
+        XCTAssertEqual(record.blocks.first?.block.title, "Read file")
+        XCTAssertEqual(record.blocks.first?.block.text, "Done")
     }
 
     func testSessionsResponseAllowsOmittedRequestID() throws {
         let envelope = try decodeEnvelope(
-            #"{"version":23,"type":"sessions","sessions":[\#(sessionRecordJSON)]}"#
+            #"{"version":24,"type":"sessions","sessions":[\#(sessionRecordJSON)]}"#
         )
         guard case .sessions(let requestID, let sessions) = envelope else {
             return XCTFail("Expected sessions envelope")
@@ -1003,8 +1063,8 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(sessions.first?.pinned, true)
     }
 
-    func testScopedGitAndCronResponsesDecodeV23Fields() throws {
-        let gitDiff = try decodeEnvelope(#"{"version":23,"type":"git_diff","request_id":"diff-1","session_id":"chat-1","scope":"unstaged","diff":"diff --git a/a b/a"}"#)
+    func testScopedGitAndCronResponsesDecodeV24Fields() throws {
+        let gitDiff = try decodeEnvelope(#"{"version":24,"type":"git_diff","request_id":"diff-1","session_id":"chat-1","scope":"unstaged","diff":"diff --git a/a b/a"}"#)
         guard case .gitDiff(let diffRequestID, let diffSessionID, let scope, let diff) = gitDiff else {
             return XCTFail("Expected git diff envelope")
         }
@@ -1013,7 +1073,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(scope, .unstaged)
         XCTAssertTrue(diff.hasPrefix("diff --git"))
 
-        let tasks = try decodeEnvelope(#"{"version":23,"type":"cron_tasks","request_id":"cron-1","session_id":"chat-1","tasks":[{"id":"task-1","session_id":"chat-1","task":"/srv/task.md","schedule":"0 9 * * *"}]}"#)
+        let tasks = try decodeEnvelope(#"{"version":24,"type":"cron_tasks","request_id":"cron-1","session_id":"chat-1","tasks":[{"id":"task-1","session_id":"chat-1","task":"/srv/task.md","schedule":"0 9 * * *"}]}"#)
         guard case .cronTasks(let taskRequestID, let taskSessionID, let cronTasks) = tasks else {
             return XCTFail("Expected cron tasks envelope")
         }
@@ -1021,7 +1081,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(taskSessionID, "chat-1")
         XCTAssertEqual(cronTasks.first?.sessionId, "chat-1")
 
-        let history = try decodeEnvelope(#"{"version":23,"type":"cron_history","request_id":"history-1","session_id":"chat-1","runs":[{"id":"run-1","task_id":"task-1","source_session_id":"chat-1","started_at":100,"finished_at":110,"status":"succeeded","session_id":"chat-2","message":null}]}"#)
+        let history = try decodeEnvelope(#"{"version":24,"type":"cron_history","request_id":"history-1","session_id":"chat-1","runs":[{"id":"run-1","task_id":"task-1","source_session_id":"chat-1","started_at":100,"finished_at":110,"status":"succeeded","session_id":"chat-2","message":null}]}"#)
         guard case .cronHistory(let historyRequestID, let historySessionID, let runs) = history else {
             return XCTFail("Expected cron history envelope")
         }
@@ -1033,34 +1093,34 @@ final class GatewayWireTests: XCTestCase {
 
     func testUnknownCronRunStatusIsRejected() {
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":23,"type":"cron_history","request_id":"history-1","session_id":"chat-1","runs":[{"id":"run-1","task_id":"task-1","source_session_id":"chat-1","started_at":100,"finished_at":110,"status":"future_status","session_id":null,"message":null}]}"#
+            #"{"version":24,"type":"cron_history","request_id":"history-1","session_id":"chat-1","runs":[{"id":"run-1","task_id":"task-1","source_session_id":"chat-1","started_at":100,"finished_at":110,"status":"future_status","session_id":null,"message":null}]}"#
         ))
     }
 
     func testControlProviderProfileAndDirectoryResponsesDecode() throws {
-        guard case .authenticated = try decodeEnvelope(#"{"version":23,"type":"authenticated"}"#) else {
+        guard case .authenticated = try decodeEnvelope(#"{"version":24,"type":"authenticated"}"#) else {
             return XCTFail("Expected authenticated envelope")
         }
-        guard case .accepted(let acceptedID) = try decodeEnvelope(#"{"version":23,"type":"accepted","request_id":"request-1"}"#) else {
+        guard case .accepted(let acceptedID) = try decodeEnvelope(#"{"version":24,"type":"accepted","request_id":"request-1"}"#) else {
             return XCTFail("Expected accepted envelope")
         }
         XCTAssertEqual(acceptedID, "request-1")
 
-        guard case .providerCredentialStatus(let credentialID, let provider, let configured) = try decodeEnvelope(#"{"version":23,"type":"provider_credential_status","request_id":"credential-1","provider":"openai_socket","configured":true}"#) else {
+        guard case .providerCredentialStatus(let credentialID, let provider, let configured) = try decodeEnvelope(#"{"version":24,"type":"provider_credential_status","request_id":"credential-1","provider":"openai_socket","configured":true}"#) else {
             return XCTFail("Expected provider credential status envelope")
         }
         XCTAssertEqual(credentialID, "credential-1")
         XCTAssertEqual(provider, "openai_socket")
         XCTAssertTrue(configured)
 
-        guard case .pairingCode(let pairingID, let code, let expiresAt) = try decodeEnvelope(#"{"version":23,"type":"pairing_code","request_id":"pairing-1","code":"123456","expires_at":500}"#) else {
+        guard case .pairingCode(let pairingID, let code, let expiresAt) = try decodeEnvelope(#"{"version":24,"type":"pairing_code","request_id":"pairing-1","code":"123456","expires_at":500}"#) else {
             return XCTFail("Expected pairing code envelope")
         }
         XCTAssertEqual(pairingID, "pairing-1")
         XCTAssertEqual(code, "123456")
         XCTAssertEqual(expiresAt, 500)
 
-        guard case .providerLoginStarted(let loginRequestID, let loginID, let loginProvider, let verificationURL, let userCode) = try decodeEnvelope(#"{"version":23,"type":"provider_login_started","request_id":"login-1","login_id":"device-1","provider":"openai_codex","verification_url":"https://example.com/device","user_code":"ABCD"}"#) else {
+        guard case .providerLoginStarted(let loginRequestID, let loginID, let loginProvider, let verificationURL, let userCode) = try decodeEnvelope(#"{"version":24,"type":"provider_login_started","request_id":"login-1","login_id":"device-1","provider":"openai_codex","verification_url":"https://example.com/device","user_code":"ABCD"}"#) else {
             return XCTFail("Expected provider login started envelope")
         }
         XCTAssertEqual(loginRequestID, "login-1")
@@ -1069,14 +1129,14 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(verificationURL, "https://example.com/device")
         XCTAssertEqual(userCode, "ABCD")
 
-        guard case .providerLoginFinished(let finishedRequestID, let finishedLoginID, let finishedProvider) = try decodeEnvelope(#"{"version":23,"type":"provider_login_finished","request_id":"login-1","login_id":"device-1","provider":"openai_codex"}"#) else {
+        guard case .providerLoginFinished(let finishedRequestID, let finishedLoginID, let finishedProvider) = try decodeEnvelope(#"{"version":24,"type":"provider_login_finished","request_id":"login-1","login_id":"device-1","provider":"openai_codex"}"#) else {
             return XCTFail("Expected provider login finished envelope")
         }
         XCTAssertEqual(finishedRequestID, "login-1")
         XCTAssertEqual(finishedLoginID, "device-1")
         XCTAssertEqual(finishedProvider, "openai_codex")
 
-        let profileFixture = #"{"version":23,"type":"profile","request_id":"profile-1","profile":{"user_name":"Ada","daily_usage":[{"unix_day":100,"provider":"anthropic","usage":\#(usageJSON)},{"unix_day":100,"provider":"openai_socket","usage":\#(usageJSON)}],"run_stats":\#(runStatsJSON),"recent_run_groups":[{"session_id":"chat-1","title":"Thread title","runs":[{"session_id":"agent-1","submission_id":"input-1","turn_id":"turn-1","started_at_ms":1000,"finished_at_ms":10000,"elapsed_ms":9000,"outcome":"completed","model_calls":2,"tool_calls":3,"failed_tool_calls":0,"usage":\#(usageJSON)}]}]}}"#
+        let profileFixture = #"{"version":24,"type":"profile","request_id":"profile-1","profile":{"user_name":"Ada","daily_usage":[{"unix_day":100,"provider":"anthropic","usage":\#(usageJSON)},{"unix_day":100,"provider":"openai_socket","usage":\#(usageJSON)}],"run_stats":\#(runStatsJSON),"recent_run_groups":[{"session_id":"chat-1","title":"Thread title","runs":[{"session_id":"agent-1","submission_id":"input-1","turn_id":"turn-1","started_at_ms":1000,"finished_at_ms":10000,"elapsed_ms":9000,"outcome":"completed","model_calls":2,"tool_calls":3,"failed_tool_calls":0,"usage":\#(usageJSON)}]}]}}"#
         guard case .profile(let profileID, let profile) = try decodeEnvelope(profileFixture) else {
             return XCTFail("Expected profile envelope")
         }
@@ -1089,7 +1149,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(profile.recentRunGroups.first?.runs.first?.sessionId, "agent-1")
         XCTAssertEqual(profile.recentRunGroups.first?.runs.first?.toolCalls, 3)
 
-        guard case .directories(let directoryID, let listing) = try decodeEnvelope(#"{"version":23,"type":"directories","request_id":"directories-1","listing":{"path":"/srv","parent":null,"entries":[]}}"#) else {
+        guard case .directories(let directoryID, let listing) = try decodeEnvelope(#"{"version":24,"type":"directories","request_id":"directories-1","listing":{"path":"/srv","parent":null,"entries":[]}}"#) else {
             return XCTFail("Expected directories envelope")
         }
         XCTAssertEqual(directoryID, "directories-1")
@@ -1097,20 +1157,20 @@ final class GatewayWireTests: XCTestCase {
     }
 
     func testPairedRejectedAndErrorResponsesDecode() throws {
-        guard case .paired(let clientID, let token) = try decodeEnvelope(#"{"version":23,"type":"paired","client_id":"phone-7","token":"bearer"}"#) else {
+        guard case .paired(let clientID, let token) = try decodeEnvelope(#"{"version":24,"type":"paired","client_id":"phone-7","token":"bearer"}"#) else {
             return XCTFail("Expected paired envelope")
         }
         XCTAssertEqual(clientID, "phone-7")
         XCTAssertEqual(token, "bearer")
 
-        guard case .rejected(let rejection) = try decodeEnvelope(#"{"version":23,"type":"rejected","request_id":"request-1","code":"conflict","message":"stale","fatal":false}"#) else {
+        guard case .rejected(let rejection) = try decodeEnvelope(#"{"version":24,"type":"rejected","request_id":"request-1","code":"conflict","message":"stale","fatal":false}"#) else {
             return XCTFail("Expected rejected envelope")
         }
         XCTAssertEqual(rejection.requestId, "request-1")
         XCTAssertEqual(rejection.code, "conflict")
         XCTAssertFalse(rejection.fatal)
 
-        guard case .error(let failure) = try decodeEnvelope(#"{"version":23,"type":"error","code":"internal","message":"failed","fatal":true}"#) else {
+        guard case .error(let failure) = try decodeEnvelope(#"{"version":24,"type":"error","code":"internal","message":"failed","fatal":true}"#) else {
             return XCTFail("Expected error envelope")
         }
         XCTAssertEqual(failure.code, "internal")
@@ -1118,7 +1178,7 @@ final class GatewayWireTests: XCTestCase {
     }
 
     func testUnknownGatewayMessageAndOperationAreRejected() {
-        XCTAssertThrowsError(try decodeEnvelope(#"{"version":23,"type":"future_message"}"#)) { error in
+        XCTAssertThrowsError(try decodeEnvelope(#"{"version":24,"type":"future_message"}"#)) { error in
             XCTAssertEqual(
                 error as? GatewayWireError,
                 .invalidFrame("unknown gateway message future_message")

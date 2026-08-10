@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use chrono::Utc;
 use horus::agent::{AgentConfig, AgentSender};
 use horus::backend::checkpoint::{
-    ActiveExecution, Checkpoint, CheckpointStore, ExecutionOutcome, ExecutionRecord,
-    ExecutionStats, SessionPageRequest, SessionSummary, TranscriptPageRequest,
+    ActiveExecution, Checkpoint, CheckpointStore, EventPageRequest, ExecutionOutcome,
+    ExecutionRecord, ExecutionStats, JournalEvent, SessionPageRequest, SessionSummary,
     sqlite::SqliteCheckpoint,
 };
 use horus::backend::model::provider::provider;
@@ -22,8 +22,9 @@ use horus::middleware::FrontendExtensions;
 use horus::middleware::scratchpad::ScratchpadStore;
 use horus::middleware::session_files::SessionFileStore;
 use horus::protocol::{
-    Event, EventMsg, FrontendBlock, FrontendBlockFormat, FrontendEvent, Op, ReviewDecision,
-    SessionFileReference, Submission, replay_events,
+    Event, EventMsg, FrontendBlock, FrontendBlockFormat, FrontendBlockRole, FrontendBlockState,
+    FrontendBlockUpdate, FrontendEvent, ModelStepOutcome, Op, RenderedBlock, ReviewDecision,
+    SessionFileReference, Submission,
 };
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use uuid::Uuid;
@@ -37,10 +38,10 @@ use crate::cron::{ActiveCronRun, BeginRun, CronStore};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{
     AgentComposition, ArtifactKind, ArtifactRecord, CronRunStatus, GitDiffScope, MAX_FRAME_BYTES,
-    ProfileSnapshot, ProviderConfig, ReadyPayload, RenderedEvent, RenderedPreview, RunStats,
-    RunSummary, ServerFrame, ServerMessage, SessionActivity, SessionActivityState, SessionOutcome,
-    SessionReadyPayload, SessionRecord, SessionRunGroup, SessionWidget, VersionedAgentConfig,
-    WorkspaceFileScope,
+    ProfileSnapshot, ProviderConfig, ReadyPayload, RecordedEvent, RenderedEvent, RenderedPreview,
+    RunStats, RunSummary, ServerFrame, ServerMessage, SessionActivity, SessionActivityState,
+    SessionOutcome, SessionReadyPayload, SessionRecord, SessionRunGroup, SessionWidget,
+    VersionedAgentConfig, WorkspaceFileScope,
 };
 use crate::{Error, Result};
 
@@ -56,6 +57,7 @@ use self::git::{
 const COMMAND_CAPACITY: usize = 128;
 const BROADCAST_CAPACITY: usize = 512;
 const REPLAY_CAPACITY: usize = 1024;
+const REPLAY_LOAD_PAGE_SIZE: usize = 8;
 const MAX_REPLAY_BYTES: usize = MAX_FRAME_BYTES;
 const ARTIFACT_CAPACITY: usize = 256;
 const SESSION_PAGE_SIZE: usize = 100;
@@ -75,6 +77,7 @@ struct HostInner {
     commands: mpsc::Sender<HostCommand>,
     events: broadcast::Sender<ServerFrame>,
     accepts_file_attachments: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
 }
 
 /// Machine-wide chat registry. A session has at most one resident agent owner.
@@ -105,7 +108,7 @@ pub(crate) struct HostSnapshot {
 }
 
 pub(crate) struct SessionHistoryPage {
-    pub(crate) events: Vec<RenderedEvent>,
+    pub(crate) records: Vec<RecordedEvent>,
     pub(crate) next_before_sequence: Option<u64>,
 }
 
@@ -126,6 +129,7 @@ struct HostState {
     scratchpad: ScratchpadStore,
     session_files: SessionFileStore,
     accepts_file_attachments: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     catalog_lock: Arc<Mutex<()>>,
     activities: SessionActivities,
     running: RunningAgent,
@@ -133,14 +137,12 @@ struct HostState {
     approval_active: bool,
     turn_error: Option<String>,
     restart_after_turn: bool,
-    suppress_history_broadcast: bool,
     pending_startup: Vec<ServerFrame>,
     active_cron: Option<ActiveCron>,
-    replay_epoch: String,
     sequence: u64,
     replay: VecDeque<ServerFrame>,
     replay_bytes: usize,
-    replay_truncated: bool,
+    next_before_sequence: Option<u64>,
     artifacts: VecDeque<ArtifactRecord>,
     widgets: SessionWidgets,
     commands: mpsc::Receiver<HostCommand>,
@@ -149,16 +151,24 @@ struct HostState {
     idle_waiters: Vec<oneshot::Sender<()>>,
 }
 
+struct LoadedReplay {
+    latest_sequence: u64,
+    replay: VecDeque<ServerFrame>,
+    replay_bytes: usize,
+    next_before_sequence: Option<u64>,
+    artifacts: VecDeque<ArtifactRecord>,
+    widgets: SessionWidgets,
+}
+
 struct RunningAgent {
     session_id: String,
-    sender: AgentSender,
-    events: mpsc::Receiver<Event>,
+    sender: Option<AgentSender>,
+    events: mpsc::Receiver<JournalEvent>,
     frontend: FrontendExtensions,
     session: horus::protocol::SessionConfiguredEvent,
     gateway_sandbox: Arc<GatewaySandbox>,
     subagent_template: Option<Arc<OnceLock<AgentConfig>>>,
     tool_count: usize,
-    next_before_sequence: Option<u64>,
 }
 
 struct ActiveCron {
@@ -171,12 +181,11 @@ struct ActiveCron {
 enum HostCommand {
     Snapshot {
         last_sequence: Option<u64>,
-        replay_epoch: Option<String>,
         reply: oneshot::Sender<std::result::Result<HostSnapshot, Rejection>>,
     },
     HistoryPage {
         before_sequence: Option<u64>,
-        max_batches: usize,
+        max_events: usize,
         reply: oneshot::Sender<std::result::Result<SessionHistoryPage, Rejection>>,
     },
     RenameSession {
@@ -187,10 +196,6 @@ enum HostCommand {
     SetSessionPinned {
         session_id: String,
         pinned: bool,
-        reply: oneshot::Sender<std::result::Result<(), Rejection>>,
-    },
-    DeleteSession {
-        session_id: String,
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
     Submit {
@@ -248,7 +253,20 @@ enum HostCommand {
 
 enum Next {
     Command(Option<HostCommand>),
-    Event(Option<Event>),
+    Event(Option<JournalEvent>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalSequence {
+    AlreadyLoaded,
+    Next,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalDelivery {
+    Live,
+    LoadedStartup,
+    ReplacementStartup,
 }
 
 impl GatewayHost {
@@ -356,9 +374,12 @@ impl GatewayHost {
         session_id: &str,
     ) -> std::result::Result<HostHandle, Rejection> {
         let mut state = self.state.lock().await;
-        if let Some(host) = state.sessions.get(session_id) {
+        if let Some(host) = state.sessions.get(session_id)
+            && host.is_alive()
+        {
             return Ok(host.clone());
         }
+        state.sessions.remove(session_id);
         state.ensure_capacity().await?;
         let checkpoint = state
             .checkpoints
@@ -402,6 +423,68 @@ impl GatewayHost {
         .map_err(internal)?;
         state.sessions.insert(session_id.into(), host.clone());
         Ok(host)
+    }
+
+    pub(crate) async fn delete_session(
+        &self,
+        session_id: &str,
+    ) -> std::result::Result<(), Rejection> {
+        let mut state = self.state.lock().await;
+        let summaries = gateway_session_summaries(&state.checkpoints)
+            .await
+            .map_err(internal)?;
+        let session_ids = session_tree_ids(session_id, &summaries).ok_or_else(unknown_session)?;
+        for id in &session_ids {
+            state.cron.require_session_idle(id).map_err(internal)?;
+        }
+        for id in &session_ids {
+            let Some(host) = state.sessions.get(id).cloned() else {
+                continue;
+            };
+            if !host.stop_if_idle().await {
+                return Err(Rejection {
+                    code: "agent_busy",
+                    message: "finish or interrupt the active turn before deleting this chat".into(),
+                    fatal: false,
+                });
+            }
+            state.sessions.remove(id);
+        }
+        for id in &session_ids {
+            state.cron.delete_session(id).map_err(internal)?;
+            state
+                .session_files
+                .delete_session(id)
+                .await
+                .map_err(internal)?;
+        }
+        let catalog_lock = Arc::clone(&state.catalog_lock);
+        let _catalog = catalog_lock.lock().await;
+        let mut metadata = load_session_metadata(&state.checkpoints)
+            .await
+            .map_err(internal)?;
+        for id in &session_ids {
+            metadata.remove(id);
+        }
+        save_session_metadata(&state.checkpoints, &metadata)
+            .await
+            .map_err(internal)?;
+        if !state
+            .checkpoints
+            .delete_session(session_id)
+            .await
+            .map_err(internal)?
+        {
+            return Err(unknown_session());
+        }
+        state
+            .activities
+            .lock()
+            .map_err(|_| internal("session activity lock is poisoned"))?
+            .retain(|id, _| !session_ids.iter().any(|deleted| deleted == id));
+        drop(_catalog);
+        drop(state);
+        self.broadcast_sessions().await
     }
 
     pub(crate) async fn run_cron(
@@ -643,14 +726,16 @@ impl HostHandle {
         let accepts_file_attachments = Arc::new(AtomicBool::new(runtime_accepts_attachments(
             &running.frontend,
         )));
+        let alive = Arc::new(AtomicBool::new(true));
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let loaded = load_replay(checkpoints.as_ref(), &session_id, &running.frontend).await?;
         activities
             .lock()
             .map_err(|_| Error::Config("session activity lock is poisoned".into()))?
             .entry(session_id.clone())
             .or_default();
-        let state = HostState {
+        let mut state = HostState {
             store,
             gateway,
             spec,
@@ -660,6 +745,7 @@ impl HostHandle {
             scratchpad,
             session_files,
             accepts_file_attachments: Arc::clone(&accepts_file_attachments),
+            alive: Arc::clone(&alive),
             catalog_lock,
             activities,
             running,
@@ -667,21 +753,20 @@ impl HostHandle {
             approval_active: false,
             turn_error: None,
             restart_after_turn: false,
-            suppress_history_broadcast: false,
             pending_startup: Vec::new(),
             active_cron: None,
-            replay_epoch: Uuid::new_v4().to_string(),
-            sequence: 0,
-            replay: VecDeque::with_capacity(REPLAY_CAPACITY),
-            replay_bytes: 0,
-            replay_truncated: false,
-            artifacts: VecDeque::with_capacity(ARTIFACT_CAPACITY),
-            widgets: BTreeMap::new(),
+            sequence: loaded.latest_sequence,
+            replay: loaded.replay,
+            replay_bytes: loaded.replay_bytes,
+            next_before_sequence: loaded.next_before_sequence,
+            artifacts: loaded.artifacts,
+            widgets: loaded.widgets,
             commands: receiver,
             events: events.clone(),
             gateway_events,
             idle_waiters: Vec::new(),
         };
+        state.reconcile_loaded_startup().await?;
         tokio::spawn(state.run());
         Ok(Self {
             inner: Arc::new(HostInner {
@@ -689,6 +774,7 @@ impl HostHandle {
                 commands,
                 events,
                 accepts_file_attachments,
+                alive,
             }),
         })
     }
@@ -707,15 +793,17 @@ impl HostHandle {
         self.inner.accepts_file_attachments.load(Ordering::Relaxed)
     }
 
+    fn is_alive(&self) -> bool {
+        self.inner.alive.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn snapshot(
         &self,
         last_sequence: Option<u64>,
-        replay_epoch: Option<String>,
     ) -> std::result::Result<HostSnapshot, Rejection> {
         let (reply, receiver) = oneshot::channel();
         self.send(HostCommand::Snapshot {
             last_sequence,
-            replay_epoch,
             reply,
         })
         .await?;
@@ -725,12 +813,12 @@ impl HostHandle {
     pub(crate) async fn history_page(
         &self,
         before_sequence: Option<u64>,
-        max_batches: usize,
+        max_events: usize,
     ) -> std::result::Result<SessionHistoryPage, Rejection> {
         let (reply, receiver) = oneshot::channel();
         self.send(HostCommand::HistoryPage {
             before_sequence,
-            max_batches,
+            max_events,
             reply,
         })
         .await?;
@@ -764,16 +852,6 @@ impl HostHandle {
             reply,
         })
         .await?;
-        receive(receiver).await
-    }
-
-    pub(crate) async fn delete_session(
-        &self,
-        session_id: String,
-    ) -> std::result::Result<(), Rejection> {
-        let (reply, receiver) = oneshot::channel();
-        self.send(HostCommand::DeleteSession { session_id, reply })
-            .await?;
         receive(receiver).await
     }
 
@@ -934,6 +1012,69 @@ impl HostHandle {
 }
 
 impl HostState {
+    async fn reconcile_loaded_startup(&mut self) -> Result<()> {
+        self.reconcile_startup_through(self.sequence, JournalDelivery::LoadedStartup)
+            .await
+    }
+
+    async fn reconcile_replacement_startup(&mut self) -> Result<()> {
+        let high_water = self
+            .checkpoints
+            .event_page(
+                &self.running.session_id,
+                EventPageRequest {
+                    before_sequence: None,
+                    limit: 1,
+                },
+            )
+            .await?
+            .latest_sequence;
+        self.reconcile_startup_through(high_water, JournalDelivery::ReplacementStartup)
+            .await
+    }
+
+    async fn reconcile_startup_through(
+        &mut self,
+        high_water: u64,
+        delivery: JournalDelivery,
+    ) -> Result<()> {
+        if high_water == 0 {
+            return Ok(());
+        }
+        loop {
+            let record = self.running.events.recv().await.ok_or_else(|| {
+                Error::Config("agent stopped before the startup high-water was delivered".into())
+            })?;
+            let sequence = record.sequence;
+            if let Some(frame) = self.project_and_publish(record, delivery)?
+                && delivery == JournalDelivery::ReplacementStartup
+            {
+                self.pending_startup.push(frame);
+            }
+            if sequence >= high_water {
+                break;
+            }
+        }
+        loop {
+            match self.running.events.try_recv() {
+                Ok(record) => {
+                    if let Some(frame) = self.project_and_publish(record, delivery)?
+                        && delivery == JournalDelivery::ReplacementStartup
+                    {
+                        self.pending_startup.push(frame);
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(Error::Config(
+                        "agent stopped while startup events were reconciled".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn run(mut self) {
         loop {
             let next = tokio::select! {
@@ -949,11 +1090,20 @@ impl HostState {
                 Next::Command(None) => break,
                 Next::Event(Some(event)) => {
                     if let Err(error) = self.forward_event(event).await {
+                        let message = error.to_string();
                         self.broadcast(ServerMessage::Error {
                             code: "host_error".into(),
-                            message: error.to_string(),
-                            fatal: false,
+                            message: message.clone(),
+                            fatal: true,
                         });
+                        if let Err(activity_error) = self.fail_activity(&message).await {
+                            self.broadcast(ServerMessage::Error {
+                                code: "session_activity".into(),
+                                message: activity_error.to_string(),
+                                fatal: false,
+                            });
+                        }
+                        break;
                     }
                 }
                 Next::Event(None) => {
@@ -989,26 +1139,23 @@ impl HostState {
         }
         self.cron.cancel_setup(&self.running.session_id);
         shutdown_agent(self.running).await;
+        self.alive.store(false, Ordering::Release);
     }
 
     async fn handle(&mut self, command: HostCommand) -> bool {
         match command {
             HostCommand::Snapshot {
                 last_sequence,
-                replay_epoch,
                 reply,
             } => {
-                let _ = reply.send(
-                    self.snapshot_value(last_sequence, replay_epoch.as_deref())
-                        .await,
-                );
+                let _ = reply.send(self.snapshot_value(last_sequence).await);
             }
             HostCommand::HistoryPage {
                 before_sequence,
-                max_batches,
+                max_events,
                 reply,
             } => {
-                let _ = reply.send(self.history_page_value(before_sequence, max_batches).await);
+                let _ = reply.send(self.history_page_value(before_sequence, max_events).await);
             }
             HostCommand::RenameSession {
                 session_id,
@@ -1024,10 +1171,6 @@ impl HostState {
                 reply,
             } => {
                 let result = self.set_session_pinned(&session_id, pinned).await;
-                let _ = reply.send(result);
-            }
-            HostCommand::DeleteSession { session_id, reply } => {
-                let result = self.delete_session(&session_id).await;
                 let _ = reply.send(result);
             }
             HostCommand::Submit { submission, reply } => {
@@ -1133,9 +1276,8 @@ impl HostState {
     async fn snapshot_value(
         &self,
         last_sequence: Option<u64>,
-        replay_epoch: Option<&str>,
     ) -> std::result::Result<HostSnapshot, Rejection> {
-        let replay = self.replay_after(last_sequence, replay_epoch)?;
+        let replay = self.replay_after(last_sequence)?;
         Ok(HostSnapshot {
             ready: self.ready().await.map_err(internal)?,
             replay,
@@ -1145,53 +1287,27 @@ impl HostState {
     async fn history_page_value(
         &self,
         before_sequence: Option<u64>,
-        max_batches: usize,
+        max_events: usize,
     ) -> std::result::Result<SessionHistoryPage, Rejection> {
         let page = self
             .checkpoints
-            .transcript_page(
+            .event_page(
                 &self.running.session_id,
-                TranscriptPageRequest {
+                EventPageRequest {
                     before_sequence,
-                    max_batches,
+                    limit: max_events,
                 },
             )
             .await
             .map_err(internal)?;
         let next_before_sequence = page.next_before_sequence;
-        let mut items = page.into_positioned_items_chronological();
-        let Some(oldest_sequence) = items.first().map(|(target, _)| target.checkpoint_sequence)
-        else {
-            return Ok(SessionHistoryPage {
-                events: Vec::new(),
-                next_before_sequence,
-            });
-        };
-        let prefix = self
-            .checkpoints
-            .transcript_page(
-                &self.running.session_id,
-                TranscriptPageRequest {
-                    before_sequence: Some(oldest_sequence),
-                    max_batches: 1,
-                },
-            )
-            .await
-            .map_err(internal)?
-            .into_positioned_items_chronological();
-        let prefix_events = replay_events(&prefix, &self.running.session_id).len();
-        let mut context = prefix;
-        context.append(&mut items);
-        let events = replay_events(&context, &self.running.session_id)
+        let records = page
+            .into_chronological()
             .into_iter()
-            .skip(prefix_events)
-            .map(|event| RenderedEvent {
-                blocks: self.running.frontend.render(&event),
-                event,
-            })
+            .map(|event| project_record(&self.running.frontend, event))
             .collect();
         Ok(SessionHistoryPage {
-            events,
+            records,
             next_before_sequence,
         })
     }
@@ -1199,20 +1315,21 @@ impl HostState {
     fn replay_after(
         &self,
         last_sequence: Option<u64>,
-        replay_epoch: Option<&str>,
     ) -> std::result::Result<Vec<ServerFrame>, Rejection> {
         let Some(last_sequence) = last_sequence else {
             return Ok(self.replay.iter().cloned().collect());
         };
-        if replay_epoch != Some(self.replay_epoch.as_str()) || last_sequence > self.sequence {
+        if last_sequence > self.sequence {
             return Err(Rejection {
                 code: "replay_unavailable",
-                message: "the gateway restarted; reload the active session".into(),
+                message: "the reconnect cursor is ahead of the durable session".into(),
                 fatal: false,
             });
         }
         let oldest = self.replay.front().and_then(event_sequence);
-        if oldest.is_some_and(|oldest| last_sequence.saturating_add(1) < oldest) {
+        if last_sequence < self.sequence
+            && oldest.is_none_or(|oldest| last_sequence.saturating_add(1) < oldest)
+        {
             return Err(Rejection {
                 code: "replay_unavailable",
                 message: "the reconnect window expired; reload the active session".into(),
@@ -1256,22 +1373,6 @@ impl HostState {
             .await
             .map_err(internal)?;
         metadata.entry(session_id.into()).or_default().pinned = pinned;
-        save_session_metadata(&self.checkpoints, &metadata)
-            .await
-            .map_err(internal)?;
-        self.broadcast_sessions().await
-    }
-
-    async fn delete_session(&mut self, session_id: &str) -> std::result::Result<(), Rejection> {
-        if session_id == self.running.session_id {
-            self.require_idle()?;
-        }
-        self.require_session(session_id).await?;
-        let _catalog = self.catalog_lock.lock().await;
-        let mut metadata = load_session_metadata(&self.checkpoints)
-            .await
-            .map_err(internal)?;
-        metadata.entry(session_id.into()).or_default().hidden = true;
         save_session_metadata(&self.checkpoints, &metadata)
             .await
             .map_err(internal)?;
@@ -1354,6 +1455,8 @@ impl HostState {
         }
         self.running
             .sender
+            .as_ref()
+            .ok_or_else(stopped)?
             .send(submission)
             .map_err(|error| Rejection {
                 code: match error {
@@ -1424,6 +1527,7 @@ impl HostState {
             )
             .map_err(invalid_config)?;
         let session_id = self.running.session_id.clone();
+        self.stop_and_drain_running().await.map_err(internal)?;
         let replacement = start_agent(
             Arc::clone(&self.gateway),
             &next,
@@ -1439,24 +1543,16 @@ impl HostState {
         )
         .await
         .map_err(internal)?;
-        let suppress_history_broadcast = reset_replay_for_restart(
-            &mut self.replay,
-            &mut self.replay_bytes,
-            &self.running.session_id,
-            &replacement.session_id,
-        );
-        self.replay_truncated = false;
         let previous = std::mem::replace(&mut self.running, replacement);
         self.accepts_file_attachments.store(
             runtime_accepts_attachments(&self.running.frontend),
             Ordering::Relaxed,
         );
-        self.suppress_history_broadcast = suppress_history_broadcast;
         self.spec = next;
-        shutdown_agent(previous).await;
-        if suppress_history_broadcast {
-            self.record_replacement_startup().map_err(internal)?;
-        }
+        drop(previous);
+        self.reconcile_replacement_startup()
+            .await
+            .map_err(internal)?;
         self.broadcast_changed().await?;
         Ok(())
     }
@@ -1503,6 +1599,8 @@ impl HostState {
     }
 
     async fn restart(&mut self, origin_label: &str) -> std::result::Result<(), Rejection> {
+        let session_id = self.running.session_id.clone();
+        self.stop_and_drain_running().await.map_err(internal)?;
         let replacement = start_agent(
             Arc::clone(&self.gateway),
             &self.spec,
@@ -1512,70 +1610,60 @@ impl HostState {
             Arc::clone(&self.checkpoints),
             self.scratchpad.clone(),
             self.session_files.clone(),
-            self.running.session_id.clone(),
+            session_id,
             origin_label,
             false,
         )
         .await
         .map_err(internal)?;
-        let suppress_history_broadcast = reset_replay_for_restart(
-            &mut self.replay,
-            &mut self.replay_bytes,
-            &self.running.session_id,
-            &replacement.session_id,
-        );
-        self.replay_truncated = false;
         let previous = std::mem::replace(&mut self.running, replacement);
         self.accepts_file_attachments.store(
             runtime_accepts_attachments(&self.running.frontend),
             Ordering::Relaxed,
         );
-        self.suppress_history_broadcast = suppress_history_broadcast;
         self.widgets.clear();
-        shutdown_agent(previous).await;
-        if suppress_history_broadcast {
-            self.record_replacement_startup().map_err(internal)?;
-        }
+        drop(previous);
+        self.reconcile_replacement_startup()
+            .await
+            .map_err(internal)?;
         self.pending_turns = 0;
         self.approval_active = false;
         self.turn_error = None;
         Ok(())
     }
 
-    fn record_replacement_startup(&mut self) -> Result<()> {
-        loop {
-            match self.running.events.try_recv() {
-                Ok(event) => {
-                    let is_history = self.suppress_history_broadcast
-                        && matches!(&event.msg, EventMsg::SessionHistory(_));
-                    if is_history {
-                        self.suppress_history_broadcast = false;
-                    }
-                    let frame = self.record_event(event, true)?;
-                    if !is_history {
-                        self.pending_startup.push(frame);
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return Err(Error::Config(
-                        "replacement agent stopped during startup".into(),
-                    ));
-                }
-            }
+    async fn stop_and_drain_running(&mut self) -> Result<()> {
+        drop(self.running.sender.take());
+        while let Some(record) = self.running.events.recv().await {
+            self.apply_event(record).await?;
         }
-        self.suppress_history_broadcast = false;
+        self.running.subagent_template.take();
         Ok(())
     }
 
-    async fn forward_event(&mut self, event: Event) -> Result<()> {
-        let was_active = self.pending_turns > 0;
-        let next_activity = self.activity_for_event(&event.msg)?;
-        let suppress_broadcast =
-            self.suppress_history_broadcast && matches!(&event.msg, EventMsg::SessionHistory(_));
-        if suppress_broadcast {
-            self.suppress_history_broadcast = false;
+    async fn forward_event(&mut self, record: JournalEvent) -> Result<()> {
+        if self.apply_event(record).await? {
+            self.restart_after_turn = false;
+            self.restart("horus-gateway")
+                .await
+                .map_err(|rejection| Error::Config(rejection.message))?;
+            self.broadcast_changed()
+                .await
+                .map_err(|rejection| Error::Config(rejection.message))?;
         }
+        Ok(())
+    }
+
+    async fn apply_event(&mut self, record: JournalEvent) -> Result<bool> {
+        let was_active = self.pending_turns > 0;
+        let event = record.event.clone();
+        if self
+            .project_and_publish(record, JournalDelivery::Live)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let next_activity = self.activity_for_event(&event.msg)?;
         match &event.msg {
             EventMsg::ExecApprovalRequest(_) => self.approval_active = true,
             EventMsg::TurnComplete(_) => {
@@ -1590,7 +1678,6 @@ impl HostState {
             _ => {}
         }
         let cron_completion = self.observe_cron_event(&event)?;
-        self.record_event(event, suppress_broadcast)?;
         if let Some(activity) = next_activity {
             self.set_activity(activity)?;
             self.broadcast_sessions()
@@ -1598,17 +1685,13 @@ impl HostState {
                 .map_err(|rejection| Error::Config(rejection.message))?;
         }
 
-        if self.pending_turns == 0 && was_active {
+        let became_idle = self.pending_turns == 0 && was_active;
+        let mut restart = false;
+        if became_idle {
             if let Some((active, status, message)) = cron_completion {
                 self.cron.finish_run(active.run, status, message)?;
-            } else if self.restart_after_turn {
-                self.restart_after_turn = false;
-                self.restart("horus-gateway")
-                    .await
-                    .map_err(|rejection| Error::Config(rejection.message))?;
-                self.broadcast_changed()
-                    .await
-                    .map_err(|rejection| Error::Config(rejection.message))?;
+            } else {
+                restart = self.restart_after_turn;
             }
             if !self.approval_active && self.active_cron.is_none() {
                 for waiter in self.idle_waiters.drain(..) {
@@ -1616,44 +1699,50 @@ impl HostState {
                 }
             }
         }
-        Ok(())
+        Ok(restart)
     }
 
-    fn record_event(&mut self, mut event: Event, suppress_broadcast: bool) -> Result<ServerFrame> {
-        update_widgets(&mut self.widgets, &event.msg);
-        let blocks = self.running.frontend.render(&event.msg);
-        self.record_artifacts(&blocks);
-        let history = render_history(&self.running.frontend, &event.msg);
-        if let Some(history) = &history {
-            for rendered in history {
-                self.record_artifacts(&rendered.blocks);
-            }
-        }
-        let preview = render_preview(&self.running.frontend, &event.msg);
-        if history.is_some() {
-            omit_raw_session_history(&mut event);
-        }
-        let sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| Error::Config("event sequence overflow".into()))?;
+    fn project_and_publish(
+        &mut self,
+        journal: JournalEvent,
+        delivery: JournalDelivery,
+    ) -> Result<Option<ServerFrame>> {
+        validate_gateway_event(&journal.event.msg)?;
+        let sequence_kind = classify_journal_sequence(self.sequence, journal.sequence, delivery)?;
+        let sequence = journal.sequence;
         let frame = ServerFrame::new(ServerMessage::AgentEvent {
             session_id: self.running.session_id.clone(),
-            sequence,
-            event,
-            blocks,
-            history,
-            preview,
+            record: project_record(&self.running.frontend, journal),
         });
-        self.replay_truncated |= record_and_publish(
+        validate_event_frame(&frame)?;
+        if let ServerMessage::AgentEvent { record, .. } = &frame.message {
+            update_widgets(&mut self.widgets, &record.event.msg);
+            self.record_artifacts(&record.blocks);
+            if let EventMsg::ModelStepCompleted(step) = &record.event.msg
+                && matches!(&step.outcome, ModelStepOutcome::Completed { .. })
+            {
+                compact_replay_deltas(
+                    &mut self.replay,
+                    &mut self.replay_bytes,
+                    &step.model_step_id,
+                )?;
+            }
+        }
+        if sequence_kind == JournalSequence::AlreadyLoaded {
+            return Ok(None);
+        }
+        let truncated = record_and_publish(
             &mut self.replay,
             &mut self.replay_bytes,
             &self.events,
             frame.clone(),
-            suppress_broadcast,
+            delivery != JournalDelivery::Live,
         )?;
+        if truncated {
+            self.next_before_sequence = self.replay.front().and_then(event_sequence);
+        }
         self.sequence = sequence;
-        Ok(frame)
+        Ok(Some(frame))
     }
 
     fn observe_cron_event(
@@ -1680,13 +1769,21 @@ impl HostState {
                 active.failure.get_or_insert_with(|| {
                     "headless cron run requested interactive tool approval".into()
                 });
-                self.running.sender.send(Submission {
-                    id: Uuid::new_v4().to_string(),
-                    op: Op::ExecApproval {
-                        id: request.id.clone(),
-                        decision: ReviewDecision::Abort,
-                    },
-                })?;
+                self.running
+                    .sender
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::Horus(horus::Error::Stopped(
+                            "agent command channel is closed".into(),
+                        ))
+                    })?
+                    .send(Submission {
+                        id: Uuid::new_v4().to_string(),
+                        op: Op::ExecApproval {
+                            id: request.id.clone(),
+                            decision: ReviewDecision::Abort,
+                        },
+                    })?;
                 self.approval_active = false;
                 None
             }
@@ -1722,7 +1819,7 @@ impl HostState {
         }))
     }
 
-    fn record_artifacts(&mut self, blocks: &[FrontendBlock]) {
+    fn record_artifacts(&mut self, blocks: &[RenderedBlock]) {
         for block in blocks {
             upsert_artifact(&mut self.artifacts, &self.running.session_id, block);
         }
@@ -1753,13 +1850,8 @@ impl HostState {
             .as_ref()
             .map(|active| active_run_summary(&checkpoint.session_id, active));
         Ok(SessionReadyPayload {
-            replay_epoch: self.replay_epoch.clone(),
             latest_sequence: self.sequence,
-            next_before_sequence: next_history_cursor(
-                self.running.next_before_sequence,
-                checkpoint.sequence,
-                self.replay_truncated,
-            ),
+            next_before_sequence: self.next_before_sequence,
             workspace: self.spec.workspace_info(),
             git: git_status(&self.running.gateway_sandbox).await,
             session: self.running.session.clone(),
@@ -1984,6 +2076,35 @@ async fn gateway_session_summaries(
             return Ok(sessions);
         };
         cursor = Some(next);
+    }
+}
+
+fn session_tree_ids(root_session_id: &str, sessions: &[SessionSummary]) -> Option<Vec<String>> {
+    sessions
+        .iter()
+        .any(|session| session.session_id == root_session_id)
+        .then_some(())?;
+    let mut seen = HashSet::from([root_session_id.to_owned()]);
+    let mut ordered = vec![root_session_id.to_owned()];
+    loop {
+        let mut changed = false;
+        for session in sessions {
+            if seen.contains(&session.session_id)
+                || !session
+                    .parent_session_id
+                    .as_ref()
+                    .is_some_and(|parent| seen.contains(parent))
+            {
+                continue;
+            }
+            seen.insert(session.session_id.clone());
+            ordered.push(session.session_id.clone());
+            changed = true;
+        }
+        if !changed {
+            ordered.reverse();
+            return Some(ordered);
+        }
     }
 }
 
@@ -2248,19 +2369,17 @@ async fn start_agent(
     let session = agent.session().clone();
     let frontend = agent.frontend().clone();
     let tool_count = agent.tool_count();
-    let next_before_sequence = agent.next_before_sequence();
     let session_id = session.session_id.clone();
-    let (sender, events) = agent.into_parts();
+    let (sender, events) = agent.into_recorded_parts();
     Ok(RunningAgent {
         session_id,
-        sender,
+        sender: Some(sender),
         events,
         frontend,
         session,
         gateway_sandbox,
         subagent_template,
         tool_count,
-        next_before_sequence,
     })
 }
 
@@ -2311,6 +2430,89 @@ async fn hide_checkpoint(checkpoints: &Arc<dyn CheckpointStore>, session_id: &st
     Ok(())
 }
 
+async fn load_replay(
+    checkpoints: &dyn CheckpointStore,
+    session_id: &str,
+    frontend: &FrontendExtensions,
+) -> Result<LoadedReplay> {
+    let mut latest_sequence = 0;
+    let mut before_sequence = None;
+    let mut scanned = 0;
+    let mut newest_first = VecDeque::with_capacity(REPLAY_CAPACITY);
+    let mut replay_bytes = 0_usize;
+    let mut has_earlier = false;
+    'pages: loop {
+        let remaining = REPLAY_CAPACITY.saturating_sub(scanned);
+        if remaining == 0 {
+            has_earlier = true;
+            break;
+        }
+        let page = checkpoints
+            .event_page(
+                session_id,
+                EventPageRequest {
+                    before_sequence,
+                    limit: remaining.min(REPLAY_LOAD_PAGE_SIZE),
+                },
+            )
+            .await?;
+        if scanned == 0 {
+            latest_sequence = page.latest_sequence;
+        }
+        let next_before_sequence = page.next_before_sequence;
+        for journal in page.events {
+            scanned += 1;
+            latest_sequence = latest_sequence.max(journal.sequence);
+            let frame = ServerFrame::new(ServerMessage::AgentEvent {
+                session_id: session_id.into(),
+                record: project_record(frontend, journal),
+            });
+            if !replayable(&frame) {
+                continue;
+            }
+            let frame_bytes = validate_event_frame(&frame)?;
+            if replay_bytes.saturating_add(frame_bytes) > MAX_REPLAY_BYTES {
+                has_earlier = true;
+                break 'pages;
+            }
+            replay_bytes = replay_bytes.saturating_add(frame_bytes);
+            newest_first.push_back(frame);
+        }
+        let Some(cursor) = next_before_sequence else {
+            break;
+        };
+        before_sequence = Some(cursor);
+    }
+    let replay = newest_first.into_iter().rev().collect::<VecDeque<_>>();
+    let next_before_sequence = if has_earlier {
+        replay
+            .front()
+            .and_then(event_sequence)
+            .or_else(|| latest_sequence.checked_add(1))
+    } else {
+        None
+    };
+    let mut artifacts = VecDeque::with_capacity(ARTIFACT_CAPACITY);
+    let mut widgets = BTreeMap::new();
+    for frame in &replay {
+        let ServerMessage::AgentEvent { record, .. } = &frame.message else {
+            continue;
+        };
+        update_widgets(&mut widgets, &record.event.msg);
+        for block in &record.blocks {
+            upsert_artifact(&mut artifacts, session_id, block);
+        }
+    }
+    Ok(LoadedReplay {
+        latest_sequence,
+        replay,
+        replay_bytes,
+        next_before_sequence,
+        artifacts,
+        widgets,
+    })
+}
+
 fn render_preview(frontend: &FrontendExtensions, event: &EventMsg) -> Option<RenderedPreview> {
     let EventMsg::Frontend(FrontendEvent::Preview { title, events }) = event else {
         return None;
@@ -2327,43 +2529,51 @@ fn render_preview(frontend: &FrontendExtensions, event: &EventMsg) -> Option<Ren
     })
 }
 
-fn render_history(frontend: &FrontendExtensions, event: &EventMsg) -> Option<Vec<RenderedEvent>> {
-    render_history_with(event, |event| frontend.render(event))
-}
-
-fn omit_raw_session_history(event: &mut Event) {
-    if let EventMsg::SessionHistory(history) = &mut event.msg {
-        history.events.clear();
+fn project_record(frontend: &FrontendExtensions, journal: JournalEvent) -> RecordedEvent {
+    let (blocks, preview) = project_event(frontend, &journal.event.msg);
+    RecordedEvent {
+        sequence: journal.sequence,
+        recorded_at_ms: journal.recorded_at_ms,
+        event: journal.event,
+        stream_metrics: journal.stream_metrics,
+        blocks,
+        preview,
     }
 }
 
-fn render_history_with(
+fn project_event(
+    frontend: &FrontendExtensions,
     event: &EventMsg,
-    render: impl Fn(&EventMsg) -> Vec<FrontendBlock>,
-) -> Option<Vec<RenderedEvent>> {
-    let EventMsg::SessionHistory(history) = event else {
-        return None;
-    };
-    Some(
-        flatten_history(&history.events)
-            .into_iter()
-            .map(|event| RenderedEvent {
-                blocks: render(&event),
-                event,
-            })
-            .collect(),
-    )
+) -> (Vec<RenderedBlock>, Option<RenderedPreview>) {
+    (frontend.render(event), render_preview(frontend, event))
 }
 
-fn flatten_history(events: &[EventMsg]) -> Vec<EventMsg> {
-    let mut flattened = Vec::new();
-    for event in events {
-        match event {
-            EventMsg::SessionHistory(history) => flattened.extend(flatten_history(&history.events)),
-            event => flattened.push(event.clone()),
-        }
+fn classify_journal_sequence(
+    current: u64,
+    incoming: u64,
+    delivery: JournalDelivery,
+) -> Result<JournalSequence> {
+    if incoming <= current && delivery == JournalDelivery::LoadedStartup {
+        return Ok(JournalSequence::AlreadyLoaded);
     }
-    flattened
+    let expected = current
+        .checked_add(1)
+        .ok_or_else(|| Error::Config("event sequence overflow".into()))?;
+    if incoming != expected {
+        return Err(Error::Horus(horus::Error::Checkpoint(format!(
+            "event journal delivery sequence is {incoming}, expected {expected}"
+        ))));
+    }
+    Ok(JournalSequence::Next)
+}
+
+fn validate_gateway_event(event: &EventMsg) -> Result<()> {
+    if matches!(event, EventMsg::SessionHistory(_)) {
+        return Err(Error::Protocol(
+            "gateway agents must emit canonical events instead of nested session history".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn flatten_preview(events: &[EventMsg]) -> Vec<EventMsg> {
@@ -2385,31 +2595,8 @@ fn flatten_preview(events: &[EventMsg]) -> Vec<EventMsg> {
 
 fn event_sequence(frame: &ServerFrame) -> Option<u64> {
     match frame.message {
-        ServerMessage::AgentEvent { sequence, .. } => Some(sequence),
+        ServerMessage::AgentEvent { ref record, .. } => Some(record.sequence),
         _ => None,
-    }
-}
-
-fn reset_replay_for_restart(
-    replay: &mut VecDeque<ServerFrame>,
-    replay_bytes: &mut usize,
-    previous_session: &str,
-    next_session: &str,
-) -> bool {
-    replay.clear();
-    *replay_bytes = 0;
-    previous_session == next_session
-}
-
-fn next_history_cursor(
-    initial: Option<u64>,
-    latest_checkpoint_sequence: u64,
-    replay_truncated: bool,
-) -> Option<u64> {
-    if replay_truncated && latest_checkpoint_sequence > 0 {
-        Some(latest_checkpoint_sequence.saturating_add(1))
-    } else {
-        initial
     }
 }
 
@@ -2428,22 +2615,21 @@ fn update_widgets(widgets: &mut SessionWidgets, event: &EventMsg) {
 fn upsert_artifact(
     artifacts: &mut VecDeque<ArtifactRecord>,
     session_id: &str,
-    block: &FrontendBlock,
+    rendered: &RenderedBlock,
 ) {
+    let block = &rendered.block;
     let (kind, title) = if let Some(file) = block.files.first() {
         (ArtifactKind::File, file.name.clone())
     } else if block.format == FrontendBlockFormat::UnifiedDiff {
-        (
-            ArtifactKind::CodeDiff,
-            block.group.clone().unwrap_or_else(|| "Code diff".into()),
-        )
+        (ArtifactKind::CodeDiff, block.title.clone())
     } else {
         return;
     };
-    let id = block
+    let source_id = block
         .id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let id = scoped_block_id(&rendered.capability, &source_id);
     if let Some(index) = artifacts.iter().position(|artifact| artifact.id == id) {
         artifacts.remove(index);
     } else if artifacts.len() == ARTIFACT_CAPACITY {
@@ -2456,6 +2642,10 @@ fn upsert_artifact(
         title,
         block: block.clone(),
     });
+}
+
+fn scoped_block_id(capability: &str, source_id: &str) -> String {
+    format!("block:{}:{capability}{source_id}", capability.len())
 }
 
 fn merge_stored_file_artifacts(
@@ -2500,9 +2690,12 @@ fn stored_file_artifact(session_id: &str, file: SessionFileReference) -> Artifac
         block: FrontendBlock {
             id: Some(id),
             group: None,
-            append: false,
-            pending: false,
-            text: format!("Sent {title}"),
+            update: FrontendBlockUpdate::Replace,
+            state: FrontendBlockState::Complete,
+            role: FrontendBlockRole::Artifact,
+            title: format!("Sent {title}"),
+            text: String::new(),
+            symbol: None,
             files: vec![file],
             format: FrontendBlockFormat::PlainText,
             tone: horus::protocol::FrontendTone::Success,
@@ -2517,23 +2710,9 @@ fn record_and_publish(
     frame: ServerFrame,
     suppress_broadcast: bool,
 ) -> Result<bool> {
-    let frame_bytes = serde_json::to_vec(&frame)?.len();
-    if frame_bytes > MAX_FRAME_BYTES {
-        return Err(Error::Protocol(format!(
-            "agent event exceeds the {MAX_FRAME_BYTES}-byte gateway frame limit"
-        )));
-    }
+    let frame_bytes = validate_event_frame(&frame)?;
     let mut truncated = false;
-    if !matches!(
-        &frame.message,
-        ServerMessage::AgentEvent {
-            event: Event {
-                msg: EventMsg::SessionResumeRequested(_),
-                ..
-            },
-            ..
-        }
-    ) {
+    if replayable(&frame) {
         while replay.len() >= REPLAY_CAPACITY
             || replay_bytes.saturating_add(frame_bytes) > MAX_REPLAY_BYTES
         {
@@ -2550,6 +2729,76 @@ fn record_and_publish(
         let _ = events.send(frame);
     }
     Ok(truncated)
+}
+
+fn compact_replay_deltas(
+    replay: &mut VecDeque<ServerFrame>,
+    replay_bytes: &mut usize,
+    model_step_id: &str,
+) -> Result<()> {
+    replay.retain(|frame| {
+        !matches!(
+            &frame.message,
+            ServerMessage::AgentEvent {
+                record: RecordedEvent {
+                    event: Event {
+                        msg: EventMsg::AgentMessageContentDelta(delta),
+                        ..
+                    },
+                    ..
+                },
+                ..
+            } if delta.model_step_id == model_step_id
+        ) && !matches!(
+            &frame.message,
+            ServerMessage::AgentEvent {
+                record: RecordedEvent {
+                    event: Event {
+                        msg: EventMsg::AgentReasoningContentDelta(delta),
+                        ..
+                    },
+                    ..
+                },
+                ..
+            } if delta.model_step_id == model_step_id
+        )
+    });
+    *replay_bytes = replay.iter().try_fold(0_usize, |total, frame| {
+        Ok::<_, Error>(total.saturating_add(serde_json::to_vec(frame)?.len()))
+    })?;
+    Ok(())
+}
+
+fn replayable(frame: &ServerFrame) -> bool {
+    !matches!(
+        &frame.message,
+        ServerMessage::AgentEvent {
+            record: RecordedEvent {
+                event: Event {
+                    msg: EventMsg::SessionResumeRequested(_)
+                        | EventMsg::Frontend(
+                            FrontendEvent::Preview { .. }
+                                | FrontendEvent::Picker { .. }
+                                | FrontendEvent::Widget { .. }
+                                | FrontendEvent::RemoveWidget { .. }
+                        ),
+                    ..
+                },
+                ..
+            },
+            ..
+        }
+    )
+}
+
+fn validate_event_frame(frame: &ServerFrame) -> Result<usize> {
+    let frame_bytes = serde_json::to_vec(frame)?.len();
+    if frame_bytes > MAX_FRAME_BYTES {
+        return Err(Error::Protocol(format!(
+            "agent event exceeds the {MAX_FRAME_BYTES}-byte gateway frame limit"
+        )));
+    }
+    Ok(frame_bytes)
 }
 
 fn publish_ready_and_pending(
@@ -2627,13 +2876,50 @@ fn invalid_cron(error: impl std::fmt::Display) -> Rejection {
 
 #[cfg(test)]
 mod tests {
-    use horus::backend::checkpoint::{Checkpoint, TranscriptPageRequest};
-    use horus::backend::model::user_message;
+    use horus::backend::checkpoint::Checkpoint;
     use horus::protocol::{SessionContext, TokenUsage};
 
-    use crate::assembly::INITIAL_REPLAY_BATCHES;
-
     use super::*;
+
+    #[test]
+    fn gateway_rejects_nested_session_history() {
+        assert!(
+            validate_gateway_event(&EventMsg::SessionHistory(
+                horus::protocol::SessionHistoryEvent { events: Vec::new() }
+            ))
+            .is_err()
+        );
+        assert!(validate_gateway_event(&EventMsg::ContextCompacted).is_ok());
+    }
+
+    #[test]
+    fn journal_delivery_accepts_loaded_records_and_rejects_gaps() {
+        assert_eq!(
+            classify_journal_sequence(5, 3, JournalDelivery::LoadedStartup).expect("loaded record"),
+            JournalSequence::AlreadyLoaded
+        );
+        assert_eq!(
+            classify_journal_sequence(5, 5, JournalDelivery::LoadedStartup)
+                .expect("loaded high-water"),
+            JournalSequence::AlreadyLoaded
+        );
+        assert_eq!(
+            classify_journal_sequence(5, 6, JournalDelivery::Live).expect("next record"),
+            JournalSequence::Next
+        );
+        assert!(
+            classify_journal_sequence(5, 7, JournalDelivery::Live)
+                .expect_err("sequence gap")
+                .to_string()
+                .contains("expected 6")
+        );
+        assert!(
+            classify_journal_sequence(5, 5, JournalDelivery::Live)
+                .expect_err("stale live record")
+                .to_string()
+                .contains("expected 6")
+        );
+    }
 
     #[test]
     fn widget_snapshot_is_namespaced_updated_and_removed() {
@@ -2844,7 +3130,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_history_pages_and_initial_replay_share_a_cursor() {
+    async fn durable_event_journal_restores_replay_and_history_cursor() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let (store, config) =
+            ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway =
+            GatewayHost::start(store, config, credentials, Arc::clone(&cron)).expect("gateway");
+        let host = gateway
+            .create_session(&workspace)
+            .await
+            .expect("create session");
+        let checkpoints = Arc::clone(&gateway.state.lock().await.checkpoints);
+        let session_id = host.session_id().to_owned();
+        assert!(host.stop_if_idle().await);
+        gateway.state.lock().await.sessions.remove(&session_id);
+        drop(host);
+        let mut latest_sequence = 0;
+        for index in 0..=REPLAY_CAPACITY {
+            let event = Event {
+                submission_id: None,
+                msg: EventMsg::Warning(horus::protocol::WarningEvent {
+                    message: format!("event {index}"),
+                }),
+            };
+            latest_sequence = checkpoints
+                .append_event(
+                    &session_id,
+                    i64::try_from(index).expect("timestamp"),
+                    &event,
+                )
+                .await
+                .expect("append journal event")
+                .sequence;
+        }
+        let durable_highwater = checkpoints
+            .append_event(
+                &session_id,
+                i64::try_from(REPLAY_CAPACITY + 1).expect("timestamp"),
+                &Event {
+                    submission_id: None,
+                    msg: EventMsg::Frontend(FrontendEvent::Preview {
+                        title: "Transient".into(),
+                        events: Vec::new(),
+                    }),
+                },
+            )
+            .await
+            .expect("advance journal high-water")
+            .sequence;
+
+        let reopened = gateway
+            .open_session(&session_id)
+            .await
+            .expect("reopen session");
+        let snapshot = reopened.snapshot(None).await.expect("session snapshot");
+        let newest = reopened
+            .history_page(latest_sequence.checked_add(1), 1)
+            .await
+            .expect("newest seeded event");
+
+        assert!(snapshot.ready.latest_sequence >= durable_highwater);
+        assert_eq!(snapshot.replay.len(), REPLAY_CAPACITY);
+        assert!(snapshot.ready.next_before_sequence.is_some());
+        assert!(matches!(
+            &newest.records[..],
+            [RecordedEvent {
+                event: Event { msg: EventMsg::Warning(warning), .. },
+                ..
+            }] if warning.message == format!("event {REPLAY_CAPACITY}")
+        ));
+        assert!(
+            reopened
+                .snapshot(Some(0))
+                .await
+                .is_err_and(|rejection| rejection.code == "replay_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_snapshot_restores_transient_widgets_without_replaying_them() {
         let root = tempfile::tempdir().expect("root");
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
@@ -2859,77 +3229,239 @@ mod tests {
             .create_session(&workspace)
             .await
             .expect("create session");
-        let checkpoints = Arc::clone(&gateway.state.lock().await.checkpoints);
-        let mut checkpoint = checkpoints
-            .load(host.session_id())
+
+        let snapshot = host.snapshot(None).await.expect("session snapshot");
+
+        assert!(!snapshot.ready.widgets.is_empty());
+        assert!(snapshot.replay.iter().all(|frame| {
+            !matches!(
+                &frame.message,
+                ServerMessage::AgentEvent {
+                    record: RecordedEvent {
+                        event: Event {
+                            msg: EventMsg::Frontend(
+                                FrontendEvent::Widget { .. } | FrontendEvent::RemoveWidget { .. }
+                            ),
+                            ..
+                        },
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn replacement_ready_precedes_every_reconciled_startup_event() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let (store, config) =
+            ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
+        let config = config
+            .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
+            .expect("register provider");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+        let host = gateway
+            .create_session(&workspace)
             .await
-            .expect("load checkpoint")
-            .expect("checkpoint");
-        let user = user_message("first");
-        checkpoint.sequence += 1;
-        checkpoint.context.push(user.clone());
+            .expect("create session");
+        let before = host.snapshot(None).await.expect("initial snapshot").ready;
+        let mut composition = before.config.config.clone();
+        composition.middleware.set_enabled("tools", false);
+        let mut updates = host.subscribe();
+
+        host.configure(before.config.revision, composition)
+            .await
+            .expect("replace agent");
+
+        let changed = updates.try_recv().expect("session changed");
+        let ServerMessage::SessionChanged { payload } = changed.message else {
+            panic!("replacement must publish ready before startup events");
+        };
+        let startup = std::iter::from_fn(|| updates.try_recv().ok()).collect::<Vec<_>>();
+        assert!(!payload.widgets.is_empty());
+        assert!(startup.iter().any(|frame| {
+            matches!(
+                &frame.message,
+                ServerMessage::AgentEvent {
+                    record: RecordedEvent {
+                        event: Event {
+                            msg: EventMsg::Frontend(FrontendEvent::Widget { .. }),
+                            ..
+                        },
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
+        assert!(startup.iter().all(|frame| {
+            event_sequence(frame).is_none_or(|sequence| {
+                sequence > before.latest_sequence && sequence <= payload.latest_sequence
+            })
+        }));
+
+        host.submit(Submission {
+            id: "post-replacement".into(),
+            op: Op::Interrupt {
+                turn_id: "not-active".into(),
+            },
+        })
+        .await
+        .expect("submit after replacement");
+        let sequences = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut sequences = Vec::new();
+            loop {
+                let frame = updates.recv().await.expect("post-replacement event");
+                let ServerMessage::AgentEvent { record, .. } = frame.message else {
+                    continue;
+                };
+                sequences.push(record.sequence);
+                if record.event.submission_id.as_deref() == Some("post-replacement") {
+                    return sequences;
+                }
+            }
+        })
+        .await
+        .expect("post-replacement delivery");
+        assert_eq!(
+            sequences.first().copied(),
+            payload.latest_sequence.checked_add(1)
+        );
+        assert!(
+            sequences
+                .windows(2)
+                .all(|pair| pair[1] == pair[0].saturating_add(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_stops_the_host_and_removes_its_durable_tree() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let (store, config) =
+            ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway =
+            GatewayHost::start(store, config, credentials, Arc::clone(&cron)).expect("gateway");
+        let deleted = gateway
+            .create_session(&workspace)
+            .await
+            .expect("create deleted session");
+        let retained = gateway
+            .create_session(&workspace)
+            .await
+            .expect("create retained session");
+        let deleted_id = deleted.session_id().to_owned();
+        let retained_id = retained.session_id().to_owned();
+        let (checkpoints, session_files) = {
+            let state = gateway.state.lock().await;
+            (Arc::clone(&state.checkpoints), state.session_files.clone())
+        };
+        let parent = checkpoints
+            .load(&deleted_id)
+            .await
+            .expect("load parent")
+            .expect("parent checkpoint");
         checkpoints
-            .save(&checkpoint, &[user], None)
-            .await
-            .expect("save user message");
-        let assistant = serde_json::json!({"role": "assistant", "content": "second"});
-        checkpoint.sequence += 1;
-        checkpoint.context.push(assistant.clone());
-        checkpoints
-            .save(&checkpoint, &[assistant], None)
-            .await
-            .expect("save assistant message");
-
-        let newest = host.history_page(None, 1).await.expect("newest page");
-        let oldest = host
-            .history_page(newest.next_before_sequence, 1)
-            .await
-            .expect("oldest page");
-
-        assert!(matches!(
-            (&oldest.events[..], &newest.events[..]),
-            ([RenderedEvent { event: EventMsg::UserMessage(user), .. }],
-             [RenderedEvent { event: EventMsg::AgentMessage(agent), .. }])
-                if user.message == "first" && agent.message == "second"
-        ));
-
-        for sequence in 3..=101 {
-            let item = user_message(&format!("message {sequence}"));
-            checkpoint.sequence = sequence;
-            checkpoint.context.push(item.clone());
-            checkpoints
-                .save(&checkpoint, &[item], None)
-                .await
-                .expect("save history item");
-        }
-        let expected = checkpoints
-            .transcript_page(
-                host.session_id(),
-                TranscriptPageRequest {
-                    before_sequence: None,
-                    max_batches: INITIAL_REPLAY_BATCHES,
-                },
+            .fork(
+                &deleted_id,
+                parent.sequence,
+                &Checkpoint::empty("deleted-child"),
             )
             .await
-            .expect("initial transcript page")
-            .next_before_sequence;
-        let session_id = host.session_id().to_owned();
-        assert!(host.stop_if_idle().await);
-        gateway.state.lock().await.sessions.remove(&session_id);
-        drop(host);
-
-        let reopened = gateway
-            .open_session(&session_id)
+            .expect("fork child");
+        for session_id in [&deleted_id, "deleted-child"] {
+            session_files
+                .publish_artifact(
+                    session_id,
+                    "result.txt".into(),
+                    "text/plain".into(),
+                    b"result",
+                )
+                .await
+                .expect("publish artifact");
+        }
+        deleted
+            .rename_session(deleted_id.clone(), "Deleted".into())
             .await
-            .expect("reopen session");
-        let snapshot = reopened
-            .snapshot(None, None)
+            .expect("title deleted session");
+        retained
+            .rename_session(retained_id.clone(), "Retained".into())
             .await
-            .expect("session snapshot");
+            .expect("title retained session");
+        let task = cron
+            .add_for_test(&deleted_id, "scheduled task", "0 9 * * *")
+            .expect("schedule task");
+        let run = match cron.begin_run(&task.id).expect("begin run") {
+            BeginRun::Started(run) => run,
+            BeginRun::Skipped => panic!("new run must start"),
+        };
+        cron.finish_run(run, CronRunStatus::Succeeded, None)
+            .expect("finish run");
 
+        gateway
+            .delete_session(&deleted_id)
+            .await
+            .expect("delete session");
+
+        assert!(
+            checkpoints
+                .load(&deleted_id)
+                .await
+                .expect("load deleted")
+                .is_none()
+        );
+        assert!(
+            checkpoints
+                .load("deleted-child")
+                .await
+                .expect("load deleted child")
+                .is_none()
+        );
+        assert!(
+            session_files
+                .list_artifacts(&deleted_id)
+                .await
+                .expect("deleted artifacts")
+                .is_empty()
+        );
+        let metadata = load_session_metadata(&checkpoints)
+            .await
+            .expect("catalog metadata");
+        assert!(!metadata.contains_key(&deleted_id));
+        assert_eq!(metadata[&retained_id].title.as_deref(), Some("Retained"));
+        assert!(
+            cron.list(&deleted_id)
+                .expect("deleted schedules")
+                .is_empty()
+        );
+        assert!(
+            cron.history(&deleted_id, None)
+                .expect("deleted schedule history")
+                .is_empty()
+        );
+        assert!(!task.task.exists());
+        assert!(deleted.snapshot(None).await.is_err());
         assert_eq!(
-            (expected, snapshot.ready.next_before_sequence),
-            (Some(82), Some(82))
+            gateway
+                .sessions()
+                .await
+                .expect("remaining sessions")
+                .into_iter()
+                .map(|session| session.summary.session_id)
+                .collect::<Vec<_>>(),
+            [retained_id]
         );
     }
 
@@ -3046,23 +3578,15 @@ mod tests {
         let first_host = gateway.create_session(&first).await.expect("first chat");
         let second_host = gateway.create_session(&second).await.expect("second chat");
         let first_before = first_host
-            .snapshot(None, None)
+            .snapshot(None)
             .await
             .expect("first snapshot")
             .ready;
         let second_before = second_host
-            .snapshot(None, None)
+            .snapshot(None)
             .await
             .expect("second snapshot")
             .ready;
-        let rejection = match first_host
-            .snapshot(Some(0), Some(second_before.replay_epoch.clone()))
-            .await
-        {
-            Ok(_) => panic!("a cursor from another host epoch must be rejected"),
-            Err(rejection) => rejection,
-        };
-        assert_eq!(rejection.code, "replay_unavailable");
         let mut composition = first_before.config.config.clone();
         composition.middleware.set_enabled("tools", false);
 
@@ -3071,12 +3595,12 @@ mod tests {
             .await
             .expect("configure first chat");
         let first_after = first_host
-            .snapshot(None, None)
+            .snapshot(None)
             .await
             .expect("first updated")
             .ready;
         let second_after = second_host
-            .snapshot(None, None)
+            .snapshot(None)
             .await
             .expect("second unchanged")
             .ready;
@@ -3160,7 +3684,7 @@ mod tests {
             .await
             .expect("selected chat");
         let mut selected_config = selected
-            .snapshot(None, None)
+            .snapshot(None)
             .await
             .expect("selected snapshot")
             .ready
@@ -3183,7 +3707,7 @@ mod tests {
             .await
             .expect("select alternate model");
         let selected_ready = selected
-            .snapshot(None, None)
+            .snapshot(None)
             .await
             .expect("selected snapshot")
             .ready;
@@ -3191,11 +3715,7 @@ mod tests {
             .create_session(&workspace)
             .await
             .expect("fresh chat");
-        let fresh_ready = fresh
-            .snapshot(None, None)
-            .await
-            .expect("fresh snapshot")
-            .ready;
+        let fresh_ready = fresh.snapshot(None).await.expect("fresh snapshot").ready;
 
         assert_eq!(selected_ready.session.model.route, alternate);
         assert_eq!(selected_ready.config.config.provider.model, "gpt-5.6-terra");
@@ -3209,6 +3729,41 @@ mod tests {
             horus::backend::model::provider::HostedWebSearch::Off
         );
         assert_ne!(selected.session_id(), fresh.session_id());
+    }
+
+    #[tokio::test]
+    async fn opening_a_stopped_cached_chat_creates_a_fresh_actor() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let state_dir = root.path().join("state");
+        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let (store, config) = ConfigStore::initialize(state_dir, listen, None).expect("config");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+        let original = gateway
+            .create_session(&workspace)
+            .await
+            .expect("create chat");
+        let session_id = original.session_id().to_string();
+
+        assert!(original.stop_if_idle().await);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while original.is_alive() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actor stopped");
+        let reopened = gateway
+            .open_session(&session_id)
+            .await
+            .expect("reopen chat");
+
+        assert!(reopened.is_alive());
+        assert!(!Arc::ptr_eq(&original.inner, &reopened.inner));
     }
 
     #[tokio::test]
@@ -3239,6 +3794,7 @@ mod tests {
                         commands,
                         events,
                         accepts_file_attachments: Arc::new(AtomicBool::new(false)),
+                        alive: Arc::new(AtomicBool::new(true)),
                     }),
                 },
             );
@@ -3250,11 +3806,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_replay_pages_from_the_latest_durable_batch() {
-        assert_eq!(next_history_cursor(Some(4), 10, false), Some(4));
-        assert_eq!(next_history_cursor(Some(4), 10, true), Some(11));
-        assert_eq!(next_history_cursor(None, 0, true), None);
-
+    fn replay_is_bounded_by_event_count() {
         let frame = ServerFrame::new(ServerMessage::Error {
             code: "test".into(),
             message: String::new(),
@@ -3302,27 +3854,9 @@ mod tests {
     }
 
     #[test]
-    fn every_restart_resets_replay_and_only_same_session_history_is_suppressed_live() {
-        let mut replay = VecDeque::from([ServerFrame::new(ServerMessage::Error {
-            code: "old".into(),
-            message: "old session".into(),
-            fatal: false,
-        })]);
-        let mut replay_bytes = serde_json::to_vec(&replay[0]).expect("encode frame").len();
-
-        let suppress =
-            reset_replay_for_restart(&mut replay, &mut replay_bytes, "session-a", "session-a");
-
-        assert!(replay.is_empty());
-        assert_eq!(replay_bytes, 0);
-        assert!(suppress);
-        assert!(!reset_replay_for_restart(
-            &mut replay,
-            &mut replay_bytes,
-            "session-a",
-            "session-b"
-        ));
-
+    fn suppressed_frames_enter_replay_without_broadcasting() {
+        let mut replay = VecDeque::new();
+        let mut replay_bytes = 0;
         let (events, mut receiver) = broadcast::channel(4);
         let history = ServerFrame::new(ServerMessage::Error {
             code: "history".into(),
@@ -3346,39 +3880,143 @@ mod tests {
     }
 
     #[test]
-    fn resume_requests_are_broadcast_without_entering_replay() {
-        let (events, mut receiver) = broadcast::channel(1);
+    fn transient_controls_are_broadcast_without_entering_replay() {
+        let (events, mut receiver) = broadcast::channel(5);
         let mut replay = VecDeque::new();
         let mut replay_bytes = 0;
-        let frame = ServerFrame::new(ServerMessage::AgentEvent {
-            session_id: "source".into(),
-            sequence: 1,
-            event: Event {
-                submission_id: Some("resume".into()),
-                msg: EventMsg::SessionResumeRequested(
-                    horus::protocol::SessionResumeRequestedEvent {
-                        session_id: "target".into(),
-                        context: Default::default(),
+        let messages = [
+            EventMsg::SessionResumeRequested(horus::protocol::SessionResumeRequestedEvent {
+                session_id: "target".into(),
+                context: Default::default(),
+            }),
+            EventMsg::Frontend(FrontendEvent::Preview {
+                title: "Preview".into(),
+                events: Vec::new(),
+            }),
+            EventMsg::Frontend(FrontendEvent::Picker {
+                title: "Choose".into(),
+                options: Vec::new(),
+            }),
+            EventMsg::Frontend(FrontendEvent::Widget {
+                capability: "test".into(),
+                item: horus::protocol::FrontendWidget {
+                    id: "status".into(),
+                    slot: horus::protocol::FrontendSlot::Header,
+                    text: "Current".into(),
+                    tone: horus::protocol::FrontendTone::Neutral,
+                    symbol: None,
+                    icon_only: false,
+                    progress: None,
+                    content: None,
+                    action: None,
+                },
+            }),
+            EventMsg::Frontend(FrontendEvent::RemoveWidget {
+                capability: "test".into(),
+                id: "status".into(),
+            }),
+        ];
+        for (index, msg) in messages.into_iter().enumerate() {
+            let frame = ServerFrame::new(ServerMessage::AgentEvent {
+                session_id: "source".into(),
+                record: RecordedEvent {
+                    sequence: u64::try_from(index + 1).expect("sequence"),
+                    recorded_at_ms: 1,
+                    event: Event {
+                        submission_id: Some("transient".into()),
+                        msg,
                     },
-                ),
-            },
-            blocks: Vec::new(),
-            history: None,
-            preview: None,
-        });
-
-        record_and_publish(
-            &mut replay,
-            &mut replay_bytes,
-            &events,
-            frame.clone(),
-            false,
-        )
-        .expect("broadcast resume request");
+                    stream_metrics: Vec::new(),
+                    blocks: Vec::new(),
+                    preview: None,
+                },
+            });
+            record_and_publish(
+                &mut replay,
+                &mut replay_bytes,
+                &events,
+                frame.clone(),
+                false,
+            )
+            .expect("broadcast transient control");
+            assert_eq!(receiver.try_recv().expect("live transient control"), frame);
+        }
 
         assert!(replay.is_empty());
         assert_eq!(replay_bytes, 0);
-        assert_eq!(receiver.try_recv().expect("live resume request"), frame);
+    }
+
+    #[test]
+    fn completed_step_compacts_only_its_progressive_replay_frames() {
+        let frame = |sequence, msg| {
+            ServerFrame::new(ServerMessage::AgentEvent {
+                session_id: "session".into(),
+                record: RecordedEvent {
+                    sequence,
+                    recorded_at_ms: 1,
+                    event: Event {
+                        submission_id: Some("submission".into()),
+                        msg,
+                    },
+                    stream_metrics: Vec::new(),
+                    blocks: Vec::new(),
+                    preview: None,
+                },
+            })
+        };
+        let mut replay = VecDeque::from([
+            frame(
+                1,
+                EventMsg::AgentMessageContentDelta(
+                    horus::protocol::AgentMessageContentDeltaEvent {
+                        session_id: "session".into(),
+                        turn_id: "turn".into(),
+                        model_step_id: "completed".into(),
+                        delta: "answer".into(),
+                        phase: horus::protocol::AgentMessagePhase::FinalAnswer,
+                    },
+                ),
+            ),
+            frame(
+                2,
+                EventMsg::AgentReasoningContentDelta(
+                    horus::protocol::AgentReasoningContentDeltaEvent {
+                        session_id: "session".into(),
+                        turn_id: "turn".into(),
+                        model_step_id: "completed".into(),
+                        delta: "reasoning".into(),
+                    },
+                ),
+            ),
+            frame(
+                3,
+                EventMsg::AgentMessageContentDelta(
+                    horus::protocol::AgentMessageContentDeltaEvent {
+                        session_id: "session".into(),
+                        turn_id: "turn".into(),
+                        model_step_id: "active".into(),
+                        delta: "partial".into(),
+                        phase: horus::protocol::AgentMessagePhase::FinalAnswer,
+                    },
+                ),
+            ),
+        ]);
+        let mut replay_bytes = replay
+            .iter()
+            .map(|frame| serde_json::to_vec(frame).expect("encode frame").len())
+            .sum();
+
+        compact_replay_deltas(&mut replay, &mut replay_bytes, "completed")
+            .expect("compact completed step");
+
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay.front().and_then(event_sequence), Some(3));
+        assert_eq!(
+            replay_bytes,
+            serde_json::to_vec(replay.front().expect("remaining frame"))
+                .expect("encode remaining frame")
+                .len()
+        );
     }
 
     #[test]
@@ -3408,96 +4046,78 @@ mod tests {
     }
 
     #[test]
-    fn session_history_carries_rendered_blocks_without_duplicate_source_events() {
-        let action = Op::CapabilityCommand {
-            capability: "subagents".into(),
-            command: "subagents".into(),
-            arguments: String::new(),
-            input: None,
-            target: None,
-        };
-        let event = EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent {
-            events: vec![
-                EventMsg::UserMessage(horus::protocol::UserMessageEvent {
-                    message: "inspect".into(),
-                    attachments: Vec::new(),
-                    message_target: None,
-                }),
-                EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent {
-                    events: vec![EventMsg::Frontend(FrontendEvent::Widget {
-                        capability: "subagents".into(),
-                        item: horus::protocol::FrontendWidget {
-                            id: "subagents".into(),
-                            slot: horus::protocol::FrontendSlot::Header,
-                            text: "subagents".into(),
-                            tone: horus::protocol::FrontendTone::Neutral,
-                            symbol: Some(horus::protocol::FrontendSymbol::Agent),
-                            icon_only: true,
-                            progress: None,
-                            content: None,
-                            action: Some(action.clone()),
-                        },
-                    })],
-                }),
-            ],
-        });
-
-        let rendered = render_history_with(&event, |_| {
-            vec![FrontendBlock {
-                id: Some("rendered".into()),
-                group: None,
-                append: false,
-                pending: false,
-                text: "rendered child".into(),
-                format: FrontendBlockFormat::PlainText,
-                tone: horus::protocol::FrontendTone::Neutral,
-                files: Vec::new(),
-            }]
-        })
-        .expect("rendered history");
-
-        assert_eq!(rendered.len(), 2);
-        assert_eq!(rendered[0].blocks[0].text, "rendered child");
-        assert!(matches!(
-            &rendered[1].event,
-            EventMsg::Frontend(FrontendEvent::Widget { item, .. })
-                if item.action.as_ref() == Some(&action)
-        ));
-
-        let mut wire_event = Event {
-            submission_id: None,
-            msg: event,
-        };
-        omit_raw_session_history(&mut wire_event);
-
-        assert!(matches!(
-            wire_event.msg,
-            EventMsg::SessionHistory(horus::protocol::SessionHistoryEvent { events })
-                if events.is_empty()
-        ));
-    }
-
-    #[test]
     fn artifact_catalog_uses_block_identity_and_upserts_updates() {
         let mut artifacts = VecDeque::new();
         let mut block = FrontendBlock {
             id: Some("tools/turn-a/call-a".into()),
             group: Some("tools/turn-a".into()),
-            append: false,
-            pending: false,
+            update: FrontendBlockUpdate::Replace,
+            state: FrontendBlockState::Complete,
+            role: FrontendBlockRole::Artifact,
+            title: "Code diff".into(),
             text: "first diff".into(),
+            symbol: None,
             format: FrontendBlockFormat::UnifiedDiff,
             tone: horus::protocol::FrontendTone::Success,
             files: Vec::new(),
         };
-        upsert_artifact(&mut artifacts, "session-a", &block);
+        upsert_artifact(
+            &mut artifacts,
+            "session-a",
+            &RenderedBlock {
+                capability: "tools".into(),
+                block: block.clone(),
+            },
+        );
         block.text = "updated diff".into();
 
-        upsert_artifact(&mut artifacts, "session-a", &block);
+        upsert_artifact(
+            &mut artifacts,
+            "session-a",
+            &RenderedBlock {
+                capability: "tools".into(),
+                block,
+            },
+        );
 
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].id, "tools/turn-a/call-a");
+        assert_eq!(artifacts[0].id, "block:5:toolstools/turn-a/call-a");
         assert_eq!(artifacts[0].block.text, "updated diff");
+    }
+
+    #[test]
+    fn artifact_catalog_scopes_equal_block_ids_by_capability() {
+        let mut artifacts = VecDeque::new();
+        for capability in ["tools", "review"] {
+            upsert_artifact(
+                &mut artifacts,
+                "session-a",
+                &RenderedBlock {
+                    capability: capability.into(),
+                    block: FrontendBlock {
+                        id: Some("result".into()),
+                        group: None,
+                        update: FrontendBlockUpdate::Replace,
+                        state: FrontendBlockState::Complete,
+                        role: FrontendBlockRole::Artifact,
+                        title: capability.into(),
+                        text: "diff".into(),
+                        symbol: None,
+                        format: FrontendBlockFormat::UnifiedDiff,
+                        tone: horus::protocol::FrontendTone::Success,
+                        files: Vec::new(),
+                    },
+                },
+            );
+        }
+
+        assert_eq!(
+            artifacts
+                .iter()
+                .map(|artifact| artifact.id.as_str())
+                .collect::<Vec<_>>(),
+            ["block:5:toolsresult", "block:6:reviewresult"]
+        );
     }
 
     #[test]
@@ -3506,9 +4126,12 @@ mod tests {
         let block = FrontendBlock {
             id: Some("artifacts/turn-a/call-a".into()),
             group: Some("artifacts/turn-a".into()),
-            append: false,
-            pending: false,
-            text: "Sent report.xlsx".into(),
+            update: FrontendBlockUpdate::Replace,
+            state: FrontendBlockState::Complete,
+            role: FrontendBlockRole::Artifact,
+            title: "Sent report.xlsx".into(),
+            text: String::new(),
+            symbol: None,
             format: FrontendBlockFormat::PlainText,
             tone: horus::protocol::FrontendTone::Success,
             files: vec![horus::protocol::SessionFileReference {
@@ -3520,7 +4143,14 @@ mod tests {
             }],
         };
 
-        upsert_artifact(&mut artifacts, "session-a", &block);
+        upsert_artifact(
+            &mut artifacts,
+            "session-a",
+            &RenderedBlock {
+                capability: "artifacts".into(),
+                block,
+            },
+        );
 
         assert_eq!(
             artifacts

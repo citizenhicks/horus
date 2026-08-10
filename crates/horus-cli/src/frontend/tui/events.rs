@@ -10,22 +10,25 @@ use super::view::bounded_terminal_text;
 use super::view::terminal_text;
 use horus::protocol::AgentMessagePhase;
 use horus::protocol::EventMsg;
-use horus::protocol::FrontendBlock;
 use horus::protocol::FrontendEvent;
+use horus::protocol::ModelStepContentPhase;
+use horus::protocol::ModelStepOutcome;
 use horus::protocol::Op;
+use horus::protocol::RenderedBlock;
 use horus::protocol::TokenUsageInfo;
-use horus_gateway::wire::{RenderedEvent, RenderedPreview};
+use horus_gateway::wire::RecordedEvent;
+use horus_gateway::wire::RenderedEvent;
 
 impl TuiState {
-    pub(super) fn handle_agent_event(&mut self, event: EventMsg, blocks: Vec<FrontendBlock>) {
+    pub(super) fn handle_agent_event(&mut self, event: EventMsg, blocks: Vec<RenderedBlock>) {
         let is_commentary = matches!(
             &event,
             EventMsg::AgentMessageContentDelta(delta)
-                if delta.phase == Some(AgentMessagePhase::Commentary)
+                if delta.phase == AgentMessagePhase::Commentary
         ) || matches!(
             &event,
             EventMsg::AgentMessage(message)
-                if message.phase == Some(AgentMessagePhase::Commentary)
+                if message.phase == AgentMessagePhase::Commentary
         );
         if !is_commentary {
             self.commit_commentary_stream();
@@ -42,18 +45,58 @@ impl TuiState {
                 self.clear_approval();
             }
             EventMsg::UserMessage(message) => {
+                self.remember_composer_input(message.message.clone());
                 self.push(format!("› {}", message.message), TranscriptTone::User);
             }
             EventMsg::AgentMessageContentDelta(delta) => {
-                let phase = delta.phase.unwrap_or(AgentMessagePhase::FinalAnswer);
-                self.append_stream(&delta.delta, phase);
+                self.remember_streamed_phase(
+                    &delta.model_step_id,
+                    match delta.phase {
+                        AgentMessagePhase::Commentary => ModelStepContentPhase::Commentary,
+                        AgentMessagePhase::FinalAnswer => ModelStepContentPhase::FinalAnswer,
+                    },
+                );
+                self.append_stream(&delta.delta, delta.phase);
             }
             EventMsg::AgentReasoningContentDelta(delta) => {
+                self.remember_streamed_phase(
+                    &delta.model_step_id,
+                    ModelStepContentPhase::Reasoning,
+                );
                 self.append_reasoning(&delta.delta);
             }
+            EventMsg::ModelStepStarted(step) => {
+                self.streamed_step_phases
+                    .entry(step.model_step_id)
+                    .or_default();
+            }
+            EventMsg::ModelStepCompleted(step) => {
+                self.commit_reasoning();
+                self.commit_stream();
+                let streamed = self
+                    .streamed_step_phases
+                    .remove(&step.model_step_id)
+                    .unwrap_or_default();
+                if let ModelStepOutcome::Completed { content, .. } = step.outcome {
+                    for item in content {
+                        if item.text.is_empty() || streamed.contains(item.phase) {
+                            continue;
+                        }
+                        let tone = match item.phase {
+                            ModelStepContentPhase::Reasoning => TranscriptTone::Reasoning,
+                            ModelStepContentPhase::Commentary
+                            | ModelStepContentPhase::FinalAnswer => TranscriptTone::Assistant,
+                        };
+                        self.push(item.text, tone);
+                    }
+                }
+                self.completed_model_steps.insert(step.model_step_id);
+            }
             EventMsg::AgentMessage(message) => {
-                let phase = message.phase.unwrap_or(AgentMessagePhase::FinalAnswer);
-                if self.streaming_phase == Some(phase) {
+                if self.completed_model_steps.contains(&message.model_step_id) {
+                    return;
+                }
+                if self.streaming_phase == Some(message.phase) {
                     self.streaming.clear();
                     self.streaming_phase = None;
                 } else {
@@ -85,34 +128,33 @@ impl TuiState {
             EventMsg::SessionResumeRequested(request) => {
                 self.requested_resume = Some(request);
             }
-            EventMsg::WebSearchBegin(_) => {
-                self.push("◉ searching the web", TranscriptTone::Warning);
-            }
-            EventMsg::WebSearchEnd(search) => {
-                self.push(
-                    format!("  searched: {}", search.query.unwrap_or(search.action)),
-                    TranscriptTone::Success,
-                );
-            }
+            // Presentation for these typed actions is part of the canonical block list.
+            EventMsg::WebSearchBegin(_) | EventMsg::WebSearchEnd(_) => {}
             EventMsg::TurnComplete(_) => {
                 self.finish_turn();
             }
             EventMsg::TurnAborted(turn) => {
                 self.finish_turn();
-                self.push(
-                    format!("turn aborted: {}", turn.reason),
-                    TranscriptTone::Warning,
-                );
+                if !was_rendered {
+                    self.push(
+                        format!("turn aborted: {}", turn.reason),
+                        TranscriptTone::Warning,
+                    );
+                }
             }
             EventMsg::Error(error) => {
                 self.commit_stream();
-                self.push(format!("error: {}", error.message), TranscriptTone::Error);
+                if !was_rendered {
+                    self.push(format!("error: {}", error.message), TranscriptTone::Error);
+                }
             }
             EventMsg::Warning(warning) => {
-                self.push(
-                    format!("warning: {}", warning.message),
-                    TranscriptTone::Warning,
-                );
+                if !was_rendered {
+                    self.push(
+                        format!("warning: {}", warning.message),
+                        TranscriptTone::Warning,
+                    );
+                }
             }
             EventMsg::Frontend(update) => match update {
                 FrontendEvent::Widget {
@@ -125,9 +167,8 @@ impl TuiState {
                 FrontendEvent::RemoveWidget { capability, id } => {
                     self.widgets.remove(&(capability, id));
                 }
-                FrontendEvent::Render { capability, block } => {
-                    self.apply_block(block.namespaced(&capability));
-                }
+                // The gateway has already projected this event into `blocks`.
+                FrontendEvent::Render { .. } => {}
                 FrontendEvent::Picker { title, options } => {
                     let selected = options
                         .iter()
@@ -194,17 +235,11 @@ impl UsageStatus {
     }
 }
 
-pub(super) fn handle_gateway_event(
-    state: &mut TuiState,
-    event: EventMsg,
-    blocks: Vec<FrontendBlock>,
-    history: Option<Vec<RenderedEvent>>,
-    preview: Option<RenderedPreview>,
-) {
-    if let Some(preview) = preview {
+pub(super) fn handle_gateway_event(state: &mut TuiState, record: RecordedEvent) {
+    if let Some(preview) = record.preview {
         let mut replay = TuiState::default();
         for rendered in preview.events {
-            replay_gateway_event(&mut replay, rendered.event, rendered.blocks);
+            apply_rendered_event(&mut replay, rendered);
         }
         replay.commit_reasoning();
         replay.commit_stream();
@@ -212,32 +247,21 @@ pub(super) fn handle_gateway_event(
             preview.title,
             PreviewContent::Snapshot(replay.transcript),
         ));
-    } else if let Some(history) = history {
-        for rendered in history {
-            if let EventMsg::UserMessage(message) = &rendered.event {
-                state.remember_composer_input(message.message.clone());
-            }
-            replay_gateway_event(state, rendered.event, rendered.blocks);
-        }
-        state.commit_reasoning();
-        state.commit_stream();
     } else {
-        replay_gateway_event(state, event, blocks);
+        state.handle_agent_event(record.event.msg, record.blocks);
     }
 }
 
-fn replay_gateway_event(state: &mut TuiState, event: EventMsg, blocks: Vec<FrontendBlock>) {
-    match event {
-        EventMsg::SessionHistory(history) => {
-            for event in history.events {
-                replay_gateway_event(state, event, Vec::new());
-            }
-            state.commit_reasoning();
-            state.commit_stream();
-        }
-        EventMsg::Frontend(FrontendEvent::Preview { .. }) => {}
-        event => state.handle_agent_event(event, blocks),
+pub(super) fn handle_gateway_history(state: &mut TuiState, records: Vec<RecordedEvent>) {
+    for record in records {
+        handle_gateway_event(state, record);
     }
+    state.commit_reasoning();
+    state.commit_stream();
+}
+
+fn apply_rendered_event(state: &mut TuiState, rendered: RenderedEvent) {
+    state.handle_agent_event(rendered.event, rendered.blocks);
 }
 
 pub(super) fn usage_status(info: &TokenUsageInfo) -> UsageStatus {

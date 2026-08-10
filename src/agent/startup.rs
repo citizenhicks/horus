@@ -7,8 +7,9 @@ use super::Agent;
 use super::AgentConfig;
 use super::AgentSender;
 use super::COMMAND_QUEUE_CAPACITY;
-use super::EVENT_QUEUE_CAPACITY;
+use super::EventRecorder;
 use super::Runner;
+use super::send_event;
 use super::try_send_event;
 use super::unix_timestamp_ms;
 use crate::Error;
@@ -26,11 +27,14 @@ use crate::protocol::ErrorEvent;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::ModelChangedEvent;
+use crate::protocol::ModelStepCompletedEvent;
+use crate::protocol::ModelStepOutcome;
 use crate::protocol::SessionConfiguredEvent;
 use crate::protocol::SessionHistoryEvent;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::ToolCallEndEvent;
+use crate::protocol::TurnAbortedEvent;
 use crate::protocol::UserMessageEvent;
 use crate::protocol::replay_events;
 
@@ -41,11 +45,6 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
     }
     if config.system_prompt.trim().is_empty() {
         return Err(Error::Config("system prompt cannot be empty".into()));
-    }
-    if config.initial_replay_batches == 0 {
-        return Err(Error::Config(
-            "initial replay batch limit must be positive".into(),
-        ));
     }
     if config.max_model_steps == 0 {
         return Err(Error::Config("maximum model steps must be positive".into()));
@@ -75,7 +74,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             config.metadata.clone_from(&state.metadata);
         }
     }
-    let (mut replay, next_before_sequence) = if is_new {
+    let (mut replay, next_before_sequence) = if is_new || config.initial_replay_batches == 0 {
         (Vec::new(), None)
     } else {
         let page = config
@@ -111,6 +110,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
     }
     let mut recovery_delta = Vec::new();
     let mut recovery_execution: Option<ExecutionRecord> = None;
+    let mut recovery_events = Vec::new();
     let route = if config.model_route_configured {
         config.provider.clone()
     } else {
@@ -126,7 +126,8 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         reasoning_effort: choice.reasoning_effort,
     };
     let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
-    let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+    let (event_tx, event_rx) =
+        EventRecorder::spawn(Arc::clone(&config.checkpoints), config.session_id.clone());
     let session = SessionConfiguredEvent {
         session_id: config.session_id.clone(),
         context: config.session_context.clone(),
@@ -137,13 +138,10 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             model_context_window: Some(config.context_window),
         },
     };
-    try_send_event(
-        &event_tx,
-        Event {
-            submission_id: None,
-            msg: EventMsg::SessionConfigured(session.clone()),
-        },
-    )?;
+    let session_event = Event {
+        submission_id: None,
+        msg: EventMsg::SessionConfigured(session.clone()),
+    };
     let middleware_events = event_tx.clone();
     let runtime = RuntimeContext {
         checkpoints: Arc::clone(&config.checkpoints),
@@ -177,6 +175,26 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             .pending_approval
             .as_ref()
             .is_none_or(|pending| pending.decision_received);
+    let interrupted_execution =
+        uncertain_tools || (state.pending_approval.is_none() && state.active_execution.is_some());
+    if interrupted_execution && let Some(step) = state.active_model_step.take() {
+        let active = state
+            .active_execution
+            .as_ref()
+            .ok_or_else(|| Error::Checkpoint("active model step has no execution".into()))?;
+        recovery_events.push(Event {
+            submission_id: Some(active.submission_id.clone()),
+            msg: EventMsg::ModelStepCompleted(ModelStepCompletedEvent {
+                session_id: state.session_id.clone(),
+                turn_id: active.turn_id.clone(),
+                model_step_id: step.model_step_id,
+                step_index: step.step_index,
+                started_at_ms: step.started_at_ms,
+                completed_at_ms: unix_timestamp_ms()?.max(step.started_at_ms),
+                outcome: ModelStepOutcome::Interrupted,
+            }),
+        });
+    }
     if uncertain_tools {
         let recovered_tool_calls = u64::try_from(state.pending_tools.len())
             .map_err(|_| Error::Checkpoint("recovered tool-call count is unsupported".into()))?;
@@ -190,24 +208,36 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             let item = crate::backend::model::tool_output(&call.call_id, output, true);
             state.context.push(item.clone());
             recovery_delta.push(item);
-            replay.push(EventMsg::ToolCallEnd(ToolCallEndEvent {
-                turn_id: recovered_turn.clone(),
-                call_id: call.call_id,
-                name: call.name,
-                output: output.into(),
-                is_error: true,
-            }));
+            recovery_events.push(Event {
+                submission_id: state
+                    .active_execution
+                    .as_ref()
+                    .map(|execution| execution.submission_id.clone()),
+                msg: EventMsg::ToolCallEnd(ToolCallEndEvent {
+                    turn_id: recovered_turn.clone(),
+                    call_id: call.call_id,
+                    name: call.name,
+                    output: output.into(),
+                    is_error: true,
+                }),
+            });
         }
         for message in std::mem::take(&mut state.pending_input) {
             let message = message.into_text();
             let item = user_message(&message);
             state.context.push(item.clone());
             recovery_delta.push(item);
-            replay.push(EventMsg::UserMessage(UserMessageEvent {
-                message,
-                attachments: Vec::new(),
-                message_target: None,
-            }));
+            recovery_events.push(Event {
+                submission_id: state
+                    .active_execution
+                    .as_ref()
+                    .map(|execution| execution.submission_id.clone()),
+                msg: EventMsg::UserMessage(UserMessageEvent {
+                    message,
+                    attachments: Vec::new(),
+                    message_target: None,
+                }),
+            });
         }
         state.pending_approval = None;
         let active = state
@@ -231,26 +261,59 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             let item = user_message(&message);
             state.context.push(item.clone());
             recovery_delta.push(item);
-            replay.push(EventMsg::UserMessage(UserMessageEvent {
-                message,
-                attachments: Vec::new(),
-                message_target: None,
-            }));
+            recovery_events.push(Event {
+                submission_id: state
+                    .active_execution
+                    .as_ref()
+                    .map(|execution| execution.submission_id.clone()),
+                msg: EventMsg::UserMessage(UserMessageEvent {
+                    message,
+                    attachments: Vec::new(),
+                    message_target: None,
+                }),
+            });
         }
         recovery_execution =
             Some(state.finish_execution(ExecutionOutcome::Aborted, unix_timestamp_ms()?)?);
         state_changed = true;
     }
+    if let Some(execution) = &recovery_execution {
+        recovery_events.push(Event {
+            submission_id: Some(execution.submission_id.clone()),
+            msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: execution.turn_id.clone(),
+                reason: "interrupted by restart".into(),
+            }),
+        });
+    }
     if is_new || state_changed {
         if !is_new {
             state.sequence += 1;
         }
-        config
-            .checkpoints
-            .save(&state, &recovery_delta, recovery_execution.as_ref())
+        let mut startup_events = vec![session_event];
+        startup_events.append(&mut recovery_events);
+        event_tx
+            .save(
+                &state,
+                &recovery_delta,
+                recovery_execution.as_ref(),
+                startup_events,
+            )
             .await?;
+    } else {
+        send_event(&event_tx, session_event).await?;
     }
-    if !replay.is_empty() {
+    if config.initial_replay_batches == 0 {
+        for msg in replay {
+            try_send_event(
+                &event_tx,
+                Event {
+                    submission_id: None,
+                    msg,
+                },
+            )?;
+        }
+    } else if !replay.is_empty() {
         try_send_event(
             &event_tx,
             Event {
@@ -280,6 +343,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         .middleware
         .initialize(runtime, &state.pending_input)
         .await?;
+    event_tx.flush().await?;
     let mut runner = Runner {
         config,
         system_prompt,
@@ -298,14 +362,14 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         let run = runner.run(command_rx).await;
         let shutdown = runner.config.middleware.shutdown(end_context).await;
         if let Some(error) = run.err().or_else(|| shutdown.err()) {
-            let _ = event_tx
-                .send(Event {
+            let _ = send_event(
+                &event_tx,
+                Event {
                     submission_id: None,
-                    msg: EventMsg::Error(ErrorEvent {
-                        message: error.to_string(),
-                    }),
-                })
-                .await;
+                    msg: EventMsg::Error(ErrorEvent::from_error(&error)),
+                },
+            )
+            .await;
         }
     });
     Ok(Agent {

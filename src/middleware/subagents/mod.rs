@@ -497,7 +497,7 @@ impl Middleware for Subagents {
                     labeled_tool_heading(text::RENDER_INTERRUPT, "target", arguments)
                 }
                 "wait_agent" => labeled_tool_heading(text::RENDER_WAIT, "timeout_ms", arguments),
-                _ => format!("◉ {name}"),
+                _ => name.to_string().into(),
             },
         )
     }

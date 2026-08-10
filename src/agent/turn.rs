@@ -5,17 +5,19 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::COMMAND_QUEUE_CAPACITY;
+use super::EventRecorder;
 use super::Runner;
+use super::input::ActiveRoute;
 use super::input::ActiveTurnRouter;
 use super::input::Wait;
-use super::input::{ActiveChange, ActiveRoute};
+use super::send_event;
 use super::try_send_event;
 use super::unix_timestamp_ms;
 use crate::Error;
 use crate::Result;
 use crate::backend::checkpoint::ActiveExecution;
+use crate::backend::checkpoint::ActiveModelStep;
 use crate::backend::checkpoint::Checkpoint;
-use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::checkpoint::ExecutionOutcome;
 use crate::backend::model::ModelEventSink;
 use crate::backend::model::ModelRequest;
@@ -33,6 +35,9 @@ use crate::protocol::ErrorEvent;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::MessageTarget;
+use crate::protocol::ModelStepCompletedEvent;
+use crate::protocol::ModelStepOutcome;
+use crate::protocol::ModelStepStartedEvent;
 use crate::protocol::Submission;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsageInfo;
@@ -81,16 +86,16 @@ impl Runner {
         else {
             return Err(error);
         };
-        let message = error.to_string();
-        self.emit(
+        let event = ErrorEvent::from_error(&error);
+        let message = event.message.clone();
+        self.abort_with_events(
             submission_id,
-            EventMsg::Error(ErrorEvent {
-                message: message.clone(),
-            }),
+            &turn_id,
+            &message,
+            ExecutionOutcome::Failed,
+            vec![turn_event(submission_id, EventMsg::Error(event))],
         )
-        .await?;
-        self.abort(submission_id, &turn_id, &message, ExecutionOutcome::Failed)
-            .await
+        .await
     }
 
     pub(super) async fn start_turn(
@@ -115,54 +120,76 @@ impl Runner {
             failed_tool_calls: 0,
             usage: crate::protocol::TokenUsage::default(),
         });
-        self.emit(
-            &submission_id,
-            EventMsg::TurnStarted(TurnStartedEvent {
-                turn_id: turn_id.clone(),
-                model_context_window: Some(self.config.context_window),
-            }),
-        )
-        .await?;
         if self.state.first_user_message.is_none() && !message.trim().is_empty() {
             self.state.first_user_message = Some(message.clone());
         }
         self.push_context(user_message_with_attachments(&message, &attachments));
         let batch_item_count = self.transcript_delta.len();
-        let checkpoint_sequence = self.save().await?;
-        self.emit(
-            &submission_id,
-            EventMsg::UserMessage(UserMessageEvent {
-                message: message.clone(),
-                attachments,
-                message_target: Some(MessageTarget {
-                    checkpoint_sequence,
-                    batch_item_count,
-                }),
-            }),
+        let checkpoint_sequence = self
+            .state
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Checkpoint("checkpoint sequence overflow".into()))?;
+        self.persist_with_events(
+            vec![
+                turn_event(
+                    &submission_id,
+                    EventMsg::TurnStarted(TurnStartedEvent {
+                        turn_id: turn_id.clone(),
+                        model_context_window: Some(self.config.context_window),
+                    }),
+                ),
+                turn_event(
+                    &submission_id,
+                    EventMsg::UserMessage(UserMessageEvent {
+                        message: message.clone(),
+                        attachments,
+                        message_target: Some(MessageTarget {
+                            checkpoint_sequence,
+                            batch_item_count,
+                        }),
+                    }),
+                ),
+            ],
+            None,
         )
         .await?;
         self.continue_turn(commands, submission_id, turn_id).await
     }
 
-    async fn publish_before_model_changes(
-        &self,
+    async fn persist_before_model_changes(
+        &mut self,
         submission_id: &str,
         mut middleware_events: Vec<EventMsg>,
-        active_changes: Vec<ActiveChange>,
         usage_changed: bool,
-        target_sequence: Option<(u64, u64)>,
+        checkpoint_changed: bool,
+        provisional_target_sequence: u64,
     ) -> Result<()> {
-        if let Some((provisional, durable)) = target_sequence {
-            rebase_live_message_targets(&mut middleware_events, provisional, durable);
+        if checkpoint_changed {
+            let durable_sequence = self
+                .state
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| Error::Checkpoint("checkpoint sequence overflow".into()))?;
+            rebase_live_message_targets(
+                &mut middleware_events,
+                provisional_target_sequence,
+                durable_sequence,
+            );
         }
-        for event in middleware_events {
-            self.emit(submission_id, event).await?;
+        let mut events = middleware_events
+            .into_iter()
+            .map(|message| turn_event(submission_id, message))
+            .collect::<Vec<_>>();
+        if usage_changed && let Some(usage) = self.usage_event(submission_id) {
+            events.push(usage);
         }
-        for change in active_changes {
-            change.publish(&self.events).await?;
-        }
-        if usage_changed {
-            self.emit_usage(submission_id)?;
+        if checkpoint_changed {
+            self.persist_with_events(events, None).await?;
+        } else {
+            for event in events {
+                send_event(&self.events, event).await?;
+            }
         }
         Ok(())
     }
@@ -183,14 +210,13 @@ impl Runner {
         let had_queued_input = !self.state.pending_input.is_empty();
         let mut durable_snapshot = self.state.clone();
         let original_pending_count = durable_snapshot.pending_input.len();
-        let checkpoints = Arc::clone(&self.config.checkpoints);
+        let recorder = self.events.clone();
         let active_events = self.events.clone();
         let mut checkpoint_changed = false;
         let mut request_input = self.state.context.clone();
-        let (control, mut queued_during_middleware, queue_changed, active_changes) = {
+        let (control, mut queued_during_middleware, queue_changed) = {
             let mut queued_during_middleware = Vec::new();
             let mut queue_changed = false;
-            let mut active_changes = Vec::new();
             let before_model = self.config.middleware.before_model(ModelContext {
                 model: &self.config.model,
                 provider: &self.config.provider,
@@ -242,8 +268,12 @@ impl Runner {
                                 durable_snapshot
                                     .pending_input
                                     .extend(queued_during_middleware.iter().cloned());
-                                persist_queue_snapshot(&checkpoints, &mut durable_snapshot).await?;
-                                active_changes.push(change);
+                                persist_queue_snapshot(
+                                    &recorder,
+                                    &mut durable_snapshot,
+                                    change.into_events(),
+                                )
+                                .await?;
                                 queue_changed = true;
                             }
                             ActiveRoute::Interrupted { submission_id } => {
@@ -254,12 +284,7 @@ impl Runner {
                     }
                 }
             };
-            (
-                control,
-                queued_during_middleware,
-                queue_changed,
-                active_changes,
-            )
+            (control, queued_during_middleware, queue_changed)
         };
         self.state.sequence = durable_snapshot.sequence;
         self.state
@@ -280,33 +305,23 @@ impl Runner {
         }
         checkpoint_changed |= usage_changed || had_queued_input || queue_changed;
         if let Some(error) = hook_error {
-            let durable_sequence = if checkpoint_changed {
-                Some(self.save().await?)
-            } else {
-                None
-            };
-            self.publish_before_model_changes(
+            self.persist_before_model_changes(
                 submission_id,
                 middleware_events,
-                active_changes,
                 usage_changed,
-                durable_sequence.map(|sequence| (provisional_target_sequence, sequence)),
+                checkpoint_changed,
+                provisional_target_sequence,
             )
             .await?;
             return Err(error);
         }
         if let Some(interrupt_submission_id) = interrupted_by {
-            let durable_sequence = if checkpoint_changed {
-                Some(self.save().await?)
-            } else {
-                None
-            };
-            self.publish_before_model_changes(
+            self.persist_before_model_changes(
                 submission_id,
                 middleware_events,
-                active_changes,
                 usage_changed,
-                durable_sequence.map(|sequence| (provisional_target_sequence, sequence)),
+                checkpoint_changed,
+                provisional_target_sequence,
             )
             .await?;
             self.abort(
@@ -319,13 +334,12 @@ impl Runner {
             return Ok(BeforeModel::Aborted);
         }
         if queue_changed {
-            let durable_sequence = self.save().await?;
-            self.publish_before_model_changes(
+            self.persist_before_model_changes(
                 submission_id,
                 middleware_events,
-                active_changes,
                 usage_changed,
-                Some((provisional_target_sequence, durable_sequence)),
+                true,
+                provisional_target_sequence,
             )
             .await?;
             return Ok(BeforeModel::Repeat);
@@ -335,20 +349,27 @@ impl Runner {
                 "queued active input was not consumed by its middleware".into(),
             ));
         }
-        let durable_sequence = if checkpoint_changed {
-            Some(self.save().await?)
-        } else {
-            None
-        };
-        self.publish_before_model_changes(
+        self.persist_before_model_changes(
             submission_id,
             middleware_events,
-            active_changes,
             usage_changed,
-            durable_sequence.map(|sequence| (provisional_target_sequence, sequence)),
+            checkpoint_changed,
+            provisional_target_sequence,
         )
         .await?;
         Ok(BeforeModel::Ready(request_input))
+    }
+
+    async fn fail_model_step(
+        &mut self,
+        submission_id: &str,
+        started: &ModelStepStartedEvent,
+        outcome: ModelStepOutcome,
+    ) -> Result<()> {
+        self.state.active_model_step = None;
+        let event = model_step_completed_event(submission_id, started, outcome)?;
+        self.persist_with_events(vec![event], None).await?;
+        Ok(())
     }
 
     pub(super) async fn continue_turn(
@@ -357,7 +378,6 @@ impl Runner {
         submission_id: String,
         turn_id: String,
     ) -> Result<()> {
-        let mut last_agent_message = None;
         let mut model_step = 0;
         loop {
             if let Some(interrupt_submission_id) = self.drain_commands(commands, &turn_id).await? {
@@ -385,13 +405,34 @@ impl Runner {
                 BeforeModel::Ready(input) => input,
             };
 
-            let item_id = Uuid::new_v4().to_string();
+            let model_step_started = ModelStepStartedEvent {
+                session_id: self.state.session_id.clone(),
+                turn_id: turn_id.clone(),
+                model_step_id: Uuid::new_v4().to_string(),
+                step_index: model_step,
+                started_at_ms: unix_timestamp_ms()?,
+            };
+            self.record_model_call()?;
+            self.state.active_model_step = Some(ActiveModelStep {
+                model_step_id: model_step_started.model_step_id.clone(),
+                step_index: model_step_started.step_index,
+                started_at_ms: model_step_started.started_at_ms,
+            });
+            self.persist_with_events(
+                vec![turn_event(
+                    &submission_id,
+                    EventMsg::ModelStepStarted(model_step_started.clone()),
+                )],
+                None,
+            )
+            .await?;
             let events = self.events.clone();
             let event_submission_id = submission_id.clone();
             let event_turn_id = turn_id.clone();
-            let thread_id = self.state.session_id.clone();
+            let event_session_id = self.state.session_id.clone();
+            let event_model_step_id = model_step_started.model_step_id.clone();
             let stream: ModelEventSink = Arc::new(move |event| {
-                let msg = event.into_event(&thread_id, &event_turn_id, &item_id);
+                let msg = event.into_event(&event_session_id, &event_turn_id, &event_model_step_id);
                 try_send_event(
                     &events,
                     Event {
@@ -401,7 +442,6 @@ impl Runner {
                 )
             });
             let tools = self.catalog.definitions();
-            self.record_model_call()?;
             let model = Arc::clone(&self.config.model);
             let provider = self.config.provider.clone();
             let model_session_id = self.state.session_id.clone();
@@ -418,13 +458,99 @@ impl Runner {
                 },
                 stream,
             );
-            let output = self.wait_active(commands, &turn_id, response).await?;
-            let Some(output) = self.ready_or_aborted(output, &turn_id).await? else {
-                return Ok(());
+            let output = match self.wait_active(commands, &turn_id, response).await {
+                Ok(Wait::Ready(Ok(output))) => output,
+                Ok(Wait::Ready(Err(error))) | Err(error) => {
+                    self.fail_model_step(
+                        &submission_id,
+                        &model_step_started,
+                        ModelStepOutcome::Failed,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Ok(Wait::Interrupted {
+                    submission_id: interrupt_submission_id,
+                }) => {
+                    self.fail_model_step(
+                        &submission_id,
+                        &model_step_started,
+                        ModelStepOutcome::Interrupted,
+                    )
+                    .await?;
+                    self.abort(
+                        &interrupt_submission_id,
+                        &turn_id,
+                        "interrupted",
+                        ExecutionOutcome::Aborted,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
-            let output = output?;
-            self.record_usage(&provider, &output.usage)?;
+            if let Err(error) = self.record_usage(&provider, &output.usage) {
+                self.fail_model_step(
+                    &submission_id,
+                    &model_step_started,
+                    ModelStepOutcome::Failed,
+                )
+                .await?;
+                return Err(error);
+            }
             self.state.last_usage = Some(output.usage.clone());
+            let context_before = self.state.context.len();
+            let batch_before = self.transcript_delta.len();
+            let message_index = output.output.iter().rposition(has_visible_output_text);
+            self.extend_context(output.output.clone());
+            let message_boundary = message_index.map(|index| context_before + index + 1);
+            let message_is_safe = message_boundary.is_some_and(|boundary| {
+                tool_complete_boundaries(&self.state.context)
+                    .binary_search(&boundary)
+                    .is_ok()
+            });
+            self.state.pending_tools.clone_from(&output.tool_calls);
+            self.state.active_model_step = None;
+            let checkpoint_sequence = self
+                .state
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| Error::Checkpoint("checkpoint sequence overflow".into()))?;
+            let mut model_events = vec![model_step_completed_event(
+                &submission_id,
+                &model_step_started,
+                ModelStepOutcome::Completed {
+                    end_turn: output.end_turn,
+                    tool_call_ids: output
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.call_id.clone())
+                        .collect(),
+                    usage: output.usage.clone(),
+                    content: output.content().to_vec(),
+                },
+            )?];
+            if !output.text.is_empty() {
+                model_events.push(turn_event(
+                    &submission_id,
+                    EventMsg::AgentMessage(AgentMessageEvent {
+                        session_id: self.state.session_id.clone(),
+                        turn_id: turn_id.clone(),
+                        model_step_id: model_step_started.model_step_id.clone(),
+                        message: output.text.clone(),
+                        phase: AgentMessagePhase::FinalAnswer,
+                        message_target: message_index.filter(|_| message_is_safe).map(|index| {
+                            MessageTarget {
+                                checkpoint_sequence,
+                                batch_item_count: batch_before + index + 1,
+                            }
+                        }),
+                    }),
+                ));
+            }
+            if let Some(usage) = self.usage_event(&submission_id) {
+                model_events.push(usage);
+            }
+            self.persist_with_events(model_events, None).await?;
             let mut after_model_events = Vec::new();
             let middleware = self.config.middleware.clone();
             let provider = self.config.provider.clone();
@@ -452,17 +578,6 @@ impl Runner {
             for event in after_model_events {
                 self.emit(&submission_id, event).await?;
             }
-            let context_before = self.state.context.len();
-            let batch_before = self.transcript_delta.len();
-            let message_index = output.output.iter().rposition(has_visible_output_text);
-            self.extend_context(output.output);
-            let message_boundary = message_index.map(|index| context_before + index + 1);
-            let message_is_safe = message_boundary.is_some_and(|boundary| {
-                tool_complete_boundaries(&self.state.context)
-                    .binary_search(&boundary)
-                    .is_ok()
-            });
-            self.state.pending_tools.clone_from(&output.tool_calls);
             let no_tools = output.tool_calls.is_empty();
             let complete = if no_tools && output.end_turn {
                 if let Some(interrupt_submission_id) =
@@ -481,43 +596,11 @@ impl Runner {
             } else {
                 false
             };
-            let checkpoint_sequence = if complete {
-                self.finish_and_save_execution(ExecutionOutcome::Completed)
-                    .await?
-            } else {
-                self.save().await?
-            };
-            self.emit_usage(&submission_id)?;
-            if !output.text.is_empty() {
-                last_agent_message = Some(output.text.clone());
-                self.emit(
-                    &submission_id,
-                    EventMsg::AgentMessage(AgentMessageEvent {
-                        message: output.text,
-                        phase: Some(AgentMessagePhase::FinalAnswer),
-                        message_target: message_index.filter(|_| message_is_safe).map(|index| {
-                            MessageTarget {
-                                checkpoint_sequence,
-                                batch_item_count: batch_before + index + 1,
-                            }
-                        }),
-                    }),
-                )
-                .await?;
-            }
             if no_tools {
                 if !complete {
                     continue;
                 }
-                self.emit_turn_ended(&submission_id, &turn_id).await?;
-                self.emit(
-                    submission_id,
-                    EventMsg::TurnComplete(TurnCompleteEvent {
-                        turn_id,
-                        last_agent_message,
-                    }),
-                )
-                .await?;
+                self.complete_turn(&submission_id, &turn_id).await?;
                 return Ok(());
             }
 
@@ -583,9 +666,9 @@ impl Runner {
                     results
                 }
             };
-            self.append_tool_results(results)?;
             self.state.pending_approval = None;
-            self.save().await?;
+            self.persist_tool_results(&submission_id, &turn_id, results)
+                .await?;
         }
     }
 
@@ -624,24 +707,32 @@ impl Runner {
         Ok(None)
     }
 
-    pub(super) fn emit_usage(&self, submission_id: &str) -> Result<()> {
-        let Some(last) = self.state.last_usage.clone() else {
-            return Ok(());
-        };
-        try_send_event(
-            &self.events,
-            Event {
-                submission_id: Some(submission_id.to_string()),
-                msg: EventMsg::TokenCount(TokenCountEvent {
-                    info: Some(TokenUsageInfo {
-                        total_token_usage: self.state.total_usage.clone(),
-                        last_token_usage: last,
-                        model_context_window: Some(self.config.context_window),
-                    }),
-                    rate_limits: None,
+    pub(super) fn usage_event(&self, submission_id: &str) -> Option<Event> {
+        let last = self.state.last_usage.clone()?;
+        Some(turn_event(
+            submission_id,
+            EventMsg::TokenCount(TokenCountEvent {
+                info: Some(TokenUsageInfo {
+                    total_token_usage: self.state.total_usage.clone(),
+                    last_token_usage: last,
+                    model_context_window: Some(self.config.context_window),
                 }),
-            },
-        )
+                rate_limits: None,
+            }),
+        ))
+    }
+
+    async fn complete_turn(&mut self, submission_id: &str, turn_id: &str) -> Result<()> {
+        let mut events = self.turn_ended_events(submission_id, turn_id)?;
+        events.push(turn_event(
+            submission_id,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn_id.to_string(),
+            }),
+        ));
+        self.finish_and_persist_execution(ExecutionOutcome::Completed, events)
+            .await?;
+        Ok(())
     }
 
     pub(super) async fn abort(
@@ -651,34 +742,72 @@ impl Runner {
         reason: &str,
         outcome: ExecutionOutcome,
     ) -> Result<()> {
+        self.abort_with_events(submission_id, turn_id, reason, outcome, Vec::new())
+            .await
+    }
+
+    async fn abort_with_events(
+        &mut self,
+        submission_id: &str,
+        turn_id: &str,
+        reason: &str,
+        outcome: ExecutionOutcome,
+        mut events: Vec<Event>,
+    ) -> Result<()> {
         self.finish_pending_tools(submission_id, turn_id, reason)
             .await?;
         self.state.pending_input.clear();
         self.state.pending_approval = None;
-        self.finish_and_save_execution(outcome).await?;
-        self.emit_turn_ended(submission_id, turn_id).await?;
-        self.emit(
+        events.extend(self.turn_ended_events(submission_id, turn_id)?);
+        events.push(turn_event(
             submission_id,
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: turn_id.to_string(),
                 reason: reason.to_string(),
             }),
-        )
-        .await
+        ));
+        self.finish_and_persist_execution(outcome, events).await?;
+        Ok(())
     }
 
-    async fn emit_turn_ended(&self, submission_id: &str, turn_id: &str) -> Result<()> {
-        let mut events = Vec::new();
+    fn turn_ended_events(&self, submission_id: &str, turn_id: &str) -> Result<Vec<Event>> {
+        let mut messages = Vec::new();
         self.config.middleware.turn_ended(TurnEndContext {
             session_id: &self.config.session_id,
             turn_id,
-            events: &mut events,
+            events: &mut messages,
         })?;
-        for event in events {
-            self.emit(submission_id, event).await?;
-        }
-        Ok(())
+        Ok(messages
+            .into_iter()
+            .map(|message| turn_event(submission_id, message))
+            .collect())
     }
+}
+
+fn turn_event(submission_id: &str, msg: EventMsg) -> Event {
+    Event {
+        submission_id: Some(submission_id.to_string()),
+        msg,
+    }
+}
+
+fn model_step_completed_event(
+    submission_id: &str,
+    started: &ModelStepStartedEvent,
+    outcome: ModelStepOutcome,
+) -> Result<Event> {
+    Ok(turn_event(
+        submission_id,
+        EventMsg::ModelStepCompleted(ModelStepCompletedEvent {
+            session_id: started.session_id.clone(),
+            turn_id: started.turn_id.clone(),
+            model_step_id: started.model_step_id.clone(),
+            step_index: started.step_index,
+            started_at_ms: started.started_at_ms,
+            completed_at_ms: unix_timestamp_ms()?.max(started.started_at_ms),
+            outcome,
+        }),
+    ))
 }
 
 fn rebase_live_message_targets(events: &mut [EventMsg], provisional: u64, durable: u64) {
@@ -694,12 +823,16 @@ fn rebase_live_message_targets(events: &mut [EventMsg], provisional: u64, durabl
 }
 
 async fn persist_queue_snapshot(
-    checkpoints: &Arc<dyn CheckpointStore>,
+    recorder: &EventRecorder,
     checkpoint: &mut Checkpoint,
+    events: Vec<Event>,
 ) -> Result<()> {
     let previous_sequence = checkpoint.sequence;
-    checkpoint.sequence += 1;
-    if let Err(error) = checkpoints.save(checkpoint, &[], None).await {
+    checkpoint.sequence = checkpoint
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| Error::Checkpoint("checkpoint sequence overflow".into()))?;
+    if let Err(error) = recorder.save(checkpoint, &[], None, events).await {
         checkpoint.sequence = previous_sequence;
         return Err(error);
     }

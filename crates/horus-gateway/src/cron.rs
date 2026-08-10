@@ -264,6 +264,37 @@ impl CronStore {
         Ok(deleted)
     }
 
+    /// Permanently removes one idle session's schedules and run history.
+    pub(crate) fn delete_session(&self, source_session_id: &str) -> Result<()> {
+        self.require_session_idle(source_session_id)?;
+        let (tasks, locks) = self.lock_session_tasks(source_session_id)?;
+        for task in &tasks {
+            remove_if_present(&task.task)?;
+        }
+        self.update(|state| {
+            state
+                .tasks
+                .retain(|task| task.session_id != source_session_id);
+            state
+                .runs
+                .retain(|run| run.source_session_id != source_session_id);
+            Ok(())
+        })?;
+        drop(locks);
+        Ok(())
+    }
+
+    pub(crate) fn require_session_idle(&self, source_session_id: &str) -> Result<()> {
+        validate_session_id(source_session_id)?;
+        if self.lock_setups()?.contains(source_session_id) {
+            return Err(Error::Config(
+                "scheduled-task setup is currently active for this session".into(),
+            ));
+        }
+        let _ = self.lock_session_tasks(source_session_id)?;
+        Ok(())
+    }
+
     /// Resolves one task by full ID or unambiguous prefix.
     pub(crate) fn task(&self, source_session_id: &str, id: &str) -> Result<CronTask> {
         let state = self.lock_state()?;
@@ -448,6 +479,21 @@ impl CronStore {
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(error.into()),
         }
+    }
+
+    fn lock_session_tasks(&self, source_session_id: &str) -> Result<(Vec<CronTask>, Vec<File>)> {
+        let tasks = self.list(source_session_id)?;
+        let mut locks = Vec::with_capacity(tasks.len());
+        for task in &tasks {
+            let Some(lock) = self.try_task_lock(&task.id)? else {
+                return Err(Error::Config(format!(
+                    "cron task {} is currently running",
+                    task.id
+                )));
+            };
+            locks.push(lock);
+        }
+        Ok((tasks, locks))
     }
 
     fn record_terminal_run(
@@ -715,6 +761,14 @@ fn private_tasks_dir(state_dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn write_private_task(directory: &Path, path: &Path, contents: &[u8]) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(directory)?;
     #[cfg(unix)]
@@ -924,6 +978,83 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn delete_session_removes_only_its_schedules_files_and_history() {
+        let (root, store) = store();
+        let deleted = add_task(&store, "session-a", "task a", "0 9 * * *");
+        let retained = add_task(&store, "session-b", "task b", "0 10 * * *");
+        for task in [&deleted, &retained] {
+            let run = match store.begin_run(&task.id).expect("begin run") {
+                BeginRun::Started(run) => run,
+                BeginRun::Skipped => panic!("run must start"),
+            };
+            store
+                .finish_run(run, CronRunStatus::Succeeded, None)
+                .expect("finish run");
+        }
+
+        store
+            .delete_session("session-a")
+            .expect("delete session cron data");
+
+        assert!(store.list("session-a").expect("deleted tasks").is_empty());
+        assert!(
+            store
+                .history("session-a", None)
+                .expect("deleted history")
+                .is_empty()
+        );
+        assert!(!deleted.task.exists());
+        assert_eq!(store.list("session-b").expect("retained tasks"), [retained]);
+        drop(store);
+        let reopened = CronStore::open(&root.path().join("state")).expect("reopen");
+        assert!(
+            reopened
+                .list("session-a")
+                .expect("reopened tasks")
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .history("session-b", None)
+                .expect("retained history")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn delete_session_rejects_a_running_schedule() {
+        let (_root, store) = store();
+        let task = add_task(&store, "session-a", "task a", "0 9 * * *");
+        let run = match store.begin_run(&task.id).expect("begin run") {
+            BeginRun::Started(run) => run,
+            BeginRun::Skipped => panic!("run must start"),
+        };
+
+        assert!(store.delete_session("session-a").is_err());
+        assert_eq!(store.list("session-a").expect("retained task"), [task]);
+
+        store
+            .finish_run(run, CronRunStatus::Succeeded, None)
+            .expect("finish run");
+    }
+
+    #[test]
+    fn delete_session_rejects_an_active_setup() {
+        let (_root, store) = store();
+        store
+            .begin_setup("session-a", Some("task a"))
+            .expect("begin setup");
+
+        assert!(store.delete_session("session-a").is_err());
+
+        store.cancel_setup("session-a");
+        store
+            .delete_session("session-a")
+            .expect("delete idle session cron data");
     }
 
     #[test]

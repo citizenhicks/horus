@@ -269,7 +269,7 @@ pub(super) fn render_preview(frame: &mut Frame<'_>, state: &mut TuiState) {
 fn transcript_lines<'a>(
     entries: impl Iterator<Item = &'a mut TranscriptEntry>,
     width: u16,
-    mut previous_group: Option<String>,
+    mut previous_group: Option<super::BlockKey>,
     mut has_previous: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();

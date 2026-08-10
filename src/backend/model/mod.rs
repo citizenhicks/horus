@@ -13,6 +13,7 @@ use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
 use crate::protocol::TokenUsage;
+use crate::protocol::{ModelStepAnnotation, ModelStepContent, ModelStepContentPhase};
 
 pub mod anthropic;
 pub mod deepseek;
@@ -27,7 +28,8 @@ mod transport;
 
 use crate::protocol::{ATTACHMENTS_FIELD, INTERNAL_MESSAGE_FIELD, SessionFileReference};
 pub(crate) use crate::protocol::{REPLAY_REASONING_FIELD, TOOL_ERROR_FIELD};
-const MAX_MODEL_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+// Leaves room for typed lifecycle metadata inside the shipped 20 MiB frontend envelope.
+const MAX_MODEL_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 128;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_CALL_ID_BYTES: usize = 4 * 1024;
@@ -109,6 +111,7 @@ pub type ModelEventSink = Arc<dyn Fn(crate::protocol::ModelEvent) -> Result<()> 
 pub struct ModelOutput {
     pub(crate) output: Vec<Value>,
     pub(crate) text: String,
+    pub(crate) content: Vec<ModelStepContent>,
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) end_turn: bool,
     pub(crate) usage: TokenUsage,
@@ -117,20 +120,26 @@ pub struct ModelOutput {
 impl ModelOutput {
     /// Validates normalized output and derives its visible text and tool calls.
     pub fn from_output(output: Vec<Value>, end_turn: bool, usage: TokenUsage) -> Result<Self> {
+        let content = normalized_step_content(&output)?;
+        Self::from_output_with_content(output, end_turn, usage, content)
+    }
+
+    pub(super) fn from_output_with_content(
+        output: Vec<Value>,
+        end_turn: bool,
+        usage: TokenUsage,
+        content: Vec<ModelStepContent>,
+    ) -> Result<Self> {
         ensure_output_size(&output)?;
         validate_usage(&usage)?;
         if output.is_empty() {
             return Err(Error::Provider("model returned no output".into()));
         }
 
-        let text = output
+        let text = content
             .iter()
-            .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
-            .filter(|item| item.get("phase").and_then(Value::as_str) != Some("commentary"))
-            .filter_map(|item| item.get("content").and_then(Value::as_array))
-            .flatten()
-            .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .filter(|content| content.phase == ModelStepContentPhase::FinalAnswer)
+            .map(|content| content.text.as_str())
             .collect();
 
         let mut call_ids = BTreeSet::new();
@@ -150,6 +159,7 @@ impl ModelOutput {
         Ok(Self {
             output,
             text,
+            content,
             tool_calls,
             end_turn,
             usage,
@@ -184,6 +194,183 @@ impl ModelOutput {
     #[must_use]
     pub fn usage(&self) -> &TokenUsage {
         &self.usage
+    }
+
+    /// Returns complete, provider-neutral text normalized at the model boundary.
+    #[must_use]
+    pub fn content(&self) -> &[ModelStepContent] {
+        &self.content
+    }
+}
+
+fn normalized_step_content(output: &[Value]) -> Result<Vec<ModelStepContent>> {
+    let mut content = Vec::new();
+    for (output_index, item) in output.iter().enumerate() {
+        normalize_reasoning_content(output_index, item, &mut content);
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let phase = if item.get("phase").and_then(Value::as_str) == Some("commentary") {
+            ModelStepContentPhase::Commentary
+        } else {
+            ModelStepContentPhase::FinalAnswer
+        };
+        for (part_index, part) in item
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if part.get("type").and_then(Value::as_str) != Some("output_text") {
+                continue;
+            }
+            let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                Error::Provider("output text part omitted text".to_string().into())
+            })?;
+            if text.is_empty() {
+                continue;
+            }
+            content.push(ModelStepContent {
+                output_index,
+                part_index,
+                phase,
+                text: text.into(),
+                annotations: normalize_output_text_annotations(part)?,
+            });
+        }
+    }
+    Ok(content)
+}
+
+fn normalize_reasoning_content(
+    output_index: usize,
+    item: &Value,
+    content: &mut Vec<ModelStepContent>,
+) {
+    let parts = if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+        ["summary", "content"]
+            .into_iter()
+            .filter_map(|field| item.get(field).and_then(Value::as_array))
+            .find(|parts| {
+                parts.iter().any(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                })
+            })
+    } else {
+        None
+    };
+    if let Some(parts) = parts {
+        content.extend(parts.iter().enumerate().filter_map(|(part_index, part)| {
+            part.get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| ModelStepContent {
+                    output_index,
+                    part_index,
+                    phase: ModelStepContentPhase::Reasoning,
+                    text: text.into(),
+                    annotations: Vec::new(),
+                })
+        }));
+        return;
+    }
+    if let Some(text) = item
+        .get(REPLAY_REASONING_FIELD)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        content.push(ModelStepContent {
+            output_index,
+            part_index: 0,
+            phase: ModelStepContentPhase::Reasoning,
+            text: text.into(),
+            annotations: Vec::new(),
+        });
+    }
+}
+
+fn normalize_output_text_annotations(part: &Value) -> Result<Vec<ModelStepAnnotation>> {
+    let Some(annotations) = part.get("annotations") else {
+        return Ok(Vec::new());
+    };
+    if annotations.is_null() {
+        return Ok(Vec::new());
+    }
+    let annotations: Vec<OutputTextAnnotation> = serde_json::from_value(annotations.clone())
+        .map_err(|error| {
+            Error::Provider(format!("invalid output text annotation: {error}").into())
+        })?;
+    Ok(annotations.into_iter().map(Into::into).collect())
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum OutputTextAnnotation {
+    UrlCitation {
+        url: String,
+        title: String,
+        start_index: usize,
+        end_index: usize,
+    },
+    FileCitation {
+        file_id: String,
+        filename: String,
+        index: usize,
+    },
+    ContainerFileCitation {
+        container_id: String,
+        file_id: String,
+        filename: String,
+        start_index: usize,
+        end_index: usize,
+    },
+    FilePath {
+        file_id: String,
+        index: usize,
+    },
+}
+
+impl From<OutputTextAnnotation> for ModelStepAnnotation {
+    fn from(annotation: OutputTextAnnotation) -> Self {
+        match annotation {
+            OutputTextAnnotation::UrlCitation {
+                url,
+                title,
+                start_index,
+                end_index,
+            } => Self::UrlCitation {
+                url,
+                title,
+                start_index,
+                end_index,
+            },
+            OutputTextAnnotation::FileCitation {
+                file_id,
+                filename,
+                index,
+            } => Self::FileCitation {
+                file_id,
+                filename,
+                index,
+            },
+            OutputTextAnnotation::ContainerFileCitation {
+                container_id,
+                file_id,
+                filename,
+                start_index,
+                end_index,
+            } => Self::ContainerFileCitation {
+                container_id,
+                file_id,
+                filename,
+                start_index,
+                end_index,
+            },
+            OutputTextAnnotation::FilePath { file_id, index } => Self::FilePath { file_id, index },
+        }
     }
 }
 
@@ -683,6 +870,102 @@ mod tests {
                 arguments: serde_json::json!({"path": "README.md"}),
             }]
         );
+    }
+
+    #[test]
+    fn normalized_output_preserves_complete_typed_step_content() {
+        let output = ModelOutput::from_output(
+            vec![
+                serde_json::json!({
+                    "type": "reasoning",
+                    (REPLAY_REASONING_FIELD): "Inspect the state."
+                }),
+                serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [
+                        {"type": "output_text", "text": "Checking "},
+                        {"type": "output_text", "text": "now."}
+                    ]
+                }),
+                serde_json::json!({
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "read",
+                    "arguments": "{}"
+                }),
+                serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done."}]
+                }),
+            ],
+            true,
+            TokenUsage::default(),
+        )
+        .expect("normalized output");
+
+        assert_eq!(
+            output.content(),
+            vec![
+                ModelStepContent {
+                    output_index: 0,
+                    part_index: 0,
+                    phase: ModelStepContentPhase::Reasoning,
+                    text: "Inspect the state.".into(),
+                    annotations: Vec::new(),
+                },
+                ModelStepContent {
+                    output_index: 1,
+                    part_index: 0,
+                    phase: ModelStepContentPhase::Commentary,
+                    text: "Checking ".into(),
+                    annotations: Vec::new(),
+                },
+                ModelStepContent {
+                    output_index: 1,
+                    part_index: 1,
+                    phase: ModelStepContentPhase::Commentary,
+                    text: "now.".into(),
+                    annotations: Vec::new(),
+                },
+                ModelStepContent {
+                    output_index: 3,
+                    part_index: 0,
+                    phase: ModelStepContentPhase::FinalAnswer,
+                    text: "Done.".into(),
+                    annotations: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn normalized_output_rejects_unmodeled_annotation_fields() {
+        let error = ModelOutput::from_output(
+            vec![serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "Source",
+                    "annotations": [{
+                        "type": "url_citation",
+                        "url": "https://example.com",
+                        "title": "Example",
+                        "start_index": 0,
+                        "end_index": 6,
+                        "unmodeled": true
+                    }]
+                }]
+            })],
+            true,
+            TokenUsage::default(),
+        )
+        .expect_err("unmodeled annotation fields must fail");
+
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]

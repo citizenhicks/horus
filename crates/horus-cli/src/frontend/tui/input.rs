@@ -578,7 +578,6 @@ impl TuiState {
         if line.is_empty() {
             return UiAction::None;
         }
-        self.remember_composer_input(line.to_owned());
         let op = self
             .active_turn
             .clone()

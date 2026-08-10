@@ -83,12 +83,16 @@ impl Middleware for Artifacts {
         let Ok(output) = serde_json::from_str::<ArtifactOutput>(&result.output) else {
             return Some(block);
         };
-        block.append = false;
+        block.update = crate::protocol::FrontendBlockUpdate::Replace;
+        block.state = crate::protocol::FrontendBlockState::Complete;
+        block.role = crate::protocol::FrontendBlockRole::Artifact;
         if session_id == output.session_id {
-            block.text = format!("{}{}", text::RENDER_SENT_PREFIX, output.file.name);
+            block.title = format!("{}{}", text::RENDER_SENT_PREFIX, output.file.name);
+            block.text.clear();
             block.files = vec![output.file];
         } else {
-            block.text = format!("{}{}", text::RENDER_UNAVAILABLE_PREFIX, output.file.name);
+            block.title = format!("{}{}", text::RENDER_UNAVAILABLE_PREFIX, output.file.name);
+            block.text.clear();
         }
         Some(block)
     }
@@ -315,8 +319,9 @@ mod tests {
             )
             .expect("block");
 
-        assert!(!block.append);
-        assert_eq!(block.text, "Sent diagram.svg");
+        assert_eq!(block.update, crate::protocol::FrontendBlockUpdate::Replace);
+        assert_eq!(block.title, "Sent diagram.svg");
+        assert!(block.text.is_empty());
         assert_eq!(block.files, [file]);
     }
 
@@ -349,6 +354,6 @@ mod tests {
             .expect("block");
 
         assert!(block.files.is_empty());
-        assert!(block.text.contains("unavailable"));
+        assert!(block.title.contains("unavailable"));
     }
 }

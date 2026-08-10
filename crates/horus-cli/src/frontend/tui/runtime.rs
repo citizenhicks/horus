@@ -12,7 +12,7 @@ use tokio::time::MissedTickBehavior;
 
 use super::TranscriptTone;
 use super::TuiState;
-use super::events::handle_gateway_event;
+use super::events::{handle_gateway_event, handle_gateway_history};
 use super::input::UiAction;
 use super::view::render_preview;
 use crate::frontend::FrontendExit;
@@ -106,19 +106,16 @@ pub(in crate::frontend) async fn run(
                         match frame.message {
                             ServerMessage::AgentEvent {
                                 session_id: actual,
-                                event,
-                                blocks,
-                                history,
-                                preview,
+                                record,
+                            } if actual == session_id => {
+                                handle_gateway_event(&mut state, record);
+                            }
+                            ServerMessage::SessionHistory {
+                                session_id: actual,
+                                records,
                                 ..
                             } if actual == session_id => {
-                                handle_gateway_event(
-                                    &mut state,
-                                    event.msg,
-                                    blocks,
-                                    history,
-                                    preview,
-                                );
+                                handle_gateway_history(&mut state, records);
                             }
                             ServerMessage::SessionOpened { payload, .. } => {
                                 *session = payload;
@@ -152,8 +149,10 @@ pub(in crate::frontend) async fn run(
                                 ..
                             } if actual == session_id => {
                                 for artifact in artifacts {
-                                    state.push(artifact.title, TranscriptTone::Neutral);
-                                    state.apply_block(artifact.block);
+                                    state.apply_block(horus::protocol::RenderedBlock {
+                                        capability: "artifacts".into(),
+                                        block: artifact.block,
+                                    });
                                 }
                             }
                             message => {

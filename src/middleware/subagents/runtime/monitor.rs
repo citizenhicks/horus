@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::AgentStatus;
@@ -13,7 +12,7 @@ use super::coordination::Mail;
 use super::coordination::MailBody;
 use crate::Error;
 use crate::Result;
-use crate::protocol::Event;
+use crate::agent::AgentEvents;
 use crate::protocol::EventMsg;
 use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendEvent;
@@ -117,9 +116,12 @@ impl Shared {
                             block: FrontendBlock {
                                 id: None,
                                 group: None,
-                                append: false,
-                                pending: false,
+                                update: crate::protocol::FrontendBlockUpdate::Replace,
+                                state: crate::protocol::FrontendBlockState::Complete,
+                                role: crate::protocol::FrontendBlockRole::Notice,
+                                title: "Subagent error".into(),
                                 text: failure,
+                                symbol: Some(crate::protocol::FrontendSymbol::Agent),
                                 files: Vec::new(),
                                 format: crate::protocol::FrontendBlockFormat::PlainText,
                                 tone: FrontendTone::Error,
@@ -189,7 +191,7 @@ pub(in crate::middleware::subagents) async fn monitor_agent(
     shared: Arc<Shared>,
     root_id: String,
     path: String,
-    mut events: mpsc::Receiver<Event>,
+    mut events: AgentEvents,
 ) -> Result<()> {
     let mut last_message = None;
     while let Some(event) = events.recv().await {
@@ -219,8 +221,8 @@ pub(in crate::middleware::subagents) async fn monitor_agent(
                 }
                 .await
             }
-            EventMsg::TurnComplete(turn) => {
-                let message = turn.last_agent_message.or_else(|| last_message.clone());
+            EventMsg::TurnComplete(_) => {
+                let message = last_message.clone();
                 return shared
                     .finished(&root_id, &path, AgentStatus::Completed, message)
                     .await;

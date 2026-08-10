@@ -551,14 +551,14 @@ fn decode_web_action(item: &Value) -> WebSearchAction {
     };
     match action.get("type").and_then(Value::as_str) {
         Some("search") => WebSearchAction::Search {
-            query: string("query").or_else(|| {
-                action
-                    .get("queries")
-                    .and_then(Value::as_array)
-                    .and_then(|queries| queries.first())
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            }),
+            queries: action
+                .get("queries")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect(),
         },
         Some("open_page") => WebSearchAction::OpenPage { url: string("url") },
         Some("find_in_page") => WebSearchAction::FindInPage {

@@ -11,8 +11,10 @@ use crate::Error;
 use crate::Result;
 use crate::backend::model::ToolCall;
 use crate::backend::sandbox::NetworkAccess;
+use crate::protocol::Event;
 use crate::protocol::MAX_CAPABILITY_INPUT_BYTES;
 use crate::protocol::MessageTarget;
+use crate::protocol::ModelStepContentPhase;
 use crate::protocol::SessionContext;
 use crate::protocol::TokenUsage;
 
@@ -33,6 +35,14 @@ pub struct ActiveExecution {
     pub tool_calls: u64,
     pub failed_tool_calls: u64,
     pub usage: TokenUsage,
+}
+
+/// The model step currently in flight for an active execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveModelStep {
+    pub model_step_id: String,
+    pub step_index: usize,
+    pub started_at_ms: i64,
 }
 
 /// Terminal outcome of one user turn.
@@ -198,6 +208,7 @@ pub struct Checkpoint {
     pub last_usage: Option<TokenUsage>,
     pub pending_input: Vec<QueuedInput>,
     pub active_execution: Option<ActiveExecution>,
+    pub active_model_step: Option<ActiveModelStep>,
     pub execution_stats: ExecutionStats,
     pub pending_tools: Vec<ToolCall>,
     pub pending_approval: Option<PendingApproval>,
@@ -221,6 +232,7 @@ impl Checkpoint {
             last_usage: None,
             pending_input: Vec::new(),
             active_execution: None,
+            active_model_step: None,
             execution_stats: ExecutionStats::default(),
             pending_tools: Vec::new(),
             pending_approval: None,
@@ -232,6 +244,11 @@ impl Checkpoint {
         outcome: ExecutionOutcome,
         finished_at_ms: i64,
     ) -> Result<ExecutionRecord> {
+        if self.active_model_step.is_some() {
+            return Err(Error::Checkpoint(
+                "turn ended with an active model step".into(),
+            ));
+        }
         let active = self
             .active_execution
             .as_ref()
@@ -335,6 +352,62 @@ pub struct TranscriptPage {
     pub next_before_sequence: Option<u64>,
 }
 
+/// One normalized frontend event in the durable session journal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JournalEvent {
+    /// Monotonic sequence within one session.
+    pub sequence: u64,
+    /// Framework record time in Unix milliseconds.
+    pub recorded_at_ms: i64,
+    /// Provider-neutral framework event.
+    pub event: Event,
+    /// Compact delivery characteristics retained after progressive deltas are removed.
+    pub stream_metrics: Vec<StreamMetrics>,
+}
+
+/// One normalized event paired with its framework receipt time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimestampedEvent {
+    pub recorded_at_ms: i64,
+    pub event: Event,
+}
+
+/// Delivery metrics for one typed text stream within a completed model step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamMetrics {
+    pub phase: ModelStepContentPhase,
+    pub first_delta_at_ms: i64,
+    pub last_delta_at_ms: i64,
+    pub chunk_count: u64,
+    pub utf8_bytes: u64,
+    pub longest_gap_ms: u64,
+}
+
+/// Bounds one newest-first event-journal query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventPageRequest {
+    pub before_sequence: Option<u64>,
+    pub limit: usize,
+}
+
+/// One newest-first page of normalized session events.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EventPage {
+    /// Durable sequence high-water, including intentionally discarded transient events.
+    pub latest_sequence: u64,
+    pub events: Vec<JournalEvent>,
+    pub next_before_sequence: Option<u64>,
+}
+
+impl EventPage {
+    /// Returns this newest-first page in replay order.
+    #[must_use]
+    pub fn into_chronological(mut self) -> Vec<JournalEvent> {
+        self.events.reverse();
+        self.events
+    }
+}
+
 impl TranscriptPage {
     /// Flattens this newest-first page into chronological items with durable positions.
     #[must_use]
@@ -366,6 +439,11 @@ pub trait CheckpointStore: Send + Sync {
     /// Loads the latest checkpoint for a session.
     fn load<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<Option<Checkpoint>>>;
 
+    /// Permanently deletes a session, its descendants, and their session-scoped state.
+    ///
+    /// Returns whether the requested session existed.
+    fn delete_session<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<bool>>;
+
     /// Atomically replaces the checkpoint, appends transcript items, and records a finished turn.
     fn save<'a>(
         &'a self,
@@ -373,6 +451,30 @@ pub trait CheckpointStore: Send + Sync {
         transcript_delta: &'a [Value],
         execution: Option<&'a ExecutionRecord>,
     ) -> BoxFuture<'a, Result<()>>;
+
+    /// Atomically saves one checkpoint and appends its normalized event batch.
+    fn save_with_events<'a>(
+        &'a self,
+        checkpoint: &'a Checkpoint,
+        transcript_delta: &'a [Value],
+        execution: Option<&'a ExecutionRecord>,
+        events: &'a [TimestampedEvent],
+    ) -> BoxFuture<'a, Result<Vec<JournalEvent>>>;
+
+    /// Assigns a session-local sequence and appends one normalized event atomically.
+    fn append_event<'a>(
+        &'a self,
+        session_id: &'a str,
+        recorded_at_ms: i64,
+        event: &'a Event,
+    ) -> BoxFuture<'a, Result<JournalEvent>>;
+
+    /// Loads one newest-first page of normalized session events.
+    fn event_page<'a>(
+        &'a self,
+        session_id: &'a str,
+        request: EventPageRequest,
+    ) -> BoxFuture<'a, Result<EventPage>>;
 
     /// Lists one page of the most recently updated sessions, newest first.
     fn list_sessions_page(

@@ -9,7 +9,7 @@ pub(super) mod runtime;
 mod shimmer;
 mod view;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
 use ratatui::text::Line;
@@ -24,11 +24,14 @@ use super::catalog::{MenuItem, UiCatalog};
 use horus::backend::model::ModelChoice;
 use horus::backend::model::ModelInfo;
 use horus::protocol::AgentMessagePhase;
-use horus::protocol::FrontendBlock;
 use horus::protocol::FrontendBlockFormat;
+use horus::protocol::FrontendBlockState;
+use horus::protocol::FrontendBlockUpdate;
 use horus::protocol::FrontendPickerOption;
 use horus::protocol::FrontendTone;
 use horus::protocol::FrontendWidget;
+use horus::protocol::ModelStepContentPhase;
+use horus::protocol::RenderedBlock;
 use horus::protocol::SessionResumeRequestedEvent;
 #[cfg(test)]
 use horus::protocol::{EventMsg, FrontendEvent, Op};
@@ -63,13 +66,44 @@ impl From<FrontendTone> for TranscriptTone {
 }
 
 struct TranscriptEntry {
-    id: Option<String>,
-    group: Option<String>,
+    id: Option<BlockKey>,
+    group: Option<BlockKey>,
     text: String,
     format: FrontendBlockFormat,
     tone: TranscriptTone,
     pending: bool,
     rendered: Option<(u16, Vec<Line<'static>>)>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct BlockKey {
+    capability: String,
+    value: String,
+}
+
+#[derive(Default)]
+struct StreamedStepPhases {
+    reasoning: bool,
+    commentary: bool,
+    final_answer: bool,
+}
+
+impl StreamedStepPhases {
+    fn insert(&mut self, phase: ModelStepContentPhase) {
+        match phase {
+            ModelStepContentPhase::Reasoning => self.reasoning = true,
+            ModelStepContentPhase::Commentary => self.commentary = true,
+            ModelStepContentPhase::FinalAnswer => self.final_answer = true,
+        }
+    }
+
+    const fn contains(&self, phase: ModelStepContentPhase) -> bool {
+        match phase {
+            ModelStepContentPhase::Reasoning => self.reasoning,
+            ModelStepContentPhase::Commentary => self.commentary,
+            ModelStepContentPhase::FinalAnswer => self.final_answer,
+        }
+    }
 }
 
 struct PickerState {
@@ -173,6 +207,8 @@ struct TuiState {
     streaming: String,
     streaming_phase: Option<AgentMessagePhase>,
     reasoning: String,
+    streamed_step_phases: BTreeMap<String, StreamedStepPhases>,
+    completed_model_steps: BTreeSet<String>,
     input: String,
     cursor: usize,
     pastes: BTreeMap<char, String>,
@@ -218,6 +254,8 @@ impl TuiState {
             streaming: String::new(),
             streaming_phase: None,
             reasoning: String::new(),
+            streamed_step_phases: BTreeMap::new(),
+            completed_model_steps: BTreeSet::new(),
             input: String::new(),
             cursor: 0,
             pastes: BTreeMap::new(),
@@ -334,42 +372,61 @@ impl TuiState {
         self.composer_history_index = Some(index);
     }
 
-    fn apply_block(&mut self, block: FrontendBlock) {
+    fn apply_block(&mut self, rendered: RenderedBlock) {
         self.commit_reasoning();
-        let mut text = bounded_terminal_text(&super::block_text(&block), MAX_ENTRY_BYTES);
-        if let Some(id) = block.id.as_deref()
+        let capability = rendered.capability;
+        let block = rendered.block;
+        let mut text = if block.format == FrontendBlockFormat::UnifiedDiff && block.files.is_empty()
+        {
+            bounded_terminal_text(&block.text, MAX_ENTRY_BYTES)
+        } else {
+            bounded_terminal_text(&super::block_text(&block), MAX_ENTRY_BYTES)
+        };
+        let id = block.id.map(|value| BlockKey {
+            capability: capability.clone(),
+            value,
+        });
+        let group = block.group.map(|value| BlockKey { capability, value });
+        if let Some(id) = id.as_ref()
             && let Some(entry) = self
                 .transcript
                 .iter_mut()
                 .rev()
-                .find(|entry| entry.id.as_deref() == Some(id))
+                .find(|entry| entry.id.as_ref() == Some(id))
         {
-            if block.append {
+            if block.update == FrontendBlockUpdate::Append {
                 text.insert_str(0, &entry.text);
             }
             entry.text = bounded_terminal_text(&text, MAX_ENTRY_BYTES);
             entry.format = block.format;
             entry.tone = block.tone.into();
-            if block.group.is_some() {
-                entry.group = block.group;
+            if group.is_some() {
+                entry.group = group;
             }
-            entry.pending = block.pending;
+            entry.pending = block.state == FrontendBlockState::Pending;
             entry.rendered = None;
             return;
         }
-        if block.append {
+        if block.update == FrontendBlockUpdate::Append {
             text = text.trim_start_matches('\n').to_string();
         }
         self.transcript.push_back(TranscriptEntry {
-            id: block.id,
-            group: block.group,
+            id,
+            group,
             text,
             format: block.format,
             tone: block.tone.into(),
-            pending: block.pending,
+            pending: block.state == FrontendBlockState::Pending,
             rendered: None,
         });
         self.trim_transcript();
+    }
+
+    fn remember_streamed_phase(&mut self, model_step_id: &str, phase: ModelStepContentPhase) {
+        self.streamed_step_phases
+            .entry(model_step_id.into())
+            .or_default()
+            .insert(phase);
     }
 
     fn append_stream(&mut self, delta: &str, phase: AgentMessagePhase) {
@@ -460,6 +517,8 @@ impl TuiState {
     fn finish_turn(&mut self) {
         self.commit_reasoning();
         self.commit_stream();
+        self.streamed_step_phases.clear();
+        self.completed_model_steps.clear();
         self.active_turn = None;
         self.turn_started_at = None;
         self.clear_approval();

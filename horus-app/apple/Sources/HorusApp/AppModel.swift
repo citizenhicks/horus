@@ -389,10 +389,17 @@ final class TranscriptEntry: Identifiable {
     let id: String
     var text: String
     var kind: Kind
+    var capability: String?
+    var role: FrontendBlockRole?
+    var title: String
+    var symbol: String?
     var group: String?
     var format: String
     var tone: String
     var pending: Bool
+    var modelStepID: String?
+    var sourceSequence: UInt64?
+    var recordedAtMs: Int64?
     var messageTarget: MessageTarget?
     var files: [SessionFileReference]
 
@@ -400,62 +407,61 @@ final class TranscriptEntry: Identifiable {
         id: String,
         text: String,
         kind: Kind,
+        capability: String? = nil,
+        role: FrontendBlockRole? = nil,
+        title: String = "",
+        symbol: String? = nil,
         group: String? = nil,
         format: String,
         tone: String = "neutral",
         pending: Bool,
+        modelStepID: String? = nil,
+        sourceSequence: UInt64? = nil,
+        recordedAtMs: Int64? = nil,
         messageTarget: MessageTarget? = nil,
         files: [SessionFileReference] = []
     ) {
         self.id = id
         self.text = text
         self.kind = kind
+        self.capability = capability
+        self.role = role
+        self.title = title
+        self.symbol = symbol
         self.group = group
         self.format = format
         self.tone = tone
         self.pending = pending
+        self.modelStepID = modelStepID
+        self.sourceSequence = sourceSequence
+        self.recordedAtMs = recordedAtMs
         self.messageTarget = messageTarget
         self.files = files
     }
 }
 
-/// What a transcript event collapses to on one line, and how a run of them is summarised.
-///
-/// Blocks arrive namespaced as "capability/turn/call" with the middleware's own heading on
-/// the first line of the text, marked with the bullet the terminal frontends draw. Both are
-/// parsed rather than carried on the wire, so a middleware that skips either still reads.
-extension TranscriptEntry {
-    var capability: String? {
-        let parts = id.split(separator: "/", maxSplits: 1)
-        guard parts.count == 2 else { return nil }
-        return String(parts[0])
-    }
+struct TranscriptGroupIdentity: Equatable {
+    let capability: String
+    let group: String
+}
 
-    var headline: String {
-        if format == "unified_diff" { return "Code change" }
-        let line = text.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? ""
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("◉") else {
-            return trimmed.isEmpty ? (tone == "error" ? "Error" : "Event") : trimmed
-        }
-        let stripped = trimmed.dropFirst().trimmingCharacters(in: .whitespaces)
-        return stripped.isEmpty ? "Event" : stripped
+/// Typed transcript presentation supplied by the framework.
+extension TranscriptEntry {
+    var headline: String { title }
+
+    var renderedGroupIdentity: TranscriptGroupIdentity? {
+        guard let capability, let group else { return nil }
+        return TranscriptGroupIdentity(capability: capability, group: group)
     }
 
     /// Everything under the heading — the tool output the one-line row hides.
     var eventDetail: String {
-        guard format != "unified_diff" else { return text }
-        let parts = text.split(separator: "\n", maxSplits: 1)
-        guard parts.count > 1 else { return "" }
-        return parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+        text
     }
 
-    /// Hosted web search reaches the transcript without a capability of its own, so the
-    /// heading is the only signal that an event is one.
+    /// Hosted web search is identified by its protocol role, independent of title or owner.
     var isWebSearch: Bool {
-        if capability == "web_search" { return true }
-        let heading = headline.lowercased()
-        return heading.contains("search") && heading.contains("web")
+        role == .webSearch
     }
 
     /// "3 tool calls • 4 web searches • 2 events • 1 error", skipping the empty categories.
@@ -469,7 +475,7 @@ extension TranscriptEntry {
                 errors += 1
             } else if entry.isWebSearch {
                 searches += 1
-            } else if entry.capability == "tools" {
+            } else if entry.role == .tool {
                 tools += 1
             } else {
                 events += 1
@@ -489,11 +495,7 @@ extension TranscriptEntry {
 }
 
 private struct BufferedAgentEvent {
-    let sequence: UInt64
-    let event: AgentEventRecord
-    let blocks: [FrontendBlock]
-    let history: [RenderedEventRecord]?
-    let preview: RenderedPreview?
+    let record: RecordedEvent
 }
 
 struct ApprovalCall: Identifiable, Equatable {
@@ -637,13 +639,13 @@ final class AppModel {
             : source
     }
     /// The one visible activity label that represents the live turn's current step.
-    /// `pending` is a block lifecycle flag and can remain true after a later step begins.
     var activeTranscriptStepID: String? {
-        guard activeTurnID != nil, let entry = displayedTranscript.last else { return nil }
-        return switch entry.kind {
-        case .reasoning, .event, .error: entry.id
-        case .user, .assistant, .commentary: nil
-        }
+        guard activeTurnID != nil,
+              let latest = displayedTranscript.last,
+              latest.pending,
+              [.reasoning, .event, .error].contains(latest.kind)
+        else { return nil }
+        return latest.id
     }
     var isLoadingTranscript: Bool {
         guard connectionState == .loading,
@@ -764,7 +766,14 @@ final class AppModel {
     @ObservationIgnored private var automaticReconnectBlocked = false
     @ObservationIgnored private var deltaFlushTask: Task<Void, Never>?
     @ObservationIgnored private var bufferedDeltas:
-        [(id: String, delta: String, kind: TranscriptEntry.Kind)] = []
+        [(
+            id: String,
+            delta: String,
+            kind: TranscriptEntry.Kind,
+            modelStepID: String,
+            sourceSequence: UInt64,
+            recordedAtMs: Int64
+        )] = []
     @ObservationIgnored private var connectionGeneration = UUID()
     @ObservationIgnored private var reconnectsOnActivation = false
     @ObservationIgnored private var pendingPairingAccount: GatewayAccount?
@@ -820,10 +829,12 @@ final class AppModel {
     @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
     @ObservationIgnored private var isChatVisible = false
     @ObservationIgnored private var latestSequence: UInt64?
-    @ObservationIgnored private var currentReplayEpoch: String?
     @ObservationIgnored private var sessionOpenCursor: UInt64?
     @ObservationIgnored private var replayRequestID: String?
     @ObservationIgnored private var replaySnapshotSequence: UInt64?
+    @ObservationIgnored private var transcriptRecordBase: [TranscriptEntry] = []
+    @ObservationIgnored private var transcriptRecordBaseSequence: UInt64?
+    @ObservationIgnored private var transcriptRecords: [UInt64: RecordedEvent] = [:]
     @ObservationIgnored private var historyRequestID: String?
     @ObservationIgnored private var nextHistoryBeforeSequence: UInt64?
     @ObservationIgnored private var previewSelections: [String: FrontendPickerOption] = [:]
@@ -1620,7 +1631,6 @@ final class AppModel {
             requestSessionOpen(
                 sessionID,
                 lastSequence: cached?.sequence,
-                replayEpoch: cached?.replayEpoch,
                 cachedTranscript: cached,
                 presentedTranscript: cached?.transcript
             )
@@ -1644,7 +1654,7 @@ final class AppModel {
             requestID: id,
             sessionID: sessionID,
             beforeSequence: beforeSequence,
-            maxBatches: 20
+            maxEvents: 300
         )) { [weak self] _ in
             guard self?.historyRequestID == id else { return }
             self?.historyRequestID = nil
@@ -1655,14 +1665,12 @@ final class AppModel {
     func restoreSession(_ sessionID: String) {
         flushStreamDeltas()
         guard sessionID == selectedSessionID,
-              let sequence = latestSequence,
-              let epoch = currentReplayEpoch
+              let sequence = latestSequence
         else {
-            requestSessionOpen(sessionID, lastSequence: nil, replayEpoch: nil)
+            requestSessionOpen(sessionID, lastSequence: nil)
             return
         }
         let base = CachedTranscript(
-            replayEpoch: epoch,
             sequence: sequence,
             nextBeforeSequence: nextHistoryBeforeSequence,
             transcript: transcript,
@@ -1670,7 +1678,6 @@ final class AppModel {
             lastUsage: lastUsage
         )
         let presentation = CachedTranscript(
-            replayEpoch: epoch,
             sequence: sequence,
             nextBeforeSequence: nextHistoryBeforeSequence,
             transcript: displayedTranscript,
@@ -1680,7 +1687,6 @@ final class AppModel {
         requestSessionOpen(
             sessionID,
             lastSequence: sequence,
-            replayEpoch: epoch,
             cachedTranscript: base,
             presentedTranscript: presentation
         )
@@ -1689,7 +1695,6 @@ final class AppModel {
     private func requestSessionOpen(
         _ sessionID: String,
         lastSequence: UInt64?,
-        replayEpoch: String?,
         cachedTranscript: CachedTranscript? = nil,
         presentedTranscript: [TranscriptEntry]? = nil
     ) {
@@ -1711,8 +1716,7 @@ final class AppModel {
         transmit(.openSession(
             requestID: id,
             sessionID: sessionID,
-            lastSequence: lastSequence,
-            replayEpoch: replayEpoch
+            lastSequence: lastSequence
         )) { [weak self] _ in
             guard self?.sessionRequestID == id else { return }
             self?.sessionRequestID = nil
@@ -2864,13 +2868,13 @@ final class AppModel {
         case .sessionHistory(
             let requestID,
             let sessionID,
-            let events,
+            let records,
             let nextBeforeSequence
         ):
             guard requestID == historyRequestID, sessionID == selectedSessionID else { break }
             historyRequestID = nil
             isLoadingEarlierHistory = false
-            prependHistory(events)
+            mergeHistory(records)
             self.nextHistoryBeforeSequence = nextBeforeSequence
         case .sessionChanged(let payload):
             guard payload.session.sessionId == selectedSessionID,
@@ -2883,17 +2887,11 @@ final class AppModel {
             handleAccepted(requestID)
         case .rejected(let rejection):
             handleRejected(rejection)
-        case .agentEvent(let sessionID, let sequence, let event, let blocks, let history, let preview):
+        case .agentEvent(let sessionID, let record):
             guard sessionID == selectedSessionID else { break }
-            let buffered = BufferedAgentEvent(
-                sequence: sequence,
-                event: event,
-                blocks: blocks,
-                history: history,
-                preview: preview
-            )
+            let buffered = BufferedAgentEvent(record: record)
             applyAgentEvent(buffered)
-            if replayRequestID == nil, shouldCacheTranscript(after: event) {
+            if replayRequestID == nil, shouldCacheTranscript(after: record.event) {
                 cacheSelectedTranscript()
             }
         case .sessions(let requestID, let sessions):
@@ -3055,14 +3053,12 @@ final class AppModel {
     }
 
     private func applyAgentEvent(_ buffered: BufferedAgentEvent) {
-        guard latestSequence.map({ buffered.sequence > $0 }) ?? true else { return }
+        guard latestSequence.map({ buffered.record.sequence > $0 }) ?? true else { return }
         observeReplayCompletion(buffered)
-        latestSequence = buffered.sequence
+        latestSequence = buffered.record.sequence
+        transcriptRecords[buffered.record.sequence] = buffered.record
         reduce(
-            event: buffered.event,
-            blocks: buffered.blocks,
-            history: buffered.history,
-            preview: buffered.preview
+            record: buffered.record
         )
     }
 
@@ -3101,7 +3097,7 @@ final class AppModel {
 
     private func shouldCacheTranscript(after event: AgentEventRecord) -> Bool {
         switch event.msg["type"]?.stringValue {
-        case "session_history", "task_complete", "turn_aborted": true
+        case "task_complete", "turn_aborted": true
         default: false
         }
     }
@@ -3109,14 +3105,12 @@ final class AppModel {
     private func cacheSelectedTranscript() {
         guard let accountID = selectedAccountID,
               let sessionID = selectedSessionID,
-              let currentReplayEpoch,
               let latestSequence,
               activeTurnID == nil,
               pendingApproval == nil,
               pendingWidgetEdit == nil
         else { return }
         let snapshot = CachedTranscript(
-            replayEpoch: currentReplayEpoch,
             sequence: latestSequence,
             nextBeforeSequence: nextHistoryBeforeSequence,
             transcript: transcript,
@@ -3230,7 +3224,6 @@ final class AppModel {
         }
         if opened {
             latestSequence = cursor
-            currentReplayEpoch = payload.replayEpoch
             self.replayRequestID = replayRequestID
             replaySnapshotSequence = payload.latestSequence
             sessionOpenCursor = nil
@@ -3238,6 +3231,9 @@ final class AppModel {
             pendingCachedTranscript = nil
             pendingPresentedTranscript = nil
             replayPresentedTranscript = presented ?? []
+            transcriptRecordBase = cached?.transcript ?? []
+            transcriptRecordBaseSequence = cursor
+            transcriptRecords.removeAll(keepingCapacity: true)
             transcript = cached?.transcript ?? []
             if let cached {
                 nextHistoryBeforeSequence = cached.nextBeforeSequence
@@ -3395,7 +3391,6 @@ final class AppModel {
     private func clearSelectedSession() {
         changeComposerDraftOwner(to: nil)
         latestSequence = nil
-        currentReplayEpoch = nil
         sessionOpenCursor = nil
         selectedSessionID = nil
         resetSessionState()
@@ -3469,7 +3464,7 @@ final class AppModel {
             pendingCachedTranscript = nil
             pendingPresentedTranscript = nil
             if sessionID == selectedSessionID { resetSessionState() }
-            requestSessionOpen(sessionID, lastSequence: nil, replayEpoch: nil)
+            requestSessionOpen(sessionID, lastSequence: nil)
             return
         }
         failSessionFileUploadRequest(rejection.requestId, message: rejection.message, showsToast: false)
@@ -3578,12 +3573,9 @@ final class AppModel {
         }
     }
 
-    func reduce(
-        event: AgentEventRecord,
-        blocks: [FrontendBlock],
-        history: [RenderedEventRecord]? = nil,
-        preview: RenderedPreview?
-    ) {
+    func reduce(record: RecordedEvent) {
+        let event = record.event
+        let blocks = record.blocks
         let type = event.msg["type"]?.stringValue ?? "unknown"
         // Queue removal also happens for edits and turn cleanup; only the immediately
         // following targeted user message proves that steering reached the model input.
@@ -3598,21 +3590,6 @@ final class AppModel {
         // so buffered text must land first to keep transcript order exact.
         if type != "agent_message_content_delta", type != "agent_reasoning_content_delta" {
             flushStreamDeltas()
-        }
-        if type == "session_history" {
-            transcript = []
-            currentUsage = TokenUsage()
-            lastUsage = TokenUsage()
-            contextTokens = 0
-            for rendered in history ?? [] {
-                guard rendered.event["frontendType"]?.stringValue != "picker" else { continue }
-                reduce(
-                    event: AgentEventRecord(submissionId: nil, msg: rendered.event),
-                    blocks: rendered.blocks,
-                    preview: nil
-                )
-            }
-            return
         }
         let wasRendered = !blocks.isEmpty
         if type == "user_message", let submissionID = event.submissionId {
@@ -3634,10 +3611,15 @@ final class AppModel {
             }
         }
 
-        if !blocks.isEmpty {
-            for block in blocks { apply(block) }
+        for (index, rendered) in blocks.enumerated() {
+            apply(
+                rendered,
+                sequence: record.sequence,
+                blockIndex: index,
+                recordedAtMs: record.recordedAtMs
+            )
         }
-        if let preview {
+        if let preview = record.preview {
             apply(
                 preview,
                 selection: event.submissionId.flatMap { previewSelections.removeValue(forKey: $0) }
@@ -3652,29 +3634,50 @@ final class AppModel {
             appendText(
                 event.msg["message"]?.stringValue,
                 kind: .user,
+                id: "event:\(record.sequence):user",
+                sourceSequence: record.sequence,
+                recordedAtMs: record.recordedAtMs,
                 messageTarget: messageTarget(from: event.msg),
                 files: attachments
             )
         case "agent_message_content_delta":
             let phase = event.msg["phase"]?.stringValue
-            guard let itemID = event.msg["itemId"]?.stringValue else { return }
+            guard let modelStepID = event.msg["modelStepId"]?.stringValue else { return }
             let commentary = phase == "commentary"
             appendStream(
-                id: commentary ? "commentary-\(itemID)" : itemID,
+                id: streamID(modelStepID: modelStepID, phase: phase ?? "final_answer"),
                 delta: event.msg["delta"]?.stringValue ?? "",
-                kind: commentary ? .commentary : .assistant
+                kind: commentary ? .commentary : .assistant,
+                modelStepID: modelStepID,
+                record: record
             )
         case "agent_reasoning_content_delta":
-            guard let itemID = event.msg["itemId"]?.stringValue else { return }
+            guard let modelStepID = event.msg["modelStepId"]?.stringValue else { return }
             appendStream(
-                id: "reasoning-\(itemID)",
+                id: streamID(modelStepID: modelStepID, phase: "reasoning"),
                 delta: event.msg["delta"]?.stringValue ?? "",
-                kind: .reasoning
+                kind: .reasoning,
+                modelStepID: modelStepID,
+                record: record
             )
+        case "model_step_completed":
+            applyModelStepCompletion(event.msg, record: record)
+        case "model_step_started":
+            if replayRequestID == nil { runStats.active?.modelCalls += 1 }
         case "agent_message":
             let phase = event.msg["phase"]?.stringValue
             let kind: TranscriptEntry.Kind = phase == "commentary" ? .commentary : .assistant
-            if wasRendered {
+            if let modelStepID = event.msg["modelStepId"]?.stringValue,
+               transcript.contains(where: {
+                   $0.modelStepID == modelStepID && $0.kind == kind && !$0.pending
+               }) {
+                if let messageTarget = messageTarget(from: event.msg),
+                   let index = transcript.lastIndex(where: {
+                       $0.modelStepID == modelStepID && $0.kind == kind
+                   }) {
+                    transcript[index].messageTarget = messageTarget
+                }
+            } else if wasRendered {
                 transcript.removeAll { $0.pending && $0.kind == kind }
             } else {
                 completeStream(
@@ -3713,12 +3716,9 @@ final class AppModel {
             pendingApproval = nil
             approvalRequestID = nil
         case "web_search_begin":
-            appendText("Searching the web", kind: .event, tone: "warning")
+            break
         case "web_search_end":
-            let query = event.msg["query"]?.stringValue
-                ?? event.msg["action"]?.stringValue
-                ?? "Web search complete"
-            appendText("Searched: \(query)", kind: .event, tone: "success")
+            break
         case "turn_aborted":
             finishPendingTranscriptEntries()
             activeTurnID = nil
@@ -3726,16 +3726,11 @@ final class AppModel {
             refreshWorkspaceChanges()
             pendingApproval = nil
             approvalRequestID = nil
-            appendText(
-                "Turn aborted: \(event.msg["reason"]?.stringValue ?? "Unknown reason")",
-                kind: .event,
-                tone: "warning"
-            )
+            if !wasRendered { finishPendingTranscriptEntries() }
         case "warning":
-            appendText(event.msg["message"]?.stringValue, kind: .event, tone: "warning")
+            break
         case "error":
-            let message = event.msg["message"]?.stringValue ?? "Agent error"
-            appendText(message, kind: .error, tone: "error")
+            break
         case "tool_call_begin":
             if replayRequestID == nil { runStats.active?.toolCalls += 1 }
         case "tool_call_end":
@@ -3775,8 +3770,7 @@ final class AppModel {
     private func applyFrontendEvent(_ event: JSONValue, submissionID: String?) {
         switch event["frontendType"]?.stringValue {
         case "render":
-            guard let block = renderedBlock(from: event) else { return }
-            apply(block)
+            break
         case "widget":
             guard let capability = event["capability"]?.stringValue,
                   let item = event["item"],
@@ -3846,18 +3840,20 @@ final class AppModel {
         }
     }
 
-    private func renderedBlock(from event: JSONValue) -> FrontendBlock? {
-        guard event["type"]?.stringValue == "frontend",
-              event["frontendType"]?.stringValue == "render",
-              let capability = event["capability"]?.stringValue,
-              let value = event["block"],
-              let block = try? FrontendBlock(json: value)
-        else { return nil }
-        return block.namespaced(to: capability)
-    }
-
-    private func apply(_ block: FrontendBlock) {
-        apply(block, to: &transcript)
+    private func apply(
+        _ rendered: RenderedBlock,
+        sequence: UInt64,
+        blockIndex: Int,
+        recordedAtMs: Int64
+    ) {
+        apply(
+            rendered,
+            sequence: sequence,
+            blockIndex: blockIndex,
+            recordedAtMs: recordedAtMs,
+            to: &transcript
+        )
+        let block = rendered.block
         if block.format == "unified_diff", !block.pending {
             refreshWorkspaceChanges()
             refreshArtifacts()
@@ -3866,34 +3862,59 @@ final class AppModel {
         }
     }
 
-    private func apply(_ block: FrontendBlock, to entries: inout [TranscriptEntry]) {
-        let id = block.id ?? UUID().uuidString
+    private func apply(
+        _ rendered: RenderedBlock,
+        sequence: UInt64,
+        blockIndex: Int,
+        recordedAtMs: Int64,
+        to entries: inout [TranscriptEntry]
+    ) {
+        let block = rendered.block
+        let sourceID = block.id ?? "record:\(sequence):\(blockIndex)"
+        let id = scopedBlockID(capability: rendered.capability, sourceID: sourceID)
+        let appending = block.update == .append
         let kind: TranscriptEntry.Kind = block.tone == "error" ? .error : .event
         if let index = entries.firstIndex(where: { $0.id == id }) {
-            entries[index].text = block.append ? entries[index].text + block.text : block.text
+            entries[index].text = appending ? entries[index].text + block.text : block.text
             entries[index].kind = kind
+            entries[index].capability = rendered.capability
+            entries[index].role = block.role
+            entries[index].title = block.title
+            entries[index].symbol = block.symbol
             if block.group != nil { entries[index].group = block.group }
             entries[index].pending = block.pending
+            entries[index].sourceSequence = sequence
+            entries[index].recordedAtMs = recordedAtMs
             entries[index].format = block.format
             entries[index].tone = block.tone
             let currentFiles = entries[index].files
             entries[index].files = mergedFiles(
                 currentFiles,
                 with: block.files,
-                appending: block.append
+                appending: appending
             )
         } else {
             entries.append(TranscriptEntry(
                 id: id,
-                text: block.append ? String(block.text.drop(while: { $0 == "\n" })) : block.text,
+                text: appending ? String(block.text.drop(while: { $0 == "\n" })) : block.text,
                 kind: kind,
+                capability: rendered.capability,
+                role: block.role,
+                title: block.title,
+                symbol: block.symbol,
                 group: block.group,
                 format: block.format,
                 tone: block.tone,
                 pending: block.pending,
+                sourceSequence: sequence,
+                recordedAtMs: recordedAtMs,
                 files: block.files
             ))
         }
+    }
+
+    private func scopedBlockID(capability: String, sourceID: String) -> String {
+        "block:\(capability.utf8.count):\(capability)\(sourceID)"
     }
 
     private func mergedFiles(
@@ -3914,12 +3935,10 @@ final class AppModel {
     }
 
     private func apply(_ preview: RenderedPreview, selection: FrontendPickerOption?) {
-        var blocks: [FrontendBlock] = []
+        var blocks: [RenderedBlock] = []
         for rendered in preview.events {
             blocks.append(contentsOf: rendered.blocks)
-            if let block = renderedBlock(from: rendered.event) {
-                blocks.append(block)
-            } else if rendered.blocks.isEmpty {
+            if rendered.blocks.isEmpty {
                 blocks.append(contentsOf: previewBlocks(for: rendered))
             }
         }
@@ -3932,8 +3951,12 @@ final class AppModel {
             title: preview.title,
             status: selection?.description ?? existing?.status,
             model: selection?.detail ?? existing?.model,
-            blocks: blocks.enumerated().map { index, block in
-                PreviewBlock(id: block.id ?? "\(id)-\(index)", block: block)
+            blocks: blocks.enumerated().map { index, rendered in
+                let sourceID = rendered.block.id ?? "\(id)-\(index)"
+                return PreviewBlock(
+                    id: scopedBlockID(capability: rendered.capability, sourceID: sourceID),
+                    block: rendered.block
+                )
             }
         )
         if let index = previews.firstIndex(where: { $0.id == id }) {
@@ -3944,75 +3967,86 @@ final class AppModel {
         if selection != nil { presentedPreview = record }
     }
 
-    private func reducePreviewBlocks(_ blocks: [FrontendBlock]) -> [FrontendBlock] {
-        var result: [FrontendBlock] = []
-        for block in blocks {
+    private func reducePreviewBlocks(_ blocks: [RenderedBlock]) -> [RenderedBlock] {
+        var result: [RenderedBlock] = []
+        for rendered in blocks {
+            let block = rendered.block
             guard let id = block.id,
-                  let index = result.lastIndex(where: { $0.id == id })
+                  let index = result.lastIndex(where: {
+                      $0.capability == rendered.capability && $0.block.id == id
+                  })
             else {
-                result.append(block)
+                result.append(rendered)
                 continue
             }
-            let current = result[index]
-            result[index] = FrontendBlock(
+            let current = result[index].block
+            let appending = block.update == .append
+            result[index] = RenderedBlock(capability: rendered.capability, block: FrontendBlock(
                 id: id,
                 group: block.group ?? current.group,
-                append: false,
-                pending: block.pending,
-                text: block.append ? current.text + block.text : block.text,
+                update: .replace,
+                state: block.state,
+                role: block.role,
+                title: block.title,
+                text: appending ? current.text + block.text : block.text,
+                symbol: block.symbol,
                 format: block.format,
                 tone: block.tone,
                 files: mergedFiles(
                     current.files,
                     with: block.files,
-                    appending: block.append
+                    appending: appending
                 )
-            )
+            ))
         }
         return result
     }
 
-    private func previewBlocks(for rendered: RenderedEventRecord) -> [FrontendBlock] {
+    private func previewBlocks(for rendered: RenderedEventRecord) -> [RenderedBlock] {
         let type = rendered.event["type"]?.stringValue
-        let tone: String
+        let title: String
         let text: String?
         switch type {
-        case "web_search_begin":
-            tone = "warning"
-            text = "Searching the web"
-        case "web_search_end":
-            tone = "success"
-            text = "Searched: \(rendered.event["query"]?.stringValue ?? rendered.event["action"]?.stringValue ?? "complete")"
-        case "turn_aborted":
-            tone = "warning"
-            text = "Turn aborted: \(rendered.event["reason"]?.stringValue ?? "Unknown reason")"
-        case "warning":
-            tone = "warning"
+        case "user_message":
+            title = "User"
             text = rendered.event["message"]?.stringValue
-        case "error":
-            tone = "error"
+        case "agent_message":
+            title = "Horus"
             text = rendered.event["message"]?.stringValue
+        case "agent_message_content_delta":
+            title = rendered.event["phase"]?.stringValue == "commentary"
+                ? "Commentary"
+                : "Horus"
+            text = rendered.event["delta"]?.stringValue
+        case "agent_reasoning_content_delta":
+            title = "Working notes"
+            text = rendered.event["delta"]?.stringValue
         default:
-            tone = "neutral"
-            text = rendered.previewText.first
+            return []
         }
         guard let text, !text.isEmpty else { return [] }
-        return [FrontendBlock(
+        return [RenderedBlock(capability: "agent", block: FrontendBlock(
             id: nil,
             group: nil,
-            append: false,
-            pending: false,
+            update: .replace,
+            state: .complete,
+            role: .notice,
+            title: title,
             text: text,
+            symbol: nil,
             format: "plain_text",
-            tone: tone,
+            tone: "neutral",
             files: []
-        )]
+        ))]
     }
 
     private func appendText(
         _ text: String?,
         kind: TranscriptEntry.Kind,
         tone: String = "neutral",
+        id: String? = nil,
+        sourceSequence: UInt64? = nil,
+        recordedAtMs: Int64? = nil,
         messageTarget: MessageTarget? = nil,
         files: [SessionFileReference] = []
     ) {
@@ -4020,6 +4054,9 @@ final class AppModel {
             text,
             kind: kind,
             tone: tone,
+            id: id,
+            sourceSequence: sourceSequence,
+            recordedAtMs: recordedAtMs,
             messageTarget: messageTarget,
             files: files,
             to: &transcript
@@ -4030,6 +4067,9 @@ final class AppModel {
         _ text: String?,
         kind: TranscriptEntry.Kind,
         tone: String = "neutral",
+        id: String? = nil,
+        sourceSequence: UInt64? = nil,
+        recordedAtMs: Int64? = nil,
         messageTarget: MessageTarget? = nil,
         files: [SessionFileReference] = [],
         to entries: inout [TranscriptEntry]
@@ -4037,12 +4077,14 @@ final class AppModel {
         let text = text ?? ""
         guard !text.isEmpty || !files.isEmpty else { return }
         entries.append(TranscriptEntry(
-            id: UUID().uuidString,
+            id: id ?? UUID().uuidString,
             text: text,
             kind: kind,
             format: "plain_text",
             tone: tone,
             pending: false,
+            sourceSequence: sourceSequence,
+            recordedAtMs: recordedAtMs,
             messageTarget: messageTarget,
             files: files
         ))
@@ -4051,12 +4093,40 @@ final class AppModel {
     // Deltas arrive several times per frame, and every application re-lays-out the whole
     // growing message. Batching to ~20 flushes a second keeps the text pipeline off the
     // critical path; ordering against non-delta events is preserved by the flush in `reduce`.
-    private func appendStream(id: String, delta: String, kind: TranscriptEntry.Kind) {
+    private func streamID(modelStepID: String, phase: String) -> String {
+        "model-stream:\(modelStepID.utf8.count):\(modelStepID)\(phase)"
+    }
+
+    private func snapshotID(
+        modelStepID: String,
+        phase: String,
+        outputIndex: Int,
+        partIndex: Int
+    ) -> String {
+        "model-output:\(modelStepID.utf8.count):\(modelStepID):\(phase):\(outputIndex):\(partIndex)"
+    }
+
+    private func appendStream(
+        id: String,
+        delta: String,
+        kind: TranscriptEntry.Kind,
+        modelStepID: String,
+        record: RecordedEvent
+    ) {
         guard !delta.isEmpty else { return }
         if let last = bufferedDeltas.indices.last, bufferedDeltas[last].id == id {
             bufferedDeltas[last].delta += delta
+            bufferedDeltas[last].sourceSequence = record.sequence
+            bufferedDeltas[last].recordedAtMs = record.recordedAtMs
         } else {
-            bufferedDeltas.append((id: id, delta: delta, kind: kind))
+            bufferedDeltas.append((
+                id: id,
+                delta: delta,
+                kind: kind,
+                modelStepID: modelStepID,
+                sourceSequence: record.sequence,
+                recordedAtMs: record.recordedAtMs
+            ))
         }
         guard deltaFlushTask == nil else { return }
         deltaFlushTask = Task { [weak self] in
@@ -4075,6 +4145,8 @@ final class AppModel {
         for buffered in bufferedDeltas {
             if let index = transcript.lastIndex(where: { $0.id == buffered.id }) {
                 transcript[index].text.append(buffered.delta)
+                transcript[index].sourceSequence = buffered.sourceSequence
+                transcript[index].recordedAtMs = buffered.recordedAtMs
             } else {
                 transcript.append(TranscriptEntry(
                     id: buffered.id,
@@ -4082,11 +4154,83 @@ final class AppModel {
                     kind: buffered.kind,
                     format: "plain_text",
                     tone: "neutral",
-                    pending: true
+                    pending: true,
+                    modelStepID: buffered.modelStepID,
+                    sourceSequence: buffered.sourceSequence,
+                    recordedAtMs: buffered.recordedAtMs
                 ))
             }
         }
         bufferedDeltas.removeAll()
+    }
+
+    private func applyModelStepCompletion(_ event: JSONValue, record: RecordedEvent) {
+        applyModelStepCompletion(event, record: record, to: &transcript)
+    }
+
+    private func applyModelStepCompletion(
+        _ event: JSONValue,
+        record: RecordedEvent,
+        to entries: inout [TranscriptEntry]
+    ) {
+        guard let modelStepID = event["modelStepId"]?.stringValue,
+              let outcome = event["outcome"],
+              let status = outcome["status"]?.stringValue
+        else { return }
+
+        guard status == "completed" else {
+            for entry in entries where entry.modelStepID == modelStepID && entry.pending {
+                entry.pending = false
+                entry.sourceSequence = record.sequence
+                entry.recordedAtMs = record.recordedAtMs
+            }
+            return
+        }
+
+        let previousSnapshotIndex = entries.firstIndex(where: {
+            $0.modelStepID == modelStepID && !$0.pending
+                && [.reasoning, .commentary, .assistant].contains($0.kind)
+        })
+        entries.removeAll {
+            $0.modelStepID == modelStepID
+                && [.reasoning, .commentary, .assistant].contains($0.kind)
+        }
+        guard let content = outcome["content"]?.arrayValue else { return }
+
+        let snapshotEntries = content.compactMap { item -> TranscriptEntry? in
+            guard let outputIndex = item["outputIndex"]?.intValue,
+                  let partIndex = item["partIndex"]?.intValue,
+                  let phase = item["phase"]?.stringValue,
+                  let text = item["text"]?.stringValue,
+                  !text.isEmpty
+            else { return nil }
+            let kind: TranscriptEntry.Kind
+            switch phase {
+            case "reasoning": kind = .reasoning
+            case "commentary": kind = .commentary
+            case "final_answer": kind = .assistant
+            default: return nil
+            }
+            return TranscriptEntry(
+                id: snapshotID(
+                    modelStepID: modelStepID,
+                    phase: phase,
+                    outputIndex: outputIndex,
+                    partIndex: partIndex
+                ),
+                text: text,
+                kind: kind,
+                format: "plain_text",
+                tone: "neutral",
+                pending: false,
+                modelStepID: modelStepID,
+                sourceSequence: record.sequence,
+                recordedAtMs: record.recordedAtMs
+            )
+        }
+        guard !snapshotEntries.isEmpty else { return }
+        let insertionIndex = min(previousSnapshotIndex ?? entries.endIndex, entries.endIndex)
+        entries.insert(contentsOf: snapshotEntries, at: insertionIndex)
     }
 
     private func completeStream(
@@ -4127,30 +4271,72 @@ final class AppModel {
         }
     }
 
-    private func prependHistory(_ events: [RenderedEventRecord]) {
+    /// Rebuilds record-owned presentation in sequence order because a replace/append pair
+    /// can straddle history pages. The cached base already includes records at its cursor.
+    private func mergeHistory(_ records: [RecordedEvent]) {
+        for record in records { transcriptRecords[record.sequence] = record }
+
         var earlier: [TranscriptEntry] = []
-        for event in events where event.event["frontendType"]?.stringValue != "picker" {
-            reduceHistory(event, into: &earlier)
+        var rebuilt = copiedTranscript(transcriptRecordBase)
+        let records = transcriptRecords.values.sorted { $0.sequence < $1.sequence }
+        for record in records {
+            if let baseSequence = transcriptRecordBaseSequence,
+               record.sequence <= baseSequence {
+                reduceHistory(record, into: &earlier)
+            } else {
+                reduceHistory(record, into: &rebuilt)
+            }
         }
-        let existingIDs = Set(transcript.map(\.id))
-        let existingTargets = Set(transcript.compactMap(\.messageTarget))
+        let baseIDs = Set(transcriptRecordBase.map(\.id))
+        let baseTargets = Set(transcriptRecordBase.compactMap(\.messageTarget))
         earlier.removeAll {
-            existingIDs.contains($0.id)
-                || $0.messageTarget.map(existingTargets.contains) == true
+            baseIDs.contains($0.id)
+                || $0.messageTarget.map(baseTargets.contains) == true
         }
-        guard !earlier.isEmpty else { return }
-        transcript.insert(contentsOf: earlier, at: 0)
-        visibleTranscriptLimit += earlier.count
+        let previousCount = transcript.count
+        rebuilt.insert(contentsOf: earlier, at: 0)
+        transcript = rebuilt
+        visibleTranscriptLimit += max(0, rebuilt.count - previousCount)
+    }
+
+    private func copiedTranscript(_ entries: [TranscriptEntry]) -> [TranscriptEntry] {
+        entries.map { entry in
+            TranscriptEntry(
+                id: entry.id,
+                text: entry.text,
+                kind: entry.kind,
+                capability: entry.capability,
+                role: entry.role,
+                title: entry.title,
+                symbol: entry.symbol,
+                group: entry.group,
+                format: entry.format,
+                tone: entry.tone,
+                pending: entry.pending,
+                modelStepID: entry.modelStepID,
+                sourceSequence: entry.sourceSequence,
+                recordedAtMs: entry.recordedAtMs,
+                messageTarget: entry.messageTarget,
+                files: entry.files
+            )
+        }
     }
 
     private func reduceHistory(
-        _ rendered: RenderedEventRecord,
+        _ record: RecordedEvent,
         into entries: inout [TranscriptEntry]
     ) {
-        let event = rendered.event
+        let event = record.event.msg
         let type = event["type"]?.stringValue ?? "unknown"
-        for block in rendered.blocks { apply(block, to: &entries) }
-        let wasRendered = !rendered.blocks.isEmpty
+        for (index, block) in record.blocks.enumerated() {
+            apply(
+                block,
+                sequence: record.sequence,
+                blockIndex: index,
+                recordedAtMs: record.recordedAtMs,
+                to: &entries
+            )
+        }
 
         switch type {
         case "user_message":
@@ -4160,17 +4346,19 @@ final class AppModel {
             appendText(
                 event["message"]?.stringValue,
                 kind: .user,
+                id: "event:\(record.sequence):user",
+                sourceSequence: record.sequence,
+                recordedAtMs: record.recordedAtMs,
                 messageTarget: messageTarget(from: event),
                 files: attachments,
                 to: &entries
             )
         case "agent_message_content_delta", "agent_reasoning_content_delta":
-            guard let itemID = event["itemId"]?.stringValue else { return }
+            guard let modelStepID = event["modelStepId"]?.stringValue else { return }
             let reasoning = type == "agent_reasoning_content_delta"
             let commentary = event["phase"]?.stringValue == "commentary"
-            let id = reasoning
-                ? "reasoning-\(itemID)"
-                : (commentary ? "commentary-\(itemID)" : itemID)
+            let phase = reasoning ? "reasoning" : (commentary ? "commentary" : "final_answer")
+            let id = streamID(modelStepID: modelStepID, phase: phase)
             let kind: TranscriptEntry.Kind = reasoning
                 ? .reasoning
                 : (commentary ? .commentary : .assistant)
@@ -4178,6 +4366,8 @@ final class AppModel {
             guard !delta.isEmpty else { return }
             if let index = entries.lastIndex(where: { $0.id == id }) {
                 entries[index].text.append(delta)
+                entries[index].sourceSequence = record.sequence
+                entries[index].recordedAtMs = record.recordedAtMs
             } else {
                 entries.append(TranscriptEntry(
                     id: id,
@@ -4185,15 +4375,23 @@ final class AppModel {
                     kind: kind,
                     format: "plain_text",
                     tone: "neutral",
-                    pending: true
+                    pending: true,
+                    modelStepID: modelStepID,
+                    sourceSequence: record.sequence,
+                    recordedAtMs: record.recordedAtMs
                 ))
             }
+        case "model_step_completed":
+            applyModelStepCompletion(event, record: record, to: &entries)
         case "agent_message":
             let kind: TranscriptEntry.Kind = event["phase"]?.stringValue == "commentary"
                 ? .commentary
                 : .assistant
-            if wasRendered {
-                entries.removeAll { $0.pending && $0.kind == kind }
+            if let modelStepID = event["modelStepId"]?.stringValue,
+               let index = entries.lastIndex(where: {
+                   $0.modelStepID == modelStepID && $0.kind == kind && !$0.pending
+               }) {
+                entries[index].messageTarget = messageTarget(from: event)
             } else {
                 completeStream(
                     text: event["message"]?.stringValue ?? "",
@@ -4204,32 +4402,8 @@ final class AppModel {
             }
         case "task_complete":
             for entry in entries where entry.pending { entry.pending = false }
-        case "web_search_begin":
-            appendText("Searching the web", kind: .event, tone: "warning", to: &entries)
-        case "web_search_end":
-            let query = event["query"]?.stringValue
-                ?? event["action"]?.stringValue
-                ?? "Web search complete"
-            appendText("Searched: \(query)", kind: .event, tone: "success", to: &entries)
         case "turn_aborted":
             for entry in entries where entry.pending { entry.pending = false }
-            appendText(
-                "Turn aborted: \(event["reason"]?.stringValue ?? "Unknown reason")",
-                kind: .event,
-                tone: "warning",
-                to: &entries
-            )
-        case "warning":
-            appendText(event["message"]?.stringValue, kind: .event, tone: "warning", to: &entries)
-        case "error":
-            appendText(
-                event["message"]?.stringValue ?? "Agent error",
-                kind: .error,
-                tone: "error",
-                to: &entries
-            )
-        case "frontend":
-            if let block = renderedBlock(from: event) { apply(block, to: &entries) }
         default:
             break
         }
@@ -4884,30 +5058,22 @@ final class AppModel {
 
     private func observeReplayCompletion(_ buffered: BufferedAgentEvent) {
         guard replayRequestID != nil else { return }
-        let type = buffered.event.msg["type"]?.stringValue
-        if let submissionID = buffered.event.submissionId,
+        let event = buffered.record.event
+        let type = event.msg["type"]?.stringValue
+        if let submissionID = event.submissionId,
            type == "user_message"
                || (type == "frontend"
-                   && buffered.event.msg["frontendType"]?.stringValue == "widget"),
+                   && event.msg["frontendType"]?.stringValue == "widget"),
            replayCompletionSubmissionIDs.count < maximumObservedReplaySubmissions
                || replayCompletionSubmissionIDs.contains(submissionID) {
             replayCompletionSubmissionIDs.insert(submissionID)
         }
 
         var messages: [ReplayUserMessage] = []
-        if type == "user_message", let text = buffered.event.msg["message"]?.stringValue {
-            let sequence = messageTarget(from: buffered.event.msg)?.checkpointSequence
-                ?? buffered.sequence
+        if type == "user_message", let text = event.msg["message"]?.stringValue {
+            let sequence = messageTarget(from: event.msg)?.checkpointSequence
+                ?? buffered.record.sequence
             messages.append(ReplayUserMessage(sequence: sequence, text: text))
-        }
-        if type == "session_history" {
-            messages.append(contentsOf: (buffered.history ?? []).compactMap { rendered in
-                guard rendered.event["type"]?.stringValue == "user_message",
-                      let text = rendered.event["message"]?.stringValue,
-                      let sequence = messageTarget(from: rendered.event)?.checkpointSequence
-                else { return nil }
-                return ReplayUserMessage(sequence: sequence, text: text)
-            })
         }
         guard !messages.isEmpty else { return }
         replayUserMessages.append(contentsOf: messages.suffix(maximumObservedReplaySubmissions))
@@ -5217,7 +5383,6 @@ final class AppModel {
         eventTask = nil
         if !preservingSession {
             latestSequence = nil
-            currentReplayEpoch = nil
         }
         sessionOpenCursor = nil
         replayRequestID = nil
@@ -5352,6 +5517,9 @@ final class AppModel {
         replayRequestID = nil
         replaySnapshotSequence = nil
         replayPresentedTranscript = nil
+        transcriptRecordBase = []
+        transcriptRecordBaseSequence = nil
+        transcriptRecords.removeAll(keepingCapacity: true)
         replayCompletionSubmissionIDs.removeAll(keepingCapacity: true)
         replayUserMessages.removeAll(keepingCapacity: true)
         completedComposerEditReplay = false

@@ -446,9 +446,12 @@ impl Shared {
                         block: FrontendBlock {
                             id: None,
                             group: None,
-                            append: false,
-                            pending: false,
+                            update: crate::protocol::FrontendBlockUpdate::Replace,
+                            state: crate::protocol::FrontendBlockState::Complete,
+                            role: crate::protocol::FrontendBlockRole::Notice,
+                            title: "Subagent error".into(),
                             text: format!("{retry_message}: {retry_error}"),
+                            symbol: Some(crate::protocol::FrontendSymbol::Agent),
                             files: Vec::new(),
                             format: crate::protocol::FrontendBlockFormat::PlainText,
                             tone: FrontendTone::Error,
@@ -598,7 +601,12 @@ mod tests {
     use super::*;
     use crate::BoxFuture;
     use crate::backend::checkpoint::Checkpoint;
+    use crate::backend::checkpoint::EventPage;
+    use crate::backend::checkpoint::EventPageRequest;
     use crate::backend::checkpoint::ExecutionRecord;
+    use crate::backend::checkpoint::JournalEvent;
+    use crate::backend::checkpoint::TimestampedEvent;
+    use crate::protocol::Event;
 
     struct FailOnceStore {
         fail_next_save: AtomicBool,
@@ -647,6 +655,10 @@ mod tests {
             Box::pin(async { Ok(None) })
         }
 
+        fn delete_session<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Result<bool>> {
+            Box::pin(async { Ok(false) })
+        }
+
         fn save<'a>(
             &'a self,
             _checkpoint: &'a Checkpoint,
@@ -654,6 +666,55 @@ mod tests {
             _execution: Option<&'a ExecutionRecord>,
         ) -> BoxFuture<'a, Result<()>> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn save_with_events<'a>(
+            &'a self,
+            checkpoint: &'a Checkpoint,
+            transcript_delta: &'a [Value],
+            execution: Option<&'a ExecutionRecord>,
+            events: &'a [TimestampedEvent],
+        ) -> BoxFuture<'a, Result<Vec<JournalEvent>>> {
+            Box::pin(async move {
+                self.save(checkpoint, transcript_delta, execution).await?;
+                let mut records = Vec::with_capacity(events.len());
+                for event in events {
+                    records.push(
+                        self.append_event(
+                            &checkpoint.session_id,
+                            event.recorded_at_ms,
+                            &event.event,
+                        )
+                        .await?,
+                    );
+                }
+                Ok(records)
+            })
+        }
+
+        fn append_event<'a>(
+            &'a self,
+            _session_id: &'a str,
+            recorded_at_ms: i64,
+            event: &'a Event,
+        ) -> BoxFuture<'a, Result<JournalEvent>> {
+            let event = event.clone();
+            Box::pin(async move {
+                Ok(JournalEvent {
+                    sequence: 1,
+                    recorded_at_ms,
+                    event,
+                    stream_metrics: Vec::new(),
+                })
+            })
+        }
+
+        fn event_page<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _request: EventPageRequest,
+        ) -> BoxFuture<'a, Result<EventPage>> {
+            Box::pin(async { Ok(EventPage::default()) })
         }
 
         fn load_state<'a>(
@@ -690,6 +751,10 @@ mod tests {
             Box::pin(async { Ok(None) })
         }
 
+        fn delete_session<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Result<bool>> {
+            Box::pin(async { Ok(false) })
+        }
+
         fn save<'a>(
             &'a self,
             _checkpoint: &'a Checkpoint,
@@ -697,6 +762,55 @@ mod tests {
             _execution: Option<&'a ExecutionRecord>,
         ) -> BoxFuture<'a, Result<()>> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn save_with_events<'a>(
+            &'a self,
+            checkpoint: &'a Checkpoint,
+            transcript_delta: &'a [Value],
+            execution: Option<&'a ExecutionRecord>,
+            events: &'a [TimestampedEvent],
+        ) -> BoxFuture<'a, Result<Vec<JournalEvent>>> {
+            Box::pin(async move {
+                self.save(checkpoint, transcript_delta, execution).await?;
+                let mut records = Vec::with_capacity(events.len());
+                for event in events {
+                    records.push(
+                        self.append_event(
+                            &checkpoint.session_id,
+                            event.recorded_at_ms,
+                            &event.event,
+                        )
+                        .await?,
+                    );
+                }
+                Ok(records)
+            })
+        }
+
+        fn append_event<'a>(
+            &'a self,
+            _session_id: &'a str,
+            recorded_at_ms: i64,
+            event: &'a Event,
+        ) -> BoxFuture<'a, Result<JournalEvent>> {
+            let event = event.clone();
+            Box::pin(async move {
+                Ok(JournalEvent {
+                    sequence: 1,
+                    recorded_at_ms,
+                    event,
+                    stream_metrics: Vec::new(),
+                })
+            })
+        }
+
+        fn event_page<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _request: EventPageRequest,
+        ) -> BoxFuture<'a, Result<EventPage>> {
+            Box::pin(async { Ok(EventPage::default()) })
         }
 
         fn load_state<'a>(

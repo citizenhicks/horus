@@ -262,6 +262,102 @@ fn responses_decode_preserves_reasoning_content_for_replay() {
 }
 
 #[test]
+fn responses_decode_preserves_text_part_boundaries_and_annotations() {
+    let decoded = decode_response(serde_json::json!({
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "Source one.",
+                    "annotations": [
+                        {
+                            "type": "url_citation",
+                            "url": "https://example.com",
+                            "title": "Example",
+                            "start_index": 0,
+                            "end_index": 10
+                        },
+                        {
+                            "type": "file_citation",
+                            "file_id": "file-1",
+                            "filename": "notes.txt",
+                            "index": 2
+                        }
+                    ]
+                },
+                {"type": "refusal", "refusal": "unused boundary"},
+                {
+                    "type": "output_text",
+                    "text": "Source two.",
+                    "annotations": [
+                        {
+                            "type": "container_file_citation",
+                            "container_id": "container-1",
+                            "file_id": "file-2",
+                            "filename": "report.pdf",
+                            "start_index": 0,
+                            "end_index": 10
+                        },
+                        {
+                            "type": "file_path",
+                            "file_id": "file-3",
+                            "index": 4
+                        }
+                    ]
+                }
+            ]
+        }]
+    }))
+    .expect("decode response");
+
+    assert_eq!(
+        serde_json::to_value(decoded.content()).expect("serialize normalized content"),
+        serde_json::json!([
+            {
+                "output_index": 0,
+                "part_index": 0,
+                "phase": "final_answer",
+                "text": "Source one.",
+                "annotations": [
+                    {
+                        "type": "url_citation",
+                        "url": "https://example.com",
+                        "title": "Example",
+                        "start_index": 0,
+                        "end_index": 10
+                    },
+                    {
+                        "type": "file_citation",
+                        "file_id": "file-1",
+                        "filename": "notes.txt",
+                        "index": 2
+                    }
+                ]
+            },
+            {
+                "output_index": 0,
+                "part_index": 2,
+                "phase": "final_answer",
+                "text": "Source two.",
+                "annotations": [
+                    {
+                        "type": "container_file_citation",
+                        "container_id": "container-1",
+                        "file_id": "file-2",
+                        "filename": "report.pdf",
+                        "start_index": 0,
+                        "end_index": 10
+                    },
+                    {"type": "file_path", "file_id": "file-3", "index": 4}
+                ]
+            }
+        ])
+    );
+}
+
+#[test]
 fn responses_decode_normalizes_tool_calls_usage_and_errors() {
     let decoded = decode_response(serde_json::json!({
         "output": [
@@ -385,6 +481,23 @@ fn responses_emits_commentary_text_deltas() {
     assert_eq!(
         *seen.lock().expect("events lock"),
         vec![ModelEvent::CommentaryDelta("Checking.".into())]
+    );
+}
+
+#[test]
+fn responses_web_search_preserves_every_query() {
+    let action = decode_web_action(&serde_json::json!({
+        "action": {
+            "type": "search",
+            "queries": ["Horus framework", "Horus gateway"]
+        }
+    }));
+
+    assert_eq!(
+        action,
+        WebSearchAction::Search {
+            queries: vec!["Horus framework".into(), "Horus gateway".into()]
+        }
     );
 }
 

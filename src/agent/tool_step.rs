@@ -11,6 +11,7 @@ use super::Runner;
 use super::input::ActiveRoute;
 use super::input::ActiveTurnRouter;
 use super::input::Wait;
+use super::send_event;
 use crate::Error;
 use crate::Result;
 use crate::backend::checkpoint::ExecutionOutcome;
@@ -29,6 +30,7 @@ use crate::middleware::QueuedInputBaseline;
 use crate::middleware::tools::ToolResult;
 use crate::middleware::tools::execute_batch;
 use crate::protocol::ApprovalCall;
+use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecApprovalRequestEvent;
 use crate::protocol::ReviewDecision;
@@ -171,8 +173,8 @@ impl Runner {
             return Ok(Some(false));
         };
         self.record_usage(&route, output.usage())?;
-        self.save().await?;
-        self.emit_usage(submission_id)?;
+        self.persist_with_events(self.usage_event(submission_id).into_iter().collect(), None)
+            .await?;
         let approved = output.tool_calls().is_empty()
             && response_approves_exactly(output.text(), &request.call_ids);
         Ok(Some(approved))
@@ -200,8 +202,9 @@ impl Runner {
             decision_received: false,
         };
         self.state.pending_approval = Some(pending.clone());
-        self.save().await?;
-        self.resolve_pending(commands, &pending).await
+        self.persist_with_events(vec![approval_event(&pending)], None)
+            .await?;
+        self.resolve_pending(commands, &pending, false).await
     }
 
     pub(super) async fn resume_pending(
@@ -209,12 +212,12 @@ impl Runner {
         commands: &mut mpsc::Receiver<Submission>,
         pending: PendingApproval,
     ) -> Result<()> {
-        let Some(results) = self.resolve_pending(commands, &pending).await? else {
+        let Some(results) = self.resolve_pending(commands, &pending, true).await? else {
             return Ok(());
         };
-        self.append_tool_results(results)?;
         self.state.pending_approval = None;
-        self.save().await?;
+        self.persist_tool_results(&pending.submission_id, &pending.turn_id, results)
+            .await?;
         self.continue_turn(commands, pending.submission_id, pending.turn_id)
             .await
     }
@@ -223,8 +226,11 @@ impl Runner {
         &mut self,
         commands: &mut mpsc::Receiver<Submission>,
         pending: &PendingApproval,
+        reassert_request: bool,
     ) -> Result<Option<Vec<ToolResult>>> {
-        self.emit_approval(pending).await?;
+        if reassert_request {
+            send_event(&self.events, approval_event(pending)).await?;
+        }
         let approval = self.wait_for_approval(commands, pending).await?;
         let Some(approval) = self.ready_or_aborted(approval, &pending.turn_id).await? else {
             return Ok(None);
@@ -300,8 +306,13 @@ impl Runner {
                 Ok(Some(order_results(&pending.calls, results)))
             }
             ReviewDecision::Abort => {
-                self.append_tool_results(denied_results(&pending.calls, "approval aborted"))?;
                 self.state.pending_approval = None;
+                self.persist_tool_results(
+                    &pending.submission_id,
+                    &pending.turn_id,
+                    denied_results(&pending.calls, "approval aborted"),
+                )
+                .await?;
                 self.abort(
                     &approval.submission_id,
                     &pending.turn_id,
@@ -390,20 +401,19 @@ impl Runner {
                 return Ok(Wait::Interrupted { submission_id });
             }
         };
-        for result in &results {
-            self.emit(
-                submission_id,
-                EventMsg::ToolCallEnd(ToolCallEndEvent {
-                    turn_id: turn_id.to_string(),
-                    call_id: result.call_id.clone(),
-                    name: result.name.clone(),
-                    output: result.output.clone(),
-                    is_error: result.is_error,
-                }),
-            )
-            .await?;
-        }
         Ok(Wait::Ready(results))
+    }
+
+    pub(super) async fn persist_tool_results(
+        &mut self,
+        submission_id: &str,
+        turn_id: &str,
+        results: Vec<ToolResult>,
+    ) -> Result<()> {
+        let events = tool_result_events(submission_id, turn_id, &results);
+        self.append_tool_results(results)?;
+        self.persist_with_events(events, None).await?;
+        Ok(())
     }
 
     pub(super) fn append_tool_results(&mut self, results: Vec<ToolResult>) -> Result<()> {
@@ -442,20 +452,11 @@ impl Runner {
             &calls,
             &format!("execution interrupted; result unknown: {reason}"),
         );
-        for result in &results {
-            self.emit(
-                submission_id,
-                EventMsg::ToolCallEnd(ToolCallEndEvent {
-                    turn_id: turn_id.to_string(),
-                    call_id: result.call_id.clone(),
-                    name: result.name.clone(),
-                    output: result.output.clone(),
-                    is_error: true,
-                }),
-            )
-            .await?;
+        if results.is_empty() {
+            return Ok(());
         }
-        self.append_tool_results(results)
+        self.persist_tool_results(submission_id, turn_id, results)
+            .await
     }
 
     async fn wait_for_approval(
@@ -500,33 +501,48 @@ impl Runner {
             "frontend disconnected during approval".into(),
         ))
     }
+}
 
-    async fn emit_approval(&self, pending: &PendingApproval) -> Result<()> {
-        let approval_call_ids = pending
-            .approval_call_ids
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        self.emit(
-            &pending.submission_id,
-            EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
-                id: pending.request_id.clone(),
-                turn_id: pending.turn_id.clone(),
-                calls: pending
-                    .calls
-                    .iter()
-                    .filter(|call| approval_call_ids.contains(&call.call_id))
-                    .map(|call| ApprovalCall {
-                        call_id: call.call_id.clone(),
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                    })
-                    .collect(),
-                reason: pending.reason.clone(),
-            }),
-        )
-        .await
+fn approval_event(pending: &PendingApproval) -> Event {
+    let approval_call_ids = pending
+        .approval_call_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    Event {
+        submission_id: Some(pending.submission_id.clone()),
+        msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+            id: pending.request_id.clone(),
+            turn_id: pending.turn_id.clone(),
+            calls: pending
+                .calls
+                .iter()
+                .filter(|call| approval_call_ids.contains(&call.call_id))
+                .map(|call| ApprovalCall {
+                    call_id: call.call_id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                })
+                .collect(),
+            reason: pending.reason.clone(),
+        }),
     }
+}
+
+fn tool_result_events(submission_id: &str, turn_id: &str, results: &[ToolResult]) -> Vec<Event> {
+    results
+        .iter()
+        .map(|result| Event {
+            submission_id: Some(submission_id.to_string()),
+            msg: EventMsg::ToolCallEnd(ToolCallEndEvent {
+                turn_id: turn_id.to_string(),
+                call_id: result.call_id.clone(),
+                name: result.name.clone(),
+                output: result.output.clone(),
+                is_error: result.is_error,
+            }),
+        })
+        .collect()
 }
 
 fn validate_approval_selection(calls: &[ToolCall], call_ids: &[String]) -> Result<()> {

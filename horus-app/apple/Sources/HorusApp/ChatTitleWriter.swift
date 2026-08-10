@@ -97,7 +97,7 @@ final class ChatTitleWriter {
                 """
             let response = try await session.respond(
                 to: request,
-                options: GenerationOptions(temperature: 0.3, maximumResponseTokens: 24)
+                options: GenerationOptions(temperature: 0.3, maximumResponseTokens: 16)
             )
             return Self.cleaned(response.content).map(Outcome.title)
                 ?? .failed("Apple returned an unusable chat title.")
@@ -155,10 +155,15 @@ final class ChatTitleWriter {
             title = String(title.dropLast())
         }
         title = title.trimmingCharacters(in: .whitespaces)
-        guard !title.isEmpty,
-              title.count <= Self.limit,
-              title.split(whereSeparator: { $0.isWhitespace }).count <= Self.wordLimit
-        else { return nil }
-        return title
+        guard !title.isEmpty else { return nil }
+        title = title
+            .split(whereSeparator: { $0.isWhitespace })
+            .prefix(Self.wordLimit)
+            .joined(separator: " ")
+        guard title.count > Self.limit else { return title }
+        let prefix = String(title.prefix(Self.limit))
+        let boundary = prefix.lastIndex(where: { $0.isWhitespace })
+        let fitted = boundary.map { String(prefix[..<$0]) } ?? prefix
+        return fitted.trimmingCharacters(in: .whitespaces) + "…"
     }
 }

@@ -19,6 +19,7 @@ use crate::protocol::ReviewDecision;
 use crate::protocol::Submission;
 use crate::protocol::WarningEvent;
 
+use super::EventRecorder;
 use super::MAX_DEFERRED_SUBMISSIONS;
 use super::Runner;
 use super::send_event;
@@ -47,8 +48,14 @@ pub(super) struct ActiveChange {
 }
 
 impl ActiveChange {
-    pub(super) async fn publish(self, events: &mpsc::Sender<Event>) -> Result<()> {
-        send_messages(events, &self.submission_id, self.events).await
+    pub(super) fn into_events(self) -> Vec<Event> {
+        self.events
+            .into_iter()
+            .map(|msg| Event {
+                submission_id: Some(self.submission_id.clone()),
+                msg,
+            })
+            .collect()
     }
 }
 
@@ -60,7 +67,7 @@ pub(super) struct ActiveTurnRouter<'a> {
     pub queued_input: &'a mut Vec<QueuedInput>,
     pub queued_before: QueuedInputBaseline,
     pub deferred: &'a mut VecDeque<Submission>,
-    pub events: &'a mpsc::Sender<Event>,
+    pub events: &'a EventRecorder,
     pub expected_approval: Option<&'a str>,
 }
 
@@ -110,8 +117,8 @@ impl Runner {
     }
 
     pub(super) async fn persist_active_change(&mut self, change: ActiveChange) -> Result<()> {
-        self.save().await?;
-        change.publish(&self.events).await
+        self.persist_with_events(change.into_events(), None).await?;
+        Ok(())
     }
 }
 
@@ -275,7 +282,7 @@ impl ActiveTurnRouter<'_> {
 }
 
 async fn send_messages(
-    events: &mpsc::Sender<Event>,
+    events: &EventRecorder,
     submission_id: &str,
     messages: Vec<EventMsg>,
 ) -> Result<()> {
@@ -294,7 +301,7 @@ async fn send_messages(
 
 pub(super) async fn defer_submission(
     deferred: &mut VecDeque<Submission>,
-    events: &mpsc::Sender<Event>,
+    events: &EventRecorder,
     submission: Submission,
 ) -> Result<()> {
     if deferred.len() >= MAX_DEFERRED_SUBMISSIONS {
@@ -305,7 +312,7 @@ pub(super) async fn defer_submission(
     Ok(())
 }
 
-async fn warn(events: &mpsc::Sender<Event>, id: String, message: &str) -> Result<()> {
+async fn warn(events: &EventRecorder, id: String, message: &str) -> Result<()> {
     send_event(
         events,
         Event {
@@ -323,9 +330,31 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::backend::checkpoint::Checkpoint;
+    use crate::backend::checkpoint::CheckpointStore;
+    use crate::backend::checkpoint::JournalEvent;
+    use crate::backend::checkpoint::sqlite::SqliteCheckpoint;
     use crate::middleware::Middleware;
 
     struct EditableMiddleware;
+
+    async fn event_recorder() -> (
+        tempfile::TempDir,
+        EventRecorder,
+        mpsc::Receiver<JournalEvent>,
+    ) {
+        let directory = tempfile::tempdir().expect("checkpoint directory");
+        let checkpoints = Arc::new(
+            SqliteCheckpoint::new(directory.path().join("checkpoints.sqlite3"))
+                .expect("checkpoint store"),
+        );
+        checkpoints
+            .save(&Checkpoint::empty("session-1"), &[], None)
+            .await
+            .expect("initial checkpoint");
+        let (recorder, events) = EventRecorder::spawn(checkpoints, "session-1".into());
+        (directory, recorder, events)
+    }
 
     impl Middleware for EditableMiddleware {
         fn name(&self) -> &'static str {
@@ -382,7 +411,7 @@ mod tests {
         let mut queued =
             vec![QueuedInput::new("editable", "message-1", "original").expect("queued input")];
         let mut deferred = VecDeque::new();
-        let (events, _receiver) = mpsc::channel(2);
+        let (_directory, events, _receiver) = event_recorder().await;
 
         let route = (ActiveTurnRouter {
             middleware: &middleware,
@@ -422,7 +451,7 @@ mod tests {
             MiddlewareStack::new(vec![Arc::new(EditableMiddleware)]).expect("middleware stack");
         let mut queued = Vec::new();
         let mut deferred = VecDeque::new();
-        let (events, mut receiver) = mpsc::channel(2);
+        let (_directory, events, mut receiver) = event_recorder().await;
 
         let route = (ActiveTurnRouter {
             middleware: &middleware,
@@ -447,7 +476,7 @@ mod tests {
         })
         .await
         .expect("route command");
-        let event = receiver.recv().await.expect("preview event");
+        let event = receiver.recv().await.expect("preview event").event;
 
         assert!(matches!(route, ActiveRoute::Continue));
         assert!(deferred.is_empty());
@@ -466,7 +495,7 @@ mod tests {
             MiddlewareStack::new(vec![Arc::new(EditableMiddleware)]).expect("middleware stack");
         let mut queued = Vec::new();
         let mut deferred = VecDeque::new();
-        let (events, _receiver) = mpsc::channel(2);
+        let (_directory, events, _receiver) = event_recorder().await;
         let submission = Submission {
             id: "command-1".into(),
             op: Op::CapabilityCommand {

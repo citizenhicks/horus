@@ -563,7 +563,6 @@ async fn open_session(
             request_id: request_id.clone(),
             session_id,
             last_sequence: None,
-            replay_epoch: None,
         })
         .await
         .map_err(gateway_error)?;
