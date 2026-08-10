@@ -8,24 +8,34 @@ struct HorusCloudOfferButton: View {
     @State private var product: Product?
     @State private var showsOffer = false
 
+    // A centred label and no chevron: with a leading glyph, a spacer and a caret this read
+    // as a list row that happened to be capsule-shaped. The accent tint marks it as the
+    // other path rather than a second copy of the pairing button.
     var body: some View {
         Button {
             showsOffer = true
         } label: {
-            HStack(spacing: 10) {
-                HorusIcon(.globe02, foreground: palette.accent)
+            Label {
                 title
-                    .font(HorusStyle.controlFont)
-                    .multilineTextAlignment(.leading)
-                Spacer(minLength: 4)
-                HorusIcon(.caretRight, size: 12, foreground: palette.muted)
+                    // Glass takes a tint from its own material, not from the button's, so
+                    // the accent has to be carried by the label for it to read at all.
+                    .foregroundStyle(palette.accent)
+            } icon: {
+                // The product's own mark, drawn full-colour: the logo is artwork rather
+                // than a template glyph, so it keeps its own colours beside accent text.
+                Image("HorusLogo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 20, height: 20)
+                    .accessibilityHidden(true)
             }
-            .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize)
-            .contentShape(Rectangle())
+            .font(HorusStyle.controlFont)
         }
         .buttonStyle(.horusGlass)
+        .tint(palette.accent)
         .buttonBorderShape(.capsule)
         .controlSize(.large)
+        .buttonSizing(.flexible)
         .task { await loadProduct() }
         .sheet(isPresented: $showsOffer) {
             HorusCloudOfferSheet(product: product)
@@ -91,20 +101,20 @@ private struct HorusCloudOfferSheet: View {
     /// One voice per line: a mark, the promise, and the shape of the offer. The price is not
     /// here — it belongs beside the button that charges it, not at the top in accent.
     private var hero: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 10) {
-                HorusIcon(.globe02, size: 22, foreground: palette.accent)
-                    .frame(width: 44, height: 44)
-                    .background(palette.accentSoft.opacity(0.65), in: Circle())
-                HorusBadge(text: "7 days free", tone: "success", glyph: .sealCheck)
-            }
+        VStack(alignment: .leading, spacing: 18) {
+            // The app's own mark, not a stock globe. The free trial is not announced twice:
+            // it is stated once, next to the price it applies to.
+            HorusComposingOrb()
+                .frame(width: 64, height: 64)
+                .frame(maxWidth: .infinity)
+                .accessibilityHidden(true)
             Text("Your private gateway, managed by Horus.")
                 .font(.largeTitle.weight(.bold))
                 .fixedSize(horizontal: false, vertical: true)
             Text(
                 "Skip server setup without giving up control. We provision, secure, and maintain a gateway scoped to your account."
             )
-                .font(.title3)
+                .font(HorusStyle.bodyFont)
                 .foregroundStyle(palette.muted)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -151,13 +161,21 @@ private struct HorusCloudOfferSheet: View {
         }
     }
 
-    /// The price sits directly above the button that charges it, in the app's own accent
-    /// rather than a hand-rolled black rectangle: an imitation of Apple's button reads as a
-    /// worse version of it, and the real one cannot front a signup that does nothing yet.
+    /// Pricing stays with the action so the terms remain visible wherever the page is scrolled.
+    ///
+    /// Sign in with Apple is a branded control: Apple's guidelines allow black, white, or
+    /// outlined only, so it cannot wear the app's accent. White is the variant meant for a
+    /// dark background. The fade underneath is not a bar — it only keeps the last line of
+    /// text from colliding with the capsule as the page scrolls past it.
     private var signupBoundary: some View {
         VStack(spacing: 10) {
             billingDescription
-                .font(HorusStyle.controlFont)
+                .font(HorusStyle.bodyFont)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Signup and billing are not enabled in this beta.")
+                .font(.footnote)
+                .foregroundStyle(palette.muted)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
             Button {
@@ -165,40 +183,39 @@ private struct HorusCloudOfferSheet: View {
             } label: {
                 Label("Continue with Apple", systemImage: "apple.logo")
                     .font(.headline)
+                    .foregroundStyle(.black)
+                    .frame(maxWidth: .infinity, minHeight: 50)
+                    .contentShape(Capsule())
             }
-            .horusProminentButton()
-            .buttonBorderShape(.capsule)
-            .controlSize(.large)
-            .buttonSizing(.flexible)
-            Text("Signup and billing are not enabled in this beta.")
-                .font(HorusStyle.metadataFont)
-                .foregroundStyle(palette.muted)
-                .multilineTextAlignment(.center)
+            .buttonStyle(.plain)
+            .background(.white, in: Capsule())
+            .shadow(color: .black.opacity(0.32), radius: 14, y: 6)
         }
         .frame(maxWidth: 680)
         .padding(.horizontal, 20)
-        .padding(.top, 14)
-        .padding(.bottom, 8)
+        .padding(.top, 20)
+        .padding(.bottom, 6)
         .frame(maxWidth: .infinity)
         .background {
-            // The bar carries the page's own surface, and a hairline says where the
-            // scrolling content ends rather than a material change nobody else uses.
-            palette.canvas
-                .overlay(alignment: .top) {
-                    Rectangle().fill(palette.line).frame(height: HorusStyle.borderWidth)
-                }
-                .ignoresSafeArea()
+            LinearGradient(
+                colors: [palette.canvas.opacity(0), palette.canvas],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
         }
     }
 
     private var billingDescription: Text {
         guard let product else {
-            return Text("7 days free, then billed monthly. ")
-                + Text("Your App Store price is shown before you pay.")
-                .foregroundColor(palette.muted)
+            return Text(
+                "7 days free, then billed monthly. \(Text("Price shown at purchase.").foregroundStyle(palette.muted))"
+            )
         }
-        return Text("7 days free, then \(product.displayPrice) a month. ")
-            + Text("Cancel anytime.").foregroundColor(palette.muted)
+        return Text(
+            "7 days free, then \(product.displayPrice) a month. \(Text("Cancel anytime.").foregroundStyle(palette.muted))"
+        )
     }
 }
 

@@ -731,6 +731,7 @@ final class AppModel {
     var toast: AppToast?
     var activeTurnID: String?
     var activeOperation: String?
+    private(set) var steeringDeliveryRevision = 0
     var contextTokens = 0
     var modelContextWindow: Int64?
     var pendingApproval: PendingApproval?
@@ -821,6 +822,7 @@ final class AppModel {
     @ObservationIgnored private var replayCompletionSubmissionIDs: Set<String> = []
     @ObservationIgnored private var replayUserMessages: [ReplayUserMessage] = []
     @ObservationIgnored private var completedComposerEditReplay = false
+    @ObservationIgnored private var awaitsSteeringDelivery = false
     @ObservationIgnored private var composerDraftOwner: ComposerDraftOwner?
     @ObservationIgnored private var composerDraftGeneration = UUID()
     @ObservationIgnored private var composerDraftSaveTask: Task<Void, Never>?
@@ -3334,6 +3336,7 @@ final class AppModel {
         }
         runStats = payload.runStats
         activeTurnID = payload.runStats.active?.turnId
+        awaitsSteeringDelivery = false
         activeOperation = payload.contributions.compactMap(\.activeInput?.operation).first
         agentDraft = refreshedAgentDraft(
             currentDraft: agentDraft,
@@ -3645,6 +3648,15 @@ final class AppModel {
         preview: RenderedPreview?
     ) {
         let type = event.msg["type"]?.stringValue ?? "unknown"
+        // Queue removal also happens for edits and turn cleanup; only the immediately
+        // following targeted user message proves that steering reached the model input.
+        let confirmsSteeringDelivery = awaitsSteeringDelivery
+            && replayRequestID == nil
+            && type == "user_message"
+            && event.submissionId != nil
+            && messageTarget(from: event.msg) != nil
+        awaitsSteeringDelivery = false
+        if confirmsSteeringDelivery { steeringDeliveryRevision &+= 1 }
         // Anything that is not a delta may read or finalize the streams the buffer feeds,
         // so buffered text must land first to keep transcript order exact.
         if type != "agent_message_content_delta", type != "agent_reasoning_content_delta" {
@@ -3844,6 +3856,12 @@ final class AppModel {
                   let id = event["id"]?.stringValue
             else { return }
             mountedWidgets.removeAll { $0.capability == capability && $0.widget.id == id }
+            if replayRequestID == nil,
+               contributions.contains(where: {
+                   $0.capability == capability && $0.activeInput != nil
+               }) {
+                awaitsSteeringDelivery = true
+            }
             acknowledgeWidgetEdit(
                 submissionID: submissionID,
                 capability: capability,
@@ -5407,6 +5425,7 @@ final class AppModel {
         visibleTranscriptLimit = 300
         activeTurnID = nil
         activeOperation = nil
+        awaitsSteeringDelivery = false
         runStats = RunStats()
         contextTokens = 0
         modelContextWindow = nil

@@ -546,8 +546,12 @@ final class AppModelTests: XCTestCase {
         }
         XCTAssertTrue(model.transcript.isEmpty)
 
-        try await Task.sleep(for: .milliseconds(150))
-        XCTAssertEqual(model.transcript.map(\.text), [String(repeating: "x", count: 100)])
+        let expected = String(repeating: "x", count: 100)
+        let deltasFlushed = await eventually {
+            model.transcript.map(\.text) == [expected]
+        }
+        XCTAssertTrue(deltasFlushed)
+        XCTAssertEqual(model.transcript.map(\.text), [expected])
         XCTAssertTrue(try XCTUnwrap(model.transcript.first).pending)
 
         model.reduce(
@@ -847,6 +851,68 @@ final class AppModelTests: XCTestCase {
         )
 
         XCTAssertEqual(model.composer, "Retry this steering")
+    }
+
+    func testSteeringFeedbackWaitsUntilTheQueuedMessageReachesTheAgent() throws {
+        let model = try model()
+        model.contributions = [FrontendContribution(
+            capability: "steering",
+            acceptsFileAttachments: false,
+            count: nil,
+            commands: [],
+            widgets: [],
+            references: [],
+            activeInput: FrontendActiveInput(operation: "steer")
+        )]
+        model.reduce(
+            event: AgentEventRecord(submissionId: "input-1", msg: .object([
+                "type": .string("task_started"),
+                "turnId": .string("turn-1")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        model.reduce(
+            event: AgentEventRecord(submissionId: "input-1", msg: .object([
+                "type": .string("user_message"),
+                "message": .string("Start"),
+                "attachments": .array([]),
+                "messageTarget": .object([
+                    "checkpointSequence": .number(1),
+                    "batchItemCount": .number(1)
+                ])
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        model.reduce(
+            event: AgentEventRecord(submissionId: "input-1", msg: .object([
+                "type": .string("frontend"),
+                "frontendType": .string("remove_widget"),
+                "capability": .string("steering"),
+                "id": .string("queued")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+
+        XCTAssertEqual(model.steeringDeliveryRevision, 0)
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: "input-1", msg: .object([
+                "type": .string("user_message"),
+                "message": .string("Use the smaller patch"),
+                "attachments": .array([]),
+                "messageTarget": .object([
+                    "checkpointSequence": .number(2),
+                    "batchItemCount": .number(1)
+                ])
+            ])),
+            blocks: [],
+            preview: nil
+        )
+
+        XCTAssertEqual(model.steeringDeliveryRevision, 1)
     }
 
     func testQueuedWidgetEditIsTakenBeforeTheComposerResubmitsFreshActiveInput() async throws {

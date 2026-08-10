@@ -75,6 +75,7 @@ struct AppShell: View {
             ).post()
         }
         .sensoryFeedback(.impact(weight: .light), trigger: model.toast?.id) { _, id in id != nil }
+        .sensoryFeedback(.impact(weight: .light), trigger: model.steeringDeliveryRevision)
         // Only a backgrounded scene loses its socket. `.inactive` covers a window losing focus
         // or a notification banner, and reconnecting on those drops a healthy session.
         .onChange(of: scenePhase) { _, newPhase in
@@ -1213,17 +1214,20 @@ struct PairingView: View {
         .onSubmit { model.pair() }
     }
 
+    /// The two ways in, then the wire detail. The protocol line led this stack before, which
+    /// put the most technical line on the screen above the decision it belongs under.
     private var pairAction: some View {
-        VStack(spacing: 14) {
-            HorusLabel(
-                title: "4-byte framed JSON · protocol v\(gatewayProtocolVersion)",
-                glyph: .shieldCheck,
-                iconColor: palette.muted
-            )
-                .font(HorusStyle.metadataFont)
-                .foregroundStyle(palette.muted)
+        VStack(spacing: 12) {
             if model.connectionState == .connecting || model.connectionState == .authenticating {
-                ProgressView().controlSize(.small)
+                HStack {
+                    HorusSpinner(size: 18, foreground: palette.accent)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(
+                    model.connectionState == .authenticating
+                        ? Text("Authenticating with gateway")
+                        : Text("Connecting to gateway")
+                )
             }
             Button("Pair to self-hosted gateway", action: model.pair)
                 .horusProminentButton()
@@ -1231,6 +1235,14 @@ struct PairingView: View {
                 .controlSize(.large)
                 .buttonSizing(.flexible)
             HorusCloudOfferButton()
+            HorusLabel(
+                title: "4-byte framed JSON · protocol v\(gatewayProtocolVersion)",
+                glyph: .shieldCheck,
+                iconColor: palette.muted
+            )
+                .font(HorusStyle.metadataFont)
+                .foregroundStyle(palette.muted)
+                .padding(.top, 2)
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 16)
