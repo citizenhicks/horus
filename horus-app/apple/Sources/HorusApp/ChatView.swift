@@ -1909,6 +1909,12 @@ struct FrontendWidgetSheet: View {
     var body: some View {
         NavigationStack {
             List {
+                if !model.isCapabilityEnabled(widget.capability) {
+                    DisabledCapabilityNotice(
+                        title: "\(currentWidget?.widget.text ?? widget.widget.text) is off",
+                        detail: "Saved content remains visible. Enable \(currentWidget?.widget.text ?? widget.widget.text) in this chat to make changes."
+                    )
+                }
                 if let content = currentWidget?.widget.content {
                     Section {
                         FrontendWidgetContentView(

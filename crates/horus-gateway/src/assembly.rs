@@ -1113,7 +1113,8 @@ mod tests {
             .iter()
             .find(|contribution| contribution.capability == "scratchpad")
             .expect("disabled scratchpad management surface");
-        assert!(scratchpad.commands.is_empty());
+        assert_eq!(scratchpad.commands.len(), 1);
+        assert_eq!(scratchpad.commands[0].name, "scratchpad");
         assert_eq!(scratchpad.widgets.len(), 2);
         let (sender, mut events) = built.agent.into_parts();
         drop(sender);

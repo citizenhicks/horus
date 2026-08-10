@@ -302,15 +302,11 @@ impl Middleware for Scratchpad {
             capability: self.name().into(),
             accepts_file_attachments: false,
             count: None,
-            commands: self
-                .agent_enabled
-                .then(|| FrontendCommand {
-                    name: "scratchpad".into(),
-                    arguments: text::COMMAND_ARGUMENTS.into(),
-                    description: text::COMMAND_DESCRIPTION.into(),
-                })
-                .into_iter()
-                .collect(),
+            commands: vec![FrontendCommand {
+                name: "scratchpad".into(),
+                arguments: text::COMMAND_ARGUMENTS.into(),
+                description: text::COMMAND_DESCRIPTION.into(),
+            }],
             widgets: surface_widgets(&Snapshot::default()),
             references: Vec::new(),
             active_input: None,
@@ -1175,7 +1171,8 @@ mod tests {
         assert!(catalog.definitions().is_empty());
         assert_eq!(middleware.prompt_section(&runtime).expect("prompt"), None);
         let contribution = middleware.frontend();
-        assert!(contribution.commands.is_empty());
+        assert_eq!(contribution.commands.len(), 1);
+        assert_eq!(contribution.commands[0].name, "scratchpad");
         assert_eq!(contribution.widgets.len(), 2);
         middleware.initialize(runtime).await.expect("initialize");
         assert!(
@@ -1197,18 +1194,23 @@ mod tests {
 
         let checkpoint = crate::backend::checkpoint::Checkpoint::empty("session");
         let session_context = crate::protocol::SessionContext::default();
+        let stack = crate::middleware::MiddlewareStack::new(vec![Arc::new(middleware)])
+            .expect("scratchpad middleware stack");
         assert_eq!(
-            middleware
-                .command(MiddlewareCommandContext {
-                    command: "scratchpad",
-                    arguments: "refresh",
-                    input: None,
-                    target: None,
-                    session_id: "session",
-                    session_context: &session_context,
-                    checkpoint: &checkpoint,
-                    checkpoints: Arc::clone(&store.checkpoints),
-                })
+            stack
+                .command(
+                    MANIFEST.id,
+                    MiddlewareCommandContext {
+                        command: "scratchpad",
+                        arguments: "refresh",
+                        input: None,
+                        target: None,
+                        session_id: "session",
+                        session_context: &session_context,
+                        checkpoint: &checkpoint,
+                        checkpoints: Arc::clone(&store.checkpoints),
+                    },
+                )
                 .await
                 .expect("refresh")
                 .events
@@ -1217,17 +1219,20 @@ mod tests {
         );
         let forget = format!("forget session {note_id}");
         assert_eq!(
-            middleware
-                .command(MiddlewareCommandContext {
-                    command: "scratchpad",
-                    arguments: &forget,
-                    input: None,
-                    target: None,
-                    session_id: "session",
-                    session_context: &session_context,
-                    checkpoint: &checkpoint,
-                    checkpoints: Arc::clone(&store.checkpoints),
-                })
+            stack
+                .command(
+                    MANIFEST.id,
+                    MiddlewareCommandContext {
+                        command: "scratchpad",
+                        arguments: &forget,
+                        input: None,
+                        target: None,
+                        session_id: "session",
+                        session_context: &session_context,
+                        checkpoint: &checkpoint,
+                        checkpoints: Arc::clone(&store.checkpoints),
+                    },
+                )
                 .await
                 .err()
                 .expect("mutation must be disabled")

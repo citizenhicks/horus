@@ -498,6 +498,12 @@ private struct FrontendContributionPage: View {
 
     var body: some View {
         PageScaffold(title: widget.title, detail: detail) {
+            if !model.isCapabilityEnabled(widget.capability) {
+                DisabledCapabilityNotice(
+                    title: "\(widget.widget.text) is off",
+                    detail: "Saved content remains visible. Enable \(widget.widget.text) in this chat to make changes."
+                )
+            }
             if let content = widget.widget.content {
                 Section {
                     FrontendWidgetContentView(

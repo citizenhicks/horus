@@ -1006,8 +1006,7 @@ struct CronView: View {
                 StatusBanner(tone: .error, title: "Schedule rejected", detail: error)
             }
             if !model.isSchedulingEnabled {
-                StatusBanner(
-                    tone: .neutral,
+                DisabledCapabilityNotice(
                     title: "Scheduling is off",
                     detail: "Saved tasks and run history remain visible. Enable Cron in this chat to change or run them."
                 )
@@ -1451,6 +1450,15 @@ private struct StatusBanner: View {
     }
 }
 
+struct DisabledCapabilityNotice: View {
+    let title: String
+    let detail: String
+
+    var body: some View {
+        StatusBanner(tone: .neutral, title: title, detail: detail)
+            .settingsStandaloneRow()
+    }
+}
 
 func cacheHit(_ usage: TokenUsage) -> String {
     guard usage.inputTokens > 0 else { return "—" }
