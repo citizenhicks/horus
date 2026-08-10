@@ -1044,11 +1044,6 @@ struct GatewayView: View {
             }
             .settingsStandaloneRow()
 
-            Section("Horus Cloud") {
-                SettingsCaption("Let Horus provision and manage a private gateway for you, with a 7-day trial and included Luna usage.")
-                HorusCloudOfferButton()
-            }
-
             Section("Pair another device") {
                 SettingsCaption("Ask this gateway for a short-lived code, then enter it with the same gateway address on the other device.")
                 if let pairing = model.pairingCodeInfo {
@@ -1077,6 +1072,11 @@ struct GatewayView: View {
                 }
             }
             .settingsStandaloneRow()
+
+            Section("Horus Cloud") {
+                SettingsCaption("Let Horus provision and manage a private gateway for you, with a 7-day trial and included Luna usage.")
+                HorusCloudOfferButton()
+            }
         }
         .confirmationDialog(
             "Forget this gateway?",
