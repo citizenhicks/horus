@@ -225,6 +225,8 @@ impl Runner {
                         };
                         let route = (ActiveTurnRouter {
                             middleware: &self.config.middleware,
+                            session_id: &self.config.session_id,
+                            metadata: &self.config.metadata,
                             turn_id,
                             queued_input: &mut queued_during_middleware,
                             queued_before: queued_before.clone(),
@@ -598,6 +600,8 @@ impl Runner {
             };
             let route = (ActiveTurnRouter {
                 middleware: &self.config.middleware,
+                session_id: &self.config.session_id,
+                metadata: &self.config.metadata,
                 turn_id,
                 queued_input: &mut self.state.pending_input,
                 queued_before: QueuedInputBaseline::default(),

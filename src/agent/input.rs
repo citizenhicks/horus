@@ -54,6 +54,8 @@ impl ActiveChange {
 
 pub(super) struct ActiveTurnRouter<'a> {
     pub middleware: &'a MiddlewareStack,
+    pub session_id: &'a str,
+    pub metadata: &'a std::collections::BTreeMap<String, serde_json::Value>,
     pub turn_id: &'a str,
     pub queued_input: &'a mut Vec<QueuedInput>,
     pub queued_before: QueuedInputBaseline,
@@ -82,6 +84,8 @@ impl Runner {
                     };
                     let route = (ActiveTurnRouter {
                         middleware: &self.config.middleware,
+                        session_id: &self.config.session_id,
+                        metadata: &self.config.metadata,
                         turn_id,
                         queued_input: &mut self.state.pending_input,
                         queued_before: QueuedInputBaseline::default(),
@@ -160,22 +164,27 @@ impl ActiveTurnRouter<'_> {
                 target,
             } => {
                 let mut messages = Vec::new();
-                let result = self.middleware.active_command(
-                    &capability,
-                    &mut ActiveCommandContext {
-                        submission_id: &id,
-                        active_turn_id: self.turn_id,
-                        command: &command,
-                        arguments: &arguments,
-                        input: input.as_deref(),
-                        target,
-                        queued_input: QueuedInputQueue::new(
-                            self.queued_input,
-                            self.queued_before.clone(),
-                        ),
-                        events: &mut messages,
-                    },
-                )?;
+                let result = self
+                    .middleware
+                    .active_command(
+                        &capability,
+                        &mut ActiveCommandContext {
+                            submission_id: &id,
+                            session_id: self.session_id,
+                            metadata: self.metadata,
+                            active_turn_id: self.turn_id,
+                            command: &command,
+                            arguments: &arguments,
+                            input: input.as_deref(),
+                            target,
+                            queued_input: QueuedInputQueue::new(
+                                self.queued_input,
+                                self.queued_before.clone(),
+                            ),
+                            events: &mut messages,
+                        },
+                    )
+                    .await?;
                 let Some(result) = result else {
                     defer_submission(
                         self.deferred,
@@ -199,6 +208,10 @@ impl ActiveTurnRouter<'_> {
                         submission_id: id,
                         events: messages,
                     })),
+                    ActiveSubmissionResult::Handled => {
+                        send_messages(self.events, &id, messages).await?;
+                        Ok(ActiveRoute::Continue)
+                    }
                     ActiveSubmissionResult::Rejected(message) => {
                         send_messages(self.events, &id, messages).await?;
                         warn(self.events, id, &message).await?;
@@ -236,6 +249,10 @@ impl ActiveTurnRouter<'_> {
                             submission_id: id,
                             events: messages,
                         }))
+                    }
+                    Some(ActiveSubmissionResult::Handled) => {
+                        send_messages(self.events, &id, messages).await?;
+                        Ok(ActiveRoute::Continue)
                     }
                     Some(ActiveSubmissionResult::Rejected(message)) => {
                         send_messages(self.events, &id, messages).await?;
@@ -315,35 +332,46 @@ mod tests {
             "editable"
         }
 
-        fn active_command(
-            &self,
-            context: &mut ActiveCommandContext<'_>,
-        ) -> Result<Option<ActiveSubmissionResult>> {
-            if context.command != "edit" {
-                return Ok(None);
-            }
-            assert_eq!(context.active_turn_id, "turn-1");
-            assert_eq!(
-                context.target,
-                Some(crate::protocol::MessageTarget {
-                    checkpoint_sequence: 7,
-                    batch_item_count: 2,
-                })
-            );
-            if context.input.is_none() {
-                return Ok(Some(ActiveSubmissionResult::Rejected(
-                    "edit requires text".into(),
-                )));
-            }
-            if context
-                .queued_input
-                .take_latest(context.arguments)?
-                .is_some()
-            {
-                Ok(Some(ActiveSubmissionResult::Accepted))
-            } else {
-                Ok(Some(ActiveSubmissionResult::Rejected("stale edit".into())))
-            }
+        fn active_command<'a>(
+            &'a self,
+            context: &'a mut ActiveCommandContext<'_>,
+        ) -> crate::BoxFuture<'a, Result<Option<ActiveSubmissionResult>>> {
+            Box::pin(async move {
+                if context.command == "preview" {
+                    context.events.push(EventMsg::Frontend(
+                        crate::protocol::FrontendEvent::Preview {
+                            title: "preview".into(),
+                            events: Vec::new(),
+                        },
+                    ));
+                    return Ok(Some(ActiveSubmissionResult::Handled));
+                }
+                if context.command != "edit" {
+                    return Ok(None);
+                }
+                assert_eq!(context.active_turn_id, "turn-1");
+                assert_eq!(
+                    context.target,
+                    Some(crate::protocol::MessageTarget {
+                        checkpoint_sequence: 7,
+                        batch_item_count: 2,
+                    })
+                );
+                if context.input.is_none() {
+                    return Ok(Some(ActiveSubmissionResult::Rejected(
+                        "edit requires text".into(),
+                    )));
+                }
+                if context
+                    .queued_input
+                    .take_latest(context.arguments)?
+                    .is_some()
+                {
+                    Ok(Some(ActiveSubmissionResult::Accepted))
+                } else {
+                    Ok(Some(ActiveSubmissionResult::Rejected("stale edit".into())))
+                }
+            })
         }
     }
 
@@ -358,6 +386,8 @@ mod tests {
 
         let route = (ActiveTurnRouter {
             middleware: &middleware,
+            session_id: "session-1",
+            metadata: &std::collections::BTreeMap::new(),
             turn_id: "turn-1",
             queued_input: &mut queued,
             queued_before: QueuedInputBaseline::default(),
@@ -387,6 +417,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handled_active_command_publishes_without_being_deferred() {
+        let middleware =
+            MiddlewareStack::new(vec![Arc::new(EditableMiddleware)]).expect("middleware stack");
+        let mut queued = Vec::new();
+        let mut deferred = VecDeque::new();
+        let (events, mut receiver) = mpsc::channel(2);
+
+        let route = (ActiveTurnRouter {
+            middleware: &middleware,
+            session_id: "session-1",
+            metadata: &std::collections::BTreeMap::new(),
+            turn_id: "turn-1",
+            queued_input: &mut queued,
+            queued_before: QueuedInputBaseline::default(),
+            deferred: &mut deferred,
+            events: &events,
+            expected_approval: None,
+        })
+        .route(Submission {
+            id: "preview-1".into(),
+            op: Op::CapabilityCommand {
+                capability: "editable".into(),
+                command: "preview".into(),
+                arguments: String::new(),
+                input: None,
+                target: None,
+            },
+        })
+        .await
+        .expect("route command");
+        let event = receiver.recv().await.expect("preview event");
+
+        assert!(matches!(route, ActiveRoute::Continue));
+        assert!(deferred.is_empty());
+        assert!(matches!(
+            event,
+            Event {
+                submission_id: Some(id),
+                msg: EventMsg::Frontend(crate::protocol::FrontendEvent::Preview { title, .. }),
+            } if id == "preview-1" && title == "preview"
+        ));
+    }
+
+    #[tokio::test]
     async fn unrelated_capability_command_remains_deferred() {
         let middleware =
             MiddlewareStack::new(vec![Arc::new(EditableMiddleware)]).expect("middleware stack");
@@ -406,6 +480,8 @@ mod tests {
 
         let route = (ActiveTurnRouter {
             middleware: &middleware,
+            session_id: "session-1",
+            metadata: &std::collections::BTreeMap::new(),
             turn_id: "turn-1",
             queued_input: &mut queued,
             queued_before: QueuedInputBaseline::default(),

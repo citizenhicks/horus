@@ -352,6 +352,8 @@ impl Runner {
                     };
                     match (ActiveTurnRouter {
                         middleware: &self.config.middleware,
+                        session_id: &self.config.session_id,
+                        metadata: &self.config.metadata,
                         turn_id,
                         queued_input: &mut self.state.pending_input,
                         queued_before: QueuedInputBaseline::default(),
@@ -464,6 +466,8 @@ impl Runner {
         while let Some(submission) = commands.recv().await {
             match (ActiveTurnRouter {
                 middleware: &self.config.middleware,
+                session_id: &self.config.session_id,
+                metadata: &self.config.metadata,
                 turn_id: &pending.turn_id,
                 queued_input: &mut self.state.pending_input,
                 queued_before: QueuedInputBaseline::default(),

@@ -392,6 +392,8 @@ pub struct ActiveSubmissionContext<'a> {
 /// Mutable turn state exposed to a capability command that can run immediately.
 pub struct ActiveCommandContext<'a> {
     pub submission_id: &'a str,
+    pub session_id: &'a str,
+    pub metadata: &'a BTreeMap<String, Value>,
     pub active_turn_id: &'a str,
     pub command: &'a str,
     pub arguments: &'a str,
@@ -405,6 +407,8 @@ pub struct ActiveCommandContext<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveSubmissionResult {
     Accepted,
+    /// The operation completed without changing durable turn state; publish its events now.
+    Handled,
     Rejected(String),
 }
 
@@ -570,12 +574,16 @@ pub trait Middleware: Send + Sync {
         )))
     }
 
-    /// Handles a capability command synchronously while a turn is active.
-    fn active_command(
-        &self,
-        _context: &mut ActiveCommandContext<'_>,
-    ) -> Result<Option<ActiveSubmissionResult>> {
-        Ok(None)
+    /// Handles a capability command while a turn is active.
+    ///
+    /// The active model, tool, or hook future is not polled until this returns. Implementations
+    /// must keep work bounded and must not await a resource held by that active future. Return
+    /// `None` when the command should retain the default after-turn behavior.
+    fn active_command<'a>(
+        &'a self,
+        _context: &'a mut ActiveCommandContext<'_>,
+    ) -> BoxFuture<'a, Result<Option<ActiveSubmissionResult>>> {
+        Box::pin(async { Ok(None) })
     }
 
     /// Observes a turn ending and may clear capability-owned transient UI.
@@ -772,7 +780,7 @@ impl MiddlewareStack {
         entry.active_submission(context).map(Some)
     }
 
-    pub(crate) fn active_command(
+    pub(crate) async fn active_command(
         &self,
         middleware: &str,
         context: &mut ActiveCommandContext<'_>,
@@ -781,7 +789,7 @@ impl MiddlewareStack {
             return Ok(None);
         };
         context.queued_input.scope(entry.name());
-        entry.active_command(context)
+        entry.active_command(context).await
     }
 
     pub(crate) async fn initialize(

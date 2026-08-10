@@ -169,24 +169,26 @@ impl Middleware for Steering {
         Ok(ActiveSubmissionResult::Accepted)
     }
 
-    fn active_command(
-        &self,
-        context: &mut ActiveCommandContext<'_>,
-    ) -> Result<Option<ActiveSubmissionResult>> {
-        if context.command != EDIT_COMMAND {
-            return Ok(None);
-        }
-        if context
-            .queued_input
-            .take_latest(context.arguments)?
-            .is_none()
-        {
-            return Ok(Some(ActiveSubmissionResult::Rejected(STALE_EDIT.into())));
-        }
-        context.events.push(EventMsg::Frontend(
-            self.queued_widget(context.queued_input.latest()),
-        ));
-        Ok(Some(ActiveSubmissionResult::Accepted))
+    fn active_command<'a>(
+        &'a self,
+        context: &'a mut ActiveCommandContext<'_>,
+    ) -> BoxFuture<'a, Result<Option<ActiveSubmissionResult>>> {
+        Box::pin(async move {
+            if context.command != EDIT_COMMAND {
+                return Ok(None);
+            }
+            if context
+                .queued_input
+                .take_latest(context.arguments)?
+                .is_none()
+            {
+                return Ok(Some(ActiveSubmissionResult::Rejected(STALE_EDIT.into())));
+            }
+            context.events.push(EventMsg::Frontend(
+                self.queued_widget(context.queued_input.latest()),
+            ));
+            Ok(Some(ActiveSubmissionResult::Accepted))
+        })
     }
 
     fn turn_ended(&self, context: &mut TurnEndContext<'_>) -> Result<()> {
@@ -404,8 +406,8 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    #[test]
-    fn active_command_takes_only_the_latest_queued_message() {
+    #[tokio::test]
+    async fn active_command_takes_only_the_latest_queued_message() {
         let steering = Steering::default();
         let mut queued = vec![item("steering-1", "older"), item("steering-2", "latest")];
         let mut events = Vec::new();
@@ -413,6 +415,8 @@ mod tests {
         let result = steering
             .active_command(&mut ActiveCommandContext {
                 submission_id: "edit-1",
+                session_id: "session-1",
+                metadata: &std::collections::BTreeMap::new(),
                 active_turn_id: "turn-1",
                 command: EDIT_COMMAND,
                 arguments: "steering-2",
@@ -421,6 +425,7 @@ mod tests {
                 queued_input: queue(&mut queued),
                 events: &mut events,
             })
+            .await
             .expect("active command");
 
         assert_eq!(result, Some(ActiveSubmissionResult::Accepted));
@@ -439,8 +444,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn active_command_rejects_a_stale_id_without_mutation() {
+    #[tokio::test]
+    async fn active_command_rejects_a_stale_id_without_mutation() {
         let steering = Steering::default();
         let mut queued = vec![item("steering-2", "latest")];
         let original = queued.clone();
@@ -449,6 +454,8 @@ mod tests {
         let result = steering
             .active_command(&mut ActiveCommandContext {
                 submission_id: "edit-1",
+                session_id: "session-1",
+                metadata: &std::collections::BTreeMap::new(),
                 active_turn_id: "turn-1",
                 command: EDIT_COMMAND,
                 arguments: "steering-1",
@@ -457,6 +464,7 @@ mod tests {
                 queued_input: queue(&mut queued),
                 events: &mut events,
             })
+            .await
             .expect("active command");
 
         assert_eq!(
@@ -467,14 +475,16 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    #[test]
-    fn second_edit_from_the_same_widget_loses_the_revision_race() {
+    #[tokio::test]
+    async fn second_edit_from_the_same_widget_loses_the_revision_race() {
         let steering = Steering::default();
         let mut queued = vec![item("steering-1", "original")];
         let mut first_events = Vec::new();
         let first = steering
             .active_command(&mut ActiveCommandContext {
                 submission_id: "edit-1",
+                session_id: "session-1",
+                metadata: &std::collections::BTreeMap::new(),
                 active_turn_id: "turn-1",
                 command: EDIT_COMMAND,
                 arguments: "steering-1",
@@ -483,11 +493,14 @@ mod tests {
                 queued_input: queue(&mut queued),
                 events: &mut first_events,
             })
+            .await
             .expect("first edit");
         let mut stale_events = Vec::new();
         let stale = steering
             .active_command(&mut ActiveCommandContext {
                 submission_id: "edit-2",
+                session_id: "session-1",
+                metadata: &std::collections::BTreeMap::new(),
                 active_turn_id: "turn-1",
                 command: EDIT_COMMAND,
                 arguments: "steering-1",
@@ -496,6 +509,7 @@ mod tests {
                 queued_input: queue(&mut queued),
                 events: &mut stale_events,
             })
+            .await
             .expect("stale edit");
 
         assert_eq!(first, Some(ActiveSubmissionResult::Accepted));
@@ -511,8 +525,8 @@ mod tests {
         assert!(stale_events.is_empty());
     }
 
-    #[test]
-    fn active_command_rejects_an_already_consumed_message() {
+    #[tokio::test]
+    async fn active_command_rejects_an_already_consumed_message() {
         let steering = Steering::default();
         let mut queued = Vec::new();
         let mut events = Vec::new();
@@ -520,6 +534,8 @@ mod tests {
         let result = steering
             .active_command(&mut ActiveCommandContext {
                 submission_id: "edit-1",
+                session_id: "session-1",
+                metadata: &std::collections::BTreeMap::new(),
                 active_turn_id: "turn-1",
                 command: EDIT_COMMAND,
                 arguments: "steering-1",
@@ -528,6 +544,7 @@ mod tests {
                 queued_input: queue(&mut queued),
                 events: &mut events,
             })
+            .await
             .expect("active command");
 
         assert_eq!(

@@ -10,6 +10,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
+use super::ActiveCommandContext;
+use super::ActiveSubmissionResult;
 use super::Middleware;
 use super::MiddlewareCommandContext;
 use super::MiddlewareCommandOutput;
@@ -362,6 +364,42 @@ impl Subagents {
         self.prompt = prompt;
         Ok(self)
     }
+
+    async fn read_command(
+        &self,
+        session_id: &str,
+        metadata: &BTreeMap<String, Value>,
+        arguments: &str,
+    ) -> Result<MiddlewareCommandOutput> {
+        let identity = AgentIdentity::read(session_id, metadata)?;
+        let path = arguments.trim();
+        if !path.is_empty() {
+            let events = self.shared.preview(&identity.root_session_id, path).await?;
+            return Ok(MiddlewareCommandOutput::events(vec![
+                FrontendEvent::Preview {
+                    title: path.into(),
+                    events,
+                },
+            ]));
+        }
+        let options = self
+            .shared
+            .resume_options(&identity.root_session_id)
+            .await?;
+        if options.is_empty() {
+            return Ok(MiddlewareCommandOutput::render(
+                "subagents",
+                text::RENDER_EMPTY,
+                FrontendTone::Neutral,
+            ));
+        }
+        Ok(MiddlewareCommandOutput::events(vec![
+            FrontendEvent::Picker {
+                title: text::RENDER_OPEN.into(),
+                options,
+            },
+        ]))
+    }
 }
 
 impl Middleware for Subagents {
@@ -475,36 +513,35 @@ impl Middleware for Subagents {
                     context.command
                 )));
             }
-            let path = context.arguments.trim();
-            if !path.is_empty() {
-                let events = self
-                    .shared
-                    .preview(&context.checkpoint.session_id, path)
-                    .await?;
-                return Ok(MiddlewareCommandOutput::events(vec![
-                    FrontendEvent::Preview {
-                        title: path.into(),
-                        events,
-                    },
-                ]));
+            self.read_command(
+                context.session_id,
+                &context.checkpoint.metadata,
+                context.arguments,
+            )
+            .await
+        })
+    }
+
+    fn active_command<'a>(
+        &'a self,
+        context: &'a mut ActiveCommandContext<'_>,
+    ) -> BoxFuture<'a, Result<Option<ActiveSubmissionResult>>> {
+        Box::pin(async move {
+            if context.command != "subagents" {
+                return Ok(None);
             }
-            let options = self
-                .shared
-                .resume_options(&context.checkpoint.session_id)
-                .await?;
-            if options.is_empty() {
-                return Ok(MiddlewareCommandOutput::render(
-                    "subagents",
-                    text::RENDER_EMPTY,
-                    FrontendTone::Neutral,
-                ));
+            match self
+                .read_command(context.session_id, context.metadata, context.arguments)
+                .await
+            {
+                Ok(output) => {
+                    context
+                        .events
+                        .extend(output.events.into_iter().map(EventMsg::Frontend));
+                    Ok(Some(ActiveSubmissionResult::Handled))
+                }
+                Err(error) => Ok(Some(ActiveSubmissionResult::Rejected(error.to_string()))),
             }
-            Ok(MiddlewareCommandOutput::events(vec![
-                FrontendEvent::Picker {
-                    title: text::RENDER_OPEN.into(),
-                    options,
-                },
-            ]))
         })
     }
 
@@ -1069,6 +1106,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::QueuedInputBaseline;
+    use crate::middleware::QueuedInputQueue;
     use crate::protocol::{ToolCallBeginEvent, ToolCallEndEvent};
 
     #[test]
@@ -1119,6 +1158,86 @@ mod tests {
                 "missing end renderer for {name}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn active_command_emits_a_subagent_transcript_preview() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+            crate::backend::checkpoint::sqlite::SqliteCheckpoint::new(
+                workspace.path().join("checkpoints.sqlite3"),
+            )
+            .expect("checkpoint store"),
+        );
+        let root = Checkpoint::empty("root");
+        checkpoints.save(&root, &[], None).await.expect("save root");
+        let transcript = serde_json::json!({"role": "user", "content": "review this"});
+        let mut child = Checkpoint::empty("child");
+        child.sequence = 1;
+        child.context.push(transcript.clone());
+        checkpoints
+            .save(&child, &[transcript], None)
+            .await
+            .expect("save child");
+        let middleware = Subagents::new(
+            1,
+            2,
+            2,
+            Arc::new(|_| Box::pin(async { Err(Error::Stopped("unused".into())) })),
+        )
+        .expect("subagents middleware");
+        middleware
+            .shared
+            .initialize(RuntimeContext {
+                checkpoints,
+                session_id: root.session_id.clone(),
+                model_route: "test".into(),
+                session_context: root.session_context.clone(),
+                metadata: root.metadata.clone(),
+                queued_input: crate::middleware::QueuedInputSnapshot::default(),
+                frontend: Arc::new(|_| Ok(())),
+            })
+            .await
+            .expect("initialize runtime");
+        middleware
+            .shared
+            .reserve(
+                "root",
+                "/root/reviewer",
+                "/root",
+                "child".into(),
+                1,
+                "test".into(),
+            )
+            .await
+            .expect("reserve child");
+        let mut queued = Vec::new();
+        let mut events = Vec::new();
+
+        let result = middleware
+            .active_command(&mut ActiveCommandContext {
+                submission_id: "preview-1",
+                session_id: "root",
+                metadata: &root.metadata,
+                active_turn_id: "turn-1",
+                command: "subagents",
+                arguments: "/root/reviewer",
+                input: None,
+                target: None,
+                queued_input: QueuedInputQueue::new(&mut queued, QueuedInputBaseline::default()),
+                events: &mut events,
+            })
+            .await
+            .expect("active command");
+
+        assert_eq!(result, Some(ActiveSubmissionResult::Handled));
+        assert!(matches!(
+            events.as_slice(),
+            [EventMsg::Frontend(FrontendEvent::Preview { title, events })]
+                if title == "/root/reviewer"
+                    && matches!(events.as_slice(), [EventMsg::UserMessage(message)] if message.message == "review this")
+        ));
+        assert!(queued.is_empty());
     }
 
     #[tokio::test]
