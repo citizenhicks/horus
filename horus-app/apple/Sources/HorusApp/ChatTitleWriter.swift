@@ -1,6 +1,7 @@
 import Foundation
 #if canImport(FoundationModels)
 import FoundationModels
+import Observation
 #endif
 
 /// Renames a new chat from its first prompt using Apple's on-device model.
@@ -23,19 +24,10 @@ final class ChatTitleWriter {
         self.generator = generator
     }
 
-    var isAvailable: Bool {
-        if generator != nil { return true }
-        #if canImport(FoundationModels)
-        return SystemLanguageModel.default.isAvailable
-        #else
-        return false
-        #endif
-    }
-
     func title(for prompt: String) async -> String? {
         if let generator { return await generator(prompt) }
         #if canImport(FoundationModels)
-        guard isAvailable else { return nil }
+        guard await systemModelBecomesAvailable() else { return nil }
         let session = LanguageModelSession {
             """
             You name chat threads in a coding assistant. Given the first message of a \
@@ -59,6 +51,26 @@ final class ChatTitleWriter {
         return nil
         #endif
     }
+
+    #if canImport(FoundationModels)
+    private func systemModelBecomesAvailable() async -> Bool {
+        let model = SystemLanguageModel.default
+        let availability = Observations<SystemLanguageModel.Availability, Never> {
+            model.availability
+        }
+        for await state in availability {
+            switch state {
+            case .available:
+                return true
+            case .unavailable(.modelNotReady):
+                continue
+            case .unavailable:
+                return false
+            }
+        }
+        return false
+    }
+    #endif
 
     /// Small models like to wrap titles in quotes, prefix them with "Title:", and end them
     /// with a full stop. None of that belongs in a sidebar row.

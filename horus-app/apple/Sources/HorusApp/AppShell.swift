@@ -1011,7 +1011,10 @@ struct SidebarView: View {
                 showDetail(.chat)
             } label: {
                 HStack(spacing: 8) {
-                    HorusTitleText(title: title)
+                    HorusTitleText(
+                        title: title,
+                        cursorColor: isSelected ? palette.accent : .primary
+                    )
                         .fontWeight(isSelected ? .semibold : nil)
                         .lineLimit(1)
                         .foregroundStyle(isSelected ? palette.accent : .primary)

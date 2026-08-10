@@ -147,14 +147,27 @@ private struct DiffFileHeader: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.horusPlain)
-        .background(palette.raised, in: HorusStyle.tileShape)
-        .overlay { HorusStyle.tileShape.stroke(palette.line.opacity(0.55), lineWidth: 0.5) }
+        .background(palette.raised, in: headerShape)
+        .overlay { headerShape.stroke(palette.line.opacity(0.55), lineWidth: 0.5) }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
             "File \(file.path), \(file.added) additions, \(file.removed) removals"
         )
         .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
         .accessibilityHint(isExpanded ? "Collapses this file" : "Shows changed lines")
+    }
+
+    private var headerShape: UnevenRoundedRectangle {
+        let bottomRadius = isExpanded ? 0 : HorusStyle.tileRadius
+        return UnevenRoundedRectangle(
+            cornerRadii: .init(
+                topLeading: HorusStyle.tileRadius,
+                bottomLeading: bottomRadius,
+                bottomTrailing: bottomRadius,
+                topTrailing: HorusStyle.tileRadius
+            ),
+            style: .continuous
+        )
     }
 }
 

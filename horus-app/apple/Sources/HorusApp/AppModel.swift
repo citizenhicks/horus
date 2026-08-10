@@ -663,6 +663,7 @@ private struct PendingChatTitle {
     let attempt: ChatTitleAttempt
     var generatedTitle: String?
     var renameRequestID: String?
+    var submissionConfirmed: Bool
 }
 
 @MainActor
@@ -1148,7 +1149,6 @@ final class AppModel {
             titleEligibleSessionIDs.remove(sessionID)
             return
         }
-
         let attempt = ChatTitleAttempt(
             accountID: accountID,
             sessionID: sessionID,
@@ -1158,10 +1158,10 @@ final class AppModel {
         pendingChatTitles[sessionID] = PendingChatTitle(
             attempt: attempt,
             generatedTitle: nil,
-            renameRequestID: nil
+            renameRequestID: nil,
+            submissionConfirmed: false
         )
         titleEligibleSessionIDs.remove(sessionID)
-        guard titleWriter.isAvailable else { return }
         let titleWriter = titleWriter
         chatTitleTasks[sessionID] = Task { [weak self] in
             let title = await titleWriter.title(for: prompt)
@@ -1178,9 +1178,32 @@ final class AppModel {
             pendingChatTitles.removeValue(forKey: attempt.sessionID)
             return
         }
-        guard let title else { return }
+        guard let title else {
+            if pendingChatTitles[attempt.sessionID]?.submissionConfirmed == true {
+                completeChatTitle(attempt.sessionID)
+            }
+            return
+        }
         pendingChatTitles[attempt.sessionID]?.generatedTitle = title
         refreshLiveActivity()
+        persistGeneratedChatTitles()
+    }
+
+    private func confirmChatTitle(submissionID: String) {
+        guard let sessionID = pendingChatTitles.first(where: {
+            $0.value.attempt.submissionID == submissionID
+        })?.key else { return }
+        confirmChatTitle(sessionID: sessionID)
+    }
+
+    private func confirmChatTitle(sessionID: String) {
+        guard pendingChatTitles[sessionID] != nil else { return }
+        pendingChatTitles[sessionID]?.submissionConfirmed = true
+        if pendingChatTitles[sessionID]?.generatedTitle == nil,
+           chatTitleTasks[sessionID] == nil {
+            completeChatTitle(sessionID)
+            return
+        }
         persistGeneratedChatTitles()
     }
 
@@ -1201,13 +1224,12 @@ final class AppModel {
                     // An explicit user or another client always wins.
                     cancelChatTitle(sessionID)
                 }
-            } else if pending.generatedTitle == nil,
-                      chatTitleTasks[sessionID] == nil {
+            } else if !pending.submissionConfirmed {
                 let catalogPrompt = (session.firstUserMessage ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !catalogPrompt.isEmpty {
-                    if catalogPrompt == pending.attempt.prompt {
-                        completeChatTitle(sessionID)
+                    if pending.attempt.prompt.hasPrefix(catalogPrompt) {
+                        confirmChatTitle(sessionID: sessionID)
                     } else {
                         cancelChatTitle(sessionID)
                     }
@@ -1231,22 +1253,15 @@ final class AppModel {
             guard var pending = pendingChatTitles[sessionID],
                   pending.attempt.accountID == accountID,
                   let title = pending.generatedTitle,
-                  pending.renameRequestID == nil,
-                  let session = sessions.first(where: { $0.sessionId == sessionID })
+                  pending.submissionConfirmed,
+                  pending.renameRequestID == nil
             else { continue }
-            guard session.explicitTitle == nil else {
-                cancelChatTitle(sessionID)
-                continue
-            }
-            let catalogPrompt = (session.firstUserMessage ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !catalogPrompt.isEmpty else { continue }
-            guard catalogPrompt == pending.attempt.prompt else {
+            if sessions.first(where: { $0.sessionId == sessionID })?.explicitTitle != nil {
                 cancelChatTitle(sessionID)
                 continue
             }
             guard let requestID = requestSessionRename(
-                session,
+                sessionID: sessionID,
                 title: title,
                 generatedTitleSessionID: sessionID
             ) else { return }
@@ -1782,12 +1797,12 @@ final class AppModel {
             return nil
         }
         cancelChatTitle(session.sessionId)
-        return requestSessionRename(session, title: title)
+        return requestSessionRename(sessionID: session.sessionId, title: title)
     }
 
     @discardableResult
     private func requestSessionRename(
-        _ session: SessionRecord,
+        sessionID: String,
         title: String,
         generatedTitleSessionID: String? = nil
     ) -> String? {
@@ -1796,7 +1811,7 @@ final class AppModel {
         sessionMutationRequestID = id
         transmit(.renameSession(
             requestID: id,
-            sessionID: session.sessionId,
+            sessionID: sessionID,
             title: title
         )) { [weak self] _ in
             guard let self else { return }
@@ -3089,9 +3104,29 @@ final class AppModel {
         replayPresentedTranscript = nil
         connectionState = .ready
         completedComposerEditReplay = true
+        reconcileChatTitleAfterReplay()
         reconcileComposerEditRecovery()
         requestSessionData()
         cacheSelectedTranscript()
+    }
+
+    /// A disconnected submission is ambiguous until replay proves whether it reached the
+    /// checkpoint. Only then can the restored draft safely become title-eligible again.
+    private func reconcileChatTitleAfterReplay() {
+        guard let sessionID = selectedSessionID,
+              let pending = pendingChatTitles[sessionID],
+              !pending.submissionConfirmed
+        else { return }
+        let promptWasReplayed = replayCompletionSubmissionIDs.contains(
+            pending.attempt.submissionID
+        ) || replayUserMessages.contains {
+            $0.text.trimmingCharacters(in: .whitespacesAndNewlines) == pending.attempt.prompt
+        }
+        if promptWasReplayed {
+            confirmChatTitle(sessionID: sessionID)
+        } else {
+            cancelChatTitle(sessionID, rearm: true)
+        }
     }
 
     private func shouldCacheTranscript(after event: AgentEventRecord) -> Bool {
@@ -3590,6 +3625,9 @@ final class AppModel {
             return
         }
         let wasRendered = !blocks.isEmpty
+        if type == "user_message", let submissionID = event.submissionId {
+            confirmChatTitle(submissionID: submissionID)
+        }
         if let submissionID = event.submissionId {
             if type == "warning" || type == "error" {
                 if let draft = pendingDrafts.removeValue(forKey: submissionID) { restoreDraft(draft) }

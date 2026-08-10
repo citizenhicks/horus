@@ -64,6 +64,7 @@ struct ChatView: View {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
                     HorusTitleText(title: chatTitle)
+                        .id(model.selectedSessionID)
                         .font(.headline)
                         .lineLimit(1)
                     if !chatSubtitle.isEmpty {

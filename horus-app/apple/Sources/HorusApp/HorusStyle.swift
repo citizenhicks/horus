@@ -209,10 +209,12 @@ struct HorusSpinner: View {
     }
 }
 
-/// Reveals the final, already-laid-out title glyph by glyph. Keeping the complete `Text`
-/// in the layout avoids resizing the toolbar and sidebar on every character.
+/// Reveals the already-laid-out title glyph by glyph. Keeping the complete `Text` in the
+/// layout avoids resizing the toolbar and sidebar on every animation frame.
 private struct HorusTitleTypingRenderer: TextRenderer {
     var progress: Double
+    var showsCursor: Bool
+    var cursorColor: Color
 
     var animatableData: Double {
         get { progress }
@@ -221,7 +223,7 @@ private struct HorusTitleTypingRenderer: TextRenderer {
 
     func draw(layout: Text.Layout, in context: inout GraphicsContext) {
         let slices = layout.flatMap { line in line.flatMap { run in run } }
-        let revealed = progress * Double(slices.count)
+        let revealed = min(max(progress, 0), 1) * Double(slices.count)
         for (index, slice) in slices.enumerated() {
             let opacity = min(max(revealed - Double(index), 0), 1)
             guard opacity > 0 else { continue }
@@ -229,47 +231,106 @@ private struct HorusTitleTypingRenderer: TextRenderer {
             copy.opacity = opacity
             copy.draw(slice)
         }
+
+        guard showsCursor, let line = layout.first else { return }
+        let visibleIndex = min(Int(ceil(revealed)), slices.count) - 1
+        let cursor: (x: CGFloat, baseline: CGFloat, ascent: CGFloat, descent: CGFloat)
+        if visibleIndex >= 0 {
+            let bounds = slices[visibleIndex].typographicBounds
+            cursor = (
+                bounds.origin.x + bounds.width,
+                bounds.origin.y,
+                bounds.ascent,
+                bounds.descent
+            )
+        } else {
+            let bounds = line.typographicBounds
+            cursor = (line.origin.x, line.origin.y, bounds.ascent, bounds.descent)
+        }
+        var path = Path()
+        path.move(to: CGPoint(x: cursor.x, y: cursor.baseline - cursor.ascent))
+        path.addLine(to: CGPoint(x: cursor.x, y: cursor.baseline + cursor.descent))
+        context.stroke(path, with: .color(cursorColor), lineWidth: 1.25)
     }
 }
 
-private struct HorusTitleTypingTransition: Transition {
-    static let duration: TimeInterval = 0.6
+private enum HorusTitleTypingPhase {
+    case settled
+    case erasing
+    case typing
+}
 
-    static var properties: TransitionProperties {
-        TransitionProperties(hasMotion: true)
-    }
-
-    func body(content: Content, phase: TransitionPhase) -> some View {
-        let renderer = HorusTitleTypingRenderer(progress: phase.isIdentity ? 1 : 0)
-        content.transaction { transaction in
-            if !transaction.disablesAnimations {
-                transaction.animation = .linear(duration: Self.duration)
-            }
-        } body: { view in
-            view.textRenderer(renderer)
-        }
-    }
+private struct HorusTitleTypingRequest: Equatable {
+    let title: String
+    let reduceMotion: Bool
 }
 
 struct HorusTitleText: View {
+    private static let eraseDuration: TimeInterval = 0.36
+    private static let typingDuration: TimeInterval = 0.6
+
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let title: String
+    let cursorColor: Color
+    @State private var displayedTitle: String
+    @State private var progress = 1.0
+    @State private var phase = HorusTitleTypingPhase.settled
+
+    init(title: String, cursorColor: Color = .primary) {
+        self.title = title
+        self.cursorColor = cursorColor
+        _displayedTitle = State(initialValue: title)
+    }
 
     var body: some View {
-        ZStack(alignment: .leading) {
-            if !reduceMotion {
-                Text(title)
-                    .id(title)
-                    .transition(HorusTitleTypingTransition())
-            } else {
-                Text(title)
+        Text(displayedTitle)
+            .textRenderer(HorusTitleTypingRenderer(
+                progress: progress,
+                showsCursor: phase != .settled,
+                cursorColor: cursorColor
+            ))
+            .task(id: HorusTitleTypingRequest(title: title, reduceMotion: reduceMotion)) {
+                await animateTitleChange()
             }
+            .accessibilityRepresentation { Text(title) }
+    }
+
+    @MainActor
+    private func animateTitleChange() async {
+        guard displayedTitle != title else {
+            progress = 1
+            phase = .settled
+            return
         }
-        .animation(
-            reduceMotion ? nil : .linear(duration: HorusTitleTypingTransition.duration),
-            value: title
-        )
-        .accessibilityRepresentation { Text(title) }
+        guard !reduceMotion else {
+            displayedTitle = title
+            progress = 1
+            phase = .settled
+            return
+        }
+
+        do {
+            phase = .erasing
+            withAnimation(.linear(duration: Self.eraseDuration)) { progress = 0 }
+            try await Task.sleep(for: .seconds(Self.eraseDuration))
+
+            displayedTitle = title
+            progress = 0
+            await Task.yield()
+            try Task.checkCancellation()
+
+            phase = .typing
+            withAnimation(.linear(duration: Self.typingDuration)) { progress = 1 }
+            try await Task.sleep(for: .seconds(Self.typingDuration))
+            try Task.checkCancellation()
+            phase = .settled
+        } catch is CancellationError {
+            // A newer title owns the next animation phase.
+        } catch {
+            displayedTitle = title
+            progress = 1
+            phase = .settled
+        }
     }
 }
 
