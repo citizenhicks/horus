@@ -28,18 +28,23 @@ struct ProfileView: View {
                     }
                 }
             }
+            .listRowSeparator(.hidden)
             Section("Account") {
                 CloudAccountSettings()
             }
+            .listRowSeparator(.hidden)
             Section("Data & Privacy") {
                 DataPrivacySettings()
             }
+            .listRowSeparator(.hidden)
             Section("Appearance") {
                 AppearanceSettings()
             }
+            .listRowSeparator(.hidden)
             Section("Security") {
                 AppLockSettings()
             }
+            .listRowSeparator(.hidden)
         }
         .task(id: model.connectionState.isReady) { model.refreshProfile() }
     }
