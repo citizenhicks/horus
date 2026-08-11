@@ -867,6 +867,78 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(model.transcript.first).pending)
     }
 
+    func testRetryingModelStepSeparatesPartialOutputAndClosesSearch() throws {
+        let model = try model()
+        model.reduce(record: recorded(1, .object([
+            "type": .string("agent_message_content_delta"),
+            "sessionId": .string("chat-1"),
+            "turnId": .string("turn-1"),
+            "modelStepId": .string("step-1"),
+            "delta": .string("Partial answer"),
+            "phase": .string("final_answer"),
+        ])))
+        model.reduce(record: recorded(2, .object([
+            "type": .string("web_search_begin"),
+            "sessionId": .string("chat-1"),
+            "turnId": .string("turn-1"),
+            "modelStepId": .string("step-1"),
+            "callId": .string("search-1"),
+        ]), blocks: [RenderedBlock(capability: "web_search", block: FrontendBlock(
+            id: "step-1/search-1",
+            group: "turn-1",
+            update: .replace,
+            state: .pending,
+            role: .webSearch,
+            title: "Searching the web",
+            text: "",
+            symbol: "search",
+            format: "plain_text",
+            tone: "neutral",
+            files: []
+        ))]))
+        model.reduce(record: recorded(3, .object([
+            "type": .string("model_step_completed"),
+            "sessionId": .string("chat-1"),
+            "turnId": .string("turn-1"),
+            "modelStepId": .string("step-1"),
+            "stepIndex": .number(0),
+            "startedAtMs": .number(100),
+            "completedAtMs": .number(300),
+            "outcome": .object(["status": .string("retrying")]),
+        ]), blocks: [RenderedBlock(capability: "agent", block: FrontendBlock(
+            id: "step-1/retry",
+            group: "turn-1",
+            update: .replace,
+            state: .complete,
+            role: .notice,
+            title: "Reconnecting…",
+            text: "",
+            symbol: nil,
+            format: "plain_text",
+            tone: "warning",
+            files: []
+        ))]))
+
+        let partial = try XCTUnwrap(model.transcript.first(where: {
+            $0.modelStepID == "step-1" && $0.kind == .assistant
+        }))
+        let search = try XCTUnwrap(model.transcript.first(where: {
+            $0.capability == "web_search"
+        }))
+        let reconnecting = try XCTUnwrap(model.transcript.first(where: {
+            $0.title == "Reconnecting…"
+        }))
+        XCTAssertFalse(partial.pending)
+        XCTAssertEqual(partial.tone, "warning")
+        XCTAssertFalse(search.pending)
+        XCTAssertEqual(search.title, "Web search interrupted")
+        XCTAssertEqual(search.tone, "warning")
+        XCTAssertLessThan(
+            try XCTUnwrap(model.transcript.firstIndex(where: { $0 === partial })),
+            try XCTUnwrap(model.transcript.firstIndex(where: { $0 === reconnecting }))
+        )
+    }
+
     func testActiveRunAllowsSessionNavigationButNotSelectedSessionMutation() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model { request in await recorder.record(request) }

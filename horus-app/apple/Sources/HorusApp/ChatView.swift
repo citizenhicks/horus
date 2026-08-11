@@ -65,6 +65,9 @@ struct ChatView: View {
                 .accessibilityElement(children: .combine)
             }
             ToolbarItem(placement: .primaryAction) {
+                newChatButton
+            }
+            ToolbarItem(placement: .primaryAction) {
                 inspectorButton
             }
             ToolbarItem(placement: .primaryAction) {
@@ -88,13 +91,33 @@ struct ChatView: View {
         }
     }
 
+    /// Starting a chat in the folder you are already in belongs with the other page-level
+    /// actions, not in the composer beside the controls that shape the message being written.
+    private var newChatButton: some View {
+        Button(action: model.openNewSessionInCurrentWorkspace) {
+            toolbarGlyph(.notePencil)
+        }
+        .disabled(model.workspace == nil || !model.canCreateSession)
+        .accessibilityLabel("New chat in this folder")
+        .tint(.primary)
+        .help("New chat in this folder")
+    }
+
     private var inspectorButton: some View {
         Button(action: model.toggleFilesInspector) {
-            HorusIcon(.sidebarSimple, foreground: .primary)
+            toolbarGlyph(.sidebarSimple)
         }
         .accessibilityLabel("Toggle Files")
         .tint(.primary)
         .help(model.showsInspector ? "Hide Files" : "Show Files")
+    }
+
+    /// A bare glyph is a 16pt target; toolbar buttons pad out to a full one the way every
+    /// other icon button in the app does.
+    private func toolbarGlyph(_ glyph: HorusGlyph) -> some View {
+        HorusIcon(glyph, foreground: .primary)
+            .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+            .contentShape(Rectangle())
     }
 
     private var workspaceName: String {
@@ -1338,9 +1361,6 @@ private struct ComposerSurface: View {
     private func submit() {
         guard !dictation.isActive else { return }
         selection = nil
-        // The message is gone from the field, so the keyboard has nothing left to edit and
-        // is only covering the reply it was sent to get.
-        isComposerFocused = false
         model.sendMessage()
     }
 

@@ -2188,6 +2188,10 @@ final class AppModel {
             return
         }
         let id = requestID("input")
+        // Past every guard, so a rejected send leaves the keyboard up with the text still
+        // there to fix. The send button and the return key both land here, which is why this
+        // belongs on the model rather than in the composer's own submit path.
+        dismissComposerFocus()
         if pendingWidgetEdit?.recovery.phase == .editing {
             submitComposerEdit(sessionID: sessionID, requestID: id, text: text)
             return
@@ -4310,8 +4314,20 @@ final class AppModel {
         else { return }
 
         guard status == "completed" else {
+            let searchPrefix = scopedBlockID(
+                capability: "web_search",
+                sourceID: "\(modelStepID)/"
+            )
+            for entry in entries where entry.pending && entry.id.hasPrefix(searchPrefix) {
+                entry.pending = false
+                entry.title = "Web search interrupted"
+                entry.tone = "warning"
+                entry.sourceSequence = record.sequence
+                entry.recordedAtMs = record.recordedAtMs
+            }
             for entry in entries where entry.modelStepID == modelStepID && entry.pending {
                 entry.pending = false
+                if status == "retrying" { entry.tone = "warning" }
                 entry.sourceSequence = record.sequence
                 entry.recordedAtMs = record.recordedAtMs
             }

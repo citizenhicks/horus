@@ -578,7 +578,7 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
     @ViewBuilder let detail: Detail
 
     @Environment(\.horusPalette) private var palette
-    @GestureState private var drag: CGFloat = 0
+    @State private var drag: CGFloat = 0
     @State private var drawerFeedback = false
 
     var body: some View {
@@ -644,17 +644,31 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
 
     private var progress: Double { Double(offset / SidebarDrawerMetrics.width) }
 
+    /// The drag is plain state, not `@GestureState`, and is cleared inside the same animated
+    /// transaction that settles the drawer.
+    ///
+    /// `@GestureState` resets itself the moment the gesture ends, and that reset lands
+    /// outside any animation: the page snapped back to where it started, then animated open
+    /// from there. Releasing a pull looked like the drawer opening twice.
     private var swipe: some Gesture {
         DragGesture(minimumDistance: 12)
-            .updating($drag) { value, state, _ in
+            .onChanged { value in
                 guard accepts(value) else { return }
-                state = value.translation.width
+                drag = value.translation.width
             }
             .onEnded { value in
-                guard accepts(value) else { return }
+                guard accepts(value) else {
+                    drag = 0
+                    return
+                }
                 let projected = (isOpen ? SidebarDrawerMetrics.width : 0)
                     + value.predictedEndTranslation.width
-                setOpen(projected > SidebarDrawerMetrics.width / 2)
+                let open = projected > SidebarDrawerMetrics.width / 2
+                if open != isOpen { drawerFeedback.toggle() }
+                withAnimation(SidebarDrawerMetrics.animation) {
+                    drag = 0
+                    isOpen = open
+                }
             }
     }
 
@@ -666,7 +680,11 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
     private func setOpen(_ open: Bool) {
         guard isOpen != open else { return }
         drawerFeedback.toggle()
-        withAnimation(SidebarDrawerMetrics.animation) { isOpen = open }
+        // Clears any drag a cancelled gesture left behind, which no longer resets itself.
+        withAnimation(SidebarDrawerMetrics.animation) {
+            drag = 0
+            isOpen = open
+        }
     }
 }
 

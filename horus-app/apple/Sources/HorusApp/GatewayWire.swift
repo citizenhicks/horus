@@ -1,7 +1,7 @@
 import Foundation
 import UIKit
 
-let gatewayProtocolVersion = 25
+let gatewayProtocolVersion = 26
 let maximumGatewayFrameBytes = 20 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 let maximumSessionFileReferences = 16
@@ -1960,7 +1960,7 @@ extension AgentEventRecord {
                     }
                     try annotations.forEach(validateModelStepAnnotation)
                 }
-            case "failed", "interrupted":
+            case "failed", "interrupted", "retrying":
                 break
             default:
                 throw GatewayWireError.invalidFrame(
