@@ -183,6 +183,7 @@ impl OpenAi {
 
         let mut bytes = Vec::new();
         let mut commentary = BTreeSet::new();
+        let mut reasoning_part = None;
         let mut web_searches = BTreeSet::new();
         let mut output = BTreeMap::new();
         let mut stream_bytes = 0;
@@ -200,7 +201,7 @@ impl OpenAi {
                 if emit_web_event(&event, &mut web_searches, &events)? {
                     continue;
                 }
-                if emit_reasoning_event(&event, &events)? {
+                if emit_reasoning_event(&event, &mut reasoning_part, &events)? {
                     continue;
                 }
                 if emit_text_event(&event, &mut commentary, &events)? {
@@ -490,19 +491,67 @@ pub(super) fn emit_web_event(
     Ok(true)
 }
 
-pub(super) fn emit_reasoning_event(event: &Value, events: &ModelEventSink) -> Result<bool> {
-    if !matches!(
-        event.get("type").and_then(Value::as_str),
-        Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta")
-    ) {
-        return Ok(false);
-    }
-    if let Some(delta) = event.get("delta").and_then(Value::as_str)
-        && !delta.is_empty()
-    {
-        events(ModelEvent::ReasoningDelta(delta.to_string()))?;
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReasoningPartKind {
+    Summary,
+    Content,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReasoningPart {
+    kind: ReasoningPartKind,
+    output_index: usize,
+    part_index: usize,
+}
+
+pub(super) fn emit_reasoning_event(
+    event: &Value,
+    previous_part: &mut Option<ReasoningPart>,
+    events: &ModelEventSink,
+) -> Result<bool> {
+    let (kind, part_field) = match event.get("type").and_then(Value::as_str) {
+        Some("response.reasoning_summary_text.delta") => {
+            (ReasoningPartKind::Summary, "summary_index")
+        }
+        Some("response.reasoning_text.delta") => (ReasoningPartKind::Content, "content_index"),
+        _ => return Ok(false),
+    };
+    let Some(delta) = event
+        .get("delta")
+        .and_then(Value::as_str)
+        .filter(|delta| !delta.is_empty())
+    else {
+        return Ok(true);
+    };
+    let part = reasoning_part(event, kind, part_field);
+    // The normalized delta is one text stream, so match replay's newline between parts.
+    let separator = match part {
+        Some(part) => previous_part
+            .replace(part)
+            .is_some_and(|previous| previous != part),
+        None => {
+            *previous_part = None;
+            false
+        }
+    };
+    events(ModelEvent::ReasoningDelta(if separator {
+        format!("\n{delta}")
+    } else {
+        delta.to_string()
+    }))?;
     Ok(true)
+}
+
+fn reasoning_part(
+    event: &Value,
+    kind: ReasoningPartKind,
+    part_field: &str,
+) -> Option<ReasoningPart> {
+    Some(ReasoningPart {
+        kind,
+        output_index: usize::try_from(event.get("output_index")?.as_u64()?).ok()?,
+        part_index: usize::try_from(event.get(part_field)?.as_u64()?).ok()?,
+    })
 }
 
 pub(super) fn emit_text_event(

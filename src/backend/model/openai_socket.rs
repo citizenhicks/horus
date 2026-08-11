@@ -862,6 +862,7 @@ async fn read_exchange(
 ) -> Result<Exchange> {
     let mut web_searches = BTreeSet::new();
     let mut commentary = BTreeSet::new();
+    let mut reasoning_part = None;
     let mut output = BTreeMap::new();
     let mut stream_bytes = 0;
     let output_delivered = Arc::new(AtomicBool::new(false));
@@ -896,7 +897,7 @@ async fn read_exchange(
         if emit_web_event(&event, &mut web_searches, &tracked_events)? {
             continue;
         }
-        if emit_reasoning_event(&event, &tracked_events)? {
+        if emit_reasoning_event(&event, &mut reasoning_part, &tracked_events)? {
             continue;
         }
         if emit_text_event(&event, &mut commentary, &tracked_events)? {

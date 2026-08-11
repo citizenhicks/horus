@@ -400,6 +400,7 @@ fn responses_emits_reasoning_text_deltas() {
         sink_seen.lock().expect("events lock").push(event);
         Ok(())
     });
+    let mut previous_part = None;
 
     assert!(
         emit_reasoning_event(
@@ -407,6 +408,7 @@ fn responses_emits_reasoning_text_deltas() {
                 "type": "response.reasoning_text.delta",
                 "delta": "Plan."
             }),
+            &mut previous_part,
             &events,
         )
         .expect("reasoning event")
@@ -425,13 +427,17 @@ fn responses_emits_reasoning_summary_deltas() {
         sink_seen.lock().expect("events lock").push(event);
         Ok(())
     });
+    let mut previous_part = None;
 
     assert!(
         emit_reasoning_event(
             &serde_json::json!({
                 "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "summary_index": 0,
                 "delta": "**Checking the request**"
             }),
+            &mut previous_part,
             &events,
         )
         .expect("reasoning summary event")
@@ -441,6 +447,44 @@ fn responses_emits_reasoning_summary_deltas() {
         vec![ModelEvent::ReasoningDelta(
             "**Checking the request**".into()
         )]
+    );
+}
+
+#[test]
+fn responses_preserves_reasoning_summary_part_boundaries() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_seen = Arc::clone(&seen);
+    let events: ModelEventSink = Arc::new(move |event| {
+        sink_seen.lock().expect("events lock").push(event);
+        Ok(())
+    });
+    let mut previous_part = None;
+
+    for (summary_index, delta) in [
+        (0, "**Planning file creation"),
+        (0, " and editing methods**"),
+        (1, "**Implementing file generation**"),
+    ] {
+        emit_reasoning_event(
+            &serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "summary_index": summary_index,
+                "delta": delta,
+            }),
+            &mut previous_part,
+            &events,
+        )
+        .expect("reasoning summary event");
+    }
+
+    assert_eq!(
+        *seen.lock().expect("events lock"),
+        vec![
+            ModelEvent::ReasoningDelta("**Planning file creation".into()),
+            ModelEvent::ReasoningDelta(" and editing methods**".into()),
+            ModelEvent::ReasoningDelta("\n**Implementing file generation**".into()),
+        ]
     );
 }
 
