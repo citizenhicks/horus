@@ -6368,13 +6368,58 @@ final class TranscriptWaitingNoteTests: XCTestCase {
         // A pending row shimmers on its own, and a pending assistant message means text is
         // arriving — neither is waiting.
         XCTAssertTrue(
-            TranscriptWaitingNote.isWaiting(hasActiveTurn: true, lastEntryIsPending: false)
+            TranscriptWaitingNote.isWaiting(
+                hasActiveTurn: true,
+                lastEntryIsPending: false,
+                connectionIsReady: true,
+                hasPendingApproval: false,
+                hasPendingPicker: false
+            )
         )
         XCTAssertFalse(
-            TranscriptWaitingNote.isWaiting(hasActiveTurn: true, lastEntryIsPending: true)
+            TranscriptWaitingNote.isWaiting(
+                hasActiveTurn: true,
+                lastEntryIsPending: true,
+                connectionIsReady: true,
+                hasPendingApproval: false,
+                hasPendingPicker: false
+            )
         )
         XCTAssertFalse(
-            TranscriptWaitingNote.isWaiting(hasActiveTurn: false, lastEntryIsPending: false)
+            TranscriptWaitingNote.isWaiting(
+                hasActiveTurn: false,
+                lastEntryIsPending: false,
+                connectionIsReady: true,
+                hasPendingApproval: false,
+                hasPendingPicker: false
+            )
+        )
+        XCTAssertFalse(
+            TranscriptWaitingNote.isWaiting(
+                hasActiveTurn: true,
+                lastEntryIsPending: false,
+                connectionIsReady: false,
+                hasPendingApproval: false,
+                hasPendingPicker: false
+            )
+        )
+        XCTAssertFalse(
+            TranscriptWaitingNote.isWaiting(
+                hasActiveTurn: true,
+                lastEntryIsPending: false,
+                connectionIsReady: true,
+                hasPendingApproval: true,
+                hasPendingPicker: false
+            )
+        )
+        XCTAssertFalse(
+            TranscriptWaitingNote.isWaiting(
+                hasActiveTurn: true,
+                lastEntryIsPending: false,
+                connectionIsReady: true,
+                hasPendingApproval: false,
+                hasPendingPicker: true
+            )
         )
     }
 

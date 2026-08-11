@@ -66,8 +66,18 @@ enum TranscriptWaitingNote {
     /// A pending event already shimmers on its own row, and a pending assistant message means
     /// text is arriving — neither is waiting. Only a turn that is running with nothing pending
     /// qualifies.
-    static func isWaiting(hasActiveTurn: Bool, lastEntryIsPending: Bool) -> Bool {
-        hasActiveTurn && !lastEntryIsPending
+    static func isWaiting(
+        hasActiveTurn: Bool,
+        lastEntryIsPending: Bool,
+        connectionIsReady: Bool,
+        hasPendingApproval: Bool,
+        hasPendingPicker: Bool
+    ) -> Bool {
+        hasActiveTurn
+            && !lastEntryIsPending
+            && connectionIsReady
+            && !hasPendingApproval
+            && !hasPendingPicker
     }
 
     static func message(seed: String, elapsed: TimeInterval) -> String {

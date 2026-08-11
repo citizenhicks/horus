@@ -694,7 +694,10 @@ final class AppModel {
     var isWaitingForModel: Bool {
         TranscriptWaitingNote.isWaiting(
             hasActiveTurn: activeTurnID != nil,
-            lastEntryIsPending: displayedTranscript.last?.pending == true
+            lastEntryIsPending: displayedTranscript.last?.pending == true,
+            connectionIsReady: connectionState.isReady,
+            hasPendingApproval: pendingApproval != nil,
+            hasPendingPicker: pendingPicker != nil
         )
     }
     var isLoadingTranscript: Bool {
