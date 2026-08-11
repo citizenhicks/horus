@@ -27,6 +27,8 @@ private struct ImportedPhotoFile: Transferable {
 }
 
 struct ComposerOptionsView: View {
+    private static let composerGlyphSize: CGFloat = 18
+
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
     let dictation: ComposerDictation
@@ -77,7 +79,11 @@ struct ComposerOptionsView: View {
                 HorusLabel(title: "Files", glyph: .fileText)
             }
         } label: {
-            HorusLabel(title: "Add attachment", glyph: .plus)
+            HorusLabel(
+                title: "Add attachment",
+                glyph: .plus,
+                iconSize: Self.composerGlyphSize
+            )
                 .labelStyle(.iconOnly)
                 .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                 .contentShape(Rectangle())
@@ -118,7 +124,8 @@ struct ComposerOptionsView: View {
             HorusLabel(
                 title: approvalLabel,
                 glyph: approvalGlyph,
-                iconColor: approvalForeground
+                iconColor: approvalForeground,
+                iconSize: Self.composerGlyphSize
             )
                 .labelStyle(.iconOnly)
                 .foregroundStyle(approvalForeground)
@@ -182,7 +189,11 @@ struct ComposerOptionsView: View {
                 ProgressView()
                     .controlSize(.small)
             } else {
-                HorusLabel(title: dictationLabel, glyph: .mic01)
+                HorusLabel(
+                    title: dictationLabel,
+                    glyph: .mic01,
+                    iconSize: Self.composerGlyphSize
+                )
             }
         }
         .labelStyle(.iconOnly)
