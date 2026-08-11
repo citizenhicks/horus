@@ -2112,7 +2112,13 @@ final class AppModelTests: XCTestCase {
             format: "unified_diff",
             tone: "success"
         )
-        let preview = RenderedPreview(title: "worker", events: [
+        let preview = RenderedPreview(
+            id: "/root/worker",
+            title: "worker",
+            subtitle: "full",
+            pageId: "latest",
+            update: .replace,
+            events: [
             RenderedEventRecord(
                 event: .object(["type": .string("tool_call_end")]),
                 blocks: [RenderedBlock(capability: "tools", block: outer)]
@@ -2133,7 +2139,9 @@ final class AppModelTests: XCTestCase {
                     files: []
                 ))]
             )
-        ])
+            ],
+            next: nil
+        )
 
         model.reduce(
             event: AgentEventRecord(submissionId: nil, msg: .object([
@@ -2148,11 +2156,11 @@ final class AppModelTests: XCTestCase {
 
         let snapshot = try XCTUnwrap(model.previews.first)
         XCTAssertEqual(snapshot.title, "worker")
-        XCTAssertEqual(snapshot.blocks.map(\.block.text), ["Read file", "@@ -1 +1 @@"])
-        XCTAssertEqual(snapshot.blocks.last?.block.id, "change")
-        XCTAssertEqual(snapshot.blocks.last?.block.group, "work")
-        XCTAssertEqual(snapshot.blocks.last?.block.format, "unified_diff")
-        XCTAssertEqual(snapshot.blocks.last?.block.tone, "success")
+        XCTAssertEqual(snapshot.context, "full")
+        XCTAssertEqual(snapshot.entries.map(\.text), ["Read file", "@@ -1 +1 @@"])
+        XCTAssertEqual(snapshot.entries.last?.group, "work")
+        XCTAssertEqual(snapshot.entries.last?.format, "unified_diff")
+        XCTAssertEqual(snapshot.entries.last?.tone, "success")
         XCTAssertNil(model.presentedPreview)
         XCTAssertFalse(model.showsInspector)
     }
@@ -2168,6 +2176,8 @@ final class AppModelTests: XCTestCase {
             "label": .string("reviewer"),
             "description": .string("running"),
             "detail": .string("gpt-5.6-sol"),
+            "symbol": .string("agent"),
+            "showsDetail": .bool(false),
             "op": .object([
                 "type": .string("capability_command"),
                 "capability": .string("subagents"),
@@ -2205,19 +2215,263 @@ final class AppModelTests: XCTestCase {
                 "events": .array([])
             ])),
             blocks: [],
-            preview: RenderedPreview(title: "reviewer", events: [
-                RenderedEventRecord(
-                    event: .object(["type": .string("agent_message")]),
-                    blocks: [RenderedBlock(capability: "worker", block: block)]
-                )
-            ])
+            preview: RenderedPreview(
+                id: "/root/reviewer",
+                title: "reviewer",
+                subtitle: "none",
+                pageId: "latest",
+                update: .replace,
+                events: [
+                    RenderedEventRecord(
+                        event: .object(["type": .string("agent_message")]),
+                        blocks: [RenderedBlock(capability: "worker", block: block)]
+                    )
+                ],
+                next: nil
+            )
         )
 
         XCTAssertEqual(model.presentedPreview?.title, "reviewer")
         XCTAssertEqual(model.presentedPreview?.status, "running")
         XCTAssertEqual(model.presentedPreview?.model, "gpt-5.6-sol")
-        XCTAssertEqual(model.presentedPreview?.blocks.map(\.block.text), ["Done"])
+        XCTAssertEqual(model.presentedPreview?.context, "none")
+        XCTAssertEqual(model.presentedPreview?.entries.map(\.text), ["Done"])
         XCTAssertFalse(model.showsInspector)
+    }
+
+    func testPreviewPaginationPrependsOlderBlocksAndClearsLoadingState() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.selectedSessionID = "chat-1"
+        let next = AgentOperation.capabilityCommand(
+            capability: "subagents",
+            command: "subagents_page",
+            arguments: #"{"path":"/root/reviewer","before_sequence":12}"#,
+            input: nil,
+            target: nil
+        )
+        func block(_ text: String) -> RenderedBlock {
+            RenderedBlock(capability: "agent", block: FrontendBlock(
+                id: nil,
+                group: nil,
+                update: .replace,
+                state: .complete,
+                role: .notice,
+                title: "Horus",
+                text: text,
+                symbol: nil,
+                format: "plain_text",
+                tone: "neutral",
+                files: []
+            ))
+        }
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object(["type": .string("frontend")])),
+            blocks: [],
+            preview: RenderedPreview(
+                id: "/root/reviewer",
+                title: "reviewer",
+                subtitle: "full",
+                pageId: "latest",
+                update: .replace,
+                events: [RenderedEventRecord(
+                    event: .object(["type": .string("agent_message")]),
+                    blocks: [block("new")]
+                )],
+                next: next
+            )
+        )
+        XCTAssertEqual(model.previews.first?.entries.map(\.text), ["new"])
+
+        let requestCount = await recorder.requestCount()
+        model.loadPreviewPage(next)
+        XCTAssertTrue(model.isLoadingPreviewPage)
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            guard case .submit("chat-1", _) = request else { return false }
+            return true
+        }
+        guard case .submit(_, let submission) = try XCTUnwrap(request) else {
+            return XCTFail("Expected preview page submission")
+        }
+        model.reduce(
+            event: AgentEventRecord(
+                submissionId: submission.id,
+                msg: .object(["type": .string("frontend")])
+            ),
+            blocks: [],
+            preview: RenderedPreview(
+                id: "/root/reviewer",
+                title: "reviewer",
+                subtitle: "full",
+                pageId: "before-12",
+                update: .prepend,
+                events: [RenderedEventRecord(
+                    event: .object(["type": .string("user_message")]),
+                    blocks: [block("old")]
+                )],
+                next: nil
+            )
+        )
+
+        XCTAssertFalse(model.isLoadingPreviewPage)
+        XCTAssertEqual(model.previews.first?.entries.map(\.text), ["old", "new"])
+        XCTAssertNil(model.previews.first?.next)
+    }
+
+    func testPreviewPaginationComposesCrossPageAppendAndAcceptsAnEmptyTerminalPage() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.selectedSessionID = "chat-1"
+        let next = AgentOperation.capabilityCommand(
+            capability: "subagents",
+            command: "preview_page",
+            arguments: #"{"path":"/root/reviewer","before_sequence":12}"#,
+            input: nil,
+            target: nil
+        )
+        func event(text: String, update: FrontendBlockUpdate) -> RenderedEventRecord {
+            RenderedEventRecord(
+                event: .object(["type": .string("tool_call_end")]),
+                blocks: [RenderedBlock(capability: "tools", block: FrontendBlock(
+                    id: "call-1",
+                    group: "turn-1",
+                    update: update,
+                    state: .complete,
+                    role: .tool,
+                    title: "Read file",
+                    text: text,
+                    symbol: "task",
+                    format: "plain_text",
+                    tone: "neutral",
+                    files: []
+                ))]
+            )
+        }
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object(["type": .string("frontend")])),
+            blocks: [],
+            preview: RenderedPreview(
+                id: "/root/reviewer",
+                title: "reviewer",
+                subtitle: "Last 1 turn",
+                pageId: "latest",
+                update: .replace,
+                events: [
+                    event(text: "new", update: .append),
+                    event(text: "er", update: .append)
+                ],
+                next: next
+            )
+        )
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object(["type": .string("frontend")])),
+            blocks: [],
+            preview: RenderedPreview(
+                id: "/root/reviewer",
+                title: "reviewer",
+                subtitle: "Last 1 turn",
+                pageId: "before-12",
+                update: .prepend,
+                events: [event(text: "old ", update: .replace)],
+                next: next
+            )
+        )
+
+        XCTAssertEqual(model.previews.first?.entries.map(\.text), ["old newer"])
+
+        let requestCount = await recorder.requestCount()
+        model.loadPreviewPage(next)
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            guard case .submit("chat-1", _) = request else { return false }
+            return true
+        }
+        guard case .submit(_, let submission) = try XCTUnwrap(request) else {
+            return XCTFail("Expected preview page submission")
+        }
+        model.reduce(
+            event: AgentEventRecord(submissionId: submission.id, msg: .object([
+                "type": .string("frontend")
+            ])),
+            blocks: [],
+            preview: RenderedPreview(
+                id: "/root/reviewer",
+                title: "reviewer",
+                subtitle: "Last 1 turn",
+                pageId: "inherited-end",
+                update: .prepend,
+                events: [],
+                next: nil
+            )
+        )
+
+        XCTAssertFalse(model.isLoadingPreviewPage)
+        XCTAssertEqual(model.previews.first?.entries.map(\.text), ["old newer"])
+        XCTAssertNil(model.previews.first?.next)
+    }
+
+    func testPreviewIdentityDoesNotCollideForMatchingLeafNames() throws {
+        let model = try model()
+        for path in ["/root/a/reviewer", "/root/b/reviewer"] {
+            model.reduce(
+                event: AgentEventRecord(
+                    submissionId: nil,
+                    msg: .object(["type": .string("frontend")])
+                ),
+                blocks: [],
+                preview: RenderedPreview(
+                    id: path,
+                    title: "reviewer",
+                    subtitle: "No context",
+                    pageId: "\(path):latest",
+                    update: .replace,
+                    events: [RenderedEventRecord(
+                        event: .object(["type": .string("user_message"), "message": .string(path)]),
+                        blocks: []
+                    )],
+                    next: nil
+                )
+            )
+        }
+
+        XCTAssertEqual(Set(model.previews.map(\.id)), ["/root/a/reviewer", "/root/b/reviewer"])
+        XCTAssertEqual(model.previews.map(\.title), ["reviewer", "reviewer"])
+    }
+
+    func testRejectedPreviewPageClearsLoadingState() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.selectedSessionID = "chat-1"
+        let operation = AgentOperation.capabilityCommand(
+            capability: "subagents",
+            command: "preview_page",
+            arguments: #"{"path":"/root/reviewer","before_sequence":12}"#,
+            input: nil,
+            target: nil
+        )
+        let requestCount = await recorder.requestCount()
+        model.loadPreviewPage(operation)
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            guard case .submit("chat-1", _) = request else { return false }
+            return true
+        }
+        guard case .submit(_, let submission) = try XCTUnwrap(request) else {
+            return XCTFail("Expected preview page submission")
+        }
+
+        model.handle(.rejected(GatewayRejection(
+            requestId: submission.id,
+            code: "invalid_request",
+            message: "Page unavailable",
+            fatal: false
+        )))
+
+        XCTAssertFalse(model.isLoadingPreviewPage)
     }
 
     func testFrontendPickerUsesGenericPromptForAnyCapability() throws {
@@ -2232,6 +2486,8 @@ final class AppModelTests: XCTestCase {
                     "label": .string("Accept"),
                     "description": .string("Accept the review result."),
                     "detail": .string("reviewer-v1"),
+                    "symbol": .null,
+                    "showsDetail": .bool(true),
                     "op": .object([
                         "type": .string("capability_command"),
                         "capability": .string("reviewer"),

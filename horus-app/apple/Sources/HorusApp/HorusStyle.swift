@@ -56,6 +56,9 @@ struct HorusGlyph: Hashable {
     static let check = Self("hi.check")
     static let checkCircle = Self("hi.checkCircle")
     static let claude = Self("hi.claude")
+    static let circle = Self("hi.circle")
+    static let circleDot = Self("hi.circleDot")
+    static let circleDotDashed = Self("hi.circleDotDashed")
     static let clock = Self("hi.clock")
     static let copy = Self("hi.copy")
     static let cpu = Self("hi.cpu")
@@ -684,6 +687,7 @@ struct HorusMenuLabel: View {
     let text: String
     var glyph: HorusGlyph?
     var detail: String?
+    var showsDisclosure = true
 
     var body: some View {
         HStack(spacing: 6) {
@@ -698,7 +702,9 @@ struct HorusMenuLabel: View {
                     .foregroundStyle(palette.muted)
                     .lineLimit(1)
             }
-            HorusIcon(.caretUpDown, size: 11, foreground: palette.muted)
+            if showsDisclosure {
+                HorusIcon(.caretUpDown, size: 11, foreground: palette.muted)
+            }
         }
         .frame(height: HorusStyle.controlHeight)
         .contentShape(Rectangle())

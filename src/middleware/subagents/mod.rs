@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -38,10 +39,12 @@ use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendCommand;
 use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendEvent;
+use crate::protocol::FrontendPreviewUpdate;
 use crate::protocol::FrontendTone;
 use crate::protocol::Op;
 use crate::protocol::{internal_message_kind, is_internal_message, strip_attachment_references};
 
+use self::runtime::AgentPresentation;
 use self::runtime::Followup;
 use self::runtime::MAX_MESSAGE_BYTES;
 use self::runtime::Shared;
@@ -51,6 +54,8 @@ mod runtime;
 
 const MAX_TASK_NAME_BYTES: usize = 64;
 const IDENTITY_KEY: &str = "subagents.identity";
+const SPAWN_CONTEXT_KEY: &str = "subagents.spawn_context";
+const PREVIEW_PAGE_COMMAND: &str = "preview_page";
 mod text {
     include!(concat!(
         env!("OUT_DIR"),
@@ -153,12 +158,66 @@ enum ForkTurns {
     Last(usize),
 }
 
+impl ForkTurns {
+    fn label(self) -> String {
+        match self {
+            Self::None => "No context".into(),
+            Self::All => "Full context".into(),
+            Self::Last(1) => "Last 1 turn".into(),
+            Self::Last(turns) => format!("Last {turns} turns"),
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentIdentity {
     root_session_id: String,
     agent_path: String,
     depth: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PreviewPosition {
+    BeforeSequence { before_sequence: u64 },
+    BeforeItem { sequence: u64, before_item: usize },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewCursor {
+    path: String,
+    position: PreviewPosition,
+}
+
+impl PreviewPosition {
+    fn validate(self) -> Result<Self> {
+        let valid = match self {
+            Self::BeforeSequence { before_sequence } => before_sequence > 0,
+            Self::BeforeItem {
+                before_item,
+                sequence: _,
+            } => before_item > 0,
+        };
+        if valid {
+            Ok(self)
+        } else {
+            Err(Error::Tool("invalid subagent preview cursor".into()))
+        }
+    }
+
+    fn page_id(self, path: &str) -> String {
+        match self {
+            Self::BeforeSequence { before_sequence } => {
+                format!("{path}:before-sequence-{before_sequence}")
+            }
+            Self::BeforeItem {
+                sequence,
+                before_item,
+            } => format!("{path}:sequence-{sequence}-before-item-{before_item}"),
+        }
+    }
 }
 
 impl AgentIdentity {
@@ -247,12 +306,13 @@ impl AgentScope {
         checkpoint.catalog_visible = false;
         checkpoint.context = fork_context(&context, turns);
         checkpoint.session_context = parent.session_context;
-        let metadata = AgentIdentity {
+        let mut metadata = AgentIdentity {
             root_session_id: self.root_session_id.clone(),
             agent_path: agent_path.clone(),
             depth: self.depth + 1,
         }
         .metadata(self.metadata.clone());
+        metadata.insert(SPAWN_CONTEXT_KEY.into(), Value::String(turns.label()));
         checkpoint.metadata.clone_from(&metadata);
         self.checkpoints
             .fork(&self.session_id, parent_sequence, &checkpoint)
@@ -273,7 +333,7 @@ impl AgentScope {
         depth: u8,
         model: String,
     ) -> Result<Agent> {
-        self.checkpoints.load(&session_id).await?.ok_or_else(|| {
+        let checkpoint = self.checkpoints.load(&session_id).await?.ok_or_else(|| {
             Error::Checkpoint(format!("checkpoint for `{agent_path}` is missing"))
         })?;
         (self.launch_agent)(SubagentLaunch {
@@ -285,7 +345,7 @@ impl AgentScope {
                 agent_path,
                 depth,
             }
-            .metadata(self.metadata.clone()),
+            .metadata(checkpoint.metadata),
         })
         .await
     }
@@ -388,13 +448,9 @@ impl Subagents {
         let identity = AgentIdentity::read(session_id, metadata)?;
         let path = arguments.trim();
         if !path.is_empty() {
-            let events = self.shared.preview(&identity.root_session_id, path).await?;
-            return Ok(MiddlewareCommandOutput::events(vec![
-                FrontendEvent::Preview {
-                    title: path.into(),
-                    events,
-                },
-            ]));
+            return self
+                .preview_page(&identity.root_session_id, path, None)
+                .await;
         }
         let options = self
             .shared
@@ -411,6 +467,65 @@ impl Subagents {
             FrontendEvent::Picker {
                 title: text::RENDER_OPEN.into(),
                 options,
+            },
+        ]))
+    }
+
+    async fn read_preview_page(
+        &self,
+        session_id: &str,
+        metadata: &BTreeMap<String, Value>,
+        arguments: &str,
+    ) -> Result<MiddlewareCommandOutput> {
+        let identity = AgentIdentity::read(session_id, metadata)?;
+        let cursor: PreviewCursor = serde_json::from_str(arguments)
+            .map_err(|_| Error::Tool("invalid subagent preview cursor".into()))?;
+        if cursor.path.trim() != cursor.path || cursor.path.is_empty() {
+            return Err(Error::Tool("invalid subagent preview cursor".into()));
+        }
+        self.preview_page(
+            &identity.root_session_id,
+            &cursor.path,
+            Some(cursor.position.validate()?),
+        )
+        .await
+    }
+
+    async fn preview_page(
+        &self,
+        root_session_id: &str,
+        path: &str,
+        position: Option<PreviewPosition>,
+    ) -> Result<MiddlewareCommandOutput> {
+        let page = self.shared.preview(root_session_id, path, position).await?;
+        let next = page
+            .next
+            .map(|position| -> Result<Op> {
+                Ok(Op::CapabilityCommand {
+                    capability: MANIFEST.id.into(),
+                    command: PREVIEW_PAGE_COMMAND.into(),
+                    arguments: serde_json::to_string(&PreviewCursor {
+                        path: path.into(),
+                        position,
+                    })?,
+                    input: None,
+                    target: None,
+                })
+            })
+            .transpose()?;
+        Ok(MiddlewareCommandOutput::events(vec![
+            FrontendEvent::Preview {
+                id: path.into(),
+                title: path.rsplit('/').next().unwrap_or(path).into(),
+                subtitle: page.subtitle,
+                page_id: page.page_id,
+                update: if position.is_some() {
+                    FrontendPreviewUpdate::Prepend
+                } else {
+                    FrontendPreviewUpdate::Replace
+                },
+                events: page.events,
+                next,
             },
         ]))
     }
@@ -515,18 +630,25 @@ impl Middleware for Subagents {
         context: MiddlewareCommandContext<'a>,
     ) -> BoxFuture<'a, Result<MiddlewareCommandOutput>> {
         Box::pin(async move {
-            if context.command != "subagents" {
-                return Err(Error::Unknown(format!(
-                    "subagents command `{}`",
-                    context.command
-                )));
+            match context.command {
+                "subagents" => {
+                    self.read_command(
+                        context.session_id,
+                        &context.checkpoint.metadata,
+                        context.arguments,
+                    )
+                    .await
+                }
+                PREVIEW_PAGE_COMMAND => {
+                    self.read_preview_page(
+                        context.session_id,
+                        &context.checkpoint.metadata,
+                        context.arguments,
+                    )
+                    .await
+                }
+                command => Err(Error::Unknown(format!("subagents command `{command}`"))),
             }
-            self.read_command(
-                context.session_id,
-                &context.checkpoint.metadata,
-                context.arguments,
-            )
-            .await
         })
     }
 
@@ -535,13 +657,18 @@ impl Middleware for Subagents {
         context: &'a mut ActiveCommandContext<'_>,
     ) -> BoxFuture<'a, Result<Option<ActiveSubmissionResult>>> {
         Box::pin(async move {
-            if context.command != "subagents" {
-                return Ok(None);
-            }
-            match self
-                .read_command(context.session_id, context.metadata, context.arguments)
-                .await
-            {
+            let output = match context.command {
+                "subagents" => {
+                    self.read_command(context.session_id, context.metadata, context.arguments)
+                        .await
+                }
+                PREVIEW_PAGE_COMMAND => {
+                    self.read_preview_page(context.session_id, context.metadata, context.arguments)
+                        .await
+                }
+                _ => return Ok(None),
+            };
+            match output {
                 Ok(output) => {
                     context
                         .events
@@ -674,7 +801,10 @@ impl Tool for SpawnAgent {
                         &scope.agent_path,
                         session_id.clone(),
                         scope.depth + 1,
-                        model.clone(),
+                        AgentPresentation {
+                            model: model.clone(),
+                            spawn_context: turns.label(),
+                        },
                     )
                     .await?;
                 let agent = match scope
@@ -689,9 +819,10 @@ impl Tool for SpawnAgent {
                         ));
                     }
                 };
+                let model = agent.model_route().to_string();
                 let (sender, events) = agent.into_parts();
                 if let Err(error) = shared
-                    .attach(&scope.root_session_id, &path, sender.clone())
+                    .attach(&scope.root_session_id, &path, sender.clone(), Some(model))
                     .await
                     .and_then(|()| {
                         sender
@@ -794,8 +925,8 @@ impl Tool for FollowupTask {
                 else {
                     return Ok(String::new());
                 };
-                let (sender, events) = match sender {
-                    Some(sender) => (sender, None),
+                let (sender, events, model) = match sender {
+                    Some(sender) => (sender, None, None),
                     None => {
                         let agent = match scope
                             .resume(
@@ -820,12 +951,18 @@ impl Tool for FollowupTask {
                                 ));
                             }
                         };
+                        let model = agent.model_route().to_string();
                         let (sender, events) = agent.into_parts();
-                        (sender, Some(events))
+                        (sender, Some(events), Some(model))
                     }
                 };
                 if let Err(error) = shared
-                    .attach(&scope.root_session_id, &arguments.target, sender.clone())
+                    .attach(
+                        &scope.root_session_id,
+                        &arguments.target,
+                        sender.clone(),
+                        model,
+                    )
                     .await
                     .and_then(|()| {
                         sender
@@ -1270,7 +1407,10 @@ mod tests {
                 "/root",
                 "child".into(),
                 1,
-                "test".into(),
+                AgentPresentation {
+                    model: "test".into(),
+                    spawn_context: String::new(),
+                },
             )
             .await
             .expect("reserve child");
@@ -1296,11 +1436,438 @@ mod tests {
         assert_eq!(result, Some(ActiveSubmissionResult::Handled));
         assert!(matches!(
             events.as_slice(),
-            [EventMsg::Frontend(FrontendEvent::Preview { title, events })]
-                if title == "/root/reviewer"
+            [EventMsg::Frontend(FrontendEvent::Preview {
+                id,
+                title,
+                subtitle,
+                page_id,
+                update: FrontendPreviewUpdate::Replace,
+                events,
+                next: None,
+            })]
+                if id == "/root/reviewer"
+                    && title == "reviewer"
+                    && subtitle.is_empty()
+                    && page_id == "/root/reviewer:latest"
                     && matches!(events.as_slice(), [EventMsg::UserMessage(message)] if message.message == "review this")
         ));
         assert!(queued.is_empty());
+    }
+
+    #[tokio::test]
+    async fn preview_pages_are_bounded_omit_the_latest_seed_and_do_not_overlap() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+            crate::backend::checkpoint::sqlite::SqliteCheckpoint::new(
+                workspace.path().join("checkpoints.sqlite3"),
+            )
+            .expect("checkpoint store"),
+        );
+        let root = Checkpoint::empty("root");
+        checkpoints.save(&root, &[], None).await.expect("save root");
+        let inherited = serde_json::json!({"role": "user", "content": "inherited parent"});
+        let mut child = Checkpoint::empty("child");
+        child.context.push(inherited);
+        child.metadata.insert(
+            SPAWN_CONTEXT_KEY.into(),
+            Value::String("Full context".into()),
+        );
+        checkpoints
+            .fork("root", root.sequence, &child)
+            .await
+            .expect("fork child");
+        for sequence in 1..=runtime::PREVIEW_TRANSCRIPT_BATCHES + 1 {
+            child.sequence = u64::try_from(sequence).expect("test sequence");
+            let item = serde_json::json!({
+                "role": "user",
+                "content": format!("child {sequence}")
+            });
+            child.context.push(item.clone());
+            checkpoints
+                .save(&child, &[item], None)
+                .await
+                .expect("save child batch");
+        }
+        let middleware = Subagents::new(
+            1,
+            2,
+            2,
+            Arc::new(|_| Box::pin(async { Err(Error::Stopped("unused".into())) })),
+        )
+        .expect("subagents middleware");
+        middleware
+            .shared
+            .initialize(RuntimeContext {
+                checkpoints,
+                session_id: root.session_id.clone(),
+                model_route: "test".into(),
+                session_context: root.session_context.clone(),
+                metadata: root.metadata.clone(),
+                queued_input: crate::middleware::QueuedInputSnapshot::default(),
+                frontend: Arc::new(|_| Ok(())),
+            })
+            .await
+            .expect("initialize runtime");
+        middleware
+            .shared
+            .reserve(
+                "root",
+                "/root/reviewer",
+                "/root",
+                "child".into(),
+                1,
+                AgentPresentation {
+                    model: "test".into(),
+                    spawn_context: "Full context".into(),
+                },
+            )
+            .await
+            .expect("reserve child");
+
+        let initial = middleware
+            .read_command("root", &root.metadata, "/root/reviewer")
+            .await
+            .expect("initial preview");
+        let [
+            FrontendEvent::Preview {
+                id,
+                title,
+                subtitle,
+                page_id,
+                update: FrontendPreviewUpdate::Replace,
+                events,
+                next:
+                    Some(Op::CapabilityCommand {
+                        command, arguments, ..
+                    }),
+                ..
+            },
+        ] = initial.events.as_slice()
+        else {
+            panic!("expected a replace preview with a continuation");
+        };
+        let initial_messages = events
+            .iter()
+            .filter_map(|event| match event {
+                EventMsg::UserMessage(message) => Some(message.message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(id, "/root/reviewer");
+        assert_eq!(title, "reviewer");
+        assert_eq!(subtitle, "Full context");
+        assert_eq!(page_id, "/root/reviewer:latest");
+        assert_eq!(command, PREVIEW_PAGE_COMMAND);
+        assert_eq!(initial_messages.len(), runtime::PREVIEW_TRANSCRIPT_BATCHES);
+        assert_eq!(initial_messages.first(), Some(&"child 2"));
+        assert_eq!(initial_messages.last(), Some(&"child 51"));
+        assert!(!initial_messages.contains(&"inherited parent"));
+
+        let older = middleware
+            .read_preview_page("root", &root.metadata, arguments)
+            .await
+            .expect("older preview");
+        let [
+            FrontendEvent::Preview {
+                page_id,
+                update: FrontendPreviewUpdate::Prepend,
+                events,
+                next: None,
+                ..
+            },
+        ] = older.events.as_slice()
+        else {
+            panic!("expected a terminal prepend preview");
+        };
+        let older_messages = events
+            .iter()
+            .filter_map(|event| match event {
+                EventMsg::UserMessage(message) => Some(message.message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(page_id, "/root/reviewer:before-sequence-2");
+        assert_eq!(older_messages, ["inherited parent", "child 1"]);
+        assert!(
+            initial_messages
+                .iter()
+                .all(|message| !older_messages.contains(message))
+        );
+    }
+
+    #[tokio::test]
+    async fn inherited_seed_uses_item_cursors_and_byte_bounded_pages() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+            crate::backend::checkpoint::sqlite::SqliteCheckpoint::new(
+                workspace.path().join("checkpoints.sqlite3"),
+            )
+            .expect("checkpoint store"),
+        );
+        let root = Checkpoint::empty("root");
+        checkpoints.save(&root, &[], None).await.expect("save root");
+        let mut child = Checkpoint::empty("child");
+        let body = "x".repeat(3 * 1024 * 1024);
+        for marker in ['a', 'b', 'c'] {
+            child.context.push(serde_json::json!({
+                "role": "user",
+                "content": format!("{marker}{body}")
+            }));
+        }
+        checkpoints
+            .fork("root", root.sequence, &child)
+            .await
+            .expect("fork child");
+        let middleware = Subagents::new(
+            1,
+            2,
+            2,
+            Arc::new(|_| Box::pin(async { Err(Error::Stopped("unused".into())) })),
+        )
+        .expect("subagents middleware");
+        middleware
+            .shared
+            .initialize(RuntimeContext {
+                checkpoints,
+                session_id: root.session_id.clone(),
+                model_route: "test".into(),
+                session_context: root.session_context.clone(),
+                metadata: root.metadata.clone(),
+                queued_input: crate::middleware::QueuedInputSnapshot::default(),
+                frontend: Arc::new(|_| Ok(())),
+            })
+            .await
+            .expect("initialize runtime");
+        middleware
+            .shared
+            .reserve(
+                "root",
+                "/root/reviewer",
+                "/root",
+                "child".into(),
+                1,
+                AgentPresentation {
+                    model: "test".into(),
+                    spawn_context: "Full context".into(),
+                },
+            )
+            .await
+            .expect("reserve child");
+
+        let initial = middleware
+            .read_command("root", &root.metadata, "/root/reviewer")
+            .await
+            .expect("initial preview");
+        let [
+            FrontendEvent::Preview {
+                events,
+                next:
+                    Some(Op::CapabilityCommand {
+                        arguments, command, ..
+                    }),
+                ..
+            },
+        ] = initial.events.as_slice()
+        else {
+            panic!("expected an inherited-context continuation");
+        };
+        assert!(events.is_empty());
+        assert_eq!(command, PREVIEW_PAGE_COMMAND);
+        assert!(matches!(
+            serde_json::from_str::<PreviewCursor>(arguments)
+                .expect("decode initial inherited cursor")
+                .position,
+            PreviewPosition::BeforeSequence { before_sequence: 1 }
+        ));
+
+        let mut arguments = arguments.clone();
+        let mut transcript = Vec::new();
+        let mut pages = 0;
+        let mut used_item_cursor = false;
+        loop {
+            let output = middleware
+                .read_preview_page("root", &root.metadata, &arguments)
+                .await
+                .expect("inherited page");
+            let [FrontendEvent::Preview { events, next, .. }] = output.events.as_slice() else {
+                panic!("expected one inherited preview page");
+            };
+            assert!(
+                serde_json::to_vec(events)
+                    .expect("encode inherited preview page")
+                    .len()
+                    <= runtime::MAX_PREVIEW_PAGE_BYTES
+            );
+            let markers = events
+                .iter()
+                .filter_map(|event| match event {
+                    EventMsg::UserMessage(message) => message.message.chars().next(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            transcript.splice(0..0, markers);
+            pages += 1;
+            let Some(Op::CapabilityCommand {
+                arguments: next_arguments,
+                ..
+            }) = next
+            else {
+                break;
+            };
+            let cursor: PreviewCursor =
+                serde_json::from_str(next_arguments).expect("decode inherited item cursor");
+            used_item_cursor |= matches!(
+                cursor.position,
+                PreviewPosition::BeforeItem {
+                    sequence: 0,
+                    before_item: 1
+                }
+            );
+            arguments.clone_from(next_arguments);
+        }
+
+        assert_eq!(pages, 2);
+        assert!(used_item_cursor);
+        assert_eq!(transcript, ['a', 'b', 'c']);
+    }
+
+    #[tokio::test]
+    async fn preview_page_keeps_a_tool_call_with_its_boundary_output() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+            crate::backend::checkpoint::sqlite::SqliteCheckpoint::new(
+                workspace.path().join("checkpoints.sqlite3"),
+            )
+            .expect("checkpoint store"),
+        );
+        let root = Checkpoint::empty("root");
+        checkpoints.save(&root, &[], None).await.expect("save root");
+        let mut child = Checkpoint::empty("child");
+        checkpoints
+            .save(&child, &[], None)
+            .await
+            .expect("save child");
+        let call = serde_json::json!({
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "inspect",
+            "arguments": "{}"
+        });
+        child.sequence = 1;
+        child.context.push(call.clone());
+        checkpoints
+            .save(&child, &[call], None)
+            .await
+            .expect("save tool call");
+        let output = serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "done"
+        });
+        child.sequence = 2;
+        child.context.push(output.clone());
+        checkpoints
+            .save(&child, &[output], None)
+            .await
+            .expect("save tool output");
+        for sequence in 3..=runtime::PREVIEW_TRANSCRIPT_BATCHES + 1 {
+            child.sequence = u64::try_from(sequence).expect("test sequence");
+            let item = serde_json::json!({
+                "role": "user",
+                "content": format!("child {sequence}")
+            });
+            child.context.push(item.clone());
+            checkpoints
+                .save(&child, &[item], None)
+                .await
+                .expect("save child batch");
+        }
+        let middleware = Subagents::new(
+            1,
+            2,
+            2,
+            Arc::new(|_| Box::pin(async { Err(Error::Stopped("unused".into())) })),
+        )
+        .expect("subagents middleware");
+        middleware
+            .shared
+            .initialize(RuntimeContext {
+                checkpoints,
+                session_id: root.session_id.clone(),
+                model_route: "test".into(),
+                session_context: root.session_context.clone(),
+                metadata: root.metadata.clone(),
+                queued_input: crate::middleware::QueuedInputSnapshot::default(),
+                frontend: Arc::new(|_| Ok(())),
+            })
+            .await
+            .expect("initialize runtime");
+        middleware
+            .shared
+            .reserve(
+                "root",
+                "/root/reviewer",
+                "/root",
+                "child".into(),
+                1,
+                AgentPresentation {
+                    model: "test".into(),
+                    spawn_context: "No context".into(),
+                },
+            )
+            .await
+            .expect("reserve child");
+
+        let preview = middleware
+            .read_command("root", &root.metadata, "/root/reviewer")
+            .await
+            .expect("preview");
+        let [
+            FrontendEvent::Preview {
+                events, next: None, ..
+            },
+        ] = preview.events.as_slice()
+        else {
+            panic!("expected one terminal preview page");
+        };
+        let begin = events.iter().find_map(|event| match event {
+            EventMsg::ToolCallBegin(event) => Some(event),
+            _ => None,
+        });
+        let end = events.iter().find_map(|event| match event {
+            EventMsg::ToolCallEnd(event) => Some(event),
+            _ => None,
+        });
+
+        assert!(matches!(
+            (begin, end),
+            (Some(begin), Some(end))
+                if begin.call_id == "call-1"
+                    && end.call_id == "call-1"
+                    && begin.name == "inspect"
+                    && end.name == "inspect"
+                    && begin.turn_id == end.turn_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn preview_cursor_rejects_unknown_fields_and_zero_offsets() {
+        let middleware = test_middleware();
+        for arguments in [
+            r#"{"path":"/root/reviewer","position":{"kind":"before_sequence","before_sequence":2},"extra":true}"#,
+            r#"{"path":"/root/reviewer","position":{"kind":"before_sequence","before_sequence":2,"extra":true}}"#,
+            r#"{"path":"/root/reviewer","position":{"kind":"before_item","sequence":0,"before_item":0}}"#,
+        ] {
+            let error = middleware
+                .read_preview_page("root", &BTreeMap::new(), arguments)
+                .await
+                .err()
+                .expect("invalid cursor must fail closed");
+
+            assert!(
+                matches!(error, Error::Tool(message) if message == "invalid subagent preview cursor")
+            );
+        }
     }
 
     #[tokio::test]
@@ -1370,6 +1937,10 @@ mod tests {
         assert_eq!(identity.root_session_id, "parent");
         assert_eq!(identity.agent_path, "/root/child");
         assert_eq!(identity.depth, 1);
+        assert_eq!(
+            child.metadata.get(SPAWN_CONTEXT_KEY),
+            Some(&Value::String("No context".into()))
+        );
     }
 
     #[test]

@@ -2521,11 +2521,24 @@ async fn load_replay(
 }
 
 fn render_preview(frontend: &FrontendExtensions, event: &EventMsg) -> Option<RenderedPreview> {
-    let EventMsg::Frontend(FrontendEvent::Preview { title, events }) = event else {
+    let EventMsg::Frontend(FrontendEvent::Preview {
+        id,
+        title,
+        subtitle,
+        page_id,
+        update,
+        events,
+        next,
+    }) = event
+    else {
         return None;
     };
     Some(RenderedPreview {
+        id: id.clone(),
         title: title.clone(),
+        subtitle: subtitle.clone(),
+        page_id: page_id.clone(),
+        update: *update,
         events: flatten_preview(events)
             .into_iter()
             .map(|event| RenderedEvent {
@@ -2533,11 +2546,15 @@ fn render_preview(frontend: &FrontendExtensions, event: &EventMsg) -> Option<Ren
                 event,
             })
             .collect(),
+        next: next.clone(),
     })
 }
 
-fn project_record(frontend: &FrontendExtensions, journal: JournalEvent) -> RecordedEvent {
+fn project_record(frontend: &FrontendExtensions, mut journal: JournalEvent) -> RecordedEvent {
     let (blocks, preview) = project_event(frontend, &journal.event.msg);
+    if preview.is_some() {
+        clear_projected_preview_events(&mut journal.event.msg);
+    }
     RecordedEvent {
         sequence: journal.sequence,
         recorded_at_ms: journal.recorded_at_ms,
@@ -2545,6 +2562,12 @@ fn project_record(frontend: &FrontendExtensions, journal: JournalEvent) -> Recor
         stream_metrics: journal.stream_metrics,
         blocks,
         preview,
+    }
+}
+
+fn clear_projected_preview_events(event: &mut EventMsg) {
+    if let EventMsg::Frontend(FrontendEvent::Preview { events, .. }) = event {
+        events.clear();
     }
 }
 
@@ -2900,6 +2923,30 @@ mod tests {
     }
 
     #[test]
+    fn projected_preview_drops_the_raw_nested_event_duplicate() {
+        let mut event = EventMsg::Frontend(FrontendEvent::Preview {
+            id: "/root/reviewer".into(),
+            title: "reviewer".into(),
+            subtitle: "Full context".into(),
+            page_id: "/root/reviewer:latest".into(),
+            update: horus::protocol::FrontendPreviewUpdate::Replace,
+            events: vec![EventMsg::ContextCompacted],
+            next: None,
+        });
+
+        clear_projected_preview_events(&mut event);
+
+        assert!(matches!(
+            event,
+            EventMsg::Frontend(FrontendEvent::Preview {
+                id,
+                events,
+                ..
+            }) if id == "/root/reviewer" && events.is_empty()
+        ));
+    }
+
+    #[test]
     fn journal_delivery_accepts_loaded_records_and_rejects_gaps() {
         assert_eq!(
             classify_journal_sequence(5, 3, JournalDelivery::LoadedStartup).expect("loaded record"),
@@ -3183,8 +3230,13 @@ mod tests {
                 &Event {
                     submission_id: None,
                     msg: EventMsg::Frontend(FrontendEvent::Preview {
+                        id: "transient".into(),
                         title: "Transient".into(),
+                        subtitle: String::new(),
+                        page_id: "transient:latest".into(),
+                        update: horus::protocol::FrontendPreviewUpdate::Replace,
                         events: Vec::new(),
+                        next: None,
                     }),
                 },
             )
@@ -3917,8 +3969,13 @@ mod tests {
                 context: Default::default(),
             }),
             EventMsg::Frontend(FrontendEvent::Preview {
+                id: "preview".into(),
                 title: "Preview".into(),
+                subtitle: String::new(),
+                page_id: "preview:latest".into(),
+                update: horus::protocol::FrontendPreviewUpdate::Replace,
                 events: Vec::new(),
+                next: None,
             }),
             EventMsg::Frontend(FrontendEvent::Picker {
                 title: "Choose".into(),

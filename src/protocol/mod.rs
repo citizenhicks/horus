@@ -453,6 +453,8 @@ pub struct FrontendPickerOption {
     pub label: String,
     pub description: String,
     pub detail: String,
+    pub symbol: Option<FrontendSymbol>,
+    pub shows_detail: bool,
     pub op: Op,
 }
 
@@ -506,9 +508,22 @@ pub enum FrontendEvent {
         options: Vec<FrontendPickerOption>,
     },
     Preview {
+        id: String,
         title: String,
+        subtitle: String,
+        page_id: String,
+        update: FrontendPreviewUpdate,
         events: Vec<EventMsg>,
+        next: Option<Op>,
     },
+}
+
+/// How one preview page changes the matching frontend preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendPreviewUpdate {
+    Replace,
+    Prepend,
 }
 
 /// A presentation hint rather than a terminal-specific color.

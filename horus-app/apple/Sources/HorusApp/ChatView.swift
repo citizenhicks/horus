@@ -243,9 +243,79 @@ private struct TranscriptRowLayout: Identifiable {
     var isEventGroup: Bool { entries.count > 1 }
 }
 
+/// The transcript body shared by the full chat and read-only agent previews.
+/// Navigation, pagination, and composing controls stay with their owning surface.
+struct TranscriptRowsView: View {
+    let entries: [TranscriptEntry]
+    var activeStepID: String?
+    var breakBefore: String?
+    var collapsesLongMessages = false
+    var rowSpacing: CGFloat = 12
+
+    var body: some View {
+        ForEach(rows) { row in
+            Group {
+                if row.isEventGroup {
+                    EventGroupView(
+                        entries: row.entries,
+                        isActive: row.entries.contains { $0.id == activeStepID }
+                    )
+                } else if let entry = row.entries.first {
+                    TranscriptRow(
+                        entry: entry,
+                        isActive: entry.id == activeStepID,
+                        collapsesLongMessages: collapsesLongMessages
+                    )
+                }
+            }
+            .id(row.id)
+            .padding(.top, row.topSpacing)
+        }
+    }
+
+    private var rows: [TranscriptRowLayout] {
+        TranscriptEntry.groupedRows(from: entries, breakBefore: breakBefore)
+            .enumerated()
+            .map { index, entries in
+                TranscriptRowLayout(
+                    entries: entries,
+                    topSpacing: index == 0 ? 0 : rowSpacing
+                )
+            }
+    }
+}
+
+struct TranscriptPaginationButton: View {
+    @Environment(\.horusPalette) private var palette
+    let isLoading: Bool
+    let isEnabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        HStack {
+            Spacer()
+            Button(action: action) {
+                HorusLabel(
+                    title: isLoading ? "Loading earlier messages" : "Load earlier messages",
+                    glyph: .arrowUp,
+                    iconColor: palette.accent
+                )
+                .frame(minHeight: HorusStyle.iconButtonSize)
+            }
+            .buttonStyle(.horusPlain)
+            .foregroundStyle(isEnabled ? palette.accent : palette.muted)
+            .tint(palette.accent)
+            .disabled(!isEnabled)
+            .accessibilityLabel(
+                isLoading ? "Loading earlier messages" : "Load earlier messages"
+            )
+            Spacer()
+        }
+    }
+}
+
 private struct TranscriptView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.horusPalette) private var palette
     let bottomInset: CGFloat
     @Binding var isAtBottom: Bool
     let scrollToBottomRequest: Int
@@ -271,48 +341,19 @@ private struct TranscriptView: View {
             // blank gaps produced by LazyVStack estimates. Paginate before making this lazy again.
             VStack(alignment: .leading, spacing: 0) {
                 if model.hasEarlierHistory {
-                    HStack {
-                        Spacer()
-                        Button(action: loadEarlierHistory) {
-                            HorusLabel(
-                                title: model.isLoadingEarlierHistory
-                                    ? "Loading earlier messages"
-                                    : "Load earlier messages",
-                                glyph: .arrowUp,
-                                iconColor: palette.accent
-                            )
-                        }
-                        .buttonStyle(.horusPlain)
-                        .foregroundStyle(model.canLoadEarlierHistory ? palette.accent : palette.muted)
-                        .tint(palette.accent)
-                        .disabled(!model.canLoadEarlierHistory)
-                        .accessibilityLabel(
-                            model.isLoadingEarlierHistory
-                                ? "Loading earlier messages"
-                                : "Load earlier messages"
-                        )
-                        Spacer()
-                    }
+                    TranscriptPaginationButton(
+                        isLoading: model.isLoadingEarlierHistory,
+                        isEnabled: model.canLoadEarlierHistory,
+                        action: loadEarlierHistory
+                    )
                     .padding(.bottom, rowSpacing)
                 }
-                let activeStepID = model.activeTranscriptStepID
-                ForEach(rows) { row in
-                    Group {
-                        if row.isEventGroup {
-                            EventGroupView(
-                                entries: row.entries,
-                                isActive: row.entries.contains { $0.id == activeStepID }
-                            )
-                        } else if let entry = row.entries.first {
-                            TranscriptRow(
-                                entry: entry,
-                                isActive: entry.id == activeStepID
-                            )
-                        }
-                    }
-                    .id(row.id)
-                    .padding(.top, row.topSpacing)
-                }
+                TranscriptRowsView(
+                    entries: model.displayedTranscript,
+                    activeStepID: model.activeTranscriptStepID,
+                    breakBefore: historyAnchorID,
+                    rowSpacing: rowSpacing
+                )
                 ForEach(model.transcriptTailWidgets) { widget in
                     QueuedMessageView(widget: widget)
                         .padding(.top, rowSpacing)
@@ -385,27 +426,6 @@ private struct TranscriptView: View {
         model.loadEarlierHistory()
     }
 
-    // Spacing is resolved up front: a row body must never index back into the live
-    // transcript, which can shrink between layout passes.
-    //
-    // A continuous activity sequence collapses together even when its typed roles or owning
-    // capabilities differ. Messages, reasoning, and the history-page anchor remain boundaries.
-    private var rows: [TranscriptRowLayout] {
-        var result: [TranscriptRowLayout] = []
-
-        // Keep the previous page boundary as a stable scroll target after prepending.
-        for entries in TranscriptEntry.groupedRows(
-            from: model.displayedTranscript,
-            breakBefore: historyAnchorID
-        ) {
-            result.append(TranscriptRowLayout(
-                entries: entries,
-                topSpacing: result.isEmpty ? 0 : rowSpacing
-            ))
-        }
-        return result
-    }
-
     private var emptyState: some View {
         HorusComposingOrb()
             .frame(width: 144, height: 144)
@@ -436,6 +456,7 @@ private struct TranscriptRow: View {
     @State private var isHovered = false
     let entry: TranscriptEntry
     let isActive: Bool
+    var collapsesLongMessages = false
 
     var body: some View {
         Group {
@@ -472,7 +493,15 @@ private struct TranscriptRow: View {
             VStack(alignment: .leading, spacing: 6) {
                 TranscriptFileCards(files: entry.files)
                 if !entry.text.isEmpty {
-                    HorusMarkdownText(entry.text, streaming: entry.pending)
+                    if collapsesLongMessages {
+                        CollapsibleText(
+                            text: entry.text,
+                            rendersMarkdown: true,
+                            streaming: entry.pending
+                        )
+                    } else {
+                        HorusMarkdownText(entry.text, streaming: entry.pending)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -562,7 +591,7 @@ private struct UserMessageContent: View {
         VStack(alignment: .trailing, spacing: 6) {
             TranscriptFileCards(files: entry.files)
             if !entry.text.isEmpty {
-                CollapsibleUserText(text: entry.text)
+                CollapsibleText(text: entry.text)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
                     .background(palette.accentSoft, in: HorusStyle.cardShape)
@@ -571,55 +600,95 @@ private struct UserMessageContent: View {
     }
 }
 
-private struct UserMessageEndAttribute: TextAttribute {}
+private struct CollapsibleTextEndAttribute: TextAttribute {}
 
-private struct CollapsibleUserText: View {
+struct CollapsibleText: View {
     private static let collapsedLineLimit = 21
+    // Bound the text SwiftUI must shape while collapsed. Four thousand characters still
+    // exceed 21 lines at the transcript's widest supported layout, including on iPad.
+    private static let collapsedCharacterLimit = 4_096
 
     @Environment(\.horusPalette) private var palette
     @State private var isExpanded = false
     @State private var isTruncated = false
+    @State private var hasMeasured = false
     let text: String
+    var rendersMarkdown = false
+    var streaming = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            markedText
-                .lineLimit(isExpanded ? nil : Self.collapsedLineLimit)
-                .truncationMode(.tail)
-                .textSelection(.enabled)
-                .onPreferenceChange(Text.LayoutKey.self) { layouts in
-                    guard !isExpanded, !layouts.isEmpty else { return }
-                    let reachedEnd = layouts.contains { proxy in
-                        proxy.layout.contains { line in
-                            line.contains { run in
-                                run[UserMessageEndAttribute.self] != nil
-                            }
-                        }
-                    }
-                    let isTruncated = !reachedEnd
-                    if self.isTruncated != isTruncated {
-                        self.isTruncated = isTruncated
-                    }
-                }
-            if isTruncated && !isExpanded {
-                Button("Read more") {
-                    isExpanded = true
+            renderedText
+            if isTruncated {
+                Button(isExpanded ? "Show less" : "Read more") {
+                    isExpanded.toggle()
                 }
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(palette.accent)
                 .buttonStyle(.horusPlain)
-                .accessibilityHint("Expands the full message")
+                .frame(minHeight: HorusStyle.iconButtonSize, alignment: .leading)
+                .accessibilityHint(
+                    isExpanded ? "Collapses the message" : "Expands the full message"
+                )
             }
+        }
+        .onChange(of: text) { _, _ in
+            guard !isExpanded else { return }
+            hasMeasured = false
+            isTruncated = false
         }
     }
 
+    @ViewBuilder
+    private var renderedText: some View {
+        if rendersMarkdown && (isExpanded || (hasMeasured && !isTruncated)) {
+            HorusMarkdownText(text, streaming: streaming)
+        } else {
+            markedText
+                .lineLimit(isExpanded ? nil : Self.collapsedLineLimit)
+                .truncationMode(.tail)
+                .textSelection(.enabled)
+                .onPreferenceChange(Text.LayoutKey.self, perform: measureTruncation)
+        }
+    }
+
+    private func measureTruncation(_ layouts: Text.LayoutKey.Value) {
+        guard !isExpanded, !layouts.isEmpty else { return }
+        if hidesBoundedSuffix {
+            isTruncated = true
+            hasMeasured = true
+            return
+        }
+        let reachedEnd = layouts.contains { proxy in
+            proxy.layout.contains { line in
+                line.contains { run in
+                    run[CollapsibleTextEndAttribute.self] != nil
+                }
+            }
+        }
+        isTruncated = !reachedEnd
+        hasMeasured = true
+    }
+
     private var markedText: Text {
-        guard let end = text.lastIndex(where: { !$0.isNewline }) else {
-            return Text(text)
+        let source = displayedText
+        guard let end = source.lastIndex(where: { !$0.isNewline }) else {
+            return Text(source)
         }
         return Text(
-            "\(Text(text[..<end]))\(Text(text[end...]).customAttribute(UserMessageEndAttribute()))"
+            "\(Text(source[..<end]))\(Text(source[end...]).customAttribute(CollapsibleTextEndAttribute()))"
         )
+    }
+
+    private var displayedText: String {
+        guard !isExpanded else { return text }
+        let prefix = text.prefix(Self.collapsedCharacterLimit)
+        guard prefix.endIndex != text.endIndex else { return text }
+        return "\(prefix)…"
+    }
+
+    private var hidesBoundedSuffix: Bool {
+        text.prefix(Self.collapsedCharacterLimit).endIndex != text.endIndex
     }
 }
 
@@ -677,7 +746,7 @@ private struct QueuedMessageView: View {
     var body: some View {
         HStack {
             Spacer(minLength: 42)
-            CollapsibleUserText(text: widget.widget.text)
+            CollapsibleText(text: widget.widget.text)
                 .font(HorusStyle.bodyFont)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 16)
@@ -1477,7 +1546,7 @@ private struct SessionStatsBadge: View {
     }
 }
 
-private struct BadgePopover<Content: View>: View {
+struct BadgePopover<Content: View>: View {
     let title: String
     @ViewBuilder let content: Content
 
@@ -1761,8 +1830,10 @@ struct FrontendWidgetContentView: View {
                 }
                 .buttonStyle(.horusPlain)
                 .accessibilityLabel(option.label)
-                .accessibilityValue(option.detail)
-                .accessibilityHint(option.description)
+                .accessibilityValue(option.showsDetail ? option.detail : option.description)
+                .accessibilityHint(
+                    option.showsDetail ? option.description : "Activates this option"
+                )
                 .disabled(!actionsEnabled)
             }
         case .actionList(_, let items):
@@ -1928,6 +1999,10 @@ private struct FrontendPickerOptionLabel: View {
 
     var body: some View {
         HStack(spacing: 8) {
+            if let symbol = option.symbol,
+               let glyph = HorusSymbol.knownGlyph(for: symbol) {
+                HorusIcon(glyph, size: 15, foreground: palette.accent)
+            }
             Text(option.label)
                 .font(HorusStyle.controlFont.weight(.semibold))
                 .foregroundStyle(palette.accent)
@@ -1939,7 +2014,7 @@ private struct FrontendPickerOptionLabel: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
-            if !option.detail.isEmpty {
+            if option.showsDetail, !option.detail.isEmpty {
                 Text(option.detail)
                     .font(HorusStyle.metadataFont)
                     .foregroundStyle(palette.muted)
@@ -2022,8 +2097,10 @@ private struct FrontendPickerView: View {
                     }
                     .buttonStyle(.horusPlain)
                     .accessibilityLabel(option.label)
-                    .accessibilityValue(option.detail)
-                    .accessibilityHint(option.description)
+                    .accessibilityValue(option.showsDetail ? option.detail : option.description)
+                    .accessibilityHint(
+                        option.showsDetail ? option.description : "Activates this option"
+                    )
                 }
             }
         }

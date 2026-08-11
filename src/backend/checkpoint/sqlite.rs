@@ -1885,8 +1885,13 @@ mod tests {
                 options: Vec::new(),
             }),
             EventMsg::Frontend(FrontendEvent::Preview {
+                id: "preview".into(),
                 title: "Preview".into(),
+                subtitle: String::new(),
+                page_id: "preview:latest".into(),
+                update: crate::protocol::FrontendPreviewUpdate::Replace,
                 events: Vec::new(),
+                next: None,
             }),
             EventMsg::Frontend(FrontendEvent::Widget {
                 capability: "test".into(),

@@ -589,44 +589,162 @@ struct NumberedSourceText: View {
 }
 
 struct PreviewTranscriptSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+    @State private var retainedEntryID: String?
+    @State private var selectedDetent: PresentationDetent = .large
     let preview: TranscriptPreview
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                VStack(spacing: 8) {
-                    Text(preview.title)
-                        .font(.title2)
-                        .bold()
-                    HStack(spacing: 8) {
-                        if let status = preview.status {
-                            HorusBadge(text: status, tone: status == "errored" ? "error" : "neutral")
+        VStack(spacing: 0) {
+            header
+            Divider()
+            ZStack {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        // This is the chat transcript surface without its navigation or composer.
+                        // Exact rows avoid lazy height estimates for very long agent messages.
+                        VStack(alignment: .leading, spacing: 0) {
+                            if let next = currentPreview.next {
+                                TranscriptPaginationButton(
+                                    isLoading: model.isLoadingPreviewPage,
+                                    isEnabled: !model.isLoadingPreviewPage
+                                ) {
+                                    retainedEntryID = currentPreview.entries.first?.id
+                                    model.loadPreviewPage(next)
+                                }
+                                .padding(.bottom, 12)
+                            }
+                            TranscriptRowsView(
+                                entries: currentPreview.entries,
+                                activeStepID: nil,
+                                breakBefore: retainedEntryID,
+                                collapsesLongMessages: true
+                            )
                         }
-                        if let model = preview.model {
-                            Text(model)
-                                .font(HorusStyle.metadataFont)
-                                .foregroundStyle(.secondary)
-                        }
+                        .scrollTargetLayout()
+                        .frame(maxWidth: 880)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                    }
+                    .background(HorusBackdrop())
+                    .scrollIndicators(.hidden)
+                    .refreshable { loadEarlierPage() }
+                    .onChange(of: currentPreview.entries.count) { _, _ in
+                        guard let retainedEntryID else { return }
+                        proxy.scrollTo(retainedEntryID, anchor: .top)
+                        self.retainedEntryID = nil
                     }
                 }
-                .frame(maxWidth: .infinity)
-                .padding()
 
-                Divider()
-
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(preview.blocks) { block in
-                            PreviewBlockView(block: block.block)
-                        }
+                if model.isLoadingPreviewPage {
+                    ZStack {
+                        palette.canvas.opacity(0.58)
+                        HorusComposingOrb()
+                            .frame(width: 112, height: 112)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding()
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Loading earlier agent messages")
                 }
-                .scrollIndicators(.hidden)
             }
         }
-        .presentationDetents([.medium, .large])
+        .presentationDetents([.medium, .large], selection: $selectedDetent)
+    }
+
+    private var header: some View {
+        HStack(spacing: 6) {
+            Text(agentName)
+                .font(HorusStyle.controlFont.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if let status = currentPreview.status {
+                headerSeparator
+                Text(status)
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(status == "errored" ? palette.danger : palette.muted)
+                    .lineLimit(1)
+            }
+            if let choice = modelChoice {
+                headerSeparator
+                HorusMenuLabel(
+                    text: model.modelLabel(for: choice),
+                    glyph: model.providerSymbol(for: choice)
+                        .flatMap(HorusSymbol.knownGlyph(for:)) ?? .robot,
+                    detail: choice.reasoningEffort?.capitalized,
+                    showsDisclosure: false
+                )
+                .layoutPriority(1)
+                .accessibilityLabel("Model and reasoning")
+                .accessibilityValue(modelSummary(choice))
+            }
+            Spacer(minLength: 0)
+            if !currentPreview.context.isEmpty {
+                SettingsInfoButton(
+                    title: "Spawn context: \(currentPreview.context)",
+                    detail: spawnContextDetail,
+                    glyph: spawnContextGlyph,
+                    accessibilityHint: "Explains the inherited conversation context"
+                )
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
+        .padding(.leading, 16)
+        .padding(.trailing, HorusStyle.iconRowPadding)
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var headerSeparator: some View {
+        Text("•")
+            .font(HorusStyle.metadataFont)
+            .foregroundStyle(palette.muted)
+            .accessibilityHidden(true)
+    }
+
+    private func loadEarlierPage() {
+        guard let next = currentPreview.next, !model.isLoadingPreviewPage else { return }
+        retainedEntryID = currentPreview.entries.first?.id
+        model.loadPreviewPage(next)
+    }
+
+    private var currentPreview: TranscriptPreview {
+        if model.presentedPreview?.id == preview.id, let presented = model.presentedPreview {
+            return presented
+        }
+        return model.previews.first(where: { $0.id == preview.id }) ?? preview
+    }
+
+    private var agentName: String {
+        currentPreview.title
+    }
+
+    private var modelChoice: ModelChoice? {
+        guard let route = currentPreview.model else { return nil }
+        return model.modelChoices.first { $0.route == route }
+    }
+
+    private func modelSummary(_ choice: ModelChoice) -> String {
+        let name = model.modelLabel(for: choice)
+        guard let reasoning = choice.reasoningEffort, !reasoning.isEmpty else { return name }
+        return "\(name) · \(reasoning.capitalized)"
+    }
+
+    private var spawnContextGlyph: HorusGlyph {
+        let context = currentPreview.context.lowercased()
+        if context.hasPrefix("no ") || context == "none" { return .circle }
+        if context.hasPrefix("full") { return .circleDot }
+        return .circleDotDashed
+    }
+
+    private var spawnContextDetail: String {
+        let context = currentPreview.context.lowercased()
+        if context.hasPrefix("no ") || context == "none" {
+            return "This agent started fresh with only its assigned task. It inherited none of the parent conversation."
+        }
+        if context.hasPrefix("full") {
+            return "This agent inherited the full parent conversation as its starting context."
+        }
+        return "This agent inherited \(currentPreview.context.lowercased()) from the parent conversation."
     }
 }
 
@@ -642,7 +760,7 @@ struct PreviewBlockView: View {
             if !block.text.isEmpty {
                 HStack(alignment: .top, spacing: 8) {
                     if block.pending { ProgressView().controlSize(.mini) }
-                    Text(block.text)
+                    CollapsibleText(text: block.text)
                         .font(
                             block.format == "unified_diff"
                                 ? HorusStyle.metadataFont

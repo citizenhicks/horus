@@ -248,6 +248,8 @@ fn fork_options(
                 label: compact_message(&message),
                 description: description.into(),
                 detail: String::new(),
+                symbol: None,
+                shows_detail: false,
                 op: Op::CapabilityCommand {
                     capability: MANIFEST.id.into(),
                     command: "fork".into(),
@@ -387,6 +389,8 @@ fn resume_page_options(
             label: text::WIDGET_MORE_CHATS.into(),
             description: String::new(),
             detail: String::new(),
+            symbol: None,
+            shows_detail: false,
             op: Op::CapabilityCommand {
                 capability: MANIFEST.id.into(),
                 command: "resume".into(),
@@ -425,6 +429,8 @@ fn resume_option(
         label,
         description,
         detail: String::new(),
+        symbol: None,
+        shows_detail: false,
         op: Op::ResumeSession {
             session_id: session.session_id,
         },

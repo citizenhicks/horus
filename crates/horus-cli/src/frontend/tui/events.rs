@@ -11,6 +11,7 @@ use super::view::terminal_text;
 use horus::protocol::AgentMessagePhase;
 use horus::protocol::EventMsg;
 use horus::protocol::FrontendEvent;
+use horus::protocol::FrontendPreviewUpdate;
 use horus::protocol::ModelStepContentPhase;
 use horus::protocol::ModelStepOutcome;
 use horus::protocol::Op;
@@ -18,6 +19,7 @@ use horus::protocol::RenderedBlock;
 use horus::protocol::TokenUsageInfo;
 use horus_gateway::wire::RecordedEvent;
 use horus_gateway::wire::RenderedEvent;
+use horus_gateway::wire::RenderedPreview;
 
 impl TuiState {
     pub(super) fn handle_agent_event(&mut self, event: EventMsg, blocks: Vec<RenderedBlock>) {
@@ -237,18 +239,65 @@ impl UsageStatus {
 
 pub(super) fn handle_gateway_event(state: &mut TuiState, record: RecordedEvent) {
     if let Some(preview) = record.preview {
-        let mut replay = TuiState::default();
-        for rendered in preview.events {
-            apply_rendered_event(&mut replay, rendered);
-        }
-        replay.commit_reasoning();
-        replay.commit_stream();
-        state.preview = Some(PreviewState::new(
-            preview.title,
-            PreviewContent::Snapshot(replay.transcript),
-        ));
+        apply_preview(state, preview);
     } else {
         state.handle_agent_event(record.event.msg, record.blocks);
+    }
+}
+
+fn apply_preview(state: &mut TuiState, preview: RenderedPreview) {
+    let current = state.preview.as_ref().and_then(|preview| {
+        let PreviewContent::Snapshot(snapshot) = &preview.content else {
+            return None;
+        };
+        Some(snapshot)
+    });
+    if preview.update == FrontendPreviewUpdate::Prepend
+        && !current.is_some_and(|snapshot| {
+            snapshot.id == preview.id && !snapshot.page_ids.contains(&preview.page_id)
+        })
+    {
+        return;
+    }
+
+    let RenderedPreview {
+        id,
+        title,
+        subtitle,
+        page_id,
+        update,
+        events,
+        next,
+    } = preview;
+    let mut replay = TuiState::default();
+    for rendered in events {
+        apply_rendered_event(&mut replay, rendered);
+    }
+    replay.commit_reasoning();
+    replay.commit_stream();
+
+    match update {
+        FrontendPreviewUpdate::Replace => {
+            state.preview = Some(PreviewState::snapshot(
+                id,
+                title,
+                subtitle,
+                page_id,
+                replay.transcript,
+                next,
+            ));
+        }
+        FrontendPreviewUpdate::Prepend => {
+            let Some(current) = state.preview.as_mut() else {
+                return;
+            };
+            let PreviewContent::Snapshot(snapshot) = &mut current.content else {
+                return;
+            };
+            current.title = super::bounded_title(&title);
+            current.subtitle = super::bounded_title(&subtitle);
+            snapshot.prepend(page_id, replay.transcript, next);
+        }
     }
 }
 

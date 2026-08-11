@@ -1,7 +1,7 @@
 import Foundation
 import UIKit
 
-let gatewayProtocolVersion = 24
+let gatewayProtocolVersion = 25
 let maximumGatewayFrameBytes = 20 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 let maximumSessionFileReferences = 16
@@ -1587,8 +1587,18 @@ struct RenderedBlock: Decodable, Sendable {
 }
 
 struct RenderedPreview: Decodable, Sendable {
+    let id: String
     let title: String
+    let subtitle: String
+    let pageId: String
+    let update: FrontendPreviewUpdate
     let events: [RenderedEventRecord]
+    let next: AgentOperation?
+}
+
+enum FrontendPreviewUpdate: String, Decodable, Sendable {
+    case replace
+    case prepend
 }
 
 struct RenderedEventRecord: Decodable, Sendable {
@@ -1658,19 +1668,32 @@ struct FrontendPickerOption: Identifiable, Sendable {
     let label: String
     let description: String
     let detail: String
+    let symbol: String?
+    let showsDetail: Bool
     let op: AgentOperation
 
     init(json: JSONValue) throws {
         guard let label = json["label"]?.stringValue,
               let description = json["description"]?.stringValue,
               let detail = json["detail"]?.stringValue,
+              let symbolValue = json["symbol"],
+              let showsDetail = json["showsDetail"]?.boolValue,
               let op = json["op"]
         else {
             throw GatewayWireError.invalidFrame("frontend picker option is missing a required field")
         }
+        let symbol: String?
+        switch symbolValue {
+        case .string(let value) where !value.isEmpty: symbol = value
+        case .null: symbol = nil
+        default:
+            throw GatewayWireError.invalidFrame("frontend picker option has an invalid symbol")
+        }
         self.label = label
         self.description = description
         self.detail = detail
+        self.symbol = symbol
+        self.showsDetail = showsDetail
         self.op = try AgentOperation(json: op)
     }
 }
@@ -2044,9 +2067,20 @@ extension AgentEventRecord {
                 }
                 try options.forEach { _ = try FrontendPickerOption(json: $0) }
             case "preview":
-                guard msg["title"]?.stringValue != nil, let events = msg["events"]?.arrayValue else {
+                guard let id = msg["id"]?.stringValue,
+                      !id.isEmpty,
+                      msg["title"]?.stringValue != nil,
+                      msg["subtitle"]?.stringValue != nil,
+                      let pageID = msg["pageId"]?.stringValue,
+                      !pageID.isEmpty,
+                      let update = msg["update"]?.stringValue,
+                      FrontendPreviewUpdate(rawValue: update) != nil,
+                      let events = msg["events"]?.arrayValue,
+                      let next = msg["next"]
+                else {
                     throw GatewayWireError.invalidFrame("frontend preview is missing a required field")
                 }
+                if next != .null { _ = try AgentOperation(json: next) }
                 try events.forEach(validate)
             default:
                 throw GatewayWireError.invalidFrame("unknown frontend event \(frontendType)")

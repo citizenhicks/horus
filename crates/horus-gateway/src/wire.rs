@@ -9,9 +9,9 @@ use horus::backend::checkpoint::{SessionSummary, StreamMetrics};
 use horus::backend::model::ModelChoice;
 use horus::backend::model::provider::HostedWebSearch;
 use horus::protocol::{
-    Event, EventMsg, FrontendBlock, FrontendContribution, FrontendSettingValue, FrontendSymbol,
-    FrontendWidget, MiddlewareFeature, RenderedBlock, SessionConfiguredEvent, SessionFileReference,
-    Submission, TokenUsage,
+    Event, EventMsg, FrontendBlock, FrontendContribution, FrontendPreviewUpdate,
+    FrontendSettingValue, FrontendSymbol, FrontendWidget, MiddlewareFeature, Op, RenderedBlock,
+    SessionConfiguredEvent, SessionFileReference, Submission, TokenUsage,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ mod base64_bytes {
 }
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 24;
+pub const PROTOCOL_VERSION: u16 = 25;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 20 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -785,8 +785,13 @@ impl MiddlewareConfig {
 /// Capability-rendered preview whose inner events remain provider-neutral.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderedPreview {
+    pub id: String,
     pub title: String,
+    pub subtitle: String,
+    pub page_id: String,
+    pub update: FrontendPreviewUpdate,
     pub events: Vec<RenderedEvent>,
+    pub next: Option<Op>,
 }
 
 /// One preview event and its capability-rendered blocks.
@@ -1239,6 +1244,33 @@ mod tests {
         let actual: ClientFrame =
             serde_json::from_slice(&encoded).expect("decode nested submission");
 
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rendered_preview_round_trip_preserves_page_metadata_and_continuation() {
+        let expected = RenderedPreview {
+            id: "/root/reviewer".into(),
+            title: "reviewer".into(),
+            subtitle: "Last 1 turn".into(),
+            page_id: "/root/reviewer:before-51".into(),
+            update: FrontendPreviewUpdate::Prepend,
+            events: Vec::new(),
+            next: Some(Op::CapabilityCommand {
+                capability: "subagents".into(),
+                command: "preview_page".into(),
+                arguments: r#"{"path":"/root/reviewer","position":{"kind":"before_sequence","before_sequence":2}}"#.into(),
+                input: None,
+                target: None,
+            }),
+        };
+
+        let encoded = serde_json::to_value(&expected).expect("encode rendered preview");
+        let actual: RenderedPreview =
+            serde_json::from_value(encoded.clone()).expect("decode rendered preview");
+
+        assert_eq!(encoded["update"], "prepend");
+        assert_eq!(encoded["page_id"], "/root/reviewer:before-51");
         assert_eq!(actual, expected);
     }
 

@@ -391,6 +391,7 @@ final class TranscriptEntry: Identifiable {
     var kind: Kind
     var capability: String?
     var role: FrontendBlockRole?
+    var update: FrontendBlockUpdate?
     var title: String
     var symbol: String?
     var group: String?
@@ -409,6 +410,7 @@ final class TranscriptEntry: Identifiable {
         kind: Kind,
         capability: String? = nil,
         role: FrontendBlockRole? = nil,
+        update: FrontendBlockUpdate? = nil,
         title: String = "",
         symbol: String? = nil,
         group: String? = nil,
@@ -426,6 +428,7 @@ final class TranscriptEntry: Identifiable {
         self.kind = kind
         self.capability = capability
         self.role = role
+        self.update = update
         self.title = title
         self.symbol = symbol
         self.group = group
@@ -590,17 +593,14 @@ private struct ReferenceMatchScore: Comparable {
     }
 }
 
-struct PreviewBlock: Identifiable, Sendable {
-    let id: String
-    let block: FrontendBlock
-}
-
-struct TranscriptPreview: Identifiable, Sendable {
+struct TranscriptPreview: Identifiable {
     let id: String
     let title: String
+    let context: String
     let status: String?
     let model: String?
-    let blocks: [PreviewBlock]
+    let entries: [TranscriptEntry]
+    let next: AgentOperation?
 }
 
 struct FrontendPickerPrompt: Sendable {
@@ -730,6 +730,7 @@ final class AppModel {
     var pendingPicker: FrontendPickerPrompt?
     var previews: [TranscriptPreview] = []
     var presentedPreview: TranscriptPreview?
+    private(set) var isLoadingPreviewPage = false
     var showsInspector = false
     var filesInspectorTab: FilesInspectorTab = .unstaged
     private(set) var workspaceFilesRevision = 0
@@ -866,6 +867,7 @@ final class AppModel {
     @ObservationIgnored private var historyRequestID: String?
     @ObservationIgnored private var nextHistoryBeforeSequence: UInt64?
     @ObservationIgnored private var previewSelections: [String: FrontendPickerOption] = [:]
+    @ObservationIgnored private var previewPageRequestID: String?
     @ObservationIgnored private var appIsInBackground = true
 
     init(
@@ -2307,6 +2309,26 @@ final class AppModel {
         ))
     }
 
+    func loadPreviewPage(_ operation: AgentOperation) {
+        guard let sessionID = selectedSessionID, !isLoadingPreviewPage else { return }
+        if case .capabilityCommand(let capability, _, _, _, _) = operation,
+           middlewareFeatures.contains(where: { $0.id == capability }),
+           !isCapabilityEnabled(capability) {
+            return
+        }
+        let id = requestID("preview-page")
+        previewPageRequestID = id
+        isLoadingPreviewPage = true
+        transmit(.submit(
+            sessionID: sessionID,
+            submission: Submission(id: id, op: operation)
+        )) { [weak self] _ in
+            guard self?.previewPageRequestID == id else { return }
+            self?.previewPageRequestID = nil
+            self?.isLoadingPreviewPage = false
+        }
+    }
+
     func submitPickerOption(_ option: FrontendPickerOption) {
         guard let sessionID = selectedSessionID else { return }
         let id = requestID("picker")
@@ -3506,6 +3528,10 @@ final class AppModel {
             historyRequestID = nil
             isLoadingEarlierHistory = false
         }
+        if rejection.requestId == previewPageRequestID {
+            previewPageRequestID = nil
+            isLoadingPreviewPage = false
+        }
         if rejection.requestId == sessionMutationRequestID {
             pendingDeletedSessionID = nil
             if let sessionID = pendingChatTitles.first(where: {
@@ -3664,6 +3690,10 @@ final class AppModel {
             if type == "warning" || type == "error" {
                 if let draft = pendingDrafts.removeValue(forKey: submissionID) { restoreDraft(draft) }
                 previewSelections.removeValue(forKey: submissionID)
+                if previewPageRequestID == submissionID {
+                    previewPageRequestID = nil
+                    isLoadingPreviewPage = false
+                }
                 rejectComposerEdit(requestID: submissionID)
             } else {
                 pendingDrafts.removeValue(forKey: submissionID)
@@ -3685,6 +3715,10 @@ final class AppModel {
             )
         }
         if let preview = record.preview {
+            if event.submissionId == previewPageRequestID {
+                previewPageRequestID = nil
+                isLoadingPreviewPage = false
+            }
             apply(
                 preview,
                 selection: event.submissionId.flatMap { previewSelections.removeValue(forKey: $0) }
@@ -3932,18 +3966,23 @@ final class AppModel {
         sequence: UInt64,
         blockIndex: Int,
         recordedAtMs: Int64,
+        recordID: String? = nil,
         to entries: inout [TranscriptEntry]
     ) {
         let block = rendered.block
-        let sourceID = block.id ?? "record:\(sequence):\(blockIndex)"
+        let sourceID = block.id
+            ?? recordID.map { "record:\($0):\(blockIndex)" }
+            ?? "record:\(sequence):\(blockIndex)"
         let id = scopedBlockID(capability: rendered.capability, sourceID: sourceID)
         let appending = block.update == .append
         let kind: TranscriptEntry.Kind = block.tone == "error" ? .error : .event
         if let index = entries.firstIndex(where: { $0.id == id }) {
+            let previousUpdate = entries[index].update
             entries[index].text = appending ? entries[index].text + block.text : block.text
             entries[index].kind = kind
             entries[index].capability = rendered.capability
             entries[index].role = block.role
+            entries[index].update = appending && previousUpdate == .append ? .append : .replace
             entries[index].title = block.title
             entries[index].symbol = block.symbol
             if block.group != nil { entries[index].group = block.group }
@@ -3961,10 +4000,13 @@ final class AppModel {
         } else {
             entries.append(TranscriptEntry(
                 id: id,
-                text: appending ? String(block.text.drop(while: { $0 == "\n" })) : block.text,
+                text: appending && recordID == nil
+                    ? String(block.text.drop(while: { $0 == "\n" }))
+                    : block.text,
                 kind: kind,
                 capability: rendered.capability,
                 role: block.role,
+                update: block.update,
                 title: block.title,
                 symbol: block.symbol,
                 group: block.group,
@@ -4000,109 +4042,71 @@ final class AppModel {
     }
 
     private func apply(_ preview: RenderedPreview, selection: FrontendPickerOption?) {
-        var blocks: [RenderedBlock] = []
-        for rendered in preview.events {
-            blocks.append(contentsOf: rendered.blocks)
-            if rendered.blocks.isEmpty {
-                blocks.append(contentsOf: previewBlocks(for: rendered))
-            }
+        var pageEntries: [TranscriptEntry] = []
+        for (index, rendered) in preview.events.enumerated() {
+            reduceHistory(
+                RecordedEvent(
+                    sequence: UInt64(index + 1),
+                    recordedAtMs: 0,
+                    event: AgentEventRecord(submissionId: nil, msg: rendered.event),
+                    streamMetrics: [],
+                    blocks: rendered.blocks,
+                    preview: nil
+                ),
+                into: &pageEntries,
+                recordID: "\(preview.pageId):\(index)"
+            )
         }
-        blocks = reducePreviewBlocks(blocks)
-        guard !blocks.isEmpty else { return }
-        let id = "preview-\(preview.title)"
-        let existing = previews.first { $0.id == id }
+        let existing = previews.first { $0.id == preview.id }
+        let visibleEntries = switch preview.update {
+        case .replace:
+            pageEntries
+        case .prepend:
+            mergePreviewPages(older: pageEntries, newer: existing?.entries ?? [])
+        }
         let record = TranscriptPreview(
-            id: id,
+            id: preview.id,
             title: preview.title,
+            context: preview.subtitle.isEmpty ? existing?.context ?? "" : preview.subtitle,
             status: selection?.description ?? existing?.status,
             model: selection?.detail ?? existing?.model,
-            blocks: blocks.enumerated().map { index, rendered in
-                let sourceID = rendered.block.id ?? "\(id)-\(index)"
-                return PreviewBlock(
-                    id: scopedBlockID(capability: rendered.capability, sourceID: sourceID),
-                    block: rendered.block
-                )
-            }
+            entries: visibleEntries,
+            next: preview.next
         )
-        if let index = previews.firstIndex(where: { $0.id == id }) {
+        if let index = previews.firstIndex(where: { $0.id == preview.id }) {
             previews[index] = record
         } else {
             previews.append(record)
         }
-        if selection != nil { presentedPreview = record }
+        if selection != nil || presentedPreview?.id == preview.id { presentedPreview = record }
     }
 
-    private func reducePreviewBlocks(_ blocks: [RenderedBlock]) -> [RenderedBlock] {
-        var result: [RenderedBlock] = []
-        for rendered in blocks {
-            let block = rendered.block
-            guard let id = block.id,
-                  let index = result.lastIndex(where: {
-                      $0.capability == rendered.capability && $0.block.id == id
-                  })
-            else {
-                result.append(rendered)
-                continue
+    private func mergePreviewPages(
+        older: [TranscriptEntry],
+        newer: [TranscriptEntry]
+    ) -> [TranscriptEntry] {
+        var merged = copiedTranscript(older)
+        var indices: [String: Int] = [:]
+        for index in merged.indices { indices[merged[index].id] = index }
+        for source in newer {
+            let entry = copiedTranscript([source])[0]
+            if let index = indices[entry.id] {
+                let previous = merged[index]
+                if entry.update == .append {
+                    entry.text = previous.text + entry.text
+                    entry.files = mergedFiles(previous.files, with: entry.files, appending: true)
+                    if entry.group == nil { entry.group = previous.group }
+                    entry.update = previous.update == .append ? .append : .replace
+                } else if entry.modelStepID != nil, entry.pending, previous.pending {
+                    entry.text = previous.text + entry.text
+                }
+                merged[index] = entry
+            } else {
+                indices[entry.id] = merged.count
+                merged.append(entry)
             }
-            let current = result[index].block
-            let appending = block.update == .append
-            result[index] = RenderedBlock(capability: rendered.capability, block: FrontendBlock(
-                id: id,
-                group: block.group ?? current.group,
-                update: .replace,
-                state: block.state,
-                role: block.role,
-                title: block.title,
-                text: appending ? current.text + block.text : block.text,
-                symbol: block.symbol,
-                format: block.format,
-                tone: block.tone,
-                files: mergedFiles(
-                    current.files,
-                    with: block.files,
-                    appending: appending
-                )
-            ))
         }
-        return result
-    }
-
-    private func previewBlocks(for rendered: RenderedEventRecord) -> [RenderedBlock] {
-        let type = rendered.event["type"]?.stringValue
-        let title: String
-        let text: String?
-        switch type {
-        case "user_message":
-            title = "User"
-            text = rendered.event["message"]?.stringValue
-        case "agent_message":
-            title = "Horus"
-            text = rendered.event["message"]?.stringValue
-        case "agent_message_content_delta":
-            title = rendered.event["phase"]?.stringValue == "commentary"
-                ? "Commentary"
-                : "Horus"
-            text = rendered.event["delta"]?.stringValue
-        case "agent_reasoning_content_delta":
-            title = "Working notes"
-            text = rendered.event["delta"]?.stringValue
-        default:
-            return []
-        }
-        guard let text, !text.isEmpty else { return [] }
-        return [RenderedBlock(capability: "agent", block: FrontendBlock(
-            id: nil,
-            group: nil,
-            update: .replace,
-            state: .complete,
-            role: .notice,
-            title: title,
-            text: text,
-            symbol: nil,
-            format: "plain_text",
-            tone: "neutral",
-            files: []
-        ))]
+        return merged
     }
 
     private func appendText(
@@ -4372,6 +4376,7 @@ final class AppModel {
                 kind: entry.kind,
                 capability: entry.capability,
                 role: entry.role,
+                update: entry.update,
                 title: entry.title,
                 symbol: entry.symbol,
                 group: entry.group,
@@ -4389,7 +4394,8 @@ final class AppModel {
 
     private func reduceHistory(
         _ record: RecordedEvent,
-        into entries: inout [TranscriptEntry]
+        into entries: inout [TranscriptEntry],
+        recordID: String? = nil
     ) {
         let event = record.event.msg
         let type = event["type"]?.stringValue ?? "unknown"
@@ -4399,6 +4405,7 @@ final class AppModel {
                 sequence: record.sequence,
                 blockIndex: index,
                 recordedAtMs: record.recordedAtMs,
+                recordID: recordID,
                 to: &entries
             )
         }
@@ -4411,7 +4418,7 @@ final class AppModel {
             appendText(
                 event["message"]?.stringValue,
                 kind: .user,
-                id: "event:\(record.sequence):user",
+                id: "event:\(recordID ?? String(record.sequence)):user",
                 sourceSequence: record.sequence,
                 recordedAtMs: record.recordedAtMs,
                 messageTarget: messageTarget(from: event),
@@ -5608,6 +5615,8 @@ final class AppModel {
         previews = []
         presentedPreview = nil
         previewSelections.removeAll()
+        previewPageRequestID = nil
+        isLoadingPreviewPage = false
         showsInspector = false
         currentUsage = TokenUsage()
         lastUsage = TokenUsage()

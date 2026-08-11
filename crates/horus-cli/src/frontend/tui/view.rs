@@ -224,8 +224,15 @@ pub(super) fn render_preview(frame: &mut Frame<'_>, state: &mut TuiState) {
         let Some(preview) = state.preview.as_ref() else {
             return;
         };
+        let has_older = matches!(&preview.content, PreviewContent::Snapshot(snapshot) if snapshot.next.is_some());
+        let older_hint = if has_older { " · O older" } else { "" };
+        let title = if preview.subtitle.is_empty() {
+            format!("{}{older_hint}", preview.title)
+        } else {
+            format!("{}{older_hint} · {}", preview.title, preview.subtitle)
+        };
         (
-            preview.title.clone(),
+            title,
             matches!(&preview.content, PreviewContent::LiveTranscript),
         )
     };
@@ -239,10 +246,10 @@ pub(super) fn render_preview(frame: &mut Frame<'_>, state: &mut TuiState) {
     let inner = block.inner(area);
     let mut lines = if live {
         live_transcript_lines(state, 0, inner.width)
-    } else if let Some(PreviewContent::Snapshot(transcript)) =
+    } else if let Some(PreviewContent::Snapshot(snapshot)) =
         state.preview.as_mut().map(|preview| &mut preview.content)
     {
-        transcript_lines(transcript.iter_mut(), inner.width, None, false)
+        transcript_lines(snapshot.transcript.iter_mut(), inner.width, None, false)
     } else {
         Vec::new()
     };
@@ -788,7 +795,7 @@ fn render_picker_menu(frame: &mut Frame<'_>, area: Rect, picker: &super::PickerS
         .options
         .iter()
         .map(|option| {
-            let description = if option.detail.is_empty() {
+            let description = if !option.shows_detail || option.detail.is_empty() {
                 option.description.clone()
             } else {
                 format!("{} · {}", option.description, option.detail)

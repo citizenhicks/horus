@@ -567,6 +567,8 @@ fn model_picker(choices: &[ModelChoice]) -> CommandAction {
                 |effort| format!("{} · {effort}", choice.group),
             ),
             detail: String::new(),
+            symbol: None,
+            shows_detail: false,
             op: Op::SetModel {
                 route: choice.route.clone(),
             },
@@ -599,6 +601,8 @@ fn reasoning_picker(route: &str, choices: &[ModelChoice]) -> CommandAction {
                 choice.model.clone()
             },
             detail: String::new(),
+            symbol: None,
+            shows_detail: false,
             op: Op::SetModel {
                 route: choice.route.clone(),
             },

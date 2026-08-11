@@ -1140,12 +1140,14 @@ struct SettingsInfoButton: View {
     @State private var showsDetail = false
     let title: String
     let detail: String
+    var glyph: HorusGlyph = .info
+    var accessibilityHint = "Shows setting guidance"
 
     var body: some View {
         Button {
             showsDetail = true
         } label: {
-            HorusIcon(.info, size: 15, foreground: palette.muted)
+            HorusIcon(glyph, size: 15, foreground: palette.muted)
                 .frame(
                     minWidth: HorusStyle.iconButtonSize,
                     minHeight: HorusStyle.iconButtonSize
@@ -1154,7 +1156,7 @@ struct SettingsInfoButton: View {
         }
         .buttonStyle(.horusPlain)
         .accessibilityLabel("About \(title)")
-        .accessibilityHint("Shows setting guidance")
+        .accessibilityHint(accessibilityHint)
         .help("About \(title)")
         .sensoryFeedback(.selection, trigger: showsDetail)
         .popover(

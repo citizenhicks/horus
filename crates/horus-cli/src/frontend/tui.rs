@@ -31,10 +31,11 @@ use horus::protocol::FrontendPickerOption;
 use horus::protocol::FrontendTone;
 use horus::protocol::FrontendWidget;
 use horus::protocol::ModelStepContentPhase;
+use horus::protocol::Op;
 use horus::protocol::RenderedBlock;
 use horus::protocol::SessionResumeRequestedEvent;
 #[cfg(test)]
-use horus::protocol::{EventMsg, FrontendEvent, Op};
+use horus::protocol::{EventMsg, FrontendEvent};
 
 const MAX_ENTRY_BYTES: usize = 40_000;
 const MAX_COMPOSER_HISTORY_ENTRIES: usize = 100;
@@ -174,6 +175,7 @@ impl Viewport {
 
 struct PreviewState {
     title: String,
+    subtitle: String,
     content: PreviewContent,
     viewport: Viewport,
 }
@@ -182,7 +184,24 @@ impl PreviewState {
     fn new(title: String, content: PreviewContent) -> Self {
         Self {
             title: bounded_title(&title),
+            subtitle: String::new(),
             content,
+            viewport: Viewport::default(),
+        }
+    }
+
+    fn snapshot(
+        id: String,
+        title: String,
+        subtitle: String,
+        page_id: String,
+        transcript: VecDeque<TranscriptEntry>,
+        next: Option<Op>,
+    ) -> Self {
+        Self {
+            title: bounded_title(&title),
+            subtitle: bounded_title(&subtitle),
+            content: PreviewContent::Snapshot(SnapshotPreview::new(id, page_id, transcript, next)),
             viewport: Viewport::default(),
         }
     }
@@ -190,7 +209,44 @@ impl PreviewState {
 
 enum PreviewContent {
     LiveTranscript,
-    Snapshot(VecDeque<TranscriptEntry>),
+    Snapshot(SnapshotPreview),
+}
+
+struct SnapshotPreview {
+    id: String,
+    page_ids: BTreeSet<String>,
+    transcript: VecDeque<TranscriptEntry>,
+    next: Option<Op>,
+}
+
+impl SnapshotPreview {
+    fn new(
+        id: String,
+        page_id: String,
+        transcript: VecDeque<TranscriptEntry>,
+        next: Option<Op>,
+    ) -> Self {
+        Self {
+            id,
+            page_ids: BTreeSet::from([page_id]),
+            transcript,
+            next,
+        }
+    }
+
+    fn prepend(
+        &mut self,
+        page_id: String,
+        mut transcript: VecDeque<TranscriptEntry>,
+        next: Option<Op>,
+    ) {
+        if !self.page_ids.insert(page_id) {
+            return;
+        }
+        transcript.append(&mut self.transcript);
+        self.transcript = transcript;
+        self.next = next;
+    }
 }
 
 struct InputDraft {

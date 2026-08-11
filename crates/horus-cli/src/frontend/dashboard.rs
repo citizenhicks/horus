@@ -1172,7 +1172,7 @@ fn render_overlay_picker(
     let lines = options
         .iter()
         .map(|option| {
-            let detail = if option.detail.is_empty() {
+            let detail = if !option.shows_detail || option.detail.is_empty() {
                 option.description.clone()
             } else {
                 format!("{} · {}", option.description, option.detail)
@@ -1768,6 +1768,8 @@ mod tests {
                     label: "Apply".into(),
                     description: "Apply the advertised operation".into(),
                     detail: String::new(),
+                    symbol: None,
+                    shows_detail: false,
                     op: op.clone(),
                 }],
             }),

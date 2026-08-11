@@ -5,6 +5,7 @@ use ratatui::crossterm::event::KeyModifiers;
 use ratatui::crossterm::event::MouseEvent;
 use ratatui::crossterm::event::MouseEventKind;
 
+use super::PreviewContent;
 use super::TranscriptTone;
 use super::TuiState;
 use super::references::ReferenceToken;
@@ -205,6 +206,21 @@ impl TuiState {
         {
             self.preview = None;
             return UiAction::None;
+        }
+        if key.kind == KeyEventKind::Press
+            && matches!(key.code, KeyCode::Char('o' | 'O'))
+            && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+        {
+            return self
+                .preview
+                .as_ref()
+                .and_then(|preview| {
+                    let PreviewContent::Snapshot(snapshot) = &preview.content else {
+                        return None;
+                    };
+                    snapshot.next.clone()
+                })
+                .map_or(UiAction::None, UiAction::Submit);
         }
         let preview = self.preview.as_mut().expect("preview checked");
         match key.code {

@@ -369,8 +369,13 @@ mod tests {
                 if context.command == "preview" {
                     context.events.push(EventMsg::Frontend(
                         crate::protocol::FrontendEvent::Preview {
+                            id: "preview".into(),
                             title: "preview".into(),
+                            subtitle: String::new(),
+                            page_id: "preview:latest".into(),
+                            update: crate::protocol::FrontendPreviewUpdate::Replace,
                             events: Vec::new(),
+                            next: None,
                         },
                     ));
                     return Ok(Some(ActiveSubmissionResult::Handled));
