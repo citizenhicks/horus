@@ -15,7 +15,10 @@ enum HorusStyle {
     static let cardPadding: CGFloat = 14
     static let controlHeight: CGFloat = 30
     static let badgeHeight: CGFloat = 26
-    static let iconSize: CGFloat = 16
+    /// Glyphs sit inside a 44pt target, so 16 left them floating in air. This fills the
+    /// button without changing it: the tap area, and every explicit size a call site asks
+    /// for, are untouched.
+    static let iconSize: CGFloat = 22
     static let iconButtonSize: CGFloat = 44
     static let borderWidth: CGFloat = 0.75
     /// Empty space an icon button keeps around its glyph to reach a full tap target.
