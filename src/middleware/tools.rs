@@ -629,7 +629,9 @@ impl Tool for ApplyPatch {
                 )));
             }
             let content = context.sandbox.read(&arguments.path).await?;
-            let patch = diffy::Patch::from_str(&arguments.patch).map_err(|error| {
+            let normalized_patch = normalize_hunk_header_counts(&arguments.patch);
+            let patch_source = normalized_patch.as_deref().unwrap_or(&arguments.patch);
+            let patch = diffy::Patch::from_str(patch_source).map_err(|error| {
                 malformed_patch_error(&content, &arguments.patch, &error.to_string())
             })?;
             if patch.hunks().is_empty() {
@@ -665,6 +667,101 @@ impl Tool for ApplyPatch {
     }
 }
 
+struct HunkHeader<'a> {
+    old_start: &'a str,
+    old_count: usize,
+    new_start: &'a str,
+    new_count: usize,
+    suffix: &'a str,
+}
+
+/// Repairs only redundant range counts; strict parsing still validates the patch structure.
+fn normalize_hunk_header_counts(input: &str) -> Option<String> {
+    let lines = input.split_inclusive('\n').collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(input.len());
+    let mut index = 0;
+    let mut saw_hunk = false;
+    let mut changed = false;
+
+    while index < lines.len() {
+        let line = lines[index];
+        if !line.starts_with("@@ ") {
+            if saw_hunk && line.starts_with('@') {
+                return None;
+            }
+            normalized.push_str(line);
+            index += 1;
+            continue;
+        }
+
+        saw_hunk = true;
+        let header = parse_hunk_header(line)?;
+        let body_start = index + 1;
+        let mut body_end = body_start;
+        let mut old_count = 0_usize;
+        let mut new_count = 0_usize;
+        while body_end < lines.len() && !lines[body_end].starts_with('@') {
+            match lines[body_end].as_bytes().first().copied() {
+                Some(b' ') | Some(b'\n') => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+                Some(b'-') => old_count += 1,
+                Some(b'+') => new_count += 1,
+                Some(b'\\') if lines[body_end].starts_with("\\ No newline at end of file") => {}
+                _ => return None,
+            }
+            body_end += 1;
+        }
+
+        if old_count == header.old_count && new_count == header.new_count {
+            normalized.push_str(line);
+        } else {
+            normalized.push_str("@@ -");
+            normalized.push_str(header.old_start);
+            normalized.push(',');
+            normalized.push_str(&old_count.to_string());
+            normalized.push_str(" +");
+            normalized.push_str(header.new_start);
+            normalized.push(',');
+            normalized.push_str(&new_count.to_string());
+            normalized.push_str(" @@");
+            normalized.push_str(header.suffix);
+            changed = true;
+        }
+        for body_line in &lines[body_start..body_end] {
+            normalized.push_str(body_line);
+        }
+        index = body_end;
+    }
+
+    changed.then_some(normalized)
+}
+
+fn parse_hunk_header(line: &str) -> Option<HunkHeader<'_>> {
+    let (ranges, suffix) = line.strip_prefix("@@ ")?.split_once(" @@")?;
+    let (old_range, new_range) = ranges.split_once(' ')?;
+    let (old_start, old_count) = parse_hunk_range(old_range, '-')?;
+    let (new_start, new_count) = parse_hunk_range(new_range, '+')?;
+    Some(HunkHeader {
+        old_start,
+        old_count,
+        new_start,
+        new_count,
+        suffix,
+    })
+}
+
+fn parse_hunk_range(range: &str, prefix: char) -> Option<(&str, usize)> {
+    let range = range.strip_prefix(prefix)?;
+    let (start, count) = match range.split_once(',') {
+        Some((start, count)) => (start, count.parse().ok()?),
+        None => (range, 1),
+    };
+    start.parse::<usize>().ok()?;
+    Some((start, count))
+}
+
 fn malformed_patch_error(content: &str, input: &str, reason: &str) -> Error {
     let received = input
         .lines()
@@ -675,8 +772,9 @@ fn malformed_patch_error(content: &str, input: &str, reason: &str) -> Error {
         "Patch rejected: malformed unified diff.\n\
          Reason: {reason}.\n\
          Expected hunk header format: @@ -start[,count] +start[,count] @@\n\
-         Received: {}\n\
-         Actual file has {} lines.",
+         Header counts describe old/new lines in the hunk body, not total file length.\n\
+         First header-like line: {}\n\
+         Target file line count: {}.",
         received.escape_debug(),
         content.lines().count()
     ))
