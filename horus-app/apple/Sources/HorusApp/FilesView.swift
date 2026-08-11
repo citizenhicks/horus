@@ -598,7 +598,6 @@ struct PreviewTranscriptSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider()
             ZStack {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -627,7 +626,6 @@ struct PreviewTranscriptSheet: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(16)
                     }
-                    .background(HorusBackdrop())
                     .scrollIndicators(.hidden)
                     .refreshable { loadEarlierPage() }
                     .onChange(of: currentPreview.entries.count) { _, _ in
@@ -648,6 +646,7 @@ struct PreviewTranscriptSheet: View {
                 }
             }
         }
+        .background(HorusBackdrop())
         .presentationDetents([.medium, .large], selection: $selectedDetent)
     }
 

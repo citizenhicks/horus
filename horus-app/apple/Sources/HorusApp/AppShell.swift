@@ -1171,7 +1171,8 @@ struct PairingView: View {
                                             model.applyPairingSetup(value)
                                         }
                                     }
-                                    .controlSize(.large)
+                                    .labelStyle(.iconOnly)
+                                    .buttonStyle(HorusIconButtonStyle())
                                     .accessibilityLabel("Paste pairing setup")
                                     .help("Paste pairing setup")
                                 }

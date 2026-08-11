@@ -1159,11 +1159,7 @@ struct SettingsInfoButton: View {
         .accessibilityHint(accessibilityHint)
         .help("About \(title)")
         .sensoryFeedback(.selection, trigger: showsDetail)
-        .popover(
-            isPresented: $showsDetail,
-            attachmentAnchor: .rect(.bounds),
-            arrowEdge: .bottom
-        ) {
+        .popover(isPresented: $showsDetail) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(title)
                     .font(HorusStyle.controlFont.weight(.semibold))
