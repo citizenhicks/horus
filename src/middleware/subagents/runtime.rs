@@ -358,7 +358,7 @@ impl Shared {
         path: &str,
         position: Option<PreviewPosition>,
     ) -> Result<PreviewPage> {
-        let (checkpoints, session_id, subtitle) = {
+        let (checkpoints, session_id, subtitle, terminal_error) = {
             let root = self.root(root_id).await?;
             let root = root.state.lock().await;
             let entry = root
@@ -370,6 +370,14 @@ impl Shared {
                 Arc::clone(&root.checkpoints),
                 entry.session_id.clone(),
                 entry.spawn_context.clone(),
+                if position.is_none() && matches!(&entry.status, AgentStatus::Errored) {
+                    entry
+                        .last_message
+                        .clone()
+                        .filter(|message| !message.is_empty())
+                } else {
+                    None
+                },
             )
         };
         let before_sequence = match position {
@@ -421,7 +429,16 @@ impl Shared {
             .map(|batch| batch.items.len())
             .sum();
         let transcript = positioned_items_chronological(batches);
-        let (start, events) = preview_events(&transcript, minimum_start, &session_id)?;
+        let terminal_error =
+            terminal_error.map(|message| EventMsg::Frontend(subagent_error_notice(message)));
+        let trailing_bytes = terminal_error
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()?
+            .map_or(0, |event| event.len());
+        let (start, mut events) =
+            preview_events(&transcript, minimum_start, &session_id, trailing_bytes)?;
+        events.extend(terminal_error);
         let has_more = store_has_more || omitted_seed || start > 0;
         let next = if has_more {
             transcript
@@ -534,22 +551,9 @@ impl Shared {
                 frontend(status)?;
                 frontend(failure_event)?;
                 if let Err(retry_error) = retry {
-                    frontend(FrontendEvent::Render {
-                        capability: "subagents".into(),
-                        block: FrontendBlock {
-                            id: None,
-                            group: None,
-                            update: crate::protocol::FrontendBlockUpdate::Replace,
-                            state: crate::protocol::FrontendBlockState::Complete,
-                            role: crate::protocol::FrontendBlockRole::Notice,
-                            title: "Subagent error".into(),
-                            text: format!("{retry_message}: {retry_error}"),
-                            symbol: Some(crate::protocol::FrontendSymbol::Agent),
-                            files: Vec::new(),
-                            format: crate::protocol::FrontendBlockFormat::PlainText,
-                            tone: FrontendTone::Error,
-                        },
-                    })?;
+                    frontend(subagent_error_notice(format!(
+                        "{retry_message}: {retry_error}"
+                    )))?;
                 }
                 Ok(Stage::Changed(output))
             }
@@ -583,6 +587,7 @@ fn preview_events(
     transcript: &[(MessageTarget, Value)],
     minimum_start: usize,
     session_id: &str,
+    trailing_bytes: usize,
 ) -> Result<(usize, Vec<EventMsg>)> {
     if transcript.is_empty() || minimum_start >= transcript.len() {
         return Ok((transcript.len(), Vec::new()));
@@ -620,7 +625,7 @@ fn preview_events(
         .unwrap_or(transcript.len());
 
     let events = replay_events(&transcript[previous..], session_id);
-    if serde_json::to_vec(&events)?.len() <= MAX_PREVIEW_PAGE_BYTES {
+    if preview_page_fits(&events, trailing_bytes)? {
         return Ok((previous, events));
     }
     if next >= transcript.len() {
@@ -629,12 +634,40 @@ fn preview_events(
         )));
     }
     let events = replay_events(&transcript[next..], session_id);
-    if events.is_empty() || serde_json::to_vec(&events)?.len() <= MAX_PREVIEW_PAGE_BYTES {
+    if events.is_empty() || preview_page_fits(&events, trailing_bytes)? {
         Ok((next, events))
     } else {
         Err(Error::Checkpoint(format!(
             "one subagent transcript item exceeds the {MAX_PREVIEW_PAGE_BYTES}-byte preview limit"
         )))
+    }
+}
+
+fn preview_page_fits(events: &[EventMsg], trailing_bytes: usize) -> Result<bool> {
+    let separator_bytes = usize::from(!events.is_empty() && trailing_bytes > 0);
+    Ok(serde_json::to_vec(events)?
+        .len()
+        .saturating_add(trailing_bytes)
+        .saturating_add(separator_bytes)
+        <= MAX_PREVIEW_PAGE_BYTES)
+}
+
+fn subagent_error_notice(message: String) -> FrontendEvent {
+    FrontendEvent::Render {
+        capability: "subagents".into(),
+        block: FrontendBlock {
+            id: None,
+            group: None,
+            update: crate::protocol::FrontendBlockUpdate::Replace,
+            state: crate::protocol::FrontendBlockState::Complete,
+            role: crate::protocol::FrontendBlockRole::Notice,
+            title: "Subagent error".into(),
+            text: message,
+            symbol: Some(FrontendSymbol::Agent),
+            files: Vec::new(),
+            format: crate::protocol::FrontendBlockFormat::PlainText,
+            tone: FrontendTone::Error,
+        },
     }
 }
 
@@ -686,7 +719,15 @@ enum OnPersistFailure {
 }
 
 fn validate_tree(tree: &Tree, max_agents: usize) -> Result<()> {
-    if tree.agents.len() >= max_agents || tree.mailbox.len() > MAX_MAILBOX_ITEMS {
+    if tree.agents.len() >= max_agents
+        || tree.mailbox.len() > MAX_MAILBOX_ITEMS
+        || tree.agents.values().any(|entry| {
+            entry
+                .last_message
+                .as_ref()
+                .is_some_and(|message| message.len() > MAX_MESSAGE_BYTES)
+        })
+    {
         return Err(Error::Config(
             "subagent checkpoint exceeds safety limits".into(),
         ));
@@ -855,6 +896,90 @@ mod tests {
                         Op::CapabilityCommand { arguments, .. }
                             if arguments == "/root/team/reviewer"
                     )
+        ));
+    }
+
+    #[test]
+    fn persisted_tree_rejects_an_oversized_last_message() {
+        let mut tree = Tree::default();
+        tree.agents.insert(
+            "/root/reviewer".into(),
+            AgentRecord {
+                parent: "/root".into(),
+                session_id: "child".into(),
+                depth: 1,
+                model: "test".into(),
+                spawn_context: String::new(),
+                active_turn_id: None,
+                status: AgentStatus::Errored,
+                last_message: Some("x".repeat(MAX_MESSAGE_BYTES + 1)),
+            },
+        );
+
+        assert!(matches!(validate_tree(&tree, 2), Err(Error::Config(_))));
+    }
+
+    #[tokio::test]
+    async fn errored_subagent_preview_ends_with_its_terminal_message() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+            crate::backend::checkpoint::sqlite::SqliteCheckpoint::new(
+                workspace.path().join("checkpoints.sqlite3"),
+            )
+            .expect("checkpoint store"),
+        );
+        let root = Checkpoint::empty("root");
+        checkpoints.save(&root, &[], None).await.expect("save root");
+        let transcript = serde_json::json!({"role": "user", "content": "review this"});
+        let mut child = Checkpoint::empty("child");
+        child.sequence = 1;
+        child.context.push(transcript.clone());
+        checkpoints
+            .save(&child, &[transcript], None)
+            .await
+            .expect("save child");
+        let shared = test_shared();
+        shared
+            .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
+            .await
+            .expect("initialize runtime");
+        shared
+            .reserve(
+                "root",
+                "/root/reviewer",
+                "/root",
+                "child".into(),
+                1,
+                test_presentation(),
+            )
+            .await
+            .expect("reserve child");
+        shared
+            .finished(
+                "root",
+                "/root/reviewer",
+                AgentStatus::Errored,
+                Some("provider error: servers are currently overloaded".into()),
+            )
+            .await
+            .expect("fail child");
+
+        let preview = shared
+            .preview("root", "/root/reviewer", None)
+            .await
+            .expect("preview errored child");
+
+        assert!(matches!(
+            preview.events.as_slice(),
+            [
+                EventMsg::UserMessage(message),
+                EventMsg::Frontend(FrontendEvent::Render { capability, block }),
+            ] if message.message == "review this"
+                && capability == "subagents"
+                && block.title == "Subagent error"
+                && block.text == "provider error: servers are currently overloaded"
+                && block.symbol == Some(FrontendSymbol::Agent)
+                && block.tone == FrontendTone::Error
         ));
     }
 

@@ -10,13 +10,11 @@ use super::Shared;
 use super::Stage;
 use super::coordination::Mail;
 use super::coordination::MailBody;
+use super::subagent_error_notice;
 use crate::Error;
 use crate::Result;
 use crate::agent::AgentEvents;
 use crate::protocol::EventMsg;
-use crate::protocol::FrontendBlock;
-use crate::protocol::FrontendEvent;
-use crate::protocol::FrontendTone;
 use crate::protocol::Op;
 use crate::protocol::ReviewDecision;
 use crate::truncate_utf8;
@@ -111,22 +109,7 @@ impl Shared {
                     }
                     (
                         format!("{repair_path} state persistence retry failed"),
-                        FrontendEvent::Render {
-                            capability: "subagents".into(),
-                            block: FrontendBlock {
-                                id: None,
-                                group: None,
-                                update: crate::protocol::FrontendBlockUpdate::Replace,
-                                state: crate::protocol::FrontendBlockState::Complete,
-                                role: crate::protocol::FrontendBlockRole::Notice,
-                                title: "Subagent error".into(),
-                                text: failure,
-                                symbol: Some(crate::protocol::FrontendSymbol::Agent),
-                                files: Vec::new(),
-                                format: crate::protocol::FrontendBlockFormat::PlainText,
-                                tone: FrontendTone::Error,
-                            },
-                        },
+                        subagent_error_notice(failure),
                     )
                 })),
             )
