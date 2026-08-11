@@ -575,6 +575,72 @@ impl OpenAiAuthorization for HttpRefreshingAuthorization {
 }
 
 #[tokio::test]
+async fn completed_http_stream_returns_before_the_transport_eof() {
+    use tokio::io::AsyncReadExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("HTTP listener");
+    let address = listener.local_addr().expect("HTTP address");
+    let (release, released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("HTTP connection");
+        let mut request = Vec::new();
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut chunk = [0; 1_024];
+            let count = stream.read(&mut chunk).await.expect("HTTP request");
+            assert_ne!(count, 0, "request ended before its headers");
+            request.extend_from_slice(&chunk[..count]);
+        }
+        let body = [
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "message-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done."}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "response-1", "output": []}
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+            body.len() + 1_024
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("HTTP response");
+        stream.flush().await.expect("flush HTTP response");
+        let _ = released.await;
+    });
+    let provider =
+        OpenAi::new("test-key", format!("http://{address}"), "test-model").expect("provider");
+    let events: ModelEventSink = Arc::new(|_| Ok(()));
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        provider.send_response(model_request(), events),
+    )
+    .await
+    .expect("completed response waited for EOF")
+    .expect("completed response");
+    let _ = release.send(());
+    server.await.expect("HTTP server");
+
+    assert_eq!(output.text(), "Done.");
+}
+
+#[tokio::test]
 async fn http_unauthorized_refreshes_and_retries_once() {
     use tokio::io::AsyncReadExt as _;
     use tokio::io::AsyncWriteExt as _;

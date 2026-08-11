@@ -1195,6 +1195,69 @@ fn completed_model_step_is_authoritative_for_replay_and_summary_events() {
 }
 
 #[test]
+fn retrying_model_step_closes_pending_search_and_marks_the_reconnect() {
+    use horus::protocol::{ModelStepCompletedEvent, ModelStepOutcome, WebSearchBeginEvent};
+
+    let mut state = state();
+    let search = EventMsg::WebSearchBegin(WebSearchBeginEvent {
+        session_id: "session".into(),
+        turn_id: "turn".into(),
+        model_step_id: "step".into(),
+        call_id: "search".into(),
+    });
+    state.handle_agent_event(
+        EventMsg::AgentMessageContentDelta(horus::protocol::AgentMessageContentDeltaEvent {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            model_step_id: "step".into(),
+            delta: "Partial answer".into(),
+            phase: AgentMessagePhase::FinalAnswer,
+        }),
+        Vec::new(),
+    );
+    state.handle_agent_event(search.clone(), search.presentation().into_iter().collect());
+    let retry = EventMsg::ModelStepCompleted(ModelStepCompletedEvent {
+        session_id: "session".into(),
+        turn_id: "turn".into(),
+        model_step_id: "step".into(),
+        step_index: 0,
+        started_at_ms: 1,
+        completed_at_ms: 2,
+        outcome: ModelStepOutcome::Retrying,
+    });
+    state.handle_agent_event(retry.clone(), retry.presentation().into_iter().collect());
+
+    assert!(state.transcript.iter().all(|entry| !entry.pending));
+    assert!(
+        state
+            .transcript
+            .iter()
+            .any(|entry| entry.text == "Web search interrupted"
+                && matches!(entry.tone, TranscriptTone::Warning))
+    );
+    assert!(
+        state
+            .transcript
+            .iter()
+            .any(|entry| entry.text.contains("Reconnecting"))
+    );
+    let texts = state
+        .transcript
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect::<Vec<_>>();
+    let partial = texts
+        .iter()
+        .position(|text| *text == "Partial answer")
+        .expect("partial answer");
+    let reconnecting = texts
+        .iter()
+        .position(|text| text.contains("Reconnecting"))
+        .expect("reconnecting notice");
+    assert!(partial < reconnecting);
+}
+
+#[test]
 fn completed_model_step_does_not_duplicate_live_streams() {
     use horus::protocol::{
         ModelStepCompletedEvent, ModelStepContent, ModelStepContentPhase, ModelStepOutcome,

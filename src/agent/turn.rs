@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -21,6 +22,7 @@ use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::ExecutionOutcome;
 use crate::backend::model::ModelEventSink;
 use crate::backend::model::ModelRequest;
+use crate::backend::model::STREAM_RETRY_LIMIT;
 use crate::backend::model::tool_complete_boundaries;
 use crate::backend::model::user_message_with_attachments;
 use crate::backend::sandbox::SandboxAuthorization;
@@ -45,6 +47,9 @@ use crate::protocol::TurnAbortedEvent;
 use crate::protocol::TurnCompleteEvent;
 use crate::protocol::TurnStartedEvent;
 use crate::protocol::UserMessageEvent;
+
+const STREAM_RETRY_BASE_DELAY_MS: u64 = 200;
+const STREAM_RETRY_MAX_DELAY_MS: u64 = 3_200;
 
 /// Outcome of `Runner::before_model_phase`.
 enum BeforeModel {
@@ -405,87 +410,138 @@ impl Runner {
                 BeforeModel::Ready(input) => input,
             };
 
-            let model_step_started = ModelStepStartedEvent {
-                session_id: self.state.session_id.clone(),
-                turn_id: turn_id.clone(),
-                model_step_id: Uuid::new_v4().to_string(),
-                step_index: model_step,
-                started_at_ms: unix_timestamp_ms()?,
-            };
-            self.record_model_call()?;
-            self.state.active_model_step = Some(ActiveModelStep {
-                model_step_id: model_step_started.model_step_id.clone(),
-                step_index: model_step_started.step_index,
-                started_at_ms: model_step_started.started_at_ms,
-            });
-            self.persist_with_events(
-                vec![turn_event(
-                    &submission_id,
-                    EventMsg::ModelStepStarted(model_step_started.clone()),
-                )],
-                None,
-            )
-            .await?;
-            let events = self.events.clone();
-            let event_submission_id = submission_id.clone();
-            let event_turn_id = turn_id.clone();
-            let event_session_id = self.state.session_id.clone();
-            let event_model_step_id = model_step_started.model_step_id.clone();
-            let stream: ModelEventSink = Arc::new(move |event| {
-                let msg = event.into_event(&event_session_id, &event_turn_id, &event_model_step_id);
-                try_send_event(
-                    &events,
-                    Event {
-                        submission_id: Some(event_submission_id.clone()),
-                        msg,
-                    },
-                )
-            });
             let tools = self.catalog.definitions();
             let model = Arc::clone(&self.config.model);
             let provider = self.config.provider.clone();
             let model_session_id = self.state.session_id.clone();
             let instructions = Arc::clone(&self.system_prompt);
-            let response = model.respond(
-                &provider,
-                ModelRequest {
-                    session_id: &model_session_id,
-                    instructions: &instructions,
-                    input: &request_input,
-                    tools: &tools,
-                    allow_hosted_tools: true,
-                    allow_continuation: true,
-                },
-                stream,
-            );
-            let output = match self.wait_active(commands, &turn_id, response).await {
-                Ok(Wait::Ready(Ok(output))) => output,
-                Ok(Wait::Ready(Err(error))) | Err(error) => {
-                    self.fail_model_step(
+            let mut stream_retries = 0;
+            let (model_step_started, output) = loop {
+                let model_step_started = ModelStepStartedEvent {
+                    session_id: self.state.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    model_step_id: Uuid::new_v4().to_string(),
+                    step_index: model_step,
+                    started_at_ms: unix_timestamp_ms()?,
+                };
+                self.record_model_call()?;
+                self.state.active_model_step = Some(ActiveModelStep {
+                    model_step_id: model_step_started.model_step_id.clone(),
+                    step_index: model_step_started.step_index,
+                    started_at_ms: model_step_started.started_at_ms,
+                });
+                self.persist_with_events(
+                    vec![turn_event(
                         &submission_id,
-                        &model_step_started,
-                        ModelStepOutcome::Failed,
+                        EventMsg::ModelStepStarted(model_step_started.clone()),
+                    )],
+                    None,
+                )
+                .await?;
+                let events = self.events.clone();
+                let event_submission_id = submission_id.clone();
+                let event_turn_id = turn_id.clone();
+                let event_session_id = self.state.session_id.clone();
+                let event_model_step_id = model_step_started.model_step_id.clone();
+                let stream: ModelEventSink = Arc::new(move |event| {
+                    let msg =
+                        event.into_event(&event_session_id, &event_turn_id, &event_model_step_id);
+                    try_send_event(
+                        &events,
+                        Event {
+                            submission_id: Some(event_submission_id.clone()),
+                            msg,
+                        },
                     )
-                    .await?;
-                    return Err(error);
-                }
-                Ok(Wait::Interrupted {
-                    submission_id: interrupt_submission_id,
-                }) => {
-                    self.fail_model_step(
-                        &submission_id,
-                        &model_step_started,
-                        ModelStepOutcome::Interrupted,
-                    )
-                    .await?;
-                    self.abort(
-                        &interrupt_submission_id,
-                        &turn_id,
-                        "interrupted",
-                        ExecutionOutcome::Aborted,
-                    )
-                    .await?;
-                    return Ok(());
+                });
+                let response = model.respond(
+                    &provider,
+                    ModelRequest {
+                        session_id: &model_session_id,
+                        instructions: &instructions,
+                        input: &request_input,
+                        tools: &tools,
+                        allow_hosted_tools: true,
+                        allow_continuation: true,
+                    },
+                    stream,
+                );
+                match self.wait_active(commands, &turn_id, response).await {
+                    Ok(Wait::Ready(Ok(output))) => break (model_step_started, output),
+                    Ok(Wait::Ready(Err(Error::Provider(error))))
+                        if error.is_stream_interrupted() && stream_retries < STREAM_RETRY_LIMIT =>
+                    {
+                        let delay = stream_retry_delay(
+                            &error,
+                            stream_retries,
+                            &model_step_started.model_step_id,
+                        );
+                        self.fail_model_step(
+                            &submission_id,
+                            &model_step_started,
+                            ModelStepOutcome::Retrying,
+                        )
+                        .await?;
+                        stream_retries += 1;
+                        match self
+                            .wait_active(commands, &turn_id, tokio::time::sleep(delay))
+                            .await?
+                        {
+                            Wait::Ready(()) => {
+                                if let Some(interrupt_submission_id) =
+                                    self.drain_commands(commands, &turn_id).await?
+                                {
+                                    self.abort(
+                                        &interrupt_submission_id,
+                                        &turn_id,
+                                        "interrupted",
+                                        ExecutionOutcome::Aborted,
+                                    )
+                                    .await?;
+                                    return Ok(());
+                                }
+                            }
+                            Wait::Interrupted {
+                                submission_id: interrupt_submission_id,
+                            } => {
+                                self.abort(
+                                    &interrupt_submission_id,
+                                    &turn_id,
+                                    "interrupted",
+                                    ExecutionOutcome::Aborted,
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Ok(Wait::Ready(Err(error))) | Err(error) => {
+                        self.fail_model_step(
+                            &submission_id,
+                            &model_step_started,
+                            ModelStepOutcome::Failed,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                    Ok(Wait::Interrupted {
+                        submission_id: interrupt_submission_id,
+                    }) => {
+                        self.fail_model_step(
+                            &submission_id,
+                            &model_step_started,
+                            ModelStepOutcome::Interrupted,
+                        )
+                        .await?;
+                        self.abort(
+                            &interrupt_submission_id,
+                            &turn_id,
+                            "interrupted",
+                            ExecutionOutcome::Aborted,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                 }
             };
             if let Err(error) = self.record_usage(&provider, &output.usage) {
@@ -810,6 +866,22 @@ fn model_step_completed_event(
     ))
 }
 
+fn stream_retry_delay(error: &crate::ProviderError, retry: usize, model_step_id: &str) -> Duration {
+    let exponential_ms = STREAM_RETRY_BASE_DELAY_MS
+        .saturating_mul(1_u64 << retry.min(4))
+        .min(STREAM_RETRY_MAX_DELAY_MS);
+    let jitter = model_step_id.bytes().fold(retry as u64, |value, byte| {
+        value.wrapping_mul(16_777_619).wrapping_add(u64::from(byte))
+    });
+    let jitter_percent = 80 + jitter % 41;
+    let backoff = Duration::from_millis(exponential_ms.saturating_mul(jitter_percent) / 100);
+    error
+        .retry_after()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .map_or(backoff, |retry_after| retry_after.max(backoff))
+}
+
 fn rebase_live_message_targets(events: &mut [EventMsg], provisional: u64, durable: u64) {
     for target in events.iter_mut().filter_map(|event| match event {
         EventMsg::UserMessage(message) => message.message_target.as_mut(),
@@ -855,4 +927,19 @@ fn has_visible_output_text(item: &Value) -> bool {
                         .and_then(Value::as_str)
                         .is_some_and(|text| !text.is_empty())
             })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_retry_delay_respects_server_seconds() {
+        let error = crate::ProviderError::stream_interrupted(Some("30".into()));
+
+        assert_eq!(
+            stream_retry_delay(&error, 0, "step-1"),
+            Duration::from_secs(30)
+        );
+    }
 }

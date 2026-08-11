@@ -182,7 +182,6 @@ impl OpenAi {
         }
 
         let mut bytes = Vec::new();
-        let mut completed = None;
         let mut commentary = BTreeSet::new();
         let mut web_searches = BTreeSet::new();
         let mut output = BTreeMap::new();
@@ -209,10 +208,12 @@ impl OpenAi {
                 }
                 match event.get("type").and_then(Value::as_str) {
                     Some("response.completed") => {
-                        completed = event
+                        let response = event
                             .get("response")
                             .cloned()
-                            .map(|response| attach_stream_output(response, &output));
+                            .map(|response| attach_stream_output(response, &output))
+                            .ok_or_else(|| Error::Provider("completion omitted response".into()))?;
+                        return decode_response(response);
                     }
                     Some("error" | "response.failed" | "response.incomplete") => {
                         return Err(Error::Provider(response_error(&event).into()));
@@ -224,9 +225,9 @@ impl OpenAi {
                 return Err(Error::Provider("SSE frame exceeded size limit".into()));
             }
         }
-        let response = completed
-            .ok_or_else(|| Error::Provider("stream ended before response.completed".into()))?;
-        decode_response(response)
+        Err(Error::Provider(
+            "stream ended before response.completed".into(),
+        ))
     }
 
     fn response_body(&self, request: ModelRequest<'_>) -> Result<Value> {

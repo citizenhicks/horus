@@ -19,6 +19,13 @@ pub struct ProviderError {
     status: Option<u16>,
     retryable: bool,
     retry_after: Option<String>,
+    kind: ProviderErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderErrorKind {
+    Other,
+    StreamInterrupted,
 }
 
 impl ProviderError {
@@ -30,6 +37,7 @@ impl ProviderError {
             status: None,
             retryable: false,
             retry_after: None,
+            kind: ProviderErrorKind::Other,
         }
     }
 
@@ -39,6 +47,18 @@ impl ProviderError {
         Self {
             retryable: true,
             ..Self::new(message)
+        }
+    }
+
+    /// Creates a retryable response-stream interruption without exposing transport details.
+    #[must_use]
+    pub fn stream_interrupted(retry_after: Option<String>) -> Self {
+        Self {
+            message: "model response stream was interrupted".into(),
+            status: None,
+            retryable: true,
+            retry_after,
+            kind: ProviderErrorKind::StreamInterrupted,
         }
     }
 
@@ -52,6 +72,7 @@ impl ProviderError {
             status: Some(status),
             retryable: status == 408 || status == 429 || (500..=599).contains(&status),
             retry_after,
+            kind: ProviderErrorKind::Other,
         }
     }
 
@@ -65,6 +86,12 @@ impl ProviderError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         self.retryable
+    }
+
+    /// Reports whether a response ended before its completion record arrived.
+    #[must_use]
+    pub fn is_stream_interrupted(&self) -> bool {
+        self.kind == ProviderErrorKind::StreamInterrupted
     }
 
     /// Returns the provider's raw `Retry-After` header value.

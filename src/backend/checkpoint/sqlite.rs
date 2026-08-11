@@ -2117,6 +2117,7 @@ mod tests {
         for (model_step_id, outcome) in [
             ("failed", ModelStepOutcome::Failed),
             ("interrupted", ModelStepOutcome::Interrupted),
+            ("retrying", ModelStepOutcome::Retrying),
         ] {
             let delta = Event {
                 submission_id: Some("submission".into()),
@@ -2164,7 +2165,7 @@ mod tests {
 
         assert_eq!(
             page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
-            [1, 2, 3, 4]
+            [1, 2, 3, 4, 5, 6]
         );
         assert!(matches!(
             page[0].event.msg,
@@ -2172,6 +2173,10 @@ mod tests {
         ));
         assert!(matches!(
             page[2].event.msg,
+            EventMsg::AgentMessageContentDelta(_)
+        ));
+        assert!(matches!(
+            page[4].event.msg,
             EventMsg::AgentMessageContentDelta(_)
         ));
     }

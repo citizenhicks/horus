@@ -580,6 +580,21 @@ impl EventMsg {
                 format: FrontendBlockFormat::PlainText,
                 tone: FrontendTone::Warning,
             },
+            Self::ModelStepCompleted(step) if step.outcome == ModelStepOutcome::Retrying => {
+                FrontendBlock {
+                    id: Some(format!("{}/retry", step.model_step_id)),
+                    group: Some(step.turn_id.clone()),
+                    update: FrontendBlockUpdate::Replace,
+                    state: FrontendBlockState::Complete,
+                    role: FrontendBlockRole::Notice,
+                    title: "Reconnecting…".into(),
+                    text: String::new(),
+                    symbol: None,
+                    files: Vec::new(),
+                    format: FrontendBlockFormat::PlainText,
+                    tone: FrontendTone::Warning,
+                }
+            }
             Self::WebSearchBegin(search) => FrontendBlock {
                 id: Some(format!("{}/{}", search.model_step_id, search.call_id)),
                 group: Some(search.turn_id.clone()),
@@ -936,6 +951,8 @@ pub enum ModelStepOutcome {
     },
     Failed,
     Interrupted,
+    /// The response stream failed and the logical step will restart with a fresh ID.
+    Retrying,
 }
 
 /// One complete normalized text item produced by a model step.
@@ -1206,6 +1223,27 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn retrying_model_step_has_a_provider_neutral_reconnect_notice() {
+        let event = EventMsg::ModelStepCompleted(ModelStepCompletedEvent {
+            session_id: "session-1".into(),
+            turn_id: "turn-1".into(),
+            model_step_id: "step-1".into(),
+            step_index: 0,
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            outcome: ModelStepOutcome::Retrying,
+        });
+
+        let rendered = event.presentation().expect("retry presentation");
+
+        assert_eq!(rendered.capability, "agent");
+        assert_eq!(rendered.block.id.as_deref(), Some("step-1/retry"));
+        assert_eq!(rendered.block.title, "Reconnecting…");
+        assert_eq!(rendered.block.tone, FrontendTone::Warning);
+        assert_eq!(rendered.block.state, FrontendBlockState::Complete);
     }
 
     #[test]

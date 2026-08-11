@@ -35,6 +35,10 @@ impl TuiState {
         if !is_commentary {
             self.commit_commentary_stream();
         }
+        if matches!(&event, EventMsg::ModelStepCompleted(_)) {
+            self.commit_reasoning();
+            self.commit_stream();
+        }
         let was_rendered = !blocks.is_empty();
         for block in blocks {
             self.apply_block(block);
@@ -73,23 +77,40 @@ impl TuiState {
                     .or_default();
             }
             EventMsg::ModelStepCompleted(step) => {
-                self.commit_reasoning();
-                self.commit_stream();
                 let streamed = self
                     .streamed_step_phases
                     .remove(&step.model_step_id)
                     .unwrap_or_default();
-                if let ModelStepOutcome::Completed { content, .. } = step.outcome {
-                    for item in content {
-                        if item.text.is_empty() || streamed.contains(item.phase) {
-                            continue;
+                match step.outcome {
+                    ModelStepOutcome::Completed { content, .. } => {
+                        for item in content {
+                            if item.text.is_empty() || streamed.contains(item.phase) {
+                                continue;
+                            }
+                            let tone = match item.phase {
+                                ModelStepContentPhase::Reasoning => TranscriptTone::Reasoning,
+                                ModelStepContentPhase::Commentary
+                                | ModelStepContentPhase::FinalAnswer => TranscriptTone::Assistant,
+                            };
+                            self.push(item.text, tone);
                         }
-                        let tone = match item.phase {
-                            ModelStepContentPhase::Reasoning => TranscriptTone::Reasoning,
-                            ModelStepContentPhase::Commentary
-                            | ModelStepContentPhase::FinalAnswer => TranscriptTone::Assistant,
-                        };
-                        self.push(item.text, tone);
+                    }
+                    ModelStepOutcome::Failed
+                    | ModelStepOutcome::Interrupted
+                    | ModelStepOutcome::Retrying => {
+                        let prefix = format!("{}/", step.model_step_id);
+                        for entry in &mut self.transcript {
+                            if entry.pending
+                                && entry.id.as_ref().is_some_and(|id| {
+                                    id.capability == "web_search" && id.value.starts_with(&prefix)
+                                })
+                            {
+                                entry.text = "Web search interrupted".into();
+                                entry.tone = TranscriptTone::Warning;
+                                entry.pending = false;
+                                entry.rendered = None;
+                            }
+                        }
                     }
                 }
                 self.completed_model_steps.insert(step.model_step_id);

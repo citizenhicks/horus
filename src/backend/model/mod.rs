@@ -34,6 +34,7 @@ const MAX_TOOL_CALLS: usize = 128;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_CALL_ID_BYTES: usize = 4 * 1024;
 const MAX_TOOL_NAME_BYTES: usize = 256;
+pub(crate) const STREAM_RETRY_LIMIT: usize = 5;
 
 /// Returns one-based context boundaries with no unfinished tool calls.
 pub(crate) fn tool_complete_boundaries<'a>(
