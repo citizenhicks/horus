@@ -6424,36 +6424,28 @@ final class TranscriptWaitingNoteTests: XCTestCase {
     }
 
     func testRotationStaysInRangeAndAdvancesOnSchedule() {
-        let seed = "turn-1"
-        let first = TranscriptWaitingNote.message(seed: seed, elapsed: 0)
+        let order = ["first", "second", "third"]
+        let first = TranscriptWaitingNote.message(in: order, elapsed: 0)
 
         // Holds for the rotation window, then moves on.
         XCTAssertEqual(
-            TranscriptWaitingNote.message(seed: seed, elapsed: TranscriptWaitingNote.rotation - 0.1),
+            TranscriptWaitingNote.message(
+                in: order,
+                elapsed: TranscriptWaitingNote.rotation - 0.1
+            ),
             first
         )
-        XCTAssertNotEqual(
-            TranscriptWaitingNote.message(seed: seed, elapsed: TranscriptWaitingNote.rotation),
+        XCTAssertEqual(
+            TranscriptWaitingNote.message(in: order, elapsed: TranscriptWaitingNote.rotation),
+            "second"
+        )
+        XCTAssertEqual(
+            TranscriptWaitingNote.message(
+                in: order,
+                elapsed: Double(order.count) * TranscriptWaitingNote.rotation
+            ),
             first
         )
-
-        // Every step of a full cycle lands on a real message, including the wrap.
-        for step in 0...TranscriptWaitingNote.messages.count {
-            let index = TranscriptWaitingNote.index(
-                seed: seed,
-                elapsed: Double(step) * TranscriptWaitingNote.rotation
-            )
-            XCTAssertTrue((0..<TranscriptWaitingNote.messages.count).contains(index))
-        }
-    }
-
-    func testDifferentTurnsOpenOnDifferentMessages() {
-        // Deterministic across launches: `hashValue` is salted per process and could not be
-        // pinned here at all.
-        XCTAssertEqual(TranscriptWaitingNote.stableSeed("turn-1"), TranscriptWaitingNote.stableSeed("turn-1"))
-        let seeds = Set((1...12).map { TranscriptWaitingNote.stableSeed("turn-\($0)") })
-        XCTAssertGreaterThan(seeds.count, 6)
-        XCTAssertEqual(TranscriptWaitingNote.messages.count, 42)
     }
 }
 

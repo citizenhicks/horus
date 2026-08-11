@@ -1,10 +1,33 @@
 import SwiftUI
 
+/// Every gap in the app — stack spacing and padding alike — is one of these six steps.
+/// A gap that is not on the scale is drift: it reads as an accident beside the rows above
+/// and below it. `0` stays 0 where a stack is deliberately flush.
+enum HorusSpace {
+    /// Two lines that belong to one another: a name over its path.
+    static let xxs: CGFloat = 2
+    /// Inside one label or badge.
+    static let xs: CGFloat = 4
+    /// The default: a glyph and its text, one row and the next.
+    static let s: CGFloat = 8
+    /// Between blocks inside a card.
+    static let m: CGFloat = 12
+    /// Screen margins, and the gap between cards.
+    static let l: CGFloat = 16
+    /// Between sections of a page.
+    static let xl: CGFloat = 24
+}
+
 enum HorusStyle {
     static let bodyFont: Font = .body
     static let controlFont: Font = .body.weight(.medium)
     static let metadataFont: Font = .footnote.monospaced()
     static let badgeFont: Font = .footnote.weight(.medium)
+    /// The title of a section or a card.
+    static let titleFont: Font = .headline
+    /// Prose one step under the body: a note under a control, a label over a figure.
+    /// `metadataFont` is the monospaced twin, for values rather than sentences.
+    static let captionFont: Font = .footnote
     static let cardRadius: CGFloat = 22
     static let controlRadius: CGFloat = 9
     /// Between a control and a card: the radius a card keeps when it shrinks to a tile.
@@ -13,19 +36,41 @@ enum HorusStyle {
     static let controlShape = RoundedRectangle(cornerRadius: controlRadius, style: .continuous)
     static let tileShape = RoundedRectangle(cornerRadius: tileRadius, style: .continuous)
     static let cardPadding: CGFloat = 14
-    static let controlHeight: CGFloat = 30
-    static let badgeHeight: CGFloat = 26
+
+    // MARK: Rows
+    /// Minimum height of a row, by how much it has to carry. A row that can be tapped needs
+    /// the full target; the two below it are for rows that only read.
+    static let rowCompact: CGFloat = 26
+    static let rowRegular: CGFloat = 30
+    static let rowTouch: CGFloat = 44
+    static let badgeHeight = rowCompact
+    static let controlHeight = rowRegular
+    static let iconButtonSize = rowTouch
+
+    // MARK: Glyphs
+    /// Marks that qualify a row rather than name it: carets, disclosure, trailing hints.
+    static let glyphMark: CGFloat = 11
+    /// A glyph standing beside text as the subject of the row.
+    static let glyphInline: CGFloat = 14
+    /// The leading mark of a header, and the standalone controls in the composer.
+    static let glyphLead: CGFloat = 18
     /// Glyphs sit inside a 44pt target, so 16 left them floating in air. This fills the
     /// button without changing it: the tap area, and every explicit size a call site asks
     /// for, are untouched.
     static let iconSize: CGFloat = 22
-    static let iconButtonSize: CGFloat = 44
+    /// The column every inline glyph is centred in, so the text beside it starts at the same
+    /// x on every row whatever the glyph's own size. Anything larger keeps its own width.
+    ///
+    /// Above the scale there is no token: a hero glyph on a card or an empty state is sized
+    /// to its container, not to the text beside it, so those stay literals at the call site.
+    static let glyphGutter: CGFloat = 18
+
     static let borderWidth: CGFloat = 0.75
     /// Empty space an icon button keeps around its glyph to reach a full tap target.
     static let iconButtonInset = (iconButtonSize - iconSize) / 2
     /// Outer padding for a row of icon buttons: they carry `iconButtonInset` of their own,
     /// so matching the margin of neighbouring text means subtracting it here.
-    static let iconRowPadding = cardPadding + 4 - iconButtonInset
+    static let iconRowPadding = cardPadding + HorusSpace.xs - iconButtonInset
 }
 
 /// One HugeIcons glyph, vendored into the asset catalog under `hi.<name>`.
@@ -137,11 +182,20 @@ struct HorusIcon: View {
     let glyph: HorusGlyph
     var size = HorusStyle.iconSize
     var foreground: Color? = nil
+    /// Off for a glyph inside a capsule, where the column's slack reads as a gap in the
+    /// pill rather than as a column shared with the rows above and below.
+    var gutter = true
 
-    init(_ glyph: HorusGlyph, size: CGFloat = HorusStyle.iconSize, foreground: Color? = nil) {
+    init(
+        _ glyph: HorusGlyph,
+        size: CGFloat = HorusStyle.iconSize,
+        foreground: Color? = nil,
+        gutter: Bool = true
+    ) {
         self.glyph = glyph
         self.size = size
         self.foreground = foreground
+        self.gutter = gutter
     }
 
     @ViewBuilder
@@ -149,11 +203,16 @@ struct HorusIcon: View {
         // The asset carries `template-rendering-intent`, so this tints from the foreground
         // style the way a symbol does. Unlike a symbol it has no intrinsic text size, which is
         // why every glyph is drawn into an explicit square instead of following the font.
+        let column = gutter ? max(size, HorusStyle.glyphGutter) : size
         let icon = Image(glyph.asset)
             .renderingMode(.template)
             .resizable()
             .aspectRatio(contentMode: .fit)
             .frame(width: size, height: size)
+            // Centred in a fixed column: a 11pt caret and a 18pt file mark then leave the
+            // text beside them starting at the same x, which is what makes a list of rows
+            // read as a list rather than as a stack of near misses.
+            .frame(width: column, height: column)
             .accessibilityHidden(true)
         if let foreground {
             icon.foregroundStyle(foreground)
@@ -421,13 +480,13 @@ struct HorusActionRow<Content: View>: View {
     var body: some View {
         Group {
             if iconsOnly {
-                HStack(spacing: 8) { content }
+                HStack(spacing: HorusSpace.s) { content }
                     .labelStyle(.iconOnly)
                     .buttonBorderShape(.circle)
             } else {
                 // Full width keeps the label: measuring for a horizontal fit either
                 // hyphenates or truncates it away.
-                VStack(spacing: 8) { content }.buttonSizing(.flexible)
+                VStack(spacing: HorusSpace.s) { content }.buttonSizing(.flexible)
             }
         }
         .frame(maxWidth: .infinity)
@@ -655,7 +714,7 @@ struct HorusBadge: View {
     var interactive = false
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: HorusSpace.s) {
             if let progress {
                 ZStack {
                     Circle().stroke(palette.line.opacity(0.55), lineWidth: 2)
@@ -668,13 +727,13 @@ struct HorusBadge: View {
                 .accessibilityHidden(true)
             }
             if let glyph {
-                HorusIcon(glyph, size: 13, foreground: foreground)
+                HorusIcon(glyph, size: HorusStyle.glyphInline, foreground: foreground, gutter: false)
             }
             if !text.isEmpty { Text(text).lineLimit(1) }
         }
         .font(HorusStyle.badgeFont)
         .foregroundStyle(foreground)
-        .padding(.horizontal, 11)
+        .padding(.horizontal, HorusSpace.m)
         .frame(height: HorusStyle.badgeHeight)
         .horusGlass(in: Capsule(), interactive: interactive)
     }
@@ -691,25 +750,33 @@ struct HorusMenuLabel: View {
     var glyph: HorusGlyph?
     var detail: String?
     var showsDisclosure = true
+    /// The composer sizes its mark up to `glyphLead` to sit level with the icon buttons
+    /// beside it; inline in a header the glyph stays on the text's own step.
+    var glyphSize = HorusStyle.glyphInline
+    /// A settings row reads at body size beside its label; the composer and the file header
+    /// carry the badge step so the label sits under the text it belongs to.
+    var font = HorusStyle.badgeFont
 
     var body: some View {
-        HStack(spacing: 6) {
-            if let glyph { HorusIcon(glyph, size: 14, foreground: palette.accent) }
+        HStack(spacing: HorusSpace.s) {
+            if let glyph {
+                HorusIcon(glyph, size: glyphSize, foreground: palette.accent, gutter: false)
+            }
             Text(text)
-                .font(HorusStyle.badgeFont)
+                .font(font)
                 .lineLimit(1)
                 .truncationMode(.middle)
             if let detail {
                 Text(detail)
-                    .font(HorusStyle.badgeFont)
+                    .font(font)
                     .foregroundStyle(palette.muted)
                     .lineLimit(1)
             }
             if showsDisclosure {
-                HorusIcon(.caretUpDown, size: 11, foreground: palette.muted)
+                HorusIcon(.caretUpDown, size: HorusStyle.glyphMark, foreground: palette.muted, gutter: false)
             }
         }
-        .frame(height: HorusStyle.controlHeight)
+        .frame(minHeight: HorusStyle.controlHeight)
         .contentShape(Rectangle())
     }
 }
@@ -869,9 +936,9 @@ struct SectionHeading: View {
     let detail: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: HorusSpace.s) {
             Text(title)
-                .font(.headline)
+                .font(HorusStyle.titleFont)
             Text(detail)
                 .font(HorusStyle.bodyFont)
                 .foregroundStyle(palette.muted)

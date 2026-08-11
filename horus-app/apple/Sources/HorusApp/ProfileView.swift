@@ -63,7 +63,7 @@ private struct SettingsInformationButton: View {
             // Bare, like the agent status dot and the per-setting info buttons: a toolbar
             // accessory in this app carries no chrome, and a glass circle on this one alone
             // read as a different kind of control.
-            HorusIcon(.info, size: 15, foreground: palette.muted)
+            HorusIcon(.info, size: HorusStyle.glyphInline, foreground: palette.muted)
                 .frame(
                     minWidth: HorusStyle.iconButtonSize,
                     minHeight: HorusStyle.iconButtonSize
@@ -83,7 +83,7 @@ private struct SettingsInformationButton: View {
                 Text(versionDescription)
                     .font(HorusStyle.controlFont)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.bottom, 16)
+                    .padding(.bottom, HorusSpace.l)
                 Divider()
                 SettingsInformationRow(
                     title: "Acceptable Use Policy",
@@ -112,7 +112,7 @@ private struct SettingsInformationButton: View {
                     action: { showPlaceholder("Help & Support") }
                 )
             }
-            .padding(18)
+            .padding(HorusSpace.l)
             .frame(width: 320, alignment: .leading)
             .presentationCompactAdaptation(.popover)
         }
@@ -139,11 +139,11 @@ private struct SettingsInformationRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 12) {
-                HorusIcon(glyph, size: 18, foreground: palette.muted)
+            HStack(spacing: HorusSpace.m) {
+                HorusIcon(glyph, size: HorusStyle.glyphLead, foreground: palette.muted)
                 Text(title)
-                Spacer(minLength: 12)
-                HorusIcon(.arrowUpRight01, size: 14, foreground: palette.muted)
+                Spacer(minLength: HorusSpace.m)
+                HorusIcon(.arrowUpRight01, size: HorusStyle.glyphMark, foreground: palette.muted)
             }
             .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize)
             .contentShape(Rectangle())
@@ -158,9 +158,9 @@ private struct CloudAllowanceStatus: View {
     @Environment(\.horusPalette) private var palette
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
+        HStack(alignment: .firstTextBaseline, spacing: HorusSpace.m) {
             Text("Included Luna usage")
-            Spacer(minLength: 8)
+            Spacer(minLength: HorusSpace.s)
             Text("Cloud only")
                 .foregroundStyle(palette.muted)
         }
@@ -235,7 +235,7 @@ private struct DataPrivacySettings: View {
         .toggleStyle(.switch)
 
         Text("Off by default, and stored on this device.")
-            .font(.footnote)
+            .font(HorusStyle.captionFont)
             .foregroundStyle(palette.muted)
             .fixedSize(horizontal: false, vertical: true)
     }
@@ -256,7 +256,7 @@ private struct ProfileUsageSection: View {
         }
         // Four fixed columns: an adaptive grid drops to three and orphans the last metric.
         // The section header already says "Usage", so the grid needs no heading of its own.
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 16) {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: HorusSpace.s), count: 4), spacing: HorusSpace.l) {
             UsageMetric(label: "Tokens", value: compact(total.totalTokens))
             UsageMetric(label: "Input", value: compact(total.inputTokens))
             UsageMetric(label: "Output", value: compact(total.outputTokens))
@@ -272,7 +272,7 @@ private struct ProfileUsageHistory: View {
     let providerLabels: [String: String]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: HorusSpace.l) {
             HStack(alignment: .firstTextBaseline) {
                 Text("Usage by provider")
                     .font(HorusStyle.controlFont)
@@ -301,16 +301,16 @@ private struct UsageMetric: View {
     let value: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: HorusSpace.xs) {
             // Sentence case, not tracked-out monospace caps: the value is the number, and a
             // shouted label competes with it at the same size the number is set in.
             Text(label)
-                .font(.footnote)
+                .font(HorusStyle.captionFont)
                 .foregroundStyle(palette.muted)
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
             Text(value)
-                .font(.headline)
+                .font(HorusStyle.titleFont)
                 .monospacedDigit()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -321,14 +321,14 @@ private struct ProfileRunStatsSection: View {
     let stats: RunStats
 
     var body: some View {
-        VStack(spacing: 16) {
-            HStack(spacing: 8) {
+        VStack(spacing: HorusSpace.l) {
+            HStack(spacing: HorusSpace.s) {
                 UsageMetric(label: "Runs", value: compact(stats.runCount))
                 UsageMetric(label: "Failed", value: compact(stats.failedRunCount))
                 UsageMetric(label: "Aborted", value: compact(stats.abortedRunCount))
                 UsageMetric(label: "Elapsed", value: formatMilliseconds(stats.elapsedMs))
             }
-            HStack(spacing: 8) {
+            HStack(spacing: HorusSpace.s) {
                 UsageMetric(label: "Model calls", value: compact(stats.modelCalls))
                 UsageMetric(label: "Tool calls", value: compact(stats.toolCalls))
                 UsageMetric(label: "Tool errors", value: compact(stats.failedToolCalls))
@@ -360,10 +360,10 @@ private struct ProfileRecentRuns: View {
                                     model.openSession(group.sessionId)
                                     model.destination = .chat
                                 } label: {
-                                    HStack(spacing: 10) {
+                                    HStack(spacing: HorusSpace.m) {
                                         HorusIcon(runGlyph(run), foreground: runColor(run))
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            HStack(spacing: 6) {
+                                        VStack(alignment: .leading, spacing: HorusSpace.xxs) {
+                                            HStack(spacing: HorusSpace.s) {
                                                 Text(run.sessionId == group.sessionId ? "Run" : "Sub-run")
                                                     .font(HorusStyle.metadataFont.weight(.semibold))
                                                 Text(
@@ -378,8 +378,8 @@ private struct ProfileRecentRuns: View {
                                                 .foregroundStyle(palette.muted)
                                                 .lineLimit(1)
                                         }
-                                        Spacer(minLength: 4)
-                                        HorusIcon(.caretRight, size: 12, foreground: palette.muted)
+                                        Spacer(minLength: HorusSpace.xs)
+                                        HorusIcon(.caretRight, size: HorusStyle.glyphMark, foreground: palette.muted)
                                     }
                                     .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize)
                                     .contentShape(Rectangle())
@@ -390,7 +390,7 @@ private struct ProfileRecentRuns: View {
                                 .accessibilityHint("Opens the chat for this run")
                             }
                         } label: {
-                            HStack(spacing: 6) {
+                            HStack(spacing: HorusSpace.s) {
                                 Text(group.title)
                                     .font(HorusStyle.controlFont)
                                     .lineLimit(1)
@@ -551,7 +551,7 @@ private struct AppLockSettings: View {
     @Environment(\.horusPalette) private var palette
 
     var body: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: HorusSpace.xs) {
             Toggle(model.appLockAuthenticationMethod.settingTitle, isOn: Binding(
                 get: { model.appLockEnabled },
                 set: { enabled in

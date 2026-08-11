@@ -28,7 +28,7 @@ struct AppShell: View {
                 if model.accounts.isEmpty {
                     PairingView(canCancel: false)
                         .frame(maxWidth: 620)
-                        .padding(24)
+                        .padding(HorusSpace.xl)
                 } else {
                     shell
                         .inspector(isPresented: $model.showsInspector) {
@@ -40,7 +40,7 @@ struct AppShell: View {
                         .sheet(isPresented: $model.showsPairing) {
                             PairingView(canCancel: true)
                                 .frame(maxWidth: 560)
-                                .padding(24)
+                                .padding(HorusSpace.xl)
                                 .overlay(alignment: .top) { AppToastOverlay() }
                                 .presentationDetents([.medium, .large])
                         }
@@ -301,8 +301,8 @@ private struct AppToastOverlay: View {
             }
         }
         .frame(maxWidth: 520)
-        .padding(.horizontal, 16)
-        .padding(.top, 12)
+        .padding(.horizontal, HorusSpace.l)
+        .padding(.top, HorusSpace.m)
         .allowsHitTesting(model.toast != nil)
         .animation(toastAnimation, value: model.toast?.id)
     }
@@ -322,14 +322,14 @@ private struct AppToastView: View {
     let dismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            HStack(alignment: .top, spacing: 10) {
+        HStack(spacing: HorusSpace.m) {
+            HStack(alignment: .top, spacing: HorusSpace.m) {
                 HorusIcon(
                     toast.tone.glyph,
                     size: 18,
                     foreground: toast.tone.color(in: palette)
                 )
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: HorusSpace.xxs) {
                     Text(toast.tone.title)
                         .font(HorusStyle.controlFont.weight(.semibold))
                         .foregroundStyle(toast.tone.color(in: palette))
@@ -344,16 +344,16 @@ private struct AppToastView: View {
             .accessibilityLabel("\(toast.tone.title): \(toast.message)")
 
             Button(action: dismiss) {
-                HorusIcon(.x, size: 14, foreground: palette.muted)
+                HorusIcon(.x, size: HorusStyle.glyphInline, foreground: palette.muted)
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.horusPlain)
             .accessibilityLabel("Dismiss notification")
         }
-        .padding(.leading, 16)
-        .padding(.trailing, 6)
-        .padding(.vertical, 10)
+        .padding(.leading, HorusSpace.l)
+        .padding(.trailing, HorusSpace.s)
+        .padding(.vertical, HorusSpace.m)
         .horusGlass(in: HorusStyle.cardShape, interactive: true)
         .shadow(color: .black.opacity(0.20), radius: 18, y: 8)
         .gesture(
@@ -472,7 +472,7 @@ private struct DirectoryBrowserHeader: View {
     let onParent: (String) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: HorusSpace.xs) {
             Text(path)
                 .font(HorusStyle.metadataFont.weight(.bold))
                 .tracking(1)
@@ -491,8 +491,8 @@ private struct DirectoryBrowserHeader: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
+        .padding(.horizontal, HorusSpace.l)
+        .padding(.vertical, HorusSpace.s)
     }
 }
 
@@ -699,7 +699,7 @@ struct SidebarView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 0) {
-                HStack(spacing: 10) {
+                HStack(spacing: HorusSpace.m) {
                     Image("HorusLogo")
                         .resizable()
                         .scaledToFit()
@@ -733,10 +733,10 @@ struct SidebarView: View {
                     .popover(isPresented: $showsConnectionDetails) { connectionDetails }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
+                .padding(.horizontal, HorusSpace.l)
+                .padding(.vertical, HorusSpace.m)
 
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: HorusSpace.xxs) {
                     navigationButton("Gateway", destination: .gateway)
                     navigationButton("Providers", destination: .providers)
                     navigationButton("Default agent", destination: .agent)
@@ -745,14 +745,14 @@ struct SidebarView: View {
                         contributionNavigationButton(widget)
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 10)
+                .padding(.horizontal, HorusSpace.m)
+                .padding(.bottom, HorusSpace.m)
 
                 VStack(alignment: .leading, spacing: 0) {
                     navigationButton("Chats", destination: .chat)
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, HorusSpace.m)
 
-                    LazyVStack(alignment: .leading, spacing: 2) {
+                    LazyVStack(alignment: .leading, spacing: HorusSpace.xxs) {
                         if model.sessions.isEmpty {
                             Text(model.connectionState.isReady ? "No chats yet" : model.connectionState.label)
                                 .foregroundStyle(palette.muted)
@@ -761,7 +761,7 @@ struct SidebarView: View {
                             workspaceGroup(group)
                         }
                     }
-                    .padding(.horizontal, 16)
+                    .padding(.horizontal, HorusSpace.l)
                 }
             }
             .frame(maxWidth: .infinity)
@@ -794,13 +794,13 @@ struct SidebarView: View {
                 .accessibilityLabel("Settings")
                 .help("Settings")
             }
-            .padding(12)
+            .padding(HorusSpace.m)
         }
         .toolbarVisibility(.hidden, for: .navigationBar)
     }
 
     private var connectionDetails: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: HorusSpace.m) {
             Text(model.connectionState.label)
                 .font(HorusStyle.controlFont.weight(.semibold))
                 .foregroundStyle(model.connectionState.isReady ? palette.signal : palette.danger)
@@ -842,7 +842,7 @@ struct SidebarView: View {
             }
         }
         .multilineTextAlignment(.center)
-        .padding(16)
+        .padding(HorusSpace.l)
         .frame(width: 280)
         .presentationCompactAdaptation(.popover)
     }
@@ -862,7 +862,7 @@ struct SidebarView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.horusPlain)
-        .padding(.horizontal, 4)
+        .padding(.horizontal, HorusSpace.xs)
         .frame(minHeight: HorusStyle.iconButtonSize)
     }
 
@@ -885,7 +885,7 @@ struct SidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.horusPlain)
-        .padding(.horizontal, 4)
+        .padding(.horizontal, HorusSpace.xs)
         .frame(minHeight: HorusStyle.iconButtonSize)
     }
 
@@ -929,7 +929,7 @@ struct SidebarView: View {
                 Button {
                     expansionBinding(for: group.id).wrappedValue.toggle()
                 } label: {
-                    HStack(spacing: 6) {
+                    HStack(spacing: HorusSpace.s) {
                         HorusIcon(.folder, foreground: palette.muted)
                         Text(group.name)
                             .font(HorusStyle.controlFont)
@@ -964,7 +964,7 @@ struct SidebarView: View {
                         title: "New chat in \(group.name)",
                         glyph: .notePencil,
                         iconColor: palette.muted,
-                        iconSize: 14
+                        iconSize: HorusStyle.glyphInline
                     )
                     .labelStyle(.iconOnly)
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
@@ -997,12 +997,12 @@ struct SidebarView: View {
         case .idle:
             activityValue = isUnread ? "Finished, unread" : ""
         }
-        return HStack(spacing: 4) {
+        return HStack(spacing: HorusSpace.xs) {
             Button {
                 model.openSession(session.sessionId)
                 showDetail(.chat)
             } label: {
-                HStack(spacing: 8) {
+                HStack(spacing: HorusSpace.s) {
                     HorusTitleText(
                         title: title,
                         cursorColor: isSelected ? palette.accent : .primary
@@ -1025,7 +1025,7 @@ struct SidebarView: View {
             .accessibilityAddTraits(isSelected ? .isSelected : [])
 
             if session.pinned {
-                HorusIcon(.pushPin, size: 12, foreground: palette.accent)
+                HorusIcon(.pushPin, size: HorusStyle.glyphMark, foreground: palette.accent)
             }
 
             Menu {
@@ -1066,7 +1066,7 @@ struct SidebarView: View {
             .accessibilityLabel("Chat actions")
             .help("Chat actions")
         }
-        .padding(.horizontal, 8)
+        .padding(.horizontal, HorusSpace.s)
         .frame(minHeight: HorusStyle.iconButtonSize)
         .background(
             isSelected ? palette.accentSoft.opacity(0.55) : .clear,
@@ -1092,7 +1092,7 @@ private struct SessionActivityIndicator: View {
         Group {
             switch state {
             case .running:
-                HorusSpinner(size: 11, foreground: palette.accent)
+                HorusSpinner(size: HorusStyle.glyphMark, foreground: palette.accent)
             case .awaitingApproval:
                 Circle()
                     .trim(from: 0.08, to: 0.76)
@@ -1133,7 +1133,7 @@ struct PairingView: View {
     var body: some View {
         @Bindable var model = model
         ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
+            VStack(alignment: .leading, spacing: HorusSpace.xl) {
                 HStack(alignment: .top) {
                     SectionHeading(
                         title: "Pair with a gateway",
@@ -1151,10 +1151,10 @@ struct PairingView: View {
                     }
                 }
 
-                VStack(spacing: 12) {
+                VStack(spacing: HorusSpace.m) {
                     HorusCard {
-                        VStack(alignment: .leading, spacing: 18) {
-                            VStack(alignment: .leading, spacing: 7) {
+                        VStack(alignment: .leading, spacing: HorusSpace.l) {
+                            VStack(alignment: .leading, spacing: HorusSpace.s) {
                                 Text("Gateway address")
                                     .font(HorusStyle.controlFont)
                                 HStack {
@@ -1169,24 +1169,18 @@ struct PairingView: View {
                                         }
                                     }
                                     .labelStyle(.iconOnly)
+                                    .buttonStyle(.glass)
+                                    .buttonBorderShape(.circle)
+                                    .controlSize(.large)
                                     .frame(
                                         width: HorusStyle.iconButtonSize,
                                         height: HorusStyle.iconButtonSize
                                     )
-                                    .contentShape(.circle)
-                                    // Preserve PasteButton's privacy-aware action while the
-                                    // stable Horus control below owns its visible presentation.
-                                    .opacity(0.01)
-                                    .overlay {
-                                        HorusIcon(.copy)
-                                            .allowsHitTesting(false)
-                                    }
-                                    .horusGlass(in: Circle(), interactive: true)
                                     .accessibilityLabel("Paste pairing setup")
                                     .help("Paste pairing setup")
                                 }
                             }
-                            VStack(alignment: .leading, spacing: 7) {
+                            VStack(alignment: .leading, spacing: HorusSpace.s) {
                                 Text("One-time code")
                                     .font(HorusStyle.controlFont)
                                 SecureField("One-time code", text: $model.pairingCode)
@@ -1201,7 +1195,7 @@ struct PairingView: View {
                         .foregroundStyle(palette.muted)
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal, 8)
+                        .padding(.horizontal, HorusSpace.s)
 
                     if let error = model.pairingError {
                         HorusLabel(
@@ -1226,10 +1220,10 @@ struct PairingView: View {
     /// The two ways in, then the wire detail. The protocol line led this stack before, which
     /// put the most technical line on the screen above the decision it belongs under.
     private var pairAction: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: HorusSpace.m) {
             if model.connectionState == .connecting || model.connectionState == .authenticating {
                 HStack {
-                    HorusSpinner(size: 18, foreground: palette.accent)
+                    HorusSpinner(size: HorusStyle.glyphLead, foreground: palette.accent)
                 }
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(
@@ -1251,10 +1245,10 @@ struct PairingView: View {
             )
                 .font(HorusStyle.metadataFont)
                 .foregroundStyle(palette.muted)
-                .padding(.top, 2)
+                .padding(.top, HorusSpace.xxs)
         }
         .frame(maxWidth: .infinity)
-        .padding(.top, 16)
+        .padding(.top, HorusSpace.l)
     }
 }
 

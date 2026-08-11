@@ -77,8 +77,8 @@ private struct UnifiedDiffView: View {
             }
 
             if document.isTruncated {
-                HStack(spacing: 8) {
-                    HorusIcon(.warning, size: 14, foreground: palette.warning)
+                HStack(spacing: HorusSpace.s) {
+                    HorusIcon(.warning, size: HorusStyle.glyphInline, foreground: palette.warning)
                     Text("Diff truncated at the safe transfer limit")
                         .font(HorusStyle.metadataFont)
                         .foregroundStyle(palette.muted)
@@ -114,9 +114,9 @@ private struct DiffFileHeader: View {
 
     var body: some View {
         Button(action: toggle) {
-            HStack(spacing: 10) {
-                HorusIcon(file.path.fileGlyph, size: 17, foreground: palette.accent)
-                VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: HorusSpace.m) {
+                HorusIcon(file.path.fileGlyph, size: HorusStyle.glyphLead, foreground: palette.accent)
+                VStack(alignment: .leading, spacing: HorusSpace.xxs) {
                     Text(file.name)
                         .font(HorusStyle.metadataFont.weight(.semibold))
                         .lineLimit(1)
@@ -129,18 +129,18 @@ private struct DiffFileHeader: View {
                             .truncationMode(.middle)
                     }
                 }
-                Spacer(minLength: 6)
-                HStack(spacing: 5) {
+                Spacer(minLength: HorusSpace.s)
+                HStack(spacing: HorusSpace.xs) {
                     Text("+\(file.added)").foregroundStyle(palette.signal)
                     Text("−\(file.removed)").foregroundStyle(palette.danger)
                 }
                 .font(HorusStyle.metadataFont.weight(.semibold))
                 .fixedSize()
-                HorusIcon(.caretRight, size: 11, foreground: palette.muted)
+                HorusIcon(.caretRight, size: HorusStyle.glyphMark, foreground: palette.muted)
                     .rotationEffect(.degrees(isExpanded ? 90 : 0))
                     .animation(.snappy(duration: 0.18), value: isExpanded)
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, HorusSpace.m)
             .frame(minHeight: 54)
             .contentShape(Rectangle())
         }
@@ -184,12 +184,12 @@ private struct DiffRowView: View {
     }
 
     private func hunkHeader(_ hunk: UnifiedDiffHunk) -> some View {
-        HStack(spacing: 8) {
-            HorusIcon(.caretDown, size: 10, foreground: palette.muted)
+        HStack(spacing: HorusSpace.s) {
+            HorusIcon(.caretDown, size: HorusStyle.glyphMark, foreground: palette.muted)
             Text(hunk.title)
                 .font(HorusStyle.metadataFont.weight(.semibold))
                 .foregroundStyle(palette.muted)
-            Spacer(minLength: 8)
+            Spacer(minLength: HorusSpace.s)
             if hunk.added > 0 {
                 Text("+\(hunk.added)").foregroundStyle(palette.signal)
             }
@@ -198,8 +198,8 @@ private struct DiffRowView: View {
             }
         }
         .font(HorusStyle.metadataFont.weight(.semibold))
-        .padding(.horizontal, 11)
-        .padding(.vertical, 7)
+        .padding(.horizontal, HorusSpace.m)
+        .padding(.vertical, HorusSpace.s)
         .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
         .background(palette.accentSoft.opacity(0.45))
         .accessibilityElement(children: .ignore)
@@ -221,7 +221,7 @@ private struct DiffRowView: View {
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.trailing, 10)
+                .padding(.trailing, HorusSpace.m)
         }
         .frame(maxWidth: .infinity, minHeight: 23, alignment: .leading)
         .background(background)
@@ -235,7 +235,7 @@ private struct DiffRowView: View {
             .monospacedDigit()
             .foregroundStyle(palette.muted)
             .frame(width: 30, alignment: .trailing)
-            .padding(.trailing, 5)
+            .padding(.trailing, HorusSpace.xs)
             .frame(maxHeight: .infinity)
             .background(palette.canvas.opacity(0.42))
             .overlay(alignment: .trailing) {

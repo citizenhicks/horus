@@ -46,7 +46,7 @@ struct ModelRoutePicker: View {
             .accessibilityLabel(label)
             .accessibilityValue(selectedModelLabel)
         } label: {
-            HStack(spacing: 5) {
+            HStack(spacing: HorusSpace.xs) {
                 Text(label)
                 SettingsInfoButton(title: label, detail: detail)
             }
@@ -75,15 +75,8 @@ struct ModelRoutePicker: View {
     }
 
     private func menuLabel(_ text: String, glyph: HorusGlyph?) -> some View {
-        HStack(spacing: 5) {
-            if let glyph { HorusIcon(glyph, size: 14) }
-            Text(text)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            HorusIcon(.caretUpDown, size: 12)
-                .accessibilityHidden(true)
-        }
-        .foregroundStyle(palette.accent)
+        HorusMenuLabel(text: text, glyph: glyph, font: HorusStyle.bodyFont)
+            .foregroundStyle(palette.accent)
     }
 
     @ViewBuilder
@@ -175,8 +168,8 @@ struct AgentSettingsView: View {
                         .textFieldStyle(.plain)
                         .labelsHidden()
                         .accessibilityLabel("System prompt")
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 12)
+                        .padding(.horizontal, HorusSpace.l)
+                        .padding(.vertical, HorusSpace.m)
                         .horusGlass(in: HorusStyle.cardShape, interactive: true)
                         .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                         .listRowBackground(Color.clear)
@@ -195,7 +188,7 @@ struct AgentSettingsView: View {
                         )
                     )
 
-                    HStack(spacing: 5) {
+                    HStack(spacing: HorusSpace.xs) {
                         // Hundreds: this ceiling is set in the thousands, and stepping by one
                         // makes the control useless for reaching any value someone wants.
                         Stepper(value: maxModelSteps, in: 1...42_000, step: 100) {
@@ -214,7 +207,7 @@ struct AgentSettingsView: View {
                         capabilityToggle(feature)
                         ForEach(feature.settings) { setting in
                             middlewareSetting(feature, setting)
-                                .padding(.leading, 12)
+                                .padding(.leading, HorusSpace.m)
                         }
                     }
                 }
@@ -243,7 +236,7 @@ struct AgentSettingsView: View {
             // Save sits before the dot: this accessory is pinned to the trailing edge, so
             // growing rightwards would shove the dot inward and the status would appear to
             // move. Leading-side growth leaves the dot where the reader last saw it.
-            HStack(spacing: 8) {
+            HStack(spacing: HorusSpace.s) {
                 if hasChanges {
                     agentSaveButton
                         .glassEffect(
@@ -291,9 +284,9 @@ struct AgentSettingsView: View {
         Button(action: applyConfiguration) {
             Group {
                 if model.isApplyingConfiguration {
-                    HorusSpinner(size: 17, foreground: palette.onAccent)
+                    HorusSpinner(size: HorusStyle.iconSize, foreground: palette.onAccent)
                 } else {
-                    HorusIcon(.saveAll, size: 17, foreground: palette.onAccent)
+                    HorusIcon(.saveAll, size: HorusStyle.iconSize, foreground: palette.onAccent)
                 }
             }
             .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
@@ -321,7 +314,7 @@ struct AgentSettingsView: View {
     }
 
     private var agentStatusDetails: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: HorusSpace.m) {
             Text(agentStatusLabel)
                 .font(HorusStyle.controlFont.weight(.semibold))
                 .foregroundStyle(agentStatusColor)
@@ -337,7 +330,7 @@ struct AgentSettingsView: View {
             }
         }
         .multilineTextAlignment(.center)
-        .padding(16)
+        .padding(HorusSpace.l)
         .frame(width: 280)
         .presentationCompactAdaptation(.popover)
     }
@@ -385,7 +378,7 @@ struct AgentSettingsView: View {
     }
 
     private func capabilityToggle(_ feature: MiddlewareFeature) -> some View {
-        HStack(spacing: 5) {
+        HStack(spacing: HorusSpace.xs) {
             Toggle(feature.label, isOn: middleware(feature))
                 .disabled(feature.required)
             SettingsInfoButton(title: feature.label, detail: feature.description)
@@ -406,7 +399,7 @@ struct AgentSettingsView: View {
                 maximum: maximum
             )
             let increment = Swift.max(Int(clamping: step), 1)
-            HStack(spacing: 5) {
+            HStack(spacing: HorusSpace.xs) {
                 if let maximum {
                     Stepper(
                         value: value,
@@ -461,9 +454,9 @@ struct AgentSettingsView: View {
                     }
                     .labelsHidden()
                 } label: {
-                    HStack(spacing: 5) {
+                    HStack(spacing: HorusSpace.xs) {
                         Text(selectedLabel)
-                        HorusIcon(.caretUpDown, size: 12)
+                        HorusIcon(.caretUpDown, size: HorusStyle.glyphMark, gutter: false)
                             .accessibilityHidden(true)
                     }
                     .foregroundStyle(palette.accent)
@@ -474,7 +467,7 @@ struct AgentSettingsView: View {
                 .accessibilityLabel(setting.label)
                 .accessibilityValue(selectedLabel)
             } label: {
-                HStack(spacing: 5) {
+                HStack(spacing: HorusSpace.xs) {
                     Text(setting.label)
                     SettingsInfoButton(
                         title: setting.label,
@@ -711,7 +704,7 @@ struct ProvidersView: View {
                         }
                     }
                 } header: {
-                    HStack(spacing: 5) {
+                    HStack(spacing: HorusSpace.xs) {
                         Text("Configured")
                         SettingsInfoButton(
                             title: "Editing configured providers",
@@ -733,7 +726,7 @@ struct ProvidersView: View {
                         .settingsPickerStyle()
                         .sensoryFeedback(.selection, trigger: providerID.wrappedValue)
                     } label: {
-                        HStack(spacing: 5) {
+                        HStack(spacing: HorusSpace.xs) {
                             Text("Provider")
                             SettingsInfoButton(
                                 title: selectedStatus.map { model.providerLabel(for: $0.provider) }
@@ -750,7 +743,7 @@ struct ProvidersView: View {
                                 TextField("model-a, model-b", text: providerModelIDs)
                                     .settingsField()
                             } label: {
-                                HStack(spacing: 5) {
+                                HStack(spacing: HorusSpace.xs) {
                                     Text("Model ID(s)")
                                     SettingsInfoButton(
                                         title: "Model ID(s)",
@@ -763,7 +756,7 @@ struct ProvidersView: View {
                                 TextField("low, medium, high", text: providerReasoningEfforts)
                                     .settingsField()
                             } label: {
-                                HStack(spacing: 5) {
+                                HStack(spacing: HorusSpace.xs) {
                                     Text("Reasoning effort(s)")
                                     SettingsInfoButton(
                                         title: "Reasoning effort(s)",
@@ -845,7 +838,7 @@ struct ProvidersView: View {
                         .textContentType(.password)
                         .settingsField()
                 } label: {
-                    HStack(spacing: 5) {
+                    HStack(spacing: HorusSpace.xs) {
                         Text("API key")
                         SettingsInfoButton(
                             title: "API key",
@@ -886,9 +879,9 @@ struct ProvidersView: View {
         case .startingLogin(let provider):
             StatusBanner(tone: .neutral, title: "Starting \(model.providerLabel(for: provider)) sign-in", detail: "Waiting for a device code.", progress: true)
         case .deviceCode(let provider, let url, let code):
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: HorusSpace.m) {
                 Text("Finish \(model.providerLabel(for: provider)) sign-in")
-                    .font(.headline)
+                    .font(HorusStyle.titleFont)
                 Text("Open the verification page and enter this code.")
                     .font(HorusStyle.bodyFont)
                     .foregroundStyle(palette.muted)
@@ -896,7 +889,7 @@ struct ProvidersView: View {
                     .font(.system(.title, design: .monospaced, weight: .bold))
                     .tracking(3)
                     .textSelection(.enabled)
-                    .padding(12)
+                    .padding(HorusSpace.m)
                     .background(palette.raised, in: HorusStyle.controlShape)
                 deviceCodeActions(url: url, code: code)
             }
@@ -1055,8 +1048,8 @@ private struct CronTaskRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: HorusSpace.m) {
+            VStack(alignment: .leading, spacing: HorusSpace.xs) {
                 Text(task.task)
                     .font(HorusStyle.bodyFont.weight(.semibold))
                     .textSelection(.enabled)
@@ -1093,9 +1086,9 @@ private struct CronRunRow: View {
     let run: CronRun
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Circle().fill(statusColor).frame(width: 9, height: 9).padding(.top, 5)
-            VStack(alignment: .leading, spacing: 5) {
+        HStack(alignment: .top, spacing: HorusSpace.m) {
+            Circle().fill(statusColor).frame(width: 9, height: 9).padding(.top, HorusSpace.xs)
+            VStack(alignment: .leading, spacing: HorusSpace.xs) {
                 HStack {
                     Text(run.status.rawValue.uppercased())
                         .font(HorusStyle.metadataFont.weight(.bold))
@@ -1114,7 +1107,7 @@ private struct CronRunRow: View {
                     }
                     .buttonStyle(.horusGlass)
                     .buttonBorderShape(.capsule)
-                    .padding(.top, 2)
+                    .padding(.top, HorusSpace.xxs)
                 }
             }
             Spacer(minLength: 0)
@@ -1147,7 +1140,7 @@ struct SettingsInfoButton: View {
         Button {
             showsDetail = true
         } label: {
-            HorusIcon(glyph, size: 15, foreground: palette.muted)
+            HorusIcon(glyph, size: HorusStyle.glyphInline, foreground: palette.muted)
                 .frame(
                     minWidth: HorusStyle.iconButtonSize,
                     minHeight: HorusStyle.iconButtonSize
@@ -1160,7 +1153,7 @@ struct SettingsInfoButton: View {
         .help("About \(title)")
         .sensoryFeedback(.selection, trigger: showsDetail)
         .popover(isPresented: $showsDetail) {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: HorusSpace.s) {
                 Text(title)
                     .font(HorusStyle.controlFont.weight(.semibold))
                 Text(detail)
@@ -1168,7 +1161,7 @@ struct SettingsInfoButton: View {
                     .foregroundStyle(palette.muted)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(16)
+            .padding(HorusSpace.l)
             .frame(width: 280, alignment: .leading)
             .presentationCompactAdaptation(.popover)
         }
@@ -1202,7 +1195,7 @@ struct GatewayView: View {
                 .settingsPickerStyle()
                 .sensoryFeedback(.selection, trigger: model.selectedAccountID)
                 LabeledContent("Status") {
-                    HStack(spacing: 7) {
+                    HStack(spacing: HorusSpace.s) {
                         Circle()
                             .fill(model.connectionState.isReady ? palette.signal : palette.danger)
                             .frame(width: 7, height: 7)
@@ -1210,9 +1203,9 @@ struct GatewayView: View {
                     }
                     .font(HorusStyle.controlFont)
                 }
-                HStack(spacing: 12) {
+                HStack(spacing: HorusSpace.m) {
                     Text("Endpoint")
-                    Spacer(minLength: 8)
+                    Spacer(minLength: HorusSpace.s)
                     Text(model.selectedAccount?.endpoint.rawValue ?? "—")
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -1407,10 +1400,10 @@ private struct StatusBanner: View {
     var action: (String, @MainActor () -> Void)?
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: HorusSpace.m) {
             if progress { ProgressView().controlSize(.small) }
             else { HorusIcon(glyph, foreground: color) }
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: HorusSpace.xs) {
                 Text(title).font(HorusStyle.controlFont)
                 Text(detail).font(HorusStyle.bodyFont).foregroundStyle(palette.muted)
             }
@@ -1421,7 +1414,7 @@ private struct StatusBanner: View {
                     .buttonBorderShape(.capsule)
             }
         }
-        .padding(13)
+        .padding(HorusSpace.m)
         .background(color.opacity(0.09), in: HorusStyle.cardShape)
         .overlay {
             HorusStyle.cardShape

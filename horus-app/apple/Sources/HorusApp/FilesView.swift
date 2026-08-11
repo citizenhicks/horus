@@ -11,8 +11,8 @@ struct FilesView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 FilesInspectorTabPicker()
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 10)
+                    .padding(.horizontal, HorusSpace.m)
+                    .padding(.bottom, HorusSpace.m)
                 Divider()
                 FilesContent()
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -224,7 +224,7 @@ private struct FileTreeRow: View {
     let node: FileTreeNode
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: HorusSpace.m) {
             HorusIcon(
                 node.isFolder ? .folder : node.id.fileGlyph,
                 size: 15,
@@ -234,14 +234,14 @@ private struct FileTreeRow: View {
                 .font(HorusStyle.bodyFont)
                 .lineLimit(1)
                 .truncationMode(.middle)
-            Spacer(minLength: 8)
+            Spacer(minLength: HorusSpace.s)
             if let size = node.size {
                 Text(size, format: .byteCount(style: .file))
                     .font(HorusStyle.metadataFont)
                     .foregroundStyle(palette.muted)
             }
         }
-        .frame(minHeight: 34)
+        .frame(minHeight: HorusStyle.rowRegular)
         .contentShape(Rectangle())
     }
 }
@@ -329,7 +329,7 @@ private struct SessionFileInspectorRow: View {
                     model.saveOrShareSessionFile(file)
                 }
             } label: {
-                HorusIcon(.dotsThree, size: 14)
+                HorusIcon(.dotsThree, size: HorusStyle.glyphInline)
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                     .contentShape(Rectangle())
             }
@@ -346,7 +346,7 @@ private struct InspectorSectionLoadingRow: View {
     let title: String
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: HorusSpace.m) {
             ProgressView().controlSize(.small)
             Text(title).foregroundStyle(.secondary)
         }
@@ -361,14 +361,14 @@ private struct InspectorEmptyRow: View {
     let glyph: HorusGlyph
 
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: HorusSpace.s) {
             HorusIcon(glyph, size: 44, foreground: palette.muted)
             Text(title)
                 .font(HorusStyle.metadataFont.weight(.semibold))
                 .foregroundStyle(palette.muted)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 16)
+        .padding(.vertical, HorusSpace.l)
         .listRowBackground(Color.clear)
         .listRowSeparator(.hidden)
         .accessibilityElement(children: .combine)
@@ -400,9 +400,9 @@ private struct InspectorFileRow: View {
     var showsDisclosure = true
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: HorusSpace.m) {
             HorusIcon(name.fileGlyph, foreground: palette.accent)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: HorusSpace.xxs) {
                 Text(name)
                     .font(HorusStyle.metadataFont.weight(.semibold))
                     .lineLimit(1)
@@ -413,12 +413,12 @@ private struct InspectorFileRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            Spacer(minLength: 8)
+            Spacer(minLength: HorusSpace.s)
             Text(size, format: .byteCount(style: .file))
                 .font(HorusStyle.metadataFont)
                 .foregroundStyle(palette.muted)
             if showsDisclosure {
-                HorusIcon(.caretRight, size: 12, foreground: palette.muted)
+                HorusIcon(.caretRight, size: HorusStyle.glyphMark, foreground: palette.muted)
             }
         }
         .frame(minHeight: HorusStyle.iconButtonSize)
@@ -502,7 +502,7 @@ struct NumberedSourceText: View {
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                             .frame(width: 44, alignment: .trailing)
-                            .padding(.trailing, 12)
+                            .padding(.trailing, HorusSpace.m)
                         Text(line.text.characters.isEmpty ? AttributedString(" ") : line.text)
                             .font(HorusStyle.metadataFont)
                             .fixedSize(horizontal: false, vertical: true)
@@ -511,8 +511,8 @@ struct NumberedSourceText: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 16)
-            .padding(.trailing, 16)
+            .padding(.vertical, HorusSpace.l)
+            .padding(.trailing, HorusSpace.l)
         }
         .textSelection(.enabled)
         .overlay {
@@ -612,7 +612,7 @@ struct PreviewTranscriptSheet: View {
                                     retainedEntryID = currentPreview.entries.first?.id
                                     model.loadPreviewPage(next)
                                 }
-                                .padding(.bottom, 12)
+                                .padding(.bottom, HorusSpace.m)
                             }
                             TranscriptRowsView(
                                 entries: currentPreview.entries,
@@ -624,7 +624,7 @@ struct PreviewTranscriptSheet: View {
                         .scrollTargetLayout()
                         .frame(maxWidth: 880)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(16)
+                        .padding(HorusSpace.l)
                     }
                     .scrollIndicators(.hidden)
                     .refreshable { loadEarlierPage() }
@@ -651,7 +651,7 @@ struct PreviewTranscriptSheet: View {
     }
 
     private var header: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: HorusSpace.s) {
             Text(agentName)
                 .font(HorusStyle.controlFont.weight(.semibold))
                 .lineLimit(1)
@@ -687,9 +687,9 @@ struct PreviewTranscriptSheet: View {
             }
         }
         .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
-        .padding(.leading, 16)
+        .padding(.leading, HorusSpace.l)
         .padding(.trailing, HorusStyle.iconRowPadding)
-        .padding(.vertical, 6)
+        .padding(.vertical, HorusSpace.s)
         .accessibilityElement(children: .contain)
     }
 
@@ -752,12 +752,12 @@ struct PreviewBlockView: View {
     let block: FrontendBlock
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: HorusSpace.s) {
             ForEach(block.files) { file in
                 SessionFileCard(file: file)
             }
             if !block.text.isEmpty {
-                HStack(alignment: .top, spacing: 8) {
+                HStack(alignment: .top, spacing: HorusSpace.s) {
                     if block.pending { ProgressView().controlSize(.mini) }
                     CollapsibleText(text: block.text)
                         .font(

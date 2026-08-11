@@ -27,8 +27,6 @@ private struct ImportedPhotoFile: Transferable {
 }
 
 struct ComposerOptionsView: View {
-    private static let composerGlyphSize: CGFloat = 18
-
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
     let dictation: ComposerDictation
@@ -43,7 +41,7 @@ struct ComposerOptionsView: View {
         HStack(spacing: 0) {
             if model.attachmentsEnabled { addAttachmentControl }
             approvalMenu
-            Spacer(minLength: 8)
+            Spacer(minLength: HorusSpace.s)
             modelMenu
             actionButtons
         }
@@ -82,7 +80,7 @@ struct ComposerOptionsView: View {
             HorusLabel(
                 title: "Add attachment",
                 glyph: .plus,
-                iconSize: Self.composerGlyphSize
+                iconSize: HorusStyle.glyphLead
             )
                 .labelStyle(.iconOnly)
                 .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
@@ -101,7 +99,8 @@ struct ComposerOptionsView: View {
             HorusMenuLabel(
                 text: currentChoice.map { model.modelLabel(for: $0) } ?? "Model",
                 glyph: providerGlyph,
-                detail: currentChoice?.reasoningEffort?.capitalized
+                detail: currentChoice?.reasoningEffort?.capitalized,
+                glyphSize: HorusStyle.glyphLead
             )
                 .frame(minHeight: HorusStyle.iconButtonSize)
                 .contentShape(Rectangle())
@@ -125,7 +124,7 @@ struct ComposerOptionsView: View {
                 title: approvalLabel,
                 glyph: approvalGlyph,
                 iconColor: approvalForeground,
-                iconSize: Self.composerGlyphSize
+                iconSize: HorusStyle.glyphLead
             )
                 .labelStyle(.iconOnly)
                 .foregroundStyle(approvalForeground)
@@ -192,7 +191,7 @@ struct ComposerOptionsView: View {
                 HorusLabel(
                     title: dictationLabel,
                     glyph: .mic01,
-                    iconSize: Self.composerGlyphSize
+                    iconSize: HorusStyle.glyphLead
                 )
             }
         }

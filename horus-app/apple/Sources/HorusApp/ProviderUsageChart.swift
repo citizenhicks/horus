@@ -121,7 +121,7 @@ struct ProviderUsageChart: View {
                 .foregroundStyle(palette.muted)
             }
         }
-        .chartLegend(position: .bottom, alignment: .leading, spacing: 10)
+        .chartLegend(position: .bottom, alignment: .leading, spacing: HorusSpace.m)
         .chartPlotStyle { plot in
             plot
                 .background(palette.line.opacity(0.08))

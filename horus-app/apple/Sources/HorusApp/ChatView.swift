@@ -51,13 +51,13 @@ struct ChatView: View {
             // Title changes animate glyphs, so the principal title must be a view the app
             // owns rather than the system's opaque navigation title.
             ToolbarItem(placement: .principal) {
-                VStack(spacing: 1) {
+                VStack(spacing: HorusSpace.xxs) {
                     HorusTitleText(title: chatTitle)
-                        .font(.headline)
+                        .font(HorusStyle.titleFont)
                         .lineLimit(1)
                     if !chatSubtitle.isEmpty {
                         Text(chatSubtitle)
-                            .font(.caption)
+                            .font(HorusStyle.captionFont)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
@@ -507,7 +507,7 @@ private struct TranscriptRow: View {
                 UserMessageContent(entry: entry)
             }
         case .assistant, .commentary:
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: HorusSpace.s) {
                 TranscriptFileCards(files: entry.files)
                 if !entry.text.isEmpty {
                     if collapsesLongMessages {
@@ -526,7 +526,7 @@ private struct TranscriptRow: View {
         case .reasoning:
             ReasoningLine(entry: entry, isActive: isActive)
         case .event, .error:
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: HorusSpace.s) {
                 TranscriptFileCards(files: entry.files)
                 if !entry.title.isEmpty || !entry.text.isEmpty {
                     EventLine(entry: entry, isActive: isActive)
@@ -606,12 +606,12 @@ private struct UserMessageContent: View {
     let entry: TranscriptEntry
 
     var body: some View {
-        VStack(alignment: .trailing, spacing: 6) {
+        VStack(alignment: .trailing, spacing: HorusSpace.s) {
             TranscriptFileCards(files: entry.files)
             if !entry.text.isEmpty {
                 CollapsibleText(text: entry.text)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
+                    .padding(.horizontal, HorusSpace.l)
+                    .padding(.vertical, HorusSpace.m)
                     .background(palette.accentSoft, in: HorusStyle.cardShape)
             }
         }
@@ -635,13 +635,13 @@ struct CollapsibleText: View {
     var streaming = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: HorusSpace.s) {
             renderedText
             if isTruncated {
                 Button(isExpanded ? "Show less" : "Read more") {
                     isExpanded.toggle()
                 }
-                .font(.footnote.weight(.semibold))
+                .font(HorusStyle.captionFont.weight(.semibold))
                 .foregroundStyle(palette.accent)
                 .buttonStyle(.horusPlain)
                 .frame(minHeight: HorusStyle.iconButtonSize, alignment: .leading)
@@ -745,7 +745,7 @@ struct SessionFileCard: View {
                     model.saveOrShareSessionFile(file)
                 }
             } label: {
-                HorusIcon(.dotsThree, size: 14)
+                HorusIcon(.dotsThree, size: HorusStyle.glyphInline)
                     .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
                     .contentShape(Rectangle())
             }
@@ -768,8 +768,8 @@ private struct QueuedMessageView: View {
             CollapsibleText(text: widget.widget.text)
                 .font(HorusStyle.bodyFont)
                 .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
+                .padding(.horizontal, HorusSpace.l)
+                .padding(.vertical, HorusSpace.m)
                 .background(palette.accentSoft.opacity(0.24), in: HorusStyle.cardShape)
                 .overlay {
                     HorusStyle.cardShape.stroke(
@@ -851,10 +851,10 @@ private struct FileCard<Trailing: View>: View {
                 .foregroundStyle(detailColor)
                 .lineLimit(1)
         }
-        .padding(10)
+        .padding(HorusSpace.m)
         .frame(width: 136, height: 112)
         .background(palette.raised, in: HorusStyle.tileShape)
-        .overlay(alignment: .topTrailing) { trailing.padding(4) }
+        .overlay(alignment: .topTrailing) { trailing.padding(HorusSpace.xs) }
         .contentShape(HorusStyle.tileShape)
     }
 }
@@ -908,7 +908,7 @@ private struct EventGroupView: View {
     let isActive: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: HorusSpace.s) {
             // Files an event produced are the deliverable, not a detail, so they stay out.
             TranscriptFileCards(files: files)
             if !lines.isEmpty {
@@ -921,7 +921,7 @@ private struct EventGroupView: View {
                 .accessibilityLabel(TranscriptEntry.summary(for: lines))
                 .accessibilityHint(isExpanded ? "Collapses the steps" : "Expands the steps")
                 if isExpanded {
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: HorusSpace.xxs) {
                         ForEach(lines) { EventLine(entry: $0, isActive: false) }
                     }
                 }
@@ -930,22 +930,21 @@ private struct EventGroupView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: HorusSpace.s) {
             // The group keeps its own mark whether or not it is running: the summary beside
             // it shimmers while the run is live, so swapping in a spinner said the same
             // thing twice and cost the row its identity while it mattered most.
-            HorusIcon(.group01, size: 14, foreground: palette.muted)
-                .frame(width: 18, height: 18)
+            HorusIcon(.group01, size: HorusStyle.glyphInline, foreground: palette.muted)
             Text(TranscriptEntry.summary(for: lines))
                 .font(HorusStyle.metadataFont)
                 .foregroundStyle(palette.muted)
                 .lineLimit(1)
                 // The group is one transcript step, so its summary owns the running mark.
                 .horusRunningShimmer(active: isActive)
-            Spacer(minLength: 8)
-            HorusIcon(.caretUpDown, size: 13, foreground: palette.muted)
+            Spacer(minLength: HorusSpace.s)
+            HorusIcon(.caretUpDown, size: HorusStyle.glyphMark, foreground: palette.muted)
         }
-        .frame(minHeight: 30)
+        .frame(minHeight: HorusStyle.rowRegular)
         .contentShape(Rectangle())
     }
 
@@ -973,8 +972,11 @@ private struct ReasoningLine: View {
         Button {
             withAnimation(.easeOut(duration: 0.16)) { isExpanded.toggle() }
         } label: {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                HorusIcon(.setup01, size: 13, foreground: palette.muted)
+            // A glyph has no baseline, so `.firstTextBaseline` hung this one by its bottom
+            // edge and left it sitting low. Centred while the summary is one line, topped
+            // once the reasoning expands into a block.
+            HStack(alignment: isExpanded ? .top : .center, spacing: HorusSpace.s) {
+                HorusIcon(.setup01, size: HorusStyle.glyphInline, foreground: palette.muted)
                 Group {
                     if isExpanded {
                         HorusMarkdownText(entry.text, streaming: entry.pending)
@@ -994,7 +996,7 @@ private struct ReasoningLine: View {
                     // can remain pending while a later tool call is already running.
                     .horusRunningShimmer(active: isActive && !isExpanded)
             }
-            .frame(minHeight: 26)
+            .frame(minHeight: HorusStyle.rowCompact)
             .contentShape(Rectangle())
         }
         .buttonStyle(.horusPlain)
@@ -1030,6 +1032,7 @@ private struct TranscriptWaitingNoteView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var startedAt: Date?
     @State private var hold: Task<Void, Never>?
+    @State private var messageOrder = TranscriptWaitingNote.messages
 
     var body: some View {
         Group {
@@ -1051,7 +1054,7 @@ private struct TranscriptWaitingNoteView: View {
         // message advances on its own schedule rather than on redraws.
         TimelineView(.periodic(from: startedAt, by: TranscriptWaitingNote.rotation)) { context in
             let elapsed = reduceMotion ? 0 : context.date.timeIntervalSince(startedAt)
-            Text(TranscriptWaitingNote.message(seed: model.activeTurnID ?? "", elapsed: elapsed))
+            Text(TranscriptWaitingNote.message(in: messageOrder, elapsed: elapsed))
                 .font(HorusStyle.metadataFont)
                 .foregroundStyle(palette.muted)
                 .lineLimit(1)
@@ -1061,7 +1064,7 @@ private struct TranscriptWaitingNoteView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .horusRunningShimmer(active: true)
         }
-        .frame(minHeight: 26)
+        .frame(minHeight: HorusStyle.rowCompact)
         .transition(.opacity)
         // One stable label: rotating the joke past VoiceOver every few seconds is noise.
         .accessibilityElement()
@@ -1085,6 +1088,7 @@ private struct TranscriptWaitingNoteView: View {
         hold = Task {
             try? await Task.sleep(for: .seconds(TranscriptWaitingNote.appearAfter))
             guard !Task.isCancelled else { return }
+            messageOrder.shuffle()
             withAnimation(.easeIn(duration: 0.2)) { startedAt = Date() }
         }
     }
@@ -1099,7 +1103,7 @@ private struct EventLine: View {
     let isActive: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: HorusSpace.xs) {
             if isInteractive {
                 Button(action: activate) { line }
                     .buttonStyle(.horusPlain)
@@ -1116,8 +1120,8 @@ private struct EventLine: View {
                     .foregroundStyle(palette.muted)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
+                    .padding(.horizontal, HorusSpace.m)
+                    .padding(.vertical, HorusSpace.s)
                     .background(palette.panel, in: HorusStyle.controlShape)
             }
         }
@@ -1132,9 +1136,9 @@ private struct EventLine: View {
     }
 
     private var line: some View {
-        HStack(spacing: 6) {
-            HorusIcon(glyph, size: 13, foreground: headlineColor)
-            HStack(spacing: 6) {
+        HStack(spacing: HorusSpace.s) {
+            HorusIcon(glyph, size: HorusStyle.glyphInline, foreground: headlineColor)
+            HStack(spacing: HorusSpace.s) {
                 Text(middlewareLabel)
                     .foregroundStyle(palette.accent)
                 Text("•")
@@ -1145,17 +1149,17 @@ private struct EventLine: View {
                     .truncationMode(.middle)
             }
             .horusRunningShimmer(active: isActive)
-            Spacer(minLength: 6)
+            Spacer(minLength: HorusSpace.s)
             // No spinner: the shimmer already says this step is running, and two marks for
             // one fact left the trailing slot flickering between them as steps completed.
             if entry.format == "unified_diff" {
-                HorusIcon(.arrowUpRight01, size: 12, foreground: palette.muted)
+                HorusIcon(.arrowUpRight01, size: HorusStyle.glyphMark, foreground: palette.muted)
             } else if !entry.eventDetail.isEmpty {
-                HorusIcon(.caretUpDown, size: 12, foreground: palette.muted)
+                HorusIcon(.caretUpDown, size: HorusStyle.glyphMark, foreground: palette.muted)
             }
         }
         .font(HorusStyle.metadataFont)
-        .frame(minHeight: 26)
+        .frame(minHeight: HorusStyle.rowCompact)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
     }
@@ -1284,7 +1288,7 @@ struct ComposerView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: HorusSpace.s) {
             ForEach(model.composerHeaderWidgets) { widget in
                 FrontendWidgetView(widget: widget)
             }
@@ -1298,14 +1302,14 @@ struct ComposerView: View {
         }
         .frame(maxWidth: 880)
         .frame(maxWidth: .infinity)
-        .padding(.horizontal, 16)
-        .padding(.bottom, 12)
+        .padding(.horizontal, HorusSpace.l)
+        .padding(.bottom, HorusSpace.m)
     }
 }
 
 private struct ComposerStack: View {
     var body: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: HorusSpace.xs) {
             ComposerActivityView()
             ComposerSurface()
         }
@@ -1325,8 +1329,8 @@ private struct ComposerSurface: View {
         VStack(spacing: 0) {
             if !model.composerAttachments.isEmpty {
                 ComposerAttachmentsView()
-                    .padding(.horizontal, 12)
-                    .padding(.top, 10)
+                    .padding(.horizontal, HorusSpace.m)
+                    .padding(.top, HorusSpace.m)
             }
             TextField(
                 "You can just do things",
@@ -1350,9 +1354,9 @@ private struct ComposerSurface: View {
                 }
                 return .handled
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 12)
-            .padding(.bottom, 4)
+            .padding(.horizontal, HorusSpace.l)
+            .padding(.top, HorusSpace.m)
+            .padding(.bottom, HorusSpace.xs)
             ComposerOptionsView(dictation: dictation, selection: $selection)
                 .padding(.horizontal, HorusStyle.iconRowPadding)
                 .padding(.bottom, HorusStyle.iconRowPadding)
@@ -1364,7 +1368,7 @@ private struct ComposerSurface: View {
                 ReferenceSuggestionsPopup(suggestions: suggestions) {
                     complete($0, suggestions: suggestions)
                 }
-                .padding(.horizontal, 8)
+                .padding(.horizontal, HorusSpace.s)
                 .zIndex(2)
             }
         }
@@ -1498,12 +1502,12 @@ private struct ReferenceSuggestionsPopup: View {
             VStack(spacing: 0) {
                 ForEach(suggestions.matches) { mounted in
                     Button { select(mounted) } label: {
-                        HStack(spacing: 10) {
+                        HStack(spacing: HorusSpace.m) {
                             Text(String(mounted.reference.trigger))
                                 .font(HorusStyle.controlFont.monospaced().weight(.semibold))
                                 .foregroundStyle(palette.accent)
                                 .frame(width: 18, alignment: .center)
-                            VStack(alignment: .leading, spacing: 2) {
+                            VStack(alignment: .leading, spacing: HorusSpace.xxs) {
                                 Text(mounted.reference.value)
                                     .font(HorusStyle.controlFont)
                                     .lineLimit(1)
@@ -1516,7 +1520,7 @@ private struct ReferenceSuggestionsPopup: View {
                             Spacer(minLength: 0)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, HorusSpace.m)
                         .frame(height: 48)
                         .contentShape(Rectangle())
                     }
@@ -1526,7 +1530,7 @@ private struct ReferenceSuggestionsPopup: View {
                     .accessibilityHint(mounted.reference.description)
                 }
             }
-            .padding(.vertical, 6)
+            .padding(.vertical, HorusSpace.s)
         }
         .scrollIndicators(.hidden)
         .frame(height: height)
@@ -1543,19 +1547,19 @@ private struct ComposerActivityView: View {
     @State private var totals = DiffLineTotals()
 
     var body: some View {
-        GlassEffectContainer(spacing: 8) {
-            HStack(spacing: 8) {
+        GlassEffectContainer(spacing: HorusSpace.s) {
+            HStack(spacing: HorusSpace.s) {
                 ForEach(model.composerFooterWidgets) { widget in
                     FrontendWidgetView(widget: widget)
                 }
                 if totals.added > 0 || totals.removed > 0 {
                     Button { model.showFiles(.unstaged) } label: {
-                        HStack(spacing: 6) {
+                        HStack(spacing: HorusSpace.s) {
                             Text("+\(totals.added)").foregroundStyle(palette.signal)
                             Text("−\(totals.removed)").foregroundStyle(palette.danger)
                         }
                         .font(HorusStyle.badgeFont)
-                        .padding(.horizontal, 11)
+                        .padding(.horizontal, HorusSpace.m)
                         .frame(height: HorusStyle.badgeHeight)
                         .horusGlass(in: Capsule(), interactive: true)
                         .frame(
@@ -1651,12 +1655,12 @@ struct BadgePopover<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: HorusSpace.m) {
             Text(title)
                 .font(HorusStyle.controlFont.weight(.semibold))
             content
         }
-        .padding(16)
+        .padding(HorusSpace.l)
         .frame(minWidth: 220, alignment: .leading)
         .presentationCompactAdaptation(.popover)
     }
@@ -1668,11 +1672,11 @@ private struct BadgeStat: View {
     let value: String
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: HorusSpace.m) {
             Text(label)
                 .font(HorusStyle.metadataFont)
                 .foregroundStyle(palette.muted)
-            Spacer(minLength: 8)
+            Spacer(minLength: HorusSpace.s)
             Text(value)
                 .font(HorusStyle.bodyFont.monospacedDigit())
         }
@@ -1685,7 +1689,7 @@ private struct ComposerAttachmentsView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: HorusSpace.s) {
             if !model.canSubmitAttachments {
                 Text(model.attachmentSubmissionUnavailableMessage)
                     .font(HorusStyle.metadataFont)
@@ -1694,7 +1698,7 @@ private struct ComposerAttachmentsView: View {
             }
             // Tiles are too tall to stack: a few files would push the text field off screen.
             ScrollView(.horizontal) {
-                HStack(spacing: 8) {
+                HStack(spacing: HorusSpace.s) {
                     ForEach(model.composerAttachments) { attachment in
                         ComposerAttachmentRow(attachment: attachment)
                     }
@@ -1716,7 +1720,7 @@ private struct ComposerAttachmentRow: View {
         FileCard(name: attachment.name, detail: status, detailColor: statusColor) {
             // A tile has no room for a row of controls, so the state sits in the corner and
             // the glyph keeps saying which file this is.
-            HStack(spacing: 2) {
+            HStack(spacing: HorusSpace.xxs) {
                 stateControl
                 Button("Remove attachment", glyph: .x) {
                     model.removeComposerAttachment(attachment.id)
@@ -1734,7 +1738,8 @@ private struct ComposerAttachmentRow: View {
     private var stateControl: some View {
         switch attachment.state {
         case .queued, .uploading:
-            HorusSpinner(size: 15).frame(width: 26, height: 26)
+            HorusSpinner(size: HorusStyle.glyphInline)
+                .frame(width: HorusStyle.rowCompact, height: HorusStyle.rowCompact)
         case .uploaded:
             EmptyView()
         case .failed:
@@ -1773,23 +1778,23 @@ private struct ApprovalView: View {
     let approval: PendingApproval
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: HorusSpace.m) {
             HorusLabel(
                 title: "Approval required",
                 glyph: .shieldCheck,
                 iconColor: palette.warning
             )
-                .font(.headline)
+                .font(HorusStyle.titleFont)
                 .foregroundStyle(palette.warning)
             Text(approval.reason).font(HorusStyle.bodyFont)
             ScrollView([.horizontal, .vertical]) {
-                LazyVStack(alignment: .leading, spacing: 9) {
+                LazyVStack(alignment: .leading, spacing: HorusSpace.s) {
                     ForEach(approval.calls) { call in
-                        VStack(alignment: .leading, spacing: 5) {
+                        VStack(alignment: .leading, spacing: HorusSpace.xs) {
                             Text(call.name).font(HorusStyle.metadataFont.weight(.bold))
                             Text(call.arguments).font(HorusStyle.metadataFont).textSelection(.enabled)
                         }
-                        .padding(10)
+                        .padding(HorusSpace.m)
                         .background(palette.raised, in: HorusStyle.controlShape)
                         .accessibilityElement(children: .combine)
                         .accessibilityLabel("\(call.name), arguments \(call.arguments)")
@@ -1798,8 +1803,8 @@ private struct ApprovalView: View {
             }
             .frame(maxHeight: 180)
             ViewThatFits(in: .horizontal) {
-                HStack(spacing: 8) { actions }
-                VStack(spacing: 8) { actions }.buttonSizing(.flexible)
+                HStack(spacing: HorusSpace.s) { actions }
+                VStack(spacing: HorusSpace.s) { actions }.buttonSizing(.flexible)
             }
             .buttonStyle(.horusGlass)
             .buttonBorderShape(.capsule)
@@ -1919,7 +1924,7 @@ struct FrontendWidgetContentView: View {
         case .blocks(_, let blocks):
             ForEach(blocks) { block in
                 PreviewBlockView(block: block.block)
-                    .padding(.vertical, 8)
+                    .padding(.vertical, HorusSpace.s)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
             }
@@ -1961,10 +1966,10 @@ private struct FrontendActionListRow: View {
     let actionsEnabled: Bool
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .top, spacing: HorusSpace.s) {
             if let statusGlyph {
-                HorusIcon(statusGlyph, size: 15, foreground: statusColor)
-                    .frame(width: 20, height: HorusStyle.iconButtonSize)
+                HorusIcon(statusGlyph, size: HorusStyle.glyphInline, foreground: statusColor)
+                    .frame(height: HorusStyle.rowTouch)
             }
             Text(item.text)
                 .font(HorusStyle.bodyFont)
@@ -2098,10 +2103,10 @@ private struct FrontendPickerOptionLabel: View {
     let option: FrontendPickerOption
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: HorusSpace.s) {
             if let symbol = option.symbol,
                let glyph = HorusSymbol.knownGlyph(for: symbol) {
-                HorusIcon(glyph, size: 15, foreground: palette.accent)
+                HorusIcon(glyph, size: HorusStyle.glyphInline, foreground: palette.accent)
             }
             Text(option.label)
                 .font(HorusStyle.controlFont.weight(.semibold))
@@ -2113,14 +2118,14 @@ private struct FrontendPickerOptionLabel: View {
                     .foregroundStyle(palette.muted)
                     .lineLimit(1)
             }
-            Spacer(minLength: 4)
+            Spacer(minLength: HorusSpace.xs)
             if option.showsDetail, !option.detail.isEmpty {
                 Text(option.detail)
                     .font(HorusStyle.metadataFont)
                     .foregroundStyle(palette.muted)
                     .lineLimit(1)
             }
-            HorusIcon(.caretRight, size: 12, foreground: palette.muted)
+            HorusIcon(.caretRight, size: HorusStyle.glyphMark, foreground: palette.muted)
         }
         .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
         .contentShape(Rectangle())
@@ -2174,13 +2179,13 @@ private struct FrontendPickerView: View {
 
     var body: some View {
         HorusCard {
-            VStack(alignment: .leading, spacing: 11) {
+            VStack(alignment: .leading, spacing: HorusSpace.m) {
                 HStack {
                     Text(picker.title)
-                        .font(.headline)
-                    Spacer(minLength: 8)
+                        .font(HorusStyle.titleFont)
+                    Spacer(minLength: HorusSpace.s)
                     Button { model.pendingPicker = nil } label: {
-                        HorusIcon(.x, size: 14, foreground: palette.muted)
+                        HorusIcon(.x, size: HorusStyle.glyphInline, foreground: palette.muted)
                             .frame(
                                 width: HorusStyle.iconButtonSize,
                                 height: HorusStyle.iconButtonSize

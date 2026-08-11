@@ -67,15 +67,15 @@ private struct HorusCloudOfferSheet: View {
             ZStack {
                 HorusBackdrop()
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 28) {
+                    VStack(alignment: .leading, spacing: HorusSpace.xl) {
                         hero
                         offerDetails
                         controlNote
                     }
                     .frame(maxWidth: 680, alignment: .leading)
-                    .padding(.horizontal, 20)
-                    .padding(.top, 18)
-                    .padding(.bottom, 28)
+                    .padding(.horizontal, HorusSpace.l)
+                    .padding(.top, HorusSpace.l)
+                    .padding(.bottom, HorusSpace.xl)
                     .frame(maxWidth: .infinity)
                 }
                 .scrollIndicators(.hidden)
@@ -101,7 +101,7 @@ private struct HorusCloudOfferSheet: View {
     /// One voice per line: a mark, the promise, and the shape of the offer. The price is not
     /// here — it belongs beside the button that charges it, not at the top in accent.
     private var hero: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: HorusSpace.l) {
             // The app's own mark, not a stock globe. The free trial is not announced twice:
             // it is stated once, next to the price it applies to.
             HorusComposingOrb()
@@ -128,19 +128,19 @@ private struct HorusCloudOfferSheet: View {
                     title: "2 million Luna tokens included",
                     detail: "Use up to 2 million tokens each month with Luna, the default Horus model."
                 )
-                Divider().padding(.leading, 42)
+                Divider().padding(.leading, HorusStyle.glyphGutter + HorusSpace.m)
                 CloudBenefit(
                     glyph: .setup01,
                     title: "Fast, modular harness",
                     detail: "Choose the providers, tools, and capabilities you want while Horus keeps the runtime lean."
                 )
-                Divider().padding(.leading, 42)
+                Divider().padding(.leading, HorusStyle.glyphGutter + HorusSpace.m)
                 CloudBenefit(
                     glyph: .key,
                     title: "Bring your own keys",
                     detail: "Connect your own provider credentials whenever you need another model or account."
                 )
-                Divider().padding(.leading, 42)
+                Divider().padding(.leading, HorusStyle.glyphGutter + HorusSpace.m)
                 CloudBenefit(
                     glyph: .shieldCheck,
                     title: "Encrypted and user-scoped",
@@ -151,9 +151,9 @@ private struct HorusCloudOfferSheet: View {
     }
 
     private var controlNote: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: HorusSpace.s) {
             Text("You stay in control")
-                .font(.headline)
+                .font(HorusStyle.titleFont)
             Text("Manage the gateway or permanently delete your cloud from the Horus app or website.")
                 .font(HorusStyle.bodyFont)
                 .foregroundStyle(palette.muted)
@@ -168,13 +168,13 @@ private struct HorusCloudOfferSheet: View {
     /// dark background. The fade underneath is not a bar — it only keeps the last line of
     /// text from colliding with the capsule as the page scrolls past it.
     private var signupBoundary: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: HorusSpace.m) {
             billingDescription
                 .font(HorusStyle.bodyFont)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
             Text("Signup and billing are not enabled in this beta.")
-                .font(.footnote)
+                .font(HorusStyle.captionFont)
                 .foregroundStyle(palette.muted)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
@@ -182,7 +182,7 @@ private struct HorusCloudOfferSheet: View {
                 showsUnavailable = true
             } label: {
                 Label("Continue with Apple", systemImage: "apple.logo")
-                    .font(.headline)
+                    .font(HorusStyle.titleFont)
                     .foregroundStyle(.black)
                     .frame(maxWidth: .infinity, minHeight: 50)
                     .contentShape(Capsule())
@@ -192,9 +192,9 @@ private struct HorusCloudOfferSheet: View {
             .shadow(color: .black.opacity(0.32), radius: 14, y: 6)
         }
         .frame(maxWidth: 680)
-        .padding(.horizontal, 20)
-        .padding(.top, 20)
-        .padding(.bottom, 6)
+        .padding(.horizontal, HorusSpace.l)
+        .padding(.top, HorusSpace.l)
+        .padding(.bottom, HorusSpace.s)
         .frame(maxWidth: .infinity)
         .background {
             LinearGradient(
@@ -226,10 +226,9 @@ private struct CloudBenefit: View {
     let detail: String
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            HorusIcon(glyph, size: 20, foreground: palette.accent)
-                .frame(width: 30, height: 30)
-            VStack(alignment: .leading, spacing: 4) {
+        HStack(alignment: .top, spacing: HorusSpace.m) {
+            HorusIcon(glyph, size: HorusStyle.glyphLead, foreground: palette.accent)
+            VStack(alignment: .leading, spacing: HorusSpace.xs) {
                 Text(title)
                     .font(HorusStyle.controlFont)
                 Text(detail)
@@ -238,6 +237,6 @@ private struct CloudBenefit: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.vertical, 13)
+        .padding(.vertical, HorusSpace.m)
     }
 }

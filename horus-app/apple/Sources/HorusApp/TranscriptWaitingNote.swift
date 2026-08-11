@@ -80,25 +80,8 @@ enum TranscriptWaitingNote {
             && !hasPendingPicker
     }
 
-    static func message(seed: String, elapsed: TimeInterval) -> String {
-        messages[index(seed: seed, elapsed: elapsed)]
-    }
-
-    /// Deterministic, so a wait opens on a different message each turn rather than always at
-    /// the top of the list, and so a test can pin one.
-    static func index(seed: String, elapsed: TimeInterval) -> Int {
+    static func message(in order: [String], elapsed: TimeInterval) -> String {
         let step = elapsed > 0 ? Int(elapsed / rotation) : 0
-        return (stableSeed(seed) + step) % messages.count
-    }
-
-    /// `hashValue` is salted per process, so it cannot pin a message in a test or hold one
-    /// steady across a relaunch. FNV-1a does neither.
-    static func stableSeed(_ value: String) -> Int {
-        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
-        for byte in value.utf8 {
-            hash ^= UInt64(byte)
-            hash = hash &* 0x100_0000_01b3
-        }
-        return Int(hash % UInt64(messages.count))
+        return order[step % order.count]
     }
 }
