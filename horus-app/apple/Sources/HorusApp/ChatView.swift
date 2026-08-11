@@ -562,11 +562,44 @@ private struct UserMessageContent: View {
         VStack(alignment: .trailing, spacing: 6) {
             TranscriptFileCards(files: entry.files)
             if !entry.text.isEmpty {
-                Text(entry.text)
-                    .textSelection(.enabled)
+                CollapsibleUserText(text: entry.text)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
                     .background(palette.accentSoft, in: HorusStyle.cardShape)
+            }
+        }
+    }
+}
+
+private struct CollapsibleUserText: View {
+    private static let collapsedLineLimit = 21
+
+    @Environment(\.horusPalette) private var palette
+    @State private var isExpanded = false
+    @State private var isTruncated = false
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(text)
+                .lineLimit(isExpanded ? nil : Self.collapsedLineLimit)
+                .truncationMode(.tail)
+                .textSelection(.enabled)
+                .onPreferenceChange(Text.LayoutKey.self) { layouts in
+                    guard !isExpanded else { return }
+                    let isTruncated = layouts.contains { $0.layout.isTruncated }
+                    if self.isTruncated != isTruncated {
+                        self.isTruncated = isTruncated
+                    }
+                }
+            if isTruncated && !isExpanded {
+                Button("Read more") {
+                    isExpanded = true
+                }
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(palette.accent)
+                .buttonStyle(.horusPlain)
+                .accessibilityHint("Expands the full message")
             }
         }
     }
@@ -626,7 +659,7 @@ private struct QueuedMessageView: View {
     var body: some View {
         HStack {
             Spacer(minLength: 42)
-            Text(widget.widget.text)
+            CollapsibleUserText(text: widget.widget.text)
                 .font(HorusStyle.bodyFont)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 16)
@@ -648,8 +681,8 @@ private struct QueuedMessageView: View {
                     Button("Copy", glyph: .copy) { copyToPasteboard(widget.widget.text) }
                 }
         }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(widget.widget.text)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Queued message")
         .accessibilityValue(editAction == nil ? "Queued" : "Queued, editable until sent")
         .accessibilityActions {
             if editAction != nil {
