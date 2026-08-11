@@ -5979,6 +5979,22 @@ final class ChatTitleWriterTests: XCTestCase {
         }
         XCTAssertEqual(title, "One two three four")
     }
+
+    @MainActor
+    func testInjectedGeneratorKeepsShortTitlesPlainAndFailuresPrivate() async {
+        let shortWriter = ChatTitleWriter { _ in "Fix retry handling" }
+        guard case .title(let title) = await shortWriter.title(for: "Review the gateway") else {
+            return XCTFail("Expected the short generated title")
+        }
+        XCTAssertEqual(title, "Fix retry handling")
+
+        let invalidWriter = ChatTitleWriter { _ in "\"\"" }
+        guard case .failed(let message) = await invalidWriter.title(for: "Private prompt") else {
+            return XCTFail("Expected private validation failure")
+        }
+        XCTAssertEqual(message, "Apple returned an unusable chat title.")
+        XCTAssertFalse(message.contains("Private prompt"))
+    }
 }
 
 final class TranscriptEventLineTests: XCTestCase {
