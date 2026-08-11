@@ -8,3 +8,7 @@
   selected for the remainder of the session.
 - Adds provider-neutral reconnect presentation and prevents raw WebSocket reset details from being
   surfaced as terminal user errors.
+- Preserves streamed reasoning-part boundaries without requiring index metadata from compatible
+  Responses endpoints.
+- Includes terminal provider errors in errored subagent previews while keeping preview pages bounded.
+- Repairs incorrect unified-diff hunk counts before applying otherwise valid workspace patches.
