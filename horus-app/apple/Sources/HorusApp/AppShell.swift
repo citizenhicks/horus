@@ -1172,7 +1172,19 @@ struct PairingView: View {
                                         }
                                     }
                                     .labelStyle(.iconOnly)
-                                    .buttonStyle(HorusIconButtonStyle())
+                                    .frame(
+                                        width: HorusStyle.iconButtonSize,
+                                        height: HorusStyle.iconButtonSize
+                                    )
+                                    .contentShape(.circle)
+                                    // Preserve PasteButton's privacy-aware action while the
+                                    // stable Horus control below owns its visible presentation.
+                                    .opacity(0.01)
+                                    .overlay {
+                                        HorusIcon(.copy)
+                                            .allowsHitTesting(false)
+                                    }
+                                    .horusGlass(in: Circle(), interactive: true)
                                     .accessibilityLabel("Paste pairing setup")
                                     .help("Paste pairing setup")
                                 }
