@@ -251,6 +251,9 @@ struct TranscriptRowsView: View {
     var breakBefore: String?
     var collapsesLongMessages = false
     var rowSpacing: CGFloat = 12
+    /// The live transcript passes the model's cached grouping; smaller one-off transcripts
+    /// (a preview sheet) group their own, where doing it per pass costs nothing.
+    var groupedEntries: [[TranscriptEntry]]?
 
     var body: some View {
         ForEach(rows) { row in
@@ -274,7 +277,7 @@ struct TranscriptRowsView: View {
     }
 
     private var rows: [TranscriptRowLayout] {
-        TranscriptEntry.groupedRows(from: entries, breakBefore: breakBefore)
+        (groupedEntries ?? TranscriptEntry.groupedRows(from: entries, breakBefore: breakBefore))
             .enumerated()
             .map { index, entries in
                 TranscriptRowLayout(
@@ -352,7 +355,8 @@ private struct TranscriptView: View {
                     entries: model.displayedTranscript,
                     activeStepID: model.activeTranscriptStepID,
                     breakBefore: historyAnchorID,
-                    rowSpacing: rowSpacing
+                    rowSpacing: rowSpacing,
+                    groupedEntries: model.transcriptRows(breakBefore: historyAnchorID)
                 )
                 ForEach(model.transcriptTailWidgets) { widget in
                     QueuedMessageView(widget: widget)
@@ -501,6 +505,7 @@ private struct TranscriptRow: View {
                         )
                     } else {
                         HorusMarkdownText(entry.text, streaming: entry.pending)
+                            .equatable()
                     }
                 }
             }
@@ -643,6 +648,7 @@ struct CollapsibleText: View {
     private var renderedText: some View {
         if rendersMarkdown && (isExpanded || (hasMeasured && !isTruncated)) {
             HorusMarkdownText(text, streaming: streaming)
+                .equatable()
         } else {
             markedText
                 .lineLimit(isExpanded ? nil : Self.collapsedLineLimit)
@@ -959,6 +965,7 @@ private struct ReasoningLine: View {
                 Group {
                     if isExpanded {
                         HorusMarkdownText(entry.text, streaming: entry.pending)
+                            .equatable()
                     } else {
                         Text(summary)
                     }
@@ -1110,7 +1117,13 @@ private struct EventLine: View {
     }
 }
 
-private struct HorusMarkdownText: View {
+/// Equatable so an unchanged message is skipped entirely.
+///
+/// Text and streaming are the view's whole input, so comparing them is complete rather than
+/// a guess. Without this, every row's body re-runs whenever anything in the transcript
+/// changes: each one rescans its own text for `\dots` and rebuilds the markdown subtree,
+/// which during streaming is a few hundred messages of work per frame to redraw one.
+private struct HorusMarkdownText: View, Equatable {
     let text: String
     let streaming: Bool
 
@@ -1294,6 +1307,9 @@ private struct ComposerSurface: View {
         .onChange(of: model.composerFocusRequest) { _, _ in
             isComposerFocused = true
         }
+        .onChange(of: model.composerBlurRequest) { _, _ in
+            isComposerFocused = false
+        }
         .onChange(of: scenePhase) { _, phase in
             guard phase == .background else { return }
             Task { await dictation.cancel() }
@@ -1322,6 +1338,9 @@ private struct ComposerSurface: View {
     private func submit() {
         guard !dictation.isActive else { return }
         selection = nil
+        // The message is gone from the field, so the keyboard has nothing left to edit and
+        // is only covering the reply it was sent to get.
+        isComposerFocused = false
         model.sendMessage()
     }
 

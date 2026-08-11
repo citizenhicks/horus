@@ -916,6 +916,25 @@ final class AppModelTests: XCTestCase {
         })
     }
 
+    func testNewSessionInCurrentWorkspaceUsesWorkspacePath() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        model.connectionState = .ready
+        model.workspace = WorkspaceInfo(
+            id: "workspace-1",
+            path: "/srv/current-project"
+        )
+
+        let requestCount = await recorder.requestCount()
+        model.openNewSessionInCurrentWorkspace()
+
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            guard case .createSession(_, "/srv/current-project") = request else { return false }
+            return true
+        }
+        XCTAssertNotNil(request)
+    }
+
     func testTaskCompleteFlushesPendingReasoning() throws {
         let model = try model()
 
@@ -6186,6 +6205,74 @@ final class AppModelTests: XCTestCase {
             )),
             "First title"
         )
+    }
+}
+
+@MainActor
+final class TranscriptRowCacheTests: XCTestCase {
+    private func model() throws -> AppModel {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        return AppModel(
+            client: GatewayClient(),
+            store: GatewayStore(
+                defaults: defaults,
+                transcriptDirectory: directory,
+                draftDirectory: directory.appendingPathComponent("Drafts", isDirectory: true)
+            ),
+            settingsDefaults: defaults,
+            appLockAuthenticator: AppLockAuthenticator(
+                method: { .unavailable },
+                authenticate: { _ in false }
+            )
+        )
+    }
+
+    private func entry(_ id: String, kind: TranscriptEntry.Kind = .event) -> TranscriptEntry {
+        TranscriptEntry(
+            id: id,
+            text: id,
+            kind: kind,
+            role: kind == .assistant ? nil : .tool,
+            format: "plain_text",
+            pending: false
+        )
+    }
+
+    func testCacheFollowsAppendsAndSessionSwitches() throws {
+        let model = try model()
+        model.transcript = [entry("a"), entry("b")]
+        XCTAssertEqual(model.transcriptRows(breakBefore: nil).map { $0.map(\.id) }, [["a", "b"]])
+
+        // An append regroups.
+        model.transcript.append(entry("c"))
+        XCTAssertEqual(model.transcriptRows(breakBefore: nil).map { $0.map(\.id) }, [["a", "b", "c"]])
+
+        // A switch to a different chat of the same length must not reuse the old rows.
+        model.transcript = [entry("x"), entry("y"), entry("z")]
+        XCTAssertEqual(model.transcriptRows(breakBefore: nil).map { $0.map(\.id) }, [["x", "y", "z"]])
+
+        // The boundary is part of the key: it splits the run without the entries changing.
+        XCTAssertEqual(
+            model.transcriptRows(breakBefore: "y").map { $0.map(\.id) },
+            [["x"], ["y", "z"]]
+        )
+    }
+
+    func testTextDeltasReuseTheCachedGrouping() throws {
+        let model = try model()
+        model.transcript = [entry("a"), entry("b")]
+        let first = model.transcriptRows(breakBefore: nil)
+
+        // Streaming mutates an entry in place; grouping does not depend on text, so the
+        // same row arrays come back rather than being rebuilt every delta.
+        model.transcript[1].text += " more"
+        let second = model.transcriptRows(breakBefore: nil)
+
+        XCTAssertEqual(second.map { $0.map(\.id) }, first.map { $0.map(\.id) })
+        XCTAssertTrue(second[0][1] === first[0][1])
     }
 }
 

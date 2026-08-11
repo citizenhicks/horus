@@ -522,6 +522,16 @@ extension TranscriptEntry {
     }
 }
 
+/// What makes a set of grouped transcript rows stale. Structure only: text deltas mutate
+/// entries in place and leave the grouping alone.
+private struct TranscriptRowsKey: Equatable {
+    let version: Int
+    let count: Int
+    let boundaryID: String?
+    let firstID: String?
+    let lastID: String?
+}
+
 private struct BufferedAgentEvent {
     let record: RecordedEvent
 }
@@ -700,7 +710,12 @@ final class AppModel {
     var composer = "" {
         didSet { scheduleComposerDraftSave() }
     }
+    @ObservationIgnored private var transcriptRowsCache: (key: TranscriptRowsKey, rows: [[TranscriptEntry]])?
+    @ObservationIgnored private var transcriptRowsVersion = 0
     private(set) var composerFocusRequest = 0
+    /// Counterpart to `composerFocusRequest`: the composer owns the focus state, so anything
+    /// outside it that needs the keyboard gone asks rather than reaching in.
+    private(set) var composerBlurRequest = 0
     var composerAttachments: [ComposerAttachment] = []
     var sessionUploads: [SessionFileReference] = []
     private(set) var isLoadingSessionUploads = false
@@ -1140,6 +1155,38 @@ final class AppModel {
         if visible, let selectedSessionID {
             unreadSessionIDs.remove(selectedSessionID)
         }
+    }
+
+    /// Asks the composer to give up the keyboard. Leaving it up while the drawer slides means
+    /// the page animates against a keyboard that belongs to a screen the reader just left.
+    func dismissComposerFocus() {
+        composerBlurRequest &+= 1
+    }
+
+    /// Grouped transcript rows, computed once per structural change rather than per frame.
+    ///
+    /// The transcript view rebuilds many times a second while a turn streams, and grouping
+    /// allocated a fresh array per row on every pass. Text deltas mutate entries in place and
+    /// never change the grouping, so the key tracks structure only: the count and the end ids
+    /// catch appends, replacements and session switches, and `transcriptRowsVersion` covers
+    /// the in-place kind and role changes those cannot see.
+    func transcriptRows(breakBefore boundaryID: String?) -> [[TranscriptEntry]] {
+        let source = displayedTranscript
+        let key = TranscriptRowsKey(
+            version: transcriptRowsVersion,
+            count: source.count,
+            boundaryID: boundaryID,
+            firstID: source.first?.id,
+            lastID: source.last?.id
+        )
+        if let cached = transcriptRowsCache, cached.key == key { return cached.rows }
+        let rows = TranscriptEntry.groupedRows(from: source, breakBefore: boundaryID)
+        transcriptRowsCache = (key, rows)
+        return rows
+    }
+
+    private func invalidateTranscriptRows() {
+        transcriptRowsVersion &+= 1
     }
 
     /// Starts the on-device rewrite with the submitted first message. The task is stored,
@@ -1669,6 +1716,11 @@ final class AppModel {
 
     func openNewSession() {
         openWorkspaceBrowser()
+    }
+
+    func openNewSessionInCurrentWorkspace() {
+        guard let path = workspace?.path else { return }
+        chooseWorkspace(path)
     }
 
     func openSession(_ sessionID: String) {
@@ -3978,6 +4030,12 @@ final class AppModel {
         let kind: TranscriptEntry.Kind = block.tone == "error" ? .error : .event
         if let index = entries.firstIndex(where: { $0.id == id }) {
             let previousUpdate = entries[index].update
+            // Grouping keys off kind and role, and both can change on an entry that is
+            // already on screen — an event turning into an error keeps its id. The row
+            // cache cannot see that from the array alone, so it is told here.
+            if entries[index].kind != kind || entries[index].role != block.role {
+                invalidateTranscriptRows()
+            }
             entries[index].text = appending ? entries[index].text + block.text : block.text
             entries[index].kind = kind
             entries[index].capability = rendered.capability

@@ -177,6 +177,16 @@ struct ComposerOptionsView: View {
 
     @ViewBuilder
     private var actionButtons: some View {
+        Button(
+            "New chat in this folder",
+            glyph: .notePencil,
+            action: model.openNewSessionInCurrentWorkspace
+        )
+        .labelStyle(.iconOnly)
+        .buttonStyle(HorusIconButtonStyle(bare: true))
+        .disabled(model.workspace == nil || !model.canCreateSession)
+        .help("New chat in this folder")
+
         Button(action: toggleDictation) {
             if dictation.isTransitioning {
                 ProgressView()

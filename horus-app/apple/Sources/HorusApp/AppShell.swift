@@ -142,11 +142,22 @@ struct AppShell: View {
                         .toolbar {
                             ToolbarItem(placement: .topBarLeading) {
                                 Button {
+                                    // The keyboard belongs to the page being slid away; left
+                                    // up, it animates against a screen the reader just left.
+                                    model.dismissComposerFocus()
                                     withAnimation(SidebarDrawerMetrics.animation) {
                                         sidebarIsOpen.toggle()
                                     }
                                 } label: {
+                                    // A bare glyph is a 16pt target. Every other icon button
+                                    // in the app pads itself out to a full one, and without
+                                    // that this took two or three tries to hit.
                                     HorusIcon(.menu, foreground: .primary)
+                                        .frame(
+                                            width: HorusStyle.iconButtonSize,
+                                            height: HorusStyle.iconButtonSize
+                                        )
+                                        .contentShape(Rectangle())
                                 }
                                 .tint(.primary)
                                 .accessibilityLabel(sidebarIsOpen ? "Hide sidebar" : "Show sidebar")
@@ -551,6 +562,10 @@ enum SidebarDrawerMetrics {
     /// UIScreen knows the number and answers only to a private key, so this is the measured
     /// value for current iPhones instead; older, tighter displays round a touch generously.
     static let displayCornerRadius: CGFloat = 62
+    /// How dark the page goes once the drawer is fully open.
+    static let scrimOpacity: Double = 0.45
+    /// How far behind the page the sidebar starts before it comes forward.
+    static let sidebarDepth: CGFloat = 0.08
 }
 
 /// Compact navigation that reveals the sidebar underneath instead of pushing a page over it.
@@ -574,28 +589,23 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
             palette.recessed.ignoresSafeArea()
             sidebar
                 .frame(width: SidebarDrawerMetrics.width)
+                // The sidebar comes forward from behind the page rather than waiting in place
+                // for it to move. Depth is what says the page is on top, and a transform
+                // costs nothing to animate.
+                .scaleEffect(
+                    1 - SidebarDrawerMetrics.sidebarDepth * (1 - progress),
+                    anchor: .leading
+                )
+                .opacity(0.4 + 0.6 * progress)
                 .accessibilityHidden(!isOpen)
             detail
-                // The sidebar sits directly behind, so the detail carries its own backdrop:
-                // glass, which is what draws the lit rim along the edge the drawer exposes. It
-                // is cut to `pageShape` so the page keeps the display's corners as it slides
-                // aside — a plain rectangle fills those corners back in and the cut disappears.
-                // Whatever sits over the glass has to stay clear of the rim, hence no scrim
-                // tint: dimming the page washes the rim out and the edge stops reading as glass.
-                .background {
-                    // `ignoresSafeArea` first: glass renders into the frame it is given, so
-                    // expanding it afterwards stretches a shape that was already cut to the
-                    // inset rect and the corners come out square.
-                    Color.clear
-                        .ignoresSafeArea()
-                        .glassEffect(.regular, in: pageShape)
-                }
                 .accessibilityHidden(isOpen)
-                // Every page paints its own opaque backdrop, and the toolbar its own scroll
-                // edge effect, both square and both over anything this view puts behind them.
-                // Cutting the corners has to happen after all of it, on the way out.
+                // Scrim first, mask second: one pass cuts the page and the dimming over it to
+                // the same corners rather than each paying for its own. Every page paints its
+                // own opaque backdrop and the toolbar its own scroll edge effect, both square,
+                // so cutting the corners has to happen after all of it, on the way out.
+                .overlay { scrim }
                 .mask { pageShape.ignoresSafeArea() }
-                .overlay { pageEdge }
                 .offset(x: offset)
                 .simultaneousGesture(swipe)
         }
@@ -608,55 +618,24 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
         ConcentricRectangle(corners: .fixed(SidebarDrawerMetrics.displayCornerRadius))
     }
 
-    /// The lit rim of the page's glass, and the tap target that closes the drawer.
+    /// The page dims as it slides, which is what separates it from the sidebar behind, and
+    /// is the tap target that closes the drawer.
     ///
-    /// Glass over the sidebar's flat canvas has nothing to refract, so the material alone barely
-    /// registers; the specular edge is the part that reads. Only the leading edge gets one —
-    /// stroking the whole shape runs a line along the top and bottom of the display, where it
-    /// meets the bezel's own curve and the two roundings visibly disagree. Fading the ends off
-    /// keeps the highlight clear of the corners entirely.
-    @ViewBuilder
-    private var pageEdge: some View {
-        if progress > 0 {
-            pageShape
-                .stroke(
-                    LinearGradient(
-                        // The Nord swatches themselves are file-private to HorusStyle; the
-                        // palette's accent is that same frost blue and is what every other view
-                        // reaches for, so the tint follows it instead of a raw nord constant.
-                        stops: [
-                            .init(color: palette.accent.opacity(0.32), location: 0),
-                            .init(color: palette.accent.opacity(0.16), location: 0.06),
-                            .init(color: .clear, location: 0.22)
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                    .opacity(progress),
-                    lineWidth: 1
-                )
-                .ignoresSafeArea()
-                // Light falls off down the edge the way it does on a real bevel; an even line
-                // reads as a drawn border instead of a lit one.
-                .mask {
-                    LinearGradient(
-                        stops: [
-                            .init(color: .white, location: 0),
-                            .init(color: .white.opacity(0.45), location: 0.45),
-                            .init(color: .white.opacity(0.25), location: 1)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                    .ignoresSafeArea()
-                }
-                .contentShape(Rectangle())
-                .onTapGesture { setOpen(false) }
-                .accessibilityElement()
-                .accessibilityLabel("Close sidebar")
-                .accessibilityAddTraits(.isButton)
-                .accessibilityAction { setOpen(false) }
-        }
+    /// This replaces a lit glass rim along the leading edge. That rim existed only because
+    /// nothing marked the boundary — glass over the sidebar's flat canvas barely registers,
+    /// so the specular edge was doing all the work, and a scrim would have washed it out.
+    /// Dimming the page states the same thing directly, and costs a colour instead of a
+    /// real-time material, a stroked gradient and a second mask on every frame of the slide.
+    private var scrim: some View {
+        Color.black
+            .opacity(SidebarDrawerMetrics.scrimOpacity * progress)
+            .ignoresSafeArea()
+            .allowsHitTesting(progress > 0)
+            .onTapGesture { setOpen(false) }
+            .accessibilityHidden(progress == 0)
+            .accessibilityLabel("Close sidebar")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { setOpen(false) }
     }
 
     private var offset: CGFloat {
