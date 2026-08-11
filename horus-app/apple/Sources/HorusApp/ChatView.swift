@@ -373,6 +373,8 @@ private struct TranscriptView: View {
                     QueuedMessageView(widget: widget)
                         .padding(.top, rowSpacing)
                 }
+                TranscriptWaitingNoteView()
+                    .padding(.top, rowSpacing)
                 Color.clear.frame(height: max(1, bottomInset))
             }
             .scrollTargetLayout()
@@ -1014,6 +1016,77 @@ private struct ReasoningLine: View {
             summary.append(AttributedString("…"))
         }
         return summary
+    }
+}
+
+/// The waiting note, held at the end of the transcript.
+///
+/// Appearance is deliberately sticky. Steps land a few hundred milliseconds apart in a busy
+/// turn, so the raw condition flickers several times a second; the note waits before showing
+/// and lingers before hiding, which is the difference between a status line and a strobe.
+private struct TranscriptWaitingNoteView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var startedAt: Date?
+    @State private var hold: Task<Void, Never>?
+
+    var body: some View {
+        Group {
+            if let startedAt {
+                note(startedAt: startedAt)
+            }
+        }
+        .onChange(of: model.isWaitingForModel, initial: true) { _, waiting in
+            reschedule(waiting)
+        }
+        .onDisappear {
+            hold?.cancel()
+            hold = nil
+        }
+    }
+
+    private func note(startedAt: Date) -> some View {
+        // The clock drives the rotation, so a transcript rebuild cannot restart it and the
+        // message advances on its own schedule rather than on redraws.
+        TimelineView(.periodic(from: startedAt, by: TranscriptWaitingNote.rotation)) { context in
+            let elapsed = reduceMotion ? 0 : context.date.timeIntervalSince(startedAt)
+            Text(TranscriptWaitingNote.message(seed: model.activeTurnID ?? "", elapsed: elapsed))
+                .font(HorusStyle.metadataFont)
+                .foregroundStyle(palette.muted)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .contentTransition(.opacity)
+                .animation(.easeInOut(duration: 0.3), value: elapsed)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .horusRunningShimmer(active: true)
+        }
+        .frame(minHeight: 26)
+        .transition(.opacity)
+        // One stable label: rotating the joke past VoiceOver every few seconds is noise.
+        .accessibilityElement()
+        .accessibilityLabel("Waiting for the model")
+    }
+
+    private func reschedule(_ waiting: Bool) {
+        hold?.cancel()
+        guard waiting else {
+            guard let began = startedAt else { return }
+            let remaining = TranscriptWaitingNote.minimumVisible
+                - Date().timeIntervalSince(began)
+            hold = Task {
+                if remaining > 0 { try? await Task.sleep(for: .seconds(remaining)) }
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeOut(duration: 0.2)) { startedAt = nil }
+            }
+            return
+        }
+        guard startedAt == nil else { return }
+        hold = Task {
+            try? await Task.sleep(for: .seconds(TranscriptWaitingNote.appearAfter))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeIn(duration: 0.2)) { startedAt = Date() }
+        }
     }
 }
 

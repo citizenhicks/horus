@@ -689,6 +689,14 @@ final class AppModel {
         else { return nil }
         return latest.id
     }
+    /// The turn is running with nothing pending, so no row is shimmering and the transcript
+    /// would otherwise sit still while the model decides what to do next.
+    var isWaitingForModel: Bool {
+        TranscriptWaitingNote.isWaiting(
+            hasActiveTurn: activeTurnID != nil,
+            lastEntryIsPending: displayedTranscript.last?.pending == true
+        )
+    }
     var isLoadingTranscript: Bool {
         guard connectionState == .loading,
               sessionRequestID != nil || replayRequestID != nil

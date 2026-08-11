@@ -1,0 +1,94 @@
+import Foundation
+
+/// The line that fills the gap between one step finishing and the next arriving.
+///
+/// A running turn is not always visibly running: a tool lands, and nothing moves until the
+/// model says what to do next. The transcript shimmers exactly one row at a time, so during
+/// that gap it shimmers nothing at all and the app looks stalled when it is only thinking.
+enum TranscriptWaitingNote {
+    /// How long one message holds before the next.
+    static let rotation: TimeInterval = 3.5
+    /// How long the gap must last before the note appears. Steps land a few hundred
+    /// milliseconds apart in a busy turn, and without this the note strobes between them.
+    static let appearAfter: TimeInterval = 0.6
+    /// How long it stays once shown, so the next step arriving does not blink it away.
+    static let minimumVisible: TimeInterval = 1.2
+
+    /// Present participles, one line each, scientific register played straight. Nothing here
+    /// claims the model is doing a thing it cannot do, and nothing reads as an error.
+    static let messages = [
+        "hedging tail risk of being bored",
+        "annealing a lukewarm take",
+        "collapsing the superposition of drafts",
+        "propagating uncertainty politely",
+        "waiting for the wavefunction to decide",
+        "borrowing energy from the vacuum, briefly",
+        "tunnelling through a modest barrier",
+        "cooling below the noise floor",
+        "conserving momentum, mostly",
+        "measuring twice to avoid decoherence",
+        "checking the units on that vibe",
+        "budgeting entropy for later",
+        "letting the gradients settle",
+        "attending to the relevant tokens",
+        "warming a cold embedding",
+        "lowering the temperature a little",
+        "pruning a branch going nowhere",
+        "backpropagating a small regret",
+        "retrieving something almost relevant",
+        "beam searching for a better opening",
+        "regularising an overconfident hunch",
+        "sampling without replacement of dignity",
+        "waiting on a slow eigenvalue",
+        "solving for the missing constant",
+        "rounding a stubborn irrational",
+        "proving the easy direction first",
+        "looking for a lemma that fits",
+        "counting on a compactness argument",
+        "checking whether the limit commutes",
+        "picking a basis with fewer regrets",
+        "inverting a matrix that resents it",
+        "bounding the error, generously",
+        "waiting for the series to converge",
+        "resampling from a better distribution",
+        "normalising against prior nonsense",
+        "resolving parallax on the problem",
+        "waiting for the light to arrive",
+        "correcting for atmospheric wobble",
+        "stacking exposures for a fainter signal",
+        "accounting for redshift in the estimate",
+        "clearing the neighbourhood of its orbit",
+        "triangulating from two good stars"
+    ]
+
+    /// Whether the transcript should show a waiting note at all.
+    ///
+    /// A pending event already shimmers on its own row, and a pending assistant message means
+    /// text is arriving — neither is waiting. Only a turn that is running with nothing pending
+    /// qualifies.
+    static func isWaiting(hasActiveTurn: Bool, lastEntryIsPending: Bool) -> Bool {
+        hasActiveTurn && !lastEntryIsPending
+    }
+
+    static func message(seed: String, elapsed: TimeInterval) -> String {
+        messages[index(seed: seed, elapsed: elapsed)]
+    }
+
+    /// Deterministic, so a wait opens on a different message each turn rather than always at
+    /// the top of the list, and so a test can pin one.
+    static func index(seed: String, elapsed: TimeInterval) -> Int {
+        let step = elapsed > 0 ? Int(elapsed / rotation) : 0
+        return (stableSeed(seed) + step) % messages.count
+    }
+
+    /// `hashValue` is salted per process, so it cannot pin a message in a test or hold one
+    /// steady across a relaunch. FNV-1a does neither.
+    static func stableSeed(_ value: String) -> Int {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100_0000_01b3
+        }
+        return Int(hash % UInt64(messages.count))
+    }
+}

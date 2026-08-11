@@ -6363,6 +6363,55 @@ final class TranscriptRowCacheTests: XCTestCase {
     }
 }
 
+final class TranscriptWaitingNoteTests: XCTestCase {
+    func testShowsOnlyWhileATurnRunsWithNothingPending() {
+        // A pending row shimmers on its own, and a pending assistant message means text is
+        // arriving — neither is waiting.
+        XCTAssertTrue(
+            TranscriptWaitingNote.isWaiting(hasActiveTurn: true, lastEntryIsPending: false)
+        )
+        XCTAssertFalse(
+            TranscriptWaitingNote.isWaiting(hasActiveTurn: true, lastEntryIsPending: true)
+        )
+        XCTAssertFalse(
+            TranscriptWaitingNote.isWaiting(hasActiveTurn: false, lastEntryIsPending: false)
+        )
+    }
+
+    func testRotationStaysInRangeAndAdvancesOnSchedule() {
+        let seed = "turn-1"
+        let first = TranscriptWaitingNote.message(seed: seed, elapsed: 0)
+
+        // Holds for the rotation window, then moves on.
+        XCTAssertEqual(
+            TranscriptWaitingNote.message(seed: seed, elapsed: TranscriptWaitingNote.rotation - 0.1),
+            first
+        )
+        XCTAssertNotEqual(
+            TranscriptWaitingNote.message(seed: seed, elapsed: TranscriptWaitingNote.rotation),
+            first
+        )
+
+        // Every step of a full cycle lands on a real message, including the wrap.
+        for step in 0...TranscriptWaitingNote.messages.count {
+            let index = TranscriptWaitingNote.index(
+                seed: seed,
+                elapsed: Double(step) * TranscriptWaitingNote.rotation
+            )
+            XCTAssertTrue((0..<TranscriptWaitingNote.messages.count).contains(index))
+        }
+    }
+
+    func testDifferentTurnsOpenOnDifferentMessages() {
+        // Deterministic across launches: `hashValue` is salted per process and could not be
+        // pinned here at all.
+        XCTAssertEqual(TranscriptWaitingNote.stableSeed("turn-1"), TranscriptWaitingNote.stableSeed("turn-1"))
+        let seeds = Set((1...12).map { TranscriptWaitingNote.stableSeed("turn-\($0)") })
+        XCTAssertGreaterThan(seeds.count, 6)
+        XCTAssertEqual(TranscriptWaitingNote.messages.count, 42)
+    }
+}
+
 final class ChatTitleWriterTests: XCTestCase {
     func testBuildsACompactPromptPreview() {
         XCTAssertEqual(
