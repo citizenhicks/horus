@@ -64,13 +64,10 @@ struct ChatView: View {
                 }
                 .accessibilityElement(children: .combine)
             }
-            ToolbarItem(placement: .primaryAction) {
+            // One group, so the two sit together rather than as separate items the bar
+            // spaces apart. Files moved into the options menu, which already carries it.
+            ToolbarItemGroup(placement: .primaryAction) {
                 newChatButton
-            }
-            ToolbarItem(placement: .primaryAction) {
-                inspectorButton
-            }
-            ToolbarItem(placement: .primaryAction) {
                 ChatOptionsMenu(
                     presentedWidget: $presentedWidget,
                     showsAgentSettings: $showsChatAgentSettings
@@ -101,15 +98,6 @@ struct ChatView: View {
         .accessibilityLabel("New chat in this folder")
         .tint(.primary)
         .help("New chat in this folder")
-    }
-
-    private var inspectorButton: some View {
-        Button(action: model.toggleFilesInspector) {
-            toolbarGlyph(.sidebarSimple)
-        }
-        .accessibilityLabel("Toggle Files")
-        .tint(.primary)
-        .help(model.showsInspector ? "Hide Files" : "Show Files")
     }
 
     /// A bare glyph is a 16pt target; toolbar buttons pad out to a full one the way every
