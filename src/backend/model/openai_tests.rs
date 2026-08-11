@@ -524,3 +524,102 @@ fn compaction_shape_contains_only_the_model_and_history() {
         })
     );
 }
+
+struct HttpRefreshingAuthorization {
+    token: std::sync::Mutex<String>,
+    refreshes: std::sync::atomic::AtomicUsize,
+}
+
+impl HttpRefreshingAuthorization {
+    fn new() -> Self {
+        Self {
+            token: std::sync::Mutex::new("rejected-token".into()),
+            refreshes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn resolved(&self) -> ResolvedAuthorization {
+        ResolvedAuthorization {
+            token: self.token.lock().expect("token lock").clone(),
+            headers: Vec::new(),
+        }
+    }
+}
+
+impl OpenAiAuthorization for HttpRefreshingAuthorization {
+    fn authorize_http<'a>(
+        &'a self,
+        _streaming: bool,
+    ) -> BoxFuture<'a, Result<ResolvedAuthorization>> {
+        let authorization = self.resolved();
+        Box::pin(async move { Ok(authorization) })
+    }
+
+    fn authorize_websocket<'a>(
+        &'a self,
+        _session_id: &'a str,
+    ) -> BoxFuture<'a, Result<ResolvedAuthorization>> {
+        let authorization = self.resolved();
+        Box::pin(async move { Ok(authorization) })
+    }
+
+    fn recover_unauthorized<'a>(&'a self, rejected_token: &'a str) -> BoxFuture<'a, Result<bool>> {
+        let mut token = self.token.lock().expect("token lock");
+        if token.as_str() == rejected_token {
+            *token = "fresh-token".into();
+            self.refreshes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Box::pin(async { Ok(true) })
+    }
+}
+
+#[tokio::test]
+async fn http_unauthorized_refreshes_and_retries_once() {
+    use tokio::io::AsyncReadExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("HTTP listener");
+    let address = listener.local_addr().expect("HTTP address");
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for response in [
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".as_slice(),
+        ] {
+            let (mut stream, _) = listener.accept().await.expect("HTTP connection");
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut chunk = [0; 1_024];
+                let count = stream.read(&mut chunk).await.expect("HTTP request");
+                assert_ne!(count, 0, "request ended before its headers");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            requests.push(String::from_utf8_lossy(&request).into_owned());
+            stream.write_all(response).await.expect("HTTP response");
+        }
+        requests
+    });
+
+    let auth = Arc::new(HttpRefreshingAuthorization::new());
+    let provider = OpenAi::with_authorization(
+        auth.clone(),
+        format!("http://{address}"),
+        "test-model",
+        reqwest::Client::new(),
+    )
+    .expect("provider");
+    let response = provider
+        .send_authorized("responses", &serde_json::json!({}), true)
+        .await
+        .expect("request should recover");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let requests = server.await.expect("HTTP server");
+    assert!(requests[0].contains("Bearer rejected-token"));
+    assert!(requests[1].contains("Bearer fresh-token"));
+    assert_eq!(auth.refreshes.load(std::sync::atomic::Ordering::Relaxed), 1);
+}

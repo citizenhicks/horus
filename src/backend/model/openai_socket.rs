@@ -41,6 +41,7 @@ use super::openai::wire_input;
 use super::openai::wire_tools;
 use super::openai_auth::ApiKeyAuthorization;
 use super::openai_auth::OpenAiAuthorization;
+use super::openai_auth::ResolvedAuthorization;
 use super::provider::HostedWebSearch;
 use super::provider::ModelPreset;
 use super::provider::ProviderAuth;
@@ -324,20 +325,31 @@ async fn connect(
     socket_url: &str,
     session_id: &str,
 ) -> Result<Socket> {
-    let request = connection_request(auth, socket_url, session_id).await?;
-    timeout(CONNECT_TIMEOUT, connect_async(request))
-        .await
-        .map_err(|_| Error::Provider("WebSocket connection timed out".into()))?
-        .map(|(socket, _)| socket)
-        .map_err(socket_error)
+    for attempt in 0..2 {
+        let authorization = auth.authorize_websocket(session_id).await?;
+        let rejected_token = authorization.token.clone();
+        let request = connection_request(socket_url, authorization)?;
+        let result = timeout(CONNECT_TIMEOUT, connect_async(request))
+            .await
+            .map_err(|_| Error::Provider("WebSocket connection timed out".into()))?;
+        match result {
+            Ok((socket, _)) => return Ok(socket),
+            Err(error) if attempt == 0 && unauthorized(&error) => {
+                if auth.recover_unauthorized(&rejected_token).await? {
+                    continue;
+                }
+                return Err(socket_error(error));
+            }
+            Err(error) => return Err(socket_error(error)),
+        }
+    }
+    unreachable!("WebSocket authorization retry is bounded")
 }
 
-pub(super) async fn connection_request(
-    auth: &dyn OpenAiAuthorization,
+fn connection_request(
     socket_url: &str,
-    session_id: &str,
+    authorization: ResolvedAuthorization,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
-    let authorization = auth.authorize_websocket(session_id).await?;
     let mut request = socket_url.into_client_request().map_err(socket_error)?;
     request.headers_mut().insert(
         AUTHORIZATION,
@@ -354,6 +366,15 @@ pub(super) async fn connection_request(
         );
     }
     Ok(request)
+}
+
+fn unauthorized(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    matches!(
+        error,
+        tokio_tungstenite::tungstenite::Error::Http(response)
+            if response.status()
+                == tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED
+    )
 }
 
 fn response_body(

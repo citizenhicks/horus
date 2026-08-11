@@ -147,3 +147,16 @@ fn credentials_refresh_with_clock_skew_leeway() {
 
     assert!(expired(&credential));
 }
+
+#[test]
+fn rejected_credentials_refresh_before_expiry() {
+    let credential = OAuthCredential {
+        access: "rejected-token".into(),
+        refresh: "refresh-token".into(),
+        expires: u64::MAX,
+        account_id: "account-123".into(),
+    };
+
+    assert!(refresh_required(&credential, Some("rejected-token")));
+    assert!(!refresh_required(&credential, Some("newer-token")));
+}

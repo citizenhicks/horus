@@ -166,8 +166,15 @@ impl ChatGptAuth {
     }
 
     async fn authorization(&self) -> Result<(String, String)> {
+        self.resolve_authorization(None).await
+    }
+
+    async fn resolve_authorization(
+        &self,
+        rejected_token: Option<&str>,
+    ) -> Result<(String, String)> {
         let mut credential = self.credential.lock().await;
-        if !expired(&credential) {
+        if !refresh_required(&credential, rejected_token) {
             return Ok(resolved(&credential));
         }
 
@@ -179,7 +186,7 @@ impl ChatGptAuth {
         })
         .await
         .map_err(|error| Error::Auth(format!("credential lock task failed: {error}")))??;
-        if !expired(&saved) {
+        if !refresh_required(&saved, rejected_token) {
             *credential = saved;
             return Ok(resolved(&credential));
         }
@@ -594,6 +601,10 @@ fn expired(credential: &OAuthCredential) -> bool {
     now().saturating_add(REFRESH_LEEWAY.as_secs()) >= credential.expires
 }
 
+fn refresh_required(credential: &OAuthCredential, rejected_token: Option<&str>) -> bool {
+    rejected_token.map_or_else(|| expired(credential), |token| credential.access == token)
+}
+
 fn resolved(credential: &OAuthCredential) -> (String, String) {
     (credential.access.clone(), credential.account_id.clone())
 }
@@ -746,6 +757,13 @@ impl OpenAiAuthorization for ChatGptAuth {
                     ("x-client-request-id".into(), session_id.into()),
                 ],
             })
+        })
+    }
+
+    fn recover_unauthorized<'a>(&'a self, rejected_token: &'a str) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            self.resolve_authorization(Some(rejected_token)).await?;
+            Ok(true)
         })
     }
 }

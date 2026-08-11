@@ -571,6 +571,8 @@ private struct UserMessageContent: View {
     }
 }
 
+private struct UserMessageEndAttribute: TextAttribute {}
+
 private struct CollapsibleUserText: View {
     private static let collapsedLineLimit = 21
 
@@ -581,13 +583,20 @@ private struct CollapsibleUserText: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(text)
+            markedText
                 .lineLimit(isExpanded ? nil : Self.collapsedLineLimit)
                 .truncationMode(.tail)
                 .textSelection(.enabled)
                 .onPreferenceChange(Text.LayoutKey.self) { layouts in
-                    guard !isExpanded else { return }
-                    let isTruncated = layouts.contains { $0.layout.isTruncated }
+                    guard !isExpanded, !layouts.isEmpty else { return }
+                    let reachedEnd = layouts.contains { proxy in
+                        proxy.layout.contains { line in
+                            line.contains { run in
+                                run[UserMessageEndAttribute.self] != nil
+                            }
+                        }
+                    }
+                    let isTruncated = !reachedEnd
                     if self.isTruncated != isTruncated {
                         self.isTruncated = isTruncated
                     }
@@ -602,6 +611,15 @@ private struct CollapsibleUserText: View {
                 .accessibilityHint("Expands the full message")
             }
         }
+    }
+
+    private var markedText: Text {
+        guard let end = text.lastIndex(where: { !$0.isNewline }) else {
+            return Text(text)
+        }
+        return Text(
+            "\(Text(text[..<end]))\(Text(text[end...]).customAttribute(UserMessageEndAttribute()))"
+        )
     }
 }
 

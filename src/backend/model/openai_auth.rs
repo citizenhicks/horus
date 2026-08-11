@@ -20,6 +20,8 @@ pub(super) trait OpenAiAuthorization: Send + Sync {
         &'a self,
         session_id: &'a str,
     ) -> BoxFuture<'a, Result<ResolvedAuthorization>>;
+
+    fn recover_unauthorized<'a>(&'a self, rejected_token: &'a str) -> BoxFuture<'a, Result<bool>>;
 }
 
 pub(super) struct ApiKeyAuthorization(Arc<str>);
@@ -43,6 +45,10 @@ impl OpenAiAuthorization for ApiKeyAuthorization {
         _session_id: &'a str,
     ) -> BoxFuture<'a, Result<ResolvedAuthorization>> {
         self.resolved()
+    }
+
+    fn recover_unauthorized<'a>(&'a self, _rejected_token: &'a str) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async { Ok(false) })
     }
 }
 

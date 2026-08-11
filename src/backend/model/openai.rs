@@ -18,6 +18,8 @@ use super::image_data_url;
 use super::image_input;
 use super::openai_auth::ApiKeyAuthorization;
 use super::openai_auth::OpenAiAuthorization;
+#[cfg(test)]
+use super::openai_auth::ResolvedAuthorization;
 use super::provider::ProviderAuth;
 use super::provider::ProviderBuildConfig;
 use super::provider::ProviderDefinition;
@@ -174,11 +176,7 @@ impl OpenAi {
         events: ModelEventSink,
     ) -> Result<ModelOutput> {
         let body = self.response_body(request)?;
-        let request = self
-            .client
-            .post(format!("{}/responses", self.base_url))
-            .json(&body);
-        let mut response = self.authorize(request, true).await?.send().await?;
+        let mut response = self.send_authorized("responses", &body, true).await?;
         if !response.status().is_success() {
             return Err(status_error(response, "Responses").await);
         }
@@ -263,11 +261,9 @@ impl OpenAi {
             ));
         }
         let body = self.compact_body(request)?;
-        let request = self
-            .client
-            .post(format!("{}/responses/compact", self.base_url))
-            .json(&body);
-        let response = self.authorize(request, false).await?.send().await?;
+        let response = self
+            .send_authorized("responses/compact", &body, false)
+            .await?;
         if !response.status().is_success() {
             return Err(status_error(response, "Responses").await);
         }
@@ -276,17 +272,32 @@ impl OpenAi {
         decode_compact_response(response)
     }
 
-    async fn authorize(
+    async fn send_authorized(
         &self,
-        mut request: reqwest::RequestBuilder,
+        endpoint: &str,
+        body: &Value,
         streaming: bool,
-    ) -> Result<reqwest::RequestBuilder> {
-        let authorization = self.auth.authorize_http(streaming).await?;
-        request = request.bearer_auth(authorization.token);
-        for (name, value) in authorization.headers {
-            request = request.header(name, value);
+    ) -> Result<reqwest::Response> {
+        for attempt in 0..2 {
+            let authorization = self.auth.authorize_http(streaming).await?;
+            let rejected_token = authorization.token.clone();
+            let mut request = self
+                .client
+                .post(format!("{}/{endpoint}", self.base_url))
+                .json(body)
+                .bearer_auth(authorization.token);
+            for (name, value) in authorization.headers {
+                request = request.header(name, value);
+            }
+            let response = request.send().await?;
+            if response.status() != reqwest::StatusCode::UNAUTHORIZED || attempt == 1 {
+                return Ok(response);
+            }
+            if !self.auth.recover_unauthorized(&rejected_token).await? {
+                return Ok(response);
+            }
         }
-        Ok(request)
+        unreachable!("authorized request retry is bounded")
     }
 
     fn compact_body(&self, request: CompactRequest<'_>) -> Result<Value> {
