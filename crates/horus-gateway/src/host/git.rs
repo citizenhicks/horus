@@ -386,7 +386,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn branch_switch_uses_the_protected_git_sandbox() {
+    async fn branch_switch_disables_hooks_and_confines_filters_to_the_workspace() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let workspace = tempfile::tempdir().expect("workspace");
@@ -410,12 +410,12 @@ mod tests {
         run_git(workspace.path(), &["commit", "--quiet", "-m", "feature"]);
         run_git(workspace.path(), &["switch", "--quiet", "main"]);
         for directory in [".agents", ".codex"] {
-            std::fs::create_dir(workspace.path().join(directory)).expect("protected directory");
+            std::fs::create_dir(workspace.path().join(directory)).expect("workspace directory");
             std::fs::write(
                 workspace.path().join(directory).join("sentinel"),
-                "protected",
+                "existing",
             )
-            .expect("protected sentinel");
+            .expect("workspace sentinel");
         }
         let hook = workspace.path().join(".git/hooks/post-checkout");
         std::fs::write(&hook, "#!/bin/sh\ntouch hook-ran\n").expect("checkout hook");
@@ -437,7 +437,7 @@ mod tests {
                 workspace.path().join(".agents/filter-ran").exists(),
                 workspace.path().join(".codex/filter-ran").exists(),
             ),
-            ("feature", "feature\n".into(), false, false, false)
+            ("feature", "feature\n".into(), false, true, true)
         );
     }
 

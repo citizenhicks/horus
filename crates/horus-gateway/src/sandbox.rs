@@ -189,12 +189,22 @@ mod tests {
 
     #[tokio::test]
     async fn commands_cannot_read_gateway_state_or_tls_key() {
+        use std::os::unix::fs::symlink;
+
         let workspace = tempfile::tempdir().expect("workspace");
         let state = tempfile::tempdir().expect("state");
         let credentials = tempfile::tempdir().expect("credentials");
         let tls_key = credentials.path().join("private-key.pem");
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(workspace.path())
+            .status()
+            .expect("initialize Git repository");
+        assert!(initialized.success());
         std::fs::write(state.path().join("sentinel"), "gateway-secret").expect("state sentinel");
         std::fs::write(&tls_key, "tls-secret").expect("TLS key");
+        symlink(state.path(), workspace.path().join("state-link")).expect("state symlink");
+        symlink(&tls_key, workspace.path().join("tls-link")).expect("TLS key symlink");
         let sandbox = GatewaySandbox::new(
             workspace.path(),
             state.path(),
@@ -202,25 +212,31 @@ mod tests {
             Duration::from_secs(5),
         )
         .expect("gateway sandbox");
-        let script = format!(
-            "cat {}/sentinel; cat {}",
-            state.path().display(),
-            tls_key.display()
-        );
 
-        let output = sandbox
-            .execute(
-                &script,
-                NetworkAccess::Denied,
-                CommandMode::Foreground,
-                CommandOutputSink::default(),
-            )
-            .await
-            .expect("blocked command still returns status");
+        for (label, mode) in [
+            ("foreground", CommandMode::Foreground),
+            ("background", CommandMode::Background),
+        ] {
+            let script = format!(
+                "touch .git/{label}; cat {}/sentinel || true; cat {} || true; cat state-link/sentinel || true; cat tls-link || true",
+                state.path().display(),
+                tls_key.display()
+            );
+            let output = sandbox
+                .execute(
+                    &script,
+                    NetworkAccess::Denied,
+                    mode,
+                    CommandOutputSink::default(),
+                )
+                .await
+                .expect("sandboxed command");
 
-        assert_ne!(output.exit_code, 0);
-        assert!(!output.stdout.contains("gateway-secret"));
-        assert!(!output.stdout.contains("tls-secret"));
+            assert_eq!(output.exit_code, 0, "{}", output.stderr);
+            assert!(workspace.path().join(".git").join(label).is_file());
+            assert!(!output.stdout.contains("gateway-secret"));
+            assert!(!output.stdout.contains("tls-secret"));
+        }
     }
 
     #[tokio::test]
