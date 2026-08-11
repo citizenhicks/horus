@@ -546,6 +546,34 @@ fn responses_web_search_preserves_every_query() {
 }
 
 #[test]
+fn responses_web_search_accepts_a_singular_query() {
+    let action = decode_web_action(&serde_json::json!({
+        "action": {
+            "type": "search",
+            "query": "Horus framework"
+        }
+    }));
+
+    assert_eq!(
+        action,
+        WebSearchAction::Search {
+            queries: vec!["Horus framework".into()]
+        }
+    );
+}
+
+#[test]
+fn responses_web_search_without_queries_is_other() {
+    let action = decode_web_action(&serde_json::json!({
+        "action": {
+            "type": "search"
+        }
+    }));
+
+    assert_eq!(action, WebSearchAction::Other);
+}
+
+#[test]
 fn compaction_shape_contains_only_the_model_and_history() {
     let provider =
         OpenAi::new("test-key", "https://api.openai.com/v1", "test-model").expect("provider");

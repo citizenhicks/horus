@@ -608,16 +608,27 @@ fn decode_web_action(item: &Value) -> WebSearchAction {
             .map(ToString::to_string)
     };
     match action.get("type").and_then(Value::as_str) {
-        Some("search") => WebSearchAction::Search {
-            queries: action
+        Some("search") => {
+            let mut queries = action
                 .get("queries")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
+                .filter(|query| !query.is_empty())
                 .map(ToString::to_string)
-                .collect(),
-        },
+                .collect::<Vec<_>>();
+            if queries.is_empty()
+                && let Some(query) = string("query").filter(|query| !query.is_empty())
+            {
+                queries.push(query);
+            }
+            if queries.is_empty() {
+                WebSearchAction::Other
+            } else {
+                WebSearchAction::Search { queries }
+            }
+        }
         Some("open_page") => WebSearchAction::OpenPage { url: string("url") },
         Some("find_in_page") => WebSearchAction::FindInPage {
             url: string("url"),

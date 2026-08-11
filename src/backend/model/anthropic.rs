@@ -280,17 +280,16 @@ impl StreamState {
         }
         if block.get("type").and_then(Value::as_str) == Some("web_search_tool_result") {
             let call_id = required_string(&block, "tool_use_id")?.to_string();
-            let queries = self
+            let action = self
                 .web_queries
                 .get(&call_id)
                 .cloned()
                 .flatten()
-                .into_iter()
-                .collect();
-            events(ModelEvent::WebSearchCompleted {
-                call_id,
-                action: WebSearchAction::Search { queries },
-            })?;
+                .filter(|query| !query.is_empty())
+                .map_or(WebSearchAction::Other, |query| WebSearchAction::Search {
+                    queries: vec![query],
+                });
+            events(ModelEvent::WebSearchCompleted { call_id, action })?;
         }
         self.blocks.insert(index, block);
         Ok(())

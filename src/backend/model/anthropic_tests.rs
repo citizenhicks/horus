@@ -76,6 +76,63 @@ fn anthropic_web_search_normalizes_query_to_a_singleton() {
 }
 
 #[test]
+fn anthropic_web_search_with_an_empty_streamed_query_is_other() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_seen = Arc::clone(&seen);
+    let events: ModelEventSink = Arc::new(move |event| {
+        sink_seen.lock().expect("events lock").push(event);
+        Ok(())
+    });
+    let mut stream = StreamState::default();
+
+    for event in [
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": "search-1",
+                "name": "web_search",
+                "input": {}
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": "{\"query\":\"\"}"
+            }
+        }),
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "web_search_tool_result",
+                "tool_use_id": "search-1",
+                "content": []
+            }
+        }),
+    ] {
+        stream.apply(event, &events).expect("stream event");
+    }
+
+    assert_eq!(
+        *seen.lock().expect("events lock"),
+        vec![
+            ModelEvent::WebSearchStarted {
+                call_id: "search-1".into()
+            },
+            ModelEvent::WebSearchCompleted {
+                call_id: "search-1".into(),
+                action: WebSearchAction::Other
+            }
+        ]
+    );
+}
+
+#[test]
 fn responses_history_translates_to_anthropic_tool_messages() {
     let messages = translate_messages(&[
         user_message("inspect it"),
