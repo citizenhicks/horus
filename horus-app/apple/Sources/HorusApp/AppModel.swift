@@ -667,8 +667,12 @@ final class AppModel {
     var sessionRenameDraft = ""
     var sessionToDelete: SessionRecord?
     private(set) var unreadSessionIDs: Set<String> = []
-    var transcript: [TranscriptEntry] = []
-    private var replayPresentedTranscript: [TranscriptEntry]?
+    var transcript: [TranscriptEntry] = [] {
+        didSet { invalidateTranscriptRows() }
+    }
+    private var replayPresentedTranscript: [TranscriptEntry]? {
+        didSet { invalidateTranscriptRows() }
+    }
     private var visibleTranscriptLimit = 300
     var displayedTranscript: [TranscriptEntry] {
         let source = replayPresentedTranscript ?? transcript

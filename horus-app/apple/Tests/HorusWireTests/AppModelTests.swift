@@ -6274,6 +6274,21 @@ final class TranscriptRowCacheTests: XCTestCase {
         XCTAssertEqual(second.map { $0.map(\.id) }, first.map { $0.map(\.id) })
         XCTAssertTrue(second[0][1] === first[0][1])
     }
+
+    func testCacheFollowsReplacementEntriesWithTheSameIDs() throws {
+        let model = try model()
+        model.transcript = [entry("a"), entry("b")]
+        let first = model.transcriptRows(breakBefore: nil)
+        let replacement = [entry("a"), entry("b")]
+        replacement[1].text = "replacement"
+
+        model.transcript = replacement
+        let second = model.transcriptRows(breakBefore: nil)
+
+        XCTAssertEqual(second[0][1].text, "replacement")
+        XCTAssertTrue(second[0][1] === replacement[1])
+        XCTAssertFalse(second[0][1] === first[0][1])
+    }
 }
 
 final class ChatTitleWriterTests: XCTestCase {
