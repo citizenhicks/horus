@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "horus-cli"
-version = "0.7.5"
+version = "0.7.6"
 dependencies = [
  "diffy",
  "horus",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "horus-gateway"
-version = "0.7.5"
+version = "0.7.6"
 dependencies = [
  "base64",
  "chrono",

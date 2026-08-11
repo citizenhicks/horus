@@ -46,6 +46,12 @@ pub(crate) struct ActiveCronRun {
     _lock: File,
 }
 
+impl Drop for ActiveCronRun {
+    fn drop(&mut self) {
+        let _ = self._lock.unlock();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CronState {
@@ -1040,6 +1046,26 @@ mod tests {
         store
             .finish_run(run, CronRunStatus::Succeeded, None)
             .expect("finish run");
+    }
+
+    #[test]
+    fn finish_run_unlocks_a_duplicated_file_handle() {
+        let (_root, store) = store();
+        let task = add_task(&store, "session-a", "task a", "0 9 * * *");
+        let run = match store.begin_run(&task.id).expect("begin run") {
+            BeginRun::Started(run) => run,
+            BeginRun::Skipped => panic!("run must start"),
+        };
+        let duplicate = run._lock.try_clone().expect("duplicate task lock");
+
+        store
+            .finish_run(run, CronRunStatus::Succeeded, None)
+            .expect("finish run");
+        store
+            .delete_session("session-a")
+            .expect("completed run must release every task lock");
+
+        drop(duplicate);
     }
 
     #[test]
