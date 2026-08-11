@@ -1,4 +1,4 @@
-//! Gateway sandbox that keeps host credentials outside the agent's read boundary.
+//! Gateway sandbox that hides gateway state from approved workspace commands.
 
 use std::path::Path;
 use std::time::Duration;
@@ -66,8 +66,7 @@ impl GatewaySandbox {
         let delegate = LocalSandbox::new(&root)?
             .command_timeout(timeout)?
             .deny_read(&state_dir)?
-            .deny_read(&tls_key)?
-            .isolated_home();
+            .deny_read(&tls_key)?;
         Ok(Self { delegate })
     }
 
@@ -213,9 +212,13 @@ mod tests {
         )
         .expect("gateway sandbox");
 
-        for (label, mode) in [
-            ("foreground", CommandMode::Foreground),
-            ("background", CommandMode::Background),
+        for (label, mode, network_access) in [
+            ("foreground", CommandMode::Foreground, NetworkAccess::Denied),
+            (
+                "background",
+                CommandMode::Background,
+                NetworkAccess::Allowed,
+            ),
         ] {
             let script = format!(
                 "touch .git/{label}; cat {}/sentinel || true; cat {} || true; cat state-link/sentinel || true; cat tls-link || true",
@@ -223,12 +226,7 @@ mod tests {
                 tls_key.display()
             );
             let output = sandbox
-                .execute(
-                    &script,
-                    NetworkAccess::Denied,
-                    mode,
-                    CommandOutputSink::default(),
-                )
+                .execute(&script, network_access, mode, CommandOutputSink::default())
                 .await
                 .expect("sandboxed command");
 
@@ -255,5 +253,26 @@ mod tests {
             .expect("read binary file");
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn commands_inherit_the_host_home() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let sandbox =
+            GatewaySandbox::new(workspace.path(), state.path(), None, Duration::from_secs(5))
+                .expect("gateway sandbox");
+
+        let output = sandbox
+            .execute(
+                r#"printf '%s' "$HOME""#,
+                NetworkAccess::Denied,
+                CommandMode::Foreground,
+                CommandOutputSink::default(),
+            )
+            .await
+            .expect("sandboxed command");
+
+        assert_eq!(output.stdout, std::env::var("HOME").expect("host HOME"));
     }
 }

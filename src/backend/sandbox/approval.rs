@@ -46,8 +46,9 @@ pub enum ApprovalPolicy {
 impl ApprovalPolicy {
     fn network_access(self) -> NetworkAccess {
         match self {
-            Self::Ask | Self::Allow => NetworkAccess::Denied,
-            Self::AllowNetwork | Self::AutoApprove => NetworkAccess::Allowed,
+            Self::Allow => NetworkAccess::Denied,
+            // `Ask` cannot reach backend execution until per-call mutation approval is granted.
+            Self::Ask | Self::AllowNetwork | Self::AutoApprove => NetworkAccess::Allowed,
         }
     }
 }
@@ -393,8 +394,8 @@ mod tests {
     }
 
     #[test]
-    fn automatic_approval_enables_backend_network() {
-        assert_eq!(ApprovalPolicy::Ask.network_access(), NetworkAccess::Denied);
+    fn authorized_execution_modes_assign_backend_network_access() {
+        assert_eq!(ApprovalPolicy::Ask.network_access(), NetworkAccess::Allowed);
         assert_eq!(
             ApprovalPolicy::Allow.network_access(),
             NetworkAccess::Denied
@@ -454,7 +455,13 @@ mod tests {
         else {
             panic!("approval required");
         };
-        assert!(!permissions.for_call("write").mutation);
+        assert_eq!(
+            (
+                permissions.network_access(),
+                permissions.for_call("write").mutation,
+            ),
+            (NetworkAccess::Allowed, false)
+        );
 
         let permissions = approval
             .resolve(

@@ -136,6 +136,11 @@ use background::BackgroundCommands;
 #[doc(hidden)]
 pub const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base_policy.sbpl");
 
+/// macOS platform services required by commands with approved network access.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub const MACOS_SEATBELT_NETWORK_POLICY: &str = include_str!("seatbelt_network_policy.sbpl");
+
 /// Whether a sandbox backend permits network access for one command.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

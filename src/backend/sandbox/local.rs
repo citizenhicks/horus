@@ -24,7 +24,7 @@ use super::{
     MAX_FILE_BYTES,
 };
 #[cfg(target_os = "macos")]
-use super::{MACOS_COMMAND_WRAPPER, MACOS_SEATBELT_BASE_POLICY};
+use super::{MACOS_COMMAND_WRAPPER, MACOS_SEATBELT_BASE_POLICY, MACOS_SEATBELT_NETWORK_POLICY};
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
@@ -33,6 +33,16 @@ const MAX_COMMAND_OUTPUT_BYTES: usize = 40_000;
 /// Read-only inspection feeds a UI rather than a model context, so it keeps a larger budget.
 const MAX_READ_ONLY_OUTPUT_BYTES: usize = 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const ISOLATED_ENVIRONMENT: [&str; 8] = [
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "DEVELOPER_DIR",
+    "SDKROOT",
+];
 #[cfg(target_os = "linux")]
 const ISOLATED_HOME: &str = "/tmp/horus-home";
 #[cfg(target_os = "macos")]
@@ -266,7 +276,7 @@ impl LocalSandbox {
         if self.isolated_home {
             command.args(["--dir", ISOLATED_HOME]);
         }
-        if Path::new("/run").is_dir() {
+        if network_access == NetworkAccess::Denied && Path::new("/run").is_dir() {
             command.args(["--tmpfs", "/run"]);
         }
         command
@@ -338,7 +348,8 @@ impl LocalSandbox {
             ));
         }
         if network_access == NetworkAccess::Allowed {
-            policy.push_str("\n(allow network*)");
+            policy.push_str("\n(allow network-outbound)\n(allow network-inbound)\n");
+            policy.push_str(MACOS_SEATBELT_NETWORK_POLICY);
         }
         if workspace_access == WorkspaceAccess::ReadOnly {
             policy.push_str(
@@ -424,30 +435,14 @@ impl LocalSandbox {
             validate_root(&self.root, &self.root_dir)?;
             let mut command =
                 self.sandboxed_command(&invocation, network_access, workspace_access)?;
-            let mut inherited = [
-                "PATH",
-                "USER",
-                "LOGNAME",
-                "LANG",
-                "LC_ALL",
-                "TERM",
-                "DEVELOPER_DIR",
-                "SDKROOT",
-            ]
-            .into_iter()
-            .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
-            .collect::<Vec<_>>();
-            if !self.isolated_home {
-                inherited.extend(
-                    ["HOME", "SHELL", "CARGO_HOME", "RUSTUP_HOME"]
-                        .into_iter()
-                        .filter_map(|name| std::env::var_os(name).map(|value| (name, value))),
-                );
+            command.current_dir(&self.root);
+            if self.isolated_home {
+                let inherited = ISOLATED_ENVIRONMENT
+                    .into_iter()
+                    .filter_map(|name| std::env::var_os(name).map(|value| (name, value)));
+                command.env_clear().envs(inherited);
             }
             command
-                .current_dir(&self.root)
-                .env_clear()
-                .envs(inherited)
                 .envs(environment.iter().copied())
                 .env("TMPDIR", command_temp(self.temp.path()));
             if self.isolated_home {
@@ -1052,7 +1047,7 @@ sleep 30"#;
         let output = sandbox
             .execute(
                 "touch outside/escaped",
-                NetworkAccess::Denied,
+                NetworkAccess::Allowed,
                 CommandMode::Foreground,
                 CommandOutputSink::default(),
             )
@@ -1099,15 +1094,19 @@ sleep 30"#;
             .expect("network-enabled command");
         #[cfg(target_os = "linux")]
         {
-            let denied = denied
-                .as_std()
-                .get_args()
-                .any(|argument| argument == "--unshare-net");
-            let allowed = allowed
-                .as_std()
-                .get_args()
-                .any(|argument| argument == "--unshare-net");
-            assert_eq!((denied, allowed), (true, false));
+            let isolation = |command: &Command| {
+                let arguments = command.as_std().get_args().collect::<Vec<_>>();
+                (
+                    arguments.contains(&OsStr::new("--unshare-net")),
+                    arguments
+                        .windows(2)
+                        .any(|pair| pair == [OsStr::new("--tmpfs"), OsStr::new("/run")]),
+                )
+            };
+            assert_eq!(
+                (isolation(&denied), isolation(&allowed)),
+                ((true, Path::new("/run").is_dir()), (false, false))
+            );
         }
         #[cfg(target_os = "macos")]
         {
@@ -1120,8 +1119,8 @@ sleep 30"#;
                     .expect("Seatbelt policy")
                     .into_owned()
             };
-            assert!(!policy(&denied).contains("(allow network*)"));
-            assert!(policy(&allowed).contains("(allow network*)"));
+            assert!(!policy(&denied).contains("com.apple.SecurityServer"));
+            assert!(policy(&allowed).contains("com.apple.SecurityServer"));
         }
     }
 
