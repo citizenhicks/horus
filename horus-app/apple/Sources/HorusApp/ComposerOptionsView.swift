@@ -136,7 +136,7 @@ struct ComposerOptionsView: View {
         Menu {
             Picker("Approval policy", selection: approvalPickerSelection) {
                 ForEach(approvalOptions) { option in
-                    approvalOptionLabel(option).tag(option.value)
+                    Text(option.label).tag(option.value)
                 }
             }
             .labelsHidden()
@@ -341,16 +341,6 @@ struct ComposerOptionsView: View {
 
     private var approvalLabel: String {
         approvalOptions.first(where: { $0.value == approvalValue })?.label ?? "Approval"
-    }
-
-    @ViewBuilder
-    private func approvalOptionLabel(_ option: FrontendSettingOption) -> some View {
-        if option.value == "full_access" {
-            HorusLabel(title: option.label, glyph: .shieldOff, iconColor: palette.danger)
-                .foregroundStyle(palette.danger)
-        } else {
-            Text(option.label)
-        }
     }
 
     private var approvalGlyph: HorusGlyph {
