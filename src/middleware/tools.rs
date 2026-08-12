@@ -175,48 +175,57 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
-/// Executes a batch concurrently only when every registered tool permits it.
+/// Executes maximal runs of parallel-safe calls concurrently.
+/// Exclusive and unknown calls form barriers and execute alone.
 pub(crate) async fn execute_batch(
     catalog: &Catalog,
     calls: &[ToolCall],
     sandbox: Arc<Sandbox>,
     permissions: &SandboxPermissions,
 ) -> Vec<ToolResult> {
-    let parallel = calls.iter().all(|call| {
-        catalog
-            .get(&call.name)
-            .is_some_and(|tool| tool.execution_mode == ExecutionMode::Parallel)
-    });
-    if !parallel {
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            results.push(
-                execute_one(
-                    catalog,
-                    call.clone(),
-                    ToolContext {
-                        sandbox: Arc::clone(&sandbox),
-                        permissions: permissions.for_call(&call.call_id),
-                    },
+    let mut results = Vec::with_capacity(calls.len());
+    let mut index = 0;
+    while index < calls.len() {
+        if is_parallel(catalog, &calls[index]) {
+            let end = calls[index..]
+                .iter()
+                .position(|call| !is_parallel(catalog, call))
+                .map_or(calls.len(), |offset| index + offset);
+            // ModelOutput validation bounds every batch to 128 calls.
+            results.extend(
+                join_all(
+                    calls[index..end]
+                        .iter()
+                        .cloned()
+                        .map(|call| execute_call(catalog, call, &sandbox, permissions)),
                 )
                 .await,
             );
+            index = end;
+        } else {
+            results.push(execute_call(catalog, calls[index].clone(), &sandbox, permissions).await);
+            index += 1;
         }
-        return results;
     }
-
-    // ModelOutput validation bounds every batch to 128 calls.
-    join_all(calls.iter().cloned().map(|call| {
-        let context = ToolContext {
-            sandbox: Arc::clone(&sandbox),
-            permissions: permissions.for_call(&call.call_id),
-        };
-        execute_one(catalog, call, context)
-    }))
-    .await
+    results
 }
 
-async fn execute_one(catalog: &Catalog, call: ToolCall, context: ToolContext) -> ToolResult {
+fn is_parallel(catalog: &Catalog, call: &ToolCall) -> bool {
+    catalog
+        .get(&call.name)
+        .is_some_and(|tool| tool.execution_mode == ExecutionMode::Parallel)
+}
+
+async fn execute_call(
+    catalog: &Catalog,
+    call: ToolCall,
+    sandbox: &Arc<Sandbox>,
+    permissions: &SandboxPermissions,
+) -> ToolResult {
+    let context = ToolContext {
+        sandbox: Arc::clone(sandbox),
+        permissions: permissions.for_call(&call.call_id),
+    };
     let tool = catalog.get(&call.name).cloned();
     let ToolCall {
         call_id,
