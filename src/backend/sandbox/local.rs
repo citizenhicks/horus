@@ -425,9 +425,9 @@ impl LocalSandbox {
         }
         let mut policy = String::from(
             "(version 1)\n(allow default)\n\
-             (deny signal (target others))\n\
-             (deny process-info* (target others))\n\
-             (deny mach-task-name (target others))\n",
+             (deny signal (require-not (target same-sandbox)))\n\
+             (deny process-info* (require-not (target same-sandbox)))\n\
+             (deny mach-task-name (require-not (target same-sandbox)))\n",
         );
         for (index, denied) in self.denied_reads.iter().enumerate() {
             let parameter = format!("DENIED_READ_{index}");
@@ -1060,13 +1060,16 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[tokio::test(start_paused = true)]
-    async fn command_cleanup_reaps_daemonized_descendants() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let sandbox = LocalSandbox::new(workspace.path())
-            .expect("sandbox")
-            .command_timeout(Duration::from_millis(100))
-            .expect("timeout");
+    async fn assert_timeout_reaps_daemonized_descendants(
+        sandbox: LocalSandbox,
+        sandbox_mode: SandboxMode,
+    ) {
+        let pid_path = sandbox.root.join("daemon.pid");
+        let network_access = if sandbox_mode == SandboxMode::DangerFullAccess {
+            NetworkAccess::Allowed
+        } else {
+            NetworkAccess::Denied
+        };
         let script = r#"/usr/bin/perl -MPOSIX=setsid -e '
 exit if fork; setsid(); exit if fork;
 open my $file, ">", "daemon.pid" or die; print $file "$$\n"; close $file;
@@ -1078,14 +1081,13 @@ sleep 30"#;
             sandbox
                 .execute(
                     script,
-                    SandboxMode::WorkspaceWrite,
-                    NetworkAccess::Denied,
+                    sandbox_mode,
+                    network_access,
                     CommandMode::Foreground,
                     CommandOutputSink::default(),
                 )
                 .await
         });
-        let pid_path = workspace.path().join("daemon.pid");
         let pid = tokio::task::spawn_blocking(move || {
             for _ in 0..500 {
                 if let Ok(pid) = std::fs::read_to_string(&pid_path)
@@ -1133,6 +1135,31 @@ sleep 30"#;
                 .status();
         }
         assert!(!alive, "daemonized child {pid} survived command cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(start_paused = true)]
+    async fn command_cleanup_reaps_daemonized_descendants() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sandbox = LocalSandbox::new(workspace.path())
+            .expect("sandbox")
+            .command_timeout(Duration::from_millis(100))
+            .expect("timeout");
+        assert_timeout_reaps_daemonized_descendants(sandbox, SandboxMode::WorkspaceWrite).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(start_paused = true)]
+    async fn protected_full_access_cleanup_reaps_daemonized_descendants() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let protected = tempfile::tempdir().expect("protected");
+        let sandbox = LocalSandbox::new(workspace.path())
+            .expect("sandbox")
+            .deny_read(protected.path())
+            .expect("protected path")
+            .command_timeout(Duration::from_millis(100))
+            .expect("timeout");
+        assert_timeout_reaps_daemonized_descendants(sandbox, SandboxMode::DangerFullAccess).await;
     }
 
     fn local_sandbox(workspace: &Path) -> LocalSandbox {
@@ -1399,7 +1426,7 @@ sleep 30"#;
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn protected_full_access_masks_paths_and_uses_scoped_cleanup() {
+    fn protected_full_access_masks_paths_and_scopes_cleanup() {
         let workspace = tempfile::tempdir().expect("workspace");
         let protected = tempfile::tempdir().expect("protected");
         let sandbox = local_sandbox(workspace.path())
@@ -1421,8 +1448,8 @@ sleep 30"#;
 
         assert!(policy.contains("(allow default)"));
         assert!(policy.contains("(deny file-read* file-write*"));
-        assert!(policy.contains("(deny signal (target others))"));
-        assert!(policy.contains("(deny process-info* (target others))"));
+        assert!(policy.contains("(deny signal (require-not (target same-sandbox)))"));
+        assert!(policy.contains("(deny process-info* (require-not (target same-sandbox)))"));
         assert!(
             arguments
                 .iter()
