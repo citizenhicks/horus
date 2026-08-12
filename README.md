@@ -175,7 +175,10 @@ backend uses Seatbelt on macOS and Bubblewrap on Linux and fails closed when the
 platform sandbox is unavailable. Linux must permit the selected `bwrap` binary
 to create user, PID, and network namespaces; AppArmor-restricted hosts need a
 matching Bubblewrap profile. Filesystem confinement remains active under every
-approval policy.
+approval policy except **Full access**, which grants shell commands host filesystem
+and network access without approval; file tools remain workspace-scoped. Gateway-owned
+state, TLS credentials, and gateway-held provider credentials remain protected in that
+mode.
 
 ## Contributing
 

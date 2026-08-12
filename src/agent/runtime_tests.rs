@@ -2300,6 +2300,10 @@ async fn malformed_automatic_review_durably_asks_without_dropping_network_access
         .expect("recorded approval request");
 
     assert_eq!(
+        pending.sandbox_mode,
+        crate::backend::sandbox::SandboxMode::WorkspaceWrite
+    );
+    assert_eq!(
         pending.network_access,
         crate::backend::sandbox::NetworkAccess::Allowed
     );

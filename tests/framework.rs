@@ -36,6 +36,7 @@ use horus::backend::sandbox::CommandOutputSink;
 use horus::backend::sandbox::NetworkAccess;
 use horus::backend::sandbox::Sandbox;
 use horus::backend::sandbox::SandboxBackend;
+use horus::backend::sandbox::SandboxMode;
 use horus::backend::sandbox::local::LocalSandbox;
 use horus::middleware::Middleware;
 use horus::middleware::MiddlewareStack;
@@ -1220,6 +1221,7 @@ async fn local_sandbox_confines_command_writes_to_the_workspace() {
                 "printf horus > command.txt; printf blocked > ../{}",
                 outside.file_name().expect("outside name").to_string_lossy()
             ),
+            SandboxMode::WorkspaceWrite,
             NetworkAccess::Denied,
             horus::backend::sandbox::CommandMode::Foreground,
             CommandOutputSink::default(),

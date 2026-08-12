@@ -108,6 +108,7 @@ async fn parallel_tool_panic_preserves_call_identity() {
     ));
     let permissions = SandboxPermissions::restore(
         "session",
+        crate::backend::sandbox::SandboxMode::WorkspaceWrite,
         crate::backend::sandbox::NetworkAccess::Denied,
         Vec::new(),
     );
@@ -140,6 +141,7 @@ async fn approval_required_handler_cannot_run_without_exact_call_authority() {
     ));
     let permissions = SandboxPermissions::restore(
         "session",
+        crate::backend::sandbox::SandboxMode::WorkspaceWrite,
         crate::backend::sandbox::NetworkAccess::Allowed,
         ["different-call".into()],
     );
@@ -188,6 +190,7 @@ async fn rejected_patch(content: &str, patch: &str) -> String {
         )),
         permissions: SandboxPermissions::restore(
             "session",
+            crate::backend::sandbox::SandboxMode::WorkspaceWrite,
             crate::backend::sandbox::NetworkAccess::Denied,
             ["patch".into()],
         )
@@ -248,6 +251,7 @@ async fn apply_patch_returns_a_unified_diff_after_writing() {
     ));
     let permissions = SandboxPermissions::restore(
         "session",
+        crate::backend::sandbox::SandboxMode::WorkspaceWrite,
         crate::backend::sandbox::NetworkAccess::Denied,
         ["call-1".into(), "call-2".into()],
     );
@@ -345,6 +349,7 @@ async fn apply_patch_supports_context_headers_and_multiple_changes() {
         )),
         permissions: SandboxPermissions::restore(
             "session",
+            crate::backend::sandbox::SandboxMode::WorkspaceWrite,
             crate::backend::sandbox::NetworkAccess::Denied,
             ["patch".into()],
         )
@@ -478,6 +483,7 @@ async fn apply_patch_cannot_make_a_file_unreadable() {
         sandbox,
         permissions: SandboxPermissions::restore(
             "session",
+            crate::backend::sandbox::SandboxMode::WorkspaceWrite,
             crate::backend::sandbox::NetworkAccess::Denied,
             ["patch".into()],
         )

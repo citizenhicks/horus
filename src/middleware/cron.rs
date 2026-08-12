@@ -187,9 +187,13 @@ mod tests {
             Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
             ApprovalPolicy::Ask,
         ));
-        let permissions =
-            SandboxPermissions::restore("session-a", NetworkAccess::Denied, ["call".into()])
-                .for_call("call");
+        let permissions = SandboxPermissions::restore(
+            "session-a",
+            crate::backend::sandbox::SandboxMode::WorkspaceWrite,
+            NetworkAccess::Denied,
+            ["call".into()],
+        )
+        .for_call("call");
 
         let output = tool
             .call(

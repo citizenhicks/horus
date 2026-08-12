@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use super::{
     CommandMode, CommandOutput, CommandOutputSink, CommandStream, NetworkAccess, SandboxBackend,
+    SandboxMode,
 };
 use crate::{Error, Result};
 
@@ -66,6 +67,7 @@ impl BackgroundCommands {
         owner: &str,
         backend: Arc<dyn SandboxBackend>,
         command: String,
+        sandbox_mode: SandboxMode,
         network_access: NetworkAccess,
     ) -> Result<String> {
         let mut entries = self.entries.lock().map_err(|_| state_error())?;
@@ -89,7 +91,13 @@ impl BackgroundCommands {
         });
         let task = tokio::spawn(async move {
             backend
-                .execute(&command, network_access, CommandMode::Background, sink)
+                .execute(
+                    &command,
+                    sandbox_mode,
+                    network_access,
+                    CommandMode::Background,
+                    sink,
+                )
                 .await
         });
         entries.insert(
@@ -303,6 +311,7 @@ mod tests {
     struct StreamingBackend {
         started: Arc<Notify>,
         release: Arc<Notify>,
+        expected_sandbox_mode: SandboxMode,
     }
 
     impl SandboxBackend for StreamingBackend {
@@ -325,11 +334,13 @@ mod tests {
         fn execute<'a>(
             &'a self,
             _command: &'a str,
+            sandbox_mode: SandboxMode,
             _network_access: NetworkAccess,
             mode: CommandMode,
             output: CommandOutputSink,
         ) -> BoxFuture<'a, Result<CommandOutput>> {
             Box::pin(async move {
+                assert_eq!(sandbox_mode, self.expected_sandbox_mode);
                 assert_eq!(mode, CommandMode::Background);
                 output.write(CommandStream::Stdout, b"first");
                 self.started.notify_one();
@@ -345,7 +356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn polling_is_incremental_owner_scoped_and_consumes_completion() {
+    async fn polling_forwards_mode_and_is_incremental_owner_scoped() {
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let commands = BackgroundCommands::default();
@@ -355,8 +366,10 @@ mod tests {
                 Arc::new(StreamingBackend {
                     started: Arc::clone(&started),
                     release: Arc::clone(&release),
+                    expected_sandbox_mode: SandboxMode::DangerFullAccess,
                 }),
                 "command".into(),
+                SandboxMode::DangerFullAccess,
                 NetworkAccess::Denied,
             )
             .expect("start");
@@ -414,6 +427,7 @@ mod tests {
         fn execute<'a>(
             &'a self,
             _command: &'a str,
+            _sandbox_mode: SandboxMode,
             _network_access: NetworkAccess,
             _mode: CommandMode,
             _output: CommandOutputSink,
@@ -439,6 +453,7 @@ mod tests {
                     cancelled: Arc::clone(&cancelled),
                 }),
                 "command".into(),
+                SandboxMode::WorkspaceWrite,
                 NetworkAccess::Denied,
             )
             .expect("start");
@@ -460,8 +475,10 @@ mod tests {
                 Arc::new(StreamingBackend {
                     started: Arc::clone(&started),
                     release: Arc::clone(&release),
+                    expected_sandbox_mode: SandboxMode::WorkspaceWrite,
                 }),
                 "command".into(),
+                SandboxMode::WorkspaceWrite,
                 NetworkAccess::Denied,
             )
             .expect("start");

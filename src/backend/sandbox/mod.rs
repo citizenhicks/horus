@@ -56,6 +56,11 @@ const APPROVAL_POLICIES: &[MiddlewareSettingChoice] = &[
         label: text::APPROVAL_POLICY_AUTO_APPROVE_LABEL,
         description: text::APPROVAL_POLICY_AUTO_APPROVE_DESCRIPTION,
     },
+    MiddlewareSettingChoice {
+        value: "full_access",
+        label: text::APPROVAL_POLICY_FULL_ACCESS_LABEL,
+        description: text::APPROVAL_POLICY_FULL_ACCESS_DESCRIPTION,
+    },
 ];
 const REVIEWER_STRICTNESS: &[MiddlewareSettingChoice] = &[
     MiddlewareSettingChoice {
@@ -150,6 +155,15 @@ pub enum NetworkAccess {
     Allowed,
 }
 
+/// Whether a command uses workspace isolation or host-wide access.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    #[default]
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
 /// Bounded output from a sandboxed command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
@@ -210,6 +224,7 @@ pub trait SandboxBackend: Send + Sync {
     fn execute<'a>(
         &'a self,
         command: &'a str,
+        sandbox_mode: SandboxMode,
         network_access: NetworkAccess,
         mode: CommandMode,
         output: CommandOutputSink,
@@ -307,6 +322,7 @@ impl Sandbox {
         }
         self.backend.execute(
             command,
+            permissions.sandbox_mode,
             permissions.network_access,
             CommandMode::Foreground,
             CommandOutputSink::default(),
@@ -327,6 +343,7 @@ impl Sandbox {
             &permissions.session_id,
             Arc::clone(&self.backend),
             command,
+            permissions.sandbox_mode,
             permissions.network_access,
         )
     }
@@ -392,6 +409,7 @@ impl Sandbox {
 #[derive(Debug)]
 pub(crate) struct SandboxPermissions {
     session_id: String,
+    sandbox_mode: SandboxMode,
     network_access: NetworkAccess,
     mutation_call_ids: BTreeSet<String>,
 }
@@ -399,11 +417,13 @@ pub(crate) struct SandboxPermissions {
 impl SandboxPermissions {
     fn new(
         session_id: impl Into<String>,
+        sandbox_mode: SandboxMode,
         network_access: NetworkAccess,
         mutation_call_ids: impl IntoIterator<Item = String>,
     ) -> Self {
         Self {
             session_id: session_id.into(),
+            sandbox_mode,
             network_access,
             mutation_call_ids: mutation_call_ids.into_iter().collect(),
         }
@@ -411,10 +431,15 @@ impl SandboxPermissions {
 
     pub(crate) fn restore(
         session_id: impl Into<String>,
+        sandbox_mode: SandboxMode,
         network_access: NetworkAccess,
         mutation_call_ids: impl IntoIterator<Item = String>,
     ) -> Self {
-        Self::new(session_id, network_access, mutation_call_ids)
+        Self::new(session_id, sandbox_mode, network_access, mutation_call_ids)
+    }
+
+    pub(crate) fn sandbox_mode(&self) -> SandboxMode {
+        self.sandbox_mode
     }
 
     pub(crate) fn network_access(&self) -> NetworkAccess {
@@ -428,6 +453,7 @@ impl SandboxPermissions {
     pub(crate) fn for_call(&self, call_id: &str) -> ToolPermissions {
         ToolPermissions {
             session_id: self.session_id.clone(),
+            sandbox_mode: self.sandbox_mode,
             network_access: self.network_access,
             mutation: self.mutation_call_ids.contains(call_id),
         }
@@ -441,6 +467,7 @@ impl SandboxPermissions {
 /// Opaque authority attached to exactly one tool call.
 pub struct ToolPermissions {
     session_id: String,
+    sandbox_mode: SandboxMode,
     network_access: NetworkAccess,
     mutation: bool,
 }
@@ -484,7 +511,12 @@ mod tests {
             Arc::new(LocalSandbox::new(workspace.path()).expect("backend")),
             ApprovalPolicy::Ask,
         );
-        let permissions = SandboxPermissions::new("session", NetworkAccess::Allowed, Vec::new());
+        let permissions = SandboxPermissions::new(
+            "session",
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Allowed,
+            Vec::new(),
+        );
 
         assert!(
             sandbox

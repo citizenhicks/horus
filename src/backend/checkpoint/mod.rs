@@ -11,6 +11,7 @@ use crate::Error;
 use crate::Result;
 use crate::backend::model::ToolCall;
 use crate::backend::sandbox::NetworkAccess;
+use crate::backend::sandbox::SandboxMode;
 use crate::protocol::Event;
 use crate::protocol::MAX_CAPABILITY_INPUT_BYTES;
 use crate::protocol::MessageTarget;
@@ -124,6 +125,7 @@ pub struct PendingApproval {
     pub authorized_call_ids: Vec<String>,
     pub calls: Vec<ToolCall>,
     pub reason: String,
+    pub sandbox_mode: SandboxMode,
     pub network_access: NetworkAccess,
     pub decision_received: bool,
 }

@@ -1,10 +1,11 @@
-//! Gateway sandbox that hides gateway state from approved workspace commands.
+//! Gateway sandbox that hides gateway state from every command mode.
 
 use std::path::Path;
 use std::time::Duration;
 
+use horus::backend::model::provider::{ProviderAuth, providers};
 use horus::backend::sandbox::{
-    CommandMode, CommandOutput, CommandOutputSink, NetworkAccess, SandboxBackend,
+    CommandMode, CommandOutput, CommandOutputSink, NetworkAccess, SandboxBackend, SandboxMode,
     local::LocalSandbox,
 };
 use horus::{BoxFuture, Error, Result};
@@ -25,8 +26,19 @@ const GIT_ARGUMENTS: [&str; 5] = [
     "-c",
     "core.fsmonitor=false",
 ];
+const GATEWAY_CREDENTIAL_ENVIRONMENT: [&str; 3] =
+    ["HORUS_GATEWAY_TOKEN", "TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"];
 
-/// Workspace backend that denies gateway state even to sandboxed shell commands.
+fn provider_credential_environment() -> impl Iterator<Item = &'static str> {
+    providers()
+        .iter()
+        .filter_map(|provider| match provider.auth() {
+            ProviderAuth::ApiKey(environment) => Some(environment),
+            ProviderAuth::Browser(_) => None,
+        })
+}
+
+/// Workspace backend that protects gateway state even from full-access commands.
 pub struct GatewaySandbox {
     delegate: LocalSandbox,
 }
@@ -63,10 +75,16 @@ impl GatewaySandbox {
             "gateway command sandbox supports macOS and Linux only".into(),
         ));
 
-        let delegate = LocalSandbox::new(&root)?
+        let mut delegate = LocalSandbox::new(&root)?
             .command_timeout(timeout)?
             .deny_read(&state_dir)?
             .deny_read(&tls_key)?;
+        for environment in GATEWAY_CREDENTIAL_ENVIRONMENT
+            .into_iter()
+            .chain(provider_credential_environment())
+        {
+            delegate = delegate.deny_environment(environment);
+        }
         Ok(Self { delegate })
     }
 
@@ -118,17 +136,43 @@ impl SandboxBackend for GatewaySandbox {
     fn execute<'a>(
         &'a self,
         script: &'a str,
+        sandbox_mode: SandboxMode,
         network_access: NetworkAccess,
         mode: CommandMode,
         output: CommandOutputSink,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
-        self.delegate.execute(script, network_access, mode, output)
+        self.delegate
+            .execute(script, sandbox_mode, network_access, mode, output)
     }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+
+    #[test]
+    fn every_provider_api_key_environment_is_hidden_from_commands() {
+        assert_eq!(
+            provider_credential_environment().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "ANTHROPIC_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "MOONSHOT_API_KEY",
+                "OPENAI_API_KEY",
+                "OPENROUTER_API_KEY",
+            ])
+        );
+    }
+
+    #[test]
+    fn gateway_bearer_environment_is_hidden_from_commands() {
+        assert_eq!(
+            GATEWAY_CREDENTIAL_ENVIRONMENT,
+            ["HORUS_GATEWAY_TOKEN", "TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"]
+        );
+    }
 
     #[test]
     fn construction_rejects_both_state_workspace_overlap_directions() {
@@ -193,6 +237,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let state = tempfile::tempdir().expect("state");
         let credentials = tempfile::tempdir().expect("credentials");
+        let outside = tempfile::tempdir().expect("outside");
         let tls_key = credentials.path().join("private-key.pem");
         let initialized = std::process::Command::new("git")
             .args(["init", "--quiet"])
@@ -212,21 +257,47 @@ mod tests {
         )
         .expect("gateway sandbox");
 
-        for (label, mode, network_access) in [
-            ("foreground", CommandMode::Foreground, NetworkAccess::Denied),
+        for (label, sandbox_mode, mode, network_access, writes_outside) in [
+            (
+                "foreground",
+                SandboxMode::WorkspaceWrite,
+                CommandMode::Foreground,
+                NetworkAccess::Denied,
+                false,
+            ),
             (
                 "background",
+                SandboxMode::WorkspaceWrite,
                 CommandMode::Background,
                 NetworkAccess::Allowed,
+                false,
+            ),
+            (
+                "full-access",
+                SandboxMode::DangerFullAccess,
+                CommandMode::Foreground,
+                NetworkAccess::Allowed,
+                true,
             ),
         ] {
+            let outside_target = outside.path().join(label);
             let script = format!(
-                "touch .git/{label}; cat {}/sentinel || true; cat {} || true; cat state-link/sentinel || true; cat tls-link || true",
+                "touch .git/{label}; touch {} || true; cat {}/sentinel || true; cat {} || true; cat state-link/sentinel || true; cat tls-link || true; printf changed > {}/sentinel || true; printf changed > {} || true; printf changed > state-link/sentinel || true; printf changed > tls-link || true; kill -0 {} && printf gateway-process-visible || true",
+                outside_target.display(),
                 state.path().display(),
-                tls_key.display()
+                tls_key.display(),
+                state.path().display(),
+                tls_key.display(),
+                std::process::id()
             );
             let output = sandbox
-                .execute(&script, network_access, mode, CommandOutputSink::default())
+                .execute(
+                    &script,
+                    sandbox_mode,
+                    network_access,
+                    mode,
+                    CommandOutputSink::default(),
+                )
                 .await
                 .expect("sandboxed command");
 
@@ -234,6 +305,16 @@ mod tests {
             assert!(workspace.path().join(".git").join(label).is_file());
             assert!(!output.stdout.contains("gateway-secret"));
             assert!(!output.stdout.contains("tls-secret"));
+            assert!(!output.stdout.contains("gateway-process-visible"));
+            assert_eq!(outside_target.is_file(), writes_outside);
+            assert_eq!(
+                std::fs::read_to_string(state.path().join("sentinel")).expect("state sentinel"),
+                "gateway-secret"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&tls_key).expect("TLS key"),
+                "tls-secret"
+            );
         }
     }
 
@@ -266,6 +347,7 @@ mod tests {
         let output = sandbox
             .execute(
                 r#"printf '%s' "$HOME""#,
+                SandboxMode::WorkspaceWrite,
                 NetworkAccess::Denied,
                 CommandMode::Foreground,
                 CommandOutputSink::default(),

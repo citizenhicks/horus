@@ -1,5 +1,6 @@
-//! Workspace-confined local filesystem Adapter.
+//! Local filesystem adapter with policy-selected command isolation.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::Component;
@@ -16,9 +17,10 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use super::NetworkAccess;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::ProcessGroupGuard;
 use super::SandboxBackend;
+use super::SandboxMode;
 use super::{
     CommandMode, CommandOutput, CommandOutputSink, CommandStream, MAX_BINARY_FILE_BYTES,
     MAX_FILE_BYTES,
@@ -53,13 +55,14 @@ const SEATBELT_POLICY_SUFFIX: &str = r#"
   (subpath (param "WRITABLE_ROOT")))
 "#;
 
-/// Restricts file operations to one canonical workspace root.
+/// Provides capability-safe file tools and policy-selected command execution.
 pub struct LocalSandbox {
     root: PathBuf,
     root_dir: Dir,
     temp: tempfile::TempDir,
     command_timeout: Duration,
     denied_reads: Vec<DeniedRead>,
+    denied_environment: BTreeSet<String>,
     isolated_home: bool,
 }
 
@@ -80,6 +83,12 @@ enum Invocation<'a> {
 enum WorkspaceAccess {
     ReadOnly,
     Writable,
+}
+
+#[derive(Clone, Copy)]
+struct CommandIsolation {
+    sandbox_mode: SandboxMode,
+    network_access: NetworkAccess,
 }
 
 impl LocalSandbox {
@@ -110,6 +119,7 @@ impl LocalSandbox {
                 temp,
                 command_timeout: DEFAULT_COMMAND_TIMEOUT,
                 denied_reads: Vec::new(),
+                denied_environment: BTreeSet::new(),
                 isolated_home: false,
             })
         }
@@ -157,6 +167,13 @@ impl LocalSandbox {
         Ok(self)
     }
 
+    /// Removes one inherited environment variable from every command.
+    #[must_use]
+    pub fn deny_environment(mut self, name: impl Into<String>) -> Self {
+        self.denied_environment.insert(name.into());
+        self
+    }
+
     /// Uses a private writable home and excludes host user configuration variables.
     #[must_use]
     pub fn isolated_home(mut self) -> Self {
@@ -177,7 +194,10 @@ impl LocalSandbox {
                 executable: &executable,
                 arguments,
             },
-            NetworkAccess::Denied,
+            CommandIsolation {
+                sandbox_mode: SandboxMode::WorkspaceWrite,
+                network_access: NetworkAccess::Denied,
+            },
             CommandMode::Foreground,
             CommandOutputSink::default(),
             environment,
@@ -221,7 +241,10 @@ impl LocalSandbox {
                 executable: &executable,
                 arguments,
             },
-            NetworkAccess::Denied,
+            CommandIsolation {
+                sandbox_mode: SandboxMode::WorkspaceWrite,
+                network_access: NetworkAccess::Denied,
+            },
             CommandMode::Foreground,
             CommandOutputSink::default(),
             environment,
@@ -320,6 +343,147 @@ impl LocalSandbox {
         Ok(command)
     }
 
+    fn host_command(&self, invocation: &Invocation<'_>) -> Command {
+        match invocation {
+            Invocation::Shell(script) => {
+                let mut command = Command::new("/bin/bash");
+                if self.isolated_home {
+                    command.args(["--noprofile", "--norc", "-c", script]);
+                } else {
+                    command.args(["-lc", script]);
+                }
+                command
+            }
+            Invocation::Argv {
+                executable,
+                arguments,
+            } => {
+                let mut command = Command::new(executable);
+                command.args(arguments.iter().copied());
+                command
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn protected_full_access_command(&self, invocation: &Invocation<'_>) -> Result<Command> {
+        let bwrap = self
+            .find_executable("bwrap")
+            .map_err(|_| Error::Sandbox("bubblewrap (`bwrap`) is required on Linux".into()))?;
+        let mut command = Command::new(bwrap);
+        command.args([
+            "--new-session",
+            "--die-with-parent",
+            "--bind",
+            "/",
+            "/",
+            "--dev-bind",
+            "/dev",
+            "/dev",
+        ]);
+        for denied in &self.denied_reads {
+            if denied.directory {
+                command.arg("--tmpfs").arg(&denied.path);
+            } else {
+                command.arg("--ro-bind").arg("/dev/null").arg(&denied.path);
+            }
+        }
+        command.args([
+            "--unshare-user",
+            "--unshare-pid",
+            "--proc",
+            "/proc",
+            "--chdir",
+        ]);
+        command.arg(&self.root).arg("--");
+        match invocation {
+            Invocation::Shell(script) => {
+                command.arg("/bin/bash");
+                if self.isolated_home {
+                    command.args(["--noprofile", "--norc", "-c", script]);
+                } else {
+                    command.args(["-lc", script]);
+                }
+            }
+            Invocation::Argv {
+                executable,
+                arguments,
+            } => {
+                command.arg(executable).args(arguments.iter().copied());
+            }
+        }
+        Ok(command)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn protected_full_access_command(&self, invocation: &Invocation<'_>) -> Result<Command> {
+        let executable = Path::new("/usr/bin/sandbox-exec");
+        if !executable.is_file() {
+            return Err(Error::Sandbox(
+                "/usr/bin/sandbox-exec is unavailable".into(),
+            ));
+        }
+        let mut policy = String::from(
+            "(version 1)\n(allow default)\n\
+             (deny signal (target others))\n\
+             (deny process-info* (target others))\n\
+             (deny mach-task-name (target others))\n",
+        );
+        for (index, denied) in self.denied_reads.iter().enumerate() {
+            let parameter = format!("DENIED_READ_{index}");
+            policy.push_str(&format!(
+                "\n(deny file-read* file-write*\n  (literal (param \"{parameter}\")){}\n)",
+                if denied.directory {
+                    format!("\n  (subpath (param \"{parameter}\"))")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        let mut command = Command::new(executable);
+        command.arg("-p").arg(policy);
+        for (index, denied) in self.denied_reads.iter().enumerate() {
+            let path = denied
+                .path
+                .to_str()
+                .ok_or_else(|| Error::Sandbox("sandbox path is not UTF-8".into()))?;
+            command.arg(format!("-DDENIED_READ_{index}={path}"));
+        }
+        command.args([
+            "--",
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            MACOS_COMMAND_WRAPPER,
+            "horus-command",
+        ]);
+        match invocation {
+            Invocation::Shell(script) => {
+                command.arg("/bin/bash");
+                if self.isolated_home {
+                    command.args(["--noprofile", "--norc", "-c", script]);
+                } else {
+                    command.args(["-lc", script]);
+                }
+            }
+            Invocation::Argv {
+                executable,
+                arguments,
+            } => {
+                command.arg(executable).args(arguments.iter().copied());
+            }
+        }
+        Ok(command)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn protected_full_access_command(&self, _invocation: &Invocation<'_>) -> Result<Command> {
+        Err(Error::Sandbox(
+            "protected full-access execution requires Linux or macOS".into(),
+        ))
+    }
+
     #[cfg(target_os = "macos")]
     fn sandboxed_command(
         &self,
@@ -416,7 +580,7 @@ impl LocalSandbox {
     async fn execute_invocation(
         &self,
         invocation: Invocation<'_>,
-        network_access: NetworkAccess,
+        isolation: CommandIsolation,
         mode: CommandMode,
         output_sink: CommandOutputSink,
         environment: &[(&str, &str)],
@@ -433,8 +597,15 @@ impl LocalSandbox {
         };
         async {
             validate_root(&self.root, &self.root_dir)?;
-            let mut command =
-                self.sandboxed_command(&invocation, network_access, workspace_access)?;
+            let mut command = match isolation.sandbox_mode {
+                SandboxMode::WorkspaceWrite => {
+                    self.sandboxed_command(&invocation, isolation.network_access, workspace_access)?
+                }
+                SandboxMode::DangerFullAccess if self.denied_reads.is_empty() => {
+                    self.host_command(&invocation)
+                }
+                SandboxMode::DangerFullAccess => self.protected_full_access_command(&invocation)?,
+            };
             command.current_dir(&self.root);
             if self.isolated_home {
                 let inherited = ISOLATED_ENVIRONMENT
@@ -450,25 +621,47 @@ impl LocalSandbox {
                     .env("HOME", command_home(self.temp.path()))
                     .env("SHELL", "/bin/bash");
             }
+            for name in &self.denied_environment {
+                command.env_remove(name);
+            }
+            command.kill_on_drop(true);
             #[cfg(target_os = "macos")]
-            command.stdin(Stdio::piped());
+            let uses_cleanup_lease = isolation.sandbox_mode == SandboxMode::WorkspaceWrite
+                || (isolation.sandbox_mode == SandboxMode::DangerFullAccess
+                    && !self.denied_reads.is_empty());
+            #[cfg(target_os = "linux")]
+            let uses_process_group = true;
+            #[cfg(target_os = "macos")]
+            let uses_process_group = !uses_cleanup_lease;
+            #[cfg(target_os = "macos")]
+            command.stdin(if uses_cleanup_lease {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
             #[cfg(not(target_os = "macos"))]
             command.stdin(Stdio::null());
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
-            #[cfg(target_os = "linux")]
-            command.process_group(0);
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if uses_process_group {
+                command.process_group(0);
+            }
             let mut child = command.spawn()?;
             #[cfg(target_os = "macos")]
-            let cleanup_lease = Some(
-                child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| Error::Sandbox("command cleanup lease unavailable".into()))?,
-            );
+            let cleanup_lease =
+                if uses_cleanup_lease {
+                    Some(child.stdin.take().ok_or_else(|| {
+                        Error::Sandbox("command cleanup lease unavailable".into())
+                    })?)
+                } else {
+                    None
+                };
             #[cfg(not(target_os = "macos"))]
             let cleanup_lease = None::<tokio::process::ChildStdin>;
-            #[cfg(target_os = "linux")]
-            let mut process_group = ProcessGroupGuard::new(&child)?;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let mut process_group = uses_process_group
+                .then(|| ProcessGroupGuard::new(&child))
+                .transpose()?;
             let stdout = child
                 .stdout
                 .take()
@@ -505,17 +698,16 @@ impl LocalSandbox {
                     match tokio::time::timeout(self.command_timeout, execution).await {
                         Ok(output) => output,
                         Err(_) => {
-                            #[cfg(target_os = "linux")]
-                            process_group.kill();
-                            #[cfg(target_os = "macos")]
+                            #[cfg(any(target_os = "linux", target_os = "macos"))]
+                            if let Some(process_group) = &mut process_group {
+                                process_group.kill();
+                            }
                             if tokio::time::timeout(Duration::from_secs(1), child.wait())
                                 .await
                                 .is_err()
                             {
                                 let _ = child.kill().await;
                             }
-                            #[cfg(not(target_os = "macos"))]
-                            let _ = child.kill().await;
                             return Err(Error::Sandbox(format!(
                                 "command exceeded {} seconds",
                                 self.command_timeout.as_secs_f64()
@@ -524,8 +716,10 @@ impl LocalSandbox {
                     }
                 }
             };
-            #[cfg(target_os = "linux")]
-            process_group.kill();
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if let Some(process_group) = &mut process_group {
+                process_group.kill();
+            }
             output
         }
         .await
@@ -583,13 +777,17 @@ impl SandboxBackend for LocalSandbox {
     fn execute<'a>(
         &'a self,
         script: &'a str,
+        sandbox_mode: SandboxMode,
         network_access: NetworkAccess,
         mode: CommandMode,
         output_sink: CommandOutputSink,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
         Box::pin(self.execute_invocation(
             Invocation::Shell(script),
-            network_access,
+            CommandIsolation {
+                sandbox_mode,
+                network_access,
+            },
             mode,
             output_sink,
             &[],
@@ -850,6 +1048,7 @@ mod tests {
         let output = sandbox
             .execute(
                 "sleep 0.05",
+                SandboxMode::WorkspaceWrite,
                 NetworkAccess::Denied,
                 CommandMode::Background,
                 CommandOutputSink::default(),
@@ -879,6 +1078,7 @@ sleep 30"#;
             sandbox
                 .execute(
                     script,
+                    SandboxMode::WorkspaceWrite,
                     NetworkAccess::Denied,
                     CommandMode::Foreground,
                     CommandOutputSink::default(),
@@ -993,6 +1193,7 @@ sleep 30"#;
         let output = sandbox
             .execute(
                 r#"test -d "$HOME" && test -w "$HOME" && printf '%s' "$HOME""#,
+                SandboxMode::WorkspaceWrite,
                 NetworkAccess::Denied,
                 CommandMode::Foreground,
                 CommandOutputSink::default(),
@@ -1020,6 +1221,7 @@ sleep 30"#;
             let output = sandbox
                 .execute(
                     &script,
+                    SandboxMode::WorkspaceWrite,
                     NetworkAccess::Denied,
                     mode,
                     CommandOutputSink::default(),
@@ -1047,6 +1249,7 @@ sleep 30"#;
         let output = sandbox
             .execute(
                 "touch outside/escaped",
+                SandboxMode::WorkspaceWrite,
                 NetworkAccess::Allowed,
                 CommandMode::Foreground,
                 CommandOutputSink::default(),
@@ -1056,6 +1259,175 @@ sleep 30"#;
 
         assert_ne!(output.exit_code, 0);
         assert!(!outside.path().join("escaped").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn full_access_commands_run_outside_the_workspace_sandbox() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("written");
+        let sandbox = local_sandbox(workspace.path());
+
+        let output = sandbox
+            .execute(
+                &format!("touch {}", target.display()),
+                SandboxMode::DangerFullAccess,
+                NetworkAccess::Allowed,
+                CommandMode::Foreground,
+                CommandOutputSink::default(),
+            )
+            .await
+            .expect("full access command");
+
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(target.is_file());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn denied_environment_is_removed_from_full_access_commands() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sandbox = local_sandbox(workspace.path())
+            .isolated_home()
+            .deny_environment("HORUS_TEST_SECRET");
+
+        let output = sandbox
+            .execute_invocation(
+                Invocation::Shell(
+                    r#"printf '%s:%s' "${HORUS_TEST_SECRET-unset}" "$HORUS_TEST_VISIBLE""#,
+                ),
+                CommandIsolation {
+                    sandbox_mode: SandboxMode::DangerFullAccess,
+                    network_access: NetworkAccess::Allowed,
+                },
+                CommandMode::Foreground,
+                CommandOutputSink::default(),
+                &[
+                    ("HORUS_TEST_SECRET", "secret"),
+                    ("HORUS_TEST_VISIBLE", "visible"),
+                ],
+                WorkspaceAccess::Writable,
+            )
+            .await
+            .expect("full access command");
+
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert_eq!(output.stdout, "unset:visible");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(start_paused = true)]
+    async fn full_access_timeout_reaps_process_group_descendants() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sandbox = local_sandbox(workspace.path())
+            .command_timeout(Duration::from_millis(100))
+            .expect("timeout");
+        let execution = tokio::spawn(async move {
+            sandbox
+                .execute(
+                    "sh -c 'echo $$ > child.pid; sleep 30' & sleep 30",
+                    SandboxMode::DangerFullAccess,
+                    NetworkAccess::Allowed,
+                    CommandMode::Foreground,
+                    CommandOutputSink::default(),
+                )
+                .await
+        });
+        let pid_path = workspace.path().join("child.pid");
+        let pid = tokio::task::spawn_blocking(move || {
+            for _ in 0..500 {
+                if let Ok(pid) = std::fs::read_to_string(&pid_path)
+                    .and_then(|pid| pid.trim().parse::<u32>().map_err(std::io::Error::other))
+                {
+                    return Some(pid);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None
+        })
+        .await
+        .expect("child readiness task")
+        .expect("child pid");
+
+        tokio::time::advance(Duration::from_millis(101)).await;
+        let error = execution
+            .await
+            .expect("command task")
+            .expect_err("foreground deadline");
+        assert!(error.to_string().contains("exceeded"));
+        let alive = tokio::task::spawn_blocking(move || {
+            for _ in 0..100 {
+                let alive = std::process::Command::new("/bin/kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if !alive {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            true
+        })
+        .await
+        .expect("child cleanup task");
+        if alive {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        assert!(!alive, "child {pid} survived full-access timeout cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_commands_do_not_embed_the_seatbelt_cleanup_wrapper() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sandbox = local_sandbox(workspace.path());
+        let command = sandbox.host_command(&Invocation::Shell("true"));
+        let command = command.as_std();
+
+        assert_eq!(command.get_program(), "/bin/bash");
+        assert!(
+            command
+                .get_args()
+                .all(|argument| argument != MACOS_COMMAND_WRAPPER)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn protected_full_access_masks_paths_and_uses_scoped_cleanup() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let protected = tempfile::tempdir().expect("protected");
+        let sandbox = local_sandbox(workspace.path())
+            .deny_read(protected.path())
+            .expect("protected path");
+        let command = sandbox
+            .protected_full_access_command(&Invocation::Shell("true"))
+            .expect("protected full access command");
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>();
+        let policy = arguments
+            .iter()
+            .position(|argument| argument == "-p")
+            .and_then(|index| arguments.get(index + 1))
+            .expect("Seatbelt policy");
+
+        assert!(policy.contains("(allow default)"));
+        assert!(policy.contains("(deny file-read* file-write*"));
+        assert!(policy.contains("(deny signal (target others))"));
+        assert!(policy.contains("(deny process-info* (target others))"));
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument.as_ref() == MACOS_COMMAND_WRAPPER)
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

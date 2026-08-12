@@ -245,6 +245,7 @@ impl Runner {
             authorized_call_ids: permissions.mutation_call_ids(),
             calls,
             reason: request.reason,
+            sandbox_mode: permissions.sandbox_mode(),
             network_access: permissions.network_access(),
             decision_received: false,
         };
@@ -298,6 +299,7 @@ impl Runner {
             &decision,
             SandboxPermissions::restore(
                 &self.config.session_id,
+                pending.sandbox_mode,
                 pending.network_access,
                 pending.authorized_call_ids.clone(),
             ),

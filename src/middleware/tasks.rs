@@ -329,8 +329,12 @@ mod tests {
             Arc::new(LocalSandbox::new(temporary.path()).expect("sandbox")),
             ApprovalPolicy::Ask,
         ));
-        let permissions =
-            SandboxPermissions::restore("session-a", NetworkAccess::Denied, Vec::new());
+        let permissions = SandboxPermissions::restore(
+            "session-a",
+            crate::backend::sandbox::SandboxMode::WorkspaceWrite,
+            NetworkAccess::Denied,
+            Vec::new(),
+        );
 
         let result = execute_batch(
             &catalog,

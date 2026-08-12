@@ -87,6 +87,9 @@ the host-side recovery flow for a stopped gateway.
 By default, owner-only state is stored under `~/.horus/gateway`. Set
 `HORUS_GATEWAY_STATE_DIR` or pass `--state-dir` to use another location.
 Provider secrets remain on the gateway and are never returned to clients.
+Full-access shell commands can use the host filesystem and network while file tools
+remain workspace-scoped. Gateway state, TLS credentials, and gateway-held provider
+credentials remain protected from those commands.
 The configured-model catalog and new-chat default live in gateway configuration.
 The first configured model becomes the default. A new chat copies that default,
 then stores its own selected model and runtime recipe beside its durable

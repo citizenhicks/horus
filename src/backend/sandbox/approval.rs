@@ -12,6 +12,7 @@ use uuid::Uuid;
 use super::NetworkAccess;
 use super::SandboxApprovalRequest;
 use super::SandboxAuthorization;
+use super::SandboxMode;
 use super::SandboxPermissions;
 use super::SandboxReview;
 use crate::Error;
@@ -34,7 +35,7 @@ const MAX_SESSION_APPROVALS: usize = 64;
 const MAX_REVIEWER_ROUTE_BYTES: usize = 4 * 1024;
 const MAX_REVIEWER_PROMPT_BYTES: usize = 16 * 1024;
 
-/// Whether approval-required tools pause before sandboxed execution.
+/// How approval-required tools receive execution authority.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalPolicy {
@@ -43,6 +44,7 @@ pub enum ApprovalPolicy {
     AllowNetwork,
     #[default]
     AutoApprove,
+    FullAccess,
 }
 
 impl ApprovalPolicy {
@@ -50,7 +52,17 @@ impl ApprovalPolicy {
         match self {
             Self::Allow => NetworkAccess::Denied,
             // `Ask` cannot reach backend execution until per-call mutation approval is granted.
-            Self::Ask | Self::AllowNetwork | Self::AutoApprove => NetworkAccess::Allowed,
+            Self::Ask | Self::AllowNetwork | Self::AutoApprove | Self::FullAccess => {
+                NetworkAccess::Allowed
+            }
+        }
+    }
+
+    fn sandbox_mode(self) -> SandboxMode {
+        if self == Self::FullAccess {
+            SandboxMode::DangerFullAccess
+        } else {
+            SandboxMode::WorkspaceWrite
         }
     }
 }
@@ -64,6 +76,7 @@ impl FromStr for ApprovalPolicy {
             "allow" => Ok(Self::Allow),
             "allow_network" => Ok(Self::AllowNetwork),
             "auto_approve" => Ok(Self::AutoApprove),
+            "full_access" => Ok(Self::FullAccess),
             _ => Err(Error::Config(format!(
                 "unknown sandbox approval policy `{value}`"
             ))),
@@ -281,7 +294,12 @@ impl Approval {
                 requested.push(call_id.clone());
             }
         }
-        let permissions = SandboxPermissions::new(session_id, policy.network_access(), approved);
+        let permissions = SandboxPermissions::new(
+            session_id,
+            policy.sandbox_mode(),
+            policy.network_access(),
+            approved,
+        );
         if requested.is_empty() {
             return Ok(SandboxAuthorization::Execute(permissions));
         }
@@ -393,6 +411,7 @@ fn widget(policy: ApprovalPolicy) -> FrontendWidget {
             ApprovalPolicy::Allow => "approval ALLOW".into(),
             ApprovalPolicy::AllowNetwork => "approval NETWORK".into(),
             ApprovalPolicy::AutoApprove => "approval AUTO".into(),
+            ApprovalPolicy::FullAccess => "approval FULL".into(),
         },
         tone: if policy == ApprovalPolicy::Ask {
             FrontendTone::Neutral
@@ -431,6 +450,7 @@ mod tests {
             ("allow", ApprovalPolicy::Allow),
             ("allow_network", ApprovalPolicy::AllowNetwork),
             ("auto_approve", ApprovalPolicy::AutoApprove),
+            ("full_access", ApprovalPolicy::FullAccess),
         ] {
             assert_eq!(value.parse::<ApprovalPolicy>().expect("policy"), expected);
         }
@@ -465,6 +485,37 @@ mod tests {
             ApprovalPolicy::AutoApprove.network_access(),
             NetworkAccess::Allowed
         );
+        assert_eq!(
+            ApprovalPolicy::FullAccess.network_access(),
+            NetworkAccess::Allowed
+        );
+        assert_eq!(
+            ApprovalPolicy::FullAccess.sandbox_mode(),
+            SandboxMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn full_access_authorizes_mutations_without_review() {
+        let approval = Approval::new(ApprovalPolicy::FullAccess);
+        approval.initialize("session").expect("initialize");
+        let calls = [ToolCall {
+            call_id: "write".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "a"}),
+        }];
+
+        let SandboxAuthorization::Execute(permissions) = approval
+            .authorize("session", &calls, &["write".into()])
+            .expect("authorization")
+        else {
+            panic!("full access must execute without review");
+        };
+        let permissions = permissions.for_call("write");
+
+        assert_eq!(permissions.sandbox_mode, SandboxMode::DangerFullAccess);
+        assert_eq!(permissions.network_access, NetworkAccess::Allowed);
+        assert!(permissions.mutation);
     }
 
     #[test]
