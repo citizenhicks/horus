@@ -457,9 +457,9 @@ extension TranscriptEntry {
         role == .webSearch
     }
 
-    /// Consecutive events share one visual row. Reasoning, commentary, and the final
-    /// message are the narrative, so they always stand alone; everything that happens
-    /// between them — any role, any capability — joins the run around it.
+    /// Consecutive activity shares one visual row. The user's message, commentary, and the
+    /// final message are the narrative, so they always stand alone; everything that happens
+    /// between them — reasoning included, any role, any capability — joins the run around it.
     static func groupedRows(
         from entries: [TranscriptEntry],
         breakBefore boundaryID: String? = nil
@@ -478,7 +478,7 @@ extension TranscriptEntry {
                 flushActivity()
             }
 
-            if entry.kind == .event || entry.kind == .error {
+            if entry.kind == .event || entry.kind == .error || entry.kind == .reasoning {
                 activity.append(entry)
             } else {
                 flushActivity()
@@ -489,9 +489,10 @@ extension TranscriptEntry {
         return rows
     }
 
-    /// "3 tool calls • 4 web searches • 1 approval • 2 events • 1 error", skipping the
-    /// empty categories.
+    /// "2 thoughts • 3 tool calls • 4 web searches • 1 approval • 2 events • 1 error", skipping
+    /// the empty categories.
     static func summary(for entries: [TranscriptEntry]) -> String {
+        var thoughts = 0
         var tools = 0
         var searches = 0
         var approvals = 0
@@ -501,6 +502,8 @@ extension TranscriptEntry {
         for entry in entries {
             if entry.kind == .error || entry.tone == "error" {
                 errors += 1
+            } else if entry.kind == .reasoning {
+                thoughts += 1
             } else if entry.isWebSearch {
                 searches += 1
             } else if entry.role == .tool {
@@ -514,8 +517,9 @@ extension TranscriptEntry {
             }
         }
         return [
-            (tools, "tool call"), (searches, "web search"), (approvals, "approval"),
-            (artifacts, "artifact"), (events, "event"), (errors, "error")
+            (thoughts, "thought"), (tools, "tool call"), (searches, "web search"),
+            (approvals, "approval"), (artifacts, "artifact"), (events, "event"),
+            (errors, "error")
         ]
         .filter { $0.0 > 0 }
         .map { counted($0.0, $0.1) }

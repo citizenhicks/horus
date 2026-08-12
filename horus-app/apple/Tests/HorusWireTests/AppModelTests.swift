@@ -6709,7 +6709,7 @@ final class TranscriptEventLineTests: XCTestCase {
         )
         XCTAssertEqual(
             rows.map { $0.map(\.id) },
-            [["tool", "event", "search"], ["reasoning"], ["later-tool", "notice"]]
+            [["tool", "event", "search", "reasoning", "later-tool", "notice"]]
         )
 
         XCTAssertEqual(
@@ -6722,8 +6722,8 @@ final class TranscriptEventLineTests: XCTestCase {
     }
 
     func testGroupingKeepsOnlyTheNarrativeAlone() {
-        // Reasoning, commentary, and the final message always stand alone; every event —
-        // approvals, artifacts, notices, untyped — joins the run around them.
+        // The user's message, commentary, and the final message always stand alone; everything
+        // else — reasoning, approvals, artifacts, notices, untyped — joins the run around them.
         let question = entry(id: "question", text: "Do the thing", kind: .user)
         let thinking = entry(id: "thinking", text: "Planning", kind: .reasoning)
         let tool = entry(id: "tool", text: "Read a file", role: .tool)
@@ -6741,16 +6741,15 @@ final class TranscriptEventLineTests: XCTestCase {
             rows.map { $0.map(\.id) },
             [
                 ["question"],
-                ["thinking"],
-                ["tool", "approval", "artifact"],
+                ["thinking", "tool", "approval", "artifact"],
                 ["commentary"],
                 ["notice", "untyped"],
                 ["answer"]
             ]
         )
         XCTAssertEqual(
-            TranscriptEntry.summary(for: [tool, approval, artifact, notice]),
-            "1 tool call • 1 approval • 1 artifact • 1 event"
+            TranscriptEntry.summary(for: [thinking, tool, approval, artifact, notice]),
+            "1 thought • 1 tool call • 1 approval • 1 artifact • 1 event"
         )
     }
 

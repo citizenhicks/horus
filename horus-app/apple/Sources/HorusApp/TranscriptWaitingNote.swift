@@ -11,8 +11,9 @@ enum TranscriptWaitingNote {
     /// How long the gap must last before the note appears. Steps land a few hundred
     /// milliseconds apart in a busy turn, and without this the note strobes between them.
     static let appearAfter: TimeInterval = 0.6
-    /// How long it stays once shown, so the next step arriving does not blink it away.
-    static let minimumVisible: TimeInterval = 1.2
+    /// The crossfade between the note and the activity row that replaces it. Both sides use
+    /// it, and both sit in the same slot at the tail, so the swap happens in place.
+    static let crossfade: TimeInterval = 0.32
 
     /// Present participles, one line each, scientific register played straight. Nothing here
     /// claims the model is doing a thing it cannot do, and nothing reads as an error.

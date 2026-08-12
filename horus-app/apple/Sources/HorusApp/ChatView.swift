@@ -251,7 +251,13 @@ private struct TranscriptRowLayout: Identifiable {
     let topSpacing: CGFloat
 
     var id: String { entries.first?.id ?? "" }
-    var isEventGroup: Bool { entries.count > 1 }
+    /// Activity always rides behind the group summary, even a run of one: the timeline is the
+    /// narrative — the user, the agent's commentary, the answer — and everything else is a
+    /// count you can open.
+    var isEventGroup: Bool {
+        guard let kind = entries.first?.kind else { return false }
+        return kind == .event || kind == .error || kind == .reasoning
+    }
 }
 
 /// The transcript body shared by the full chat and read-only agent previews.
@@ -290,8 +296,12 @@ struct TranscriptRowsView: View {
         // A fast turn lands rows faster than the eye tracks them. One animation on the entry
         // count fades an arriving row in and glides the content above it, and covers a row
         // turning into a group. Streaming deltas leave the count alone, so text still grows
-        // without a per-frame animation fighting the scroll anchor.
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: entries.count)
+        // without a per-frame animation fighting the scroll anchor. The duration is the
+        // waiting note's: the first activity row of a turn replaces it in place.
+        .animation(
+            reduceMotion ? nil : .easeInOut(duration: TranscriptWaitingNote.crossfade),
+            value: entries.count
+        )
     }
 
     private var rows: [TranscriptRowLayout] {
@@ -380,8 +390,7 @@ private struct TranscriptView: View {
                     QueuedMessageView(widget: widget)
                         .padding(.top, rowSpacing)
                 }
-                TranscriptWaitingNoteView()
-                    .padding(.top, rowSpacing)
+                TranscriptWaitingNoteView(topSpacing: rowSpacing)
                 Color.clear.frame(height: max(1, bottomInset))
             }
             .scrollTargetLayout()
@@ -530,6 +539,9 @@ private struct TranscriptRow: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            // Commentary arrives in one short burst between steps; the final message streams
+            // long enough to read as it lands on its own.
+            .horusStreamingReveal(count: entry.text.count, active: entry.kind == .commentary)
         case .reasoning:
             ReasoningLine(entry: entry, isActive: isActive)
         case .event, .error:
@@ -929,7 +941,13 @@ private struct EventGroupView: View {
                 .accessibilityHint(isExpanded ? "Collapses the steps" : "Expands the steps")
                 if isExpanded {
                     VStack(alignment: .leading, spacing: HorusSpace.xxs) {
-                        ForEach(lines) { EventLine(entry: $0, isActive: false) }
+                        ForEach(lines) { entry in
+                            if entry.kind == .reasoning {
+                                ReasoningLine(entry: entry, isActive: false)
+                            } else {
+                                EventLine(entry: entry, isActive: false)
+                            }
+                        }
                     }
                 }
             }
@@ -1033,9 +1051,10 @@ private struct ReasoningLine: View {
 
 /// The waiting note, held at the end of the transcript.
 ///
-/// Appearance is deliberately sticky. Steps land a few hundred milliseconds apart in a busy
-/// turn, so the raw condition flickers several times a second; the note waits before showing
-/// and lingers before hiding, which is the difference between a status line and a strobe.
+/// Appearance is deliberately sticky: steps land a few hundred milliseconds apart in a busy
+/// turn, so the raw condition flickers several times a second and the note waits before
+/// showing, which is the difference between a status line and a strobe. It leaves without a
+/// delay, because what ends the wait is a row arriving in the slot the note is holding.
 private struct TranscriptWaitingNoteView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
@@ -1043,11 +1062,15 @@ private struct TranscriptWaitingNoteView: View {
     @State private var startedAt: Date?
     @State private var hold: Task<Void, Never>?
     @State private var messageOrder = TranscriptWaitingNote.messages
+    /// Owned rather than applied by the transcript: padding outside the condition reserves
+    /// the gap while the note is hidden, and the arriving row then lands 12pt low.
+    let topSpacing: CGFloat
 
     var body: some View {
         Group {
             if let startedAt {
                 note(startedAt: startedAt)
+                    .padding(.top, topSpacing)
             }
         }
         .onChange(of: model.isWaitingForModel, initial: true) { _, waiting in
@@ -1077,7 +1100,9 @@ private struct TranscriptWaitingNoteView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(minHeight: HorusStyle.rowCompact)
+        // The group header's height, so the row that replaces this one lands on the same
+        // baseline and the swap reads as one line changing rather than two rows trading places.
+        .frame(minHeight: HorusStyle.rowRegular)
         .transition(.opacity)
         // One stable label: rotating the joke past VoiceOver every few seconds is noise.
         .accessibilityElement()
@@ -1086,15 +1111,11 @@ private struct TranscriptWaitingNoteView: View {
 
     private func reschedule(_ waiting: Bool) {
         hold?.cancel()
+        let fade = Animation.easeInOut(duration: TranscriptWaitingNote.crossfade)
+        // The step that ends the wait lands in the same slot the note occupies, so the note
+        // leaves on the step's own animation rather than lingering over it.
         guard waiting else {
-            guard let began = startedAt else { return }
-            let remaining = TranscriptWaitingNote.minimumVisible
-                - Date().timeIntervalSince(began)
-            hold = Task {
-                if remaining > 0 { try? await Task.sleep(for: .seconds(remaining)) }
-                guard !Task.isCancelled else { return }
-                withAnimation(.easeOut(duration: 0.2)) { startedAt = nil }
-            }
+            withAnimation(fade) { startedAt = nil }
             return
         }
         guard startedAt == nil else { return }
@@ -1102,7 +1123,7 @@ private struct TranscriptWaitingNoteView: View {
             try? await Task.sleep(for: .seconds(TranscriptWaitingNote.appearAfter))
             guard !Task.isCancelled else { return }
             messageOrder.shuffle()
-            withAnimation(.easeIn(duration: 0.2)) { startedAt = Date() }
+            withAnimation(fade) { startedAt = Date() }
         }
     }
 }

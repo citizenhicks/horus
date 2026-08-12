@@ -332,6 +332,69 @@ struct HorusSpinner: View {
     }
 }
 
+/// Fades arriving text in behind a soft leading edge, a few glyphs wide, so a short burst of
+/// commentary reads as it is written rather than appearing whole.
+private struct HorusRevealRenderer: TextRenderer {
+    /// Glyphs revealed so far, counted from the start of this text.
+    var revealed: Double
+
+    /// Wide enough that the edge lands on words rather than letters.
+    private static let ramp = 8.0
+
+    var animatableData: Double {
+        get { revealed }
+        set { revealed = newValue }
+    }
+
+    func draw(layout: Text.Layout, in context: inout GraphicsContext) {
+        let slices = layout.flatMap { line in line.flatMap { run in run } }
+        guard revealed < Double(slices.count) else {
+            for slice in slices { context.draw(slice) }
+            return
+        }
+        for (index, slice) in slices.enumerated() {
+            let opacity = min(max((revealed - Double(index)) / Self.ramp, 0), 1)
+            guard opacity > 0 else { continue }
+            var copy = context
+            copy.opacity = opacity
+            copy.draw(slice)
+        }
+    }
+}
+
+private struct HorusStreamingReveal: ViewModifier {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let count: Int
+    let active: Bool
+    @State private var revealed = 0.0
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if active {
+            content
+                .textRenderer(HorusRevealRenderer(revealed: revealed))
+                // `initial` settles text that was already there — a restored transcript should
+                // not type itself out. Only growth after that animates.
+                .onChange(of: count, initial: true) { previous, current in
+                    guard !reduceMotion, current > previous else {
+                        revealed = Double(current)
+                        return
+                    }
+                    withAnimation(.linear(duration: 0.3)) { revealed = Double(current) }
+                }
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    /// Fades this text in as it grows, `count` characters long so far.
+    func horusStreamingReveal(count: Int, active: Bool) -> some View {
+        modifier(HorusStreamingReveal(count: count, active: active))
+    }
+}
+
 /// Reveals the already-laid-out title glyph by glyph. Keeping the complete `Text` in the
 /// layout avoids resizing the toolbar and sidebar on every animation frame.
 private struct HorusTitleTypingRenderer: TextRenderer {
