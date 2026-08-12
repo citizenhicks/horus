@@ -257,6 +257,7 @@ private struct TranscriptRowLayout: Identifiable {
 /// The transcript body shared by the full chat and read-only agent previews.
 /// Navigation, pagination, and composing controls stay with their owning surface.
 struct TranscriptRowsView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let entries: [TranscriptEntry]
     var activeStepID: String?
     var breakBefore: String?
@@ -284,7 +285,13 @@ struct TranscriptRowsView: View {
             }
             .id(row.id)
             .padding(.top, row.topSpacing)
+            .transition(.opacity)
         }
+        // A fast turn lands rows faster than the eye tracks them. One animation on the entry
+        // count fades an arriving row in and glides the content above it, and covers a row
+        // turning into a group. Streaming deltas leave the count alone, so text still grows
+        // without a per-frame animation fighting the scroll anchor.
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: entries.count)
     }
 
     private var rows: [TranscriptRowLayout] {
@@ -939,6 +946,9 @@ private struct EventGroupView: View {
                 .font(HorusStyle.metadataFont)
                 .foregroundStyle(palette.muted)
                 .lineLimit(1)
+                // The count climbs every time a step joins the run; morphing the digit reads
+                // as the same line counting up rather than a new line replacing it.
+                .contentTransition(.numericText())
                 // The group is one transcript step, so its summary owns the running mark.
                 .horusRunningShimmer(active: isActive)
             Spacer(minLength: HorusSpace.s)
@@ -1111,31 +1121,32 @@ private struct EventLine: View {
                 Button(action: activate) { line }
                     .buttonStyle(.horusPlain)
                     .accessibilityLabel("\(middlewareLabel), \(headline)")
+                    .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
                     .accessibilityHint(accessibilityHint)
             } else {
                 line
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel("\(middlewareLabel), \(headline)")
             }
-            if isExpanded, !entry.eventDetail.isEmpty {
-                Text(entry.eventDetail)
-                    .font(HorusStyle.metadataFont)
-                    .foregroundStyle(palette.muted)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, HorusSpace.m)
-                    .padding(.vertical, HorusSpace.s)
-                    .background(palette.panel, in: HorusStyle.controlShape)
+            if isExpanded {
+                if entry.format == "unified_diff" {
+                    InlineUnifiedDiffView(source: entry.text)
+                } else if !entry.eventDetail.isEmpty {
+                    Text(entry.eventDetail)
+                        .font(HorusStyle.metadataFont)
+                        .foregroundStyle(palette.muted)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, HorusSpace.m)
+                        .padding(.vertical, HorusSpace.s)
+                        .background(palette.panel, in: HorusStyle.controlShape)
+                }
             }
         }
     }
 
     private func activate() {
-        if entry.format == "unified_diff" {
-            model.showFiles(.unstaged)
-        } else {
-            withAnimation(.easeOut(duration: 0.16)) { isExpanded.toggle() }
-        }
+        withAnimation(.easeOut(duration: 0.16)) { isExpanded.toggle() }
     }
 
     private var line: some View {
@@ -1156,7 +1167,9 @@ private struct EventLine: View {
             // No spinner: the shimmer already says this step is running, and two marks for
             // one fact left the trailing slot flickering between them as steps completed.
             if entry.format == "unified_diff" {
-                HorusIcon(.arrowUpRight01, size: HorusStyle.glyphMark, foreground: palette.muted)
+                HorusIcon(.caretRight, size: HorusStyle.glyphMark, foreground: palette.muted)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    .animation(.snappy(duration: 0.18), value: isExpanded)
             } else if !entry.eventDetail.isEmpty {
                 HorusIcon(.caretUpDown, size: HorusStyle.glyphMark, foreground: palette.muted)
             }
@@ -1203,7 +1216,9 @@ private struct EventLine: View {
     }
 
     private var accessibilityHint: String {
-        if entry.format == "unified_diff" { return "Opens modified files" }
+        if entry.format == "unified_diff" {
+            return isExpanded ? "Collapses code changes" : "Shows code changes"
+        }
         return isExpanded ? "Collapses details" : "Expands details"
     }
 }
@@ -1661,7 +1676,11 @@ struct BadgePopover<Content: View>: View {
         VStack(alignment: .leading, spacing: HorusSpace.m) {
             Text(title)
                 .font(HorusStyle.controlFont.weight(.semibold))
-            content
+            // A full list (every subagent, every file) would otherwise grow the popover
+            // past the screen with no way to reach the bottom.
+            ScrollView { content }
+                .frame(maxHeight: HorusStyle.rowTouch * 8)
+                .scrollBounceBehavior(.basedOnSize)
         }
         .padding(HorusSpace.l)
         .frame(minWidth: 220, alignment: .leading)
@@ -2199,17 +2218,24 @@ private struct FrontendPickerView: View {
                     .accessibilityLabel("Dismiss \(picker.title)")
                     .help("Dismiss")
                 }
-                ForEach(picker.options) { option in
-                    Button { model.submitPickerOption(option) } label: {
-                        FrontendPickerOptionLabel(option: option)
+                // A full agent list must scroll instead of growing the card off screen.
+                ScrollView {
+                    VStack(alignment: .leading, spacing: HorusSpace.m) {
+                        ForEach(picker.options) { option in
+                            Button { model.submitPickerOption(option) } label: {
+                                FrontendPickerOptionLabel(option: option)
+                            }
+                            .buttonStyle(.horusPlain)
+                            .accessibilityLabel(option.label)
+                            .accessibilityValue(option.showsDetail ? option.detail : option.description)
+                            .accessibilityHint(
+                                option.showsDetail ? option.description : "Activates this option"
+                            )
+                        }
                     }
-                    .buttonStyle(.horusPlain)
-                    .accessibilityLabel(option.label)
-                    .accessibilityValue(option.showsDetail ? option.detail : option.description)
-                    .accessibilityHint(
-                        option.showsDetail ? option.description : "Activates this option"
-                    )
                 }
+                .frame(maxHeight: HorusStyle.rowTouch * 8)
+                .scrollBounceBehavior(.basedOnSize)
             }
         }
     }

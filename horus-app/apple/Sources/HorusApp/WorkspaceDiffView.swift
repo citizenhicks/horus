@@ -53,8 +53,99 @@ struct WorkspaceDiffView: View {
     }
 }
 
-private struct UnifiedDiffView: View {
+struct InlineUnifiedDiffView: View {
     @Environment(\.horusPalette) private var palette
+    let source: String
+    @State private var document: UnifiedDiffDocument?
+    @State private var expandedFileIDs: Set<Int> = []
+
+    var body: some View {
+        content
+            .task(id: source) {
+                document = nil
+                expandedFileIDs.removeAll()
+                guard !source.isEmpty else { return }
+
+                let parseTask = Task.detached(priority: .userInitiated) {
+                    UnifiedDiffDocument(source)
+                }
+                let parsed = await withTaskCancellationHandler {
+                    await parseTask.value
+                } onCancel: {
+                    parseTask.cancel()
+                }
+                guard !Task.isCancelled else { return }
+                expandedFileIDs = Set(parsed.files.map(\.id))
+                document = parsed
+            }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if source.isEmpty {
+            EmptyView()
+        } else if let document {
+            if document.files.isEmpty {
+                Text(source)
+                    .font(HorusStyle.metadataFont.monospaced())
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(HorusSpace.m)
+                    .background(palette.panel, in: HorusStyle.tileShape)
+            } else {
+                VStack(alignment: .leading, spacing: HorusSpace.s) {
+                    ForEach(document.files) { file in
+                        VStack(spacing: 0) {
+                            DiffFileHeader(
+                                file: file,
+                                isExpanded: expandedFileIDs.contains(file.id),
+                                toggle: { toggle(file.id) }
+                            )
+                            if expandedFileIDs.contains(file.id) {
+                                ForEach(file.rows) { row in
+                                    DiffRowView(row: row)
+                                }
+                            }
+                        }
+                        .background(palette.panel, in: HorusStyle.tileShape)
+                        .clipShape(HorusStyle.tileShape)
+                    }
+
+                    if document.isTruncated {
+                        DiffTruncationWarning()
+                            .padding(.horizontal, HorusSpace.m)
+                            .padding(.vertical, HorusSpace.s)
+                    }
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel(
+                    "Code diff, \(document.files.count) files, "
+                        + "\(document.added) additions and \(document.removed) removals"
+                )
+            }
+        } else {
+            HStack(spacing: HorusSpace.s) {
+                ProgressView().controlSize(.small)
+                Text("Preparing code change")
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(palette.muted)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(HorusSpace.m)
+            .background(palette.panel, in: HorusStyle.tileShape)
+        }
+    }
+
+    private func toggle(_ id: Int) {
+        if expandedFileIDs.contains(id) {
+            expandedFileIDs.remove(id)
+        } else {
+            expandedFileIDs.insert(id)
+        }
+    }
+}
+
+private struct UnifiedDiffView: View {
     let document: UnifiedDiffDocument
     @Binding var expandedFileIDs: Set<Int>
 
@@ -77,13 +168,8 @@ private struct UnifiedDiffView: View {
             }
 
             if document.isTruncated {
-                HStack(spacing: HorusSpace.s) {
-                    HorusIcon(.warning, size: HorusStyle.glyphInline, foreground: palette.warning)
-                    Text("Diff truncated at the safe transfer limit")
-                        .font(HorusStyle.metadataFont)
-                        .foregroundStyle(palette.muted)
-                }
-                .diffListRow(topPadding: 8, bottomPadding: 12)
+                DiffTruncationWarning()
+                    .diffListRow(topPadding: 8, bottomPadding: 12)
             }
         }
         .environment(\.defaultMinListRowHeight, 0)
@@ -102,6 +188,19 @@ private struct UnifiedDiffView: View {
             expandedFileIDs.remove(id)
         } else {
             expandedFileIDs.insert(id)
+        }
+    }
+}
+
+private struct DiffTruncationWarning: View {
+    @Environment(\.horusPalette) private var palette
+
+    var body: some View {
+        HStack(spacing: HorusSpace.s) {
+            HorusIcon(.warning, size: HorusStyle.glyphInline, foreground: palette.warning)
+            Text("Diff truncated at the safe transfer limit")
+                .font(HorusStyle.metadataFont)
+                .foregroundStyle(palette.muted)
         }
     }
 }

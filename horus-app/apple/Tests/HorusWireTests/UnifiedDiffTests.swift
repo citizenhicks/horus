@@ -88,6 +88,27 @@ final class UnifiedDiffTests: XCTestCase {
         XCTAssertEqual(document.files[1].rows.last?.text, "after")
     }
 
+    func testParsesStandaloneToolPatchWithoutGitHeader() throws {
+        let document = UnifiedDiffDocument(
+            """
+            --- note.txt
+            +++ note.txt
+            @@ -1,3 +1,3 @@
+             first
+            -old
+            +new
+             last
+            """
+        )
+
+        let file = try XCTUnwrap(document.files.first)
+        XCTAssertEqual(document.files.count, 1)
+        XCTAssertEqual(file.path, "note.txt")
+        XCTAssertEqual(file.added, 1)
+        XCTAssertEqual(file.removed, 1)
+        XCTAssertEqual(file.rows.map(\.text), ["@@ -1,3 +1,3 @@", "first", "old", "new", "last"])
+    }
+
     func testBoundsOneMinifiedLineBeforeRendering() throws {
         let source = """
         diff --git a/data.json b/data.json

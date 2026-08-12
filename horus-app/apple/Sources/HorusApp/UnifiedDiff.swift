@@ -120,6 +120,10 @@ private struct UnifiedDiffParser {
             nextRowID = 0
             return
         }
+        if file == nil, raw.hasPrefix("--- ") {
+            file = PendingDiffFile(fallbackPath: nil)
+            nextRowID = 0
+        }
         guard file != nil else { return }
         if raw.hasPrefix("@@") {
             flushHunk()

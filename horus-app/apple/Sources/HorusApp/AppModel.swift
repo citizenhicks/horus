@@ -457,8 +457,9 @@ extension TranscriptEntry {
         role == .webSearch
     }
 
-    /// Consecutive framework activity shares one visual row. Capability and protocol group
-    /// still describe each entry, but neither interrupts a continuous sequence for the reader.
+    /// Consecutive events share one visual row. Reasoning, commentary, and the final
+    /// message are the narrative, so they always stand alone; everything that happens
+    /// between them — any role, any capability — joins the run around it.
     static func groupedRows(
         from entries: [TranscriptEntry],
         breakBefore boundaryID: String? = nil
@@ -477,11 +478,7 @@ extension TranscriptEntry {
                 flushActivity()
             }
 
-            let hasActivityRole = switch entry.role {
-            case .activity, .tool, .webSearch: true
-            case .artifact, .approval, .notice, nil: false
-            }
-            if (entry.kind == .event || entry.kind == .error) && hasActivityRole {
+            if entry.kind == .event || entry.kind == .error {
                 activity.append(entry)
             } else {
                 flushActivity()
@@ -492,10 +489,13 @@ extension TranscriptEntry {
         return rows
     }
 
-    /// "3 tool calls • 4 web searches • 2 events • 1 error", skipping the empty categories.
+    /// "3 tool calls • 4 web searches • 1 approval • 2 events • 1 error", skipping the
+    /// empty categories.
     static func summary(for entries: [TranscriptEntry]) -> String {
         var tools = 0
         var searches = 0
+        var approvals = 0
+        var artifacts = 0
         var events = 0
         var errors = 0
         for entry in entries {
@@ -505,14 +505,21 @@ extension TranscriptEntry {
                 searches += 1
             } else if entry.role == .tool {
                 tools += 1
+            } else if entry.role == .approval {
+                approvals += 1
+            } else if entry.role == .artifact {
+                artifacts += 1
             } else {
                 events += 1
             }
         }
-        return [(tools, "tool call"), (searches, "web search"), (events, "event"), (errors, "error")]
-            .filter { $0.0 > 0 }
-            .map { counted($0.0, $0.1) }
-            .joined(separator: " • ")
+        return [
+            (tools, "tool call"), (searches, "web search"), (approvals, "approval"),
+            (artifacts, "artifact"), (events, "event"), (errors, "error")
+        ]
+        .filter { $0.0 > 0 }
+        .map { counted($0.0, $0.1) }
+        .joined(separator: " • ")
     }
 
     private static func counted(_ count: Int, _ noun: String) -> String {
@@ -1047,7 +1054,6 @@ final class AppModel {
         attachmentsEnabled
             && connectionState.isReady
             && selectedSessionID != nil
-            && activeTurnID == nil
             && pendingWidgetEdit == nil
     }
 

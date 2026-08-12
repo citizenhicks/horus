@@ -34,6 +34,7 @@ struct ComposerOptionsView: View {
     @State private var isFileImporterPresented = false
     @State private var isPhotoPickerPresented = false
     @State private var photoSelection: [PhotosPickerItem] = []
+    @State private var isFullAccessConfirmationPresented = false
 
     var body: some View {
         // The icon buttons already pad their own glyphs, so they need no spacing between
@@ -63,6 +64,23 @@ struct ComposerOptionsView: View {
             photoSelection = []
             Task { await importPhotos(items) }
         }
+        .confirmationDialog(
+            "Enable full access?",
+            isPresented: $isFullAccessConfirmationPresented,
+            titleVisibility: .visible
+        ) {
+            Button("Enable Full Access", role: .destructive) {
+                model.setApprovalPolicyForCurrentChat("full_access")
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "Shell commands can read, modify, or delete files available to the gateway "
+                    + "account and use the network without approval. File tools remain limited "
+                    + "to the workspace. Horus gateway state, TLS credentials, and provider "
+                    + "credentials remain protected."
+            )
+        }
     }
 
     /// The photo library and the file browser are separate pickers, so the plus offers both
@@ -80,6 +98,9 @@ struct ComposerOptionsView: View {
             HorusLabel(
                 title: "Add attachment",
                 glyph: .plus,
+                // A plain menu label gets no disabled treatment, so mute the glyph whenever
+                // connection or composer state makes importing unavailable.
+                iconColor: model.canImportAttachments ? nil : palette.muted,
                 iconSize: HorusStyle.glyphLead
             )
                 .labelStyle(.iconOnly)
@@ -115,7 +136,7 @@ struct ComposerOptionsView: View {
         Menu {
             Picker("Approval policy", selection: approvalPickerSelection) {
                 ForEach(approvalOptions) { option in
-                    Text(option.label).tag(option.value)
+                    approvalOptionLabel(option).tag(option.value)
                 }
             }
             .labelsHidden()
@@ -310,12 +331,26 @@ struct ComposerOptionsView: View {
         Binding {
             approvalValue ?? ""
         } set: { policy in
-            model.setApprovalPolicyForCurrentChat(policy)
+            if policy == "full_access", approvalValue != "full_access" {
+                isFullAccessConfirmationPresented = true
+            } else {
+                model.setApprovalPolicyForCurrentChat(policy)
+            }
         }
     }
 
     private var approvalLabel: String {
         approvalOptions.first(where: { $0.value == approvalValue })?.label ?? "Approval"
+    }
+
+    @ViewBuilder
+    private func approvalOptionLabel(_ option: FrontendSettingOption) -> some View {
+        if option.value == "full_access" {
+            HorusLabel(title: option.label, glyph: .shieldOff, iconColor: palette.danger)
+                .foregroundStyle(palette.danger)
+        } else {
+            Text(option.label)
+        }
     }
 
     private var approvalGlyph: HorusGlyph {
@@ -324,13 +359,18 @@ struct ComposerOptionsView: View {
         case "allow": .shield02
         case "allow_network": .shieldAlert
         case "auto_approve": .aiSecurity02
+        case "full_access": .shieldOff
         default: .shieldCheck
         }
     }
 
     private var approvalForeground: Color {
         guard let approvalValue else { return palette.muted }
-        return approvalValue == "ask" ? palette.muted : palette.warning
+        switch approvalValue {
+        case "ask": palette.muted
+        case "full_access": palette.danger
+        default: palette.warning
+        }
     }
 
     private var modelLabel: String {

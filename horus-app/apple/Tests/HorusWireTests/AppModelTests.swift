@@ -1903,6 +1903,39 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.composer, "Do not lose this")
     }
 
+    func testAttachmentsCanBeImportedWhileATurnIsActive() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.contributions = [fileAttachmentContribution()]
+        model.activeTurnID = "turn-1"
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("during-turn.txt")
+        try Data("queued while running".utf8).write(to: fileURL)
+
+        XCTAssertTrue(model.canImportAttachments)
+        let requestCount = await recorder.requestCount()
+        await model.importAttachments([fileURL])
+
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            if case .beginSessionFileUpload = request { return true }
+            return false
+        }
+        guard case .beginSessionFileUpload(_, let sessionID, let name, let size, _) = try XCTUnwrap(
+            request
+        ) else { return XCTFail("Expected an attachment upload during the active turn") }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(name, "during-turn.txt")
+        XCTAssertEqual(size, 20)
+    }
+
     func testSwitchingGatewaysClearsGatewayScopedStateBeforeTokenLookup() throws {
         let suiteName = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -2654,20 +2687,28 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(target)
     }
 
-    func testUnifiedDiffRefreshesGatewayChanges() async throws {
+    func testUnifiedDiffPreservesInlinePatchAndRefreshesGatewayChanges() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
             await recorder.record(request)
         })
         model.selectedSessionID = "chat-1"
         model.connectionState = .ready
+        let patch = """
+        --- note.txt
+        +++ note.txt
+        @@ -1 +1 @@
+        -old
+        +new
+        """
 
         let requestCount = await recorder.requestCount()
         model.reduce(
             event: renderEvent(
                 capability: "reviewer",
-                text: "@@ -1 +1 @@",
-                format: "unified_diff"
+                text: patch,
+                format: "unified_diff",
+                tone: "success"
             ),
             blocks: [],
             preview: nil
@@ -2677,6 +2718,10 @@ final class AppModelTests: XCTestCase {
             return true
         }
         XCTAssertNotNil(refresh)
+        let entry = try XCTUnwrap(model.transcript.last)
+        XCTAssertEqual(entry.text, patch)
+        XCTAssertEqual(entry.format, "unified_diff")
+        XCTAssertEqual(entry.tone, "success")
     }
 
     func testDuplicateSessionIdentifiersAreRejectedWithoutReplacingTheCatalog() throws {
@@ -4388,6 +4433,34 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(
             config.middleware.settings["sandbox"]?["approval_policy"],
             .string("allow_network")
+        )
+    }
+
+    func testFullAccessPolicyConfiguresTheActiveChatThroughMiddleware() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        var active = composition()
+        active.middleware.setSetting(
+            .string("ask"),
+            middleware: "sandbox",
+            setting: "approval_policy"
+        )
+        model.selectedSessionID = "chat-1"
+        model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
+        model.agentDraft = active
+
+        model.setApprovalPolicyForCurrentChat("full_access")
+        try await Task.sleep(for: .milliseconds(20))
+
+        let requests = await recorder.requests()
+        let request = try XCTUnwrap(requests.first)
+        guard case .configureSession(_, _, let expectedRevision, let config) = request else {
+            return XCTFail("Expected approval policy to configure the active chat")
+        }
+        XCTAssertEqual(expectedRevision, 3)
+        XCTAssertEqual(
+            config.middleware.settings["sandbox"]?["approval_policy"],
+            .string("full_access")
         )
     }
 
@@ -6636,7 +6709,7 @@ final class TranscriptEventLineTests: XCTestCase {
         )
         XCTAssertEqual(
             rows.map { $0.map(\.id) },
-            [["tool", "event", "search"], ["reasoning"], ["later-tool"], ["notice"]]
+            [["tool", "event", "search"], ["reasoning"], ["later-tool", "notice"]]
         )
 
         XCTAssertEqual(
@@ -6645,6 +6718,39 @@ final class TranscriptEventLineTests: XCTestCase {
                 breakBefore: event.id
             ).map { $0.map(\.id) },
             [["tool"], ["event"]]
+        )
+    }
+
+    func testGroupingKeepsOnlyTheNarrativeAlone() {
+        // Reasoning, commentary, and the final message always stand alone; every event —
+        // approvals, artifacts, notices, untyped — joins the run around them.
+        let question = entry(id: "question", text: "Do the thing", kind: .user)
+        let thinking = entry(id: "thinking", text: "Planning", kind: .reasoning)
+        let tool = entry(id: "tool", text: "Read a file", role: .tool)
+        let approval = entry(id: "approval", text: "AI approved", role: .approval)
+        let artifact = entry(id: "artifact", text: "Wrote a file", role: .artifact)
+        let commentary = entry(id: "commentary", text: "Halfway there", kind: .commentary)
+        let notice = entry(id: "notice", text: "Context low", role: .notice)
+        let untyped = entry(id: "untyped", text: "Something happened")
+        let answer = entry(id: "answer", text: "Done", kind: .assistant)
+
+        let rows = TranscriptEntry.groupedRows(
+            from: [question, thinking, tool, approval, artifact, commentary, notice, untyped, answer]
+        )
+        XCTAssertEqual(
+            rows.map { $0.map(\.id) },
+            [
+                ["question"],
+                ["thinking"],
+                ["tool", "approval", "artifact"],
+                ["commentary"],
+                ["notice", "untyped"],
+                ["answer"]
+            ]
+        )
+        XCTAssertEqual(
+            TranscriptEntry.summary(for: [tool, approval, artifact, notice]),
+            "1 tool call • 1 approval • 1 artifact • 1 event"
         )
     }
 

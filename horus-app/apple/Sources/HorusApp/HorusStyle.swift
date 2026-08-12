@@ -160,6 +160,7 @@ struct HorusGlyph: Hashable {
     static let shield02 = Self("hi.shield02")
     static let shieldAlert = Self("hi.shieldAlert")
     static let shieldCheck = Self("hi.shieldCheck")
+    static let shieldOff = Self("hi.shieldOff")
     static let sidebarSimple = Self("hi.sidebarSimple")
     static let signIn = Self("hi.signIn")
     static let slidersHorizontal = Self("hi.slidersHorizontal")
