@@ -332,15 +332,12 @@ impl ModelContext<'_> {
     }
 
     /// Appends durable input to model context and its transcript journal.
-    pub fn push_input(&mut self, item: Value) -> MessageTarget {
+    pub fn push_input(&mut self, item: Value) -> Result<MessageTarget> {
         self.request_input.push(item.clone());
         self.durable_input.push(item.clone());
         self.transcript_delta.push(item);
         *self.checkpoint_changed = true;
-        MessageTarget {
-            checkpoint_sequence: self.checkpoint_sequence + 1,
-            batch_item_count: self.transcript_delta.len(),
-        }
+        provisional_message_target(self.checkpoint_sequence, self.transcript_delta.len())
     }
 
     /// Estimates serialized model input at four bytes per token.
@@ -352,6 +349,18 @@ impl ModelContext<'_> {
         }
         i64::try_from(approximate_tokens(bytes.0)).unwrap_or(i64::MAX)
     }
+}
+
+fn provisional_message_target(
+    checkpoint_sequence: u64,
+    batch_item_count: usize,
+) -> Result<MessageTarget> {
+    Ok(MessageTarget {
+        checkpoint_sequence: checkpoint_sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Checkpoint("checkpoint sequence overflow".into()))?,
+        batch_item_count,
+    })
 }
 
 #[derive(Default)]
@@ -1451,6 +1460,14 @@ mod tests {
         };
 
         assert!(validate_frontend(&[contribution]).is_err());
+    }
+
+    #[test]
+    fn provisional_message_target_rejects_sequence_overflow() {
+        assert!(matches!(
+            provisional_message_target(u64::MAX, 1),
+            Err(Error::Checkpoint(message)) if message == "checkpoint sequence overflow"
+        ));
     }
 
     struct Observer(&'static str, Arc<Mutex<Vec<&'static str>>>);

@@ -38,6 +38,30 @@ use crate::protocol::TurnAbortedEvent;
 use crate::protocol::UserMessageEvent;
 use crate::protocol::replay_events;
 
+fn drain_pending_input(
+    state: &mut Checkpoint,
+    recovery_delta: &mut Vec<serde_json::Value>,
+    recovery_events: &mut Vec<Event>,
+) {
+    for message in std::mem::take(&mut state.pending_input) {
+        let message = message.into_text();
+        let item = user_message(&message);
+        state.context.push(item.clone());
+        recovery_delta.push(item);
+        recovery_events.push(Event {
+            submission_id: state
+                .active_execution
+                .as_ref()
+                .map(|execution| execution.submission_id.clone()),
+            msg: EventMsg::UserMessage(UserMessageEvent {
+                message,
+                attachments: Vec::new(),
+                message_target: None,
+            }),
+        });
+    }
+}
+
 /// Validates capabilities, restores a checkpoint, and starts the agent loop.
 pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
     if config.context_window <= 0 {
@@ -222,23 +246,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
                 }),
             });
         }
-        for message in std::mem::take(&mut state.pending_input) {
-            let message = message.into_text();
-            let item = user_message(&message);
-            state.context.push(item.clone());
-            recovery_delta.push(item);
-            recovery_events.push(Event {
-                submission_id: state
-                    .active_execution
-                    .as_ref()
-                    .map(|execution| execution.submission_id.clone()),
-                msg: EventMsg::UserMessage(UserMessageEvent {
-                    message,
-                    attachments: Vec::new(),
-                    message_target: None,
-                }),
-            });
-        }
+        drain_pending_input(&mut state, &mut recovery_delta, &mut recovery_events);
         state.pending_approval = None;
         let active = state
             .active_execution
@@ -256,23 +264,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             Some(state.finish_execution(ExecutionOutcome::Aborted, unix_timestamp_ms()?)?);
         state_changed = true;
     } else if state.pending_approval.is_none() && state.active_execution.is_some() {
-        for message in std::mem::take(&mut state.pending_input) {
-            let message = message.into_text();
-            let item = user_message(&message);
-            state.context.push(item.clone());
-            recovery_delta.push(item);
-            recovery_events.push(Event {
-                submission_id: state
-                    .active_execution
-                    .as_ref()
-                    .map(|execution| execution.submission_id.clone()),
-                msg: EventMsg::UserMessage(UserMessageEvent {
-                    message,
-                    attachments: Vec::new(),
-                    message_target: None,
-                }),
-            });
-        }
+        drain_pending_input(&mut state, &mut recovery_delta, &mut recovery_events);
         recovery_execution =
             Some(state.finish_execution(ExecutionOutcome::Aborted, unix_timestamp_ms()?)?);
         state_changed = true;
@@ -288,7 +280,10 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
     }
     if is_new || state_changed {
         if !is_new {
-            state.sequence += 1;
+            state.sequence = state
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| Error::Checkpoint("checkpoint sequence overflow".into()))?;
         }
         let mut startup_events = vec![session_event];
         startup_events.append(&mut recovery_events);

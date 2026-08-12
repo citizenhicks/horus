@@ -702,7 +702,7 @@ impl Middleware for Subagents {
                 *context.checkpoint_changed = true;
             }
             for mail in mail {
-                context.push_input(internal_user_message(&mail.internal_kind(), &mail.render()));
+                context.push_input(internal_user_message(&mail.internal_kind(), &mail.render()))?;
             }
             Ok(())
         })

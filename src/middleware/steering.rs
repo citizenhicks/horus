@@ -218,7 +218,7 @@ impl Middleware for Steering {
             for message in queued {
                 let message = message.into_text();
                 let item = user_message(&message);
-                let message_target = context.push_input(item);
+                let message_target = context.push_input(item)?;
                 context.events.push(EventMsg::UserMessage(UserMessageEvent {
                     message,
                     attachments: Vec::new(),

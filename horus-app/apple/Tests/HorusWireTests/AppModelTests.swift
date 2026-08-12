@@ -897,6 +897,26 @@ final class AppModelTests: XCTestCase {
             files: []
         ))]))
         model.reduce(record: recorded(3, .object([
+            "type": .string("web_search_end"),
+            "sessionId": .string("chat-1"),
+            "turnId": .string("turn-1"),
+            "modelStepId": .string("step-1"),
+            "callId": .string("search-1"),
+            "action": .object(["type": .string("interrupted")]),
+        ]), blocks: [RenderedBlock(capability: "web_search", block: FrontendBlock(
+            id: "step-1/search-1",
+            group: "turn-1",
+            update: .replace,
+            state: .complete,
+            role: .webSearch,
+            title: "Web search interrupted",
+            text: "",
+            symbol: "search",
+            format: "plain_text",
+            tone: "warning",
+            files: []
+        ))]))
+        model.reduce(record: recorded(4, .object([
             "type": .string("model_step_completed"),
             "sessionId": .string("chat-1"),
             "turnId": .string("turn-1"),
@@ -4678,10 +4698,12 @@ final class AppModelTests: XCTestCase {
             let historyID,
             "chat-1",
             40,
-            300
+            let pageSize
         ) = try XCTUnwrap(historyRequest) else {
             return XCTFail("Expected paged history request")
         }
+        // The gateway rejects pages outside 1...100 events.
+        XCTAssertTrue((1...100).contains(pageSize))
 
         let events = [
             RenderedEventRecord(event: .object([

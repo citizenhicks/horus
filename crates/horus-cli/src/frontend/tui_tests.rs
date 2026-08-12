@@ -1196,7 +1196,10 @@ fn completed_model_step_is_authoritative_for_replay_and_summary_events() {
 
 #[test]
 fn retrying_model_step_closes_pending_search_and_marks_the_reconnect() {
-    use horus::protocol::{ModelStepCompletedEvent, ModelStepOutcome, WebSearchBeginEvent};
+    use horus::protocol::{
+        ModelStepCompletedEvent, ModelStepOutcome, WebSearchAction, WebSearchBeginEvent,
+        WebSearchEndEvent,
+    };
 
     let mut state = state();
     let search = EventMsg::WebSearchBegin(WebSearchBeginEvent {
@@ -1216,6 +1219,16 @@ fn retrying_model_step_closes_pending_search_and_marks_the_reconnect() {
         Vec::new(),
     );
     state.handle_agent_event(search.clone(), search.presentation().into_iter().collect());
+    // The backend closes a search its step can never finish; the protocol record,
+    // not a frontend rule, carries the interrupted presentation.
+    let end = EventMsg::WebSearchEnd(WebSearchEndEvent {
+        session_id: "session".into(),
+        turn_id: "turn".into(),
+        model_step_id: "step".into(),
+        call_id: "search".into(),
+        action: WebSearchAction::Interrupted,
+    });
+    state.handle_agent_event(end.clone(), end.presentation().into_iter().collect());
     let retry = EventMsg::ModelStepCompleted(ModelStepCompletedEvent {
         session_id: "session".into(),
         turn_id: "turn".into(),
@@ -1255,6 +1268,40 @@ fn retrying_model_step_closes_pending_search_and_marks_the_reconnect() {
         .position(|text| text.contains("Reconnecting"))
         .expect("reconnecting notice");
     assert!(partial < reconnecting);
+}
+
+#[test]
+fn failed_model_step_clears_pending_blocks_without_an_end_event() {
+    use horus::protocol::{ModelStepCompletedEvent, ModelStepOutcome, WebSearchBeginEvent};
+
+    // Replay after a crash journals no end event, so the step-namespaced sweep
+    // must not strand the pending block.
+    let mut state = state();
+    let search = EventMsg::WebSearchBegin(WebSearchBeginEvent {
+        session_id: "session".into(),
+        turn_id: "turn".into(),
+        model_step_id: "step".into(),
+        call_id: "search".into(),
+    });
+    state.handle_agent_event(search.clone(), search.presentation().into_iter().collect());
+    let failed = EventMsg::ModelStepCompleted(ModelStepCompletedEvent {
+        session_id: "session".into(),
+        turn_id: "turn".into(),
+        model_step_id: "step".into(),
+        step_index: 0,
+        started_at_ms: 1,
+        completed_at_ms: 2,
+        outcome: ModelStepOutcome::Failed,
+    });
+    state.handle_agent_event(failed.clone(), failed.presentation().into_iter().collect());
+
+    let entry = state
+        .transcript
+        .iter()
+        .find(|entry| entry.text == "Searching the web")
+        .expect("search entry");
+    assert!(!entry.pending);
+    assert!(matches!(entry.tone, TranscriptTone::Warning));
 }
 
 #[test]

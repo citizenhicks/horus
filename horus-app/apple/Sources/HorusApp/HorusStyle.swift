@@ -142,6 +142,7 @@ struct HorusGlyph: Hashable {
     static let menu = Self("hi.menu")
     static let mic01 = Self("hi.mic01")
     static let moon = Self("hi.moon")
+    static let neuralNetwork = Self("hi.neuralNetwork")
     static let notePencil = Self("hi.notePencil")
     static let path = Self("hi.path")
     static let pencilSimple = Self("hi.pencilSimple")

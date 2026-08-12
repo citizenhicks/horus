@@ -45,7 +45,7 @@ mod base64_bytes {
 }
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 26;
+pub const PROTOCOL_VERSION: u16 = 27;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 20 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -1065,6 +1065,13 @@ pub fn validate_version(version: u16) -> Result<()> {
         return Err(Error::Protocol(format!(
             "unsupported protocol version {version}; expected {PROTOCOL_VERSION}"
         )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_session_id(session_id: &str) -> Result<()> {
+    if session_id.trim().is_empty() || session_id.len() > 4 * 1024 {
+        return Err(Error::Config("session ID must be 1–4096 bytes".into()));
     }
     Ok(())
 }

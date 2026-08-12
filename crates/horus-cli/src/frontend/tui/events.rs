@@ -98,14 +98,18 @@ impl TuiState {
                     ModelStepOutcome::Failed
                     | ModelStepOutcome::Interrupted
                     | ModelStepOutcome::Retrying => {
+                        // Block ids are namespaced by model step, so a step that ends
+                        // without completing can never finish its pending blocks. The
+                        // backend closes live ones with its own end events; this sweep
+                        // only keeps replay after a crash from stranding them.
                         let prefix = format!("{}/", step.model_step_id);
                         for entry in &mut self.transcript {
                             if entry.pending
-                                && entry.id.as_ref().is_some_and(|id| {
-                                    id.capability == "web_search" && id.value.starts_with(&prefix)
-                                })
+                                && entry
+                                    .id
+                                    .as_ref()
+                                    .is_some_and(|id| id.value.starts_with(&prefix))
                             {
-                                entry.text = "Web search interrupted".into();
                                 entry.tone = TranscriptTone::Warning;
                                 entry.pending = false;
                                 entry.rendered = None;
@@ -135,6 +139,7 @@ impl TuiState {
                 self.turn_started_at.get_or_insert_with(Instant::now);
                 self.begin_approval(request.id);
             }
+            EventMsg::ExecApprovalReview(_) => {}
             EventMsg::TokenCount(tokens) => {
                 if let Some(info) = tokens.info {
                     self.usage = usage_status(&info);

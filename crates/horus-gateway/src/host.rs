@@ -41,7 +41,7 @@ use crate::wire::{
     ProfileSnapshot, ProviderConfig, ReadyPayload, RecordedEvent, RenderedEvent, RenderedPreview,
     RunStats, RunSummary, ServerFrame, ServerMessage, SessionActivity, SessionActivityState,
     SessionOutcome, SessionReadyPayload, SessionRecord, SessionRunGroup, SessionWidget,
-    VersionedAgentConfig, WorkspaceFileScope,
+    VersionedAgentConfig, WorkspaceFileScope, validate_session_id,
 };
 use crate::{Error, Result};
 
@@ -373,6 +373,7 @@ impl GatewayHost {
         &self,
         session_id: &str,
     ) -> std::result::Result<HostHandle, Rejection> {
+        validate_session_id(session_id).map_err(|_| invalid_session_id())?;
         let mut state = self.state.lock().await;
         if let Some(host) = state.sessions.get(session_id)
             && host.is_alive()
@@ -448,6 +449,8 @@ impl GatewayHost {
                     fatal: false,
                 });
             }
+        }
+        for id in &session_ids {
             state.sessions.remove(id);
         }
         for id in &session_ids {
@@ -2896,6 +2899,14 @@ fn unknown_session() -> Rejection {
     }
 }
 
+fn invalid_session_id() -> Rejection {
+    Rejection {
+        code: "invalid_session_id",
+        message: "session ID must be 1–4096 bytes".into(),
+        fatal: false,
+    }
+}
+
 fn invalid_cron(error: impl std::fmt::Display) -> Rejection {
     Rejection {
         code: "invalid_cron",
@@ -3522,6 +3533,93 @@ mod tests {
                 .collect::<Vec<_>>(),
             [retained_id]
         );
+    }
+
+    #[tokio::test]
+    async fn delete_session_keeps_all_resident_hosts_when_a_descendant_is_busy() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let (store, config) =
+            ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+        let root_host = gateway
+            .create_session(&workspace)
+            .await
+            .expect("create root session");
+        let root_id = root_host.session_id().to_owned();
+        let checkpoints = Arc::clone(&gateway.state.lock().await.checkpoints);
+        let root_checkpoint = checkpoints
+            .load(&root_id)
+            .await
+            .expect("load root")
+            .expect("root checkpoint");
+        checkpoints
+            .fork(
+                &root_id,
+                root_checkpoint.sequence,
+                &Checkpoint::empty("child"),
+            )
+            .await
+            .expect("fork child");
+
+        let (commands, mut receiver) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Some(HostCommand::StopIfIdle { reply }) = receiver.recv().await {
+                let _ = reply.send(false);
+            }
+        });
+        let (events, _) = broadcast::channel(1);
+        gateway.state.lock().await.sessions.insert(
+            "child".into(),
+            HostHandle {
+                inner: Arc::new(HostInner {
+                    session_id: "child".into(),
+                    commands,
+                    events,
+                    accepts_file_attachments: Arc::new(AtomicBool::new(false)),
+                    alive: Arc::new(AtomicBool::new(true)),
+                }),
+            },
+        );
+
+        let error = gateway
+            .delete_session(&root_id)
+            .await
+            .expect_err("busy descendant must reject deletion");
+
+        assert_eq!(error.code, "agent_busy");
+        let state = gateway.state.lock().await;
+        assert!(state.sessions.contains_key(&root_id));
+        assert!(state.sessions.contains_key("child"));
+    }
+
+    #[tokio::test]
+    async fn open_session_rejects_invalid_ids_before_checkpoint_lookup() {
+        let root = tempfile::tempdir().expect("root");
+        let (store, config) = ConfigStore::initialize(
+            root.path().join("state"),
+            "127.0.0.1:8741".parse().expect("listen address"),
+            None,
+        )
+        .expect("config");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+
+        for session_id in [" ".to_owned(), "x".repeat(4097)] {
+            let error = match gateway.open_session(&session_id).await {
+                Ok(_) => panic!("invalid session ID must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, "invalid_session_id");
+            assert_eq!(error.message, "session ID must be 1–4096 bytes");
+        }
     }
 
     #[test]

@@ -433,7 +433,7 @@ private struct TranscriptView: View {
     }
 
     private func followTranscript() {
-        guard isAtBottom || model.activeTurnID != nil else { return }
+        guard isAtBottom || (model.activeTurnID != nil && !position.isPositionedByUser) else { return }
         position.scrollTo(edge: .bottom)
     }
 
@@ -1054,15 +1054,18 @@ private struct TranscriptWaitingNoteView: View {
         // message advances on its own schedule rather than on redraws.
         TimelineView(.periodic(from: startedAt, by: TranscriptWaitingNote.rotation)) { context in
             let elapsed = reduceMotion ? 0 : context.date.timeIntervalSince(startedAt)
-            Text(TranscriptWaitingNote.message(in: messageOrder, elapsed: elapsed))
-                .font(HorusStyle.metadataFont)
-                .foregroundStyle(palette.muted)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .contentTransition(.opacity)
-                .animation(.easeInOut(duration: 0.3), value: elapsed)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .horusRunningShimmer(active: true)
+            HStack(spacing: HorusSpace.s) {
+                HorusIcon(.neuralNetwork, size: HorusStyle.glyphInline, foreground: palette.muted)
+                Text(TranscriptWaitingNote.message(in: messageOrder, elapsed: elapsed))
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(palette.muted)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .contentTransition(.opacity)
+                    .animation(.easeInOut(duration: 0.3), value: elapsed)
+                    .horusRunningShimmer(active: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(minHeight: HorusStyle.rowCompact)
         .transition(.opacity)

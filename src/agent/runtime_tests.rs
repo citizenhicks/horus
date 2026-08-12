@@ -53,6 +53,8 @@ use crate::middleware::tools::Catalog;
 use crate::middleware::tools::Tool;
 use crate::middleware::tools::ToolContext;
 use crate::middleware::tools::Tools;
+use crate::protocol::ApprovalReviewEscalation;
+use crate::protocol::ApprovalReviewStatus;
 use crate::protocol::ErrorKind;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
@@ -70,6 +72,7 @@ use crate::protocol::SessionContext;
 use crate::protocol::TokenUsage;
 use crate::protocol::ToolCallEndEvent;
 use crate::protocol::WarningEvent;
+use crate::protocol::WebSearchAction;
 
 async fn drain_until_notified(agent: &mut Agent, notification: &Notify) {
     loop {
@@ -181,7 +184,9 @@ fn consume_queued_input(context: &mut ModelContext<'_>) {
             }));
     }
     for item in queued {
-        context.push_input(crate::backend::model::user_message(item.text()));
+        context
+            .push_input(crate::backend::model::user_message(item.text()))
+            .expect("provisional target");
     }
 }
 
@@ -313,7 +318,7 @@ impl Middleware for DurableBeforeModel {
         Box::pin(async move {
             context.push_input(crate::backend::model::internal_user_message(
                 "settled", "durable",
-            ));
+            ))?;
             context.usage.push(scripted_usage());
             context.events.push(EventMsg::ContextCompacted);
             Ok(())
@@ -1252,6 +1257,7 @@ async fn interrupted_stream_retries_in_a_fresh_model_step() {
     let mut message = None;
     let mut tool_begins = 0;
     let mut web_search = None;
+    let mut web_search_ends = Vec::new();
     while let Some(event) = agent.next_event().await {
         match event.msg {
             EventMsg::ModelStepStarted(event) => started.push(event),
@@ -1260,6 +1266,7 @@ async fn interrupted_stream_retries_in_a_fresh_model_step() {
             EventMsg::AgentMessage(event) => message = Some(event),
             EventMsg::ToolCallBegin(_) => tool_begins += 1,
             EventMsg::WebSearchBegin(event) => web_search = Some(event),
+            EventMsg::WebSearchEnd(event) => web_search_ends.push(event),
             EventMsg::TurnComplete(_) => break,
             _ => {}
         }
@@ -1294,6 +1301,14 @@ async fn interrupted_stream_retries_in_a_fresh_model_step() {
         web_search.expect("interrupted web search").model_step_id,
         started[0].model_step_id
     );
+    // The failed attempt started a search it could never finish, so the backend
+    // closes it out instead of leaving frontends to infer the interruption.
+    let [search_end] = web_search_ends.as_slice() else {
+        panic!("expected exactly one web search end, got {web_search_ends:?}");
+    };
+    assert_eq!(search_end.call_id, "search-1");
+    assert_eq!(search_end.model_step_id, started[0].model_step_id);
+    assert!(matches!(search_end.action, WebSearchAction::Interrupted));
     assert_eq!(model.calls.load(Ordering::SeqCst), 2);
     let inputs = model.inputs.lock().expect("stream input lock");
     assert_eq!(inputs.len(), 2);
@@ -2016,6 +2031,7 @@ async fn automatic_approval_counts_isolated_review_usage_without_replacing_prima
         })
         .expect("submit input");
     let mut usage_events = Vec::new();
+    let mut review_events = Vec::new();
     loop {
         match agent.next_event().await.expect("agent event").msg {
             EventMsg::TokenCount(count) => {
@@ -2024,6 +2040,9 @@ async fn automatic_approval_counts_isolated_review_usage_without_replacing_prima
                     usage.total_token_usage.total_tokens,
                     usage.last_token_usage.total_tokens,
                 ));
+            }
+            EventMsg::ExecApprovalReview(review) => {
+                review_events.push((review.status, review.reason));
             }
             EventMsg::TurnComplete(_) => break,
             _ => {}
@@ -2059,6 +2078,13 @@ async fn automatic_approval_counts_isolated_review_usage_without_replacing_prima
     assert_eq!(saved.total_usage.total_tokens, 9);
     assert_eq!(saved.last_usage, Some(scripted_usage()));
     assert_eq!(usage_events, [(1, 1), (8, 1), (9, 1)]);
+    assert_eq!(
+        review_events,
+        [
+            (ApprovalReviewStatus::Reviewing, None),
+            (ApprovalReviewStatus::Approved, None),
+        ]
+    );
     assert_eq!(
         observed_usage
             .lock()
@@ -2239,13 +2265,15 @@ async fn malformed_automatic_review_durably_asks_without_dropping_network_access
             attachments: Vec::new(),
         })
         .expect("submit input");
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let review_events = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut review_events = Vec::new();
         loop {
-            if matches!(
-                agent.next_event().await.expect("agent event").msg,
-                EventMsg::ExecApprovalRequest(_)
-            ) {
-                break;
+            match agent.next_event().await.expect("agent event").msg {
+                EventMsg::ExecApprovalReview(review) => {
+                    review_events.push((review.status, review.reason));
+                }
+                EventMsg::ExecApprovalRequest(_) => break review_events,
+                _ => {}
             }
         }
     })
@@ -2276,6 +2304,16 @@ async fn malformed_automatic_review_durably_asks_without_dropping_network_access
         crate::backend::sandbox::NetworkAccess::Allowed
     );
     assert_eq!(saved.total_usage.total_tokens, 2);
+    assert_eq!(
+        review_events,
+        [
+            (ApprovalReviewStatus::Reviewing, None),
+            (
+                ApprovalReviewStatus::Escalated,
+                Some(ApprovalReviewEscalation::InvalidResponse),
+            ),
+        ]
+    );
     assert!(matches!(
         recorded.event.msg,
         EventMsg::ExecApprovalRequest(request) if request.id == pending.request_id

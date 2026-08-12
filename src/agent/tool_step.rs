@@ -30,9 +30,12 @@ use crate::middleware::QueuedInputBaseline;
 use crate::middleware::tools::ToolResult;
 use crate::middleware::tools::execute_batch;
 use crate::protocol::ApprovalCall;
+use crate::protocol::ApprovalReviewEscalation;
+use crate::protocol::ApprovalReviewStatus;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecApprovalRequestEvent;
+use crate::protocol::ExecApprovalReviewEvent;
 use crate::protocol::ReviewDecision;
 use crate::protocol::Submission;
 use crate::protocol::ToolCallBeginEvent;
@@ -77,6 +80,21 @@ enum AutomaticDecision {
     Ask,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomaticReviewOutcome {
+    Approved,
+    Escalated(ApprovalReviewEscalation),
+}
+
+impl AutomaticReviewOutcome {
+    fn event_fields(self) -> (ApprovalReviewStatus, Option<ApprovalReviewEscalation>) {
+        match self {
+            Self::Approved => (ApprovalReviewStatus::Approved, None),
+            Self::Escalated(reason) => (ApprovalReviewStatus::Escalated, Some(reason)),
+        }
+    }
+}
+
 impl Runner {
     pub(super) async fn review_and_resolve(
         &mut self,
@@ -92,7 +110,19 @@ impl Runner {
             permissions,
         } = review;
         validate_approval_selection(&calls, &request.call_ids)?;
-        let Some(approved) = self
+        self.persist_with_events(
+            vec![approval_review_event(
+                submission_id,
+                turn_id,
+                &calls,
+                &request,
+                ApprovalReviewStatus::Reviewing,
+                None,
+            )],
+            None,
+        )
+        .await?;
+        let Some(outcome) = self
             .review_approval(
                 commands,
                 submission_id,
@@ -105,7 +135,10 @@ impl Runner {
         else {
             return Ok(None);
         };
-        if !approved {
+        let (status, reason) = outcome.event_fields();
+        let terminal =
+            approval_review_event(submission_id, turn_id, &calls, &request, status, reason);
+        if !matches!(outcome, AutomaticReviewOutcome::Approved) {
             return self
                 .pause_and_resolve(
                     commands,
@@ -114,9 +147,11 @@ impl Runner {
                     calls,
                     request,
                     permissions,
+                    vec![terminal],
                 )
                 .await;
         }
+        self.persist_with_events(vec![terminal], None).await?;
         let permissions = self.config.sandbox.resolve_approval(
             &self.config.session_id,
             &calls,
@@ -138,14 +173,16 @@ impl Runner {
         calls: &[ToolCall],
         request: &SandboxApprovalRequest,
         reviewer: &ApprovalReviewerConfig,
-    ) -> Result<Option<bool>> {
+    ) -> Result<Option<AutomaticReviewOutcome>> {
         let Some(payload) = review_payload(
             &self.state.context,
             calls,
             &request.call_ids,
             &self.catalog.definitions(),
         ) else {
-            return Ok(Some(false));
+            return Ok(Some(AutomaticReviewOutcome::Escalated(
+                ApprovalReviewEscalation::ReviewDataUnavailable,
+            )));
         };
         let instructions = reviewer_instructions(reviewer);
         let input = [user_message(&payload)];
@@ -170,16 +207,25 @@ impl Runner {
             return Ok(None);
         };
         let Ok(output) = output else {
-            return Ok(Some(false));
+            return Ok(Some(AutomaticReviewOutcome::Escalated(
+                ApprovalReviewEscalation::ReviewerUnavailable,
+            )));
         };
         self.record_usage(&route, output.usage())?;
         self.persist_with_events(self.usage_event(submission_id).into_iter().collect(), None)
             .await?;
-        let approved = output.tool_calls().is_empty()
-            && response_approves_exactly(output.text(), &request.call_ids);
-        Ok(Some(approved))
+        let outcome = if output.tool_calls().is_empty() {
+            automatic_review_outcome(output.text(), &request.call_ids)
+        } else {
+            AutomaticReviewOutcome::Escalated(ApprovalReviewEscalation::InvalidResponse)
+        };
+        Ok(Some(outcome))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "pausing a turn needs its correlation IDs, calls, authorization outcome, and any journaled preamble in one transaction"
+    )]
     pub(super) async fn pause_and_resolve(
         &mut self,
         commands: &mut mpsc::Receiver<Submission>,
@@ -188,6 +234,7 @@ impl Runner {
         calls: Vec<ToolCall>,
         request: SandboxApprovalRequest,
         permissions: SandboxPermissions,
+        leading_events: Vec<Event>,
     ) -> Result<Option<Vec<ToolResult>>> {
         validate_approval_selection(&calls, &request.call_ids)?;
         let pending = PendingApproval {
@@ -202,8 +249,9 @@ impl Runner {
             decision_received: false,
         };
         self.state.pending_approval = Some(pending.clone());
-        self.persist_with_events(vec![approval_event(&pending)], None)
-            .await?;
+        let mut events = leading_events;
+        events.push(approval_event(&pending));
+        self.persist_with_events(events, None).await?;
         self.resolve_pending(commands, &pending, false).await
     }
 
@@ -504,29 +552,48 @@ impl Runner {
 }
 
 fn approval_event(pending: &PendingApproval) -> Event {
-    let approval_call_ids = pending
-        .approval_call_ids
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
     Event {
         submission_id: Some(pending.submission_id.clone()),
         msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
             id: pending.request_id.clone(),
             turn_id: pending.turn_id.clone(),
-            calls: pending
-                .calls
-                .iter()
-                .filter(|call| approval_call_ids.contains(&call.call_id))
-                .map(|call| ApprovalCall {
-                    call_id: call.call_id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                })
-                .collect(),
+            calls: selected_approval_calls(&pending.calls, &pending.approval_call_ids),
             reason: pending.reason.clone(),
         }),
     }
+}
+
+fn approval_review_event(
+    submission_id: &str,
+    turn_id: &str,
+    calls: &[ToolCall],
+    request: &SandboxApprovalRequest,
+    status: ApprovalReviewStatus,
+    reason: Option<ApprovalReviewEscalation>,
+) -> Event {
+    Event {
+        submission_id: Some(submission_id.to_string()),
+        msg: EventMsg::ExecApprovalReview(ExecApprovalReviewEvent {
+            id: request.id.clone(),
+            turn_id: turn_id.to_string(),
+            calls: selected_approval_calls(calls, &request.call_ids),
+            status,
+            reason,
+        }),
+    }
+}
+
+fn selected_approval_calls(calls: &[ToolCall], call_ids: &[String]) -> Vec<ApprovalCall> {
+    let selected = call_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    calls
+        .iter()
+        .filter(|call| selected.contains(call.call_id.as_str()))
+        .map(|call| ApprovalCall {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        })
+        .collect()
 }
 
 fn tool_result_events(submission_id: &str, turn_id: &str, results: &[ToolResult]) -> Vec<Event> {
@@ -626,9 +693,6 @@ fn recent_intent(context: &[Value]) -> Option<Vec<ReviewMessage>> {
         let Some(message) = visible_message(item) else {
             continue;
         };
-        if message.text.len() > MAX_REVIEW_INTENT_BYTES {
-            return None;
-        }
         if bytes.saturating_add(message.text.len()) > MAX_REVIEW_INTENT_BYTES {
             break;
         }
@@ -668,16 +732,19 @@ fn visible_message(item: &Value) -> Option<ReviewMessage> {
     (!text.trim().is_empty()).then_some(ReviewMessage { role, text })
 }
 
-fn response_approves_exactly(text: &str, call_ids: &[String]) -> bool {
+fn automatic_review_outcome(text: &str, call_ids: &[String]) -> AutomaticReviewOutcome {
     if text.len() > MAX_REVIEW_RESPONSE_BYTES {
-        return false;
+        return AutomaticReviewOutcome::Escalated(ApprovalReviewEscalation::InvalidResponse);
     }
     let Ok(response) = serde_json::from_str::<ReviewResponse>(text.trim()) else {
-        return false;
+        return AutomaticReviewOutcome::Escalated(ApprovalReviewEscalation::InvalidResponse);
     };
+    if response.decision == AutomaticDecision::Ask && response.call_ids.is_empty() {
+        return AutomaticReviewOutcome::Escalated(ApprovalReviewEscalation::ReviewerAsked);
+    }
     if response.decision != AutomaticDecision::Approve || response.call_ids.len() != call_ids.len()
     {
-        return false;
+        return AutomaticReviewOutcome::Escalated(ApprovalReviewEscalation::InvalidResponse);
     }
     let expected = call_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let actual = response
@@ -685,7 +752,11 @@ fn response_approves_exactly(text: &str, call_ids: &[String]) -> bool {
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    actual.len() == response.call_ids.len() && actual == expected
+    if actual.len() == response.call_ids.len() && actual == expected {
+        AutomaticReviewOutcome::Approved
+    } else {
+        AutomaticReviewOutcome::Escalated(ApprovalReviewEscalation::InvalidResponse)
+    }
 }
 
 fn denied_results(calls: &[ToolCall], rejection: &str) -> Vec<ToolResult> {
@@ -744,14 +815,45 @@ mod tests {
     fn reviewer_approval_requires_the_exact_call_set() {
         let expected = ["one".to_string(), "two".to_string()];
 
-        assert!(response_approves_exactly(
-            r#"{"decision":"approve","call_ids":["two","one"]}"#,
-            &expected,
-        ));
-        assert!(!response_approves_exactly(
-            r#"{"decision":"approve","call_ids":["one"]}"#,
-            &expected,
-        ));
+        assert_eq!(
+            automatic_review_outcome(
+                r#"{"decision":"approve","call_ids":["two","one"]}"#,
+                &expected,
+            ),
+            AutomaticReviewOutcome::Approved
+        );
+        assert_eq!(
+            automatic_review_outcome(r#"{"decision":"approve","call_ids":["one"]}"#, &expected,),
+            AutomaticReviewOutcome::Escalated(ApprovalReviewEscalation::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn reviewer_ask_is_distinct_from_an_invalid_response() {
+        assert_eq!(
+            automatic_review_outcome(r#"{"decision":"ask","call_ids":[]}"#, &["one".into()],),
+            AutomaticReviewOutcome::Escalated(ApprovalReviewEscalation::ReviewerAsked)
+        );
+    }
+
+    #[test]
+    fn reviewer_intent_keeps_a_new_user_request_after_an_oversized_older_message() {
+        let context = [
+            serde_json::json!({
+                "role": "assistant",
+                "content": "x".repeat(MAX_REVIEW_INTENT_BYTES + 1)
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": "review the current change"
+            }),
+        ];
+
+        let intent = recent_intent(&context).expect("recent user intent");
+
+        assert_eq!(intent.len(), 1);
+        assert_eq!(intent[0].role, "user");
+        assert_eq!(intent[0].text, "review the current change");
     }
 
     #[test]

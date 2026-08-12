@@ -674,6 +674,8 @@ final class AppModel {
         didSet { invalidateTranscriptRows() }
     }
     private var visibleTranscriptLimit = 300
+    /// The gateway rejects history requests outside 1...100 events per page.
+    private let historyPageSize = 100
     var displayedTranscript: [TranscriptEntry] {
         let source = replayPresentedTranscript ?? transcript
         return source.count > visibleTranscriptLimit
@@ -1783,7 +1785,7 @@ final class AppModel {
             requestID: id,
             sessionID: sessionID,
             beforeSequence: beforeSequence,
-            maxEvents: 300
+            maxEvents: historyPageSize
         )) { [weak self] _ in
             guard self?.historyRequestID == id else { return }
             self?.historyRequestID = nil
@@ -4325,13 +4327,19 @@ final class AppModel {
         else { return }
 
         guard status == "completed" else {
-            let searchPrefix = scopedBlockID(
-                capability: "web_search",
-                sourceID: "\(modelStepID)/"
-            )
-            for entry in entries where entry.pending && entry.id.hasPrefix(searchPrefix) {
+            // Block source ids are namespaced by model step, so a step that ends without
+            // completing can never finish its pending blocks. The backend closes live
+            // ones with its own end events; this sweep only keeps replay after a crash
+            // from stranding them.
+            for entry in entries
+            where entry.pending
+                && entry.capability.map({ capability in
+                    entry.id.hasPrefix(
+                        scopedBlockID(capability: capability, sourceID: "\(modelStepID)/")
+                    )
+                }) == true
+            {
                 entry.pending = false
-                entry.title = "Web search interrupted"
                 entry.tone = "warning"
                 entry.sourceSequence = record.sequence
                 entry.recordedAtMs = record.recordedAtMs

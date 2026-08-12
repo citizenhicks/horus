@@ -355,7 +355,16 @@ impl GatewayServer {
                             let host = self.host.clone();
                             tokio::spawn(async move {
                                 for task in due {
-                                    let _ = host.run_cron(task.session_id, task.id).await;
+                                    let session_id = task.session_id;
+                                    let task_id = task.id;
+                                    if let Err(error) =
+                                        host.run_cron(session_id.clone(), task_id.clone()).await
+                                    {
+                                        eprintln!(
+                                            "cron run failed: session_id={session_id} task_id={task_id} code={} message={}",
+                                            error.code, error.message
+                                        );
+                                    }
                                 }
                             });
                         }

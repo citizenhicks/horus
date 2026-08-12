@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -47,6 +48,8 @@ use crate::protocol::TurnAbortedEvent;
 use crate::protocol::TurnCompleteEvent;
 use crate::protocol::TurnStartedEvent;
 use crate::protocol::UserMessageEvent;
+use crate::protocol::WebSearchAction;
+use crate::protocol::WebSearchEndEvent;
 
 const STREAM_RETRY_BASE_DELAY_MS: u64 = 200;
 const STREAM_RETRY_MAX_DELAY_MS: u64 = 3_200;
@@ -210,7 +213,11 @@ impl Runner {
     ) -> Result<BeforeModel> {
         let mut middleware_events = Vec::new();
         let mut middleware_usage = Vec::new();
-        let provisional_target_sequence = self.state.sequence + 1;
+        let provisional_target_sequence = self
+            .state
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Checkpoint("checkpoint sequence overflow".into()))?;
         let queued_before = QueuedInputBaseline::from_items(&self.state.pending_input);
         let had_queued_input = !self.state.pending_input.is_empty();
         let mut durable_snapshot = self.state.clone();
@@ -370,10 +377,32 @@ impl Runner {
         submission_id: &str,
         started: &ModelStepStartedEvent,
         outcome: ModelStepOutcome,
+        pending_searches: &Mutex<Vec<String>>,
     ) -> Result<()> {
         self.state.active_model_step = None;
-        let event = model_step_completed_event(submission_id, started, outcome)?;
-        self.persist_with_events(vec![event], None).await?;
+        // A failed step can never complete the hosted searches it started, so the
+        // backend closes them out instead of leaving every frontend to infer it.
+        let dangling = pending_searches
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default();
+        let mut events: Vec<Event> = dangling
+            .into_iter()
+            .map(|call_id| {
+                turn_event(
+                    submission_id,
+                    EventMsg::WebSearchEnd(WebSearchEndEvent {
+                        session_id: started.session_id.clone(),
+                        turn_id: started.turn_id.clone(),
+                        model_step_id: started.model_step_id.clone(),
+                        call_id,
+                        action: WebSearchAction::Interrupted,
+                    }),
+                )
+            })
+            .collect();
+        events.push(model_step_completed_event(submission_id, started, outcome)?);
+        self.persist_with_events(events, None).await?;
         Ok(())
     }
 
@@ -416,7 +445,7 @@ impl Runner {
             let model_session_id = self.state.session_id.clone();
             let instructions = Arc::clone(&self.system_prompt);
             let mut stream_retries = 0;
-            let (model_step_started, output) = loop {
+            let (model_step_started, output, pending_searches) = loop {
                 let model_step_started = ModelStepStartedEvent {
                     session_id: self.state.session_id.clone(),
                     turn_id: turn_id.clone(),
@@ -443,7 +472,22 @@ impl Runner {
                 let event_turn_id = turn_id.clone();
                 let event_session_id = self.state.session_id.clone();
                 let event_model_step_id = model_step_started.model_step_id.clone();
+                let pending_searches = Arc::new(Mutex::new(Vec::<String>::new()));
+                let tracked_searches = Arc::clone(&pending_searches);
                 let stream: ModelEventSink = Arc::new(move |event| {
+                    match &event {
+                        crate::protocol::ModelEvent::WebSearchStarted { call_id } => {
+                            if let Ok(mut pending) = tracked_searches.lock() {
+                                pending.push(call_id.clone());
+                            }
+                        }
+                        crate::protocol::ModelEvent::WebSearchCompleted { call_id, .. } => {
+                            if let Ok(mut pending) = tracked_searches.lock() {
+                                pending.retain(|open| open != call_id);
+                            }
+                        }
+                        _ => {}
+                    }
                     let msg =
                         event.into_event(&event_session_id, &event_turn_id, &event_model_step_id);
                     try_send_event(
@@ -467,7 +511,9 @@ impl Runner {
                     stream,
                 );
                 match self.wait_active(commands, &turn_id, response).await {
-                    Ok(Wait::Ready(Ok(output))) => break (model_step_started, output),
+                    Ok(Wait::Ready(Ok(output))) => {
+                        break (model_step_started, output, pending_searches);
+                    }
                     Ok(Wait::Ready(Err(Error::Provider(error))))
                         if error.is_stream_interrupted() && stream_retries < STREAM_RETRY_LIMIT =>
                     {
@@ -480,6 +526,7 @@ impl Runner {
                             &submission_id,
                             &model_step_started,
                             ModelStepOutcome::Retrying,
+                            &pending_searches,
                         )
                         .await?;
                         stream_retries += 1;
@@ -520,6 +567,7 @@ impl Runner {
                             &submission_id,
                             &model_step_started,
                             ModelStepOutcome::Failed,
+                            &pending_searches,
                         )
                         .await?;
                         return Err(error);
@@ -531,6 +579,7 @@ impl Runner {
                             &submission_id,
                             &model_step_started,
                             ModelStepOutcome::Interrupted,
+                            &pending_searches,
                         )
                         .await?;
                         self.abort(
@@ -549,6 +598,7 @@ impl Runner {
                     &submission_id,
                     &model_step_started,
                     ModelStepOutcome::Failed,
+                    &pending_searches,
                 )
                 .await?;
                 return Err(error);
@@ -699,6 +749,7 @@ impl Runner {
                             output.tool_calls,
                             request,
                             permissions,
+                            Vec::new(),
                         )
                         .await?
                     else {

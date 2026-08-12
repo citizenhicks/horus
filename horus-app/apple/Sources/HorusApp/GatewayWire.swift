@@ -1,7 +1,7 @@
 import Foundation
 import UIKit
 
-let gatewayProtocolVersion = 26
+let gatewayProtocolVersion = 27
 let maximumGatewayFrameBytes = 20 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 let maximumSessionFileReferences = 16
@@ -1997,6 +1997,43 @@ extension AgentEventRecord {
                     throw GatewayWireError.invalidFrame("exec_approval_request has invalid arguments")
                 }
             }
+        case "exec_approval_review":
+            for key in ["id", "turnId"] { try requireString(key) }
+            guard let calls = msg["calls"]?.arrayValue else {
+                throw GatewayWireError.invalidFrame("exec_approval_review has invalid calls")
+            }
+            for call in calls {
+                try requireString("callId", in: call)
+                try requireString("name", in: call)
+                guard call["arguments"] != nil else {
+                    throw GatewayWireError.invalidFrame("exec_approval_review has invalid arguments")
+                }
+            }
+            switch msg["status"]?.stringValue {
+            case "reviewing", "approved":
+                if let reason = msg["reason"], reason != .null {
+                    throw GatewayWireError.invalidFrame(
+                        "exec_approval_review has an unexpected reason"
+                    )
+                }
+            case "escalated":
+                guard let reason = msg["reason"]?.stringValue,
+                      [
+                          "reviewer_asked",
+                          "review_data_unavailable",
+                          "reviewer_unavailable",
+                          "invalid_response",
+                      ].contains(reason)
+                else {
+                    throw GatewayWireError.invalidFrame(
+                        "exec_approval_review has an invalid reason"
+                    )
+                }
+            default:
+                throw GatewayWireError.invalidFrame(
+                    "exec_approval_review has an invalid status"
+                )
+            }
         case "token_count":
             if let info = msg["info"], info != .null {
                 guard info.objectValue != nil,
@@ -2037,7 +2074,7 @@ extension AgentEventRecord {
             case "find_in_page":
                 try optionalString("url", in: action)
                 try optionalString("pattern", in: action)
-            case "other":
+            case "interrupted", "other":
                 break
             default:
                 throw GatewayWireError.invalidFrame("web_search_end has unknown action")

@@ -13,6 +13,7 @@ use crate::Result;
 use crate::agent::AgentSender;
 use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::checkpoint::TranscriptBatch;
+use crate::backend::checkpoint::TranscriptPage;
 use crate::backend::checkpoint::TranscriptPageRequest;
 use crate::middleware::RuntimeContext;
 use crate::protocol::EventMsg;
@@ -562,25 +563,11 @@ impl Shared {
 }
 
 fn positioned_items_chronological(batches: Vec<TranscriptBatch>) -> Vec<(MessageTarget, Value)> {
-    batches
-        .into_iter()
-        .rev()
-        .flat_map(|batch| {
-            batch
-                .items
-                .into_iter()
-                .enumerate()
-                .map(move |(index, item)| {
-                    (
-                        MessageTarget {
-                            checkpoint_sequence: batch.sequence,
-                            batch_item_count: index + 1,
-                        },
-                        item,
-                    )
-                })
-        })
-        .collect()
+    TranscriptPage {
+        batches,
+        next_before_sequence: None,
+    }
+    .into_positioned_items_chronological()
 }
 
 fn preview_events(

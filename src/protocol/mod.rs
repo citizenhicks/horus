@@ -151,6 +151,7 @@ pub enum EventMsg {
     ToolCallBegin(ToolCallBeginEvent),
     ToolCallEnd(ToolCallEndEvent),
     ExecApprovalRequest(ExecApprovalRequestEvent),
+    ExecApprovalReview(ExecApprovalReviewEvent),
     TokenCount(TokenCountEvent),
     ContextCompacted,
     WebSearchBegin(WebSearchBeginEvent),
@@ -187,6 +188,7 @@ pub enum WebSearchAction {
         url: Option<String>,
         pattern: Option<String>,
     },
+    Interrupted,
     Other,
 }
 
@@ -609,11 +611,17 @@ impl EventMsg {
                 tone: FrontendTone::Neutral,
             },
             Self::WebSearchEnd(search) => {
-                let (title, text) = match &search.action {
-                    WebSearchAction::Search { queries } => ("Searched the web", queries.join("\n")),
-                    WebSearchAction::OpenPage { url } => {
-                        ("Opened a web page", url.clone().unwrap_or_default())
-                    }
+                let (title, text, tone) = match &search.action {
+                    WebSearchAction::Search { queries } => (
+                        "Searched the web",
+                        queries.join("\n"),
+                        FrontendTone::Success,
+                    ),
+                    WebSearchAction::OpenPage { url } => (
+                        "Opened a web page",
+                        url.clone().unwrap_or_default(),
+                        FrontendTone::Success,
+                    ),
                     WebSearchAction::FindInPage { url, pattern } => {
                         let text = match (url, pattern) {
                             (Some(url), Some(pattern)) => format!("{pattern}\n{url}"),
@@ -621,9 +629,16 @@ impl EventMsg {
                             (None, Some(pattern)) => pattern.clone(),
                             (None, None) => String::new(),
                         };
-                        ("Searched a web page", text)
+                        ("Searched a web page", text, FrontendTone::Success)
                     }
-                    WebSearchAction::Other => ("Web search complete", String::new()),
+                    WebSearchAction::Interrupted => (
+                        "Web search interrupted",
+                        String::new(),
+                        FrontendTone::Warning,
+                    ),
+                    WebSearchAction::Other => {
+                        ("Web search complete", String::new(), FrontendTone::Success)
+                    }
                 };
                 FrontendBlock {
                     id: Some(format!("{}/{}", search.model_step_id, search.call_id)),
@@ -636,7 +651,7 @@ impl EventMsg {
                     symbol: Some(FrontendSymbol::Search),
                     files: Vec::new(),
                     format: FrontendBlockFormat::PlainText,
-                    tone: FrontendTone::Success,
+                    tone,
                 }
             }
             Self::Frontend(FrontendEvent::Render { capability, block }) => {
@@ -1094,6 +1109,33 @@ pub struct ExecApprovalRequestEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecApprovalReviewEvent {
+    pub id: String,
+    pub turn_id: String,
+    pub calls: Vec<ApprovalCall>,
+    pub status: ApprovalReviewStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ApprovalReviewEscalation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalReviewStatus {
+    Reviewing,
+    Approved,
+    Escalated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalReviewEscalation {
+    ReviewerAsked,
+    ReviewDataUnavailable,
+    ReviewerUnavailable,
+    InvalidResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalCall {
     pub call_id: String,
     pub name: String,
@@ -1223,6 +1265,35 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn interrupted_web_search_renders_a_terminal_warning_block() {
+        let event = EventMsg::WebSearchEnd(WebSearchEndEvent {
+            session_id: "session-1".into(),
+            turn_id: "turn-1".into(),
+            model_step_id: "step-1".into(),
+            call_id: "search-1".into(),
+            action: WebSearchAction::Interrupted,
+        });
+
+        assert_eq!(
+            serde_json::to_value(&event).expect("serialize interrupted search"),
+            json!({
+                "type": "web_search_end",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "model_step_id": "step-1",
+                "call_id": "search-1",
+                "action": {"type": "interrupted"}
+            })
+        );
+        let block = event.presentation().expect("interrupted search renders");
+        assert_eq!(block.capability, "web_search");
+        assert_eq!(block.block.id.as_deref(), Some("step-1/search-1"));
+        assert_eq!(block.block.state, FrontendBlockState::Complete);
+        assert_eq!(block.block.tone, FrontendTone::Warning);
+        assert_eq!(&*block.block.title, "Web search interrupted");
     }
 
     #[test]
@@ -1462,6 +1533,54 @@ mod tests {
         assert_eq!(
             serde_json::to_value(EventMsg::ContextCompacted).expect("serialize compaction"),
             json!({"type": "context_compacted"})
+        );
+    }
+
+    #[test]
+    fn approval_review_serializes_the_wire_contract() {
+        let calls = || {
+            vec![ApprovalCall {
+                call_id: "call-1".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "git status"}),
+            }]
+        };
+        let reviewing = EventMsg::ExecApprovalReview(ExecApprovalReviewEvent {
+            id: "approval-1".into(),
+            turn_id: "turn-1".into(),
+            calls: calls(),
+            status: ApprovalReviewStatus::Reviewing,
+            reason: None,
+        });
+        let escalated = EventMsg::ExecApprovalReview(ExecApprovalReviewEvent {
+            id: "approval-1".into(),
+            turn_id: "turn-1".into(),
+            calls: calls(),
+            status: ApprovalReviewStatus::Escalated,
+            reason: Some(ApprovalReviewEscalation::ReviewerAsked),
+        });
+
+        // Clients reject a null reason for reviewing/approved, so the key stays absent.
+        assert_eq!(
+            serde_json::to_value(reviewing).expect("serialize reviewing"),
+            json!({
+                "type": "exec_approval_review",
+                "id": "approval-1",
+                "turn_id": "turn-1",
+                "calls": [{"call_id": "call-1", "name": "bash", "arguments": {"command": "git status"}}],
+                "status": "reviewing"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(escalated).expect("serialize escalated"),
+            json!({
+                "type": "exec_approval_review",
+                "id": "approval-1",
+                "turn_id": "turn-1",
+                "calls": [{"call_id": "call-1", "name": "bash", "arguments": {"command": "git status"}}],
+                "status": "escalated",
+                "reason": "reviewer_asked"
+            })
         );
     }
 

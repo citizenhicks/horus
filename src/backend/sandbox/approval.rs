@@ -18,6 +18,8 @@ use crate::Error;
 use crate::Result;
 use crate::backend::model::ToolCall;
 use crate::preview_json;
+use crate::protocol::ApprovalReviewEscalation;
+use crate::protocol::ApprovalReviewStatus;
 use crate::protocol::EventMsg;
 use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendContribution;
@@ -185,28 +187,57 @@ impl Approval {
     }
 
     pub(super) fn render(&self, event: &EventMsg) -> Option<FrontendBlock> {
-        let EventMsg::ExecApprovalRequest(request) = event else {
-            return None;
-        };
-        let tools = request
-            .calls
-            .iter()
-            .map(|call| format!("{} {}", call.name, preview_json(&call.arguments)))
-            .collect::<Vec<_>>()
-            .join("\n  ");
-        Some(FrontendBlock {
-            id: None,
-            group: None,
-            update: crate::protocol::FrontendBlockUpdate::Replace,
-            state: crate::protocol::FrontendBlockState::Complete,
-            role: crate::protocol::FrontendBlockRole::Approval,
-            title: "Approval required".into(),
-            text: format!("{}\n{tools}", request.reason),
-            symbol: None,
-            files: Vec::new(),
-            format: crate::protocol::FrontendBlockFormat::PlainText,
-            tone: FrontendTone::Warning,
-        })
+        match event {
+            EventMsg::ExecApprovalRequest(request) => Some(FrontendBlock {
+                id: None,
+                group: None,
+                update: crate::protocol::FrontendBlockUpdate::Replace,
+                state: crate::protocol::FrontendBlockState::Complete,
+                role: crate::protocol::FrontendBlockRole::Approval,
+                title: "Approval required".into(),
+                text: format!("{}\n{}", request.reason, approval_tools(&request.calls)),
+                symbol: None,
+                files: Vec::new(),
+                format: crate::protocol::FrontendBlockFormat::PlainText,
+                tone: FrontendTone::Warning,
+            }),
+            EventMsg::ExecApprovalReview(review) => {
+                let (title, summary, state, tone) = match review.status {
+                    ApprovalReviewStatus::Reviewing => (
+                        "AI reviewing tools",
+                        "Checking these actions against your request.",
+                        crate::protocol::FrontendBlockState::Pending,
+                        FrontendTone::Neutral,
+                    ),
+                    ApprovalReviewStatus::Approved => (
+                        "AI approved tools",
+                        "The AI reviewer authorized these actions.",
+                        crate::protocol::FrontendBlockState::Complete,
+                        FrontendTone::Success,
+                    ),
+                    ApprovalReviewStatus::Escalated => (
+                        "AI requested approval",
+                        escalation_summary(review.reason),
+                        crate::protocol::FrontendBlockState::Complete,
+                        FrontendTone::Warning,
+                    ),
+                };
+                Some(FrontendBlock {
+                    id: Some(format!("approval-review:{}", review.id)),
+                    group: Some(review.turn_id.clone()),
+                    update: crate::protocol::FrontendBlockUpdate::Replace,
+                    state,
+                    role: crate::protocol::FrontendBlockRole::Approval,
+                    title: title.into(),
+                    text: format!("{summary}\n{}", approval_tools(&review.calls)),
+                    symbol: None,
+                    files: Vec::new(),
+                    format: crate::protocol::FrontendBlockFormat::PlainText,
+                    tone,
+                })
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn initialize(&self, session_id: &str) -> Result<Vec<FrontendEvent>> {
@@ -327,6 +358,32 @@ impl Approval {
     }
 }
 
+fn approval_tools(calls: &[crate::protocol::ApprovalCall]) -> String {
+    calls
+        .iter()
+        .map(|call| format!("{} {}", call.name, preview_json(&call.arguments)))
+        .collect::<Vec<_>>()
+        .join("\n  ")
+}
+
+fn escalation_summary(reason: Option<ApprovalReviewEscalation>) -> &'static str {
+    match reason {
+        Some(ApprovalReviewEscalation::ReviewerAsked) => {
+            "The AI reviewer could not safely authorize these actions."
+        }
+        Some(ApprovalReviewEscalation::ReviewDataUnavailable) => {
+            "The AI reviewer could not build a bounded review from the recent intent."
+        }
+        Some(ApprovalReviewEscalation::ReviewerUnavailable) => {
+            "The AI reviewer was unavailable, so these actions need your approval."
+        }
+        Some(ApprovalReviewEscalation::InvalidResponse) => {
+            "The AI reviewer returned an invalid decision, so these actions need your approval."
+        }
+        None => "The AI reviewer could not authorize these actions.",
+    }
+}
+
 fn widget(policy: ApprovalPolicy) -> FrontendWidget {
     FrontendWidget {
         id: "approval_policy".into(),
@@ -430,6 +487,43 @@ mod tests {
         assert_eq!(block.title, "Approval required");
         assert!(block.text.starts_with("command execution\n"));
         assert!(!block.text.contains('[') && !block.text.contains(']'));
+    }
+
+    #[test]
+    fn automatic_review_rendering_updates_one_frontend_block() {
+        let approval = Approval::new(ApprovalPolicy::AutoApprove);
+        let event = |status, reason| {
+            EventMsg::ExecApprovalReview(crate::protocol::ExecApprovalReviewEvent {
+                id: "review".into(),
+                turn_id: "turn".into(),
+                calls: vec![crate::protocol::ApprovalCall {
+                    call_id: "call".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "git status"}),
+                }],
+                status,
+                reason,
+            })
+        };
+
+        let reviewing = approval
+            .render(&event(ApprovalReviewStatus::Reviewing, None))
+            .expect("reviewing block");
+        let approved = approval
+            .render(&event(ApprovalReviewStatus::Approved, None))
+            .expect("approved block");
+
+        assert_eq!(reviewing.id, approved.id);
+        assert_eq!(
+            reviewing.state,
+            crate::protocol::FrontendBlockState::Pending
+        );
+        assert_eq!(
+            approved.state,
+            crate::protocol::FrontendBlockState::Complete
+        );
+        assert_eq!(approved.title, "AI approved tools");
+        assert_eq!(approved.tone, FrontendTone::Success);
     }
 
     #[test]

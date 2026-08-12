@@ -41,7 +41,7 @@ use crate::middleware_manifest::{BuiltinMiddleware, MIDDLEWARE};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{
     MiddlewareConfig, ProviderAuthKind, ProviderConfig, ProviderModel, ProviderStatus,
-    ReasoningChoice,
+    ReasoningChoice, validate_session_id,
 };
 use crate::{Error, Result};
 
@@ -71,6 +71,9 @@ pub(crate) async fn assemble(
     origin_label: &str,
     override_saved_model_route: bool,
 ) -> Result<BuiltAgent> {
+    if let Some(session_id) = session_id.as_deref() {
+        validate_session_id(session_id)?;
+    }
     let gateway_config = gateway
         .lock()
         .map_err(|_| Error::Config("gateway configuration lock is poisoned".into()))?
@@ -167,9 +170,6 @@ pub(crate) async fn assemble(
         ..SessionContext::default()
     });
     if let Some(session_id) = session_id {
-        if session_id.trim().is_empty() || session_id.len() > 4 * 1024 {
-            return Err(Error::Config("session ID must be 1–4096 bytes".into()));
-        }
         agent_config = agent_config.session_id(session_id);
     }
     if override_saved_model_route {
