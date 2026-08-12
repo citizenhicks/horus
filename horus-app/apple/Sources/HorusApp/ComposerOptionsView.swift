@@ -366,7 +366,7 @@ struct ComposerOptionsView: View {
 
     private var approvalForeground: Color {
         guard let approvalValue else { return palette.muted }
-        switch approvalValue {
+        return switch approvalValue {
         case "ask": palette.muted
         case "full_access": palette.danger
         default: palette.warning
