@@ -609,15 +609,16 @@ struct PreviewTranscriptSheet: View {
                                     isLoading: model.isLoadingPreviewPage,
                                     isEnabled: !model.isLoadingPreviewPage
                                 ) {
-                                    retainedEntryID = currentPreview.entries.first?.id
+                                    retainedEntryID = currentPreview.entries.first?.presentationID
                                     model.loadPreviewPage(next)
                                 }
                                 .padding(.bottom, HorusSpace.m)
                             }
                             TranscriptRowsView(
-                                entries: currentPreview.entries,
-                                activeStepID: nil,
-                                breakBefore: retainedEntryID,
+                                projection: TranscriptProjection(
+                                    entries: currentPreview.entries,
+                                    breakBefore: retainedEntryID
+                                ),
                                 collapsesLongMessages: true
                             )
                         }
@@ -702,7 +703,7 @@ struct PreviewTranscriptSheet: View {
 
     private func loadEarlierPage() {
         guard let next = currentPreview.next, !model.isLoadingPreviewPage else { return }
-        retainedEntryID = currentPreview.entries.first?.id
+        retainedEntryID = currentPreview.entries.first?.presentationID
         model.loadPreviewPage(next)
     }
 

@@ -8,6 +8,7 @@ struct CachedTranscript: Codable, Sendable {
 
     private struct Entry: Codable, Sendable {
         let id: String
+        let presentationID: String?
         let text: String
         let kind: TranscriptEntry.Kind
         let capability: String?
@@ -26,6 +27,7 @@ struct CachedTranscript: Codable, Sendable {
 
         init(_ entry: TranscriptEntry) {
             id = entry.id
+            presentationID = entry.presentationID
             text = entry.text
             kind = entry.kind
             capability = entry.capability
@@ -46,6 +48,7 @@ struct CachedTranscript: Codable, Sendable {
         var transcriptEntry: TranscriptEntry {
             TranscriptEntry(
                 id: id,
+                presentationID: presentationID,
                 text: text,
                 kind: kind,
                 capability: capability,
@@ -100,6 +103,7 @@ struct CachedTranscript: Codable, Sendable {
         }
         for entry in entries {
             guard consume(entry.id),
+                  consume(entry.presentationID),
                   consume(entry.text),
                   consume(entry.capability),
                   consume(entry.title),

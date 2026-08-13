@@ -65,14 +65,16 @@ struct ChatView: View {
                 }
                 .accessibilityElement(children: .combine)
             }
-            // One group, so the two sit together rather than as separate items the bar
-            // spaces apart. Files moved into the options menu, which already carries it.
-            ToolbarItemGroup(placement: .primaryAction) {
-                newChatButton
-                ChatOptionsMenu(
-                    presentedWidget: $presentedWidget,
-                    showsAgentSettings: $showsChatAgentSettings
-                )
+            // One item holding both, so the spacing is this stack's rather than the bar's
+            // between two items. The 44pt targets still touch; only the slack goes.
+            ToolbarItem(placement: .primaryAction) {
+                HStack(spacing: 0) {
+                    newChatButton
+                    ChatOptionsMenu(
+                        presentedWidget: $presentedWidget,
+                        showsAgentSettings: $showsChatAgentSettings
+                    )
+                }
             }
         }
         .sheet(item: $model.presentedPreview, content: PreviewTranscriptSheet.init)
@@ -246,92 +248,51 @@ private struct ChatOptionsMenu: View {
     }
 }
 
-/// One row of the transcript: a single entry, or a run of events that share one summary.
-private struct TranscriptRowLayout: Identifiable {
-    let entries: [TranscriptEntry]
-    let topSpacing: CGFloat
-    let isLast: Bool
-
-    var id: String { entries.first?.id ?? "" }
-    /// Activity always rides behind the group summary, even a run of one: the timeline is the
-    /// narrative — the user, the agent's commentary, the answer — and everything else is a
-    /// count you can open.
-    var isEventGroup: Bool {
-        entries.first?.kind.isActivity ?? false
-    }
-}
-
-/// The waiting line's current state: when it started, and the order it rotates through.
-///
-/// It is a value rather than a view so the transcript can hand it to whichever row owns the
-/// bottom slot — the tail group's header, or a line of its own when there is no group yet.
-struct TranscriptWaitingPhrase: Equatable {
-    let startedAt: Date
-    let order: [String]
-}
-
 /// The transcript body shared by the full chat and read-only agent previews.
 /// Navigation, pagination, and composing controls stay with their owning surface.
+///
+/// The projection decides what a row is, what it is called, how it is sized and who holds the
+/// waiting line. This view only draws it.
 struct TranscriptRowsView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    let entries: [TranscriptEntry]
-    var activeStepID: String?
-    var breakBefore: String?
+    let projection: TranscriptProjection
+    var activeStepID: TranscriptPresentationID?
     var collapsesLongMessages = false
     var rowSpacing: CGFloat = 12
-    /// The live transcript passes the model's cached grouping; smaller one-off transcripts
-    /// (a preview sheet) group their own, where doing it per pass costs nothing.
-    var groupedEntries: [[TranscriptEntry]]?
-    /// Set when the transcript wants the last group's header to hold the waiting line.
-    var waiting: TranscriptWaitingPhrase?
 
     var body: some View {
-        ForEach(rows) { row in
-            Group {
-                if row.isEventGroup {
-                    EventGroupView(
-                        entries: row.entries,
-                        isActive: row.entries.contains { $0.id == activeStepID },
-                        waiting: row.isLast ? waiting : nil
-                    )
-                } else if let entry = row.entries.first {
-                    TranscriptRow(
-                        entry: entry,
-                        isActive: entry.id == activeStepID,
-                        collapsesLongMessages: collapsesLongMessages
-                    )
-                }
-            }
-            .id(row.id)
-            .padding(.top, row.topSpacing)
-            // A run of parallel tool calls arrives as one row with nothing before it, and a
-            // plain fade leaves the transcript looking bumped. Rising the last few points into
-            // place is the same entrance the waiting line makes, so the swap between them reads
-            // as one thing continuing rather than two things happening.
-            .transition(
-                reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 8))
-            )
+        ForEach(Array(projection.rows.enumerated()), id: \.element.id) { index, row in
+            self.row(row)
+                .id(row.id)
+                .padding(.top, index == 0 ? 0 : rowSpacing)
+                // A run of parallel tool calls arrives as one row with nothing before it, and
+                // a plain fade leaves the transcript looking bumped. Rising the last few
+                // points into place is the same entrance the waiting line makes, so the swap
+                // between them reads as one thing continuing rather than two things happening.
+                .transition(
+                    reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 8))
+                )
         }
-        // A fast turn lands rows faster than the eye tracks them. One animation on the entry
-        // count fades an arriving row in and glides the content above it, and covers a row
-        // turning into a group. Streaming deltas leave the count alone, so text still grows
-        // without a per-frame animation fighting the scroll anchor. The duration is the
-        // waiting note's: the first activity row of a turn replaces it in place.
-        .animation(
-            reduceMotion ? nil : .easeInOut(duration: TranscriptWaitingNote.crossfade),
-            value: entries.count
-        )
     }
 
-    private var rows: [TranscriptRowLayout] {
-        let grouped = groupedEntries
-            ?? TranscriptEntry.groupedRows(from: entries, breakBefore: breakBefore)
-        return grouped.enumerated().map { index, entries in
-            TranscriptRowLayout(
-                entries: entries,
-                topSpacing: index == 0 ? 0 : rowSpacing,
-                isLast: index == grouped.count - 1
+    @ViewBuilder
+    private func row(_ row: TranscriptPresentationRow) -> some View {
+        switch row.kind {
+        case .activityGroup:
+            EventGroupView(
+                entries: row.records,
+                isActive: row.records.contains { $0.presentationID == activeStepID },
+                waiting: projection.waiting.phrase(forRow: row.id)
             )
+        case .user, .narrative:
+            if let entry = row.records.first {
+                TranscriptRow(
+                    entry: entry,
+                    isUser: row.kind == .user,
+                    sizing: row.sizing,
+                    collapsesLongMessages: collapsesLongMessages
+                )
+            }
         }
     }
 }
@@ -365,19 +326,40 @@ struct TranscriptPaginationButton: View {
     }
 }
 
+/// Who is allowed to move the transcript, and why.
+///
+/// The bottom anchor and an explicit `scrollTo` both correct the same offset, so leaving both
+/// live means the visible result is whichever ran last. Exactly one is active per mode.
+private enum TranscriptScrollMode {
+    /// The session is opening: explicit scrolls only, until the content settles.
+    case openingAtLatest
+    /// Parked at the end. The bottom anchor follows content growth; nothing else scrolls.
+    case followingTail
+    /// The reader is somewhere else. Nothing follows, and structure lands without animation.
+    case freeScrolling
+    /// A page of history was prepended. The previously visible row is restored, not the tail.
+    case restoringHistory
+
+    var followsContentGrowth: Bool { self == .followingTail }
+    /// Stream-driven movement animates only when the reader is parked and at rest. An
+    /// invisible correction made visible is the lurch this avoids.
+    var animatesStructure: Bool { self == .followingTail }
+}
+
 private struct TranscriptView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let bottomInset: CGFloat
     @Binding var isAtBottom: Bool
     let scrollToBottomRequest: Int
     // A restored transcript lands after the scroll view exists, so an initial-offset anchor
     // resolves against empty content. A bottom-edge scroll position survives the late fill.
     @State private var position = ScrollPosition(edge: .bottom)
-    @State private var historyAnchorID: String?
+    @State private var historyAnchorID: TranscriptPresentationID?
+    @State private var scrollMode = TranscriptScrollMode.openingAtLatest
     @State private var waitingSince: Date?
     @State private var waitingHold: Task<Void, Never>?
     @State private var waitingOrder = TranscriptWaitingNote.messages
-    @State private var waitingHeldByGroup = false
     private let rowSpacing: CGFloat = 12
     private let contentPadding: CGFloat = 16
 
@@ -403,23 +385,21 @@ private struct TranscriptView: View {
                     )
                     .padding(.bottom, rowSpacing)
                 }
-                TranscriptRowsView(
-                    entries: model.displayedTranscript,
-                    activeStepID: model.activeTranscriptStepID,
-                    breakBefore: historyAnchorID,
-                    rowSpacing: rowSpacing,
-                    groupedEntries: model.transcriptRows(breakBefore: historyAnchorID),
-                    waiting: waitingHeldByGroup ? waitingPhrase : nil
-                )
+                Group {
+                    TranscriptRowsView(
+                        projection: projection,
+                        activeStepID: model.activeTranscriptStepID,
+                        rowSpacing: rowSpacing
+                    )
+                    TranscriptTailView(slot: projection.waiting, topSpacing: rowSpacing)
+                }
+                // Structure only. Text deltas and a summary counting up inside its fixed slot
+                // leave the revision alone, so streaming never animates the page. This scope
+                // includes the standalone tail line, but not unrelated queued-message widgets.
+                .animation(structuralAnimation, value: projection.structuralRevision)
                 ForEach(model.transcriptTailWidgets) { widget in
                     QueuedMessageView(widget: widget)
                         .padding(.top, rowSpacing)
-                }
-                if showsTailSlot {
-                    TranscriptWaitingNoteView(
-                        phrase: waitingHeldByGroup ? nil : waitingPhrase,
-                        topSpacing: rowSpacing
-                    )
                 }
                 Color.clear.frame(height: max(1, bottomInset))
             }
@@ -433,7 +413,12 @@ private struct TranscriptView: View {
         // its backdrop the same way, which is why only the chat showed the cut.
         .background(HorusBackdrop())
         .scrollPosition($position)
-        .defaultScrollAnchor(.bottom, for: .sizeChanges)
+        // The one automatic mechanism, and only while parked at the end. Off, growth lands
+        // below the fold and the reader keeps their place.
+        .defaultScrollAnchor(
+            scrollMode.followsContentGrowth ? .bottom : nil,
+            for: .sizeChanges
+        )
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(.interactively)
         .refreshable { loadEarlierHistory() }
@@ -444,24 +429,32 @@ private struct TranscriptView: View {
         }
         // Measured against the furthest reachable offset, including the bottom inset:
         // comparing the visible rect to the content height never reads as "at bottom".
-        .onScrollGeometryChange(for: Bool.self) { geometry in
-            // The visible rect covers the toolbar inset that `containerSize` leaves out, so it is
-            // the only measure that reaches the content height at rest.
-            return geometry.visibleRect.maxY >= geometry.contentSize.height - 24
-        } action: { _, atBottom in
+        .onScrollGeometryChange(for: Bool.self) { Self.atBottom($0) } action: { _, atBottom in
             isAtBottom = atBottom
         }
+        // The reader's own intent, and the only thing that takes the transcript out of
+        // following. A drag ends the follow; coming to rest at the end restores it.
+        .onScrollPhaseChange { _, phase, context in
+            guard scrollMode != .restoringHistory else { return }
+            if scrollMode == .openingAtLatest {
+                if phase == .tracking || phase == .interacting || phase == .decelerating {
+                    scrollMode = .freeScrolling
+                }
+                return
+            }
+            scrollMode = phase == .idle && Self.atBottom(context.geometry)
+                ? .followingTail
+                : .freeScrolling
+        }
         .onChange(of: scrollToBottomRequest) {
+            scrollMode = .followingTail
             withAnimation(.easeOut(duration: 0.2)) { position.scrollTo(edge: .bottom) }
         }
-        // Streaming deltas land several times per frame, which is more often than `onChange` may
-        // fire. Growing content is what `defaultScrollAnchor(.bottom, for: .sizeChanges)` follows,
-        // so only a new row needs an explicit scroll.
-        .onChange(of: model.displayedTranscript.count) { followTranscript() }
-        .onChange(of: model.displayedTranscript.first?.id) { previous, _ in
+        .onChange(of: model.displayedTranscript.first?.presentationID) { previous, _ in
             guard let historyAnchorID, historyAnchorID == previous else { return }
-            position.scrollTo(id: historyAnchorID, anchor: .top)
+            restoreHistoryAnchor()
         }
+        .onChange(of: model.historyLoadCompletionRevision) { restoreHistoryAnchor() }
         .onChange(of: model.selectedSessionID) { historyAnchorID = nil }
         .task(id: model.selectedSessionID) { await openAtLatest() }
         .onChange(of: model.isWaitingForModel, initial: true) { _, waiting in
@@ -473,49 +466,29 @@ private struct TranscriptView: View {
         }
     }
 
-    private var waitingPhrase: TranscriptWaitingPhrase? {
-        waitingSince.map { TranscriptWaitingPhrase(startedAt: $0, order: waitingOrder) }
-    }
-
-    /// A waiting turn owns one activity line at the tail, whether or not it has anything to
-    /// say there yet.
-    ///
-    /// Otherwise the first step of a run arrives into no space at all: the row's height is
-    /// allocated in the frame it appears, so the transcript is yanked up 42 points while the
-    /// row itself is still fading in. Holding the line open means the step lands in a slot
-    /// that already exists and only the text inside it changes.
-    private var showsTailSlot: Bool {
-        TranscriptWaitingNote.showsStandaloneSlot(
-            isWaiting: model.isWaitingForModel,
-            groupHoldsPhrase: groupHoldsWaitingPhrase,
-            phraseIsHeldByGroup: waitingSince != nil && waitingHeldByGroup
+    private var projection: TranscriptProjection {
+        model.transcriptProjection(
+            breakBefore: historyAnchorID,
+            waitingPhrase: waitingPhrase
         )
     }
 
-    /// Once the turn has a group at the tail, the gap between steps belongs to that row: the
-    /// phrase takes over its summary rather than appearing below it and moving the transcript.
-    ///
-    /// Read once, when the phrase appears, and held in `waitingHeldByGroup` until it leaves.
-    /// What ends a wait is a row arriving, which is also what flips this answer — left live,
-    /// the phrase changes slot on its way out and carries a row's height with it, out and
-    /// back, inside a third of a second.
-    private var groupHoldsWaitingPhrase: Bool {
-        guard model.transcriptTailWidgets.isEmpty,
-              model.displayedTranscript.last?.kind.isActivity == true,
-              let lastGroup = model.transcriptRows(breakBefore: historyAnchorID).last
-        else { return false }
-        return lastGroup.contains { !$0.title.isEmpty || !$0.text.isEmpty }
+    private var waitingPhrase: TranscriptWaitingPhrase? {
+        guard model.isWaitingForModel, let waitingSince else { return nil }
+        return TranscriptWaitingPhrase(startedAt: waitingSince, order: waitingOrder)
     }
 
-    /// Appearance is deliberately sticky: steps land a few hundred milliseconds apart in a busy
-    /// turn, so the raw condition flickers several times a second and the phrase waits before
-    /// showing, which is the difference between a status line and a strobe. It leaves without a
-    /// delay, because what ends the wait always lands in the slot the phrase is holding.
+    private var structuralAnimation: Animation? {
+        guard !reduceMotion, scrollMode.animatesStructure else { return nil }
+        return .easeInOut(duration: TranscriptWaitingNote.crossfade)
+    }
+
+    /// Steps land a few hundred milliseconds apart in a busy turn, so the phrase waits before
+    /// appearing instead of strobing between them. It leaves without a delay once work resumes.
     private func rescheduleWaitingPhrase(_ waiting: Bool) {
         waitingHold?.cancel()
-        let fade = Animation.easeInOut(duration: TranscriptWaitingNote.crossfade)
         guard waiting else {
-            withAnimation(fade) { waitingSince = nil }
+            waitingSince = nil
             return
         }
         guard waitingSince == nil else { return }
@@ -523,8 +496,7 @@ private struct TranscriptView: View {
             try? await Task.sleep(for: .seconds(TranscriptWaitingNote.appearAfter))
             guard !Task.isCancelled else { return }
             waitingOrder.shuffle()
-            waitingHeldByGroup = groupHoldsWaitingPhrase
-            withAnimation(fade) { waitingSince = Date() }
+            waitingSince = Date()
         }
     }
 
@@ -532,22 +504,40 @@ private struct TranscriptView: View {
     /// lands short on a long transcript. Re-assert until the content settles, or the reader scrolls.
     private func openAtLatest() async {
         isAtBottom = true
+        scrollMode = .openingAtLatest
+        defer { if scrollMode == .openingAtLatest { scrollMode = .followingTail } }
         for _ in 0..<20 {
+            guard scrollMode == .openingAtLatest else { return }
             position.scrollTo(edge: .bottom)
             try? await Task.sleep(for: .milliseconds(100))
-            if isAtBottom || position.isPositionedByUser { return }
+            guard scrollMode == .openingAtLatest else { return }
+            if position.isPositionedByUser {
+                scrollMode = .freeScrolling
+                return
+            }
+            if isAtBottom { return }
         }
-    }
-
-    private func followTranscript() {
-        guard isAtBottom || (model.activeTurnID != nil && !position.isPositionedByUser) else { return }
-        position.scrollTo(edge: .bottom)
     }
 
     private func loadEarlierHistory() {
         guard model.canLoadEarlierHistory else { return }
-        historyAnchorID = model.displayedTranscript.first?.id
+        historyAnchorID = model.displayedTranscript.first?.presentationID
+        scrollMode = .restoringHistory
         model.loadEarlierHistory()
+    }
+
+    private func restoreHistoryAnchor() {
+        guard scrollMode == .restoringHistory else { return }
+        if let historyAnchorID {
+            position.scrollTo(id: historyAnchorID, anchor: .top)
+        }
+        scrollMode = .freeScrolling
+    }
+
+    private static func atBottom(_ geometry: ScrollGeometry) -> Bool {
+        // The visible rect covers the toolbar inset that `containerSize` leaves out, so it is
+        // the only measure that reaches the content height at rest.
+        geometry.visibleRect.maxY >= geometry.contentSize.height - 24
     }
 
     private var emptyState: some View {
@@ -577,43 +567,33 @@ private struct TranscriptLoadingView: View {
 private struct TranscriptRow: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
-    @State private var isHovered = false
     let entry: TranscriptEntry
-    let isActive: Bool
+    /// Activity never reaches this view: a run is a group row, whatever its length. The
+    /// projection sends only what the reader wrote and what the agent said back.
+    let isUser: Bool
+    let sizing: TranscriptRowSizing
     var collapsesLongMessages = false
 
     var body: some View {
-        Group {
-            if hasMessageActions {
-                VStack(alignment: actionAlignment, spacing: 0) {
-                    content
-                    if hasInlineControls {
-                        controls
-                            .opacity(inlineControlsVisible ? 1 : 0)
-                            .allowsHitTesting(inlineControlsVisible)
-                            .accessibilityHidden(!inlineControlsVisible)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: frameAlignment)
-                .animation(.easeOut(duration: 0.12), value: isHovered)
-            } else {
-                content
-            }
+        VStack(alignment: isUser ? .trailing : .leading, spacing: 0) {
+            content
+            // The reader's own message carries its actions in the context menu; the agent's
+            // carries them under the text, where they are always available.
+            if !isUser { controls }
         }
+        .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
         .contentShape(Rectangle())
-        .onHover { isHovered = $0 }
         .contextMenu { transcriptActions }
     }
 
     @ViewBuilder
     private var content: some View {
-        switch entry.kind {
-        case .user:
+        if isUser {
             HStack {
                 Spacer(minLength: 42)
                 UserMessageContent(entry: entry)
             }
-        case .assistant, .commentary:
+        } else {
             VStack(alignment: .leading, spacing: HorusSpace.s) {
                 TranscriptFileCards(files: entry.files)
                 if !entry.text.isEmpty {
@@ -630,23 +610,13 @@ private struct TranscriptRow: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            // Both kinds can land whole rather than stream — a short commentary between steps,
-            // a final message the gateway sends in one piece — and text that appears all at
-            // once is the thing this smooths over.
+            // Commentary and a final message can both land whole rather than stream, and text
+            // that appears all at once is what this smooths over.
             .horusStreamingReveal(
                 count: entry.text.count,
-                active: isAssistantMessage,
+                active: sizing == .revealedIntrinsic,
                 live: model.isLiveTranscriptEntry(entry)
             )
-        case .reasoning:
-            ReasoningLine(entry: entry, isActive: isActive)
-        case .event, .error:
-            VStack(alignment: .leading, spacing: HorusSpace.s) {
-                TranscriptFileCards(files: entry.files)
-                if !entry.title.isEmpty || !entry.text.isEmpty {
-                    EventLine(entry: entry, isActive: isActive)
-                }
-            }
         }
     }
 
@@ -671,45 +641,19 @@ private struct TranscriptRow: View {
 
     @ViewBuilder
     private var transcriptActions: some View {
-        if hasMessageActions {
-            Button("Copy", glyph: .copy) { copyToPasteboard(entry.text) }
-            if let target = entry.messageTarget {
-                ForEach(model.messageActionWidgets) { widget in
-                    Button(widget.widget.text, glyph: messageActionGlyph(widget)) {
-                        model.submitMessageAction(widget, target: target)
-                    }
-                    .disabled(!model.canModifySelectedSession)
+        Button("Copy", glyph: .copy) { copyToPasteboard(entry.text) }
+        if let target = entry.messageTarget {
+            ForEach(model.messageActionWidgets) { widget in
+                Button(widget.widget.text, glyph: messageActionGlyph(widget)) {
+                    model.submitMessageAction(widget, target: target)
                 }
+                .disabled(!model.canModifySelectedSession)
             }
         }
     }
 
     private func messageActionGlyph(_ widget: MountedWidget) -> HorusGlyph {
         widget.widget.symbol.map { HorusSymbol.glyph(for: $0) } ?? .dotsThree
-    }
-
-    private var hasMessageActions: Bool {
-        entry.kind == .user || isAssistantMessage
-    }
-
-    private var hasInlineControls: Bool {
-        isAssistantMessage
-    }
-
-    private var inlineControlsVisible: Bool {
-        isAssistantMessage || isHovered
-    }
-
-    private var isAssistantMessage: Bool {
-        entry.kind == .assistant || entry.kind == .commentary
-    }
-
-    private var actionAlignment: HorizontalAlignment {
-        entry.kind == .user ? .trailing : .leading
-    }
-
-    private var frameAlignment: Alignment {
-        entry.kind == .user ? .trailing : .leading
     }
 }
 
@@ -1019,6 +963,11 @@ private struct MessageActionButton: View {
 private struct EventGroupView: View {
     @Environment(\.horusPalette) private var palette
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// One line, whatever it says. A count climbing from 1 to 47, an icon swapping, the
+    /// waiting phrase taking the summary's place: none of it changes the row's height.
+    /// Scaled rather than fixed, because `.footnote` grows with Dynamic Type and a hard 30pt
+    /// clips it at accessibility sizes.
+    @ScaledMetric(relativeTo: .footnote) private var summaryHeight = HorusStyle.rowRegular
     @State private var isExpanded = false
     let entries: [TranscriptEntry]
     let isActive: Bool
@@ -1043,7 +992,7 @@ private struct EventGroupView: View {
                 .accessibilityHint(isExpanded ? "Collapses the steps" : "Expands the steps")
                 if isExpanded {
                     VStack(alignment: .leading, spacing: HorusSpace.xxs) {
-                        ForEach(lines) { entry in
+                        ForEach(lines, id: \.presentationID) { entry in
                             if entry.kind == .reasoning {
                                 ReasoningLine(entry: entry, isActive: false)
                             } else {
@@ -1085,12 +1034,12 @@ private struct EventGroupView: View {
             Spacer(minLength: HorusSpace.s)
             HorusIcon(.caretUpDown, size: HorusStyle.glyphMark, foreground: palette.muted)
         }
-        .frame(minHeight: HorusStyle.rowRegular)
+        .frame(minHeight: summaryHeight)
         .contentShape(Rectangle())
     }
 
     private var lines: [TranscriptEntry] {
-        entries.filter { !$0.title.isEmpty || !$0.text.isEmpty }
+        entries.filter(\.hasActivityLineContent)
     }
 
     /// Two events in a run can carry the same file, and `ForEach` needs the ids unique.
@@ -1189,20 +1138,27 @@ private struct TranscriptWaitingPhraseText: View {
     }
 }
 
-/// The waiting line on a row of its own, for the part of a turn that has no group yet.
-private struct TranscriptWaitingNoteView: View {
+/// The bottom of the transcript, as one view with one state.
+///
+/// The waiting line used to be a row that appeared and disappeared while a group header
+/// separately took the phrase over, which meant two views trading a slot and a row's height
+/// moving with them. The projection now says which state the tail is in; this draws it.
+private struct TranscriptTailView: View {
     @Environment(\.horusPalette) private var palette
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    /// Absent is a valid state, and the point of the view: the line keeps its height so the
-    /// group that lands next takes a slot that already exists.
-    let phrase: TranscriptWaitingPhrase?
+    /// `.footnote` scales with Dynamic Type, so a hard 30pt clips the line at accessibility
+    /// sizes. The summary slot and this line share the metric and stay the same height.
+    @ScaledMetric(relativeTo: .footnote) private var lineHeight = HorusStyle.rowRegular
+    let slot: TranscriptWaitingSlot
     /// Owned rather than applied by the transcript: padding outside the condition reserves
-    /// the gap while the note is hidden, and the arriving row then lands 12pt low.
+    /// the gap while the line is absent, and the arriving row then lands 12pt low.
     let topSpacing: CGFloat
 
     var body: some View {
-        HStack(spacing: HorusSpace.s) {
-            if let phrase {
+        Group {
+            // The other cases belong to a row: its summary is its own, and the phrase, when a
+            // row holds it, is drawn inside that row's header.
+            if case .standaloneLine(let phrase) = slot {
                 HStack(spacing: HorusSpace.s) {
                     HorusIcon(
                         .neuralNetwork,
@@ -1211,23 +1167,15 @@ private struct TranscriptWaitingNoteView: View {
                     )
                     TranscriptWaitingPhraseText(phrase: phrase)
                 }
-                .transition(.opacity)
+                .frame(maxWidth: .infinity, minHeight: lineHeight, alignment: .leading)
+                .padding(.top, topSpacing)
+                .transition(
+                    reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 8))
+                )
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Waiting for the model")
             }
         }
-        .animation(
-            reduceMotion ? nil : .easeInOut(duration: TranscriptWaitingNote.crossfade),
-            value: phrase == nil
-        )
-        // The group header's height, so the row that replaces this one lands on the same
-        // baseline and the swap reads as one line changing rather than two rows trading places.
-        .frame(maxWidth: .infinity, minHeight: HorusStyle.rowRegular, alignment: .leading)
-        .padding(.top, topSpacing)
-        .transition(
-            reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 8))
-        )
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Waiting for the model")
-        .accessibilityHidden(phrase == nil)
     }
 }
 

@@ -387,6 +387,7 @@ final class TranscriptEntry: Identifiable {
     }
 
     let id: String
+    let presentationID: String
     var text: String
     var kind: Kind
     var capability: String?
@@ -406,6 +407,7 @@ final class TranscriptEntry: Identifiable {
 
     init(
         id: String,
+        presentationID: String? = nil,
         text: String,
         kind: Kind,
         capability: String? = nil,
@@ -424,6 +426,7 @@ final class TranscriptEntry: Identifiable {
         files: [SessionFileReference] = []
     ) {
         self.id = id
+        self.presentationID = presentationID ?? id
         self.text = text
         self.kind = kind
         self.capability = capability
@@ -449,10 +452,182 @@ extension TranscriptEntry.Kind {
     var isActivity: Bool {
         self == .event || self == .error || self == .reasoning
     }
+
+    var narrativePhase: String? {
+        switch self {
+        case .assistant: "final_answer"
+        case .commentary: "commentary"
+        case .reasoning: "reasoning"
+        case .user, .event, .error: nil
+        }
+    }
+}
+
+extension TranscriptEntry {
+    var hasActivityLineContent: Bool { !title.isEmpty || !text.isEmpty }
+}
+
+typealias TranscriptPresentationID = String
+
+enum TranscriptRowSizing: Equatable {
+    case fixedSummary
+    case intrinsic
+    case revealedIntrinsic
+}
+
+struct TranscriptPresentationRow: Identifiable {
+    enum Kind: Equatable {
+        case user
+        case narrative
+        case activityGroup
+    }
+
+    let id: TranscriptPresentationID
+    let records: [TranscriptEntry]
+    let sizing: TranscriptRowSizing
+    let kind: Kind
+}
+
+struct TranscriptWaitingPhrase: Equatable {
+    let startedAt: Date
+    let order: [String]
+}
+
+/// Where the waiting phrase is drawn, if anywhere.
+///
+/// A run at the tail shows it in place of its summary, so a gap between steps costs no
+/// height. With no run to hold it — the turn has only just started, or a message is the last
+/// thing on screen — it takes a line of its own, which the next run then replaces.
+enum TranscriptWaitingSlot: Equatable {
+    case absent
+    case standaloneLine(TranscriptWaitingPhrase)
+    case row(TranscriptPresentationID, TranscriptWaitingPhrase)
+
+    var isStandaloneLine: Bool {
+        if case .standaloneLine = self { return true }
+        return false
+    }
+
+    func phrase(forRow id: TranscriptPresentationID) -> TranscriptWaitingPhrase? {
+        guard case .row(id, let phrase) = self else { return nil }
+        return phrase
+    }
+}
+
+struct TranscriptProjection {
+    let rows: [TranscriptPresentationRow]
+    let waiting: TranscriptWaitingSlot
+    let structuralRevision: UInt64
+
+    private struct RowStructure: Equatable {
+        let id: TranscriptPresentationID
+        let sizing: TranscriptRowSizing
+        let kind: TranscriptPresentationRow.Kind
+    }
+
+    private struct Structure: Equatable {
+        let rows: [RowStructure]
+        /// The standalone line is a row's worth of height, so it belongs to the structure.
+        /// The phrase rotating inside it does not.
+        let showsStandaloneLine: Bool
+    }
+
+    private let structure: Structure
+
+    init(
+        entries: [TranscriptEntry],
+        breakBefore boundaryID: TranscriptPresentationID? = nil,
+        waitingPhrase: TranscriptWaitingPhrase? = nil,
+        previous: TranscriptProjection? = nil
+    ) {
+        let rows = Self.rows(from: entries, breakBefore: boundaryID)
+        let waiting = Self.waitingSlot(
+            for: waitingPhrase,
+            rows: rows
+        )
+        let structure = Structure(
+            rows: rows.map { RowStructure(id: $0.id, sizing: $0.sizing, kind: $0.kind) },
+            showsStandaloneLine: waiting.isStandaloneLine
+        )
+        let structuralRevision: UInt64
+        if let previous {
+            structuralRevision = previous.structure == structure
+                ? previous.structuralRevision
+                : previous.structuralRevision &+ 1
+        } else {
+            structuralRevision = structure.rows.isEmpty && !structure.showsStandaloneLine ? 0 : 1
+        }
+
+        self.rows = rows
+        self.waiting = waiting
+        self.structuralRevision = structuralRevision
+        self.structure = structure
+    }
+
+    /// Only the current tail can own the phrase, and only when it has a visible summary header.
+    /// File-only groups keep their cards in the row while the phrase uses the standalone slot.
+    private static func waitingSlot(
+        for phrase: TranscriptWaitingPhrase?,
+        rows: [TranscriptPresentationRow]
+    ) -> TranscriptWaitingSlot {
+        guard let phrase else { return .absent }
+        guard let tailRun = rows.last,
+              tailRun.kind == .activityGroup,
+              tailRun.records.contains(where: { $0.hasActivityLineContent })
+        else {
+            return .standaloneLine(phrase)
+        }
+        return .row(tailRun.id, phrase)
+    }
+
+    private static func rows(
+        from entries: [TranscriptEntry],
+        breakBefore boundaryID: TranscriptPresentationID?
+    ) -> [TranscriptPresentationRow] {
+        var rows: [TranscriptPresentationRow] = []
+        var activity: [TranscriptEntry] = []
+
+        func appendActivity() {
+            guard let first = activity.first else { return }
+            rows.append(TranscriptPresentationRow(
+                id: first.presentationID,
+                records: activity,
+                sizing: .fixedSummary,
+                kind: .activityGroup
+            ))
+            activity = []
+        }
+
+        for entry in entries {
+            if entry.presentationID == boundaryID { appendActivity() }
+            if entry.kind.isActivity {
+                activity.append(entry)
+                continue
+            }
+            appendActivity()
+            let isUser = entry.kind == .user
+            rows.append(TranscriptPresentationRow(
+                id: entry.presentationID,
+                records: [entry],
+                sizing: isUser ? .intrinsic : .revealedIntrinsic,
+                kind: isUser ? .user : .narrative
+            ))
+        }
+        appendActivity()
+        return rows
+    }
 }
 
 /// Typed transcript presentation supplied by the framework.
 extension TranscriptEntry {
+    static func narrativePresentationID(
+        modelStepID: String,
+        phase: String,
+        ordinal: Int
+    ) -> String {
+        "\(modelStepID):\(phase):\(ordinal)"
+    }
+
     var headline: String { title }
 
     /// Everything under the heading — the tool output the one-line row hides.
@@ -463,38 +638,6 @@ extension TranscriptEntry {
     /// Hosted web search is identified by its protocol role, independent of title or owner.
     var isWebSearch: Bool {
         role == .webSearch
-    }
-
-    /// Consecutive activity shares one visual row. The user's message, commentary, and the
-    /// final message are the narrative, so they always stand alone; everything that happens
-    /// between them — reasoning included, any role, any capability — joins the run around it.
-    static func groupedRows(
-        from entries: [TranscriptEntry],
-        breakBefore boundaryID: String? = nil
-    ) -> [[TranscriptEntry]] {
-        var rows: [[TranscriptEntry]] = []
-        var activity: [TranscriptEntry] = []
-
-        func flushActivity() {
-            guard !activity.isEmpty else { return }
-            rows.append(activity)
-            activity = []
-        }
-
-        for entry in entries {
-            if let boundaryID, entry.id == boundaryID {
-                flushActivity()
-            }
-
-            if entry.kind.isActivity {
-                activity.append(entry)
-            } else {
-                flushActivity()
-                rows.append([entry])
-            }
-        }
-        flushActivity()
-        return rows
     }
 
     /// "2 thoughts • 3 tool calls • 4 web searches • 1 approval • 2 events • 1 error", skipping
@@ -541,14 +684,13 @@ extension TranscriptEntry {
     }
 }
 
-/// What makes a set of grouped transcript rows stale. Structure only: text deltas mutate
-/// entries in place and leave the grouping alone.
-private struct TranscriptRowsKey: Equatable {
+private struct TranscriptProjectionKey: Equatable {
     let version: Int
     let count: Int
     let boundaryID: String?
     let firstID: String?
     let lastID: String?
+    let waitingPhrase: TranscriptWaitingPhrase?
 }
 
 private struct BufferedAgentEvent {
@@ -687,12 +829,14 @@ final class AppModel {
     var sessionToDelete: SessionRecord?
     private(set) var unreadSessionIDs: Set<String> = []
     var transcript: [TranscriptEntry] = [] {
-        didSet { invalidateTranscriptRows() }
+        didSet { invalidateTranscriptProjection() }
     }
     private var replayPresentedTranscript: [TranscriptEntry]? {
-        didSet { invalidateTranscriptRows() }
+        didSet { invalidateTranscriptProjection() }
     }
-    private var visibleTranscriptLimit = 300
+    private var visibleTranscriptLimit = 300 {
+        didSet { invalidateTranscriptProjection() }
+    }
     /// The gateway rejects history requests outside 1...100 events per page.
     private let historyPageSize = 100
     var displayedTranscript: [TranscriptEntry] {
@@ -708,7 +852,7 @@ final class AppModel {
               latest.pending,
               [.reasoning, .event, .error].contains(latest.kind)
         else { return nil }
-        return latest.id
+        return latest.presentationID
     }
     /// The turn is running with nothing pending, so no row is shimmering and the transcript
     /// would otherwise sit still while the model decides what to do next.
@@ -739,6 +883,7 @@ final class AppModel {
         return opensAnotherSession || (replayPresentedTranscript ?? transcript).isEmpty
     }
     private(set) var isLoadingEarlierHistory = false
+    private(set) var historyLoadCompletionRevision = 0
     var hasEarlierHistory: Bool {
         let source = replayPresentedTranscript ?? transcript
         return source.count > visibleTranscriptLimit
@@ -755,8 +900,9 @@ final class AppModel {
     var composer = "" {
         didSet { scheduleComposerDraftSave() }
     }
-    @ObservationIgnored private var transcriptRowsCache: (key: TranscriptRowsKey, rows: [[TranscriptEntry]])?
-    @ObservationIgnored private var transcriptRowsVersion = 0
+    @ObservationIgnored private var transcriptProjectionCache:
+        (key: TranscriptProjectionKey, projection: TranscriptProjection)?
+    @ObservationIgnored private var transcriptProjectionVersion = 0
     private(set) var composerFocusRequest = 0
     /// Counterpart to `composerFocusRequest`: the composer owns the focus state, so anything
     /// outside it that needs the keyboard gone asks rather than reaching in.
@@ -1208,30 +1354,37 @@ final class AppModel {
         composerBlurRequest &+= 1
     }
 
-    /// Grouped transcript rows, computed once per structural change rather than per frame.
-    ///
-    /// The transcript view rebuilds many times a second while a turn streams, and grouping
-    /// allocated a fresh array per row on every pass. Text deltas mutate entries in place and
-    /// never change the grouping, so the key tracks structure only: the count and the end ids
-    /// catch appends, replacements and session switches, and `transcriptRowsVersion` covers
-    /// the in-place kind and role changes those cannot see.
-    func transcriptRows(breakBefore boundaryID: String?) -> [[TranscriptEntry]] {
+    /// The stable presentation consumed by ChatView. Wire identity and reduction stay below
+    /// this boundary; text deltas keep the cached row objects, while structural changes are
+    /// projected once and receive one revision.
+    func transcriptProjection(
+        breakBefore boundaryID: TranscriptPresentationID?,
+        waitingPhrase: TranscriptWaitingPhrase? = nil
+    ) -> TranscriptProjection {
         let source = displayedTranscript
-        let key = TranscriptRowsKey(
-            version: transcriptRowsVersion,
+        let key = TranscriptProjectionKey(
+            version: transcriptProjectionVersion,
             count: source.count,
             boundaryID: boundaryID,
-            firstID: source.first?.id,
-            lastID: source.last?.id
+            firstID: source.first?.presentationID,
+            lastID: source.last?.presentationID,
+            waitingPhrase: waitingPhrase
         )
-        if let cached = transcriptRowsCache, cached.key == key { return cached.rows }
-        let rows = TranscriptEntry.groupedRows(from: source, breakBefore: boundaryID)
-        transcriptRowsCache = (key, rows)
-        return rows
+        if let cached = transcriptProjectionCache, cached.key == key {
+            return cached.projection
+        }
+        let projection = TranscriptProjection(
+            entries: source,
+            breakBefore: boundaryID,
+            waitingPhrase: waitingPhrase,
+            previous: transcriptProjectionCache?.projection
+        )
+        transcriptProjectionCache = (key, projection)
+        return projection
     }
 
-    private func invalidateTranscriptRows() {
-        transcriptRowsVersion &+= 1
+    private func invalidateTranscriptProjection() {
+        transcriptProjectionVersion &+= 1
     }
 
     /// Starts the on-device rewrite with the submitted first message. The task is stored,
@@ -1801,6 +1954,7 @@ final class AppModel {
         let source = replayPresentedTranscript ?? transcript
         if source.count > visibleTranscriptLimit {
             visibleTranscriptLimit = min(source.count, visibleTranscriptLimit + 300)
+            historyLoadCompletionRevision &+= 1
             return
         }
         guard let sessionID = selectedSessionID,
@@ -1816,9 +1970,15 @@ final class AppModel {
             maxEvents: historyPageSize
         )) { [weak self] _ in
             guard self?.historyRequestID == id else { return }
-            self?.historyRequestID = nil
-            self?.isLoadingEarlierHistory = false
+            self?.finishHistoryLoad()
         }
+    }
+
+    private func finishHistoryLoad() {
+        let wasLoading = historyRequestID != nil || isLoadingEarlierHistory
+        historyRequestID = nil
+        isLoadingEarlierHistory = false
+        if wasLoading { historyLoadCompletionRevision &+= 1 }
     }
 
     func restoreSession(_ sessionID: String) {
@@ -3060,10 +3220,9 @@ final class AppModel {
             let nextBeforeSequence
         ):
             guard requestID == historyRequestID, sessionID == selectedSessionID else { break }
-            historyRequestID = nil
-            isLoadingEarlierHistory = false
             mergeHistory(records)
             self.nextHistoryBeforeSequence = nextBeforeSequence
+            finishHistoryLoad()
         case .sessionChanged(let payload):
             guard payload.session.sessionId == selectedSessionID,
                   payload.config.revision >= (agentSnapshot?.revision ?? 0)
@@ -3630,8 +3789,7 @@ final class AppModel {
 
     private func handleRejected(_ rejection: GatewayRejection) {
         if rejection.requestId == historyRequestID {
-            historyRequestID = nil
-            isLoadingEarlierHistory = false
+            finishHistoryLoad()
         }
         if rejection.requestId == previewPageRequestID {
             previewPageRequestID = nil
@@ -3887,6 +4045,7 @@ final class AppModel {
                 completeStream(
                     text: event.msg["message"]?.stringValue ?? "",
                     kind: kind,
+                    modelStepID: event.msg["modelStepId"]?.stringValue,
                     messageTarget: messageTarget(from: event.msg),
                     sourceSequence: record.sequence,
                     recordedAtMs: record.recordedAtMs
@@ -4087,9 +4246,9 @@ final class AppModel {
             let previousUpdate = entries[index].update
             // Grouping keys off kind and role, and both can change on an entry that is
             // already on screen — an event turning into an error keeps its id. The row
-            // cache cannot see that from the array alone, so it is told here.
+            // projection cannot see that from the array alone, so it is told here.
             if entries[index].kind != kind || entries[index].role != block.role {
-                invalidateTranscriptRows()
+                invalidateTranscriptProjection()
             }
             entries[index].text = appending ? entries[index].text + block.text : block.text
             entries[index].kind = kind
@@ -4227,6 +4386,8 @@ final class AppModel {
         kind: TranscriptEntry.Kind,
         tone: String = "neutral",
         id: String? = nil,
+        presentationID: String? = nil,
+        modelStepID: String? = nil,
         sourceSequence: UInt64? = nil,
         recordedAtMs: Int64? = nil,
         messageTarget: MessageTarget? = nil,
@@ -4237,6 +4398,8 @@ final class AppModel {
             kind: kind,
             tone: tone,
             id: id,
+            presentationID: presentationID,
+            modelStepID: modelStepID,
             sourceSequence: sourceSequence,
             recordedAtMs: recordedAtMs,
             messageTarget: messageTarget,
@@ -4250,6 +4413,8 @@ final class AppModel {
         kind: TranscriptEntry.Kind,
         tone: String = "neutral",
         id: String? = nil,
+        presentationID: String? = nil,
+        modelStepID: String? = nil,
         sourceSequence: UInt64? = nil,
         recordedAtMs: Int64? = nil,
         messageTarget: MessageTarget? = nil,
@@ -4260,11 +4425,13 @@ final class AppModel {
         guard !text.isEmpty || !files.isEmpty else { return }
         entries.append(TranscriptEntry(
             id: id ?? UUID().uuidString,
+            presentationID: presentationID,
             text: text,
             kind: kind,
             format: "plain_text",
             tone: tone,
             pending: false,
+            modelStepID: modelStepID,
             sourceSequence: sourceSequence,
             recordedAtMs: recordedAtMs,
             messageTarget: messageTarget,
@@ -4332,6 +4499,13 @@ final class AppModel {
             } else {
                 transcript.append(TranscriptEntry(
                     id: buffered.id,
+                    presentationID: buffered.kind.narrativePhase.map {
+                        TranscriptEntry.narrativePresentationID(
+                            modelStepID: buffered.modelStepID,
+                            phase: $0,
+                            ordinal: 0
+                        )
+                    },
                     text: buffered.delta,
                     kind: buffered.kind,
                     format: "plain_text",
@@ -4397,6 +4571,7 @@ final class AppModel {
         }
         guard let content = outcome["content"]?.arrayValue else { return }
 
+        var nextPresentationOrdinal: [String: Int] = [:]
         let snapshotEntries = content.compactMap { item -> TranscriptEntry? in
             guard let outputIndex = item["outputIndex"]?.intValue,
                   let partIndex = item["partIndex"]?.intValue,
@@ -4411,12 +4586,19 @@ final class AppModel {
             case "final_answer": kind = .assistant
             default: return nil
             }
+            let ordinal = nextPresentationOrdinal[phase, default: 0]
+            nextPresentationOrdinal[phase] = ordinal + 1
             return TranscriptEntry(
                 id: snapshotID(
                     modelStepID: modelStepID,
                     phase: phase,
                     outputIndex: outputIndex,
                     partIndex: partIndex
+                ),
+                presentationID: TranscriptEntry.narrativePresentationID(
+                    modelStepID: modelStepID,
+                    phase: phase,
+                    ordinal: ordinal
                 ),
                 text: text,
                 kind: kind,
@@ -4436,6 +4618,7 @@ final class AppModel {
     private func completeStream(
         text: String,
         kind: TranscriptEntry.Kind,
+        modelStepID: String?,
         messageTarget: MessageTarget?,
         sourceSequence: UInt64?,
         recordedAtMs: Int64?
@@ -4443,6 +4626,7 @@ final class AppModel {
         completeStream(
             text: text,
             kind: kind,
+            modelStepID: modelStepID,
             messageTarget: messageTarget,
             sourceSequence: sourceSequence,
             recordedAtMs: recordedAtMs,
@@ -4453,21 +4637,36 @@ final class AppModel {
     private func completeStream(
         text: String,
         kind: TranscriptEntry.Kind,
+        modelStepID: String?,
         messageTarget: MessageTarget?,
         sourceSequence: UInt64?,
         recordedAtMs: Int64?,
         in entries: inout [TranscriptEntry]
     ) {
-        if let index = entries.lastIndex(where: { $0.pending && $0.kind == kind }) {
+        if let index = entries.lastIndex(where: {
+            $0.pending && $0.kind == kind
+                && (modelStepID == nil || $0.modelStepID == modelStepID)
+        }) {
             entries[index].text = text
             entries[index].pending = false
             entries[index].messageTarget = messageTarget
             if let sourceSequence { entries[index].sourceSequence = sourceSequence }
             if let recordedAtMs { entries[index].recordedAtMs = recordedAtMs }
         } else {
+            let presentationID = modelStepID.flatMap { modelStepID in
+                kind.narrativePhase.map {
+                    TranscriptEntry.narrativePresentationID(
+                        modelStepID: modelStepID,
+                        phase: $0,
+                        ordinal: 0
+                    )
+                }
+            }
             appendText(
                 text,
                 kind: kind,
+                presentationID: presentationID,
+                modelStepID: modelStepID,
                 sourceSequence: sourceSequence,
                 recordedAtMs: recordedAtMs,
                 messageTarget: messageTarget,
@@ -4518,6 +4717,7 @@ final class AppModel {
         entries.map { entry in
             TranscriptEntry(
                 id: entry.id,
+                presentationID: entry.presentationID,
                 text: entry.text,
                 kind: entry.kind,
                 capability: entry.capability,
@@ -4589,6 +4789,11 @@ final class AppModel {
             } else {
                 entries.append(TranscriptEntry(
                     id: id,
+                    presentationID: TranscriptEntry.narrativePresentationID(
+                        modelStepID: modelStepID,
+                        phase: phase,
+                        ordinal: 0
+                    ),
                     text: delta,
                     kind: kind,
                     format: "plain_text",
@@ -4614,6 +4819,7 @@ final class AppModel {
                 completeStream(
                     text: event["message"]?.stringValue ?? "",
                     kind: kind,
+                    modelStepID: event["modelStepId"]?.stringValue,
                     messageTarget: messageTarget(from: event),
                     sourceSequence: record.sequence,
                     recordedAtMs: record.recordedAtMs,
@@ -5607,8 +5813,7 @@ final class AppModel {
         sessionOpenCursor = nil
         replayRequestID = nil
         replaySnapshotSequence = nil
-        historyRequestID = nil
-        isLoadingEarlierHistory = false
+        finishHistoryLoad()
         if !preservingSession {
             nextHistoryBeforeSequence = nil
             visibleTranscriptLimit = 300
@@ -5747,8 +5952,7 @@ final class AppModel {
         replayCompletionSubmissionIDs.removeAll(keepingCapacity: true)
         replayUserMessages.removeAll(keepingCapacity: true)
         completedComposerEditReplay = false
-        historyRequestID = nil
-        isLoadingEarlierHistory = false
+        finishHistoryLoad()
         nextHistoryBeforeSequence = nil
         visibleTranscriptLimit = 300
         activeTurnID = nil

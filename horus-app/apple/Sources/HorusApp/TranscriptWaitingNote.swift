@@ -11,8 +11,7 @@ enum TranscriptWaitingNote {
     /// How long the gap must last before the note appears. Steps land a few hundred
     /// milliseconds apart in a busy turn, and without this the note strobes between them.
     static let appearAfter: TimeInterval = 0.6
-    /// The crossfade between the note and the activity row that replaces it. Both sides use
-    /// it, and both sit in the same slot at the tail, so the swap happens in place.
+    /// Shared duration for structural tail changes and the in-row phrase crossfade.
     static let crossfade: TimeInterval = 0.32
 
     /// Present participles, one line each, scientific register played straight. Nothing here
@@ -79,17 +78,6 @@ enum TranscriptWaitingNote {
             && connectionIsReady
             && !hasPendingApproval
             && !hasPendingPicker
-    }
-
-    /// Reserve the standalone line only while the model is actually waiting and no activity
-    /// group owns it, including sticky ownership held while a phrase fades out. Tail widgets do
-    /// not own the line; the transcript places it after them instead.
-    static func showsStandaloneSlot(
-        isWaiting: Bool,
-        groupHoldsPhrase: Bool,
-        phraseIsHeldByGroup: Bool
-    ) -> Bool {
-        isWaiting && !groupHoldsPhrase && !phraseIsHeldByGroup
     }
 
     static func message(in order: [String], elapsed: TimeInterval) -> String {

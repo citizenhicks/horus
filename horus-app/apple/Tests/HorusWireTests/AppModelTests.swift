@@ -504,6 +504,7 @@ final class AppModelTests: XCTestCase {
         group: String? = "turn",
         append: Bool = false,
         pending: Bool = false,
+        title: String = "Tool",
         text: String,
         format: String = "plain_text",
         tone: String = "neutral",
@@ -519,7 +520,7 @@ final class AppModelTests: XCTestCase {
                 "update": .string(append ? "append" : "replace"),
                 "state": .string(pending ? "pending" : "complete"),
                 "role": .string("tool"),
-                "title": .string("Tool"),
+                "title": .string(title),
                 "text": .string(text),
                 "symbol": .null,
                 "format": .string(format),
@@ -852,7 +853,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(live.transcript.map(\.presentationID), replay.transcript.map(\.presentationID))
     }
 
-    func testCompletedModelStepAssignsDeterministicPresentationOrdinalsWithinEachPhase() throws {
+    func testCompletedModelStepAssignsDeterministicPresentationOrdinalsWithinEachPhase() async throws {
         let live = try model()
         let replay = try model()
         let stepID = "step-1"
@@ -865,7 +866,11 @@ final class AppModelTests: XCTestCase {
             "phase": .string("commentary"),
             "delta": .string("First"),
         ])))
-        XCTAssertEqual(live.transcript.map(\.presentationID), ["step-1:commentary:0"])
+        // Deltas are batched, so the streamed row exists a flush later, not on the record.
+        let streamed = await eventually {
+            live.transcript.map(\.presentationID) == ["step-1:commentary:0"]
+        }
+        XCTAssertTrue(streamed)
 
         let completion = recorded(2, .object([
             "type": .string("model_step_completed"),
@@ -2380,6 +2385,40 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.transcript.first?.text, "Report ready\nOpen it below.")
         XCTAssertEqual(model.transcript.first?.files, [file])
+    }
+
+    func testProjectionRecomputesWhenAFileOnlyActivityBlockGainsText() throws {
+        let model = try model()
+        let file = SessionFileReference(
+            id: "file-1",
+            name: "report.txt",
+            size: 4,
+            mediaType: "text/plain"
+        )
+        let phrase = TranscriptWaitingPhrase(startedAt: Date(timeIntervalSince1970: 1), order: [
+            "Waiting"
+        ])
+
+        model.reduce(
+            event: renderEvent(title: "", text: "", files: [file]),
+            blocks: [],
+            preview: nil
+        )
+        XCTAssertEqual(
+            model.transcriptProjection(breakBefore: nil, waitingPhrase: phrase).waiting,
+            .standaloneLine(phrase)
+        )
+
+        model.reduce(
+            event: renderEvent(title: "", text: "Ready", files: [file]),
+            blocks: [],
+            preview: nil
+        )
+
+        XCTAssertEqual(
+            model.transcriptProjection(breakBefore: nil, waitingPhrase: phrase).waiting,
+            .row("block:5:toolsresult", phrase)
+        )
     }
 
     func testPreviewPreservesRenderedBlocksAndCapabilityRender() throws {
@@ -4996,6 +5035,69 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.hasEarlierHistory)
     }
 
+    func testHistoryCompletionRevisionCoversRejectedAndEmptyPages() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+
+        model.openSession("chat-1")
+        let openRequest = await recorder.firstRequest(after: 0) {
+            guard case .openSession(_, "chat-1", _) = $0 else { return false }
+            return true
+        }
+        guard case .openSession(let openID, _, _) = try XCTUnwrap(openRequest) else {
+            return XCTFail("Expected session open")
+        }
+        model.handle(.sessionOpened(
+            requestID: openID,
+            payload: sessionReady(latestSequence: 8, nextBeforeSequence: 40)
+        ))
+        model.handle(.sessionReplayComplete(requestID: openID, sessionID: "chat-1"))
+
+        let initialRevision = model.historyLoadCompletionRevision
+        var requestCount = await recorder.requestCount()
+        model.loadEarlierHistory()
+        let rejectedRequest = await recorder.firstRequest(after: requestCount) {
+            if case .getSessionHistory = $0 { return true }
+            return false
+        }
+        guard case .getSessionHistory(let rejectedID, _, _, _) = try XCTUnwrap(rejectedRequest)
+        else { return XCTFail("Expected rejected history request") }
+
+        model.handle(.rejected(GatewayRejection(
+            requestId: rejectedID,
+            code: "unavailable",
+            message: "Try again",
+            fatal: false
+        )))
+
+        XCTAssertFalse(model.isLoadingEarlierHistory)
+        XCTAssertEqual(model.historyLoadCompletionRevision, initialRevision + 1)
+
+        requestCount = await recorder.requestCount()
+        model.loadEarlierHistory()
+        let emptyRequest = await recorder.firstRequest(after: requestCount) {
+            if case .getSessionHistory = $0 { return true }
+            return false
+        }
+        guard case .getSessionHistory(let emptyID, _, _, _) = try XCTUnwrap(emptyRequest)
+        else { return XCTFail("Expected empty history request") }
+
+        model.handle(.sessionHistory(
+            requestID: emptyID,
+            sessionID: "chat-1",
+            records: [],
+            nextBeforeSequence: nil
+        ))
+
+        XCTAssertFalse(model.isLoadingEarlierHistory)
+        XCTAssertEqual(model.historyLoadCompletionRevision, initialRevision + 2)
+        XCTAssertFalse(model.hasEarlierHistory)
+    }
+
     func testHistoryPagesRebuildCrossPageAppendsAndFailedStepDeltas() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model { request in await recorder.record(request) }
@@ -6524,31 +6626,15 @@ final class AppModelTests: XCTestCase {
     }
 }
 
-@MainActor
-final class TranscriptRowCacheTests: XCTestCase {
-    private func model() throws -> AppModel {
-        let suiteName = UUID().uuidString
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        return AppModel(
-            client: GatewayClient(),
-            store: GatewayStore(
-                defaults: defaults,
-                transcriptDirectory: directory,
-                draftDirectory: directory.appendingPathComponent("Drafts", isDirectory: true)
-            ),
-            settingsDefaults: defaults,
-            appLockAuthenticator: AppLockAuthenticator(
-                method: { .unavailable },
-                authenticate: { _ in false }
-            )
-        )
-    }
-
-    private func entry(_ id: String, kind: TranscriptEntry.Kind = .event) -> TranscriptEntry {
+final class TranscriptProjectionTests: XCTestCase {
+    private func entry(
+        _ id: String,
+        presentationID: String? = nil,
+        kind: TranscriptEntry.Kind = .event
+    ) -> TranscriptEntry {
         TranscriptEntry(
             id: id,
+            presentationID: presentationID,
             text: id,
             kind: kind,
             role: kind == .assistant ? nil : .tool,
@@ -6557,53 +6643,188 @@ final class TranscriptRowCacheTests: XCTestCase {
         )
     }
 
-    func testCacheFollowsAppendsAndSessionSwitches() throws {
-        let model = try model()
-        model.transcript = [entry("a"), entry("b")]
-        XCTAssertEqual(model.transcriptRows(breakBefore: nil).map { $0.map(\.id) }, [["a", "b"]])
+    private var phrase: TranscriptWaitingPhrase {
+        TranscriptWaitingPhrase(startedAt: Date(timeIntervalSince1970: 0), order: ["thinking"])
+    }
 
-        // An append regroups.
-        model.transcript.append(entry("c"))
-        XCTAssertEqual(model.transcriptRows(breakBefore: nil).map { $0.map(\.id) }, [["a", "b", "c"]])
+    /// A run at the tail shows the phrase in its own summary line; with no run to hold it the
+    /// phrase takes a line of its own.
+    func testWaitingPhraseGoesToTheTailRunWhenThereIsOne() {
+        let event = entry("event:1")
+        let message = entry("wire:1", presentationID: "step:final_answer:0", kind: .assistant)
 
-        // A switch to a different chat of the same length must not reuse the old rows.
-        model.transcript = [entry("x"), entry("y"), entry("z")]
-        XCTAssertEqual(model.transcriptRows(breakBefore: nil).map { $0.map(\.id) }, [["x", "y", "z"]])
-
-        // The boundary is part of the key: it splits the run without the entries changing.
         XCTAssertEqual(
-            model.transcriptRows(breakBefore: "y").map { $0.map(\.id) },
-            [["x"], ["y", "z"]]
+            TranscriptProjection(entries: [message, event], waitingPhrase: phrase).waiting,
+            .row("event:1", phrase)
+        )
+        XCTAssertEqual(
+            TranscriptProjection(entries: [event, message], waitingPhrase: phrase).waiting,
+            .standaloneLine(phrase)
         )
     }
 
-    func testTextDeltasReuseTheCachedGrouping() throws {
-        let model = try model()
-        model.transcript = [entry("a"), entry("b")]
-        let first = model.transcriptRows(breakBefore: nil)
+    /// Ownership follows the renderable tail. A new run can take the fixed summary slot without
+    /// leaving a standalone line behind above it.
+    func testWaitingPhraseMovesToANewTailRun() {
+        let message = entry("wire:1", presentationID: "step:final_answer:0", kind: .assistant)
+        let standalone = TranscriptProjection(entries: [message], waitingPhrase: phrase)
+        XCTAssertEqual(standalone.waiting, .standaloneLine(phrase))
 
-        // Streaming mutates an entry in place; grouping does not depend on text, so the
-        // same row arrays come back rather than being rebuilt every delta.
-        model.transcript[1].text += " more"
-        let second = model.transcriptRows(breakBefore: nil)
+        let event = entry("event:1")
+        let joined = TranscriptProjection(
+            entries: [message, event],
+            waitingPhrase: phrase,
+            previous: standalone
+        )
 
-        XCTAssertEqual(second.map { $0.map(\.id) }, first.map { $0.map(\.id) })
-        XCTAssertTrue(second[0][1] === first[0][1])
+        XCTAssertEqual(joined.waiting, .row("event:1", phrase))
+        XCTAssertEqual(
+            TranscriptProjection(entries: [message, event], previous: joined).waiting,
+            .absent
+        )
     }
 
-    func testCacheFollowsReplacementEntriesWithTheSameIDs() throws {
-        let model = try model()
-        model.transcript = [entry("a"), entry("b")]
-        let first = model.transcriptRows(breakBefore: nil)
-        let replacement = [entry("a"), entry("b")]
-        replacement[1].text = "replacement"
+    func testWaitingPhraseLeavesAnActivityRowWhenNarrativeBecomesTheTail() {
+        let event = entry("event:1")
+        let running = TranscriptProjection(entries: [event], waitingPhrase: phrase)
+        XCTAssertEqual(running.waiting, .row("event:1", phrase))
 
-        model.transcript = replacement
-        let second = model.transcriptRows(breakBefore: nil)
+        let message = entry("wire:1", presentationID: "step:commentary:0", kind: .commentary)
+        let continued = TranscriptProjection(
+            entries: [event, message],
+            waitingPhrase: phrase,
+            previous: running
+        )
 
-        XCTAssertEqual(second[0][1].text, "replacement")
-        XCTAssertTrue(second[0][1] === replacement[1])
-        XCTAssertFalse(second[0][1] === first[0][1])
+        XCTAssertEqual(continued.waiting, .standaloneLine(phrase))
+    }
+
+    func testFileOnlyActivityRowCannotHideTheWaitingPhrase() {
+        let event = entry("event:1")
+        event.text = ""
+        event.files = [SessionFileReference(
+            id: "file:1",
+            name: "result.txt",
+            size: 1,
+            mediaType: "text/plain"
+        )]
+
+        let projection = TranscriptProjection(entries: [event], waitingPhrase: phrase)
+
+        XCTAssertEqual(projection.waiting, .standaloneLine(phrase))
+    }
+
+    func testStandaloneWaitingLineIsInitialStructure() {
+        let projection = TranscriptProjection(entries: [], waitingPhrase: phrase)
+
+        XCTAssertEqual(projection.waiting, .standaloneLine(phrase))
+        XCTAssertEqual(projection.structuralRevision, 1)
+    }
+
+    /// The line is a row's worth of height. The phrase rotating inside it is not.
+    func testStandaloneLineIsStructuralAndItsPhraseIsNot() {
+        let message = entry("wire:1", presentationID: "step:final_answer:0", kind: .assistant)
+        let settled = TranscriptProjection(entries: [message])
+        let waiting = TranscriptProjection(
+            entries: [message],
+            waitingPhrase: phrase,
+            previous: settled
+        )
+        XCTAssertEqual(waiting.structuralRevision, settled.structuralRevision + 1)
+
+        let rotated = TranscriptWaitingPhrase(
+            startedAt: phrase.startedAt,
+            order: ["something else"]
+        )
+        let later = TranscriptProjection(
+            entries: [message],
+            waitingPhrase: rotated,
+            previous: waiting
+        )
+        XCTAssertEqual(later.structuralRevision, waiting.structuralRevision)
+    }
+
+    func testTextDeltaLeavesStructuralRevisionUnchanged() {
+        let message = entry("wire:1", presentationID: "step:final_answer:0", kind: .assistant)
+        let first = TranscriptProjection(entries: [message])
+
+        message.text += " more"
+        let second = TranscriptProjection(entries: [message], previous: first)
+
+        XCTAssertEqual(second.structuralRevision, first.structuralRevision)
+        XCTAssertTrue(second.rows[0].records[0] === message)
+    }
+
+    func testStepJoiningExistingActivityGroupLeavesStructuralRevisionUnchanged() {
+        let firstEvent = entry("event:1")
+        let first = TranscriptProjection(entries: [firstEvent])
+        let secondEvent = entry("event:2")
+        let second = TranscriptProjection(entries: [firstEvent, secondEvent], previous: first)
+
+        XCTAssertEqual(second.rows.count, 1)
+        XCTAssertEqual(second.rows[0].records.map(\.presentationID), ["event:1", "event:2"])
+        XCTAssertEqual(second.structuralRevision, first.structuralRevision)
+    }
+
+    func testNewActivityRunBumpsStructuralRevisionOnce() {
+        let firstEvent = entry("event:1")
+        let user = entry("user:1", kind: .user)
+        let settled = TranscriptProjection(entries: [firstEvent, user])
+        let nextEvent = entry("event:2")
+        let running = TranscriptProjection(entries: [firstEvent, user, nextEvent], previous: settled)
+
+        XCTAssertEqual(running.rows.map(\.id), ["event:1", "user:1", "event:2"])
+        XCTAssertEqual(running.structuralRevision, settled.structuralRevision + 1)
+    }
+
+    func testReplacementWithTheSamePresentationIdentityKeepsTheRowStable() {
+        let streamed = entry(
+            "model-stream:1",
+            presentationID: "step:commentary:0",
+            kind: .commentary
+        )
+        let first = TranscriptProjection(entries: [streamed])
+        let snapshot = entry(
+            "model-output:1",
+            presentationID: "step:commentary:0",
+            kind: .commentary
+        )
+        snapshot.text = "replacement"
+
+        let second = TranscriptProjection(entries: [snapshot], previous: first)
+
+        XCTAssertEqual(second.rows[0].id, first.rows[0].id)
+        XCTAssertEqual(second.structuralRevision, first.structuralRevision)
+        XCTAssertTrue(second.rows[0].records[0] === snapshot)
+    }
+
+    func testBoundaryAndSizingUsePresentationSemantics() {
+        let firstEvent = entry("wire:1", presentationID: "event:first")
+        let secondEvent = entry("wire:2", presentationID: "event:second")
+        let user = entry("wire:3", presentationID: "user:first", kind: .user)
+        let narrative = entry(
+            "wire:4",
+            presentationID: "step:final_answer:0",
+            kind: .assistant
+        )
+
+        let projection = TranscriptProjection(
+            entries: [firstEvent, secondEvent, user, narrative],
+            breakBefore: secondEvent.presentationID
+        )
+
+        XCTAssertEqual(projection.rows.map(\.id), [
+            "event:first",
+            "event:second",
+            "user:first",
+            "step:final_answer:0",
+        ])
+        XCTAssertEqual(projection.rows.map(\.sizing), [
+            .fixedSummary,
+            .fixedSummary,
+            .intrinsic,
+            .revealedIntrinsic,
+        ])
     }
 }
 
@@ -6663,37 +6884,6 @@ final class TranscriptWaitingNoteTests: XCTestCase {
                 connectionIsReady: true,
                 hasPendingApproval: false,
                 hasPendingPicker: true
-            )
-        )
-    }
-
-    func testStandaloneSlotExistsOnlyWhileWaitingWithoutLiveOrStickyGroupOwnership() {
-        XCTAssertTrue(
-            TranscriptWaitingNote.showsStandaloneSlot(
-                isWaiting: true,
-                groupHoldsPhrase: false,
-                phraseIsHeldByGroup: false
-            )
-        )
-        XCTAssertFalse(
-            TranscriptWaitingNote.showsStandaloneSlot(
-                isWaiting: false,
-                groupHoldsPhrase: false,
-                phraseIsHeldByGroup: false
-            )
-        )
-        XCTAssertFalse(
-            TranscriptWaitingNote.showsStandaloneSlot(
-                isWaiting: true,
-                groupHoldsPhrase: true,
-                phraseIsHeldByGroup: false
-            )
-        )
-        XCTAssertFalse(
-            TranscriptWaitingNote.showsStandaloneSlot(
-                isWaiting: true,
-                groupHoldsPhrase: false,
-                phraseIsHeldByGroup: true
             )
         )
     }
@@ -6884,19 +7074,19 @@ final class TranscriptEventLineTests: XCTestCase {
         let laterTool = entry(id: "later-tool", text: "Checked again", role: .tool)
         let notice = entry(id: "notice", text: "Needs attention", role: .notice)
 
-        let rows = TranscriptEntry.groupedRows(
-            from: [tool, event, search, reasoning, laterTool, notice]
-        )
+        let rows = TranscriptProjection(
+            entries: [tool, event, search, reasoning, laterTool, notice]
+        ).rows
         XCTAssertEqual(
-            rows.map { $0.map(\.id) },
+            rows.map { $0.records.map(\.id) },
             [["tool", "event", "search", "reasoning", "later-tool", "notice"]]
         )
 
         XCTAssertEqual(
-            TranscriptEntry.groupedRows(
-                from: [tool, event],
-                breakBefore: event.id
-            ).map { $0.map(\.id) },
+            TranscriptProjection(
+                entries: [tool, event],
+                breakBefore: event.presentationID
+            ).rows.map { $0.records.map(\.id) },
             [["tool"], ["event"]]
         )
     }
@@ -6914,11 +7104,11 @@ final class TranscriptEventLineTests: XCTestCase {
         let untyped = entry(id: "untyped", text: "Something happened")
         let answer = entry(id: "answer", text: "Done", kind: .assistant)
 
-        let rows = TranscriptEntry.groupedRows(
-            from: [question, thinking, tool, approval, artifact, commentary, notice, untyped, answer]
-        )
+        let rows = TranscriptProjection(
+            entries: [question, thinking, tool, approval, artifact, commentary, notice, untyped, answer]
+        ).rows
         XCTAssertEqual(
-            rows.map { $0.map(\.id) },
+            rows.map { $0.records.map(\.id) },
             [
                 ["question"],
                 ["thinking", "tool", "approval", "artifact"],
