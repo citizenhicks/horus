@@ -6518,6 +6518,37 @@ final class TranscriptWaitingNoteTests: XCTestCase {
         )
     }
 
+    func testStandaloneSlotExistsOnlyWhileWaitingWithoutLiveOrStickyGroupOwnership() {
+        XCTAssertTrue(
+            TranscriptWaitingNote.showsStandaloneSlot(
+                isWaiting: true,
+                groupHoldsPhrase: false,
+                phraseIsHeldByGroup: false
+            )
+        )
+        XCTAssertFalse(
+            TranscriptWaitingNote.showsStandaloneSlot(
+                isWaiting: false,
+                groupHoldsPhrase: false,
+                phraseIsHeldByGroup: false
+            )
+        )
+        XCTAssertFalse(
+            TranscriptWaitingNote.showsStandaloneSlot(
+                isWaiting: true,
+                groupHoldsPhrase: true,
+                phraseIsHeldByGroup: false
+            )
+        )
+        XCTAssertFalse(
+            TranscriptWaitingNote.showsStandaloneSlot(
+                isWaiting: true,
+                groupHoldsPhrase: false,
+                phraseIsHeldByGroup: true
+            )
+        )
+    }
+
     func testRotationStaysInRangeAndAdvancesOnSchedule() {
         let order = ["first", "second", "third"]
         let first = TranscriptWaitingNote.message(in: order, elapsed: 0)

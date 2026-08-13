@@ -415,8 +415,11 @@ private struct TranscriptView: View {
                     QueuedMessageView(widget: widget)
                         .padding(.top, rowSpacing)
                 }
-                if let waitingPhrase, !waitingHeldByGroup {
-                    TranscriptWaitingNoteView(phrase: waitingPhrase, topSpacing: rowSpacing)
+                if showsTailSlot {
+                    TranscriptWaitingNoteView(
+                        phrase: waitingHeldByGroup ? nil : waitingPhrase,
+                        topSpacing: rowSpacing
+                    )
                 }
                 Color.clear.frame(height: max(1, bottomInset))
             }
@@ -472,6 +475,21 @@ private struct TranscriptView: View {
 
     private var waitingPhrase: TranscriptWaitingPhrase? {
         waitingSince.map { TranscriptWaitingPhrase(startedAt: $0, order: waitingOrder) }
+    }
+
+    /// A waiting turn owns one activity line at the tail, whether or not it has anything to
+    /// say there yet.
+    ///
+    /// Otherwise the first step of a run arrives into no space at all: the row's height is
+    /// allocated in the frame it appears, so the transcript is yanked up 42 points while the
+    /// row itself is still fading in. Holding the line open means the step lands in a slot
+    /// that already exists and only the text inside it changes.
+    private var showsTailSlot: Bool {
+        TranscriptWaitingNote.showsStandaloneSlot(
+            isWaiting: model.isWaitingForModel,
+            groupHoldsPhrase: groupHoldsWaitingPhrase,
+            phraseIsHeldByGroup: waitingSince != nil && waitingHeldByGroup
+        )
     }
 
     /// Once the turn has a group at the tail, the gap between steps belongs to that row: the
@@ -612,11 +630,12 @@ private struct TranscriptRow: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            // Commentary arrives in one short burst between steps; the final message streams
-            // long enough to read as it lands on its own.
+            // Both kinds can land whole rather than stream — a short commentary between steps,
+            // a final message the gateway sends in one piece — and text that appears all at
+            // once is the thing this smooths over.
             .horusStreamingReveal(
                 count: entry.text.count,
-                active: entry.kind == .commentary,
+                active: isAssistantMessage,
                 live: model.isLiveTranscriptEntry(entry)
             )
         case .reasoning:
@@ -1174,25 +1193,41 @@ private struct TranscriptWaitingPhraseText: View {
 private struct TranscriptWaitingNoteView: View {
     @Environment(\.horusPalette) private var palette
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    let phrase: TranscriptWaitingPhrase
+    /// Absent is a valid state, and the point of the view: the line keeps its height so the
+    /// group that lands next takes a slot that already exists.
+    let phrase: TranscriptWaitingPhrase?
     /// Owned rather than applied by the transcript: padding outside the condition reserves
     /// the gap while the note is hidden, and the arriving row then lands 12pt low.
     let topSpacing: CGFloat
 
     var body: some View {
         HStack(spacing: HorusSpace.s) {
-            HorusIcon(.neuralNetwork, size: HorusStyle.glyphInline, foreground: palette.muted)
-            TranscriptWaitingPhraseText(phrase: phrase)
+            if let phrase {
+                HStack(spacing: HorusSpace.s) {
+                    HorusIcon(
+                        .neuralNetwork,
+                        size: HorusStyle.glyphInline,
+                        foreground: palette.muted
+                    )
+                    TranscriptWaitingPhraseText(phrase: phrase)
+                }
+                .transition(.opacity)
+            }
         }
+        .animation(
+            reduceMotion ? nil : .easeInOut(duration: TranscriptWaitingNote.crossfade),
+            value: phrase == nil
+        )
         // The group header's height, so the row that replaces this one lands on the same
         // baseline and the swap reads as one line changing rather than two rows trading places.
-        .frame(minHeight: HorusStyle.rowRegular)
+        .frame(maxWidth: .infinity, minHeight: HorusStyle.rowRegular, alignment: .leading)
         .padding(.top, topSpacing)
         .transition(
             reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 8))
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Waiting for the model")
+        .accessibilityHidden(phrase == nil)
     }
 }
 

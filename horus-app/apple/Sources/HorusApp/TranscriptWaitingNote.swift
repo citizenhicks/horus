@@ -81,6 +81,17 @@ enum TranscriptWaitingNote {
             && !hasPendingPicker
     }
 
+    /// Reserve the standalone line only while the model is actually waiting and no activity
+    /// group owns it, including sticky ownership held while a phrase fades out. Tail widgets do
+    /// not own the line; the transcript places it after them instead.
+    static func showsStandaloneSlot(
+        isWaiting: Bool,
+        groupHoldsPhrase: Bool,
+        phraseIsHeldByGroup: Bool
+    ) -> Bool {
+        isWaiting && !groupHoldsPhrase && !phraseIsHeldByGroup
+    }
+
     static func message(in order: [String], elapsed: TimeInterval) -> String {
         let step = elapsed > 0 ? Int(elapsed / rotation) : 0
         return order[step % order.count]
