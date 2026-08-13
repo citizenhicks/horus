@@ -33,6 +33,7 @@ mod text {
 }
 
 const KEEP_RECENT_TOKENS: usize = 20_000;
+const NATIVE_RETAINED_TOKENS: usize = 64_000;
 const MAX_SUMMARY_TOOL_RESULT_CHARS: usize = 2_000;
 const COMPACTION_RESERVE_TOKENS: i64 = 16_384;
 const _: () = {
@@ -129,12 +130,16 @@ impl Middleware for Compaction {
                 return Ok(());
             }
             let output = if context.model.compaction_endpoint(context.provider)? {
+                let tools = context.tools.definitions();
                 context
                     .model
                     .compact(
                         context.provider,
                         CompactRequest {
+                            session_id: context.session_id,
+                            instructions: context.instructions,
                             input: context.input(),
+                            tools: &tools,
                         },
                     )
                     .await?
@@ -147,7 +152,7 @@ impl Middleware for Compaction {
                 ));
             }
             let active_user = latest_real_user(context.input());
-            let mut compacted = output.output;
+            let mut compacted = retain_native_context(context.input(), output.output);
             restore_user_private_fields(&mut compacted, active_user);
             context.replace_input(compacted);
             context.record_transcript_item(internal_user_message(CONTEXT_COMPACTED_MARKER, ""));
@@ -156,6 +161,24 @@ impl Middleware for Compaction {
             Ok(())
         })
     }
+}
+
+fn retain_native_context(input: &[Value], mut compacted: Vec<Value>) -> Vec<Value> {
+    if compacted.len() != 1
+        || compacted[0].get("type").and_then(Value::as_str) != Some("compaction")
+    {
+        return compacted;
+    }
+    let cut = recent_cut(input, NATIVE_RETAINED_TOKENS).unwrap_or(0);
+    let mut retained = input[cut..]
+        .iter()
+        .filter(|item| {
+            !is_internal_message(item) && item.get("role").and_then(Value::as_str) == Some("user")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    retained.append(&mut compacted);
+    retained
 }
 
 fn latest_real_user(input: &[Value]) -> Option<&Value> {
@@ -456,8 +479,12 @@ mod tests {
     }
 
     #[test]
-    fn compaction_omitting_a_private_user_does_not_restore_its_tool_tail() {
+    fn v2_compaction_retains_the_user_before_the_marker_without_its_tool_tail() {
         let input = vec![
+            serde_json::json!({
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "stale instructions"}]
+            }),
             serde_json::json!({
                 "role": "user",
                 "content": [{"type": "input_text", "text": "inspect"}],
@@ -471,16 +498,16 @@ mod tests {
             }),
             tool_output("call-1", "large result", false),
         ];
-        let mut compacted = vec![serde_json::json!({
+        let compacted = vec![serde_json::json!({
             "type": "compaction",
             "encrypted_content": "opaque"
         })];
-
+        let mut compacted = retain_native_context(&input, compacted);
         restore_user_private_fields(&mut compacted, latest_real_user(&input));
 
         assert_eq!(compacted.len(), 2);
-        assert_eq!(compacted[0]["type"], "compaction");
-        assert_eq!(compacted[1], input[0]);
+        assert_eq!(compacted[0], input[1]);
+        assert_eq!(compacted[1]["type"], "compaction");
     }
 
     #[test]

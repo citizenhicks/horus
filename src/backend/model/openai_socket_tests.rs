@@ -80,6 +80,35 @@ async fn write_http_stream(stream: &mut tokio::net::TcpStream, text: &str, respo
         .expect("HTTP stream response");
 }
 
+async fn write_http_compaction_stream(stream: &mut tokio::net::TcpStream) {
+    let events = [
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "compaction",
+                "encrypted_content": "opaque"
+            }
+        }),
+        serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "response-compact", "output": []}
+        }),
+    ];
+    let body = events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .expect("HTTP compaction response");
+}
+
 #[test]
 fn generic_processing_error_is_a_retryable_stream_failure() {
     let request_id = "922d2b28-14a7-4b76-be1e-ae6be18309b9";
@@ -279,16 +308,16 @@ async fn active_socket_sessions_are_never_evicted() {
 }
 
 #[tokio::test]
-async fn idle_socket_sessions_expire_before_new_sessions_are_cached() {
+async fn idle_socket_sessions_remain_cached_below_capacity() {
     let provider = OpenAiSocket::new("test-key", "test-model").expect("provider");
     let stale = provider.session("stale").await.expect("stale session");
-    stale.lock().await.last_used_at = Instant::now() - CONNECTION_IDLE_TIMEOUT;
+    stale.lock().await.last_used_at = Instant::now() - Duration::from_secs(60 * 60);
     drop(stale);
 
     provider.session("fresh").await.expect("fresh session");
 
     let sessions = provider.sessions.lock().await;
-    assert!(!sessions.contains_key("stale"));
+    assert!(sessions.contains_key("stale"));
     assert!(sessions.contains_key("fresh"));
 }
 
@@ -574,57 +603,7 @@ async fn active_connection_pump_forwards_bursts_without_blocking_ping() {
 }
 
 #[tokio::test]
-async fn connection_age_limit_closes_before_another_send() {
-    use futures_util::StreamExt as _;
-
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("WebSocket listener");
-    let address = listener.local_addr().expect("WebSocket address");
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("WebSocket connection");
-        let mut socket = tokio_tungstenite::accept_async(stream)
-            .await
-            .expect("WebSocket handshake");
-        match timeout(Duration::from_secs(1), socket.next())
-            .await
-            .expect("connection age close")
-        {
-            Some(Ok(Message::Close(_))) | None => {}
-            Some(Ok(message)) => panic!("expired socket received {message:?}"),
-            Some(Err(_)) => {}
-        }
-    });
-    let (socket, _) = connect_async(format!("ws://{address}"))
-        .await
-        .expect("client connection");
-    let mut connection = OpenAiWsConnection::with_lifecycle(
-        socket,
-        Duration::from_millis(1),
-        Duration::from_secs(60),
-        Duration::from_secs(60),
-    );
-
-    timeout(Duration::from_secs(1), async {
-        while !connection.closed.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("connection did not expire");
-
-    assert!(!connection.is_usable());
-    assert!(
-        connection
-            .start(Message::text("late request"))
-            .await
-            .is_err()
-    );
-    server.await.expect("WebSocket server");
-}
-
-#[tokio::test]
-async fn active_response_survives_the_soft_reuse_age() {
+async fn idle_connection_remains_reusable() {
     use futures_util::SinkExt as _;
     use futures_util::StreamExt as _;
 
@@ -637,40 +616,45 @@ async fn active_response_survives_the_soft_reuse_age() {
         let mut socket = tokio_tungstenite::accept_async(stream)
             .await
             .expect("WebSocket handshake");
-        socket
-            .next()
-            .await
-            .expect("response request")
-            .expect("valid response request");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        socket
-            .send(Message::text("response"))
-            .await
-            .expect("response message");
-        let _ = socket.next().await;
+        for response in ["first response", "second response"] {
+            socket
+                .next()
+                .await
+                .expect("response request")
+                .expect("valid response request");
+            socket
+                .send(Message::text(response))
+                .await
+                .expect("response message");
+        }
     });
     let (socket, _) = connect_async(format!("ws://{address}"))
         .await
         .expect("client connection");
-    let mut connection = OpenAiWsConnection::with_lifecycle(
-        socket,
-        Duration::from_millis(100),
-        Duration::from_secs(2),
-        Duration::from_secs(2),
-    );
+    let mut connection = OpenAiWsConnection::new(socket);
     connection
-        .start(Message::text("request"))
+        .start(Message::text("first request"))
         .await
-        .expect("start exchange");
+        .expect("start first exchange");
+    let first = timeout(Duration::from_secs(1), connection.messages.recv())
+        .await
+        .expect("first response timed out")
+        .expect("first response event");
+    assert!(matches!(first, SocketEvent::Message(Message::Text(_))));
+    connection.finish();
 
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(!connection.closed.load(Ordering::Acquire));
-    let message = timeout(Duration::from_secs(1), connection.messages.recv())
+    assert!(connection.is_usable());
+    connection
+        .start(Message::text("second request"))
         .await
-        .expect("response timed out")
-        .expect("response event");
+        .expect("start second exchange");
+    let second = timeout(Duration::from_secs(1), connection.messages.recv())
+        .await
+        .expect("second response timed out")
+        .expect("second response event");
 
-    assert!(matches!(message, SocketEvent::Message(Message::Text(_))));
+    assert!(matches!(second, SocketEvent::Message(Message::Text(_))));
     connection.finish();
     connection.close().await;
     server.await.expect("WebSocket server");
@@ -1056,6 +1040,205 @@ async fn previous_response_not_found_rebuilds_full_context_on_the_same_connectio
 }
 
 #[tokio::test]
+async fn native_compaction_reuses_the_websocket_with_a_v2_trigger() {
+    use futures_util::SinkExt as _;
+    use futures_util::StreamExt as _;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("WebSocket listener");
+    let address = listener.local_addr().expect("WebSocket address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("WebSocket connection");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("WebSocket handshake");
+        let initial: Value = serde_json::from_slice(
+            &socket
+                .next()
+                .await
+                .expect("initial request")
+                .expect("valid initial request")
+                .into_data(),
+        )
+        .expect("initial request body");
+        assert!(initial.get("previous_response_id").is_none());
+        for event in completed_events("Warm response.", "response-warm") {
+            socket
+                .send(Message::text(event.to_string()))
+                .await
+                .expect("initial completed event");
+        }
+
+        let compact: Value = serde_json::from_slice(
+            &socket
+                .next()
+                .await
+                .expect("compaction request")
+                .expect("valid compaction request")
+                .into_data(),
+        )
+        .expect("compaction request body");
+        assert_eq!(compact["previous_response_id"], "response-warm");
+        assert_eq!(
+            compact["input"],
+            serde_json::json!([{"type": "compaction_trigger"}])
+        );
+        socket
+            .send(Message::text(
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "opaque"
+                    }
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("compaction output");
+        socket
+            .send(Message::text(
+                serde_json::json!({
+                    "type": "response.completed",
+                    "response": {"id": "response-compact", "output": []}
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("completed compaction response");
+    });
+    let provider = OpenAiSocket::with_authorization(
+        Arc::new(ApiKeyAuthorization::new("test-key".into())),
+        "http://127.0.0.1:1",
+        format!("ws://{address}/responses"),
+        "test-model",
+        reqwest::Client::new(),
+    )
+    .expect("provider");
+    let initial_input = vec![serde_json::json!({"role": "user", "content": "one"})];
+    let initial_output = provider
+        .send_response(
+            ModelRequest {
+                session_id: "test-session",
+                instructions: "Test instructions",
+                input: &initial_input,
+                tools: &[],
+                allow_hosted_tools: false,
+                allow_continuation: true,
+            },
+            Arc::new(|_| Ok(())),
+        )
+        .await
+        .expect("initial response");
+    let mut input = initial_input;
+    input.extend_from_slice(initial_output.output());
+
+    let compacted = provider
+        .compact(CompactRequest {
+            session_id: "test-session",
+            instructions: "Test instructions",
+            input: &input,
+            tools: &[],
+        })
+        .await
+        .expect("native compaction");
+    server.await.expect("WebSocket server");
+
+    assert_eq!(
+        compacted.output(),
+        &[serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "opaque"
+        })]
+    );
+}
+
+#[tokio::test]
+async fn native_compaction_retries_an_interrupted_websocket() {
+    use futures_util::SinkExt as _;
+    use futures_util::StreamExt as _;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("WebSocket listener");
+    let address = listener.local_addr().expect("WebSocket address");
+    let server = tokio::spawn(async move {
+        for attempt in 0..2 {
+            let (stream, _) = listener.accept().await.expect("WebSocket connection");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake");
+            let compact: Value = serde_json::from_slice(
+                &socket
+                    .next()
+                    .await
+                    .expect("compaction request")
+                    .expect("valid compaction request")
+                    .into_data(),
+            )
+            .expect("compaction request body");
+            assert!(compact.get("previous_response_id").is_none());
+            assert_eq!(
+                compact["input"].as_array().and_then(|input| input.last()),
+                Some(&serde_json::json!({"type": "compaction_trigger"}))
+            );
+            if attempt == 0 {
+                drop(socket);
+                continue;
+            }
+            socket
+                .send(Message::text(
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "compaction",
+                            "encrypted_content": "opaque"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("compaction output");
+            socket
+                .send(Message::text(
+                    serde_json::json!({
+                        "type": "response.completed",
+                        "response": {"id": "response-compact", "output": []}
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("completed compaction response");
+        }
+    });
+    let provider = OpenAiSocket::with_authorization(
+        Arc::new(ApiKeyAuthorization::new("test-key".into())),
+        "http://127.0.0.1:1",
+        format!("ws://{address}/responses"),
+        "test-model",
+        reqwest::Client::new(),
+    )
+    .expect("provider");
+    let input = vec![serde_json::json!({"role": "user", "content": "one"})];
+
+    let compacted = provider
+        .compact(CompactRequest {
+            session_id: "test-session",
+            instructions: "Test instructions",
+            input: &input,
+            tools: &[],
+        })
+        .await
+        .expect("retried native compaction");
+    server.await.expect("WebSocket server");
+
+    assert_eq!(compacted.output()[0]["type"], "compaction");
+}
+
+#[tokio::test]
 async fn upgrade_required_switches_only_that_session_to_sticky_http() {
     use futures_util::SinkExt as _;
     use futures_util::StreamExt as _;
@@ -1130,9 +1313,9 @@ async fn upgrade_required_switches_only_that_session_to_sticky_http() {
         .await
         .expect("HTTP listener");
     let http_address = http_listener.local_addr().expect("HTTP address");
-    let (request_sender, mut requests) = mpsc::channel(3);
+    let (request_sender, mut requests) = mpsc::channel(4);
     let http_server = tokio::spawn(async move {
-        for attempt in 0..3 {
+        for attempt in 0..4 {
             let (mut stream, _) = http_listener.accept().await.expect("HTTP connection");
             let request = read_http_json(&mut stream).await;
             request_sender
@@ -1150,6 +1333,8 @@ async fn upgrade_required_switches_only_that_session_to_sticky_http() {
                     &format!("response-http-{attempt}"),
                 )
                 .await;
+            } else if attempt == 2 {
+                write_http_compaction_stream(&mut stream).await;
             }
         }
     });
@@ -1240,6 +1425,15 @@ async fn upgrade_required_switches_only_that_session_to_sticky_http() {
         )
         .await
         .expect("sticky HTTP fallback");
+    let compacted = provider
+        .compact(CompactRequest {
+            session_id: "fallback-session",
+            instructions: "Test instructions",
+            input: &continued_input,
+            tools: &[],
+        })
+        .await
+        .expect("HTTP v2 compaction");
     let Error::Provider(http_error) = provider
         .send_response(
             ModelRequest {
@@ -1259,12 +1453,20 @@ async fn upgrade_required_switches_only_that_session_to_sticky_http() {
     };
     let first_http = requests.recv().await.expect("first HTTP request");
     let second_http = requests.recv().await.expect("second HTTP request");
+    let compact_http = requests.recv().await.expect("compaction HTTP request");
     let failed_http = requests.recv().await.expect("failed HTTP request");
     http_server.await.expect("HTTP server");
     websocket_server.await.expect("WebSocket server");
 
     assert_eq!(fallback.text(), "HTTP fallback.");
     assert_eq!(sticky.text(), "Still HTTP.");
+    assert_eq!(
+        compacted.output(),
+        &[serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "opaque"
+        })]
+    );
     assert_eq!(http_error.status(), None);
     assert!(!http_error.is_stream_interrupted());
     assert_eq!(http_error.to_string(), "HTTPS fallback transport failed");
@@ -1283,6 +1485,15 @@ async fn upgrade_required_switches_only_that_session_to_sticky_http() {
             serde_json::json!([{"type": "web_search", "external_web_access": false}])
         );
     }
+    assert!(compact_http.get("previous_response_id").is_none());
+    let compact_input = compact_http["input"]
+        .as_array()
+        .expect("full HTTP compaction input");
+    assert_eq!(compact_input.len(), continued_input.len() + 1);
+    assert_eq!(
+        compact_input.last(),
+        Some(&serde_json::json!({"type": "compaction_trigger"}))
+    );
 }
 
 struct RefreshingAuthorization {
@@ -1316,6 +1527,7 @@ impl OpenAiAuthorization for RefreshingAuthorization {
     fn authorize_http<'a>(
         &'a self,
         _streaming: bool,
+        _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<ResolvedAuthorization>> {
         self.resolve()
     }

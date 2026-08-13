@@ -95,14 +95,17 @@ pub struct ModelRequest<'a> {
     pub allow_continuation: bool,
 }
 
-/// Durable conversation history for a provider's native compaction endpoint.
-///
-/// Current system instructions and tool definitions are intentionally excluded.
-/// The agent reapplies their current values to each subsequent [`ModelRequest`].
+/// Input for a provider's native compaction endpoint.
 #[derive(Debug)]
 pub struct CompactRequest<'a> {
+    /// Stable conversation identity used by providers for request routing.
+    pub session_id: &'a str,
+    /// Current system instructions governing the compacted conversation.
+    pub instructions: &'a str,
     /// Conversation items to replace with the returned [`CompactOutput`].
     pub input: &'a [Value],
+    /// Current model-facing tool definitions.
+    pub tools: &'a [ToolDefinition],
 }
 
 /// Fallible synchronous callback used to forward streaming provider events.
@@ -458,10 +461,6 @@ pub trait Model: Send + Sync {
     }
 
     /// Calls the native history-compaction endpoint when advertised.
-    ///
-    /// Implementations must preserve the history-only contract of
-    /// [`CompactRequest`] and [`CompactOutput`]; runtime instructions and tools
-    /// are reapplied by the agent after compaction.
     fn compact<'a>(&'a self, _request: CompactRequest<'a>) -> BoxFuture<'a, Result<CompactOutput>> {
         Box::pin(async {
             Err(Error::Provider(

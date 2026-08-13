@@ -574,25 +574,53 @@ fn responses_web_search_without_queries_is_other() {
 }
 
 #[test]
-fn compaction_shape_contains_only_the_model_and_history() {
-    let provider =
-        OpenAi::new("test-key", "https://api.openai.com/v1", "test-model").expect("provider");
+fn compaction_shape_matches_the_responses_contract() {
+    let provider = OpenAi::new("test-key", "https://api.openai.com/v1", "test-model")
+        .expect("provider")
+        .with_reasoning_effort("medium")
+        .expect("reasoning effort")
+        .with_reasoning_summary()
+        .with_web_search();
     assert!(!provider.compaction_endpoint());
     let input = [serde_json::json!({
         "role": "user",
         "content": "hello",
         "_private": true
     })];
+    let tools = [ToolDefinition {
+        name: "read".into(),
+        description: "Read a file".into(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
     let body = provider
         .with_compaction_endpoint()
-        .compact_body(CompactRequest { input: &input })
+        .compact_body(CompactRequest {
+            session_id: "test-session",
+            instructions: "Compact the conversation",
+            input: &input,
+            tools: &tools,
+        })
         .expect("compact body");
 
     assert_eq!(
         body,
         serde_json::json!({
             "model": "test-model",
-            "input": [{"role": "user", "content": "hello"}]
+            "instructions": "Compact the conversation",
+            "input": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object"},
+                    "strict": false
+                },
+                {"type": "web_search"}
+            ],
+            "parallel_tool_calls": true,
+            "prompt_cache_key": "test-session",
+            "reasoning": {"effort": "medium", "summary": "auto"}
         })
     );
 }
@@ -622,6 +650,7 @@ impl OpenAiAuthorization for HttpRefreshingAuthorization {
     fn authorize_http<'a>(
         &'a self,
         _streaming: bool,
+        _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<ResolvedAuthorization>> {
         let authorization = self.resolved();
         Box::pin(async move { Ok(authorization) })
@@ -751,7 +780,12 @@ async fn http_unauthorized_refreshes_and_retries_once() {
     )
     .expect("provider");
     let response = provider
-        .send_authorized("responses", &serde_json::json!({}), true)
+        .send_authorized(
+            "responses",
+            &serde_json::json!({}),
+            true,
+            Some("test-session"),
+        )
         .await
         .expect("request should recover");
     assert_eq!(response.status(), reqwest::StatusCode::OK);

@@ -64,6 +64,9 @@ mod manifest {
 const PROVIDER_ID: &str = "openai_codex";
 const HTTP_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const SOCKET_URL: &str = "wss://chatgpt.com/backend-api/codex/responses";
+// ChatGPT feature-gates Codex models and transports by this wire-client version.
+// Keep it aligned with the audited upstream Codex release.
+const CODEX_COMPAT_VERSION: &str = "0.147.0";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -716,19 +719,25 @@ impl OpenAiAuthorization for ChatGptAuth {
     fn authorize_http<'a>(
         &'a self,
         streaming: bool,
+        session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<ResolvedAuthorization>> {
         Box::pin(async move {
             let (token, account_id) = self.authorization().await?;
             let mut headers = vec![
                 ("chatgpt-account-id".into(), account_id),
                 ("originator".into(), "horus".into()),
+                ("version".into(), CODEX_COMPAT_VERSION.into()),
                 (
                     "user-agent".into(),
                     concat!("horus/", env!("CARGO_PKG_VERSION")).into(),
                 ),
             ];
-            if streaming {
-                headers.push(("openai-beta".into(), "responses=experimental".into()));
+            if let Some(session_id) = session_id {
+                headers.push(("session-id".into(), session_id.into()));
+                headers.push(("thread-id".into(), session_id.into()));
+                if streaming {
+                    headers.push(("x-client-request-id".into(), session_id.into()));
+                }
             }
             Ok(ResolvedAuthorization { token, headers })
         })
@@ -745,6 +754,7 @@ impl OpenAiAuthorization for ChatGptAuth {
                 headers: vec![
                     ("chatgpt-account-id".into(), account_id),
                     ("originator".into(), "horus".into()),
+                    ("version".into(), CODEX_COMPAT_VERSION.into()),
                     (
                         "user-agent".into(),
                         concat!("horus/", env!("CARGO_PKG_VERSION")).into(),
@@ -754,6 +764,7 @@ impl OpenAiAuthorization for ChatGptAuth {
                         "responses_websockets=2026-02-06".into(),
                     ),
                     ("session-id".into(), session_id.into()),
+                    ("thread-id".into(), session_id.into()),
                     ("x-client-request-id".into(), session_id.into()),
                 ],
             })

@@ -262,7 +262,13 @@ async fn native_compaction_survives_recreation_with_current_prompt_and_tools() {
 
     let compact_requests = model.compact_requests.lock().expect("compact requests");
     assert_eq!(compact_requests.len(), 1);
-    let compact_input = serde_json::to_string(&compact_requests[0]).expect("compact input");
+    let compact_request = &compact_requests[0];
+    assert_eq!(compact_request.session_id, "prompt-refresh");
+    assert!(compact_request.instructions.contains("old base marker"));
+    assert!(compact_request.instructions.contains("old section marker"));
+    assert!(compact_request.instructions.contains("**cron**"));
+    assert_eq!(compact_request.tools[0].name, "schedule_task");
+    let compact_input = serde_json::to_string(&compact_request.input).expect("compact input");
     assert!(compact_input.contains("first turn"));
     assert!(compact_input.contains("compact turn"));
     assert!(!compact_input.contains("old base marker"));
@@ -701,7 +707,7 @@ async fn steering_is_injected_before_native_compaction() {
     let requests = scripted.compact_requests.lock().expect("compact requests");
     assert_eq!(requests.len(), 1);
     assert!(
-        serde_json::to_string(&requests[0])
+        serde_json::to_string(&requests[0].input)
             .expect("serialize compact input")
             .contains("steered")
     );
@@ -1393,12 +1399,19 @@ struct ScriptedModel {
     responses: Mutex<VecDeque<ModelOutput>>,
     compact_outputs: Mutex<VecDeque<CompactOutput>>,
     requests: Mutex<Vec<RecordedRequest>>,
-    compact_requests: Mutex<Vec<Vec<Value>>>,
+    compact_requests: Mutex<Vec<RecordedCompactRequest>>,
     compaction_endpoint: bool,
     image_input: bool,
 }
 
 struct RecordedRequest {
+    instructions: String,
+    input: Vec<Value>,
+    tools: Vec<ToolDefinition>,
+}
+
+struct RecordedCompactRequest {
+    session_id: String,
     instructions: String,
     input: Vec<Value>,
     tools: Vec<ToolDefinition>,
@@ -1496,7 +1509,12 @@ impl Model for ScriptedModel {
             self.compact_requests
                 .lock()
                 .expect("compact requests")
-                .push(request.input.to_vec());
+                .push(RecordedCompactRequest {
+                    session_id: request.session_id.into(),
+                    instructions: request.instructions.into(),
+                    input: request.input.to_vec(),
+                    tools: request.tools.to_vec(),
+                });
             self.compact_outputs
                 .lock()
                 .expect("compact outputs")

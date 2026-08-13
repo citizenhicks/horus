@@ -175,8 +175,11 @@ impl OpenAi {
         request: ModelRequest<'_>,
         events: ModelEventSink,
     ) -> Result<ModelOutput> {
+        let session_id = request.session_id;
         let body = self.response_body(request)?;
-        let mut response = self.send_authorized("responses", &body, true).await?;
+        let mut response = self
+            .send_authorized("responses", &body, true, Some(session_id))
+            .await?;
         if !response.status().is_success() {
             return Err(status_error(response, "Responses").await);
         }
@@ -243,15 +246,8 @@ impl OpenAi {
             "store": false,
             "stream": true
         });
-        if self.reasoning_effort.is_some() || self.reasoning_summary {
-            let mut reasoning = serde_json::Map::new();
-            if let Some(effort) = &self.reasoning_effort {
-                reasoning.insert("effort".into(), Value::String(effort.clone()));
-            }
-            if self.reasoning_summary {
-                reasoning.insert("summary".into(), Value::String("auto".into()));
-            }
-            body["reasoning"] = Value::Object(reasoning);
+        if let Some(reasoning) = self.reasoning() {
+            body["reasoning"] = reasoning;
         }
         Ok(body)
     }
@@ -262,9 +258,10 @@ impl OpenAi {
                 "OpenAI-compatible provider has no compaction endpoint".into(),
             ));
         }
+        let session_id = request.session_id;
         let body = self.compact_body(request)?;
         let response = self
-            .send_authorized("responses/compact", &body, false)
+            .send_authorized("responses/compact", &body, false, Some(session_id))
             .await?;
         if !response.status().is_success() {
             return Err(status_error(response, "Responses").await);
@@ -279,9 +276,10 @@ impl OpenAi {
         endpoint: &str,
         body: &Value,
         streaming: bool,
+        session_id: Option<&str>,
     ) -> Result<reqwest::Response> {
         for attempt in 0..2 {
-            let authorization = self.auth.authorize_http(streaming).await?;
+            let authorization = self.auth.authorize_http(streaming, session_id).await?;
             let rejected_token = authorization.token.clone();
             let mut request = self
                 .client
@@ -303,10 +301,32 @@ impl OpenAi {
     }
 
     fn compact_body(&self, request: CompactRequest<'_>) -> Result<Value> {
-        Ok(serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
-            "input": wire_input(request.input, self.image_input)?
-        }))
+            "instructions": request.instructions,
+            "input": wire_input(request.input, self.image_input)?,
+            "tools": wire_tools(request.tools, &self.hosted_tools, true),
+            "parallel_tool_calls": true,
+            "prompt_cache_key": request.session_id
+        });
+        if let Some(reasoning) = self.reasoning() {
+            body["reasoning"] = reasoning;
+        }
+        Ok(body)
+    }
+
+    fn reasoning(&self) -> Option<Value> {
+        if self.reasoning_effort.is_none() && !self.reasoning_summary {
+            return None;
+        }
+        let mut reasoning = serde_json::Map::new();
+        if let Some(effort) = &self.reasoning_effort {
+            reasoning.insert("effort".into(), Value::String(effort.clone()));
+        }
+        if self.reasoning_summary {
+            reasoning.insert("summary".into(), Value::String("auto".into()));
+        }
+        Some(Value::Object(reasoning))
     }
 }
 

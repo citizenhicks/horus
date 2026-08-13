@@ -79,9 +79,8 @@ const SOCKET_COMMAND_CAPACITY: usize = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const CONNECTION_REUSE_AGE: Duration = Duration::from_secs(50 * 60);
-const CONNECTION_HARD_AGE: Duration = Duration::from_secs(59 * 60);
+const COMPACTION_STREAM_RETRY_LIMIT: usize = 2;
+const COMPACTION_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 
 type RawSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -121,7 +120,6 @@ struct OpenAiWsConnection {
     commands: mpsc::Sender<SocketCommand>,
     messages: mpsc::UnboundedReceiver<SocketEvent>,
     closed: Arc<AtomicBool>,
-    reuse_until: Instant,
     pump: tokio::task::AbortHandle,
 }
 
@@ -143,7 +141,7 @@ enum SocketEvent {
 }
 
 impl OpenAiSocket {
-    /// Creates the first-party socket transport and HTTP compaction fallback.
+    /// Creates the first-party Responses transport with HTTP fallback.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Result<Self> {
         Self::with_client(api_key, model, super::transport::streaming_client()?)
     }
@@ -175,8 +173,7 @@ impl OpenAiSocket {
         client: reqwest::Client,
     ) -> Result<Self> {
         let model = model.into();
-        let http = OpenAi::with_authorization(Arc::clone(&auth), http_url, model.clone(), client)?
-            .with_compaction_endpoint();
+        let http = OpenAi::with_authorization(Arc::clone(&auth), http_url, model.clone(), client)?;
         Ok(Self {
             auth,
             socket_url: socket_url.into(),
@@ -355,6 +352,54 @@ impl OpenAiSocket {
             })
     }
 
+    async fn compact_response(&self, request: CompactRequest<'_>) -> Result<CompactOutput> {
+        let mut input = request.input.to_vec();
+        input.push(serde_json::json!({"type": "compaction_trigger"}));
+        let mut retries = 0;
+        let output = loop {
+            match self
+                .send_response(
+                    ModelRequest {
+                        session_id: request.session_id,
+                        instructions: request.instructions,
+                        input: &input,
+                        tools: request.tools,
+                        allow_hosted_tools: true,
+                        allow_continuation: true,
+                    },
+                    Arc::new(|_| Ok(())),
+                )
+                .await
+            {
+                Ok(output) => break output,
+                Err(Error::Provider(error))
+                    if error.is_stream_interrupted() && retries < COMPACTION_STREAM_RETRY_LIMIT =>
+                {
+                    let delay = compaction_retry_delay(&error, retries);
+                    retries += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let compaction = output
+            .output()
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if compaction.len() != 1 {
+            return Err(Error::Provider(
+                format!(
+                    "Responses compaction expected exactly one compaction item, got {}",
+                    compaction.len()
+                )
+                .into(),
+            ));
+        }
+        CompactOutput::from_output(compaction, output.usage().clone())
+    }
+
     async fn session(&self, session_id: &str) -> Result<Arc<Mutex<SocketState>>> {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get(session_id) {
@@ -362,24 +407,6 @@ impl OpenAiSocket {
         }
 
         let mut close = Vec::new();
-        let expired = sessions
-            .iter()
-            .filter(|(_, session)| Arc::strong_count(session) == 1)
-            .filter_map(|(id, session)| {
-                let state = session.try_lock().ok()?;
-                (!state.use_http && state.last_used_at.elapsed() >= CONNECTION_IDLE_TIMEOUT)
-                    .then(|| id.clone())
-            })
-            .collect::<Vec<_>>();
-        for id in expired {
-            if let Some(session) = sessions.remove(&id)
-                && let Ok(mut state) = session.try_lock()
-                && let Some(connection) = state.connection.take()
-            {
-                close.push(connection);
-            }
-        }
-
         let websocket_sessions = sessions
             .values()
             .filter(|session| session.try_lock().map_or(true, |state| !state.use_http))
@@ -440,6 +467,15 @@ impl OpenAiSocket {
     }
 }
 
+fn compaction_retry_delay(error: &crate::ProviderError, retry: usize) -> Duration {
+    let backoff = COMPACTION_RETRY_BASE_DELAY.saturating_mul(1_u32 << retry.min(4));
+    error
+        .retry_after()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .map_or(backoff, |retry_after| retry_after.max(backoff))
+}
+
 async fn close_connections(connections: Vec<OpenAiWsConnection>) {
     join_all(connections.into_iter().map(OpenAiWsConnection::close)).await;
 }
@@ -487,50 +523,31 @@ impl Model for OpenAiSocket {
     }
 
     fn compact<'a>(&'a self, request: CompactRequest<'a>) -> BoxFuture<'a, Result<CompactOutput>> {
-        self.http.compact(request)
+        Box::pin(self.compact_response(request))
     }
 }
 
 impl OpenAiWsConnection {
     fn new(socket: RawSocket) -> Self {
-        Self::with_lifecycle(
-            socket,
-            CONNECTION_REUSE_AGE,
-            CONNECTION_HARD_AGE,
-            CONNECTION_IDLE_TIMEOUT,
-        )
-    }
-
-    fn with_lifecycle(
-        socket: RawSocket,
-        reuse_age: Duration,
-        hard_age: Duration,
-        idle_timeout: Duration,
-    ) -> Self {
         let (commands, command_receiver) = mpsc::channel(SOCKET_COMMAND_CAPACITY);
         let (message_sender, messages) = mpsc::unbounded_channel();
         let closed = Arc::new(AtomicBool::new(false));
-        let connected_at = Instant::now();
         let task = tokio::spawn(socket_pump(
             socket,
             command_receiver,
             message_sender,
             Arc::clone(&closed),
-            connected_at + reuse_age,
-            connected_at + hard_age,
-            idle_timeout,
         ));
         Self {
             commands,
             messages,
             closed,
-            reuse_until: connected_at + reuse_age,
             pump: task.abort_handle(),
         }
     }
 
     fn is_usable(&self) -> bool {
-        !self.closed.load(Ordering::Acquire) && Instant::now() < self.reuse_until
+        !self.closed.load(Ordering::Acquire)
     }
 
     async fn start(&mut self, message: Message) -> std::result::Result<(), ()> {
@@ -591,33 +608,16 @@ async fn socket_pump(
     mut commands: mpsc::Receiver<SocketCommand>,
     messages: mpsc::UnboundedSender<SocketEvent>,
     closed: Arc<AtomicBool>,
-    reuse_until: Instant,
-    hard_expires_at: Instant,
-    idle_timeout: Duration,
 ) {
     let mut active = false;
     let mut stream_bytes = 0;
     let mut stream_events = 0;
-    let mut idle_at = Instant::now() + idle_timeout;
     let mut close_result = None;
     loop {
-        let deadline = if active {
-            hard_expires_at
-        } else {
-            reuse_until.min(idle_at)
-        };
         tokio::select! {
-            () = tokio::time::sleep_until(deadline) => {
-                if active {
-                    let _ = messages.send(SocketEvent::Closed);
-                }
-                break;
-            }
             command = commands.recv() => {
                 match command {
-                    Some(SocketCommand::Send { message, result })
-                        if !active && Instant::now() < reuse_until =>
-                    {
+                    Some(SocketCommand::Send { message, result }) if !active => {
                         let sent = matches!(
                             timeout(SOCKET_IO_TIMEOUT, socket.send(message)).await,
                             Ok(Ok(()))
@@ -632,13 +632,9 @@ async fn socket_pump(
                     }
                     Some(SocketCommand::Send { result, .. }) => {
                         let _ = result.send(Err(()));
-                        if !active && Instant::now() >= reuse_until {
-                            break;
-                        }
                     }
                     Some(SocketCommand::Finish) => {
                         active = false;
-                        idle_at = Instant::now() + idle_timeout;
                     }
                     Some(SocketCommand::Close { result }) => {
                         close_result = Some(result);
@@ -813,6 +809,7 @@ fn response_body(
         "tool_choice": "auto",
         "parallel_tool_calls": true,
         "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": request.session_id,
         "store": false
     });
     if let Some(response_id) = previous_response_id {

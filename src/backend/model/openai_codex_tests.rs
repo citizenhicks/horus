@@ -48,6 +48,72 @@ fn saved_auth_is_owner_only() {
 }
 
 #[tokio::test]
+async fn codex_requests_include_session_and_thread_identity() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("auth.json");
+    let payload = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&serde_json::json!({
+            (JWT_AUTH_CLAIM): {"chatgpt_account_id": "account-123"}
+        }))
+        .expect("JWT payload"),
+    );
+    write_credential(
+        &path,
+        &OAuthCredential {
+            access: format!("e30.{payload}.signature"),
+            refresh: "refresh-token".into(),
+            expires: u64::MAX,
+            account_id: "account-123".into(),
+        },
+    )
+    .expect("save credential");
+    let auth = ChatGptAuth::load(path).expect("load auth");
+
+    let compact = auth
+        .authorize_http(false, Some("session-123"))
+        .await
+        .expect("compaction authorization");
+    assert_eq!(header(&compact, "version"), Some(CODEX_COMPAT_VERSION));
+    assert_eq!(header(&compact, "session-id"), Some("session-123"));
+    assert_eq!(header(&compact, "thread-id"), Some("session-123"));
+    assert_eq!(header(&compact, "x-client-request-id"), None);
+    assert_eq!(header(&compact, "openai-beta"), None);
+
+    let responses = auth
+        .authorize_http(true, Some("session-123"))
+        .await
+        .expect("Responses authorization");
+    assert_eq!(
+        header(&responses, "x-client-request-id"),
+        Some("session-123")
+    );
+    assert_eq!(header(&responses, "openai-beta"), None);
+
+    let websocket = auth
+        .authorize_websocket("session-123")
+        .await
+        .expect("WebSocket authorization");
+    assert_eq!(header(&websocket, "version"), Some(CODEX_COMPAT_VERSION));
+    assert_eq!(header(&websocket, "session-id"), Some("session-123"));
+    assert_eq!(header(&websocket, "thread-id"), Some("session-123"));
+    assert_eq!(
+        header(&websocket, "x-client-request-id"),
+        Some("session-123")
+    );
+    assert_eq!(
+        header(&websocket, "openai-beta"),
+        Some("responses_websockets=2026-02-06")
+    );
+}
+
+fn header<'a>(authorization: &'a ResolvedAuthorization, name: &str) -> Option<&'a str> {
+    authorization
+        .headers
+        .iter()
+        .find_map(|(header, value)| header.eq_ignore_ascii_case(name).then_some(value.as_str()))
+}
+
+#[tokio::test]
 async fn callback_rejects_wrong_state_then_accepts_the_expected_state() {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await

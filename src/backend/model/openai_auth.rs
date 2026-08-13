@@ -14,6 +14,7 @@ pub(super) trait OpenAiAuthorization: Send + Sync {
     fn authorize_http<'a>(
         &'a self,
         streaming: bool,
+        session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<ResolvedAuthorization>>;
 
     fn authorize_websocket<'a>(
@@ -36,6 +37,7 @@ impl OpenAiAuthorization for ApiKeyAuthorization {
     fn authorize_http<'a>(
         &'a self,
         _streaming: bool,
+        _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<ResolvedAuthorization>> {
         self.resolved()
     }
