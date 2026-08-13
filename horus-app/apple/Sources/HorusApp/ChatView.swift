@@ -269,10 +269,8 @@ struct TranscriptRowsView: View {
             self.row(row)
                 .id(row.id)
                 .padding(.top, index == 0 ? 0 : rowSpacing)
-                // Keep the row at full layout size; the scroll view glides the tail offset
-                // while this only reveals its pixels.
+                // The scroll view owns movement; rows only fade in.
                 .opacity(isVisible ? 1 : 0)
-                .offset(y: isVisible || reduceMotion ? 0 : 6)
         }
         .onAppear {
             visibleRowIDs = Set(projection.rows.map(\.id))
