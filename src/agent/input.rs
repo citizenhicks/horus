@@ -396,11 +396,7 @@ mod tests {
                         "edit requires text".into(),
                     )));
                 }
-                if context
-                    .queued_input
-                    .take_latest(context.arguments)?
-                    .is_some()
-                {
+                if context.queued_input.take(context.arguments)?.is_some() {
                     Ok(Some(ActiveSubmissionResult::Accepted))
                 } else {
                     Ok(Some(ActiveSubmissionResult::Rejected("stale edit".into())))

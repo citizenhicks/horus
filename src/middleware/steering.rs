@@ -5,7 +5,6 @@ use super::ActiveSubmissionContext;
 use super::ActiveSubmissionResult;
 use super::Middleware;
 use super::ModelContext;
-use super::QueuedInputView;
 use super::RuntimeContext;
 use super::TurnEndContext;
 use super::manifest::{MiddlewareManifest, MiddlewareSettingManifest};
@@ -84,19 +83,20 @@ impl Steering {
         Ok(Self { max_pending })
     }
 
-    fn queued_widget(&self, message: Option<QueuedInputView<'_>>) -> FrontendEvent {
-        let Some(message) = message else {
-            return FrontendEvent::RemoveWidget {
-                capability: self.name().into(),
-                id: "queued".into(),
-            };
-        };
+    fn remove_widget(&self, id: &str) -> FrontendEvent {
+        FrontendEvent::RemoveWidget {
+            capability: self.name().into(),
+            id: id.into(),
+        }
+    }
+
+    fn queued_widget(&self, id: &str, text: &str) -> FrontendEvent {
         FrontendEvent::Widget {
             capability: self.name().into(),
             item: FrontendWidget {
-                id: "queued".into(),
+                id: id.into(),
                 slot: FrontendSlot::TranscriptTail,
-                text: message.text().into(),
+                text: text.into(),
                 tone: FrontendTone::Neutral,
                 symbol: None,
                 icon_only: false,
@@ -105,8 +105,8 @@ impl Steering {
                 action: Some(Op::CapabilityCommand {
                     capability: self.name().into(),
                     command: EDIT_COMMAND.into(),
-                    arguments: message.id().into(),
-                    input: Some(message.text().into()),
+                    arguments: id.into(),
+                    input: Some(text.into()),
                     target: None,
                 }),
             },
@@ -164,7 +164,7 @@ impl Middleware for Steering {
             ));
         }
         context.events.push(EventMsg::Frontend(
-            self.queued_widget(context.queued_input.latest()),
+            self.queued_widget(context.submission_id, context.text),
         ));
         Ok(ActiveSubmissionResult::Accepted)
     }
@@ -177,31 +177,29 @@ impl Middleware for Steering {
             if context.command != EDIT_COMMAND {
                 return Ok(None);
             }
-            if context
-                .queued_input
-                .take_latest(context.arguments)?
-                .is_none()
-            {
+            if context.queued_input.take(context.arguments)?.is_none() {
                 return Ok(Some(ActiveSubmissionResult::Rejected(STALE_EDIT.into())));
             }
-            context.events.push(EventMsg::Frontend(
-                self.queued_widget(context.queued_input.latest()),
-            ));
+            context
+                .events
+                .push(EventMsg::Frontend(self.remove_widget(context.arguments)));
             Ok(Some(ActiveSubmissionResult::Accepted))
         })
     }
 
     fn turn_ended(&self, context: &mut TurnEndContext<'_>) -> Result<()> {
-        context
-            .events
-            .push(EventMsg::Frontend(self.queued_widget(None)));
+        let removals = context
+            .queued_input()
+            .map(|message| EventMsg::Frontend(self.remove_widget(message.id())))
+            .collect::<Vec<_>>();
+        context.events.extend(removals);
         Ok(())
     }
 
     fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            if let Some(message) = context.queued_input.latest() {
-                (context.frontend)(self.queued_widget(Some(message)))?;
+            for message in context.queued_input.views() {
+                (context.frontend)(self.queued_widget(message.id(), message.text()))?;
             }
             Ok(())
         })
@@ -210,10 +208,10 @@ impl Middleware for Steering {
     fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let queued = context.queued_input.drain();
-            if !queued.is_empty() {
+            for message in &queued {
                 context
                     .events
-                    .push(EventMsg::Frontend(self.queued_widget(None)));
+                    .push(EventMsg::Frontend(self.remove_widget(message.id())));
             }
             for message in queued {
                 let message = message.into_text();
@@ -268,7 +266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_restores_the_latest_owned_queue_widget() {
+    async fn initialize_restores_every_owned_queue_widget() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
             SqliteCheckpoint::new(temporary.path().join("checkpoints.sqlite3"))
@@ -301,12 +299,23 @@ mod tests {
             .expect("initialize middleware");
 
         let events = frontend_events.lock().expect("frontend events");
-        let [FrontendEvent::Widget { item, .. }] = events.as_slice() else {
-            panic!("expected one restored widget");
+        let [
+            FrontendEvent::Widget { item: older, .. },
+            FrontendEvent::Widget { item: latest, .. },
+        ] = events.as_slice()
+        else {
+            panic!("expected both restored widgets");
         };
-        assert_eq!(item.text, "latest");
+        assert_eq!(
+            (older.id.as_str(), older.text.as_str()),
+            ("steering-1", "older")
+        );
+        assert_eq!(
+            (latest.id.as_str(), latest.text.as_str()),
+            ("steering-2", "latest")
+        );
         assert!(matches!(
-            &item.action,
+            &latest.action,
             Some(Op::CapabilityCommand { arguments, .. }) if arguments == "steering-2"
         ));
     }
@@ -364,7 +373,7 @@ mod tests {
             panic!("expected queued widget");
         };
         assert_eq!(capability, MANIFEST.id);
-        assert_eq!(item.id, "queued");
+        assert_eq!(item.id, "steering-1");
         assert_eq!(item.slot, FrontendSlot::TranscriptTail);
         assert_eq!(item.text, text);
         assert_eq!(
@@ -377,6 +386,40 @@ mod tests {
                 target: None,
             })
         );
+    }
+
+    #[test]
+    fn active_submissions_publish_distinct_widgets() {
+        let steering = Steering::default();
+        let mut queued = Vec::new();
+        let mut events = Vec::new();
+
+        for (submission_id, text) in [("steering-1", "older"), ("steering-2", "latest")] {
+            let result = steering
+                .active_submission(&mut ActiveSubmissionContext {
+                    submission_id,
+                    operation: OPERATION,
+                    active_turn_id: "turn-1",
+                    target_turn_id: "turn-1",
+                    text,
+                    queued_input: queue(&mut queued),
+                    events: &mut events,
+                })
+                .expect("active submission");
+            assert_eq!(result, ActiveSubmissionResult::Accepted);
+        }
+
+        assert_eq!(
+            queued,
+            vec![item("steering-1", "older"), item("steering-2", "latest")]
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                EventMsg::Frontend(FrontendEvent::Widget { item: older, .. }),
+                EventMsg::Frontend(FrontendEvent::Widget { item: latest, .. })
+            ] if older.id == "steering-1" && latest.id == "steering-2"
+        ));
     }
 
     #[test]
@@ -407,7 +450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_command_takes_only_the_latest_queued_message() {
+    async fn active_command_takes_the_selected_queued_message() {
         let steering = Steering::default();
         let mut queued = vec![item("steering-1", "older"), item("steering-2", "latest")];
         let mut events = Vec::new();
@@ -419,8 +462,8 @@ mod tests {
                 metadata: &std::collections::BTreeMap::new(),
                 active_turn_id: "turn-1",
                 command: EDIT_COMMAND,
-                arguments: "steering-2",
-                input: Some("latest"),
+                arguments: "steering-1",
+                input: Some("older"),
                 target: None,
                 queued_input: queue(&mut queued),
                 events: &mut events,
@@ -429,18 +472,50 @@ mod tests {
             .expect("active command");
 
         assert_eq!(result, Some(ActiveSubmissionResult::Accepted));
-        assert_eq!(queued, vec![item("steering-1", "older")]);
-        let [
-            EventMsg::Frontend(FrontendEvent::Widget {
-                capability, item, ..
-            }),
-        ] = events.as_slice()
+        assert_eq!(queued, vec![item("steering-2", "latest")]);
+        let [EventMsg::Frontend(FrontendEvent::RemoveWidget { capability, id })] =
+            events.as_slice()
         else {
-            panic!("expected prior widget");
+            panic!("expected the edited widget to be removed");
         };
         assert_eq!(
-            (capability.as_str(), item.text.as_str()),
-            (MANIFEST.id, "older")
+            (capability.as_str(), id.as_str()),
+            (MANIFEST.id, "steering-1")
+        );
+    }
+
+    #[test]
+    fn turn_ended_removes_each_pending_widget_by_id() {
+        let stack = MiddlewareStack::new(vec![Arc::new(Steering::default())]).expect("stack");
+        let queued = vec![
+            DurableQueuedInput::new("other", "private", "hidden").expect("other item"),
+            item("steering-1", "older"),
+            item("steering-2", "latest"),
+        ];
+        let mut events = Vec::new();
+
+        stack
+            .turn_ended(TurnEndContext {
+                session_id: "session-1",
+                turn_id: "turn-1",
+                queued_input: &queued,
+                owner: None,
+                events: &mut events,
+            })
+            .expect("turn ended");
+
+        assert_eq!(
+            events,
+            vec![
+                EventMsg::Frontend(FrontendEvent::RemoveWidget {
+                    capability: MANIFEST.id.into(),
+                    id: "steering-1".into(),
+                }),
+                EventMsg::Frontend(FrontendEvent::RemoveWidget {
+                    capability: MANIFEST.id.into(),
+                    id: "steering-2".into(),
+                })
+            ]
         );
     }
 

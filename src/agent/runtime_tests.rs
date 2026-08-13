@@ -827,14 +827,14 @@ async fn active_changes_precede_later_hook_events_in_recorded_order() {
                 let event = record.event;
                 match event.msg {
                     EventMsg::Frontend(FrontendEvent::RemoveWidget { capability, id })
-                        if capability == "steering" && id == "queued" =>
+                        if capability == "steering" && id == "old" =>
                     {
                         order.push("remove");
                         sequences.push(sequence);
                     }
                     EventMsg::Frontend(FrontendEvent::Widget { capability, item })
                         if capability == "steering"
-                            && item.id == "queued"
+                            && item.id == queued_submission
                             && event.submission_id.as_deref() == Some(&queued_submission) =>
                     {
                         order.push("widget");

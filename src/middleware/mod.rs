@@ -88,6 +88,12 @@ pub struct QueuedInputValue {
 }
 
 impl QueuedInputValue {
+    /// Returns the identity token for this queued input.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     /// Returns the exact queued text.
     #[must_use]
     pub fn text(&self) -> &str {
@@ -108,10 +114,9 @@ pub struct QueuedInputSnapshot {
 }
 
 impl QueuedInputSnapshot {
-    /// Returns the newest queued item owned by this middleware.
-    #[must_use]
-    pub fn latest(&self) -> Option<QueuedInputView<'_>> {
-        self.items.last().map(|item| QueuedInputView {
+    /// Returns every queued item owned by this middleware, oldest first.
+    pub fn views(&self) -> impl Iterator<Item = QueuedInputView<'_>> {
+        self.items.iter().map(|item| QueuedInputView {
             id: &item.id,
             text: item.text(),
         })
@@ -236,15 +241,16 @@ impl<'a> QueuedInputQueue<'a> {
         Ok(true)
     }
 
-    /// Removes the newest item when its revision matches.
-    pub fn take_latest(&mut self, expected_id: &str) -> Result<Option<QueuedInputValue>> {
+    /// Removes the item with the matching identity.
+    pub fn take(&mut self, id: &str) -> Result<Option<QueuedInputValue>> {
         let owner = self.owner()?;
-        let Some(index) = self.items.iter().rposition(|item| item.owner() == owner) else {
+        let Some(index) = self
+            .items
+            .iter()
+            .position(|item| item.owner() == owner && item.id() == id)
+        else {
             return Ok(None);
         };
-        if self.items[index].id() != expected_id {
-            return Ok(None);
-        }
         let (id, text) = self.items.remove(index).into_id_and_text();
         Ok(Some(QueuedInputValue { id, text }))
     }
@@ -429,7 +435,23 @@ pub enum ActiveSubmissionResult {
 pub struct TurnEndContext<'a> {
     pub session_id: &'a str,
     pub turn_id: &'a str,
+    pub(crate) queued_input: &'a [DurableQueuedInput],
+    pub(crate) owner: Option<&'static str>,
     pub events: &'a mut Vec<EventMsg>,
+}
+
+impl TurnEndContext<'_> {
+    /// Returns queued input still pending for this middleware, oldest first.
+    pub fn queued_input(&self) -> impl Iterator<Item = QueuedInputView<'_>> {
+        let owner = self.owner;
+        self.queued_input
+            .iter()
+            .filter(move |item| owner.is_some_and(|owner| item.owner() == owner))
+            .map(|item| QueuedInputView {
+                id: item.id(),
+                text: item.text(),
+            })
+    }
 }
 
 /// Durable identity exposed when one agent runtime stops.
@@ -888,6 +910,7 @@ impl MiddlewareStack {
 
     pub(crate) fn turn_ended(&self, mut context: TurnEndContext<'_>) -> Result<()> {
         for entry in &self.entries {
+            context.owner = Some(entry.name());
             entry.turn_ended(&mut context)?;
         }
         Ok(())
@@ -1193,28 +1216,30 @@ mod tests {
     }
 
     #[test]
-    fn queued_input_take_is_owner_scoped_and_rejects_stale_cas() {
+    fn queued_input_take_is_exact_and_owner_scoped() {
         let mut items = vec![
             queued("alpha", "one", "first"),
+            queued("alpha", "two", "second"),
             queued("beta", "private", "other owner"),
         ];
         {
             let mut queue = scoped_queue(&mut items, "alpha", QueuedInputBaseline::default());
-            assert!(
-                queue
-                    .take_latest("stale")
-                    .expect("stale comparison")
-                    .is_none()
-            );
+            assert!(queue.take("stale").expect("stale comparison").is_none());
             let taken = queue
-                .take_latest("one")
+                .take("one")
                 .expect("valid comparison")
                 .expect("matching item");
             assert_eq!(taken.text(), "first");
-            assert!(queue.take_latest("one").expect("already taken").is_none());
+            assert!(queue.take("one").expect("already taken").is_none());
         }
 
-        assert_eq!(items, vec![queued("beta", "private", "other owner")]);
+        assert_eq!(
+            items,
+            vec![
+                queued("alpha", "two", "second"),
+                queued("beta", "private", "other owner")
+            ]
+        );
     }
 
     #[test]
@@ -1233,7 +1258,7 @@ mod tests {
                     )
                     .is_err()
             );
-            assert!(queue.take_latest("").expect("stale comparison").is_none());
+            assert!(queue.take("").expect("stale comparison").is_none());
         }
 
         assert_eq!(items, original);

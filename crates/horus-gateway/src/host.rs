@@ -5,7 +5,7 @@ mod files;
 mod git;
 mod providers;
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -65,7 +65,7 @@ const RECENT_RUN_LIMIT: usize = 30;
 pub(crate) const MAX_ACTIVE_SESSIONS: usize = 32;
 
 type SessionActivities = Arc<StdMutex<HashMap<String, SessionActivity>>>;
-type SessionWidgets = BTreeMap<(String, String), horus::protocol::FrontendWidget>;
+type SessionWidgets = Vec<((String, String), horus::protocol::FrontendWidget)>;
 
 #[derive(Clone)]
 pub(crate) struct HostHandle {
@@ -2503,7 +2503,7 @@ async fn load_replay(
         None
     };
     let mut artifacts = VecDeque::with_capacity(ARTIFACT_CAPACITY);
-    let mut widgets = BTreeMap::new();
+    let mut widgets = SessionWidgets::new();
     for frame in &replay {
         let ServerMessage::AgentEvent { record, .. } = &frame.message else {
             continue;
@@ -2636,10 +2636,16 @@ fn event_sequence(frame: &ServerFrame) -> Option<u64> {
 fn update_widgets(widgets: &mut SessionWidgets, event: &EventMsg) {
     match event {
         EventMsg::Frontend(FrontendEvent::Widget { capability, item }) => {
-            widgets.insert((capability.clone(), item.id.clone()), item.clone());
+            let key = (capability.clone(), item.id.clone());
+            if let Some((_, current)) = widgets.iter_mut().find(|(candidate, _)| candidate == &key)
+            {
+                *current = item.clone();
+            } else {
+                widgets.push((key, item.clone()));
+            }
         }
         EventMsg::Frontend(FrontendEvent::RemoveWidget { capability, id }) => {
-            widgets.remove(&(capability.clone(), id.clone()));
+            widgets.retain(|((owner, widget), _)| owner != capability || widget != id);
         }
         _ => {}
     }
@@ -2988,8 +2994,8 @@ mod tests {
 
     #[test]
     fn widget_snapshot_is_namespaced_updated_and_removed() {
-        let widget = |text: &str| horus::protocol::FrontendWidget {
-            id: "status".into(),
+        let widget = |id: &str, text: &str| horus::protocol::FrontendWidget {
+            id: id.into(),
             slot: horus::protocol::FrontendSlot::Header,
             text: text.into(),
             tone: horus::protocol::FrontendTone::Neutral,
@@ -3004,21 +3010,28 @@ mod tests {
             &mut widgets,
             &EventMsg::Frontend(FrontendEvent::Widget {
                 capability: "tasks".into(),
-                item: widget("one"),
-            }),
-        );
-        update_widgets(
-            &mut widgets,
-            &EventMsg::Frontend(FrontendEvent::Widget {
-                capability: "subagents".into(),
-                item: widget("two"),
+                item: widget("z-older", "one"),
             }),
         );
         update_widgets(
             &mut widgets,
             &EventMsg::Frontend(FrontendEvent::Widget {
                 capability: "tasks".into(),
-                item: widget("updated"),
+                item: widget("a-newer", "two"),
+            }),
+        );
+        update_widgets(
+            &mut widgets,
+            &EventMsg::Frontend(FrontendEvent::Widget {
+                capability: "subagents".into(),
+                item: widget("status", "other"),
+            }),
+        );
+        update_widgets(
+            &mut widgets,
+            &EventMsg::Frontend(FrontendEvent::Widget {
+                capability: "tasks".into(),
+                item: widget("z-older", "updated"),
             }),
         );
         update_widgets(
@@ -3034,7 +3047,10 @@ mod tests {
                 .into_iter()
                 .map(|((capability, id), item)| (capability, id, item.text))
                 .collect::<Vec<_>>(),
-            vec![("tasks".into(), "status".into(), "updated".into())]
+            vec![
+                ("tasks".into(), "z-older".into(), "updated".into()),
+                ("tasks".into(), "a-newer".into(), "two".into())
+            ]
         );
     }
 

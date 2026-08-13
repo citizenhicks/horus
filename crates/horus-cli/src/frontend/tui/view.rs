@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use diffy::Line as DiffLine;
 use diffy::Patch;
 use ratatui::Frame;
@@ -674,12 +672,12 @@ fn footer_line(state: &TuiState, width: u16) -> Line<'static> {
 }
 
 fn widget_line(
-    widgets: &BTreeMap<(String, String), FrontendWidget>,
+    widgets: &[((String, String), FrontendWidget)],
     slot: FrontendSlot,
 ) -> Line<'static> {
     let theme = current();
     let mut spans = Vec::new();
-    for item in widgets.values().filter(|item| item.slot == slot) {
+    for (_, item) in widgets.iter().filter(|(_, item)| item.slot == slot) {
         separator(&mut spans);
         let style = if slot == FrontendSlot::ComposerHeader && item.tone == FrontendTone::Neutral {
             theme.style(Role::Muted).add_modifier(Modifier::ITALIC)
@@ -764,7 +762,7 @@ fn elapsed_label(elapsed: std::time::Duration) -> String {
     }
 }
 
-pub(super) fn initial_widgets(catalog: &UiCatalog) -> BTreeMap<(String, String), FrontendWidget> {
+pub(super) fn initial_widgets(catalog: &UiCatalog) -> Vec<((String, String), FrontendWidget)> {
     catalog
         .widgets()
         .map(|(middleware, item)| {
@@ -775,10 +773,10 @@ pub(super) fn initial_widgets(catalog: &UiCatalog) -> BTreeMap<(String, String),
         .collect()
 }
 
-pub(super) fn widget_status(widgets: &BTreeMap<(String, String), FrontendWidget>) -> String {
+pub(super) fn widget_status(widgets: &[((String, String), FrontendWidget)]) -> String {
     widgets
-        .values()
-        .map(|item| format!(" · {}", item.text))
+        .iter()
+        .map(|(_, item)| format!(" · {}", item.text))
         .collect()
 }
 

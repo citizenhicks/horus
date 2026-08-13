@@ -10,8 +10,9 @@ use crate::frontend::theme::{Role, current};
 use horus::backend::model::ModelChoice;
 use horus::protocol::{
     Event, FrontendActiveInput, FrontendBlock, FrontendBlockFormat, FrontendBlockRole,
-    FrontendBlockState, FrontendBlockUpdate, FrontendContribution, FrontendPreviewUpdate,
-    FrontendSlot, FrontendTone, FrontendWidget, RenderedBlock, ReviewDecision,
+    FrontendBlockState, FrontendBlockUpdate, FrontendContribution, FrontendEvent,
+    FrontendPreviewUpdate, FrontendSlot, FrontendTone, FrontendWidget, RenderedBlock,
+    ReviewDecision,
 };
 use horus_gateway::wire::{RecordedEvent, RenderedEvent, RenderedPreview};
 
@@ -522,7 +523,7 @@ fn capability_header_is_live_styled_and_transparent() {
     let catalog = default_catalog();
     let mut state = state();
     state.transcript.clear();
-    state.widgets.insert(
+    state.widgets.push((
         ("skills".into(), "count".into()),
         FrontendWidget {
             id: "count".into(),
@@ -535,7 +536,7 @@ fn capability_header_is_live_styled_and_transparent() {
             content: None,
             action: None,
         },
-    );
+    ));
     let mut terminal = Terminal::new(TestBackend::new(50, 15)).expect("terminal");
     terminal
         .draw(|frame| view::render(frame, &mut state, &catalog))
@@ -557,30 +558,47 @@ fn capability_header_is_live_styled_and_transparent() {
 }
 
 #[test]
-fn transcript_tail_widget_renders_after_live_output() {
+fn transcript_tail_widgets_render_after_live_output_in_arrival_order() {
     let mut state = state();
     state.transcript.clear();
     state.streaming = "working".into();
-    state.widgets.insert(
-        ("editable".into(), "latest".into()),
-        FrontendWidget {
-            id: "latest".into(),
-            slot: FrontendSlot::TranscriptTail,
-            text: "queued first line\nqueued second line".into(),
-            tone: FrontendTone::Neutral,
-            symbol: None,
-            icon_only: false,
-            progress: None,
-            content: None,
-            action: None,
-        },
-    );
+    let widget = |id: &str, text: &str| {
+        EventMsg::Frontend(FrontendEvent::Widget {
+            capability: "steering".into(),
+            item: FrontendWidget {
+                id: id.into(),
+                slot: FrontendSlot::TranscriptTail,
+                text: text.into(),
+                tone: FrontendTone::Neutral,
+                symbol: None,
+                icon_only: false,
+                progress: None,
+                content: None,
+                action: None,
+            },
+        })
+    };
+    state.handle_agent_event(widget("z-older", "older"), Vec::new());
+    state.handle_agent_event(widget("a-newer", "newer"), Vec::new());
 
     let lines = view::live_transcript_lines(&mut state, 0, 80);
 
     assert_eq!(
         rendered_text(&lines),
-        "◉ working\n\n┊ Editable message\n┊ queued first line\n┊ queued second line"
+        "◉ working\n\n┊ Steering message\n┊ older\n\n┊ Steering message\n┊ newer"
+    );
+
+    state.handle_agent_event(
+        EventMsg::Frontend(FrontendEvent::RemoveWidget {
+            capability: "steering".into(),
+            id: "z-older".into(),
+        }),
+        Vec::new(),
+    );
+    let lines = view::live_transcript_lines(&mut state, 0, 80);
+    assert_eq!(
+        rendered_text(&lines),
+        "◉ working\n\n┊ Steering message\n┊ newer"
     );
 }
 

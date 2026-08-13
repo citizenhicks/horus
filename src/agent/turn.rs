@@ -21,6 +21,7 @@ use crate::backend::checkpoint::ActiveExecution;
 use crate::backend::checkpoint::ActiveModelStep;
 use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::ExecutionOutcome;
+use crate::backend::checkpoint::QueuedInput;
 use crate::backend::model::ModelEventSink;
 use crate::backend::model::ModelRequest;
 use crate::backend::model::STREAM_RETRY_LIMIT;
@@ -830,7 +831,8 @@ impl Runner {
     }
 
     async fn complete_turn(&mut self, submission_id: &str, turn_id: &str) -> Result<()> {
-        let mut events = self.turn_ended_events(submission_id, turn_id)?;
+        let mut events =
+            self.turn_ended_events(submission_id, turn_id, &self.state.pending_input)?;
         events.push(turn_event(
             submission_id,
             EventMsg::TurnComplete(TurnCompleteEvent {
@@ -863,9 +865,9 @@ impl Runner {
     ) -> Result<()> {
         self.finish_pending_tools(submission_id, turn_id, reason)
             .await?;
-        self.state.pending_input.clear();
+        let pending_input = std::mem::take(&mut self.state.pending_input);
         self.state.pending_approval = None;
-        events.extend(self.turn_ended_events(submission_id, turn_id)?);
+        events.extend(self.turn_ended_events(submission_id, turn_id, &pending_input)?);
         events.push(turn_event(
             submission_id,
             EventMsg::TurnAborted(TurnAbortedEvent {
@@ -877,11 +879,18 @@ impl Runner {
         Ok(())
     }
 
-    fn turn_ended_events(&self, submission_id: &str, turn_id: &str) -> Result<Vec<Event>> {
+    fn turn_ended_events(
+        &self,
+        submission_id: &str,
+        turn_id: &str,
+        queued_input: &[QueuedInput],
+    ) -> Result<Vec<Event>> {
         let mut messages = Vec::new();
         self.config.middleware.turn_ended(TurnEndContext {
             session_id: &self.config.session_id,
             turn_id,
+            queued_input,
+            owner: None,
             events: &mut messages,
         })?;
         Ok(messages

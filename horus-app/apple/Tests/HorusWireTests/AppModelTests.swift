@@ -841,6 +841,101 @@ final class AppModelTests: XCTestCase {
         }
         XCTAssertEqual(liveProjection, replayProjection)
         XCTAssertEqual(live.transcript.map(\.text), ["Reason", "Checking", "Done"])
+        XCTAssertEqual(
+            live.transcript.map(\.presentationID),
+            [
+                "step-1:reasoning:0",
+                "step-1:commentary:0",
+                "step-1:final_answer:0",
+            ]
+        )
+        XCTAssertEqual(live.transcript.map(\.presentationID), replay.transcript.map(\.presentationID))
+    }
+
+    func testCompletedModelStepAssignsDeterministicPresentationOrdinalsWithinEachPhase() throws {
+        let live = try model()
+        let replay = try model()
+        let stepID = "step-1"
+
+        live.reduce(record: recorded(1, .object([
+            "type": .string("agent_message_content_delta"),
+            "sessionId": .string("chat-1"),
+            "turnId": .string("turn-1"),
+            "modelStepId": .string(stepID),
+            "phase": .string("commentary"),
+            "delta": .string("First"),
+        ])))
+        XCTAssertEqual(live.transcript.map(\.presentationID), ["step-1:commentary:0"])
+
+        let completion = recorded(2, .object([
+            "type": .string("model_step_completed"),
+            "sessionId": .string("chat-1"),
+            "turnId": .string("turn-1"),
+            "modelStepId": .string(stepID),
+            "stepIndex": .number(0),
+            "startedAtMs": .number(100),
+            "completedAtMs": .number(200),
+            "outcome": .object([
+                "status": .string("completed"),
+                "endTurn": .bool(false),
+                "toolCallIds": .array([]),
+                "usage": .object([
+                    "inputTokens": .number(1),
+                    "cachedInputTokens": .number(0),
+                    "cacheWriteInputTokens": .number(0),
+                    "outputTokens": .number(2),
+                    "reasoningOutputTokens": .number(0),
+                    "totalTokens": .number(3),
+                ]),
+                "content": .array([
+                    .object([
+                        "outputIndex": .number(0),
+                        "partIndex": .number(0),
+                        "phase": .string("commentary"),
+                        "text": .string("First"),
+                        "annotations": .array([]),
+                    ]),
+                    .object([
+                        "outputIndex": .number(0),
+                        "partIndex": .number(1),
+                        "phase": .string("commentary"),
+                        "text": .string("Second"),
+                        "annotations": .array([]),
+                    ]),
+                    .object([
+                        "outputIndex": .number(1),
+                        "partIndex": .number(0),
+                        "phase": .string("final_answer"),
+                        "text": .string("Done"),
+                        "annotations": .array([]),
+                    ]),
+                ]),
+            ]),
+        ]))
+
+        live.reduce(record: completion)
+        replay.reduce(record: completion)
+
+        let expected = [
+            "step-1:commentary:0",
+            "step-1:commentary:1",
+            "step-1:final_answer:0",
+        ]
+        XCTAssertEqual(live.transcript.map(\.presentationID), expected)
+        XCTAssertEqual(replay.transcript.map(\.presentationID), expected)
+        XCTAssertEqual(Set(expected).count, expected.count)
+    }
+
+    func testNonNarrativePresentationIdentityDefaultsToRecordIdentity() {
+        let entry = TranscriptEntry(
+            id: "event:1",
+            text: "Compiled",
+            kind: .event,
+            format: "plain_text",
+            pending: false
+        )
+
+        XCTAssertEqual(entry.presentationID, entry.id)
     }
 
     func testFailedModelStepKeepsItsPartialDelta() throws {
@@ -1242,7 +1337,7 @@ final class AppModelTests: XCTestCase {
                 "frontendType": .string("widget"),
                 "capability": .string("steering"),
                 "item": .object([
-                    "id": .string("queued"),
+                    "id": .string(first.id),
                     "slot": .string("transcript_tail"),
                     "text": .string("Use the smaller patch"),
                     "tone": .string("neutral"),
@@ -1301,6 +1396,60 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.composer, "Retry this steering")
     }
 
+    func testQueuedSteeringKeepsOneBubblePerMessageAndRemovesOnlyTheTarget() throws {
+        let model = try model()
+        for (id, text) in [("steer-1", "First"), ("steer-2", "Second")] {
+            model.reduce(
+                event: AgentEventRecord(submissionId: id, msg: .object([
+                    "type": .string("frontend"),
+                    "frontendType": .string("widget"),
+                    "capability": .string("steering"),
+                    "item": .object([
+                        "id": .string(id),
+                        "slot": .string("transcript_tail"),
+                        "text": .string(text),
+                        "tone": .string("neutral"),
+                        "symbol": .null,
+                        "iconOnly": .bool(false),
+                        "progress": .null,
+                        "content": .null,
+                        "action": .null
+                    ])
+                ])),
+                blocks: [],
+                preview: nil
+            )
+        }
+
+        XCTAssertEqual(model.transcriptTailWidgets.map(\.widget.text), ["First", "Second"])
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: "input-1", msg: .object([
+                "type": .string("frontend"),
+                "frontendType": .string("remove_widget"),
+                "capability": .string("steering"),
+                "id": .string("steer-1")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+
+        XCTAssertEqual(model.transcriptTailWidgets.map(\.widget.text), ["Second"])
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: "input-1", msg: .object([
+                "type": .string("frontend"),
+                "frontendType": .string("remove_widget"),
+                "capability": .string("steering"),
+                "id": .string("steer-2")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+
+        XCTAssertTrue(model.transcriptTailWidgets.isEmpty)
+    }
+
     func testSteeringFeedbackWaitsUntilTheQueuedMessageReachesTheAgent() throws {
         let model = try model()
         model.contributions = [FrontendContribution(
@@ -1338,7 +1487,7 @@ final class AppModelTests: XCTestCase {
                 "type": .string("frontend"),
                 "frontendType": .string("remove_widget"),
                 "capability": .string("steering"),
-                "id": .string("queued")
+                "id": .string("steering-1")
             ])),
             blocks: [],
             preview: nil

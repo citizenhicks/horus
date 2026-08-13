@@ -190,10 +190,20 @@ impl TuiState {
                     mut item,
                 } => {
                     item.text = bounded_terminal_text(&item.text, MAX_ENTRY_BYTES);
-                    self.widgets.insert((capability, item.id.clone()), item);
+                    let key = (capability, item.id.clone());
+                    if let Some((_, current)) = self
+                        .widgets
+                        .iter_mut()
+                        .find(|(candidate, _)| candidate == &key)
+                    {
+                        *current = item;
+                    } else {
+                        self.widgets.push((key, item));
+                    }
                 }
                 FrontendEvent::RemoveWidget { capability, id } => {
-                    self.widgets.remove(&(capability, id));
+                    self.widgets
+                        .retain(|((owner, widget), _)| owner != &capability || widget != &id);
                 }
                 // The gateway has already projected this event into `blocks`.
                 FrontendEvent::Render { .. } => {}

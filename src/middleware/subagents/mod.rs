@@ -64,7 +64,7 @@ mod text {
 }
 
 const MIN_WAIT_MS: u64 = 10_000;
-const MAX_WAIT_MS: u64 = 3_600_000;
+const MAX_WAIT_MS: u64 = 120_000;
 const MAX_CONFIGURED_DEPTH: u8 = 16;
 const MAX_CONFIGURED_CONCURRENCY: usize = 64;
 const MAX_CONFIGURED_AGENTS: usize = 256;
@@ -1111,17 +1111,7 @@ impl Tool for WaitAgent {
         ToolDefinition {
             name: "wait_agent".into(),
             description: text::TOOL_WAIT_AGENT_DESCRIPTION.into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "timeout_ms": {
-                        "type": "integer",
-                        "minimum": MIN_WAIT_MS,
-                        "maximum": MAX_WAIT_MS
-                    }
-                },
-                "additionalProperties": false
-            }),
+            parameters: wait_parameters(),
         }
     }
 
@@ -1136,19 +1126,10 @@ impl Tool for WaitAgent {
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let arguments: WaitArgs = serde_json::from_value(arguments)?;
-            let timeout_ms = arguments.timeout_ms.unwrap_or(DEFAULT_WAIT_MS);
-            if !(MIN_WAIT_MS..=MAX_WAIT_MS).contains(&timeout_ms) {
-                return Err(Error::Tool(format!(
-                    "timeout_ms must be between {MIN_WAIT_MS} and {MAX_WAIT_MS}"
-                )));
-            }
+            let timeout = wait_timeout(arguments.timeout_ms)?;
             let agents = self
                 .shared
-                .wait(
-                    &self.scope.root_session_id,
-                    &self.scope.agent_path,
-                    Duration::from_millis(timeout_ms),
-                )
+                .wait(&self.scope.root_session_id, &self.scope.agent_path, timeout)
                 .await?;
             Ok(serde_json::json!({
                 "updated": !agents.is_empty(),
@@ -1157,6 +1138,30 @@ impl Tool for WaitAgent {
             .to_string())
         })
     }
+}
+
+fn wait_parameters() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": MIN_WAIT_MS,
+                "maximum": MAX_WAIT_MS
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn wait_timeout(timeout_ms: Option<u64>) -> Result<Duration> {
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_WAIT_MS);
+    if !(MIN_WAIT_MS..=MAX_WAIT_MS).contains(&timeout_ms) {
+        return Err(Error::Tool(format!(
+            "timeout_ms must be between {MIN_WAIT_MS} and {MAX_WAIT_MS}"
+        )));
+    }
+    Ok(Duration::from_millis(timeout_ms))
 }
 
 fn fork_context(context: &[Value], turns: ForkTurns) -> Vec<Value> {
@@ -1358,6 +1363,23 @@ mod tests {
                 "missing end renderer for {name}"
             );
         }
+    }
+
+    #[test]
+    fn wait_agent_matches_the_sandbox_timeout_limit() {
+        assert_eq!(
+            wait_parameters()["properties"]["timeout_ms"]["maximum"],
+            serde_json::json!(120_000)
+        );
+        assert_eq!(
+            wait_timeout(Some(120_000)).expect("maximum timeout"),
+            Duration::from_secs(120)
+        );
+        assert!(matches!(
+            wait_timeout(Some(120_001)),
+            Err(Error::Tool(message))
+                if message == "timeout_ms must be between 10000 and 120000"
+        ));
     }
 
     #[tokio::test]

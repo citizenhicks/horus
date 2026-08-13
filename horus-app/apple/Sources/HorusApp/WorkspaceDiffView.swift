@@ -107,8 +107,6 @@ struct InlineUnifiedDiffView: View {
                                 }
                             }
                         }
-                        .background(palette.panel, in: HorusStyle.tileShape)
-                        .clipShape(HorusStyle.tileShape)
                     }
 
                     if document.isTruncated {
@@ -362,9 +360,7 @@ private struct DiffRowView: View {
 
     private var background: Color {
         switch row.kind {
-        case .addition: palette.signal.opacity(0.14)
-        case .removal: palette.danger.opacity(0.14)
-        case .context: palette.panel
+        case .addition, .removal, .context: palette.panel
         case .metadata: palette.raised.opacity(0.72)
         case .hunk: .clear
         }

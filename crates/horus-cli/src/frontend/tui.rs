@@ -24,6 +24,8 @@ use super::catalog::{MenuItem, UiCatalog};
 use horus::backend::model::ModelChoice;
 use horus::backend::model::ModelInfo;
 use horus::protocol::AgentMessagePhase;
+#[cfg(test)]
+use horus::protocol::EventMsg;
 use horus::protocol::FrontendBlockFormat;
 use horus::protocol::FrontendBlockState;
 use horus::protocol::FrontendBlockUpdate;
@@ -34,8 +36,6 @@ use horus::protocol::ModelStepContentPhase;
 use horus::protocol::Op;
 use horus::protocol::RenderedBlock;
 use horus::protocol::SessionResumeRequestedEvent;
-#[cfg(test)]
-use horus::protocol::{EventMsg, FrontendEvent};
 
 const MAX_ENTRY_BYTES: usize = 40_000;
 const MAX_COMPOSER_HISTORY_ENTRIES: usize = 100;
@@ -257,7 +257,7 @@ struct InputDraft {
 
 #[derive(Default)]
 struct TuiState {
-    widgets: BTreeMap<(String, String), FrontendWidget>,
+    widgets: Vec<((String, String), FrontendWidget)>,
     transcript: VecDeque<TranscriptEntry>,
     transcript_viewport: Viewport,
     streaming: String,
