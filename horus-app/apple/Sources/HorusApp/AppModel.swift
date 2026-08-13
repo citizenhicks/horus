@@ -1264,6 +1264,10 @@ final class AppModel {
         Set(sessions.lazy.filter { $0.activity.state != .idle }.map(\.sessionId))
     }
 
+    var attentionSessionIDs: Set<String> {
+        runningSessionIDs.union(unreadSessionIDs)
+    }
+
     var isApplyingConfiguration: Bool {
         configRequestID != nil
             || defaultConfigRequestID != nil

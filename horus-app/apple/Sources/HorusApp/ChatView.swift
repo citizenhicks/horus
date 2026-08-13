@@ -269,7 +269,8 @@ struct TranscriptRowsView: View {
             self.row(row)
                 .id(row.id)
                 .padding(.top, index == 0 ? 0 : rowSpacing)
-                // Keep layout immediate; only pixels animate after scroll anchoring settles.
+                // Keep the row at full layout size; the scroll view glides the tail offset
+                // while this only reveals its pixels.
                 .opacity(isVisible ? 1 : 0)
                 .offset(y: isVisible || reduceMotion ? 0 : 6)
         }
@@ -352,6 +353,7 @@ private enum TranscriptScrollMode {
 
 private struct TranscriptView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let bottomInset: CGFloat
     @Binding var isAtBottom: Bool
     let scrollToBottomRequest: Int
@@ -415,6 +417,11 @@ private struct TranscriptView: View {
         .defaultScrollAnchor(
             scrollMode.followsContentGrowth ? .bottom : nil,
             for: .sizeChanges
+        )
+        // Match the row reveal so the bottom-anchor correction no longer lands a frame first.
+        .animation(
+            reduceMotion || !scrollMode.followsContentGrowth ? nil : .easeOut(duration: 0.5),
+            value: projection.structuralRevision
         )
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(.interactively)

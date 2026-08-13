@@ -698,6 +698,7 @@ struct SidebarView: View {
     @State private var collapsedWorkspaces: Set<String> = []
     @State private var visibleSessionCounts: [String: Int] = [:]
     @State private var showsConnectionDetails = false
+    @State private var showsAttentionOnly = false
 
     var body: some View {
         ScrollView {
@@ -752,12 +753,31 @@ struct SidebarView: View {
                 .padding(.bottom, HorusSpace.m)
 
                 VStack(alignment: .leading, spacing: 0) {
-                    navigationButton("Chats", destination: .chat)
-                        .padding(.horizontal, HorusSpace.m)
+                    HStack(spacing: 0) {
+                        navigationButton("Chats", destination: .chat)
+                        Button {
+                            showsAttentionOnly.toggle()
+                        } label: {
+                            HorusIcon(.notificationSquare)
+                        }
+                        .buttonStyle(HorusIconButtonStyle(
+                            prominent: showsAttentionOnly,
+                            bare: true
+                        ))
+                        .accessibilityLabel("Filter chats needing attention")
+                        .accessibilityValue(showsAttentionOnly ? "On" : "Off")
+                        .accessibilityAddTraits(showsAttentionOnly ? .isSelected : [])
+                        .help(
+                            showsAttentionOnly
+                                ? "Show all chats"
+                                : "Show active and unread chats"
+                        )
+                    }
+                    .padding(.horizontal, HorusSpace.m)
 
                     LazyVStack(alignment: .leading, spacing: HorusSpace.xxs) {
-                        if model.sessions.isEmpty {
-                            Text(model.connectionState.isReady ? "No chats yet" : model.connectionState.label)
+                        if sessionGroups.isEmpty {
+                            Text(emptySessionsMessage)
                                 .foregroundStyle(palette.muted)
                         }
                         ForEach(sessionGroups) { group in
@@ -892,8 +912,21 @@ struct SidebarView: View {
         .frame(minHeight: HorusStyle.iconButtonSize)
     }
 
+    private var displayedSessions: [SessionRecord] {
+        guard showsAttentionOnly else { return model.sessions }
+        let attentionSessionIDs = model.attentionSessionIDs
+        return model.sessions.filter { attentionSessionIDs.contains($0.sessionId) }
+    }
+
+    private var emptySessionsMessage: String {
+        if model.sessions.isEmpty {
+            return model.connectionState.isReady ? "No chats yet" : model.connectionState.label
+        }
+        return "No chats need attention"
+    }
+
     private var sessionGroups: [WorkspaceSessions] {
-        Dictionary(grouping: model.sessions) {
+        Dictionary(grouping: displayedSessions) {
             $0.sessionContext.workspaceId ?? $0.sessionContext.workspaceLabel ?? "workspace"
         }
         .map { id, sessions in

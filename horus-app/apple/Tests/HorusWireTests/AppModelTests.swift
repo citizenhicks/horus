@@ -4096,18 +4096,22 @@ final class AppModelTests: XCTestCase {
 
         model.applySessions([session(state: .running, turnID: "turn-1")])
         XCTAssertTrue(model.runningSessionIDs.contains("chat-1"))
+        XCTAssertEqual(model.attentionSessionIDs, ["chat-1"])
 
         model.applySessions([session(state: .awaitingApproval, turnID: "turn-1")])
         XCTAssertEqual(model.toast?.tone, .warning)
+        XCTAssertEqual(model.attentionSessionIDs, ["chat-1"])
 
         model.applySessions([session(state: .idle, outcome: .completed)])
         XCTAssertFalse(model.runningSessionIDs.contains("chat-1"))
         XCTAssertTrue(model.unreadSessionIDs.contains("chat-1"))
+        XCTAssertEqual(model.attentionSessionIDs, ["chat-1"])
         XCTAssertEqual(model.toast?.tone, .success)
 
         model.destination = .chat
         model.setChatVisible(true)
         XCTAssertFalse(model.unreadSessionIDs.contains("chat-1"))
+        XCTAssertTrue(model.attentionSessionIDs.isEmpty)
         model.dismissToast()
         model.applySessions([session(state: .running, turnID: "turn-2")])
         model.applySessions([session(state: .idle, outcome: .completed)])

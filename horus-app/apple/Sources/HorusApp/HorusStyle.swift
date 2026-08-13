@@ -144,6 +144,7 @@ struct HorusGlyph: Hashable {
     static let moon = Self("hi.moon")
     static let neuralNetwork = Self("hi.neuralNetwork")
     static let notePencil = Self("hi.notePencil")
+    static let notificationSquare = Self("hi.notificationSquare")
     static let path = Self("hi.path")
     static let pencilSimple = Self("hi.pencilSimple")
     static let playFill = Self("hi.playFill")
@@ -300,16 +301,16 @@ struct HorusSpinner: View {
                 ? 0
                 : ProcessInfo.processInfo.systemUptime
                     .truncatingRemainder(dividingBy: 0.9) / 0.9
-            let lineWidth = max(1.3, size * 0.1)
+            let lineWidth = max(1.5, size * 0.11)
             let headSize = max(2.4, size * 0.19)
             let radius = max(0, (size - lineWidth) / 2)
             ZStack {
                 Circle()
-                    .trim(from: 0.12, to: 0.86)
+                    .trim(from: 0.06, to: 0.86)
                     .stroke(
                         AngularGradient(
                             gradient: Gradient(stops: [
-                                .init(color: tint.opacity(0), location: 0.12),
+                                .init(color: tint.opacity(0), location: 0.06),
                                 .init(color: tint.opacity(0.04), location: 0.3),
                                 .init(color: tint.opacity(0.14), location: 0.52),
                                 .init(color: tint.opacity(0.38), location: 0.72),
