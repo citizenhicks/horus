@@ -577,6 +577,7 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
     @ViewBuilder let sidebar: Sidebar
     @ViewBuilder let detail: Detail
 
+    @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
     @State private var drag: CGFloat = 0
     @State private var drawerFeedback = false
@@ -607,6 +608,7 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
                 .overlay { scrim }
                 .mask { pageShape.ignoresSafeArea() }
                 .offset(x: offset)
+                .scrollDisabled(drag != 0)
                 .simultaneousGesture(swipe)
         }
         .sensoryFeedback(.impact(weight: .light), trigger: drawerFeedback)
@@ -654,6 +656,9 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
         DragGesture(minimumDistance: 12)
             .onChanged { value in
                 guard accepts(value) else { return }
+                if !isOpen, drag == 0, value.translation.width > 0 {
+                    model.dismissComposerFocus()
+                }
                 drag = value.translation.width
             }
             .onEnded { value in

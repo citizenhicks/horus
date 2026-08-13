@@ -396,6 +396,7 @@ private struct TranscriptView: View {
                 TranscriptTailView(slot: projection.waiting, topSpacing: rowSpacing)
                 ForEach(model.transcriptTailWidgets) { widget in
                     QueuedMessageView(widget: widget)
+                        .geometryGroup()
                         .padding(.top, rowSpacing)
                 }
                 Color.clear.frame(height: max(1, bottomInset))
