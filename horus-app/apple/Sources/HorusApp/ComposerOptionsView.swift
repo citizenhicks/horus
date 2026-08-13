@@ -75,10 +75,10 @@ struct ComposerOptionsView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "Shell commands can read, modify, or delete files available to the gateway "
-                    + "account and use the network without approval. File tools remain limited "
-                    + "to the workspace. Horus gateway state, TLS credentials, and provider "
-                    + "credentials remain protected."
+                "Shell commands run directly on the gateway host and can read, modify, or "
+                    + "delete files, use host services, and access the network without approval. "
+                    + "This includes Horus state, TLS credentials, and stored provider "
+                    + "credentials. File tools remain limited to the workspace."
             )
         }
     }

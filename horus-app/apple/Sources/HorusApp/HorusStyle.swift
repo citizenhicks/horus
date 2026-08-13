@@ -332,18 +332,23 @@ struct HorusSpinner: View {
     }
 }
 
-/// Fades arriving text in behind a soft leading edge, a few glyphs wide, so a short burst of
-/// commentary reads as it is written rather than appearing whole.
+/// Resolves arriving text a line at a time, each one lifting out of a blur as the reveal
+/// passes its first glyph.
+///
+/// The line is the unit rather than the glyph: a per-glyph edge, however wide its feather,
+/// still travels along the words and the eye follows it ticking. A line fades as one thing,
+/// and lines stack up at reading pace. Blur does the rest — opacity alone is a ghost at low
+/// alpha, while text coming out of focus reads as text being written.
 private struct HorusRevealRenderer: TextRenderer {
     /// Glyphs revealed so far, counted from the start of this text.
     var revealed: Double
 
-    /// A phrase-wide feather. A narrow edge lands letter by letter, which reads as a stutter
-    /// however smoothly it is animated; with this many glyphs fading at once the edge is a
-    /// gradient passing over the words rather than a cursor typing them.
-    private static let ramp = 30.0
-    /// How far a glyph rises into place, in points. Small enough to be felt, not watched.
-    private static let rise = 2.0
+    /// How many glyphs the reveal travels while one line fades in. Short lines finish early,
+    /// which is what staggers them.
+    private static let ramp = 24.0
+    /// How far a line rises, and how far out of focus it starts.
+    private static let rise = 3.0
+    private static let blur = 3.0
 
     var animatableData: Double {
         get { revealed }
@@ -351,21 +356,22 @@ private struct HorusRevealRenderer: TextRenderer {
     }
 
     func draw(layout: Text.Layout, in context: inout GraphicsContext) {
-        let slices = layout.flatMap { line in line.flatMap { run in run } }
-        guard revealed < Double(slices.count) else {
-            for slice in slices { context.draw(slice) }
-            return
-        }
-        for (index, slice) in slices.enumerated() {
-            let progress = min(max((revealed - Double(index)) / Self.ramp, 0), 1)
+        var start = 0.0
+        for line in layout {
+            let progress = min(max((revealed - start) / Self.ramp, 0), 1)
+            start += Double(line.reduce(0) { $0 + $1.count })
             guard progress > 0 else { continue }
-            // Smoothstep: a linear ramp leaves a hard line where the fade begins and ends,
-            // and the eye reads that line as the edge ticking along.
+            guard progress < 1 else {
+                context.draw(line)
+                continue
+            }
+            // Smoothstep: a linear ramp leaves a hard edge where the fade begins and ends.
             let eased = progress * progress * (3 - 2 * progress)
             var copy = context
             copy.opacity = eased
             copy.translateBy(x: 0, y: (1 - eased) * Self.rise)
-            copy.draw(slice)
+            copy.addFilter(.blur(radius: (1 - eased) * Self.blur))
+            copy.draw(line)
         }
     }
 }

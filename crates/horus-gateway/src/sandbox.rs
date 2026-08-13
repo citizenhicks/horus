@@ -1,4 +1,4 @@
-//! Gateway sandbox that hides gateway state from every command mode.
+//! Gateway sandbox with protected and host-wide command modes.
 
 use std::path::Path;
 use std::time::Duration;
@@ -38,13 +38,14 @@ fn provider_credential_environment() -> impl Iterator<Item = &'static str> {
         })
 }
 
-/// Workspace backend that protects gateway state even from full-access commands.
+/// Workspace backend that protects gateway state outside full-access commands.
 pub struct GatewaySandbox {
     delegate: LocalSandbox,
+    full_access_delegate: LocalSandbox,
 }
 
 impl GatewaySandbox {
-    /// Creates a fail-closed command sandbox for a gateway host.
+    /// Creates protected and full-access command delegates for a gateway host.
     pub fn new(
         workspace: &Path,
         state_dir: &Path,
@@ -79,13 +80,18 @@ impl GatewaySandbox {
             .command_timeout(timeout)?
             .deny_read(&state_dir)?
             .deny_read(&tls_key)?;
+        let mut full_access_delegate = LocalSandbox::new(&root)?.command_timeout(timeout)?;
         for environment in GATEWAY_CREDENTIAL_ENVIRONMENT
             .into_iter()
             .chain(provider_credential_environment())
         {
             delegate = delegate.deny_environment(environment);
+            full_access_delegate = full_access_delegate.deny_environment(environment);
         }
-        Ok(Self { delegate })
+        Ok(Self {
+            delegate,
+            full_access_delegate,
+        })
     }
 
     pub(crate) async fn execute_git(&self, args: &[&str]) -> Result<CommandOutput> {
@@ -141,8 +147,11 @@ impl SandboxBackend for GatewaySandbox {
         mode: CommandMode,
         output: CommandOutputSink,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
-        self.delegate
-            .execute(script, sandbox_mode, network_access, mode, output)
+        let delegate = match sandbox_mode {
+            SandboxMode::WorkspaceWrite => &self.delegate,
+            SandboxMode::DangerFullAccess => &self.full_access_delegate,
+        };
+        delegate.execute(script, sandbox_mode, network_access, mode, output)
     }
 }
 
@@ -231,7 +240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commands_cannot_read_gateway_state_or_tls_key() {
+    async fn protected_commands_cannot_read_gateway_state_or_tls_key() {
         use std::os::unix::fs::symlink;
 
         let workspace = tempfile::tempdir().expect("workspace");
@@ -257,27 +266,12 @@ mod tests {
         )
         .expect("gateway sandbox");
 
-        for (label, sandbox_mode, mode, network_access, writes_outside) in [
-            (
-                "foreground",
-                SandboxMode::WorkspaceWrite,
-                CommandMode::Foreground,
-                NetworkAccess::Denied,
-                false,
-            ),
+        for (label, mode, network_access) in [
+            ("foreground", CommandMode::Foreground, NetworkAccess::Denied),
             (
                 "background",
-                SandboxMode::WorkspaceWrite,
                 CommandMode::Background,
                 NetworkAccess::Allowed,
-                false,
-            ),
-            (
-                "full-access",
-                SandboxMode::DangerFullAccess,
-                CommandMode::Foreground,
-                NetworkAccess::Allowed,
-                true,
             ),
         ] {
             let outside_target = outside.path().join(label);
@@ -293,7 +287,7 @@ mod tests {
             let output = sandbox
                 .execute(
                     &script,
-                    sandbox_mode,
+                    SandboxMode::WorkspaceWrite,
                     network_access,
                     mode,
                     CommandOutputSink::default(),
@@ -306,7 +300,7 @@ mod tests {
             assert!(!output.stdout.contains("gateway-secret"));
             assert!(!output.stdout.contains("tls-secret"));
             assert!(!output.stdout.contains("gateway-process-visible"));
-            assert_eq!(outside_target.is_file(), writes_outside);
+            assert!(!outside_target.is_file());
             assert_eq!(
                 std::fs::read_to_string(state.path().join("sentinel")).expect("state sentinel"),
                 "gateway-secret"
@@ -316,6 +310,42 @@ mod tests {
                 "tls-secret"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn full_access_commands_can_read_gateway_state_and_tls_key() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let credentials = tempfile::tempdir().expect("credentials");
+        let tls_key = credentials.path().join("private-key.pem");
+        std::fs::write(state.path().join("sentinel"), "gateway-secret").expect("state sentinel");
+        std::fs::write(&tls_key, "tls-secret").expect("TLS key");
+        let sandbox = GatewaySandbox::new(
+            workspace.path(),
+            state.path(),
+            Some(&tls_key),
+            Duration::from_secs(5),
+        )
+        .expect("gateway sandbox");
+        let script = format!(
+            "printf '%s:%s' \"$(cat {}/sentinel)\" \"$(cat {})\"",
+            state.path().display(),
+            tls_key.display()
+        );
+
+        let output = sandbox
+            .execute(
+                &script,
+                SandboxMode::DangerFullAccess,
+                NetworkAccess::Allowed,
+                CommandMode::Foreground,
+                CommandOutputSink::default(),
+            )
+            .await
+            .expect("full-access command");
+
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert_eq!(output.stdout, "gateway-secret:tls-secret");
     }
 
     #[tokio::test]
