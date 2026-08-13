@@ -689,11 +689,14 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
 }
 
 struct SidebarView: View {
+    private static let sessionPageSize = 10
+
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.horusPalette) private var palette
     let showDetail: (AppDestination) -> Void
     @State private var collapsedWorkspaces: Set<String> = []
+    @State private var visibleSessionCounts: [String: Int] = [:]
     @State private var showsConnectionDetails = false
 
     var body: some View {
@@ -924,7 +927,11 @@ struct SidebarView: View {
     }
 
     private func workspaceGroup(_ group: WorkspaceSessions) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let visibleCount = min(
+            visibleSessionCounts[group.id, default: Self.sessionPageSize],
+            group.sessions.count
+        )
+        return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 0) {
                 Button {
                     expansionBinding(for: group.id).wrappedValue.toggle()
@@ -977,8 +984,31 @@ struct SidebarView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             if !collapsedWorkspaces.contains(group.id) {
-                ForEach(group.sessions) { session in
+                ForEach(group.sessions.prefix(visibleCount)) { session in
                     sessionRow(session)
+                }
+                if visibleCount < group.sessions.count {
+                    Button {
+                        visibleSessionCounts[group.id] = visibleCount + Self.sessionPageSize
+                    } label: {
+                        HorusLabel(
+                            title: "Load more",
+                            glyph: .arrowDown,
+                            iconColor: palette.muted,
+                            iconSize: HorusStyle.glyphInline
+                        )
+                        .font(HorusStyle.metadataFont)
+                        .foregroundStyle(palette.muted)
+                        .frame(
+                            maxWidth: .infinity,
+                            minHeight: HorusStyle.iconButtonSize,
+                            alignment: .leading
+                        )
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.horusPlain)
+                    .padding(.horizontal, HorusSpace.s)
+                    .accessibilityLabel("Load more chats in \(group.name)")
                 }
             }
         }

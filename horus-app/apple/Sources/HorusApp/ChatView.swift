@@ -46,6 +46,7 @@ struct ChatView: View {
                 .zIndex(2)
             }
         }
+        .onChange(of: model.selectedSessionID) { isAtBottom = true }
         .navigationTitle(chatTitle)
         .toolbarTitleDisplayMode(.inline)
         .toolbar {
@@ -255,6 +256,8 @@ private struct ChatOptionsMenu: View {
 /// waiting line. This view only draws it.
 struct TranscriptRowsView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var visibleRowIDs = Set<TranscriptPresentationID>()
+    @State private var hasAppeared = false
     let projection: TranscriptProjection
     var activeStepID: TranscriptPresentationID?
     var collapsesLongMessages = false
@@ -262,16 +265,22 @@ struct TranscriptRowsView: View {
 
     var body: some View {
         ForEach(Array(projection.rows.enumerated()), id: \.element.id) { index, row in
+            let isVisible = !hasAppeared || visibleRowIDs.contains(row.id)
             self.row(row)
                 .id(row.id)
                 .padding(.top, index == 0 ? 0 : rowSpacing)
-                // A run of parallel tool calls arrives as one row with nothing before it, and
-                // a plain fade leaves the transcript looking bumped. Rising the last few
-                // points into place is the same entrance the waiting line makes, so the swap
-                // between them reads as one thing continuing rather than two things happening.
-                .transition(
-                    reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 8))
-                )
+                // Keep layout immediate; only pixels animate after scroll anchoring settles.
+                .opacity(isVisible ? 1 : 0)
+                .offset(y: isVisible || reduceMotion ? 0 : 6)
+        }
+        .onAppear {
+            visibleRowIDs = Set(projection.rows.map(\.id))
+            hasAppeared = true
+        }
+        .onChange(of: projection.rows.map(\.id)) { _, rowIDs in
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.5)) {
+                visibleRowIDs = Set(rowIDs)
+            }
         }
     }
 
@@ -331,8 +340,6 @@ struct TranscriptPaginationButton: View {
 /// The bottom anchor and an explicit `scrollTo` both correct the same offset, so leaving both
 /// live means the visible result is whichever ran last. Exactly one is active per mode.
 private enum TranscriptScrollMode {
-    /// The session is opening: explicit scrolls only, until the content settles.
-    case openingAtLatest
     /// Parked at the end. The bottom anchor follows content growth; nothing else scrolls.
     case followingTail
     /// The reader is somewhere else. Nothing follows, and structure lands without animation.
@@ -341,14 +348,10 @@ private enum TranscriptScrollMode {
     case restoringHistory
 
     var followsContentGrowth: Bool { self == .followingTail }
-    /// Stream-driven movement animates only when the reader is parked and at rest. An
-    /// invisible correction made visible is the lurch this avoids.
-    var animatesStructure: Bool { self == .followingTail }
 }
 
 private struct TranscriptView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let bottomInset: CGFloat
     @Binding var isAtBottom: Bool
     let scrollToBottomRequest: Int
@@ -356,7 +359,7 @@ private struct TranscriptView: View {
     // resolves against empty content. A bottom-edge scroll position survives the late fill.
     @State private var position = ScrollPosition(edge: .bottom)
     @State private var historyAnchorID: TranscriptPresentationID?
-    @State private var scrollMode = TranscriptScrollMode.openingAtLatest
+    @State private var scrollMode = TranscriptScrollMode.followingTail
     @State private var waitingSince: Date?
     @State private var waitingHold: Task<Void, Never>?
     @State private var waitingOrder = TranscriptWaitingNote.messages
@@ -385,18 +388,12 @@ private struct TranscriptView: View {
                     )
                     .padding(.bottom, rowSpacing)
                 }
-                Group {
-                    TranscriptRowsView(
-                        projection: projection,
-                        activeStepID: model.activeTranscriptStepID,
-                        rowSpacing: rowSpacing
-                    )
-                    TranscriptTailView(slot: projection.waiting, topSpacing: rowSpacing)
-                }
-                // Structure only. Text deltas and a summary counting up inside its fixed slot
-                // leave the revision alone, so streaming never animates the page. This scope
-                // includes the standalone tail line, but not unrelated queued-message widgets.
-                .animation(structuralAnimation, value: projection.structuralRevision)
+                TranscriptRowsView(
+                    projection: projection,
+                    activeStepID: model.activeTranscriptStepID,
+                    rowSpacing: rowSpacing
+                )
+                TranscriptTailView(slot: projection.waiting, topSpacing: rowSpacing)
                 ForEach(model.transcriptTailWidgets) { widget in
                     QueuedMessageView(widget: widget)
                         .padding(.top, rowSpacing)
@@ -436,18 +433,11 @@ private struct TranscriptView: View {
         // following. A drag ends the follow; coming to rest at the end restores it.
         .onScrollPhaseChange { _, phase, context in
             guard scrollMode != .restoringHistory else { return }
-            if scrollMode == .openingAtLatest {
-                if phase == .tracking || phase == .interacting || phase == .decelerating {
-                    scrollMode = .freeScrolling
-                }
-                return
-            }
             scrollMode = phase == .idle && Self.atBottom(context.geometry)
                 ? .followingTail
                 : .freeScrolling
         }
         .onChange(of: scrollToBottomRequest) {
-            scrollMode = .followingTail
             withAnimation(.easeOut(duration: 0.2)) { position.scrollTo(edge: .bottom) }
         }
         .onChange(of: model.displayedTranscript.first?.presentationID) { previous, _ in
@@ -456,7 +446,6 @@ private struct TranscriptView: View {
         }
         .onChange(of: model.historyLoadCompletionRevision) { restoreHistoryAnchor() }
         .onChange(of: model.selectedSessionID) { historyAnchorID = nil }
-        .task(id: model.selectedSessionID) { await openAtLatest() }
         .onChange(of: model.isWaitingForModel, initial: true) { _, waiting in
             rescheduleWaitingPhrase(waiting)
         }
@@ -478,11 +467,6 @@ private struct TranscriptView: View {
         return TranscriptWaitingPhrase(startedAt: waitingSince, order: waitingOrder)
     }
 
-    private var structuralAnimation: Animation? {
-        guard !reduceMotion, scrollMode.animatesStructure else { return nil }
-        return .easeInOut(duration: TranscriptWaitingNote.crossfade)
-    }
-
     /// Steps land a few hundred milliseconds apart in a busy turn, so the phrase waits before
     /// appearing instead of strobing between them. It leaves without a delay once work resumes.
     private func rescheduleWaitingPhrase(_ waiting: Bool) {
@@ -497,25 +481,6 @@ private struct TranscriptView: View {
             guard !Task.isCancelled else { return }
             waitingOrder.shuffle()
             waitingSince = Date()
-        }
-    }
-
-    /// A lazy stack only estimates the height of rows it has not built, so a single bottom scroll
-    /// lands short on a long transcript. Re-assert until the content settles, or the reader scrolls.
-    private func openAtLatest() async {
-        isAtBottom = true
-        scrollMode = .openingAtLatest
-        defer { if scrollMode == .openingAtLatest { scrollMode = .followingTail } }
-        for _ in 0..<20 {
-            guard scrollMode == .openingAtLatest else { return }
-            position.scrollTo(edge: .bottom)
-            try? await Task.sleep(for: .milliseconds(100))
-            guard scrollMode == .openingAtLatest else { return }
-            if position.isPositionedByUser {
-                scrollMode = .freeScrolling
-                return
-            }
-            if isAtBottom { return }
         }
     }
 
