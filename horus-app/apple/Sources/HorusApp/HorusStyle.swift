@@ -338,8 +338,12 @@ private struct HorusRevealRenderer: TextRenderer {
     /// Glyphs revealed so far, counted from the start of this text.
     var revealed: Double
 
-    /// Wide enough that the edge lands on words rather than letters.
-    private static let ramp = 10.0
+    /// A phrase-wide feather. A narrow edge lands letter by letter, which reads as a stutter
+    /// however smoothly it is animated; with this many glyphs fading at once the edge is a
+    /// gradient passing over the words rather than a cursor typing them.
+    private static let ramp = 30.0
+    /// How far a glyph rises into place, in points. Small enough to be felt, not watched.
+    private static let rise = 2.0
 
     var animatableData: Double {
         get { revealed }
@@ -353,10 +357,14 @@ private struct HorusRevealRenderer: TextRenderer {
             return
         }
         for (index, slice) in slices.enumerated() {
-            let opacity = min(max((revealed - Double(index)) / Self.ramp, 0), 1)
-            guard opacity > 0 else { continue }
+            let progress = min(max((revealed - Double(index)) / Self.ramp, 0), 1)
+            guard progress > 0 else { continue }
+            // Smoothstep: a linear ramp leaves a hard line where the fade begins and ends,
+            // and the eye reads that line as the edge ticking along.
+            let eased = progress * progress * (3 - 2 * progress)
             var copy = context
-            copy.opacity = opacity
+            copy.opacity = eased
+            copy.translateBy(x: 0, y: (1 - eased) * Self.rise)
             copy.draw(slice)
         }
     }
@@ -397,7 +405,7 @@ private struct HorusStreamingReveal: ViewModifier {
         }
         // Paced by how much arrived, so a two-word aside and a full sentence both read as
         // written rather than one crawling and the other flashing.
-        let duration = min(0.8, max(0.2, delta * 0.015))
+        let duration = min(1.0, max(0.35, delta * 0.02))
         withAnimation(.linear(duration: duration)) { revealed = target }
     }
 }

@@ -304,7 +304,13 @@ struct TranscriptRowsView: View {
             }
             .id(row.id)
             .padding(.top, row.topSpacing)
-            .transition(.opacity)
+            // A run of parallel tool calls arrives as one row with nothing before it, and a
+            // plain fade leaves the transcript looking bumped. Rising the last few points into
+            // place is the same entrance the waiting line makes, so the swap between them reads
+            // as one thing continuing rather than two things happening.
+            .transition(
+                reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 8))
+            )
         }
         // A fast turn lands rows faster than the eye tracks them. One animation on the entry
         // count fades an arriving row in and glides the content above it, and covers a row
@@ -1160,6 +1166,7 @@ private struct TranscriptWaitingPhraseText: View {
 /// The waiting line on a row of its own, for the part of a turn that has no group yet.
 private struct TranscriptWaitingNoteView: View {
     @Environment(\.horusPalette) private var palette
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let phrase: TranscriptWaitingPhrase
     /// Owned rather than applied by the transcript: padding outside the condition reserves
     /// the gap while the note is hidden, and the arriving row then lands 12pt low.
@@ -1174,7 +1181,9 @@ private struct TranscriptWaitingNoteView: View {
         // baseline and the swap reads as one line changing rather than two rows trading places.
         .frame(minHeight: HorusStyle.rowRegular)
         .padding(.top, topSpacing)
-        .transition(.opacity)
+        .transition(
+            reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 8))
+        )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Waiting for the model")
     }
