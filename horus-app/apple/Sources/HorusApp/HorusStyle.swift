@@ -339,7 +339,7 @@ private struct HorusRevealRenderer: TextRenderer {
     var revealed: Double
 
     /// Wide enough that the edge lands on words rather than letters.
-    private static let ramp = 8.0
+    private static let ramp = 10.0
 
     var animatableData: Double {
         get { revealed }
@@ -366,32 +366,47 @@ private struct HorusStreamingReveal: ViewModifier {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let count: Int
     let active: Bool
-    @State private var revealed = 0.0
+    @State private var revealed: Double
+
+    init(count: Int, active: Bool, live: Bool) {
+        self.count = count
+        self.active = active
+        // A block that arrives whole still sweeps in, so the reveal starts closed and the
+        // first pass opens it. Restored history starts open: it should not type itself out.
+        _revealed = State(initialValue: live ? 0 : Double(count))
+    }
 
     @ViewBuilder
     func body(content: Content) -> some View {
         if active {
             content
                 .textRenderer(HorusRevealRenderer(revealed: revealed))
-                // `initial` settles text that was already there — a restored transcript should
-                // not type itself out. Only growth after that animates.
-                .onChange(of: count, initial: true) { previous, current in
-                    guard !reduceMotion, current > previous else {
-                        revealed = Double(current)
-                        return
-                    }
-                    withAnimation(.linear(duration: 0.3)) { revealed = Double(current) }
-                }
+                .task { reveal(to: count) }
+                .onChange(of: count) { _, current in reveal(to: current) }
         } else {
             content
         }
     }
+
+    private func reveal(to count: Int) {
+        let target = Double(count)
+        let delta = target - revealed
+        guard !reduceMotion, delta > 0 else {
+            revealed = target
+            return
+        }
+        // Paced by how much arrived, so a two-word aside and a full sentence both read as
+        // written rather than one crawling and the other flashing.
+        let duration = min(0.8, max(0.2, delta * 0.015))
+        withAnimation(.linear(duration: duration)) { revealed = target }
+    }
 }
 
 extension View {
-    /// Fades this text in as it grows, `count` characters long so far.
-    func horusStreamingReveal(count: Int, active: Bool) -> some View {
-        modifier(HorusStreamingReveal(count: count, active: active))
+    /// Fades this text in as it grows, `count` characters long so far. `live` distinguishes
+    /// text arriving now from a transcript that was already on screen.
+    func horusStreamingReveal(count: Int, active: Bool, live: Bool) -> some View {
+        modifier(HorusStreamingReveal(count: count, active: active, live: live))
     }
 }
 

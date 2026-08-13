@@ -443,6 +443,14 @@ final class TranscriptEntry: Identifiable {
     }
 }
 
+extension TranscriptEntry.Kind {
+    /// Everything that is not the narrative: it rides behind a group summary rather than
+    /// taking a line of the timeline to itself.
+    var isActivity: Bool {
+        self == .event || self == .error || self == .reasoning
+    }
+}
+
 /// Typed transcript presentation supplied by the framework.
 extension TranscriptEntry {
     var headline: String { title }
@@ -478,7 +486,7 @@ extension TranscriptEntry {
                 flushActivity()
             }
 
-            if entry.kind == .event || entry.kind == .error || entry.kind == .reasoning {
+            if entry.kind.isActivity {
                 activity.append(entry)
             } else {
                 flushActivity()
@@ -713,6 +721,15 @@ final class AppModel {
             hasPendingPicker: pendingPicker != nil
         )
     }
+
+    /// Replay can restore a session with an active turn. Only entries from the latest live
+    /// gateway record should receive the arrival reveal; restored commentary starts settled.
+    func isLiveTranscriptEntry(_ entry: TranscriptEntry) -> Bool {
+        guard let liveTranscriptSequence,
+              let sourceSequence = entry.sourceSequence
+        else { return false }
+        return sourceSequence == liveTranscriptSequence
+    }
     var isLoadingTranscript: Bool {
         guard connectionState == .loading,
               sessionRequestID != nil || replayRequestID != nil
@@ -901,6 +918,7 @@ final class AppModel {
     @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
     @ObservationIgnored private var isChatVisible = false
     @ObservationIgnored private var latestSequence: UInt64?
+    @ObservationIgnored private var liveTranscriptSequence: UInt64?
     @ObservationIgnored private var sessionOpenCursor: UInt64?
     @ObservationIgnored private var replayRequestID: String?
     @ObservationIgnored private var replaySnapshotSequence: UInt64?
@@ -3226,6 +3244,9 @@ final class AppModel {
         guard latestSequence.map({ buffered.record.sequence > $0 }) ?? true else { return }
         observeReplayCompletion(buffered)
         latestSequence = buffered.record.sequence
+        if replayRequestID == nil {
+            liveTranscriptSequence = buffered.record.sequence
+        }
         transcriptRecords[buffered.record.sequence] = buffered.record
         reduce(
             record: buffered.record
@@ -3395,6 +3416,7 @@ final class AppModel {
         if opened {
             latestSequence = cursor
             self.replayRequestID = replayRequestID
+            liveTranscriptSequence = nil
             replaySnapshotSequence = payload.latestSequence
             sessionOpenCursor = nil
             sessionOpeningID = nil
@@ -3865,7 +3887,9 @@ final class AppModel {
                 completeStream(
                     text: event.msg["message"]?.stringValue ?? "",
                     kind: kind,
-                    messageTarget: messageTarget(from: event.msg)
+                    messageTarget: messageTarget(from: event.msg),
+                    sourceSequence: record.sequence,
+                    recordedAtMs: record.recordedAtMs
                 )
             }
         case "task_started":
@@ -4412,12 +4436,16 @@ final class AppModel {
     private func completeStream(
         text: String,
         kind: TranscriptEntry.Kind,
-        messageTarget: MessageTarget?
+        messageTarget: MessageTarget?,
+        sourceSequence: UInt64?,
+        recordedAtMs: Int64?
     ) {
         completeStream(
             text: text,
             kind: kind,
             messageTarget: messageTarget,
+            sourceSequence: sourceSequence,
+            recordedAtMs: recordedAtMs,
             in: &transcript
         )
     }
@@ -4426,14 +4454,25 @@ final class AppModel {
         text: String,
         kind: TranscriptEntry.Kind,
         messageTarget: MessageTarget?,
+        sourceSequence: UInt64?,
+        recordedAtMs: Int64?,
         in entries: inout [TranscriptEntry]
     ) {
         if let index = entries.lastIndex(where: { $0.pending && $0.kind == kind }) {
             entries[index].text = text
             entries[index].pending = false
             entries[index].messageTarget = messageTarget
+            if let sourceSequence { entries[index].sourceSequence = sourceSequence }
+            if let recordedAtMs { entries[index].recordedAtMs = recordedAtMs }
         } else {
-            appendText(text, kind: kind, messageTarget: messageTarget, to: &entries)
+            appendText(
+                text,
+                kind: kind,
+                sourceSequence: sourceSequence,
+                recordedAtMs: recordedAtMs,
+                messageTarget: messageTarget,
+                to: &entries
+            )
         }
     }
 
@@ -4576,6 +4615,8 @@ final class AppModel {
                     text: event["message"]?.stringValue ?? "",
                     kind: kind,
                     messageTarget: messageTarget(from: event),
+                    sourceSequence: record.sequence,
+                    recordedAtMs: record.recordedAtMs,
                     in: &entries
                 )
             }
@@ -5702,6 +5743,7 @@ final class AppModel {
         transcriptRecordBase = []
         transcriptRecordBaseSequence = nil
         transcriptRecords.removeAll(keepingCapacity: true)
+        liveTranscriptSequence = nil
         replayCompletionSubmissionIDs.removeAll(keepingCapacity: true)
         replayUserMessages.removeAll(keepingCapacity: true)
         completedComposerEditReplay = false

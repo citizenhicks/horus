@@ -27,6 +27,7 @@ struct ChatView: View {
                 isAtBottom: $isAtBottom,
                 scrollToBottomRequest: scrollToBottomRequest
             )
+            .id(model.selectedSessionID)
             ComposerView()
                 .onGeometryChange(for: CGFloat.self) { geometry in
                     geometry.size.height
@@ -249,15 +250,24 @@ private struct ChatOptionsMenu: View {
 private struct TranscriptRowLayout: Identifiable {
     let entries: [TranscriptEntry]
     let topSpacing: CGFloat
+    let isLast: Bool
 
     var id: String { entries.first?.id ?? "" }
     /// Activity always rides behind the group summary, even a run of one: the timeline is the
     /// narrative — the user, the agent's commentary, the answer — and everything else is a
     /// count you can open.
     var isEventGroup: Bool {
-        guard let kind = entries.first?.kind else { return false }
-        return kind == .event || kind == .error || kind == .reasoning
+        entries.first?.kind.isActivity ?? false
     }
+}
+
+/// The waiting line's current state: when it started, and the order it rotates through.
+///
+/// It is a value rather than a view so the transcript can hand it to whichever row owns the
+/// bottom slot — the tail group's header, or a line of its own when there is no group yet.
+struct TranscriptWaitingPhrase: Equatable {
+    let startedAt: Date
+    let order: [String]
 }
 
 /// The transcript body shared by the full chat and read-only agent previews.
@@ -272,6 +282,8 @@ struct TranscriptRowsView: View {
     /// The live transcript passes the model's cached grouping; smaller one-off transcripts
     /// (a preview sheet) group their own, where doing it per pass costs nothing.
     var groupedEntries: [[TranscriptEntry]]?
+    /// Set when the transcript wants the last group's header to hold the waiting line.
+    var waiting: TranscriptWaitingPhrase?
 
     var body: some View {
         ForEach(rows) { row in
@@ -279,7 +291,8 @@ struct TranscriptRowsView: View {
                 if row.isEventGroup {
                     EventGroupView(
                         entries: row.entries,
-                        isActive: row.entries.contains { $0.id == activeStepID }
+                        isActive: row.entries.contains { $0.id == activeStepID },
+                        waiting: row.isLast ? waiting : nil
                     )
                 } else if let entry = row.entries.first {
                     TranscriptRow(
@@ -305,14 +318,15 @@ struct TranscriptRowsView: View {
     }
 
     private var rows: [TranscriptRowLayout] {
-        (groupedEntries ?? TranscriptEntry.groupedRows(from: entries, breakBefore: breakBefore))
-            .enumerated()
-            .map { index, entries in
-                TranscriptRowLayout(
-                    entries: entries,
-                    topSpacing: index == 0 ? 0 : rowSpacing
-                )
-            }
+        let grouped = groupedEntries
+            ?? TranscriptEntry.groupedRows(from: entries, breakBefore: breakBefore)
+        return grouped.enumerated().map { index, entries in
+            TranscriptRowLayout(
+                entries: entries,
+                topSpacing: index == 0 ? 0 : rowSpacing,
+                isLast: index == grouped.count - 1
+            )
+        }
     }
 }
 
@@ -354,6 +368,9 @@ private struct TranscriptView: View {
     // resolves against empty content. A bottom-edge scroll position survives the late fill.
     @State private var position = ScrollPosition(edge: .bottom)
     @State private var historyAnchorID: String?
+    @State private var waitingSince: Date?
+    @State private var waitingHold: Task<Void, Never>?
+    @State private var waitingOrder = TranscriptWaitingNote.messages
     private let rowSpacing: CGFloat = 12
     private let contentPadding: CGFloat = 16
 
@@ -384,13 +401,16 @@ private struct TranscriptView: View {
                     activeStepID: model.activeTranscriptStepID,
                     breakBefore: historyAnchorID,
                     rowSpacing: rowSpacing,
-                    groupedEntries: model.transcriptRows(breakBefore: historyAnchorID)
+                    groupedEntries: model.transcriptRows(breakBefore: historyAnchorID),
+                    waiting: groupHoldsWaitingPhrase ? waitingPhrase : nil
                 )
                 ForEach(model.transcriptTailWidgets) { widget in
                     QueuedMessageView(widget: widget)
                         .padding(.top, rowSpacing)
                 }
-                TranscriptWaitingNoteView(topSpacing: rowSpacing)
+                if let waitingPhrase, !groupHoldsWaitingPhrase {
+                    TranscriptWaitingNoteView(phrase: waitingPhrase, topSpacing: rowSpacing)
+                }
                 Color.clear.frame(height: max(1, bottomInset))
             }
             .scrollTargetLayout()
@@ -402,7 +422,6 @@ private struct TranscriptView: View {
         // keyboard's top edge and the rounded corners expose black. Every other page paints
         // its backdrop the same way, which is why only the chat showed the cut.
         .background(HorusBackdrop())
-        .id(model.selectedSessionID)
         .scrollPosition($position)
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
         .scrollIndicators(.hidden)
@@ -435,6 +454,47 @@ private struct TranscriptView: View {
         }
         .onChange(of: model.selectedSessionID) { historyAnchorID = nil }
         .task(id: model.selectedSessionID) { await openAtLatest() }
+        .onChange(of: model.isWaitingForModel, initial: true) { _, waiting in
+            rescheduleWaitingPhrase(waiting)
+        }
+        .onDisappear {
+            waitingHold?.cancel()
+            waitingHold = nil
+        }
+    }
+
+    private var waitingPhrase: TranscriptWaitingPhrase? {
+        waitingSince.map { TranscriptWaitingPhrase(startedAt: $0, order: waitingOrder) }
+    }
+
+    /// Once the turn has a group at the tail, the gap between steps belongs to that row: the
+    /// phrase takes over its summary rather than appearing below it and moving the transcript.
+    private var groupHoldsWaitingPhrase: Bool {
+        guard model.transcriptTailWidgets.isEmpty,
+              model.displayedTranscript.last?.kind.isActivity == true,
+              let lastGroup = model.transcriptRows(breakBefore: historyAnchorID).last
+        else { return false }
+        return lastGroup.contains { !$0.title.isEmpty || !$0.text.isEmpty }
+    }
+
+    /// Appearance is deliberately sticky: steps land a few hundred milliseconds apart in a busy
+    /// turn, so the raw condition flickers several times a second and the phrase waits before
+    /// showing, which is the difference between a status line and a strobe. It leaves without a
+    /// delay, because what ends the wait always lands in the slot the phrase is holding.
+    private func rescheduleWaitingPhrase(_ waiting: Bool) {
+        waitingHold?.cancel()
+        let fade = Animation.easeInOut(duration: TranscriptWaitingNote.crossfade)
+        guard waiting else {
+            withAnimation(fade) { waitingSince = nil }
+            return
+        }
+        guard waitingSince == nil else { return }
+        waitingHold = Task {
+            try? await Task.sleep(for: .seconds(TranscriptWaitingNote.appearAfter))
+            guard !Task.isCancelled else { return }
+            waitingOrder.shuffle()
+            withAnimation(fade) { waitingSince = Date() }
+        }
     }
 
     /// A lazy stack only estimates the height of rows it has not built, so a single bottom scroll
@@ -541,7 +601,11 @@ private struct TranscriptRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             // Commentary arrives in one short burst between steps; the final message streams
             // long enough to read as it lands on its own.
-            .horusStreamingReveal(count: entry.text.count, active: entry.kind == .commentary)
+            .horusStreamingReveal(
+                count: entry.text.count,
+                active: entry.kind == .commentary,
+                live: model.isLiveTranscriptEntry(entry)
+            )
         case .reasoning:
             ReasoningLine(entry: entry, isActive: isActive)
         case .event, .error:
@@ -922,9 +986,13 @@ private struct MessageActionButton: View {
 /// the reader asks for more.
 private struct EventGroupView: View {
     @Environment(\.horusPalette) private var palette
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded = false
     let entries: [TranscriptEntry]
     let isActive: Bool
+    /// The gap between two steps belongs to this row: rather than growing the transcript by a
+    /// line that then has to disappear again, the summary hands its slot to the waiting line.
+    var waiting: TranscriptWaitingPhrase?
 
     var body: some View {
         VStack(alignment: .leading, spacing: HorusSpace.s) {
@@ -937,7 +1005,9 @@ private struct EventGroupView: View {
                     header
                 }
                 .buttonStyle(.horusPlain)
-                .accessibilityLabel(TranscriptEntry.summary(for: lines))
+                .accessibilityLabel(
+                    waiting == nil ? TranscriptEntry.summary(for: lines) : "Waiting for the model"
+                )
                 .accessibilityHint(isExpanded ? "Collapses the steps" : "Expands the steps")
                 if isExpanded {
                     VStack(alignment: .leading, spacing: HorusSpace.xxs) {
@@ -960,15 +1030,26 @@ private struct EventGroupView: View {
             // it shimmers while the run is live, so swapping in a spinner said the same
             // thing twice and cost the row its identity while it mattered most.
             HorusIcon(.group01, size: HorusStyle.glyphInline, foreground: palette.muted)
-            Text(TranscriptEntry.summary(for: lines))
-                .font(HorusStyle.metadataFont)
-                .foregroundStyle(palette.muted)
-                .lineLimit(1)
-                // The count climbs every time a step joins the run; morphing the digit reads
-                // as the same line counting up rather than a new line replacing it.
-                .contentTransition(.numericText())
-                // The group is one transcript step, so its summary owns the running mark.
-                .horusRunningShimmer(active: isActive)
+            Group {
+                if let waiting {
+                    TranscriptWaitingPhraseText(phrase: waiting)
+                } else {
+                    Text(TranscriptEntry.summary(for: lines))
+                        .font(HorusStyle.metadataFont)
+                        .foregroundStyle(palette.muted)
+                        .lineLimit(1)
+                        // The count climbs every time a step joins the run; morphing the digit
+                        // reads as the same line counting up rather than a new line replacing it.
+                        .contentTransition(.numericText())
+                        // The group is one transcript step, so its summary owns the running mark.
+                        .horusRunningShimmer(active: isActive)
+                }
+            }
+            .transition(.opacity)
+            .animation(
+                reduceMotion ? nil : .easeInOut(duration: TranscriptWaitingNote.crossfade),
+                value: waiting != nil
+            )
             Spacer(minLength: HorusSpace.s)
             HorusIcon(.caretUpDown, size: HorusStyle.glyphMark, foreground: palette.muted)
         }
@@ -1049,82 +1130,53 @@ private struct ReasoningLine: View {
     }
 }
 
-/// The waiting note, held at the end of the transcript.
-///
-/// Appearance is deliberately sticky: steps land a few hundred milliseconds apart in a busy
-/// turn, so the raw condition flickers several times a second and the note waits before
-/// showing, which is the difference between a status line and a strobe. It leaves without a
-/// delay, because what ends the wait is a row arriving in the slot the note is holding.
-private struct TranscriptWaitingNoteView: View {
-    @Environment(AppModel.self) private var model
+/// The rotating waiting line, wherever it is shown.
+private struct TranscriptWaitingPhraseText: View {
     @Environment(\.horusPalette) private var palette
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var startedAt: Date?
-    @State private var hold: Task<Void, Never>?
-    @State private var messageOrder = TranscriptWaitingNote.messages
+    let phrase: TranscriptWaitingPhrase
+
+    var body: some View {
+        // The clock drives the rotation, so a transcript rebuild cannot restart it and the
+        // message advances on its own schedule rather than on redraws.
+        TimelineView(.periodic(from: phrase.startedAt, by: TranscriptWaitingNote.rotation)) { context in
+            let elapsed = reduceMotion ? 0 : context.date.timeIntervalSince(phrase.startedAt)
+            Text(TranscriptWaitingNote.message(in: phrase.order, elapsed: elapsed))
+                .font(HorusStyle.metadataFont)
+                .foregroundStyle(palette.muted)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .contentTransition(.opacity)
+                .animation(.easeInOut(duration: 0.3), value: elapsed)
+                .horusRunningShimmer(active: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // One stable label: rotating the joke past VoiceOver every few seconds is noise.
+        .accessibilityElement()
+        .accessibilityLabel("Waiting for the model")
+    }
+}
+
+/// The waiting line on a row of its own, for the part of a turn that has no group yet.
+private struct TranscriptWaitingNoteView: View {
+    @Environment(\.horusPalette) private var palette
+    let phrase: TranscriptWaitingPhrase
     /// Owned rather than applied by the transcript: padding outside the condition reserves
     /// the gap while the note is hidden, and the arriving row then lands 12pt low.
     let topSpacing: CGFloat
 
     var body: some View {
-        Group {
-            if let startedAt {
-                note(startedAt: startedAt)
-                    .padding(.top, topSpacing)
-            }
-        }
-        .onChange(of: model.isWaitingForModel, initial: true) { _, waiting in
-            reschedule(waiting)
-        }
-        .onDisappear {
-            hold?.cancel()
-            hold = nil
-        }
-    }
-
-    private func note(startedAt: Date) -> some View {
-        // The clock drives the rotation, so a transcript rebuild cannot restart it and the
-        // message advances on its own schedule rather than on redraws.
-        TimelineView(.periodic(from: startedAt, by: TranscriptWaitingNote.rotation)) { context in
-            let elapsed = reduceMotion ? 0 : context.date.timeIntervalSince(startedAt)
-            HStack(spacing: HorusSpace.s) {
-                HorusIcon(.neuralNetwork, size: HorusStyle.glyphInline, foreground: palette.muted)
-                Text(TranscriptWaitingNote.message(in: messageOrder, elapsed: elapsed))
-                    .font(HorusStyle.metadataFont)
-                    .foregroundStyle(palette.muted)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .contentTransition(.opacity)
-                    .animation(.easeInOut(duration: 0.3), value: elapsed)
-                    .horusRunningShimmer(active: true)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+        HStack(spacing: HorusSpace.s) {
+            HorusIcon(.neuralNetwork, size: HorusStyle.glyphInline, foreground: palette.muted)
+            TranscriptWaitingPhraseText(phrase: phrase)
         }
         // The group header's height, so the row that replaces this one lands on the same
         // baseline and the swap reads as one line changing rather than two rows trading places.
         .frame(minHeight: HorusStyle.rowRegular)
+        .padding(.top, topSpacing)
         .transition(.opacity)
-        // One stable label: rotating the joke past VoiceOver every few seconds is noise.
-        .accessibilityElement()
+        .accessibilityElement(children: .ignore)
         .accessibilityLabel("Waiting for the model")
-    }
-
-    private func reschedule(_ waiting: Bool) {
-        hold?.cancel()
-        let fade = Animation.easeInOut(duration: TranscriptWaitingNote.crossfade)
-        // The step that ends the wait lands in the same slot the note occupies, so the note
-        // leaves on the step's own animation rather than lingering over it.
-        guard waiting else {
-            withAnimation(fade) { startedAt = nil }
-            return
-        }
-        guard startedAt == nil else { return }
-        hold = Task {
-            try? await Task.sleep(for: .seconds(TranscriptWaitingNote.appearAfter))
-            guard !Task.isCancelled else { return }
-            messageOrder.shuffle()
-            withAnimation(fade) { startedAt = Date() }
-        }
     }
 }
 
