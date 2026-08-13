@@ -38,7 +38,6 @@ use super::ModelEventSink;
 use super::ModelInfo;
 use super::ModelOutput;
 use super::ModelRequest;
-use super::STREAM_RETRY_LIMIT;
 use super::openai::OpenAi;
 use super::openai::attach_stream_output;
 use super::openai::collect_stream_output;
@@ -100,7 +99,6 @@ pub struct OpenAiSocket {
 struct SocketState {
     connection: Option<OpenAiWsConnection>,
     continuation: Option<Continuation>,
-    websocket_failures: usize,
     use_http: bool,
     last_used_at: Instant,
 }
@@ -257,6 +255,12 @@ impl OpenAiSocket {
                     state.continuation = None;
                     match connect(self.auth.as_ref(), &self.socket_url, request.session_id).await {
                         Ok(connection) => connection,
+                        Err(Error::Provider(error)) if error.status() == Some(426) => {
+                            state.use_http = true;
+                            state.continuation = None;
+                            drop(state);
+                            return self.send_http_response(request, events).await;
+                        }
                         Err(Error::Provider(error)) if error.is_stream_interrupted() => {
                             return Err(websocket_failure(
                                 &mut state,
@@ -299,7 +303,6 @@ impl OpenAiSocket {
                     } else {
                         None
                     };
-                    state.websocket_failures = 0;
                     state.last_used_at = Instant::now();
                     state.connection = Some(connection);
                     return Ok(output);
@@ -408,7 +411,6 @@ impl OpenAiSocket {
         let session = Arc::new(Mutex::new(SocketState {
             connection: None,
             continuation: None,
-            websocket_failures: 0,
             use_http: false,
             last_used_at: Instant::now(),
         }));
@@ -443,13 +445,7 @@ async fn close_connections(connections: Vec<OpenAiWsConnection>) {
 }
 
 fn websocket_failure(state: &mut SocketState, retry_after: Option<String>) -> Error {
-    state.websocket_failures = state.websocket_failures.saturating_add(1);
     state.last_used_at = Instant::now();
-    if state.websocket_failures >= STREAM_RETRY_LIMIT {
-        state.use_http = true;
-        state.connection = None;
-        state.continuation = None;
-    }
     Error::Provider(ProviderError::stream_interrupted(retry_after))
 }
 
@@ -754,12 +750,17 @@ async fn connect(
 
 fn websocket_connect_error(error: WebSocketError) -> Error {
     if let WebSocketError::Http(response) = error {
+        let status = response.status();
         let retry_after = response
             .headers()
             .get(tokio_tungstenite::tungstenite::http::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        return Error::Provider(ProviderError::stream_interrupted(retry_after));
+        return Error::Provider(ProviderError::http(
+            format!("WebSocket HTTP {status}"),
+            status.as_u16(),
+            retry_after,
+        ));
     }
     Error::Provider(ProviderError::stream_interrupted(None))
 }

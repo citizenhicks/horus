@@ -1,4 +1,5 @@
 use super::*;
+use crate::backend::model::STREAM_RETRY_LIMIT;
 use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
 use tokio_tungstenite::connect_async;
@@ -106,7 +107,7 @@ fn generic_processing_error_is_a_retryable_stream_failure() {
 }
 
 #[tokio::test]
-async fn non_authentication_handshake_rejection_is_retryable() {
+async fn upgrade_required_handshake_rejection_preserves_status() {
     use tokio::io::AsyncReadExt as _;
     use tokio::io::AsyncWriteExt as _;
 
@@ -144,7 +145,65 @@ async fn non_authentication_handshake_rejection_is_retryable() {
     let Error::Provider(error) = error else {
         panic!("expected provider error");
     };
-    assert!(error.is_stream_interrupted());
+    assert_eq!(error.status(), Some(426));
+    assert!(!error.is_stream_interrupted());
+}
+
+#[tokio::test]
+async fn not_found_handshake_rejection_does_not_trigger_http_fallback() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("WebSocket listener");
+    let address = listener.local_addr().expect("WebSocket address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("WebSocket connection");
+        let mut request = Vec::new();
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut chunk = [0; 1_024];
+            let count = stream.read(&mut chunk).await.expect("handshake request");
+            assert_ne!(count, 0, "request ended before its headers");
+            request.extend_from_slice(&chunk[..count]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("handshake rejection");
+    });
+    let auth = ApiKeyAuthorization::new("test-key".into());
+
+    let error = match connect(&auth, &format!("ws://{address}/responses"), "session").await {
+        Ok(connection) => {
+            connection.close().await;
+            panic!("404 handshake unexpectedly succeeded");
+        }
+        Err(error) => error,
+    };
+    server.await.expect("WebSocket server");
+
+    let Error::Provider(error) = error else {
+        panic!("expected provider error");
+    };
+    assert_eq!(error.status(), Some(404));
+    assert!(!error.is_stream_interrupted());
+}
+
+#[test]
+fn stream_failures_do_not_enable_http_fallback() {
+    let mut state = SocketState {
+        connection: None,
+        continuation: None,
+        use_http: false,
+        last_used_at: Instant::now(),
+    };
+
+    for _ in 0..STREAM_RETRY_LIMIT {
+        let Error::Provider(error) = websocket_failure(&mut state, None) else {
+            panic!("expected provider error");
+        };
+        assert!(error.is_stream_interrupted());
+    }
+
+    assert!(!state.use_http);
 }
 
 #[test]
@@ -160,7 +219,6 @@ fn continuation_sends_only_new_items_and_resets_on_rewrite() {
             known_items: known.len(),
             fingerprint: fingerprint(known.iter()).expect("fingerprint"),
         }),
-        websocket_failures: 0,
         use_http: false,
         last_used_at: Instant::now(),
     };
@@ -998,7 +1056,7 @@ async fn previous_response_not_found_rebuilds_full_context_on_the_same_connectio
 }
 
 #[tokio::test]
-async fn five_websocket_failures_switch_only_that_session_to_sticky_http() {
+async fn upgrade_required_switches_only_that_session_to_sticky_http() {
     use futures_util::SinkExt as _;
     use futures_util::StreamExt as _;
 
@@ -1049,39 +1107,23 @@ async fn five_websocket_failures_switch_only_that_session_to_sticky_http() {
         );
         drop(socket);
 
-        for _ in 1..STREAM_RETRY_LIMIT {
-            let (stream, _) = websocket_listener
-                .accept()
-                .await
-                .expect("failed WebSocket connection");
-            let mut socket = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("WebSocket handshake");
-            socket
-                .next()
-                .await
-                .expect("response request")
-                .expect("valid response request");
-        }
-
-        let (stream, _) = websocket_listener
+        let (mut stream, _) = websocket_listener
             .accept()
             .await
-            .expect("other session connection");
-        let mut socket = tokio_tungstenite::accept_async(stream)
-            .await
-            .expect("other session handshake");
-        socket
-            .next()
-            .await
-            .expect("other session request")
-            .expect("valid other session request");
-        for event in completed_events("Other session.", "response-other") {
-            socket
-                .send(Message::text(event.to_string()))
-                .await
-                .expect("other session completed event");
+            .expect("fallback WebSocket connection");
+        let mut request = Vec::new();
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut chunk = [0; 1_024];
+            let count = stream.read(&mut chunk).await.expect("handshake request");
+            assert_ne!(count, 0, "request ended before its headers");
+            request.extend_from_slice(&chunk[..count]);
         }
+        stream
+            .write_all(
+                b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("fallback handshake response");
     });
 
     let http_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1151,27 +1193,24 @@ async fn five_websocket_failures_switch_only_that_session_to_sticky_http() {
         "content": [{"type": "input_text", "text": "continue"}]
     }));
 
-    for _ in 0..STREAM_RETRY_LIMIT {
-        let Error::Provider(error) = provider
-            .send_response(
-                ModelRequest {
-                    session_id: "fallback-session",
-                    instructions: "Test instructions",
-                    input: &continued_input,
-                    tools: &[],
-                    allow_hosted_tools: true,
-                    allow_continuation: true,
-                },
-                Arc::clone(&events),
-            )
-            .await
-            .expect_err("WebSocket attempt should be interrupted")
-        else {
-            panic!("expected provider error");
-        };
-        assert!(error.is_stream_interrupted());
-        assert_eq!(error.to_string(), "model response stream was interrupted");
-    }
+    let Error::Provider(error) = provider
+        .send_response(
+            ModelRequest {
+                session_id: "fallback-session",
+                instructions: "Test instructions",
+                input: &continued_input,
+                tools: &[],
+                allow_hosted_tools: true,
+                allow_continuation: true,
+            },
+            Arc::clone(&events),
+        )
+        .await
+        .expect_err("closed WebSocket should be retried before fallback")
+    else {
+        panic!("expected provider error");
+    };
+    assert!(error.is_stream_interrupted());
 
     let fallback = provider
         .send_response(
@@ -1218,21 +1257,6 @@ async fn five_websocket_failures_switch_only_that_session_to_sticky_http() {
     else {
         panic!("expected provider error");
     };
-    let other = provider
-        .send_response(
-            ModelRequest {
-                session_id: "other-session",
-                instructions: "Test instructions",
-                input: &continued_input,
-                tools: &[],
-                allow_hosted_tools: true,
-                allow_continuation: true,
-            },
-            events,
-        )
-        .await
-        .expect("other session WebSocket");
-
     let first_http = requests.recv().await.expect("first HTTP request");
     let second_http = requests.recv().await.expect("second HTTP request");
     let failed_http = requests.recv().await.expect("failed HTTP request");
@@ -1244,7 +1268,6 @@ async fn five_websocket_failures_switch_only_that_session_to_sticky_http() {
     assert_eq!(http_error.status(), None);
     assert!(!http_error.is_stream_interrupted());
     assert_eq!(http_error.to_string(), "HTTPS fallback transport failed");
-    assert_eq!(other.text(), "Other session.");
     for request in [first_http, second_http, failed_http] {
         assert!(request.get("previous_response_id").is_none());
         assert_eq!(
