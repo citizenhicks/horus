@@ -377,6 +377,7 @@ private struct TranscriptView: View {
     @State private var waitingSince: Date?
     @State private var waitingHold: Task<Void, Never>?
     @State private var waitingOrder = TranscriptWaitingNote.messages
+    @State private var waitingHeldByGroup = false
     private let rowSpacing: CGFloat = 12
     private let contentPadding: CGFloat = 16
 
@@ -408,13 +409,13 @@ private struct TranscriptView: View {
                     breakBefore: historyAnchorID,
                     rowSpacing: rowSpacing,
                     groupedEntries: model.transcriptRows(breakBefore: historyAnchorID),
-                    waiting: groupHoldsWaitingPhrase ? waitingPhrase : nil
+                    waiting: waitingHeldByGroup ? waitingPhrase : nil
                 )
                 ForEach(model.transcriptTailWidgets) { widget in
                     QueuedMessageView(widget: widget)
                         .padding(.top, rowSpacing)
                 }
-                if let waitingPhrase, !groupHoldsWaitingPhrase {
+                if let waitingPhrase, !waitingHeldByGroup {
                     TranscriptWaitingNoteView(phrase: waitingPhrase, topSpacing: rowSpacing)
                 }
                 Color.clear.frame(height: max(1, bottomInset))
@@ -475,6 +476,11 @@ private struct TranscriptView: View {
 
     /// Once the turn has a group at the tail, the gap between steps belongs to that row: the
     /// phrase takes over its summary rather than appearing below it and moving the transcript.
+    ///
+    /// Read once, when the phrase appears, and held in `waitingHeldByGroup` until it leaves.
+    /// What ends a wait is a row arriving, which is also what flips this answer — left live,
+    /// the phrase changes slot on its way out and carries a row's height with it, out and
+    /// back, inside a third of a second.
     private var groupHoldsWaitingPhrase: Bool {
         guard model.transcriptTailWidgets.isEmpty,
               model.displayedTranscript.last?.kind.isActivity == true,
@@ -499,6 +505,7 @@ private struct TranscriptView: View {
             try? await Task.sleep(for: .seconds(TranscriptWaitingNote.appearAfter))
             guard !Task.isCancelled else { return }
             waitingOrder.shuffle()
+            waitingHeldByGroup = groupHoldsWaitingPhrase
             withAnimation(fade) { waitingSince = Date() }
         }
     }
