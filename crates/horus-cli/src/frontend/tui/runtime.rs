@@ -31,6 +31,36 @@ use uuid::Uuid;
 const ELAPSED_INTERVAL: Duration = Duration::from_secs(1);
 const CLEAR_SCREEN_AND_SCROLLBACK: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
 
+struct ReplayHydration {
+    pending: bool,
+}
+
+impl ReplayHydration {
+    const fn pending() -> Self {
+        Self { pending: true }
+    }
+
+    const fn allows_draw(&self) -> bool {
+        !self.pending
+    }
+
+    fn observe(&mut self, message: &ServerMessage, session_id: &str) {
+        if matches!(
+            message,
+            ServerMessage::SessionReplayComplete {
+                session_id: actual,
+                ..
+            } if actual == session_id
+        ) {
+            self.pending = false;
+        }
+    }
+
+    fn finish(&mut self) {
+        self.pending = false;
+    }
+}
+
 pub(in crate::frontend) async fn run(
     sender: GatewaySender,
     mut events: GatewayEvents,
@@ -82,11 +112,12 @@ pub(in crate::frontend) async fn run(
     elapsed.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut events_open = true;
     let mut dirty = true;
+    let mut replay_hydration = ReplayHydration::pending();
     let mut exit = FrontendExit::Exit;
     let mut clear_on_exit = false;
 
     'ui: loop {
-        if dirty {
+        if dirty && replay_hydration.allows_draw() {
             io::stdout().sync_update(|_| -> Result<()> {
                 terminal.draw(|frame| {
                     if state.preview.is_some() {
@@ -103,6 +134,7 @@ pub(in crate::frontend) async fn run(
             event = events.next(), if events_open => {
                 match event {
                     Ok(Some(frame)) => {
+                        replay_hydration.observe(&frame.message, &session_id);
                         match frame.message {
                             ServerMessage::AgentEvent {
                                 session_id: actual,
@@ -168,12 +200,14 @@ pub(in crate::frontend) async fn run(
                         }
                     }
                     Ok(None) => {
+                        replay_hydration.finish();
                         events_open = false;
                         state.disconnected = true;
                         state.finish_turn();
                         state.push("gateway disconnected · press q to exit", TranscriptTone::Error);
                     }
                     Err(error) => {
+                        replay_hydration.finish();
                         events_open = false;
                         state.disconnected = true;
                         state.finish_turn();
@@ -411,4 +445,58 @@ async fn send_op(
         })
         .await
         .map_err(|error| Error::Stopped(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use horus::protocol::{Event, EventMsg};
+    use horus_gateway::wire::RecordedEvent;
+
+    fn replay_event(sequence: u64) -> ServerMessage {
+        ServerMessage::AgentEvent {
+            session_id: "session-a".into(),
+            record: RecordedEvent {
+                sequence,
+                recorded_at_ms: 0,
+                event: Event {
+                    submission_id: None,
+                    msg: EventMsg::ContextCompacted,
+                },
+                stream_metrics: Vec::new(),
+                blocks: Vec::new(),
+                preview: None,
+            },
+        }
+    }
+
+    #[test]
+    fn replay_hydration_blocks_draw_until_current_session_completes() {
+        let mut hydration = ReplayHydration::pending();
+
+        for sequence in 1..=3 {
+            hydration.observe(&replay_event(sequence), "session-a");
+            assert!(!hydration.allows_draw());
+        }
+        hydration.observe(
+            &ServerMessage::SessionReplayComplete {
+                request_id: "other-request".into(),
+                session_id: "session-b".into(),
+            },
+            "session-a",
+        );
+        assert!(!hydration.allows_draw());
+
+        hydration.observe(
+            &ServerMessage::SessionReplayComplete {
+                request_id: "open-request".into(),
+                session_id: "session-a".into(),
+            },
+            "session-a",
+        );
+        assert!(hydration.allows_draw());
+
+        hydration.observe(&replay_event(4), "session-a");
+        assert!(hydration.allows_draw());
+    }
 }
