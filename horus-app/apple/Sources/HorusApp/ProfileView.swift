@@ -268,13 +268,37 @@ private struct ProfileUsageSection: View {
 
 private struct ProfileUsageHistory: View {
     @Environment(\.horusPalette) private var palette
+    @State private var aggregation: UsageAggregation = .daily
     let days: [DailyUsage]
     let providerLabels: [String: String]
 
     var body: some View {
         VStack(alignment: .leading, spacing: HorusSpace.l) {
+            VStack(alignment: .leading, spacing: HorusSpace.l) {
+                Text("Token activity")
+                    .font(HorusStyle.controlFont)
+                Picker("Usage grouping", selection: $aggregation) {
+                    ForEach(UsageAggregation.allCases) { option in
+                        Text(option.title).tag(option)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .sensoryFeedback(.selection, trigger: aggregation)
+                UsageHeatmap(days: days, aggregation: aggregation)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(HorusStyle.cardPadding)
+            .background(palette.panel, in: HorusStyle.cardShape)
+            .overlay {
+                HorusStyle.cardShape.stroke(
+                    palette.line.opacity(0.45),
+                    lineWidth: HorusStyle.borderWidth
+                )
+                .allowsHitTesting(false)
+            }
             HStack(alignment: .firstTextBaseline) {
-                Text("Usage by provider")
+                Text("By provider")
                     .font(HorusStyle.controlFont)
                 Spacer()
                 Text("Last \(profileUsageWeekCount) weeks")
@@ -284,12 +308,9 @@ private struct ProfileUsageHistory: View {
             ProviderUsageChart(
                 usage: days,
                 providerLabels: providerLabels,
-                weekCount: profileUsageWeekCount
+                weekCount: profileUsageWeekCount,
+                aggregation: aggregation
             )
-            Text("\(profileUsageWeekCount)-week activity")
-                .font(HorusStyle.controlFont)
-                .foregroundStyle(palette.muted)
-            UsageHeatmap(days: days)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -357,8 +378,7 @@ private struct ProfileRecentRuns: View {
                         DisclosureGroup(isExpanded: expansion(for: group.id)) {
                             ForEach(group.runs) { run in
                                 Button {
-                                    model.openSession(group.sessionId)
-                                    model.destination = .chat
+                                    model.openChat(group.sessionId)
                                 } label: {
                                     HStack(spacing: HorusSpace.m) {
                                         HorusIcon(runGlyph(run), foreground: runColor(run))
@@ -385,6 +405,10 @@ private struct ProfileRecentRuns: View {
                                     .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.horusPlain)
+                                .disabled(
+                                    !model.canOpenSession
+                                        && group.sessionId != model.selectedSessionID
+                                )
                                 .accessibilityLabel("\(runOutcome(run)), \(group.title)")
                                 .accessibilityValue(runDetail(run))
                                 .accessibilityHint("Opens the chat for this run")
@@ -465,62 +489,100 @@ private struct UsageHeatmap: View {
     @Environment(\.horusPalette) private var palette
     @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiatesWithoutColor
     let days: [DailyUsage]
+    let aggregation: UsageAggregation
 
     var body: some View {
         let chart = chartData
-        let canvas = Canvas { context, size in
-            let spacing: CGFloat = 3
-            let cell = min(
-                (size.width - spacing * CGFloat(profileUsageWeekCount - 1))
-                    / CGFloat(profileUsageWeekCount),
-                (size.height - spacing * 6) / 7
-            )
-            let width = cell * CGFloat(profileUsageWeekCount)
-                + spacing * CGFloat(profileUsageWeekCount - 1)
-            let originX = (size.width - width) / 2
-
-            for index in chart.values.indices {
-                let week = index % profileUsageWeekCount
-                let weekday = index / profileUsageWeekCount
-                let rect = CGRect(
-                    x: originX + CGFloat(week) * (cell + spacing),
-                    y: CGFloat(weekday) * (cell + spacing),
-                    width: cell,
-                    height: cell
+        VStack(alignment: .leading, spacing: HorusSpace.xs) {
+            Canvas { context, size in
+                let gapRatio: CGFloat = 0.28
+                let cell = size.width / (
+                    CGFloat(profileUsageWeekCount)
+                        + gapRatio * CGFloat(profileUsageWeekCount - 1)
                 )
-                let path = Path(roundedRect: rect, cornerRadius: min(2.5, cell * 0.3))
-                context.fill(path, with: .color(heatColor(value: chart.values[index], maximum: chart.maximum)))
-                if differentiatesWithoutColor, chart.values[index] > 0 {
-                    context.stroke(path, with: .color(palette.canvas), lineWidth: 1)
+                let spacing = cell * gapRatio
+
+                for index in chart.values.indices {
+                    let week = index / 7
+                    let weekday = index % 7
+                    guard week < profileUsageWeekCount else { continue }
+                    let value = chart.values[index]
+                    let rect = CGRect(
+                        x: CGFloat(week) * (cell + spacing),
+                        y: CGFloat(weekday) * (cell + spacing),
+                        width: cell,
+                        height: cell
+                    )
+                    let path = Path(roundedRect: rect, cornerRadius: min(4, cell * 0.3))
+                    context.fill(path, with: .color(heatColor(value: value, maximum: chart.maximum)))
+                    if differentiatesWithoutColor, value > 0 {
+                        context.stroke(path, with: .color(palette.canvas), lineWidth: 1)
+                    }
                 }
             }
+            .aspectRatio(heatmapAspectRatio, contentMode: .fit)
+
+            GeometryReader { geometry in
+                let gapRatio: CGFloat = 0.28
+                let cell = geometry.size.width / (
+                    CGFloat(profileUsageWeekCount)
+                        + gapRatio * CGFloat(profileUsageWeekCount - 1)
+                )
+                let spacing = cell * gapRatio
+                ZStack(alignment: .topLeading) {
+                    ForEach(monthLabels) { label in
+                        Text(label.title)
+                            .font(HorusStyle.metadataFont)
+                            .foregroundStyle(palette.muted)
+                            .position(
+                                x: CGFloat(label.week) * (cell + spacing) + 12,
+                                y: 8
+                            )
+                    }
+                }
+            }
+            .frame(height: 16)
         }
-        GeometryReader { geometry in
-            canvas.frame(width: geometry.size.width, height: 78)
-        }
-        .frame(height: 78)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(profileUsageWeekCount)-week token activity")
+        .accessibilityLabel("\(aggregation.title) token activity")
         .accessibilityValue("\(chart.activeDays) active days, \(chart.totalTokens) total tokens")
     }
 
-    private var chartData: (values: [Int], maximum: Int, activeDays: Int, totalTokens: Int) {
-        let values = days.reduce(into: [UInt64: Int]()) { values, day in
-            values[day.unixDay, default: 0] += day.usage.totalTokens
-        }
+    private var heatmapAspectRatio: CGFloat {
+        let gapRatio: CGFloat = 0.28
+        return (
+            CGFloat(profileUsageWeekCount)
+                + gapRatio * CGFloat(profileUsageWeekCount - 1)
+        ) / (7 + gapRatio * 6)
+    }
+
+    private var monthLabels: [UsageMonthLabel] {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
         let today = UInt64(Date.now.timeIntervalSince1970 / 86_400)
         let dayCount = profileUsageWeekCount * 7
         let start = today - min(today, UInt64(dayCount - 1))
-        let samples = (0..<dayCount).map { index in
-            let week = index % profileUsageWeekCount
-            let weekday = index / profileUsageWeekCount
-            return values[start + UInt64(week * 7 + weekday)] ?? 0
+        var labels: [UsageMonthLabel] = []
+        var previousMonth: Int?
+        for week in 0..<profileUsageWeekCount {
+            let date = Date(timeIntervalSince1970: TimeInterval(start + UInt64(week * 7)) * 86_400)
+            let month = calendar.component(.month, from: date)
+            guard month != previousMonth else { continue }
+            previousMonth = month
+            labels.append(UsageMonthLabel(
+                week: week,
+                title: date.formatted(.dateTime.month(.narrow))
+            ))
         }
-        return (
-            samples,
-            max(samples.max() ?? 0, 1),
-            samples.filter { $0 > 0 }.count,
-            samples.reduce(0, +)
+        return labels
+    }
+
+    private var chartData: UsageActivitySnapshot {
+        UsageActivitySeries.snapshot(
+            from: days,
+            endingOn: UInt64(Date.now.timeIntervalSince1970 / 86_400),
+            weekCount: profileUsageWeekCount,
+            aggregation: aggregation
         )
     }
 
@@ -529,6 +591,13 @@ private struct UsageHeatmap: View {
         let ratio = Double(value) / Double(maximum)
         return palette.accent.opacity(0.25 + 0.75 * ratio.squareRoot())
     }
+}
+
+private struct UsageMonthLabel: Identifiable {
+    let week: Int
+    let title: String
+
+    var id: Int { week }
 }
 
 private struct AppearanceSettings: View {

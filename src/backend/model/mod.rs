@@ -8,12 +8,17 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
 use crate::protocol::TokenUsage;
-use crate::protocol::{ModelStepAnnotation, ModelStepContent, ModelStepContentPhase};
+use crate::protocol::{
+    ModelStepAnnotation, ModelStepContent, ModelStepContentPhase, ModelStepDiagnostics,
+    PromptCacheDiagnostics, PromptCacheMode, PromptCacheOutcome,
+};
 
 pub mod anthropic;
 pub mod deepseek;
@@ -34,6 +39,7 @@ const MAX_TOOL_CALLS: usize = 128;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_CALL_ID_BYTES: usize = 4 * 1024;
 const MAX_TOOL_NAME_BYTES: usize = 256;
+pub(crate) const PROMPT_CACHE_BREAKPOINT_FIELD: &str = "_horus_prompt_cache_breakpoint";
 pub(crate) const STREAM_RETRY_LIMIT: usize = 5;
 
 /// Returns one-based context boundaries with no unfinished tool calls.
@@ -85,7 +91,10 @@ pub struct ToolCall {
 /// Input for one model turn.
 #[derive(Debug)]
 pub struct ModelRequest<'a> {
+    /// Local session identity used for transport continuation state.
     pub session_id: &'a str,
+    /// Optional provider-visible prompt-cache identity.
+    pub prompt_cache: Option<PromptCacheIdentity<'a>>,
     pub instructions: &'a str,
     pub input: &'a [Value],
     pub tools: &'a [ToolDefinition],
@@ -95,11 +104,163 @@ pub struct ModelRequest<'a> {
     pub allow_continuation: bool,
 }
 
+/// Provider-visible identity for one prompt-cache lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptCacheIdentity<'a> {
+    /// Opaque, stable key. Providers must never receive the raw session ID here.
+    pub key: &'a str,
+    /// Active-context rewrite epoch, used to invalidate transport continuation.
+    pub context_epoch: u64,
+}
+
+/// Prompt-cache behavior advertised by a model provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptCacheCapability {
+    Unsupported,
+    Implicit,
+    Explicit,
+}
+
+impl PromptCacheCapability {
+    fn mode(self) -> PromptCacheMode {
+        match self {
+            Self::Unsupported => PromptCacheMode::Unsupported,
+            Self::Implicit => PromptCacheMode::Implicit,
+            Self::Explicit => PromptCacheMode::Explicit,
+        }
+    }
+
+    fn outcome(self, usage: &TokenUsage, context_rewritten: bool) -> PromptCacheOutcome {
+        if self == Self::Unsupported {
+            PromptCacheOutcome::Unsupported
+        } else if usage.cached_input_tokens > 0 {
+            PromptCacheOutcome::Hit
+        } else if context_rewritten {
+            PromptCacheOutcome::ContextRewrite
+        } else if usage.cache_write_input_tokens > 0 {
+            PromptCacheOutcome::Write
+        } else {
+            PromptCacheOutcome::Miss
+        }
+    }
+}
+
+/// Token rates owned by one concrete provider/model implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelPricing {
+    input_microusd_per_million: u64,
+    cached_input_microusd_per_million: u64,
+    cache_write_input_microusd_per_million: u64,
+    output_microusd_per_million: u64,
+    long_context: Option<LongContextPricing>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LongContextPricing {
+    threshold_input_tokens: u64,
+    input_multiplier_millis: u32,
+    output_multiplier_millis: u32,
+}
+
+impl ModelPricing {
+    /// Creates standard per-million-token rates expressed in millionths of a dollar.
+    #[must_use]
+    pub const fn new(
+        input_microusd_per_million: u64,
+        cached_input_microusd_per_million: u64,
+        cache_write_input_microusd_per_million: u64,
+        output_microusd_per_million: u64,
+    ) -> Self {
+        Self {
+            input_microusd_per_million,
+            cached_input_microusd_per_million,
+            cache_write_input_microusd_per_million,
+            output_microusd_per_million,
+            long_context: None,
+        }
+    }
+
+    pub(crate) const fn with_long_context(
+        mut self,
+        threshold_input_tokens: u64,
+        input_multiplier_millis: u32,
+        output_multiplier_millis: u32,
+    ) -> Self {
+        self.long_context = Some(LongContextPricing {
+            threshold_input_tokens,
+            input_multiplier_millis,
+            output_multiplier_millis,
+        });
+        self
+    }
+
+    /// Estimates request cost in millionths of a dollar, rounded up.
+    #[must_use]
+    pub fn estimate_microusd(self, usage: &TokenUsage) -> Option<u64> {
+        const RATE_DENOMINATOR: u128 = 1_000_000 * 1_000;
+
+        let input = u64::try_from(usage.input_tokens).ok()?;
+        let cached_input = u64::try_from(usage.cached_input_tokens).ok()?;
+        let cache_write_input = u64::try_from(usage.cache_write_input_tokens).ok()?;
+        let output = u64::try_from(usage.output_tokens).ok()?;
+        let uncached_input = input
+            .checked_sub(cached_input)?
+            .checked_sub(cache_write_input)?;
+        let (input_multiplier, output_multiplier) =
+            self.long_context.map_or((1_000, 1_000), |long| {
+                if input > long.threshold_input_tokens {
+                    (long.input_multiplier_millis, long.output_multiplier_millis)
+                } else {
+                    (1_000, 1_000)
+                }
+            });
+        let mut numerator = priced_tokens(
+            uncached_input,
+            self.input_microusd_per_million,
+            input_multiplier,
+        )?;
+        numerator = numerator.checked_add(priced_tokens(
+            cached_input,
+            self.cached_input_microusd_per_million,
+            input_multiplier,
+        )?)?;
+        numerator = numerator.checked_add(priced_tokens(
+            cache_write_input,
+            self.cache_write_input_microusd_per_million,
+            input_multiplier,
+        )?)?;
+        numerator = numerator.checked_add(priced_tokens(
+            output,
+            self.output_microusd_per_million,
+            output_multiplier,
+        )?)?;
+        let rounded = numerator.checked_add(RATE_DENOMINATOR - 1)? / RATE_DENOMINATOR;
+        u64::try_from(rounded).ok()
+    }
+}
+
+fn priced_tokens(tokens: u64, rate: u64, multiplier_millis: u32) -> Option<u128> {
+    u128::from(tokens)
+        .checked_mul(u128::from(rate))?
+        .checked_mul(u128::from(multiplier_millis))
+}
+
+/// Hashes a local session identity into a stable provider cache key.
+#[must_use]
+pub fn prompt_cache_key(session_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"horus/prompt-cache/v1/");
+    digest.update(session_id.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
 /// Input for a provider's native compaction endpoint.
 #[derive(Debug)]
 pub struct CompactRequest<'a> {
     /// Stable conversation identity used by providers for request routing.
     pub session_id: &'a str,
+    /// Optional provider-visible prompt-cache identity.
+    pub prompt_cache: Option<PromptCacheIdentity<'a>>,
     /// Current system instructions governing the compacted conversation.
     pub instructions: &'a str,
     /// Conversation items to replace with the returned [`CompactOutput`].
@@ -448,6 +609,16 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Reports the provider's prompt-cache mode without exposing transport details.
+    fn prompt_cache_capability(&self) -> PromptCacheCapability {
+        PromptCacheCapability::Unsupported
+    }
+
+    /// Returns current token pricing when this provider owns a known billing schedule.
+    fn pricing(&self) -> Option<ModelPricing> {
+        None
+    }
+
     /// Produces one streamed response.
     fn respond<'a>(
         &'a self,
@@ -584,6 +755,51 @@ impl ModelRouter {
     /// Reports whether one route accepts native image input.
     pub fn supports_image_input(&self, provider: &str) -> Result<bool> {
         Ok(self.provider(provider)?.supports_image_input())
+    }
+
+    /// Reports prompt-cache support for one route.
+    pub fn prompt_cache_capability(&self, provider: &str) -> Result<PromptCacheCapability> {
+        Ok(self.provider(provider)?.prompt_cache_capability())
+    }
+
+    /// Returns provider-owned pricing for one route when it is known.
+    pub fn pricing(&self, provider: &str) -> Result<Option<ModelPricing>> {
+        Ok(self.provider(provider)?.pricing())
+    }
+
+    /// Estimates one completed request from provider-owned rates.
+    pub fn estimated_cost_microusd(
+        &self,
+        provider: &str,
+        usage: &TokenUsage,
+    ) -> Result<Option<u64>> {
+        Ok(self
+            .provider(provider)?
+            .pricing()
+            .and_then(|pricing| pricing.estimate_microusd(usage)))
+    }
+
+    pub(crate) fn model_step_diagnostics(
+        &self,
+        provider: &str,
+        context_epoch: u64,
+        rewrite_reasons: Vec<String>,
+        usage: &TokenUsage,
+    ) -> Result<ModelStepDiagnostics> {
+        let model = self.provider(provider)?;
+        let capability = model.prompt_cache_capability();
+        Ok(ModelStepDiagnostics {
+            provider: provider.into(),
+            prompt_cache: PromptCacheDiagnostics {
+                capability: capability.mode(),
+                context_epoch,
+                outcome: capability.outcome(usage, !rewrite_reasons.is_empty()),
+                rewrite_reasons,
+            },
+            estimated_cost_microusd: model
+                .pricing()
+                .and_then(|pricing| pricing.estimate_microusd(usage)),
+        })
     }
 
     /// Compacts context through the selected provider.
@@ -800,6 +1016,52 @@ pub fn user_message_with_attachments(text: &str, attachments: &[SessionFileRefer
     message
 }
 
+pub(crate) fn has_prompt_cache_breakpoint(input: &[Value]) -> bool {
+    input.iter().any(|item| {
+        item.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|part| {
+                    part.get(PROMPT_CACHE_BREAKPOINT_FIELD)
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+            })
+    })
+}
+
+pub(crate) fn mark_prompt_cache_breakpoint(item: &mut Value) -> bool {
+    let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let Some(part) = content
+        .iter_mut()
+        .find(|part| part.get("type").and_then(Value::as_str) == Some("input_text"))
+    else {
+        return false;
+    };
+    part[PROMPT_CACHE_BREAKPOINT_FIELD] = Value::Bool(true);
+    true
+}
+
+pub(crate) fn reset_prompt_cache_breakpoint(input: &mut [Value]) {
+    for item in input.iter_mut() {
+        let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in content {
+            if let Some(fields) = part.as_object_mut() {
+                fields.remove(PROMPT_CACHE_BREAKPOINT_FIELD);
+            }
+        }
+    }
+    for item in input.iter_mut().rev() {
+        if mark_prompt_cache_breakpoint(item) {
+            break;
+        }
+    }
+}
+
 pub(crate) fn internal_user_message(kind: &str, text: &str) -> Value {
     let mut message = user_message(text);
     message[INTERNAL_MESSAGE_FIELD] = Value::String(kind.into());
@@ -824,6 +1086,8 @@ mod tests {
 
     struct DefaultCapabilities;
 
+    struct ObservedCapabilities;
+
     impl Model for DefaultCapabilities {
         fn respond<'a>(
             &'a self,
@@ -832,6 +1096,87 @@ mod tests {
         ) -> BoxFuture<'a, Result<ModelOutput>> {
             Box::pin(async { Err(Error::Provider("response was not expected".into())) })
         }
+    }
+
+    impl Model for ObservedCapabilities {
+        fn prompt_cache_capability(&self) -> PromptCacheCapability {
+            PromptCacheCapability::Explicit
+        }
+
+        fn pricing(&self) -> Option<ModelPricing> {
+            Some(ModelPricing::new(1_000_000, 100_000, 1_250_000, 2_000_000))
+        }
+
+        fn respond<'a>(
+            &'a self,
+            _request: ModelRequest<'a>,
+            _events: ModelEventSink,
+        ) -> BoxFuture<'a, Result<ModelOutput>> {
+            Box::pin(async { Err(Error::Provider("response was not expected".into())) })
+        }
+    }
+
+    #[test]
+    fn prompt_cache_identity_is_session_stable_and_keeps_one_latest_breakpoint() {
+        let first = prompt_cache_key("session-1");
+        assert_eq!(first, prompt_cache_key("session-1"));
+        assert_ne!(first, prompt_cache_key("session-2"));
+
+        let mut input = vec![user_message("old"), user_message("new")];
+        assert!(mark_prompt_cache_breakpoint(&mut input[0]));
+        reset_prompt_cache_breakpoint(&mut input);
+
+        assert!(!has_prompt_cache_breakpoint(&input[..1]));
+        assert!(has_prompt_cache_breakpoint(&input[1..]));
+    }
+
+    #[test]
+    fn pricing_separates_cache_buckets_and_applies_long_context_rates() {
+        let usage = TokenUsage {
+            input_tokens: 1_000,
+            cached_input_tokens: 200,
+            cache_write_input_tokens: 300,
+            output_tokens: 100,
+            total_tokens: 1_100,
+            ..TokenUsage::default()
+        };
+        let pricing = ModelPricing::new(1_000_000, 100_000, 1_250_000, 2_000_000);
+
+        assert_eq!(pricing.estimate_microusd(&usage), Some(1_095));
+        assert_eq!(
+            pricing
+                .with_long_context(999, 2_000, 1_500)
+                .estimate_microusd(&usage),
+            Some(2_090)
+        );
+    }
+
+    #[test]
+    fn model_step_diagnostics_report_rewrite_before_cache_write() {
+        let router = ModelRouter::new("observed", Arc::new(ObservedCapabilities));
+        let usage = TokenUsage {
+            input_tokens: 100,
+            cache_write_input_tokens: 100,
+            total_tokens: 100,
+            ..TokenUsage::default()
+        };
+
+        let diagnostics = router
+            .model_step_diagnostics("observed", 4, vec!["compaction".into()], &usage)
+            .expect("diagnostics");
+
+        assert_eq!(diagnostics.provider, "observed");
+        assert_eq!(
+            diagnostics.prompt_cache.capability,
+            PromptCacheMode::Explicit
+        );
+        assert_eq!(
+            diagnostics.prompt_cache.outcome,
+            PromptCacheOutcome::ContextRewrite
+        );
+        assert_eq!(diagnostics.prompt_cache.context_epoch, 4);
+        assert_eq!(diagnostics.prompt_cache.rewrite_reasons, ["compaction"]);
+        assert_eq!(diagnostics.estimated_cost_microusd, Some(125));
     }
 
     #[test]

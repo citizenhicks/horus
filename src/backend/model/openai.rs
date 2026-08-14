@@ -12,7 +12,10 @@ use super::Model;
 use super::ModelEventSink;
 use super::ModelInfo;
 use super::ModelOutput;
+use super::ModelPricing;
 use super::ModelRequest;
+use super::PROMPT_CACHE_BREAKPOINT_FIELD;
+use super::PromptCacheCapability;
 use super::ToolDefinition;
 use super::image_data_url;
 use super::image_input;
@@ -51,6 +54,16 @@ const MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STREAM_OUTPUT_ITEMS: usize = 1_024;
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
+fn openai_model_pricing(model: &str) -> Option<ModelPricing> {
+    let pricing = match model {
+        "gpt-5.6-sol" => ModelPricing::new(5_000_000, 500_000, 6_250_000, 30_000_000),
+        "gpt-5.6-terra" => ModelPricing::new(2_000_000, 200_000, 2_500_000, 12_000_000),
+        "gpt-5.6-luna" => ModelPricing::new(200_000, 20_000, 250_000, 1_200_000),
+        _ => return None,
+    };
+    Some(pricing.with_long_context(272_000, 2_000, 1_500))
+}
+
 /// OpenAI Responses API configuration.
 pub struct OpenAi {
     client: Client,
@@ -62,6 +75,7 @@ pub struct OpenAi {
     hosted_tools: Vec<Value>,
     compaction_endpoint: bool,
     image_input: bool,
+    explicit_prompt_cache: bool,
 }
 
 impl OpenAi {
@@ -114,6 +128,7 @@ impl OpenAi {
             hosted_tools: Vec::new(),
             compaction_endpoint: false,
             image_input: true,
+            explicit_prompt_cache: false,
         })
     }
 
@@ -167,6 +182,11 @@ impl OpenAi {
     #[must_use]
     pub(super) fn without_image_input(mut self) -> Self {
         self.image_input = false;
+        self
+    }
+
+    pub(super) fn with_explicit_prompt_cache(mut self) -> Self {
+        self.explicit_prompt_cache = true;
         self
     }
 
@@ -238,7 +258,11 @@ impl OpenAi {
         let mut body = serde_json::json!({
             "model": self.model,
             "instructions": request.instructions,
-            "input": wire_input(request.input, self.image_input)?,
+            "input": wire_input_with_cache(
+                request.input,
+                self.image_input,
+                self.explicit_prompt_cache,
+            )?,
             "tools": wire_tools(request.tools, &self.hosted_tools, request.allow_hosted_tools),
             "tool_choice": "auto",
             "parallel_tool_calls": true,
@@ -246,6 +270,12 @@ impl OpenAi {
             "store": false,
             "stream": true
         });
+        if let Some(prompt_cache) = request.prompt_cache {
+            body["prompt_cache_key"] = Value::String(prompt_cache.key.into());
+        }
+        if self.explicit_prompt_cache {
+            body["prompt_cache_options"] = serde_json::json!({"mode": "explicit"});
+        }
         if let Some(reasoning) = self.reasoning() {
             body["reasoning"] = reasoning;
         }
@@ -304,11 +334,20 @@ impl OpenAi {
         let mut body = serde_json::json!({
             "model": self.model,
             "instructions": request.instructions,
-            "input": wire_input(request.input, self.image_input)?,
+            "input": wire_input_with_cache(
+                request.input,
+                self.image_input,
+                self.explicit_prompt_cache,
+            )?,
             "tools": wire_tools(request.tools, &self.hosted_tools, true),
             "parallel_tool_calls": true,
-            "prompt_cache_key": request.session_id
         });
+        if let Some(prompt_cache) = request.prompt_cache {
+            body["prompt_cache_key"] = Value::String(prompt_cache.key.into());
+        }
+        if self.explicit_prompt_cache {
+            body["prompt_cache_options"] = serde_json::json!({"mode": "explicit"});
+        }
         if let Some(reasoning) = self.reasoning() {
             body["reasoning"] = reasoning;
         }
@@ -342,6 +381,20 @@ impl Model for OpenAi {
         self.image_input
     }
 
+    fn prompt_cache_capability(&self) -> PromptCacheCapability {
+        if self.explicit_prompt_cache {
+            PromptCacheCapability::Explicit
+        } else {
+            PromptCacheCapability::Implicit
+        }
+    }
+
+    fn pricing(&self) -> Option<ModelPricing> {
+        (self.base_url == DEFAULT_BASE_URL)
+            .then(|| openai_model_pricing(&self.model))
+            .flatten()
+    }
+
     fn respond<'a>(
         &'a self,
         request: ModelRequest<'a>,
@@ -359,7 +412,11 @@ impl Model for OpenAi {
     }
 }
 
-pub(super) fn wire_input(input: &[Value], allow_images: bool) -> Result<Vec<Value>> {
+pub(super) fn wire_input_with_cache(
+    input: &[Value],
+    allow_images: bool,
+    explicit_prompt_cache: bool,
+) -> Result<Vec<Value>> {
     let mut input = input.to_vec();
     for item in &mut input {
         if let Some(fields) = item.as_object_mut() {
@@ -370,6 +427,19 @@ pub(super) fn wire_input(input: &[Value], allow_images: bool) -> Result<Vec<Valu
             continue;
         };
         for part in content {
+            let breakpoint = part
+                .get(PROMPT_CACHE_BREAKPOINT_FIELD)
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Some(fields) = part.as_object_mut() {
+                fields.retain(|name, _| !name.starts_with('_'));
+                if breakpoint && explicit_prompt_cache {
+                    fields.insert(
+                        "prompt_cache_breakpoint".into(),
+                        serde_json::json!({"mode": "explicit"}),
+                    );
+                }
+            }
             if part.get("type").and_then(Value::as_str) != Some("input_image") {
                 continue;
             }

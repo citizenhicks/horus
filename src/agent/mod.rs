@@ -333,6 +333,7 @@ fn validate_identifier(name: &str, value: &str, limit: usize) -> Result<()> {
 pub struct Agent {
     sender: AgentSender,
     events: mpsc::Receiver<JournalEvent>,
+    model_router: Arc<ModelRouter>,
     frontend: FrontendExtensions,
     session: SessionConfiguredEvent,
     model: ModelInfo,
@@ -346,6 +347,12 @@ impl Agent {
     #[must_use]
     pub fn sender(&self) -> AgentSender {
         self.sender.clone()
+    }
+
+    /// Returns the immutable provider router owned by this runtime.
+    #[must_use]
+    pub fn model_router(&self) -> Arc<ModelRouter> {
+        Arc::clone(&self.model_router)
     }
 
     /// Receives the next agent event.

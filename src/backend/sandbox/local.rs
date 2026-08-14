@@ -686,10 +686,14 @@ impl LocalSandbox {
                     read_output(stderr, CommandStream::Stderr, output_sink, output_limit),
                     wait
                 );
+                let stdout = stdout?;
+                let stderr = stderr?;
                 Ok(CommandOutput {
                     exit_code: status?.code().unwrap_or(-1),
-                    stdout: stdout?,
-                    stderr: stderr?,
+                    stdout: stdout.text,
+                    stdout_truncated: stdout.truncated,
+                    stderr: stderr.text,
+                    stderr_truncated: stderr.truncated,
                 })
             };
             let output = match mode {
@@ -991,7 +995,7 @@ async fn read_output(
     stream: CommandStream,
     sink: CommandOutputSink,
     limit: usize,
-) -> Result<String> {
+) -> Result<BoundedOutput> {
     let mut output = Vec::new();
     let mut buffer = [0; 8192];
     let mut truncated = false;
@@ -1009,7 +1013,15 @@ async fn read_output(
     if truncated {
         output.push_str("\n[output truncated]");
     }
-    Ok(output)
+    Ok(BoundedOutput {
+        text: output,
+        truncated,
+    })
+}
+
+struct BoundedOutput {
+    text: String,
+    truncated: bool,
 }
 
 #[cfg(unix)]
@@ -1036,6 +1048,21 @@ fn validate_root(_path: &Path, _directory: &Dir) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_output_reports_when_the_stream_was_truncated() {
+        let output = read_output(
+            &b"abcdef"[..],
+            CommandStream::Stdout,
+            CommandOutputSink::default(),
+            3,
+        )
+        .await
+        .expect("bounded output");
+
+        assert_eq!(output.text, "abc\n[output truncated]");
+        assert!(output.truncated);
+    }
 
     #[tokio::test]
     async fn background_commands_do_not_use_the_foreground_deadline() {

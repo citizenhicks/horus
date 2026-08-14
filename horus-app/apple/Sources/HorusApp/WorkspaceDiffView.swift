@@ -321,7 +321,12 @@ private struct DiffRowView: View {
                 .padding(.trailing, HorusSpace.m)
         }
         .frame(maxWidth: .infinity, minHeight: 23, alignment: .leading)
-        .background(background)
+        .background {
+            ZStack {
+                baseBackground
+                changeHighlight
+            }
+        }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
     }
@@ -334,7 +339,7 @@ private struct DiffRowView: View {
             .frame(width: 30, alignment: .trailing)
             .padding(.trailing, HorusSpace.xs)
             .frame(maxHeight: .infinity)
-            .background(palette.canvas.opacity(0.42))
+            .background(gutterBackground)
             .overlay(alignment: .trailing) {
                 Rectangle().fill(palette.line.opacity(0.6)).frame(width: 0.5)
             }
@@ -358,11 +363,26 @@ private struct DiffRowView: View {
         }
     }
 
-    private var background: Color {
+    private var baseBackground: Color {
         switch row.kind {
         case .addition, .removal, .context: palette.panel
         case .metadata: palette.raised.opacity(0.72)
         case .hunk: .clear
+        }
+    }
+
+    private var changeHighlight: Color {
+        switch row.kind {
+        case .addition: palette.signal.opacity(0.16)
+        case .removal: palette.danger.opacity(0.16)
+        case .context, .metadata, .hunk: .clear
+        }
+    }
+
+    private var gutterBackground: Color {
+        switch row.kind {
+        case .addition, .removal: .clear
+        case .context, .metadata, .hunk: palette.canvas.opacity(0.42)
         }
     }
 

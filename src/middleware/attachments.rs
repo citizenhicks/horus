@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use base64::Engine as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::manifest::MiddlewareManifest;
@@ -14,8 +14,8 @@ use super::tools::{
 use super::{Middleware, ModelContext, PromptSection, RuntimeContext};
 use crate::backend::model::{ToolDefinition, internal_user_message};
 use crate::protocol::{
-    ATTACHMENTS_FIELD, EventMsg, FrontendBlock, FrontendContribution, INTERNAL_MESSAGE_FIELD,
-    SessionFileReference,
+    ATTACHMENT_CONTEXT_MARKER, ATTACHMENTS_FIELD, EventMsg, FrontendBlock, FrontendContribution,
+    INTERNAL_MESSAGE_FIELD, SessionFileReference, internal_message_kind,
 };
 use crate::{BoxFuture, Error, Result};
 
@@ -28,6 +28,16 @@ mod text {
 
 const MAX_TOOL_READ_BYTES: usize = 32 * 1024;
 const MAX_DIRECT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MATERIALIZED_ATTACHMENTS_FIELD: &str = "_horus_attachment_blobs";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaterializedAttachment {
+    reference: SessionFileReference,
+    content_hash: Option<String>,
+    image_media_type: Option<String>,
+    unavailable_reason: Option<String>,
+}
 /// Configuration metadata for protected user uploads.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     id: "attachments",
@@ -93,52 +103,148 @@ impl Middleware for Attachments {
         )
     }
 
+    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let Some((message_index, references)) = referenced_attachments(context.input())?.pop()
+            else {
+                return Ok(());
+            };
+            if materialization_matches(context.input(), message_index, &references)? {
+                return Ok(());
+            }
+            if message_index + 1 != context.input().len() {
+                return Err(Error::Checkpoint(
+                    "attachment-bearing user message is missing adjacent materialization".into(),
+                ));
+            }
+            let mut direct_image_bytes = 0_usize;
+            let mut materialized = Vec::with_capacity(references.len());
+            let mut first_error = None;
+            for reference in references {
+                let content_hash = match self
+                    .store
+                    .upload_content_hash(context.session_id, &reference)
+                    .await
+                {
+                    Ok(content_hash) => content_hash,
+                    Err(error) => {
+                        let reason = error.to_string();
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        materialized.push(MaterializedAttachment {
+                            reference,
+                            content_hash: None,
+                            image_media_type: None,
+                            unavailable_reason: Some(reason),
+                        });
+                        continue;
+                    }
+                };
+                let image_media_type = if reference.media_type.starts_with("image/") {
+                    let result = usize::try_from(reference.size)
+                        .ok()
+                        .and_then(|size| direct_image_bytes.checked_add(size))
+                        .filter(|size| *size <= MAX_DIRECT_IMAGE_BYTES)
+                        .ok_or_else(|| {
+                            Error::Provider(
+                                "image attachments exceed the 8 MiB model-input limit".into(),
+                            )
+                        });
+                    match result {
+                        Ok(next_image_bytes) => {
+                            let bytes = self
+                                .store
+                                .read_content_blob(&content_hash, reference.size)
+                                .await;
+                            match bytes
+                                .and_then(|bytes| raster_media_type(&bytes).map(str::to_string))
+                            {
+                                Ok(media_type) => {
+                                    direct_image_bytes = next_image_bytes;
+                                    Some(media_type)
+                                }
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    if first_error.is_none() {
+                                        first_error = Some(error);
+                                    }
+                                    materialized.push(MaterializedAttachment {
+                                        reference,
+                                        content_hash: Some(content_hash),
+                                        image_media_type: None,
+                                        unavailable_reason: Some(reason),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let reason = error.to_string();
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                            materialized.push(MaterializedAttachment {
+                                reference,
+                                content_hash: Some(content_hash),
+                                image_media_type: None,
+                                unavailable_reason: Some(reason),
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                materialized.push(MaterializedAttachment {
+                    reference,
+                    content_hash: Some(content_hash),
+                    image_media_type,
+                    unavailable_reason: None,
+                });
+            }
+            context.append_model_input(materialization_message(&materialized)?);
+            first_error.map_or(Ok(()), Err)
+        })
+    }
+
     fn decorate_model_request<'a>(
         &'a self,
         context: &'a mut ModelContext<'_>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let attachment_messages = referenced_attachments(context.request_input())?;
-            if attachment_messages.is_empty() {
-                return Ok(());
-            }
-            let mut input = context.request_input().to_vec();
+            let latest_user = context.request_input().iter().rposition(is_real_user);
             let supports_image_input = context.model.supports_image_input(context.provider)?;
-            let latest_user = context.request_input().iter().rposition(|item| {
-                item.get("role").and_then(Value::as_str) == Some("user")
-                    && item.get(INTERNAL_MESSAGE_FIELD).is_none()
-            });
             let mut direct_image_bytes = 0_usize;
-            let mut available = Vec::new();
-            let mut unavailable = Vec::new();
-            for (message_index, attachments) in attachment_messages.into_iter().rev() {
-                let current = Some(message_index) == latest_user;
-                for reference in attachments {
-                    if let Err(error) = self
-                        .store
-                        .verify_upload(context.session_id, &reference)
-                        .await
-                    {
-                        if current {
-                            return Err(error);
-                        }
-                        unavailable.push(reference);
+            let mut input = context.request_input().to_vec();
+            let mut changed = false;
+            for message_index in (0..input.len()).rev() {
+                let Some(materialized) = materialized_attachments(&input[message_index])? else {
+                    continue;
+                };
+                let current = source_user_index(&input, message_index) == latest_user;
+                let mut images = Vec::new();
+                for attachment in materialized {
+                    if attachment.unavailable_reason.is_some() {
                         continue;
                     }
-                    if !reference.media_type.starts_with("image/") {
-                        available.push(reference);
+                    let Some(media_type) = attachment.image_media_type else {
                         continue;
-                    }
+                    };
+                    let content_hash = attachment.content_hash.ok_or_else(|| {
+                        Error::Checkpoint(
+                            "available materialized attachment omitted content hash".into(),
+                        )
+                    })?;
                     if !supports_image_input {
                         if current {
                             return Err(Error::Provider(
                                 "the selected model does not support image input".into(),
                             ));
                         }
-                        unavailable.push(reference);
                         continue;
                     }
-                    let Some(next_image_bytes) = usize::try_from(reference.size)
+                    let Some(next_image_bytes) = usize::try_from(attachment.reference.size)
                         .ok()
                         .and_then(|size| direct_image_bytes.checked_add(size))
                         .filter(|size| *size <= MAX_DIRECT_IMAGE_BYTES)
@@ -148,59 +254,108 @@ impl Middleware for Attachments {
                                 "image attachments exceed the 8 MiB model-input limit".into(),
                             ));
                         }
-                        unavailable.push(reference);
                         continue;
                     };
-                    let bytes = match self
+                    let bytes = self
                         .store
-                        .read_upload_all(context.session_id, &reference)
-                        .await
-                    {
-                        Ok((_, bytes)) => bytes,
-                        Err(error) if current => return Err(error),
-                        Err(_) => {
-                            unavailable.push(reference);
-                            continue;
-                        }
-                    };
-                    let media_type = match raster_media_type(&bytes) {
-                        Ok(media_type) => media_type,
-                        Err(error) if current => return Err(error),
-                        Err(_) => {
-                            unavailable.push(reference);
-                            continue;
-                        }
-                    };
-                    let content = input
-                        .get_mut(message_index)
-                        .and_then(|item| item.get_mut("content"))
-                        .and_then(Value::as_array_mut);
-                    let Some(content) = content else {
-                        if current {
-                            return Err(Error::Checkpoint(
-                                "attachment-bearing user message has invalid content".into(),
-                            ));
-                        }
-                        unavailable.push(reference);
-                        continue;
-                    };
-                    content.push(serde_json::json!({
+                        .read_content_blob(&content_hash, attachment.reference.size)
+                        .await?;
+                    if raster_media_type(&bytes)? != media_type {
+                        return Err(Error::Checkpoint(
+                            "materialized attachment media type changed".into(),
+                        ));
+                    }
+                    images.push(serde_json::json!({
                         "type": "input_image",
                         "media_type": media_type,
                         "data": base64::engine::general_purpose::STANDARD.encode(bytes)
                     }));
                     direct_image_bytes = next_image_bytes;
-                    available.push(reference);
                 }
+                if images.is_empty() {
+                    continue;
+                }
+                let content = input[message_index]
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| {
+                        Error::Checkpoint(
+                            "materialized attachment context has invalid content".into(),
+                        )
+                    })?;
+                content.extend(images);
+                changed = true;
             }
-            input.push(internal_user_message(
-                "attachments",
-                &render_attachment_context(&available, &unavailable),
-            ));
-            context.replace_request_input(input);
+            if changed {
+                context.replace_request_input(input);
+            }
             Ok(())
         })
     }
+}
+
+pub(crate) fn is_attachment_materialization(item: &Value) -> bool {
+    internal_message_kind(item) == Some(ATTACHMENT_CONTEXT_MARKER)
+}
+
+fn is_real_user(item: &Value) -> bool {
+    item.get("role").and_then(Value::as_str) == Some("user")
+        && item.get(INTERNAL_MESSAGE_FIELD).is_none()
+}
+
+fn source_user_index(input: &[Value], materialization_index: usize) -> Option<usize> {
+    input[..materialization_index]
+        .iter()
+        .rposition(is_real_user)
+}
+
+fn materialization_message(attachments: &[MaterializedAttachment]) -> Result<Value> {
+    let available = attachments
+        .iter()
+        .filter(|attachment| attachment.unavailable_reason.is_none())
+        .map(|attachment| attachment.reference.clone())
+        .collect::<Vec<_>>();
+    let unavailable = attachments
+        .iter()
+        .filter(|attachment| attachment.unavailable_reason.is_some())
+        .map(|attachment| attachment.reference.clone())
+        .collect::<Vec<_>>();
+    let mut message = internal_user_message(
+        ATTACHMENT_CONTEXT_MARKER,
+        &render_attachment_context(&available, &unavailable),
+    );
+    message[MATERIALIZED_ATTACHMENTS_FIELD] = serde_json::to_value(attachments)?;
+    Ok(message)
+}
+
+fn materialized_attachments(item: &Value) -> Result<Option<Vec<MaterializedAttachment>>> {
+    if !is_attachment_materialization(item) {
+        return Ok(None);
+    }
+    let value = item.get(MATERIALIZED_ATTACHMENTS_FIELD).ok_or_else(|| {
+        Error::Checkpoint("materialized attachment context omitted blob metadata".into())
+    })?;
+    let attachments = serde_json::from_value(value.clone()).map_err(|error| {
+        Error::Checkpoint(format!("invalid materialized attachment context: {error}"))
+    })?;
+    Ok(Some(attachments))
+}
+
+fn materialization_matches(
+    input: &[Value],
+    user_index: usize,
+    references: &[SessionFileReference],
+) -> Result<bool> {
+    let Some(item) = input.get(user_index + 1) else {
+        return Ok(false);
+    };
+    let Some(materialized) = materialized_attachments(item)? else {
+        return Ok(false);
+    };
+    Ok(materialized
+        .iter()
+        .map(|attachment| &attachment.reference)
+        .eq(references))
 }
 
 fn raster_media_type(bytes: &[u8]) -> Result<&'static str> {

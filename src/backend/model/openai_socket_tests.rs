@@ -1,4 +1,5 @@
 use super::*;
+use crate::backend::model::PromptCacheIdentity;
 use crate::backend::model::STREAM_RETRY_LIMIT;
 use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
@@ -7,6 +8,10 @@ use tokio_tungstenite::connect_async;
 fn model_request() -> ModelRequest<'static> {
     ModelRequest {
         session_id: "test-session",
+        prompt_cache: Some(PromptCacheIdentity {
+            key: "hashed-cache-key",
+            context_epoch: 1,
+        }),
         instructions: "Test instructions",
         input: &[],
         tools: &[],
@@ -247,21 +252,41 @@ fn continuation_sends_only_new_items_and_resets_on_rewrite() {
             response_id: "resp-1".into(),
             known_items: known.len(),
             fingerprint: fingerprint(known.iter()).expect("fingerprint"),
+            envelope_fingerprint: envelope_fingerprint("test-model", &model_request(), None, &[])
+                .expect("envelope fingerprint"),
         }),
         use_http: false,
         last_used_at: Instant::now(),
     };
     let mut continued = known.clone();
     continued.push(serde_json::json!({"type": "function_call_output"}));
-    let (response, input) = continuation_input(&mut state, &continued).expect("continue");
+    let envelope = envelope_fingerprint("test-model", &model_request(), None, &[])
+        .expect("envelope fingerprint");
+    let (response, input) = continuation_input(&mut state, &continued, envelope).expect("continue");
     assert_eq!(response.as_deref(), Some("resp-1"));
     assert_eq!(
         input,
         &[serde_json::json!({"type": "function_call_output"})]
     );
 
+    let changed_envelope = envelope_fingerprint(
+        "test-model",
+        &ModelRequest {
+            instructions: "Changed instructions",
+            ..model_request()
+        },
+        None,
+        &[],
+    )
+    .expect("changed envelope fingerprint");
+    let (response, input) =
+        continuation_input(&mut state, &continued, changed_envelope).expect("envelope reset");
+    assert_eq!(response, None);
+    assert_eq!(input, continued);
+    assert!(state.continuation.is_none());
+
     let rewritten = vec![serde_json::json!({"type": "compaction"})];
-    let (response, input) = continuation_input(&mut state, &rewritten).expect("reset");
+    let (response, input) = continuation_input(&mut state, &rewritten, envelope).expect("reset");
     assert_eq!(response, None);
     assert_eq!(input, rewritten);
     assert!(state.continuation.is_none());
@@ -270,8 +295,10 @@ fn continuation_sends_only_new_items_and_resets_on_rewrite() {
         response_id: "resp-2".into(),
         known_items: known.len(),
         fingerprint: fingerprint(known.iter()).expect("fingerprint"),
+        envelope_fingerprint: envelope,
     });
-    let (response, input) = response_input(&mut state, &known, false).expect("stateless request");
+    let (response, input) =
+        response_input(&mut state, &known, false, envelope).expect("stateless request");
     assert_eq!(response, None);
     assert_eq!(input, known);
     assert!(state.continuation.is_none());
@@ -1006,6 +1033,10 @@ async fn previous_response_not_found_rebuilds_full_context_on_the_same_connectio
         .send_response(
             ModelRequest {
                 session_id: "test-session",
+                prompt_cache: Some(PromptCacheIdentity {
+                    key: "hashed-cache-key",
+                    context_epoch: 1,
+                }),
                 instructions: "Test instructions",
                 input: &initial_input,
                 tools: &[],
@@ -1024,6 +1055,10 @@ async fn previous_response_not_found_rebuilds_full_context_on_the_same_connectio
         .send_response(
             ModelRequest {
                 session_id: "test-session",
+                prompt_cache: Some(PromptCacheIdentity {
+                    key: "hashed-cache-key",
+                    context_epoch: 1,
+                }),
                 instructions: "Test instructions",
                 input: &input,
                 tools: &[],
@@ -1122,6 +1157,10 @@ async fn native_compaction_reuses_the_websocket_with_a_v2_trigger() {
         .send_response(
             ModelRequest {
                 session_id: "test-session",
+                prompt_cache: Some(PromptCacheIdentity {
+                    key: "hashed-cache-key",
+                    context_epoch: 1,
+                }),
                 instructions: "Test instructions",
                 input: &initial_input,
                 tools: &[],
@@ -1138,6 +1177,10 @@ async fn native_compaction_reuses_the_websocket_with_a_v2_trigger() {
     let compacted = provider
         .compact(CompactRequest {
             session_id: "test-session",
+            prompt_cache: Some(PromptCacheIdentity {
+                key: "hashed-cache-key",
+                context_epoch: 1,
+            }),
             instructions: "Test instructions",
             input: &input,
             tools: &[],
@@ -1227,6 +1270,10 @@ async fn native_compaction_retries_an_interrupted_websocket() {
     let compacted = provider
         .compact(CompactRequest {
             session_id: "test-session",
+            prompt_cache: Some(PromptCacheIdentity {
+                key: "hashed-cache-key",
+                context_epoch: 1,
+            }),
             instructions: "Test instructions",
             input: &input,
             tools: &[],
@@ -1361,6 +1408,10 @@ async fn upgrade_required_switches_only_that_session_to_sticky_http() {
         .send_response(
             ModelRequest {
                 session_id: "fallback-session",
+                prompt_cache: Some(PromptCacheIdentity {
+                    key: "hashed-fallback-session",
+                    context_epoch: 1,
+                }),
                 instructions: "Test instructions",
                 input: &input,
                 tools: &[],
@@ -1382,6 +1433,10 @@ async fn upgrade_required_switches_only_that_session_to_sticky_http() {
         .send_response(
             ModelRequest {
                 session_id: "fallback-session",
+                prompt_cache: Some(PromptCacheIdentity {
+                    key: "hashed-fallback-session",
+                    context_epoch: 1,
+                }),
                 instructions: "Test instructions",
                 input: &continued_input,
                 tools: &[],
@@ -1401,6 +1456,10 @@ async fn upgrade_required_switches_only_that_session_to_sticky_http() {
         .send_response(
             ModelRequest {
                 session_id: "fallback-session",
+                prompt_cache: Some(PromptCacheIdentity {
+                    key: "hashed-fallback-session",
+                    context_epoch: 1,
+                }),
                 instructions: "Test instructions",
                 input: &continued_input,
                 tools: &[],
@@ -1415,6 +1474,10 @@ async fn upgrade_required_switches_only_that_session_to_sticky_http() {
         .send_response(
             ModelRequest {
                 session_id: "fallback-session",
+                prompt_cache: Some(PromptCacheIdentity {
+                    key: "hashed-fallback-session",
+                    context_epoch: 1,
+                }),
                 instructions: "Test instructions",
                 input: &continued_input,
                 tools: &[],
@@ -1428,6 +1491,10 @@ async fn upgrade_required_switches_only_that_session_to_sticky_http() {
     let compacted = provider
         .compact(CompactRequest {
             session_id: "fallback-session",
+            prompt_cache: Some(PromptCacheIdentity {
+                key: "hashed-fallback-session",
+                context_epoch: 1,
+            }),
             instructions: "Test instructions",
             input: &continued_input,
             tools: &[],
@@ -1438,6 +1505,10 @@ async fn upgrade_required_switches_only_that_session_to_sticky_http() {
         .send_response(
             ModelRequest {
                 session_id: "fallback-session",
+                prompt_cache: Some(PromptCacheIdentity {
+                    key: "hashed-fallback-session",
+                    context_epoch: 1,
+                }),
                 instructions: "Test instructions",
                 input: &continued_input,
                 tools: &[],

@@ -1,6 +1,6 @@
 # Horus for iPhone and iPad
 
-One SwiftUI client target builds for iOS and iPadOS 26+. Both device families use the same `AppModel`, `GatewayClient`, pairing flow, and versioned Horus gateway protocol. The next TestFlight release is version 0.7.33 (build 95).
+One SwiftUI client target builds for iOS and iPadOS 26+. Both device families use the same `AppModel`, `GatewayClient`, pairing flow, and versioned Horus gateway protocol. The next TestFlight release is version 0.8.0 (build 104).
 
 Open `HorusApp.xcodeproj` and run the shared `HorusApp` scheme on an iPhone or iPad destination. Command-line builds use:
 

@@ -1206,13 +1206,14 @@ async fn handle_message(
                 Err(rejection) => return write_rejection(writer, request_id, rejection).await,
             };
             match host.workspace_files(scope).await {
-                Ok(files) => {
+                Ok(catalog) => {
                     write_frame(
                         writer,
                         &ServerFrame::new(ServerMessage::WorkspaceFiles {
                             request_id,
                             session_id,
-                            files,
+                            files: catalog.files,
+                            truncated: catalog.truncated,
                         }),
                     )
                     .await

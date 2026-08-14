@@ -1187,6 +1187,7 @@ fn completed_model_step_is_authoritative_for_replay_and_summary_events() {
                     },
                 ],
             },
+            diagnostics: None,
         }),
         Vec::new(),
     );
@@ -1255,6 +1256,7 @@ fn retrying_model_step_closes_pending_search_and_marks_the_reconnect() {
         started_at_ms: 1,
         completed_at_ms: 2,
         outcome: ModelStepOutcome::Retrying,
+        diagnostics: None,
     });
     state.handle_agent_event(retry.clone(), retry.presentation().into_iter().collect());
 
@@ -1310,6 +1312,7 @@ fn failed_model_step_clears_pending_blocks_without_an_end_event() {
         started_at_ms: 1,
         completed_at_ms: 2,
         outcome: ModelStepOutcome::Failed,
+        diagnostics: None,
     });
     state.handle_agent_event(failed.clone(), failed.presentation().into_iter().collect());
 
@@ -1360,6 +1363,7 @@ fn completed_model_step_does_not_duplicate_live_streams() {
                     annotations: Vec::new(),
                 }],
             },
+            diagnostics: None,
         }),
         Vec::new(),
     );

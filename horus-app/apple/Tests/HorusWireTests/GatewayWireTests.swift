@@ -51,7 +51,7 @@ final class GatewayWireTests: XCTestCase {
     }
 
     private var sessionReadyPayloadJSON: String {
-        #"{"latest_sequence":7,"next_before_sequence":2,"workspace":{"id":"workspace-1","path":"/srv/horus"},"git":{"current_branch":"main","branches":["feature","main"]},"session":{"session_id":"chat-1","context":{"workspace_id":"workspace-1"},"model":{"route":"openai_socket/gpt-5.6-sol","model":"gpt-5.6-sol","reasoning_effort":"high","model_context_window":200000}},"contributions":[{"capability":"subagents","accepts_file_attachments":false,"count":2,"commands":[],"widgets":[{"id":"subagents","slot":"composer_footer","text":"Subagents","tone":"neutral","symbol":"agent","icon_only":true,"progress":null,"content":{"type":"picker","title":"Subagents","options":[{"label":"reviewer","description":"running","detail":"gpt-5.6-sol","symbol":"agent","shows_detail":false,"op":{"type":"capability_command","capability":"subagents","command":"subagents","arguments":"reviewer","input":null,"target":null}}]},"action":null}],"references":[],"active_input":null}],"widgets":[],"tool_count":7,"run_stats":\#(runStatsJSON),"config":\#(configJSON)}"#
+        #"{"latest_sequence":7,"next_before_sequence":2,"workspace":{"id":"workspace-1","path":"/srv/horus"},"git":{"current_branch":"main","branches":["feature","main"]},"session":{"session_id":"chat-1","context":{"workspace_id":"workspace-1"},"model":{"route":"openai_socket/gpt-5.6-sol","model":"gpt-5.6-sol","reasoning_effort":"high","model_context_window":200000}},"contributions":[{"capability":"subagents","accepts_file_attachments":false,"count":2,"commands":[],"widgets":[{"id":"subagents","slot":"composer_footer","text":"Subagents","tone":"neutral","symbol":"agent","icon_only":true,"progress":null,"content":{"type":"picker","title":"Subagents","options":[{"label":"reviewer","description":"running","detail":"gpt-5.6-sol","symbol":"agent","shows_detail":false,"op":{"type":"capability_command","capability":"subagents","command":"subagents","arguments":"reviewer","input":null,"target":null}}]},"action":null}],"references":[],"active_input":null}],"widgets":[],"tool_count":7,"compaction_count":2,"run_stats":\#(runStatsJSON),"config":\#(configJSON)}"#
     }
 
     private var composition: AgentComposition {
@@ -488,6 +488,7 @@ final class GatewayWireTests: XCTestCase {
         XCTAssertEqual(requestID, "open-1")
         XCTAssertEqual(payload.latestSequence, 7)
         XCTAssertEqual(payload.nextBeforeSequence, 2)
+        XCTAssertEqual(payload.compactionCount, 2)
         XCTAssertEqual(payload.workspace.path, "/srv/horus")
         XCTAssertEqual(payload.git?.currentBranch, "main")
         XCTAssertEqual(payload.git?.branches, ["feature", "main"])
@@ -559,6 +560,14 @@ final class GatewayWireTests: XCTestCase {
         )
         XCTAssertThrowsError(try decodeEnvelope(
             #"{"version":27,"type":"session_opened","request_id":"open-1","payload":\#(payloadWithoutToolCount)}"#
+        ))
+
+        let payloadWithoutCompactionCount = sessionReadyPayloadJSON.replacingOccurrences(
+            of: #","compaction_count":2"#,
+            with: ""
+        )
+        XCTAssertThrowsError(try decodeEnvelope(
+            #"{"version":27,"type":"session_opened","request_id":"open-1","payload":\#(payloadWithoutCompactionCount)}"#
         ))
 
         let payloadWithoutContributionCount = sessionReadyPayloadJSON.replacingOccurrences(
@@ -1035,11 +1044,18 @@ final class GatewayWireTests: XCTestCase {
     }
 
     func testWorkspaceViewerResponsesMatchV27() throws {
-        let files = try decodeEnvelope(#"{"version":27,"type":"workspace_files","request_id":"files-1","session_id":"chat-1","files":[{"path":"Sources/App.swift","size":3}]}"#)
-        guard case .workspaceFiles(_, _, let records) = files else {
+        let files = try decodeEnvelope(#"{"version":27,"type":"workspace_files","request_id":"files-1","session_id":"chat-1","files":[{"path":"Sources/App.swift","size":3}],"truncated":true}"#)
+        guard case .workspaceFiles(_, _, let records, let truncated) = files else {
             return XCTFail("Expected workspace files")
         }
         XCTAssertEqual(records.first, WorkspaceFileRecord(path: "Sources/App.swift", size: 3))
+        XCTAssertTrue(truncated)
+
+        let complete = try decodeEnvelope(#"{"version":27,"type":"workspace_files","request_id":"files-2","session_id":"chat-1","files":[{"path":"Sources/App.swift","size":3}]}"#)
+        guard case .workspaceFiles(_, _, _, let completeTruncated) = complete else {
+            return XCTFail("Expected complete workspace files")
+        }
+        XCTAssertFalse(completeTruncated)
 
         let chunk = try decodeEnvelope(#"{"version":27,"type":"workspace_file_chunk","request_id":"read-1","session_id":"chat-1","path":"Sources/App.swift","offset":0,"data":"AQID","next_offset":null}"#)
         guard case .workspaceFileChunk(_, _, let path, let offset, let data, let nextOffset) = chunk else {

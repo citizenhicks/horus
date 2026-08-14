@@ -349,7 +349,9 @@ mod tests {
                 Ok(CommandOutput {
                     exit_code: 7,
                     stdout: "first".into(),
+                    stdout_truncated: false,
                     stderr: "last".into(),
+                    stderr_truncated: false,
                 })
             })
         }

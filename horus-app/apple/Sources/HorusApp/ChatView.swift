@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import MarkdownView
+import CoreText
 @preconcurrency import AVFoundation
 import UIKit
 
@@ -13,11 +14,14 @@ extension MountedWidget {
 
 struct ChatView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var composerHeight: CGFloat = 0
     @State private var isAtBottom = true
     @State private var scrollToBottomRequest = 0
     @State private var presentedWidget: MountedWidget?
     @State private var showsChatAgentSettings = false
+    @State private var hasEntered = false
+    @State private var transcriptPresentationID = UUID()
 
     var body: some View {
         @Bindable var model = model
@@ -27,7 +31,7 @@ struct ChatView: View {
                 isAtBottom: $isAtBottom,
                 scrollToBottomRequest: scrollToBottomRequest
             )
-            .id(model.selectedSessionID)
+            .id(transcriptPresentationID)
             ComposerView()
                 .onGeometryChange(for: CGFloat.self) { geometry in
                     geometry.size.height
@@ -46,7 +50,20 @@ struct ChatView: View {
                 .zIndex(2)
             }
         }
-        .onChange(of: model.selectedSessionID) { isAtBottom = true }
+        .scaleEffect(hasEntered || reduceMotion ? 1 : 0.985)
+        .opacity(hasEntered ? 1 : 0)
+        .onAppear {
+            // SwiftUI can retain a navigation destination after it is popped. Give every
+            // presentation a fresh scroll state even when the same session is reopened.
+            transcriptPresentationID = UUID()
+            withAnimation(reduceMotion ? .easeOut(duration: 0.12) : .smooth(duration: 0.28)) {
+                hasEntered = true
+            }
+        }
+        .onChange(of: model.selectedSessionID) {
+            transcriptPresentationID = UUID()
+            isAtBottom = true
+        }
         .navigationTitle(chatTitle)
         .toolbarTitleDisplayMode(.inline)
         .toolbar {
@@ -204,7 +221,7 @@ private struct ChatOptionsMenu: View {
                 }
                 .disabled(!model.canStartCronSetup)
                 Button {
-                    model.openWorkspaceBrowser()
+                    model.openNewSession()
                 } label: {
                     HorusLabel(
                         title: "New chat in another folder…",
@@ -230,7 +247,9 @@ private struct ChatOptionsMenu: View {
                 }
             }
         } label: {
-            HorusIcon(.dotsThree)
+            HorusIcon(.dotsThree, foreground: .primary)
+                .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
+                .contentShape(Rectangle())
         }
         .labelStyle(.titleAndIcon)
         .menuIndicator(.hidden)
@@ -262,11 +281,12 @@ struct TranscriptRowsView: View {
     var activeStepID: TranscriptPresentationID?
     var collapsesLongMessages = false
     var rowSpacing: CGFloat = 12
+    var onExpandActivityGroup: () -> Void = {}
 
     var body: some View {
         ForEach(Array(projection.rows.enumerated()), id: \.element.id) { index, row in
             let isVisible = !hasAppeared || visibleRowIDs.contains(row.id)
-            self.row(row)
+            VStack(alignment: .leading, spacing: 0) { self.row(row) }
                 .id(row.id)
                 .padding(.top, index == 0 ? 0 : rowSpacing)
                 // The scroll view owns movement; rows only fade in.
@@ -290,14 +310,14 @@ struct TranscriptRowsView: View {
             EventGroupView(
                 entries: row.records,
                 isActive: row.records.contains { $0.presentationID == activeStepID },
-                waiting: projection.waiting.phrase(forRow: row.id)
+                waiting: projection.waiting.phrase(forRow: row.id),
+                onExpand: onExpandActivityGroup
             )
         case .user, .narrative:
             if let entry = row.records.first {
                 TranscriptRow(
                     entry: entry,
                     isUser: row.kind == .user,
-                    sizing: row.sizing,
                     collapsesLongMessages: collapsesLongMessages
                 )
             }
@@ -355,9 +375,10 @@ private struct TranscriptView: View {
     let bottomInset: CGFloat
     @Binding var isAtBottom: Bool
     let scrollToBottomRequest: Int
-    // A restored transcript lands after the scroll view exists, so an initial-offset anchor
-    // resolves against empty content. A bottom-edge scroll position survives the late fill.
+    // A restored transcript can land after the scroll view exists. The bottom-edge position
+    // survives that late fill, while ChatView supplies a fresh identity for each presentation.
     @State private var position = ScrollPosition(edge: .bottom)
+    @State private var historyBoundaryID: TranscriptPresentationID?
     @State private var historyAnchorID: TranscriptPresentationID?
     @State private var scrollMode = TranscriptScrollMode.followingTail
     @State private var waitingSince: Date?
@@ -391,7 +412,8 @@ private struct TranscriptView: View {
                 TranscriptRowsView(
                     projection: projection,
                     activeStepID: model.activeTranscriptStepID,
-                    rowSpacing: rowSpacing
+                    rowSpacing: rowSpacing,
+                    onExpandActivityGroup: { scrollMode = .freeScrolling }
                 )
                 TranscriptTailView(slot: projection.waiting, topSpacing: rowSpacing)
                 ForEach(model.transcriptTailWidgets) { widget in
@@ -411,13 +433,14 @@ private struct TranscriptView: View {
         // its backdrop the same way, which is why only the chat showed the cut.
         .background(HorusBackdrop())
         .scrollPosition($position)
+        .defaultScrollAnchor(.bottom, for: .initialOffset)
         // The one automatic mechanism, and only while parked at the end. Off, growth lands
         // below the fold and the reader keeps their place.
         .defaultScrollAnchor(
             scrollMode.followsContentGrowth ? .bottom : nil,
             for: .sizeChanges
         )
-        // Match the row reveal so the bottom-anchor correction no longer lands a frame first.
+        // Match the row fade so the bottom-anchor correction no longer lands a frame first.
         .animation(
             reduceMotion || !scrollMode.followsContentGrowth ? nil : .easeOut(duration: 0.5),
             value: projection.structuralRevision
@@ -425,6 +448,10 @@ private struct TranscriptView: View {
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(.interactively)
         .refreshable { loadEarlierHistory() }
+        .onAppear {
+            scrollMode = .followingTail
+            position.scrollTo(edge: .bottom)
+        }
         .overlay {
             if model.displayedTranscript.isEmpty {
                 emptyState
@@ -438,7 +465,7 @@ private struct TranscriptView: View {
         // The reader's own intent, and the only thing that takes the transcript out of
         // following. A drag ends the follow; coming to rest at the end restores it.
         .onScrollPhaseChange { _, phase, context in
-            guard scrollMode != .restoringHistory else { return }
+            guard scrollMode != .restoringHistory, phase != .animating else { return }
             scrollMode = phase == .idle && Self.atBottom(context.geometry)
                 ? .followingTail
                 : .freeScrolling
@@ -447,11 +474,16 @@ private struct TranscriptView: View {
             withAnimation(.easeOut(duration: 0.2)) { position.scrollTo(edge: .bottom) }
         }
         .onChange(of: model.displayedTranscript.first?.presentationID) { previous, _ in
-            guard let historyAnchorID, historyAnchorID == previous else { return }
+            guard let historyBoundaryID, historyBoundaryID == previous else { return }
             restoreHistoryAnchor()
         }
         .onChange(of: model.historyLoadCompletionRevision) { restoreHistoryAnchor() }
-        .onChange(of: model.selectedSessionID) { historyAnchorID = nil }
+        .onChange(of: model.selectedSessionID) {
+            historyBoundaryID = nil
+            historyAnchorID = nil
+            scrollMode = .followingTail
+            position = ScrollPosition(edge: .bottom)
+        }
         .onChange(of: model.isWaitingForModel, initial: true) { _, waiting in
             rescheduleWaitingPhrase(waiting)
         }
@@ -463,7 +495,7 @@ private struct TranscriptView: View {
 
     private var projection: TranscriptProjection {
         model.transcriptProjection(
-            breakBefore: historyAnchorID,
+            breakBefore: historyBoundaryID,
             waitingPhrase: waitingPhrase
         )
     }
@@ -492,7 +524,8 @@ private struct TranscriptView: View {
 
     private func loadEarlierHistory() {
         guard model.canLoadEarlierHistory else { return }
-        historyAnchorID = model.displayedTranscript.first?.presentationID
+        historyAnchorID = projection.rows.first?.id
+        historyBoundaryID = model.displayedTranscript.first?.presentationID
         scrollMode = .restoringHistory
         model.loadEarlierHistory()
     }
@@ -542,19 +575,27 @@ private struct TranscriptRow: View {
     /// Activity never reaches this view: a run is a group row, whatever its length. The
     /// projection sends only what the reader wrote and what the agent said back.
     let isUser: Bool
-    let sizing: TranscriptRowSizing
     var collapsesLongMessages = false
 
+    @ViewBuilder
     var body: some View {
+        if isUser {
+            rowContent
+                .contentShape(Rectangle())
+                .contextMenu { transcriptActions }
+        } else {
+            rowContent
+        }
+    }
+
+    private var rowContent: some View {
         VStack(alignment: isUser ? .trailing : .leading, spacing: 0) {
             content
             // The reader's own message carries its actions in the context menu; the agent's
-            // carries them under the text, where they are always available.
-            if !isUser { controls }
+            // final answer carries them under the text, where they are always available.
+            if entry.kind == .assistant { controls }
         }
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
-        .contentShape(Rectangle())
-        .contextMenu { transcriptActions }
     }
 
     @ViewBuilder
@@ -581,13 +622,6 @@ private struct TranscriptRow: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            // Commentary and a final message can both land whole rather than stream, and text
-            // that appears all at once is what this smooths over.
-            .horusStreamingReveal(
-                count: entry.text.count,
-                active: sizing == .revealedIntrinsic,
-                live: model.isLiveTranscriptEntry(entry)
-            )
         }
     }
 
@@ -936,22 +970,27 @@ private struct EventGroupView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// One line, whatever it says. A count climbing from 1 to 47, an icon swapping, the
     /// waiting phrase taking the summary's place: none of it changes the row's height.
-    /// Scaled rather than fixed, because `.footnote` grows with Dynamic Type and a hard 30pt
+    /// Scaled rather than fixed, because `.body` grows with Dynamic Type and a hard 30pt
     /// clips it at accessibility sizes.
-    @ScaledMetric(relativeTo: .footnote) private var summaryHeight = HorusStyle.rowRegular
+    @ScaledMetric(relativeTo: .body) private var summaryHeight = HorusStyle.rowRegular
     @State private var isExpanded = false
     let entries: [TranscriptEntry]
     let isActive: Bool
     /// The gap between two steps belongs to this row: rather than growing the transcript by a
     /// line that then has to disappear again, the summary hands its slot to the waiting line.
     var waiting: TranscriptWaitingPhrase?
+    var onExpand: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: HorusSpace.s) {
             // Files an event produced are the deliverable, not a detail, so they stay out.
             TranscriptFileCards(files: files)
-            if !lines.isEmpty {
+            // The summary slot belongs to the run, not to its contents: while the run holds
+            // the waiting phrase it draws the slot whether or not any step has named itself,
+            // so naming one costs a crossfade rather than a row's worth of height.
+            if !lines.isEmpty || waiting != nil {
                 Button {
+                    if !isExpanded { onExpand() }
                     withAnimation(.easeOut(duration: 0.16)) { isExpanded.toggle() }
                 } label: {
                     header
@@ -987,7 +1026,7 @@ private struct EventGroupView: View {
                     TranscriptWaitingPhraseText(phrase: waiting)
                 } else {
                     Text(TranscriptEntry.summary(for: lines))
-                        .font(HorusStyle.metadataFont)
+                        .font(HorusStyle.bodyFont)
                         .foregroundStyle(palette.muted)
                         .lineLimit(1)
                         // The count climbs every time a step joins the run; morphing the digit
@@ -1094,7 +1133,7 @@ private struct TranscriptWaitingPhraseText: View {
         TimelineView(.periodic(from: phrase.startedAt, by: TranscriptWaitingNote.rotation)) { context in
             let elapsed = reduceMotion ? 0 : context.date.timeIntervalSince(phrase.startedAt)
             Text(TranscriptWaitingNote.message(in: phrase.order, elapsed: elapsed))
-                .font(HorusStyle.metadataFont)
+                .font(HorusStyle.bodyFont)
                 .foregroundStyle(palette.muted)
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -1117,9 +1156,9 @@ private struct TranscriptWaitingPhraseText: View {
 private struct TranscriptTailView: View {
     @Environment(\.horusPalette) private var palette
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    /// `.footnote` scales with Dynamic Type, so a hard 30pt clips the line at accessibility
+    /// `.body` scales with Dynamic Type, so a hard 30pt clips the line at accessibility
     /// sizes. The summary slot and this line share the metric and stay the same height.
-    @ScaledMetric(relativeTo: .footnote) private var lineHeight = HorusStyle.rowRegular
+    @ScaledMetric(relativeTo: .body) private var lineHeight = HorusStyle.rowRegular
     let slot: TranscriptWaitingSlot
     /// Owned rather than applied by the transcript: padding outside the condition reserves
     /// the gap while the line is absent, and the arriving row then lands 12pt low.
@@ -1176,7 +1215,7 @@ private struct EventLine: View {
                     InlineUnifiedDiffView(source: entry.text)
                 } else if !entry.eventDetail.isEmpty {
                     Text(entry.eventDetail)
-                        .font(HorusStyle.metadataFont)
+                        .font(HorusStyle.bodyFont)
                         .foregroundStyle(palette.muted)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1217,7 +1256,7 @@ private struct EventLine: View {
                 HorusIcon(.caretUpDown, size: HorusStyle.glyphMark, foreground: palette.muted)
             }
         }
-        .font(HorusStyle.metadataFont)
+        .font(HorusStyle.bodyFont)
         .frame(minHeight: HorusStyle.rowCompact)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
@@ -1283,7 +1322,6 @@ private struct HorusMarkdownText: View, Equatable {
 
     var body: some View {
         StreamingMarkdown(text: normalizedText, streaming: streaming)
-            .markdownFontGroup(HorusMarkdownFonts())
             .markdownMathRenderingEnabled()
             .markdownTableStyle(.github)
             .markdownBlockQuoteStyle(.github)
@@ -1303,7 +1341,10 @@ private struct HorusMarkdownText: View, Equatable {
 }
 
 private struct StreamingMarkdown: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.fontResolutionContext) private var fontResolutionContext
     @State private var source: StreamingMarkdownSource
+    @State private var showsRevealRenderer: Bool
     let text: String
     let streaming: Bool
 
@@ -1311,15 +1352,40 @@ private struct StreamingMarkdown: View {
         self.text = text
         self.streaming = streaming
         _source = State(initialValue: StreamingMarkdownSource(text))
+        _showsRevealRenderer = State(initialValue: streaming)
     }
 
     var body: some View {
         StreamingMarkdownReader(source) { parseResult in
-            MarkdownView(parseResult)
+            // Keep the final selectable renderer in layout throughout: swapping renderers
+            // after the reveal changes the row's intrinsic height by a fraction of a line.
+            MarkdownText(parseResult)
+                .opacity(showsRevealRenderer ? 0 : 1)
+                .allowsHitTesting(!showsRevealRenderer)
+                .accessibilityHidden(showsRevealRenderer)
+                .overlay(alignment: .topLeading) {
+                    if showsRevealRenderer {
+                        MarkdownView(parseResult)
+                            .horusStreamingReveal(count: text.count)
+                    }
+                }
         }
+        .markdownFontGroup(HorusMarkdownFonts(context: fontResolutionContext))
         .onChange(of: update, initial: true) { _, update in
             source.text = update.text
             if !update.streaming { source.finishStreaming() }
+        }
+        .task(id: streaming) {
+            if streaming {
+                showsRevealRenderer = true
+                return
+            }
+            guard showsRevealRenderer else { return }
+            if !reduceMotion {
+                do { try await Task.sleep(for: .seconds(1)) }
+                catch { return }
+            }
+            showsRevealRenderer = false
         }
     }
 
@@ -1334,15 +1400,21 @@ private struct StreamingMarkdownUpdate: Equatable {
 }
 
 private struct HorusMarkdownFonts: MarkdownFontGroup {
-    var h1: any CustomCTFontConvertible { Font.title3.weight(.semibold) }
-    var h2: any CustomCTFontConvertible { Font.headline }
-    var h3: any CustomCTFontConvertible { Font.subheadline.weight(.semibold) }
-    var body: any CustomCTFontConvertible { HorusStyle.bodyFont }
-    var blockQuote: any CustomCTFontConvertible { HorusStyle.bodyFont }
-    var codeBlock: any CustomCTFontConvertible { Font.footnote.monospaced() }
-    var tableBody: any CustomCTFontConvertible { HorusStyle.bodyFont }
-    var inlineMath: any CustomCTFontConvertible { HorusStyle.bodyFont }
-    var displayMath: any CustomCTFontConvertible { HorusStyle.bodyFont }
+    let context: Font.Context
+
+    var h1: any CustomCTFontConvertible { resolve(Font.title3.weight(.semibold)) }
+    var h2: any CustomCTFontConvertible { resolve(Font.headline) }
+    var h3: any CustomCTFontConvertible { resolve(Font.subheadline.weight(.semibold)) }
+    var body: any CustomCTFontConvertible { resolve(HorusStyle.bodyFont) }
+    var blockQuote: any CustomCTFontConvertible { resolve(HorusStyle.bodyFont) }
+    var codeBlock: any CustomCTFontConvertible { resolve(Font.footnote.monospaced()) }
+    var tableBody: any CustomCTFontConvertible { resolve(HorusStyle.bodyFont) }
+    var inlineMath: any CustomCTFontConvertible { resolve(HorusStyle.bodyFont) }
+    var displayMath: any CustomCTFontConvertible { resolve(HorusStyle.bodyFont) }
+
+    private func resolve(_ font: Font) -> CTFont {
+        font.resolve(in: context).ctFont
+    }
 }
 
 struct ComposerView: View {
@@ -1687,6 +1759,10 @@ private struct SessionStatsBadge: View {
                         BadgeStat(
                             label: "Context",
                             value: "\(model.contextTokens.formatted()) · \(model.contextFillPercent)%"
+                        )
+                        BadgeStat(
+                            label: "Compactions",
+                            value: model.sessionCompactionCount.formatted()
                         )
                         BadgeStat(label: "Elapsed", value: formatDuration(elapsed))
                         BadgeStat(label: "Runs", value: model.sessionRunCount.formatted())

@@ -1,6 +1,7 @@
 use serde_json::json;
 
 use super::*;
+use crate::backend::model::PromptCacheIdentity;
 use crate::backend::model::user_message;
 
 #[test]
@@ -48,6 +49,10 @@ fn responses_history_becomes_kimi_messages_and_tools() {
     }];
     let request = ModelRequest {
         session_id: "session-7",
+        prompt_cache: Some(PromptCacheIdentity {
+            key: "hashed-session-7",
+            context_epoch: 0,
+        }),
         instructions: "Be precise.",
         input: &input,
         tools: &tools,
@@ -59,7 +64,7 @@ fn responses_history_becomes_kimi_messages_and_tools() {
 
     assert_eq!(body["model"], "kimi-k3");
     assert_eq!(body["reasoning_effort"], "high");
-    assert_eq!(body["prompt_cache_key"], "session-7");
+    assert_eq!(body["prompt_cache_key"], "hashed-session-7");
     assert_eq!(body["stream_options"], json!({"include_usage": true}));
     assert_eq!(body["parallel_tool_calls"], true);
     assert_eq!(

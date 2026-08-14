@@ -13,6 +13,7 @@ use crate::Error;
 use crate::Result;
 use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::CheckpointStore;
+use crate::backend::checkpoint::ContextRewriteReason;
 use crate::backend::checkpoint::MAX_QUEUED_INPUTS;
 use crate::backend::checkpoint::QueuedInput as DurableQueuedInput;
 use crate::backend::model::ModelOutput;
@@ -297,6 +298,9 @@ pub struct ModelContext<'a> {
     pub(crate) request_input: &'a mut Vec<Value>,
     pub(crate) durable_input: &'a mut Vec<Value>,
     pub(crate) transcript_delta: &'a mut Vec<Value>,
+    pub(crate) context_epoch: &'a mut u64,
+    pub(crate) compaction_count: &'a mut u64,
+    pub(crate) rewrite_reasons: &'a mut Vec<ContextRewriteReason>,
     pub queued_input: QueuedInputQueue<'a>,
     pub last_usage: Option<&'a TokenUsage>,
     pub tools: &'a Catalog,
@@ -319,11 +323,24 @@ impl ModelContext<'_> {
         self.request_input
     }
 
-    /// Replaces model context without adding synthetic history to the transcript.
-    pub fn replace_input(&mut self, input: Vec<Value>) {
+    /// Replaces active model context and advances its rewrite epoch once per boundary.
+    pub fn rewrite_input(&mut self, reason: ContextRewriteReason, input: Vec<Value>) -> Result<()> {
+        if *self.durable_input == input {
+            return Ok(());
+        }
+        if self.rewrite_reasons.is_empty() {
+            *self.context_epoch = self
+                .context_epoch
+                .checked_add(1)
+                .ok_or_else(|| Error::Checkpoint("context rewrite epoch overflow".into()))?;
+        }
+        if !self.rewrite_reasons.contains(&reason) {
+            self.rewrite_reasons.push(reason);
+        }
         self.durable_input.clone_from(&input);
         *self.request_input = input;
         *self.checkpoint_changed = true;
+        Ok(())
     }
 
     /// Replaces only the input sent by the next model request.
@@ -334,6 +351,13 @@ impl ModelContext<'_> {
     /// Appends a durable replay item without adding it to provider context.
     pub(crate) fn record_transcript_item(&mut self, item: Value) {
         self.transcript_delta.push(item);
+        *self.checkpoint_changed = true;
+    }
+
+    /// Appends durable provider context without adding synthetic replay history.
+    pub fn append_model_input(&mut self, item: Value) {
+        self.request_input.push(item.clone());
+        self.durable_input.push(item);
         *self.checkpoint_changed = true;
     }
 
@@ -567,6 +591,14 @@ pub trait Middleware: Send + Sync {
     /// Contributes one immutable system-prompt section while the agent is created.
     fn prompt_section(&self, _runtime: &RuntimeContext) -> Result<Option<PromptSection>> {
         Ok(None)
+    }
+
+    /// Seeds provider context for a newly created session before initialization.
+    fn seed_session<'a>(
+        &'a self,
+        _runtime: &'a RuntimeContext,
+    ) -> BoxFuture<'a, Result<Vec<Value>>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     /// Declares commands and status data that any frontend may render.
@@ -803,6 +835,14 @@ impl MiddlewareStack {
             prompt.push_str(body);
         }
         Ok(prompt)
+    }
+
+    pub(crate) async fn seed_session(&self, runtime: &RuntimeContext) -> Result<Vec<Value>> {
+        let mut input = Vec::new();
+        for entry in &self.entries {
+            input.extend(entry.seed_session(runtime).await?);
+        }
+        Ok(input)
     }
 
     /// Builds and validates the frontend-neutral capability catalog.

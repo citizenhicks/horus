@@ -1078,12 +1078,12 @@ async fn attachment_hydration_runs_after_native_compaction_replaces_context() {
 }
 
 #[tokio::test]
-async fn text_attachments_do_not_require_image_input_support() {
+async fn video_attachments_do_not_require_image_input_support() {
     let workspace = TempDir::new().expect("create workspace");
-    let session_id = "text-attachment";
+    let session_id = "video-attachment";
     let store = SessionFileStore::new(workspace.path());
     let attachment =
-        upload_attachment(&store, session_id, "notes.txt", "text/plain", b"hello").await;
+        upload_attachment(&store, session_id, "clip.mov", "video/quicktime", b"video").await;
     let model = Arc::new(ScriptedModel::new(vec![text_response("done")]));
     let config = test_config(
         workspace.path(),
@@ -1107,6 +1107,68 @@ async fn text_attachments_do_not_require_image_input_support() {
     let input = serde_json::to_string(&requests[0].input).expect("serialize request");
     assert!(input.contains("User-attached files available"));
     assert!(input.contains(&attachment.id));
+}
+
+#[tokio::test]
+async fn materialized_image_keeps_an_exact_prefix_on_later_turns() {
+    let workspace = TempDir::new().expect("create workspace");
+    let session_id = "stable-image-prefix";
+    let store = SessionFileStore::new(workspace.path());
+    let attachment = upload_attachment(
+        &store,
+        session_id,
+        "photo.png",
+        "image/png",
+        b"\x89PNG\r\n\x1a\n",
+    )
+    .await;
+    let model = Arc::new(
+        ScriptedModel::new(vec![text_response("first"), text_response("second")])
+            .with_image_input(),
+    );
+    let config = test_config(
+        workspace.path(),
+        Arc::clone(&model),
+        vec![Arc::new(Attachments::new(store))],
+    )
+    .session_id(session_id);
+    let mut agent = create_agent(config).await.expect("create agent");
+
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "inspect".into(),
+            attachments: vec![attachment],
+        })
+        .expect("submit image turn");
+    assert_eq!(final_message(&mut agent).await, "first");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "continue".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit later turn");
+    assert_eq!(final_message(&mut agent).await, "second");
+
+    let requests = model.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(request_image_count(&requests[0].input), 1);
+    assert_eq!(request_image_count(&requests[1].input), 1);
+    assert_eq!(
+        requests[1].input[..requests[0].input.len()],
+        requests[0].input
+    );
+    assert_eq!(
+        requests[1]
+            .input
+            .iter()
+            .filter(
+                |item| item.get("_horus_internal").and_then(Value::as_str) == Some("attachments")
+            )
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

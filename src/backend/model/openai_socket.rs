@@ -37,7 +37,9 @@ use super::Model;
 use super::ModelEventSink;
 use super::ModelInfo;
 use super::ModelOutput;
+use super::ModelPricing;
 use super::ModelRequest;
+use super::PromptCacheCapability;
 use super::openai::OpenAi;
 use super::openai::attach_stream_output;
 use super::openai::collect_stream_output;
@@ -46,7 +48,7 @@ use super::openai::emit_reasoning_event;
 use super::openai::emit_text_event;
 use super::openai::emit_web_event;
 use super::openai::response_error;
-use super::openai::wire_input;
+use super::openai::wire_input_with_cache;
 use super::openai::wire_tools;
 use super::openai_auth::ApiKeyAuthorization;
 use super::openai_auth::OpenAiAuthorization;
@@ -106,6 +108,7 @@ struct Continuation {
     response_id: String,
     known_items: usize,
     fingerprint: u64,
+    envelope_fingerprint: u64,
 }
 
 enum Exchange {
@@ -173,7 +176,8 @@ impl OpenAiSocket {
         client: reqwest::Client,
     ) -> Result<Self> {
         let model = model.into();
-        let http = OpenAi::with_authorization(Arc::clone(&auth), http_url, model.clone(), client)?;
+        let http = OpenAi::with_authorization(Arc::clone(&auth), http_url, model.clone(), client)?
+            .with_explicit_prompt_cache();
         Ok(Self {
             auth,
             socket_url: socket_url.into(),
@@ -268,8 +272,18 @@ impl OpenAiSocket {
                     }
                 }
             };
-            let (previous_response_id, input) =
-                response_input(&mut state, request.input, request.allow_continuation)?;
+            let envelope_fingerprint = envelope_fingerprint(
+                &self.model,
+                &request,
+                self.reasoning_effort.as_deref(),
+                &self.hosted_tools,
+            )?;
+            let (previous_response_id, input) = response_input(
+                &mut state,
+                request.input,
+                request.allow_continuation,
+                envelope_fingerprint,
+            )?;
             let used_previous_response = previous_response_id.is_some();
             let body = response_body(
                 &self.model,
@@ -296,6 +310,7 @@ impl OpenAiSocket {
                             fingerprint: fingerprint(
                                 request.input.iter().chain(output.output().iter()),
                             )?,
+                            envelope_fingerprint,
                         })
                     } else {
                         None
@@ -361,6 +376,7 @@ impl OpenAiSocket {
                 .send_response(
                     ModelRequest {
                         session_id: request.session_id,
+                        prompt_cache: request.prompt_cache,
                         instructions: request.instructions,
                         input: &input,
                         tools: request.tools,
@@ -489,9 +505,10 @@ fn response_input<'a>(
     state: &mut SocketState,
     input: &'a [Value],
     allow_continuation: bool,
+    envelope_fingerprint: u64,
 ) -> Result<(Option<String>, &'a [Value])> {
     if allow_continuation {
-        continuation_input(state, input)
+        continuation_input(state, input, envelope_fingerprint)
     } else {
         state.continuation = None;
         Ok((None, input))
@@ -508,6 +525,14 @@ impl Model for OpenAiSocket {
 
     fn supports_image_input(&self) -> bool {
         true
+    }
+
+    fn prompt_cache_capability(&self) -> PromptCacheCapability {
+        PromptCacheCapability::Explicit
+    }
+
+    fn pricing(&self) -> Option<ModelPricing> {
+        self.http.pricing()
     }
 
     fn respond<'a>(
@@ -804,14 +829,17 @@ fn response_body(
         "type": "response.create",
         "model": model,
         "instructions": request.instructions,
-        "input": wire_input(input, true)?,
+        "input": wire_input_with_cache(input, true, true)?,
         "tools": wire_tools(request.tools, hosted_tools, request.allow_hosted_tools),
         "tool_choice": "auto",
         "parallel_tool_calls": true,
         "include": ["reasoning.encrypted_content"],
-        "prompt_cache_key": request.session_id,
         "store": false
     });
+    if let Some(prompt_cache) = request.prompt_cache {
+        body["prompt_cache_key"] = Value::String(prompt_cache.key.into());
+    }
+    body["prompt_cache_options"] = serde_json::json!({"mode": "explicit"});
     if let Some(response_id) = previous_response_id {
         body["previous_response_id"] = Value::String(response_id.into());
     }
@@ -821,14 +849,38 @@ fn response_body(
     Ok(body)
 }
 
+fn envelope_fingerprint(
+    model: &str,
+    request: &ModelRequest<'_>,
+    reasoning_effort: Option<&str>,
+    hosted_tools: &[Value],
+) -> Result<u64> {
+    let envelope = serde_json::json!({
+        "model": model,
+        "instructions": request.instructions,
+        "tools": wire_tools(request.tools, hosted_tools, request.allow_hosted_tools),
+        "reasoning_effort": reasoning_effort,
+        "prompt_cache": request.prompt_cache.map(|cache| {
+            serde_json::json!({
+                "key": cache.key,
+                "context_epoch": cache.context_epoch,
+                "mode": "explicit"
+            })
+        })
+    });
+    fingerprint(std::iter::once(&envelope))
+}
+
 fn continuation_input<'a>(
     state: &mut SocketState,
     input: &'a [Value],
+    envelope_fingerprint: u64,
 ) -> Result<(Option<String>, &'a [Value])> {
     let Some(continuation) = &state.continuation else {
         return Ok((None, input));
     };
-    if continuation.known_items <= input.len()
+    if continuation.envelope_fingerprint == envelope_fingerprint
+        && continuation.known_items <= input.len()
         && fingerprint(input[..continuation.known_items].iter())? == continuation.fingerprint
     {
         return Ok((

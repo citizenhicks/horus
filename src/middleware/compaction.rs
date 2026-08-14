@@ -5,17 +5,23 @@ use std::sync::Arc;
 use super::Middleware;
 use super::ModelContext;
 use super::approximate_item_tokens;
+use super::attachments::is_attachment_materialization;
 use super::manifest::{MiddlewareManifest, MiddlewareSettingManifest};
+use super::scratchpad::is_projection_item;
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
+use crate::backend::checkpoint::ContextRewriteReason;
 use crate::backend::model::CompactOutput;
 use crate::backend::model::CompactRequest;
 use crate::backend::model::ModelRequest;
+use crate::backend::model::PromptCacheIdentity;
 use crate::backend::model::internal_user_message;
+use crate::backend::model::prompt_cache_key;
+use crate::backend::model::reset_prompt_cache_breakpoint;
 use crate::backend::model::tool_complete_boundaries;
 use crate::backend::model::user_message;
 use crate::protocol::CONTEXT_COMPACTED_MARKER;
@@ -131,12 +137,17 @@ impl Middleware for Compaction {
             }
             let output = if context.model.compaction_endpoint(context.provider)? {
                 let tools = context.tools.definitions();
+                let cache_key = prompt_cache_key(context.session_id);
                 context
                     .model
                     .compact(
                         context.provider,
                         CompactRequest {
                             session_id: context.session_id,
+                            prompt_cache: Some(PromptCacheIdentity {
+                                key: &cache_key,
+                                context_epoch: *context.context_epoch,
+                            }),
                             instructions: context.instructions,
                             input: context.input(),
                             tools: &tools,
@@ -153,8 +164,15 @@ impl Middleware for Compaction {
             }
             let active_user = latest_real_user(context.input());
             let mut compacted = retain_native_context(context.input(), output.output);
+            compacted.retain(|item| !is_projection_item(item));
             restore_user_private_fields(&mut compacted, active_user);
-            context.replace_input(compacted);
+            reset_prompt_cache_breakpoint(&mut compacted);
+            context.rewrite_input(ContextRewriteReason::Compaction, compacted)?;
+            *context.compaction_count = context
+                .compaction_count
+                .checked_add(1)
+                .ok_or_else(|| Error::Checkpoint("compaction count overflow".into()))?;
+            *context.checkpoint_changed = true;
             context.record_transcript_item(internal_user_message(CONTEXT_COMPACTED_MARKER, ""));
             context.usage.push(output.usage);
             context.events.push(EventMsg::ContextCompacted);
@@ -170,25 +188,45 @@ fn retain_native_context(input: &[Value], mut compacted: Vec<Value>) -> Vec<Valu
         return compacted;
     }
     let cut = recent_cut(input, NATIVE_RETAINED_TOKENS).unwrap_or(0);
-    let mut retained = input[cut..]
-        .iter()
-        .filter(|item| {
-            !is_internal_message(item) && item.get("role").and_then(Value::as_str) == Some("user")
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let recent = &input[cut..];
+    let mut retained = Vec::new();
+    for (index, item) in recent.iter().enumerate() {
+        if !is_internal_message(item) && item.get("role").and_then(Value::as_str) == Some("user") {
+            retained.push(item.clone());
+            if let Some(materialization) = recent.get(index + 1)
+                && is_attachment_materialization(materialization)
+            {
+                retained.push(materialization.clone());
+            }
+        }
+    }
     retained.append(&mut compacted);
     retained
 }
 
-fn latest_real_user(input: &[Value]) -> Option<&Value> {
-    input.iter().rfind(|item| {
+struct ActiveUser<'a> {
+    item: &'a Value,
+    materialization: Option<&'a Value>,
+}
+
+fn latest_real_user(input: &[Value]) -> Option<ActiveUser<'_>> {
+    let index = input.iter().rposition(|item| {
         item.get("role").and_then(Value::as_str) == Some("user") && !is_internal_message(item)
+    })?;
+    Some(ActiveUser {
+        item: &input[index],
+        materialization: input
+            .get(index + 1)
+            .filter(|item| is_attachment_materialization(item)),
     })
 }
 
-fn restore_user_private_fields(compacted: &mut Vec<Value>, user: Option<&Value>) {
-    let Some(user) = user else {
+fn restore_user_private_fields(compacted: &mut Vec<Value>, active_user: Option<ActiveUser<'_>>) {
+    let Some(ActiveUser {
+        item: user,
+        materialization,
+    }) = active_user
+    else {
         return;
     };
     let Some(fields) = user.as_object() else {
@@ -199,28 +237,48 @@ fn restore_user_private_fields(compacted: &mut Vec<Value>, user: Option<&Value>)
         .filter(|(name, _)| name.starts_with('_'))
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<Vec<_>>();
-    if private.is_empty() {
+    if private.is_empty() && materialization.is_none() {
         return;
     }
-    let retained = compacted.iter_mut().rfind(|item| {
+    let retained_index = compacted.iter().rposition(|item| {
         !is_internal_message(item)
             && item.get("role") == user.get("role")
             && item.get("content") == user.get("content")
     });
-    let Some(retained) = retained else {
+    let user_index = if let Some(index) = retained_index {
+        if let Some(fields) = compacted[index].as_object_mut() {
+            fields.extend(private);
+        }
+        index
+    } else {
         compacted.push(user.clone());
+        compacted.len() - 1
+    };
+    restore_attachment_materialization(compacted, user_index, materialization);
+}
+
+fn restore_attachment_materialization(
+    compacted: &mut Vec<Value>,
+    user_index: usize,
+    materialization: Option<&Value>,
+) {
+    let Some(materialization) = materialization else {
         return;
     };
-    let Some(fields) = retained.as_object_mut() else {
-        return;
-    };
-    fields.extend(private);
+    match compacted.get(user_index + 1) {
+        Some(retained) if retained == materialization => {}
+        Some(retained) if is_attachment_materialization(retained) => {
+            compacted[user_index + 1] = materialization.clone();
+        }
+        Some(_) | None => compacted.insert(user_index + 1, materialization.clone()),
+    }
 }
 
 async fn summarize(context: &ModelContext<'_>) -> Result<CompactOutput> {
     let (prompt, recent) = prepare_summary(context.input())
         .ok_or_else(|| Error::Provider("context has no safe history boundary to compact".into()))?;
     let session_id = Uuid::new_v4().to_string();
+    let cache_key = prompt_cache_key(&session_id);
     let input = [user_message(&prompt)];
     let output = context
         .model
@@ -228,6 +286,10 @@ async fn summarize(context: &ModelContext<'_>) -> Result<CompactOutput> {
             context.provider,
             ModelRequest {
                 session_id: &session_id,
+                prompt_cache: Some(PromptCacheIdentity {
+                    key: &cache_key,
+                    context_epoch: *context.context_epoch,
+                }),
                 instructions: text::PROMPT_SUMMARY_SYSTEM,
                 input: &input,
                 tools: &[],
@@ -289,6 +351,9 @@ fn safe_boundaries(input: &[Value]) -> Vec<usize> {
 }
 
 fn safe_start(item: &Value) -> bool {
+    if is_attachment_materialization(item) {
+        return false;
+    }
     match item.get("type").and_then(Value::as_str) {
         Some("function_call") => true,
         Some("message") | None => matches!(
@@ -467,7 +532,13 @@ mod tests {
             serde_json::json!({"type": "compaction", "encrypted_content": "opaque"}),
         ];
 
-        restore_user_private_fields(&mut compacted, Some(&user));
+        restore_user_private_fields(
+            &mut compacted,
+            Some(ActiveUser {
+                item: &user,
+                materialization: None,
+            }),
+        );
 
         assert_eq!(compacted.len(), 2);
         assert_eq!(compacted[0]["id"], "message-1");
@@ -508,6 +579,29 @@ mod tests {
         assert_eq!(compacted.len(), 2);
         assert_eq!(compacted[0], input[1]);
         assert_eq!(compacted[1]["type"], "compaction");
+    }
+
+    #[test]
+    fn compaction_restores_an_omitted_attachment_materialization_with_its_user() {
+        let user = serde_json::json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": "inspect"}],
+            "_horus_attachments": [{"id": "upload-1"}]
+        });
+        let materialization = internal_user_message(
+            crate::protocol::ATTACHMENT_CONTEXT_MARKER,
+            "attachment context",
+        );
+        let input = vec![user.clone(), materialization.clone()];
+        let compaction = serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "opaque"
+        });
+        let mut compacted = vec![compaction.clone()];
+
+        restore_user_private_fields(&mut compacted, latest_real_user(&input));
+
+        assert_eq!(compacted, vec![compaction, user, materialization]);
     }
 
     #[test]

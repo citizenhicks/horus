@@ -21,7 +21,7 @@ use crate::protocol::TokenUsage;
 
 pub mod sqlite;
 
-pub(crate) const CHECKPOINT_VERSION: u32 = 5;
+pub(crate) const CHECKPOINT_VERSION: u32 = 6;
 pub(crate) const MAX_QUEUED_INPUTS: usize = 1_024;
 const MAX_QUEUED_OWNER_BYTES: usize = 256;
 const MAX_QUEUED_ID_BYTES: usize = 4 * 1024;
@@ -82,6 +82,32 @@ pub struct ExecutionStats {
     pub failed_tool_calls: u64,
     pub elapsed_ms: u64,
     pub usage: TokenUsage,
+}
+
+/// One intentional replacement of active model history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextRewriteReason {
+    ContextOffloading,
+    Compaction,
+    Scratchpad,
+}
+
+impl ContextRewriteReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextOffloading => "context_offloading",
+            Self::Compaction => "compaction",
+            Self::Scratchpad => "scratchpad",
+        }
+    }
+}
+
+/// The latest deliberate active-context rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextRewrite {
+    pub epoch: u64,
+    pub reasons: Vec<ContextRewriteReason>,
 }
 
 impl ExecutionStats {
@@ -206,6 +232,9 @@ pub struct Checkpoint {
     pub model_route: Option<String>,
     pub sequence: u64,
     pub context: Vec<Value>,
+    pub context_epoch: u64,
+    pub compaction_count: u64,
+    pub last_context_rewrite: Option<ContextRewrite>,
     pub total_usage: TokenUsage,
     pub last_usage: Option<TokenUsage>,
     pub pending_input: Vec<QueuedInput>,
@@ -230,6 +259,9 @@ impl Checkpoint {
             model_route: None,
             sequence: 0,
             context: Vec::new(),
+            context_epoch: 0,
+            compaction_count: 0,
+            last_context_rewrite: None,
             total_usage: TokenUsage::default(),
             last_usage: None,
             pending_input: Vec::new(),

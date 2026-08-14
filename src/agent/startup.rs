@@ -184,6 +184,11 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             )
         }),
     };
+    if is_new {
+        state
+            .context
+            .extend(config.middleware.seed_session(&runtime).await?);
+    }
     let system_prompt: Arc<str> = config
         .middleware
         .system_prompt(&config.system_prompt, &runtime)?
@@ -216,6 +221,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
                 started_at_ms: step.started_at_ms,
                 completed_at_ms: unix_timestamp_ms()?.max(step.started_at_ms),
                 outcome: ModelStepOutcome::Interrupted,
+                diagnostics: None,
             }),
         });
     }
@@ -339,6 +345,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         .initialize(runtime, &state.pending_input)
         .await?;
     event_tx.flush().await?;
+    let model_router = Arc::clone(&config.model);
     let mut runner = Runner {
         config,
         system_prompt,
@@ -372,6 +379,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             commands: command_tx,
         },
         events: event_rx,
+        model_router,
         frontend,
         session,
         model,

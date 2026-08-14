@@ -1,9 +1,14 @@
 use super::*;
+use crate::backend::model::PromptCacheIdentity;
 use crate::backend::model::REPLAY_REASONING_FIELD;
 
 fn model_request() -> ModelRequest<'static> {
     ModelRequest {
         session_id: "test-session",
+        prompt_cache: Some(PromptCacheIdentity {
+            key: "hashed-cache-key",
+            context_epoch: 3,
+        }),
         instructions: "Test instructions",
         input: &[],
         tools: &[],
@@ -21,6 +26,27 @@ fn base_url_rejects_serializable_secret_locations() {
     ] {
         assert!(OpenAi::new("test-key", url, "test-model").is_err());
     }
+}
+
+#[test]
+fn only_the_first_party_endpoint_reports_known_gpt_56_pricing() {
+    let usage = TokenUsage {
+        input_tokens: 100_000,
+        total_tokens: 100_000,
+        ..TokenUsage::default()
+    };
+    let official = OpenAi::new("test-key", "https://api.openai.com/v1", "gpt-5.6-luna")
+        .expect("official provider");
+    let compatible = OpenAi::new("test-key", "https://example.com/v1", "gpt-5.6-luna")
+        .expect("compatible provider");
+
+    assert_eq!(
+        official
+            .pricing()
+            .and_then(|pricing| pricing.estimate_microusd(&usage)),
+        Some(20_000)
+    );
+    assert_eq!(compatible.pricing(), None);
 }
 
 #[test]
@@ -120,7 +146,7 @@ fn responses_input_strips_only_top_level_provider_metadata() {
     ];
 
     assert_eq!(
-        wire_input(&input, true).expect("wire input"),
+        wire_input_with_cache(&input, true, false).expect("wire input"),
         vec![
             serde_json::json!({
                 "type": "function_call",
@@ -148,6 +174,71 @@ fn responses_input_strips_only_top_level_provider_metadata() {
                 "status": "completed"
             }),
         ]
+    );
+}
+
+#[test]
+fn compatible_responses_are_implicit_while_first_party_breakpoints_are_explicit() {
+    let input = [serde_json::json!({
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": "stable prefix",
+            "_horus_prompt_cache_breakpoint": true
+        }]
+    })];
+    let request = ModelRequest {
+        session_id: "local-session",
+        prompt_cache: Some(PromptCacheIdentity {
+            key: "opaque-cache-key",
+            context_epoch: 4,
+        }),
+        instructions: "Instructions",
+        input: &input,
+        tools: &[],
+        allow_hosted_tools: false,
+        allow_continuation: true,
+    };
+
+    let compatible = OpenAi::new("test-key", "https://example.com/v1", "test-model")
+        .expect("compatible provider");
+    let compatible_body = compatible.response_body(request).expect("compatible body");
+    assert_eq!(compatible_body["prompt_cache_key"], "opaque-cache-key");
+    assert!(compatible_body.get("prompt_cache_options").is_none());
+    assert_eq!(
+        compatible_body["input"][0]["content"][0],
+        serde_json::json!({"type": "input_text", "text": "stable prefix"})
+    );
+
+    let request = ModelRequest {
+        session_id: "local-session",
+        prompt_cache: Some(PromptCacheIdentity {
+            key: "opaque-cache-key",
+            context_epoch: 4,
+        }),
+        instructions: "Instructions",
+        input: &input,
+        tools: &[],
+        allow_hosted_tools: false,
+        allow_continuation: true,
+    };
+    let first_party = OpenAi::new("test-key", "https://api.openai.com/v1", "test-model")
+        .expect("first-party provider")
+        .with_explicit_prompt_cache();
+    let first_party_body = first_party
+        .response_body(request)
+        .expect("first-party body");
+    assert_eq!(
+        first_party_body["prompt_cache_options"],
+        serde_json::json!({"mode": "explicit"})
+    );
+    assert_eq!(
+        first_party_body["input"][0]["content"][0],
+        serde_json::json!({
+            "type": "input_text",
+            "text": "stable prefix",
+            "prompt_cache_breakpoint": {"mode": "explicit"}
+        })
     );
 }
 
@@ -224,7 +315,7 @@ fn responses_converts_neutral_images_and_rejects_them_when_disabled() {
         ]
     })];
 
-    let wired = wire_input(&input, true).expect("wire image");
+    let wired = wire_input_with_cache(&input, true, false).expect("wire image");
     assert_eq!(
         wired[0]["content"][1],
         serde_json::json!({
@@ -233,7 +324,7 @@ fn responses_converts_neutral_images_and_rejects_them_when_disabled() {
         })
     );
     assert!(
-        wire_input(&input, false)
+        wire_input_with_cache(&input, false, false)
             .expect_err("disabled image input")
             .to_string()
             .contains("does not support image attachments")
@@ -596,6 +687,10 @@ fn compaction_shape_matches_the_responses_contract() {
         .with_compaction_endpoint()
         .compact_body(CompactRequest {
             session_id: "test-session",
+            prompt_cache: Some(PromptCacheIdentity {
+                key: "hashed-cache-key",
+                context_epoch: 3,
+            }),
             instructions: "Compact the conversation",
             input: &input,
             tools: &tools,
@@ -619,7 +714,7 @@ fn compaction_shape_matches_the_responses_contract() {
                 {"type": "web_search"}
             ],
             "parallel_tool_calls": true,
-            "prompt_cache_key": "test-session",
+            "prompt_cache_key": "hashed-cache-key",
             "reasoning": {"effort": "medium", "summary": "auto"}
         })
     );

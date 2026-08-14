@@ -2,4 +2,5 @@
 /.horus
 .env
 xcuserdata/
+/horus-app/apple/DerivedData*/
 *.profraw

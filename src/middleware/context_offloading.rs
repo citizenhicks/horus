@@ -4,6 +4,8 @@ use serde_json::Value;
 
 use super::manifest::{MiddlewareManifest, MiddlewareSettingManifest};
 use super::{Middleware, ModelContext, approximate_item_tokens};
+use crate::backend::checkpoint::ContextRewriteReason;
+use crate::backend::model::tool_complete_boundaries;
 use crate::protocol::{TOOL_ERROR_FIELD, is_internal_message};
 use crate::{BoxFuture, Error, Result};
 
@@ -15,6 +17,10 @@ mod text {
 }
 
 const MASKED_TOOL_OUTPUT: &str = "[offloaded]";
+
+fn high_water_tokens(stale_after_tokens: usize) -> usize {
+    stale_after_tokens.saturating_add((stale_after_tokens / 2).max(1))
+}
 
 const _: () = {
     assert!(text::DEFAULTS_STALE_AFTER_TOKENS >= 1);
@@ -69,7 +75,7 @@ impl Middleware for ContextOffloading {
     fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             if let Some(input) = mask_stale_outputs(context.input(), self.stale_after_tokens) {
-                context.replace_input(input);
+                context.rewrite_input(ContextRewriteReason::ContextOffloading, input)?;
             }
             Ok(())
         })
@@ -80,27 +86,34 @@ fn mask_stale_outputs(input: &[Value], stale_after_tokens: usize) -> Option<Vec<
     let latest_user = input.iter().rposition(|item| {
         item.get("role").and_then(Value::as_str) == Some("user") && !is_internal_message(item)
     })?;
-    let mut newer_tokens = 0;
-    let mut stale = Vec::new();
-
-    for (index, item) in input.iter().enumerate().rev() {
-        if index < latest_user
-            && newer_tokens >= stale_after_tokens
-            && successful_tool_output(item).is_some_and(|output| output != MASKED_TOOL_OUTPUT)
-        {
-            stale.push(index);
-        }
-        newer_tokens = newer_tokens.saturating_add(approximate_item_tokens(item));
-    }
-
-    if stale.is_empty() {
+    let total_tokens = input
+        .iter()
+        .map(approximate_item_tokens)
+        .fold(0, usize::saturating_add);
+    if total_tokens <= high_water_tokens(stale_after_tokens) {
         return None;
     }
-    let mut masked = input.to_vec();
-    for index in stale {
-        masked[index]["output"] = Value::String(MASKED_TOOL_OUTPUT.into());
+
+    let mut suffix_tokens = vec![0_usize; input.len() + 1];
+    for index in (0..input.len()).rev() {
+        suffix_tokens[index] =
+            suffix_tokens[index + 1].saturating_add(approximate_item_tokens(&input[index]));
     }
-    Some(masked)
+    let boundaries = tool_complete_boundaries(&input[..latest_user]);
+    let block_end = boundaries
+        .iter()
+        .copied()
+        .find(|&boundary| suffix_tokens[boundary] <= stale_after_tokens)
+        .or_else(|| boundaries.last().copied())?;
+    let mut masked = input.to_vec();
+    let mut changed = false;
+    for item in &mut masked[..block_end] {
+        if successful_tool_output(item).is_some() {
+            item["output"] = Value::String(MASKED_TOOL_OUTPUT.into());
+            changed = true;
+        }
+    }
+    changed.then_some(masked)
 }
 
 fn successful_tool_output(item: &Value) -> Option<&str> {
@@ -109,7 +122,9 @@ fn successful_tool_output(item: &Value) -> Option<&str> {
     {
         return None;
     }
-    item.get("output").and_then(Value::as_str)
+    item.get("output")
+        .and_then(Value::as_str)
+        .filter(|output| *output != MASKED_TOOL_OUTPUT)
 }
 
 #[cfg(test)]
@@ -118,65 +133,111 @@ mod tests {
     use crate::backend::model::{tool_output, user_message};
 
     #[test]
-    fn masks_only_stale_successful_outputs_before_the_latest_user() {
-        let stale_output = "stale".repeat(100);
-        let failed_output = "failed".repeat(100);
-        let recent_output = "recent".repeat(100);
-        let active_output = "active".repeat(100);
+    fn masks_parallel_calls_as_one_complete_block() {
         let input = vec![
             user_message("old turn"),
             serde_json::json!({
-                "type": "function_call",
-                "call_id": "stale",
-                "name": "read",
-                "arguments": "{}"
+                "type": "function_call", "call_id": "a", "name": "read", "arguments": "{}"
             }),
-            tool_output("stale", &stale_output, false),
             serde_json::json!({
-                "type": "function_call",
-                "call_id": "failed",
-                "name": "read",
-                "arguments": "{}"
+                "type": "function_call", "call_id": "b", "name": "read", "arguments": "{}"
             }),
-            tool_output("failed", &failed_output, true),
-            serde_json::json!({"role": "assistant", "content": "padding".repeat(200)}),
-            serde_json::json!({
-                "type": "function_call",
-                "call_id": "recent",
-                "name": "read",
-                "arguments": "{}"
-            }),
-            tool_output("recent", &recent_output, false),
+            tool_output("a", &"a".repeat(100), false),
+            tool_output("b", &"b".repeat(100), false),
             user_message("latest turn"),
+        ];
+
+        let masked = mask_stale_outputs(&input, 10).expect("stale parallel block");
+
+        assert_eq!(masked[1], input[1]);
+        assert_eq!(masked[2], input[2]);
+        assert_eq!(masked[3]["output"], MASKED_TOOL_OUTPUT);
+        assert_eq!(masked[4]["output"], MASKED_TOOL_OUTPUT);
+    }
+
+    #[test]
+    fn preserves_failed_outputs_and_waits_for_safe_boundary() {
+        let incomplete = vec![
+            user_message("old turn"),
             serde_json::json!({
                 "type": "function_call",
-                "call_id": "active",
+                "call_id": "open",
                 "name": "read",
                 "arguments": "{}"
             }),
-            tool_output("active", &active_output, false),
+            user_message("latest turn"),
         ];
-        let latest_user = input
-            .iter()
-            .rposition(|item| item.get("role").and_then(Value::as_str) == Some("user"))
-            .expect("latest user");
-        let recent_age = input[latest_user..]
+        assert!(mask_stale_outputs(&incomplete, 1).is_none());
+
+        let input = vec![
+            user_message("old turn"),
+            serde_json::json!({
+                "type": "function_call", "call_id": "failed", "name": "read", "arguments": "{}"
+            }),
+            tool_output("failed", &"failed".repeat(100), true),
+            serde_json::json!({
+                "type": "function_call", "call_id": "stale", "name": "read", "arguments": "{}"
+            }),
+            tool_output("stale", &"stale".repeat(100), false),
+            user_message("latest turn"),
+        ];
+
+        let masked = mask_stale_outputs(&input, 10).expect("stale complete block");
+
+        assert_eq!(masked[2], input[2]);
+        assert_eq!(masked[4]["output"], MASKED_TOOL_OUTPUT);
+    }
+
+    #[test]
+    fn uses_high_water_trigger_and_low_water_retention() {
+        let low_input = vec![
+            user_message("old turn"),
+            serde_json::json!({
+                "type": "function_call", "call_id": "stale", "name": "read", "arguments": "{}"
+            }),
+            tool_output("stale", "stale", false),
+            user_message("latest turn"),
+        ];
+        let low = low_input
             .iter()
             .map(approximate_item_tokens)
-            .sum::<usize>();
+            .sum::<usize>()
+            .saturating_sub(1);
+        assert!(low_input.iter().map(approximate_item_tokens).sum::<usize>() > low);
+        assert!(
+            low_input.iter().map(approximate_item_tokens).sum::<usize>() <= high_water_tokens(low)
+        );
+        assert!(mask_stale_outputs(&low_input, low).is_none());
 
-        let masked = mask_stale_outputs(&input, recent_age + 10).expect("stale output");
-
+        let mut over_high = vec![
+            user_message("old turn"),
+            serde_json::json!({
+                "type": "function_call", "call_id": "stale", "name": "read", "arguments": "{}"
+            }),
+            tool_output("stale", &"stale".repeat(20), false),
+            serde_json::json!({"role": "assistant", "content": "padding".repeat(20)}),
+            user_message("latest turn"),
+        ];
+        over_high.insert(
+            4,
+            serde_json::json!({"role": "assistant", "content": "more".repeat(20)}),
+        );
+        let masked = mask_stale_outputs(&over_high, low).expect("high-water rewrite");
         assert_eq!(masked[2]["output"], MASKED_TOOL_OUTPUT);
-        assert_eq!(masked[4]["output"], failed_output);
-        assert_eq!(masked[7]["output"], recent_output);
-        assert_eq!(masked[10]["output"], active_output);
-        for (index, (before, after)) in input.iter().zip(&masked).enumerate() {
-            if index != 2 {
-                assert_eq!(before, after);
-            }
-        }
-        assert!(mask_stale_outputs(&masked, recent_age + 10).is_none());
-        assert!(mask_stale_outputs(&input[1..latest_user], 1).is_none());
+        assert_eq!(masked.last(), over_high.last());
+    }
+
+    #[test]
+    fn is_idempotent_after_one_block_rewrite() {
+        let input = vec![
+            user_message("old turn"),
+            serde_json::json!({
+                "type": "function_call", "call_id": "stale", "name": "read", "arguments": "{}"
+            }),
+            tool_output("stale", &"stale".repeat(100), false),
+            user_message("latest turn"),
+        ];
+        let masked = mask_stale_outputs(&input, 10).expect("stale block");
+        assert!(mask_stale_outputs(&masked, 10).is_none());
     }
 }

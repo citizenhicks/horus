@@ -46,7 +46,7 @@ use crate::protocol::ModelStepContentPhase;
 use crate::protocol::ModelStepOutcome;
 use crate::protocol::SessionContext;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SCHEMA: &str = "
@@ -104,7 +104,7 @@ CREATE INDEX IF NOT EXISTS execution_journal_recent_idx
     ON execution_journal(started_at_ms DESC, session_id DESC, sequence DESC);
 CREATE INDEX IF NOT EXISTS event_journal_step_idx
     ON event_journal(session_id, model_step_id, event_kind);
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 COMMIT;
 ";
 
@@ -1419,7 +1419,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "checkpoint error: unversioned SQLite database is not empty; expected schema version \
-             5 (start with a fresh database)"
+             6 (start with a fresh database)"
         );
     }
 
@@ -2029,6 +2029,7 @@ mod tests {
                         },
                     ],
                 },
+                diagnostics: None,
             })),
         ];
         for (index, event) in events.iter().enumerate() {
@@ -2140,6 +2141,7 @@ mod tests {
                     started_at_ms: 10,
                     completed_at_ms: 20,
                     outcome,
+                    diagnostics: None,
                 }),
             };
             store

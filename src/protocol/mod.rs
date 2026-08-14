@@ -6,8 +6,9 @@ use serde::Serialize;
 
 pub use self::replay::events as replay_events;
 pub(crate) use self::replay::{
-    ATTACHMENTS_FIELD, CONTEXT_COMPACTED_MARKER, INTERNAL_MESSAGE_FIELD, REPLAY_REASONING_FIELD,
-    TOOL_ERROR_FIELD, internal_message_kind, is_internal_message, strip_attachment_references,
+    ATTACHMENT_CONTEXT_MARKER, ATTACHMENTS_FIELD, CONTEXT_COMPACTED_MARKER, INTERNAL_MESSAGE_FIELD,
+    REPLAY_REASONING_FIELD, TOOL_ERROR_FIELD, internal_message_kind, is_internal_message,
+    strip_attachment_references,
 };
 
 mod replay;
@@ -952,6 +953,46 @@ pub struct ModelStepCompletedEvent {
     pub started_at_ms: i64,
     pub completed_at_ms: i64,
     pub outcome: ModelStepOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<ModelStepDiagnostics>,
+}
+
+/// Provider-owned cost and prompt-cache observations for one completed request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelStepDiagnostics {
+    pub provider: String,
+    pub prompt_cache: PromptCacheDiagnostics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_microusd: Option<u64>,
+}
+
+/// Prompt-cache behavior observed for one completed request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCacheDiagnostics {
+    pub capability: PromptCacheMode,
+    pub context_epoch: u64,
+    pub outcome: PromptCacheOutcome,
+    pub rewrite_reasons: Vec<String>,
+}
+
+/// Provider-advertised prompt-cache behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheMode {
+    Unsupported,
+    Implicit,
+    Explicit,
+}
+
+/// Cache result inferred from provider usage and local rewrite metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheOutcome {
+    Unsupported,
+    Hit,
+    Write,
+    Miss,
+    ContextRewrite,
 }
 
 /// Provider-neutral outcome of a completed model step.
@@ -1306,6 +1347,7 @@ mod tests {
             started_at_ms: 1,
             completed_at_ms: 2,
             outcome: ModelStepOutcome::Retrying,
+            diagnostics: None,
         });
 
         let rendered = event.presentation().expect("retry presentation");

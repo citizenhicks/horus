@@ -1102,11 +1102,11 @@ private struct CronRunRow: View {
                 }
                 if let sessionID = run.sessionId {
                     Button("Open session") {
-                        model.openSession(sessionID)
-                        model.destination = .chat
+                        model.openChat(sessionID)
                     }
                     .buttonStyle(.horusGlass)
                     .buttonBorderShape(.capsule)
+                    .disabled(!model.canOpenSession && sessionID != model.selectedSessionID)
                     .padding(.top, HorusSpace.xxs)
                 }
             }
@@ -1180,13 +1180,35 @@ struct GatewayView: View {
             title: "Gateway",
             detail: "Manage the selected gateway and pair another device."
         ) {
-            Section("Connection") {
+            Section {
+                if model.accounts.isEmpty {
+                    Text("No gateway configured on this device.")
+                        .foregroundStyle(palette.muted)
+                } else {
+                    ForEach(model.accounts) { account in
+                        LabeledContent(account.machineName) {
+                            Text("Configured")
+                                .foregroundStyle(palette.signal)
+                        }
+                    }
+                }
+            } header: {
+                HStack(spacing: HorusSpace.xs) {
+                    Text("Configured")
+                    SettingsInfoButton(
+                        title: "Configured gateways",
+                        detail: "Paired gateways are listed by the machine name they report after authentication."
+                    )
+                }
+            }
+
+            Section("Gateway") {
                 Picker("Gateway", selection: Binding(
                     get: { model.selectedAccountID },
                     set: { model.selectAccount($0) }
                 )) {
                     ForEach(model.accounts) { account in
-                        Text(account.displayName)
+                        Text(account.machineName)
                             .lineLimit(1)
                             .truncationMode(.middle)
                             .tag(Optional(account.id))

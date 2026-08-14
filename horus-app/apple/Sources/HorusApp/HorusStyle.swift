@@ -143,6 +143,7 @@ struct HorusGlyph: Hashable {
     static let mic01 = Self("hi.mic01")
     static let moon = Self("hi.moon")
     static let neuralNetwork = Self("hi.neuralNetwork")
+    static let note01 = Self("hi.note01")
     static let notePencil = Self("hi.notePencil")
     static let notificationSquare = Self("hi.notificationSquare")
     static let path = Self("hi.path")
@@ -301,9 +302,10 @@ struct HorusSpinner: View {
                 ? 0
                 : ProcessInfo.processInfo.systemUptime
                     .truncatingRemainder(dividingBy: 0.9) / 0.9
-            let lineWidth = max(1.5, size * 0.11)
+            let ringSize = size * 1.04
+            let lineWidth = max(1.8, size * 0.14)
             let headSize = max(2.4, size * 0.19)
-            let radius = max(0, (size - lineWidth) / 2)
+            let radius = max(0, (ringSize - lineWidth) / 2)
             ZStack {
                 Circle()
                     .trim(from: 0.06, to: 0.86)
@@ -327,27 +329,19 @@ struct HorusSpinner: View {
                     .offset(y: -radius)
                     .rotationEffect(.degrees(turn * 360 + 0.86 * 360))
             }
+            .frame(width: ringSize, height: ringSize)
             .frame(width: size, height: size)
         }
         .accessibilityHidden(true)
     }
 }
 
-/// Resolves arriving text a line at a time, each one lifting out of a blur as the reveal
-/// passes its first glyph.
-///
-/// The line is the unit rather than the glyph: a per-glyph edge, however wide its feather,
-/// still travels along the words and the eye follows it ticking. A line fades as one thing,
-/// and lines stack up at reading pace. Blur does the rest — opacity alone is a ghost at low
-/// alpha, while text coming out of focus reads as text being written.
+/// Reveals arriving SwiftUI text a line at a time. Selectable UIKit-backed markdown takes
+/// over after streaming settles, so this renderer stays presentation-only.
 private struct HorusRevealRenderer: TextRenderer {
-    /// Glyphs revealed so far, counted from the start of this text.
     var revealed: Double
 
-    /// How many glyphs the reveal travels while one line fades in. Short lines finish early,
-    /// which is what staggers them.
     private static let ramp = 24.0
-    /// How far a line rises, and how far out of focus it starts.
     private static let rise = 3.0
     private static let blur = 3.0
 
@@ -366,7 +360,6 @@ private struct HorusRevealRenderer: TextRenderer {
                 context.draw(line)
                 continue
             }
-            // Smoothstep: a linear ramp leaves a hard edge where the fade begins and ends.
             let eased = progress * progress * (3 - 2 * progress)
             var copy = context
             copy.opacity = eased
@@ -380,27 +373,13 @@ private struct HorusRevealRenderer: TextRenderer {
 private struct HorusStreamingReveal: ViewModifier {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let count: Int
-    let active: Bool
-    @State private var revealed: Double
+    @State private var revealed = 0.0
 
-    init(count: Int, active: Bool, live: Bool) {
-        self.count = count
-        self.active = active
-        // A block that arrives whole still sweeps in, so the reveal starts closed and the
-        // first pass opens it. Restored history starts open: it should not type itself out.
-        _revealed = State(initialValue: live ? 0 : Double(count))
-    }
-
-    @ViewBuilder
     func body(content: Content) -> some View {
-        if active {
-            content
-                .textRenderer(HorusRevealRenderer(revealed: revealed))
-                .task { reveal(to: count) }
-                .onChange(of: count) { _, current in reveal(to: current) }
-        } else {
-            content
-        }
+        content
+            .textRenderer(HorusRevealRenderer(revealed: revealed))
+            .task { reveal(to: count) }
+            .onChange(of: count) { _, current in reveal(to: current) }
     }
 
     private func reveal(to count: Int) {
@@ -410,18 +389,14 @@ private struct HorusStreamingReveal: ViewModifier {
             revealed = target
             return
         }
-        // Paced by how much arrived, so a two-word aside and a full sentence both read as
-        // written rather than one crawling and the other flashing.
         let duration = min(1.0, max(0.35, delta * 0.02))
         withAnimation(.linear(duration: duration)) { revealed = target }
     }
 }
 
 extension View {
-    /// Fades this text in as it grows, `count` characters long so far. `live` distinguishes
-    /// text arriving now from a transcript that was already on screen.
-    func horusStreamingReveal(count: Int, active: Bool, live: Bool) -> some View {
-        modifier(HorusStreamingReveal(count: count, active: active, live: live))
+    func horusStreamingReveal(count: Int) -> some View {
+        modifier(HorusStreamingReveal(count: count))
     }
 }
 

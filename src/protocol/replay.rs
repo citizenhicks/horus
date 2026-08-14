@@ -16,13 +16,14 @@ use crate::protocol::UserMessageEvent;
 
 pub(crate) const INTERNAL_MESSAGE_FIELD: &str = "_horus_internal";
 pub(crate) const CONTEXT_COMPACTED_MARKER: &str = "context_compacted";
+pub(crate) const ATTACHMENT_CONTEXT_MARKER: &str = "attachments";
 pub(crate) const ATTACHMENTS_FIELD: &str = "_horus_attachments";
 pub(crate) const REPLAY_REASONING_FIELD: &str = "_horus_reasoning";
 pub(crate) const TOOL_ERROR_FIELD: &str = "_horus_is_error";
 const FORKED_ATTACHMENT_PLACEHOLDER: &str = "[Attachment unavailable in this fork]";
 
-pub(crate) fn strip_attachment_references(items: &mut [Value]) {
-    for item in items {
+pub(crate) fn strip_attachment_references(items: &mut Vec<Value>) {
+    for item in items.iter_mut() {
         let needs_placeholder = item.get("role").and_then(Value::as_str) == Some("user")
             && !attachment_references(item).is_empty()
             && message_text(item, "user").is_none_or(|text| text.trim().is_empty());
@@ -39,6 +40,7 @@ pub(crate) fn strip_attachment_references(items: &mut [Value]) {
             }
         }
     }
+    items.retain(|item| internal_message_kind(item) != Some(ATTACHMENT_CONTEXT_MARKER));
 }
 
 pub(crate) fn internal_message_kind(message: &Value) -> Option<&str> {
@@ -375,18 +377,22 @@ mod tests {
 
     #[test]
     fn stripped_attachment_only_messages_keep_a_neutral_fork_placeholder() {
-        let mut items = vec![serde_json::json!({
-            "role": "user",
-            "content": [{"type": "input_text", "text": ""}],
-            "_horus_attachments": [{
-                "id": "3d46beff-7e84-46ea-859a-e66b4614a79b",
-                "name": "photo.png",
-                "size": 4,
-                "media_type": "image/png"
-            }]
-        })];
+        let mut items = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": [{"type": "input_text", "text": ""}],
+                "_horus_attachments": [{
+                    "id": "3d46beff-7e84-46ea-859a-e66b4614a79b",
+                    "name": "photo.png",
+                    "size": 4,
+                    "media_type": "image/png"
+                }]
+            }),
+            internal_user_message(ATTACHMENT_CONTEXT_MARKER, "private blob context"),
+        ];
 
         strip_attachment_references(&mut items);
+        assert_eq!(items.len(), 1);
         let context = [(
             MessageTarget {
                 checkpoint_sequence: 1,

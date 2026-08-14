@@ -17,6 +17,7 @@ use horus::backend::checkpoint::{
     ExecutionRecord, ExecutionStats, JournalEvent, SessionPageRequest, SessionSummary,
     sqlite::SqliteCheckpoint,
 };
+use horus::backend::model::ModelRouter;
 use horus::backend::model::provider::provider;
 use horus::middleware::FrontendExtensions;
 use horus::middleware::scratchpad::ScratchpadStore;
@@ -49,7 +50,9 @@ use self::catalog::{
     SessionCatalogMetadata, load_session_metadata, save_session_metadata, session_catalog,
     validate_session_title,
 };
-use self::files::{WorkspaceRead, list as list_workspace_files, read as read_workspace_file};
+use self::files::{
+    WorkspaceFiles, WorkspaceRead, list as list_workspace_files, read as read_workspace_file,
+};
 use self::git::{
     diff as workspace_git_diff, status as git_status, switch_branch as switch_workspace_branch,
 };
@@ -164,6 +167,7 @@ struct RunningAgent {
     session_id: String,
     sender: Option<AgentSender>,
     events: mpsc::Receiver<JournalEvent>,
+    model_router: Arc<ModelRouter>,
     frontend: FrontendExtensions,
     session: horus::protocol::SessionConfiguredEvent,
     gateway_sandbox: Arc<GatewaySandbox>,
@@ -217,8 +221,7 @@ enum HostCommand {
     },
     WorkspaceFiles {
         scope: WorkspaceFileScope,
-        reply:
-            oneshot::Sender<std::result::Result<Vec<crate::wire::WorkspaceFileRecord>, Rejection>>,
+        reply: oneshot::Sender<std::result::Result<WorkspaceFiles, Rejection>>,
     },
     ReadWorkspaceFile {
         path: String,
@@ -724,6 +727,7 @@ impl HostHandle {
             session_id.clone(),
             origin_label,
             false,
+            None,
         )
         .await?;
         let accepts_file_attachments = Arc::new(AtomicBool::new(runtime_accepts_attachments(
@@ -904,7 +908,7 @@ impl HostHandle {
     pub(crate) async fn workspace_files(
         &self,
         scope: WorkspaceFileScope,
-    ) -> std::result::Result<Vec<crate::wire::WorkspaceFileRecord>, Rejection> {
+    ) -> std::result::Result<WorkspaceFiles, Rejection> {
         let (reply, receiver) = oneshot::channel();
         self.send(HostCommand::WorkspaceFiles { scope, reply })
             .await?;
@@ -1537,8 +1541,11 @@ impl HostState {
             )
             .map_err(invalid_config)?;
         let session_id = self.running.session_id.clone();
+        let old_spec = self.spec.clone();
+        let old_router = Arc::clone(&self.running.model_router);
+        let reusable_router = reusable_model_router(&old_spec, &next, &old_router);
         self.stop_and_drain_running().await.map_err(internal)?;
-        let replacement = start_agent(
+        let replacement = match start_agent(
             Arc::clone(&self.gateway),
             &next,
             &self.store,
@@ -1550,9 +1557,50 @@ impl HostState {
             session_id,
             "horus-gateway",
             true,
+            reusable_router,
         )
         .await
-        .map_err(internal)?;
+        {
+            Ok(replacement) => replacement,
+            Err(primary) => {
+                let recovery = start_agent(
+                    Arc::clone(&self.gateway),
+                    &old_spec,
+                    &self.store,
+                    Arc::clone(&self.credentials),
+                    Arc::clone(&self.cron),
+                    Arc::clone(&self.checkpoints),
+                    self.scratchpad.clone(),
+                    self.session_files.clone(),
+                    self.running.session_id.clone(),
+                    "horus-gateway-rollback",
+                    true,
+                    Some(old_router),
+                )
+                .await;
+                let recovery = match recovery {
+                    Ok(recovery) => recovery,
+                    Err(rollback) => {
+                        return Err(internal(horus::Error::Rollback {
+                            primary: Box::new(horus::Error::Config(primary.to_string())),
+                            rollback: Box::new(horus::Error::Config(rollback.to_string())),
+                        }));
+                    }
+                };
+                self.running = recovery;
+                self.accepts_file_attachments.store(
+                    runtime_accepts_attachments(&self.running.frontend),
+                    Ordering::Relaxed,
+                );
+                if let Err(rollback) = self.reconcile_replacement_startup().await {
+                    return Err(internal(horus::Error::Rollback {
+                        primary: Box::new(horus::Error::Config(primary.to_string())),
+                        rollback: Box::new(horus::Error::Config(rollback.to_string())),
+                    }));
+                }
+                return Err(internal(primary));
+            }
+        };
         let previous = std::mem::replace(&mut self.running, replacement);
         self.accepts_file_attachments.store(
             runtime_accepts_attachments(&self.running.frontend),
@@ -1623,6 +1671,7 @@ impl HostState {
             session_id,
             origin_label,
             false,
+            None,
         )
         .await
         .map_err(internal)?;
@@ -1700,9 +1749,8 @@ impl HostState {
         if became_idle {
             if let Some((active, status, message)) = cron_completion {
                 self.cron.finish_run(active.run, status, message)?;
-            } else {
-                restart = self.restart_after_turn;
             }
+            restart = self.restart_after_turn;
             if !self.approval_active && self.active_cron.is_none() {
                 for waiter in self.idle_waiters.drain(..) {
                     let _ = waiter.send(());
@@ -1875,6 +1923,7 @@ impl HostState {
                 })
                 .collect(),
             tool_count: self.running.tool_count,
+            compaction_count: checkpoint.compaction_count,
             run_stats,
             config: self.spec.agent.clone(),
         })
@@ -2357,9 +2406,11 @@ async fn start_agent(
     session_id: String,
     origin_label: &str,
     override_saved_model_route: bool,
+    reusable_model_router: Option<Arc<ModelRouter>>,
 ) -> Result<RunningAgent> {
     let BuiltAgent {
         agent,
+        model_router,
         gateway_sandbox,
         subagent_template,
     } = assemble(
@@ -2374,6 +2425,7 @@ async fn start_agent(
         Some(session_id),
         origin_label,
         override_saved_model_route,
+        reusable_model_router,
     )
     .await?;
     let session = agent.session().clone();
@@ -2385,12 +2437,25 @@ async fn start_agent(
         session_id,
         sender: Some(sender),
         events,
+        model_router,
         frontend,
         session,
         gateway_sandbox,
         subagent_template,
         tool_count,
     })
+}
+
+fn reusable_model_router(
+    old_spec: &ChatSpec,
+    next_spec: &ChatSpec,
+    router: &Arc<ModelRouter>,
+) -> Option<Arc<ModelRouter>> {
+    provider_config_unchanged(old_spec, next_spec).then(|| Arc::clone(router))
+}
+
+fn provider_config_unchanged(old_spec: &ChatSpec, next_spec: &ChatSpec) -> bool {
+    old_spec.agent.config.provider == next_spec.agent.config.provider
 }
 
 fn runtime_accepts_attachments(frontend: &FrontendExtensions) -> bool {
@@ -2961,6 +3026,45 @@ mod tests {
                 ..
             }) if id == "/root/reviewer" && events.is_empty()
         ));
+    }
+
+    #[test]
+    fn router_reuse_ignores_local_recipe_changes_but_not_provider_changes() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        let state_dir = root.path().join("state");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::create_dir(&state_dir).expect("state directory");
+        let base = ChatSpec::new(
+            &workspace,
+            VersionedAgentConfig {
+                revision: 1,
+                config: AgentComposition::default(),
+            },
+            &state_dir,
+            None,
+        )
+        .expect("chat spec");
+
+        let changes: [fn(&mut AgentComposition); 3] = [
+            |config: &mut AgentComposition| config.system_prompt.push_str(" updated"),
+            |config: &mut AgentComposition| config.max_model_steps += 1,
+            |config: &mut AgentComposition| config.middleware.set_enabled("cron", false),
+        ];
+        for change in changes {
+            let mut next = base.clone();
+            change(&mut next.agent.config);
+            assert!(provider_config_unchanged(&base, &next));
+        }
+
+        let mut provider_changed = base.clone();
+        provider_changed
+            .agent
+            .config
+            .provider
+            .model
+            .push_str("-changed");
+        assert!(!provider_config_unchanged(&base, &provider_changed));
     }
 
     #[test]

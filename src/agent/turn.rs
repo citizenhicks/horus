@@ -20,11 +20,16 @@ use crate::Result;
 use crate::backend::checkpoint::ActiveExecution;
 use crate::backend::checkpoint::ActiveModelStep;
 use crate::backend::checkpoint::Checkpoint;
+use crate::backend::checkpoint::ContextRewrite;
 use crate::backend::checkpoint::ExecutionOutcome;
 use crate::backend::checkpoint::QueuedInput;
 use crate::backend::model::ModelEventSink;
 use crate::backend::model::ModelRequest;
+use crate::backend::model::PromptCacheIdentity;
 use crate::backend::model::STREAM_RETRY_LIMIT;
+use crate::backend::model::has_prompt_cache_breakpoint;
+use crate::backend::model::mark_prompt_cache_breakpoint;
+use crate::backend::model::prompt_cache_key;
 use crate::backend::model::tool_complete_boundaries;
 use crate::backend::model::user_message_with_attachments;
 use crate::backend::sandbox::SandboxAuthorization;
@@ -40,6 +45,7 @@ use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::MessageTarget;
 use crate::protocol::ModelStepCompletedEvent;
+use crate::protocol::ModelStepDiagnostics;
 use crate::protocol::ModelStepOutcome;
 use crate::protocol::ModelStepStartedEvent;
 use crate::protocol::Submission;
@@ -60,9 +66,12 @@ enum BeforeModel {
     /// An interrupt aborted the turn; `continue_turn` returns.
     Aborted,
     /// Middleware queued input during the phase; re-run it before the model call.
-    Repeat,
+    Repeat(Vec<crate::backend::checkpoint::ContextRewriteReason>),
     /// Proceed to the model request.
-    Ready(Vec<Value>),
+    Ready {
+        input: Vec<Value>,
+        rewrite_reasons: Vec<crate::backend::checkpoint::ContextRewriteReason>,
+    },
 }
 
 impl Runner {
@@ -132,7 +141,11 @@ impl Runner {
         if self.state.first_user_message.is_none() && !message.trim().is_empty() {
             self.state.first_user_message = Some(message.clone());
         }
-        self.push_context(user_message_with_attachments(&message, &attachments));
+        let mut user_message = user_message_with_attachments(&message, &attachments);
+        if !has_prompt_cache_breakpoint(&self.state.context) {
+            let _ = mark_prompt_cache_breakpoint(&mut user_message);
+        }
+        self.push_context(user_message);
         let batch_item_count = self.transcript_delta.len();
         let checkpoint_sequence = self
             .state
@@ -226,6 +239,7 @@ impl Runner {
         let recorder = self.events.clone();
         let active_events = self.events.clone();
         let mut checkpoint_changed = false;
+        let mut rewrite_reasons = Vec::new();
         let mut request_input = self.state.context.clone();
         let (control, mut queued_during_middleware, queue_changed) = {
             let mut queued_during_middleware = Vec::new();
@@ -244,6 +258,9 @@ impl Runner {
                 request_input: &mut request_input,
                 durable_input: &mut self.state.context,
                 transcript_delta: &mut self.transcript_delta,
+                context_epoch: &mut self.state.context_epoch,
+                compaction_count: &mut self.state.compaction_count,
+                rewrite_reasons: &mut rewrite_reasons,
                 queued_input: QueuedInputQueue::new(
                     &mut self.state.pending_input,
                     QueuedInputBaseline::default(),
@@ -309,6 +326,12 @@ impl Runner {
             Wait::Interrupted { submission_id } => (None, Some(submission_id)),
         };
         let usage_changed = !middleware_usage.is_empty();
+        if !rewrite_reasons.is_empty() {
+            self.state.last_context_rewrite = Some(ContextRewrite {
+                epoch: self.state.context_epoch,
+                reasons: rewrite_reasons.clone(),
+            });
+        }
         if usage_changed {
             let route = self.config.provider.clone();
             for usage in &middleware_usage {
@@ -355,7 +378,7 @@ impl Runner {
                 provisional_target_sequence,
             )
             .await?;
-            return Ok(BeforeModel::Repeat);
+            return Ok(BeforeModel::Repeat(rewrite_reasons));
         }
         if !self.state.pending_input.is_empty() {
             return Err(Error::Config(
@@ -370,7 +393,10 @@ impl Runner {
             provisional_target_sequence,
         )
         .await?;
-        Ok(BeforeModel::Ready(request_input))
+        Ok(BeforeModel::Ready {
+            input: request_input,
+            rewrite_reasons,
+        })
     }
 
     async fn fail_model_step(
@@ -402,7 +428,12 @@ impl Runner {
                 )
             })
             .collect();
-        events.push(model_step_completed_event(submission_id, started, outcome)?);
+        events.push(model_step_completed_event(
+            submission_id,
+            started,
+            outcome,
+            None,
+        )?);
         self.persist_with_events(events, None).await?;
         Ok(())
     }
@@ -431,19 +462,31 @@ impl Runner {
                     self.config.max_model_steps
                 )));
             }
-            let request_input = match self
-                .before_model_phase(commands, &submission_id, &turn_id, model_step)
-                .await?
-            {
-                BeforeModel::Aborted => return Ok(()),
-                BeforeModel::Repeat => continue,
-                BeforeModel::Ready(input) => input,
+            let mut rewrite_reasons = Vec::new();
+            let request_input = loop {
+                match self
+                    .before_model_phase(commands, &submission_id, &turn_id, model_step)
+                    .await?
+                {
+                    BeforeModel::Aborted => return Ok(()),
+                    BeforeModel::Repeat(reasons) => {
+                        extend_rewrite_reasons(&mut rewrite_reasons, reasons);
+                    }
+                    BeforeModel::Ready {
+                        input,
+                        rewrite_reasons: reasons,
+                    } => {
+                        extend_rewrite_reasons(&mut rewrite_reasons, reasons);
+                        break input;
+                    }
+                }
             };
 
             let tools = self.catalog.definitions();
             let model = Arc::clone(&self.config.model);
             let provider = self.config.provider.clone();
             let model_session_id = self.state.session_id.clone();
+            let cache_key = prompt_cache_key(&model_session_id);
             let instructions = Arc::clone(&self.system_prompt);
             let mut stream_retries = 0;
             let (model_step_started, output, pending_searches) = loop {
@@ -503,6 +546,10 @@ impl Runner {
                     &provider,
                     ModelRequest {
                         session_id: &model_session_id,
+                        prompt_cache: Some(PromptCacheIdentity {
+                            key: &cache_key,
+                            context_epoch: self.state.context_epoch,
+                        }),
                         instructions: &instructions,
                         input: &request_input,
                         tools: &tools,
@@ -617,6 +664,15 @@ impl Runner {
             });
             self.state.pending_tools.clone_from(&output.tool_calls);
             self.state.active_model_step = None;
+            let diagnostics = model.model_step_diagnostics(
+                &provider,
+                self.state.context_epoch,
+                rewrite_reasons
+                    .iter()
+                    .map(|reason| reason.as_str().into())
+                    .collect(),
+                &output.usage,
+            )?;
             let checkpoint_sequence = self
                 .state
                 .sequence
@@ -635,6 +691,7 @@ impl Runner {
                     usage: output.usage.clone(),
                     content: output.content().to_vec(),
                 },
+                Some(diagnostics),
             )?];
             if !output.text.is_empty() {
                 model_events.push(turn_event(
@@ -911,6 +968,7 @@ fn model_step_completed_event(
     submission_id: &str,
     started: &ModelStepStartedEvent,
     outcome: ModelStepOutcome,
+    diagnostics: Option<ModelStepDiagnostics>,
 ) -> Result<Event> {
     Ok(turn_event(
         submission_id,
@@ -922,8 +980,20 @@ fn model_step_completed_event(
             started_at_ms: started.started_at_ms,
             completed_at_ms: unix_timestamp_ms()?.max(started.started_at_ms),
             outcome,
+            diagnostics,
         }),
     ))
+}
+
+fn extend_rewrite_reasons(
+    collected: &mut Vec<crate::backend::checkpoint::ContextRewriteReason>,
+    additional: Vec<crate::backend::checkpoint::ContextRewriteReason>,
+) {
+    for reason in additional {
+        if !collected.contains(&reason) {
+            collected.push(reason);
+        }
+    }
 }
 
 fn stream_retry_delay(error: &crate::ProviderError, retry: usize, model_step_id: &str) -> Duration {

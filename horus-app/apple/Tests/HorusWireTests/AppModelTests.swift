@@ -408,6 +408,7 @@ final class AppModelTests: XCTestCase {
         sessionID: String = "chat-1",
         contributions: [FrontendContribution] = [],
         widgets: [SessionWidget] = [],
+        compactionCount: UInt64 = 0,
         runStats: RunStats = RunStats()
     ) -> SessionReadyPayload {
         SessionReadyPayload(
@@ -435,6 +436,7 @@ final class AppModelTests: XCTestCase {
             contributions: contributions,
             widgets: widgets,
             toolCount: 0,
+            compactionCount: compactionCount,
             runStats: runStats,
             config: VersionedAgentConfig(revision: 1, config: composition())
         )
@@ -605,6 +607,51 @@ final class AppModelTests: XCTestCase {
         // `session(state:)` starts a running turn at 100, not at the chat's creation time.
         model.sessions = [session(state: .running, createdAt: 20, updatedAt: 160)]
         XCTAssertEqual(model.sessionElapsed(at: Date(timeIntervalSince1970: 200)), 100)
+    }
+
+    func testSessionCompactionCountRestoresAndAdvancesOnlyFromLiveEvents() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+
+        model.openSession("chat-1")
+        let request = await recorder.firstRequest(after: 0) {
+            guard case .openSession(_, "chat-1", nil) = $0 else { return false }
+            return true
+        }
+        guard case .openSession(let requestID, _, _) = try XCTUnwrap(request)
+        else { return XCTFail("Expected session open") }
+
+        model.handle(.sessionOpened(
+            requestID: requestID,
+            payload: sessionReady(latestSequence: 8, compactionCount: 2)
+        ))
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            sequence: 8,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("context_compacted")
+            ])),
+            blocks: [],
+            preview: nil
+        ))
+        XCTAssertEqual(model.sessionCompactionCount, 2)
+
+        model.handle(.sessionReplayComplete(requestID: requestID, sessionID: "chat-1"))
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            sequence: 9,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("context_compacted")
+            ])),
+            blocks: [],
+            preview: nil
+        ))
+
+        XCTAssertEqual(model.sessionCompactionCount, 3)
     }
 
     func testLiveRunStatsStartImmediatelyAndTrackToolCalls() throws {
@@ -1125,6 +1172,211 @@ final class AppModelTests: XCTestCase {
             return true
         }
         XCTAssertNotNil(request)
+    }
+
+    func testGatewayReadyPopulatesChatCatalogWithoutOpeningSession() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+
+        model.handle(.ready(ready(
+            defaultConfig: VersionedAgentConfig(revision: 1, config: composition()),
+            sessions: [
+                session(sessionID: "chat-1", state: .idle),
+                session(sessionID: "chat-2", state: .idle),
+            ]
+        )))
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertEqual(model.sessions.map(\.sessionId), ["chat-1", "chat-2"])
+        XCTAssertNil(model.selectedSessionID)
+        XCTAssertNil(model.chatRoute)
+        let requests = await recorder.requests()
+        XCTAssertFalse(requests.contains { request in
+            if case .openSession = request { return true }
+            return false
+        })
+    }
+
+    func testOpenChatSetsRouteAndRequestsSessionOnce() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        model.connectionState = .ready
+        model.sessions = [session(sessionID: "chat-2", state: .idle)]
+
+        let requestCount = await recorder.requestCount()
+        model.openChat("chat-2")
+
+        XCTAssertEqual(model.destination, .chats)
+        XCTAssertEqual(model.chatRoute, .session("chat-2"))
+        XCTAssertTrue(model.chatNavigationPath.isEmpty)
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            guard case .openSession(_, "chat-2", _) = request else { return false }
+            return true
+        }
+        guard case .openSession(let requestID, _, _) = try XCTUnwrap(request) else {
+            return XCTFail("Expected the chat to open")
+        }
+        model.handle(.sessionOpened(
+            requestID: requestID,
+            payload: sessionReady(latestSequence: 0, sessionID: "chat-2")
+        ))
+        XCTAssertEqual(model.chatNavigationPath, [.session("chat-2")])
+        try await Task.sleep(for: .milliseconds(30))
+        let requests = await recorder.requests()
+        let opens = requests.dropFirst(requestCount).filter { request in
+            if case .openSession = request { return true }
+            return false
+        }
+        XCTAssertEqual(opens.count, 1)
+    }
+
+    func testPoppingChatNavigationPathClearsPresentedChat() throws {
+        let model = try model()
+        model.selectedSessionID = "chat-1"
+        model.chatRoute = .session("chat-1")
+
+        XCTAssertEqual(model.chatNavigationPath, [.session("chat-1")])
+
+        model.chatNavigationPath = []
+
+        XCTAssertNil(model.chatRoute)
+    }
+
+    func testCreatedSessionPresentsChatOnlyAfterGatewayOpensIt() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        model.connectionState = .ready
+
+        let requestCount = await recorder.requestCount()
+        model.chooseWorkspace("/srv/horus")
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            if case .createSession = request { return true }
+            return false
+        }
+        guard case .createSession(let requestID, let path) = try XCTUnwrap(request) else {
+            return XCTFail("Expected a create-session request")
+        }
+        XCTAssertEqual(path, "/srv/horus")
+        XCTAssertNil(model.chatRoute)
+
+        model.handle(.sessionOpened(
+            requestID: requestID,
+            payload: sessionReady(latestSequence: 0, sessionID: "chat-created")
+        ))
+
+        XCTAssertEqual(model.destination, .chats)
+        XCTAssertEqual(model.selectedSessionID, "chat-created")
+        XCTAssertEqual(model.chatRoute, .session("chat-created"))
+    }
+
+    func testDeletingPresentedChatReturnsToCatalogWithoutOpeningAnother() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let selected = session(sessionID: "chat-1", state: .idle)
+        let remaining = session(sessionID: "chat-2", state: .idle)
+        model.connectionState = .ready
+        model.sessions = [selected, remaining]
+        model.selectedSessionID = selected.sessionId
+        model.destination = .chats
+        model.chatRoute = .session(selected.sessionId)
+
+        let requestCount = await recorder.requestCount()
+        model.deleteSession(selected)
+
+        XCTAssertNil(model.selectedSessionID)
+        XCTAssertNil(model.chatRoute)
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            guard case .deleteSession(_, "chat-1") = request else { return false }
+            return true
+        }
+        guard case .deleteSession(let requestID, _) = try XCTUnwrap(request) else {
+            return XCTFail("Expected a delete-session request")
+        }
+        model.handle(.accepted(requestID: requestID))
+        model.handle(.sessions(requestID: requestID, sessions: [remaining]))
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertEqual(model.sessions.map(\.sessionId), ["chat-2"])
+        let requests = await recorder.requests()
+        XCTAssertFalse(requests.dropFirst(requestCount).contains { request in
+            if case .openSession = request { return true }
+            return false
+        })
+    }
+
+    func testRejectedDeleteRestoresPresentedChat() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let selected = session(sessionID: "chat-1", state: .idle)
+        model.connectionState = .ready
+        model.sessions = [selected]
+        model.selectedSessionID = selected.sessionId
+        model.destination = .chats
+        model.chatRoute = .session(selected.sessionId)
+
+        model.deleteSession(selected)
+        let deleteRequest = await recorder.firstRequest(after: 0) { request in
+            guard case .deleteSession(_, "chat-1") = request else { return false }
+            return true
+        }
+        guard case .deleteSession(let requestID, _) = try XCTUnwrap(deleteRequest) else {
+            return XCTFail("Expected a delete-session request")
+        }
+        let requestCount = await recorder.requestCount()
+
+        model.handle(.rejected(GatewayRejection(
+            requestId: requestID,
+            code: "delete_failed",
+            message: "Chat could not be deleted",
+            fatal: false
+        )))
+
+        XCTAssertEqual(model.destination, .chats)
+        XCTAssertEqual(model.chatRoute, .session("chat-1"))
+        let openRequest = await recorder.firstRequest(after: requestCount) { request in
+            guard case .openSession(_, "chat-1", _) = request else { return false }
+            return true
+        }
+        XCTAssertNotNil(openRequest)
+    }
+
+    func testDeleteSendFailureRestoresPresentedChatWhileOpeningIsBlocked() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in
+            await recorder.record(request)
+            if case .deleteSession = request { throw URLError(.cannotConnectToHost) }
+        }
+        let selected = session(sessionID: "chat-1", state: .running, turnID: "turn-1")
+        model.connectionState = .ready
+        model.sessions = [selected]
+        model.selectedSessionID = selected.sessionId
+        model.destination = .chats
+        model.chatRoute = .session(selected.sessionId)
+        model.activeTurnID = "turn-1"
+        model.activeOperation = "steer"
+        model.composer = "Keep working"
+
+        model.sendMessage()
+        let submission = await recorder.firstRequest(after: 0) { request in
+            if case .submit = request { return true }
+            return false
+        }
+        XCTAssertNotNil(submission)
+        XCTAssertFalse(model.canOpenSession)
+
+        let requestCount = await recorder.requestCount()
+        model.deleteSession(selected)
+
+        XCTAssertNil(model.selectedSessionID)
+        XCTAssertNil(model.chatRoute)
+        let openRequest = await recorder.firstRequest(after: requestCount) { request in
+            guard case .openSession(_, "chat-1", _) = request else { return false }
+            return true
+        }
+
+        XCTAssertNotNil(openRequest)
+        XCTAssertEqual(model.destination, .chats)
+        XCTAssertEqual(model.chatRoute, .session("chat-1"))
     }
 
     func testTaskCompleteFlushesPendingReasoning() throws {
@@ -2137,12 +2389,32 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(store.loadAccounts().first?.displayName, "Home gateway")
     }
 
-    func testReactivationReplacesAStaleConnectionAndPreservesTheActiveChat() throws {
+    func testGatewayCatalogPersistsMachineNameForConfiguredAccount() throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("wss://gateway.example"))
+        defaults.set(try JSONEncoder().encode([account]), forKey: "paired-gateways")
+        defaults.set(account.id.uuidString, forKey: "selected-gateway")
+        let store = GatewayStore(defaults: defaults)
+        let model = AppModel(client: GatewayClient(), store: store)
+
+        model.applyGatewayCatalog(ready(
+            defaultConfig: VersionedAgentConfig(revision: 1, config: composition())
+        ))
+
+        XCTAssertEqual(model.selectedAccount?.machineName, "snowwhite.local")
+        XCTAssertEqual(store.loadAccounts().first?.machineName, "snowwhite.local")
+    }
+
+    func testReactivationReplacesAStaleConnectionAndPreservesThePresentedChat() throws {
         let model = try model()
         let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
         model.accounts = [account]
         model.selectedAccountID = account.id
         model.selectedSessionID = "chat-1"
+        model.destination = .chats
+        model.chatRoute = .session("chat-1")
         model.connectionState = .ready
 
         model.setSceneActive(true)
@@ -2153,6 +2425,26 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.connectionState, .connecting)
         XCTAssertEqual(model.selectedSessionID, "chat-1")
+        XCTAssertEqual(model.chatRoute, .session("chat-1"))
+    }
+
+    func testReactivationFromChatCatalogDoesNotPreserveSelectedSession() throws {
+        let model = try model()
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.selectedSessionID = "chat-1"
+        model.destination = .chats
+        model.chatRoute = nil
+        model.connectionState = .ready
+
+        model.setSceneActive(true)
+        model.setSceneActive(false)
+        model.setSceneActive(true)
+
+        XCTAssertEqual(model.connectionState, .connecting)
+        XCTAssertNil(model.selectedSessionID)
+        XCTAssertNil(model.chatRoute)
     }
 
     func testAutomaticReconnectRestoresDraftWithoutReplayingSubmission() async throws {
@@ -2192,12 +2484,17 @@ final class AppModelTests: XCTestCase {
         await harness.yield(.ready(ready(
             defaultConfig: VersionedAgentConfig(revision: 1, config: composition())
         )))
-        try await Task.sleep(for: .milliseconds(50))
-        let readyRequests = await recorder.requests()
-        let openRequest = try XCTUnwrap(readyRequests.last(where: {
-            if case .openSession = $0 { return true }
-            return false
-        }))
+        let gatewayReady = await eventually { model.connectionState.isReady }
+        XCTAssertTrue(gatewayReady)
+        let openRequestCount = await recorder.requestCount()
+        model.openChat("chat-1")
+        let recordedOpen = await recorder.firstRequest(
+            after: openRequestCount
+        ) { request in
+            guard case .openSession(_, "chat-1", _) = request else { return false }
+            return true
+        }
+        let openRequest = try XCTUnwrap(recordedOpen)
         guard case .openSession(let openRequestID, _, _) = openRequest else {
             return XCTFail("Expected session open")
         }
@@ -2404,9 +2701,12 @@ final class AppModelTests: XCTestCase {
             blocks: [],
             preview: nil
         )
+        // The run owns the phrase from the moment it exists. It used to start as a line of
+        // its own and move into the row once text landed, which grew the transcript by a row
+        // and shrank it again — one arrival, two corrections, a visible bump at the tail.
         XCTAssertEqual(
             model.transcriptProjection(breakBefore: nil, waitingPhrase: phrase).waiting,
-            .standaloneLine(phrase)
+            .row("block:5:toolsresult", phrase)
         )
 
         model.reduce(
@@ -3310,6 +3610,61 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.toast?.message, "Attachments in one message are limited to 100 MiB total.")
     }
 
+    func testAttachmentImportAccepts50MiBFile() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.contributions = [fileAttachmentContribution()]
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("large-video.mp4")
+        try Data(repeating: 0, count: 50 * 1024 * 1024).write(to: fileURL)
+
+        await model.importAttachments([fileURL])
+
+        let request = await recorder.firstRequest(after: 0) { request in
+            if case .beginSessionFileUpload = request { return true }
+            return false
+        }
+        guard case .beginSessionFileUpload(_, let sessionID, let name, let size, let mediaType) =
+            try XCTUnwrap(request)
+        else { return XCTFail("Expected large attachment upload start") }
+        XCTAssertEqual(sessionID, "chat-1")
+        XCTAssertEqual(name, "large-video.mp4")
+        XCTAssertEqual(size, 50 * 1024 * 1024)
+        XCTAssertEqual(mediaType, "video/mp4")
+    }
+
+    func testAttachmentImportRejectsFileOver50MiB() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.contributions = [fileAttachmentContribution()]
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("too-large-video.mp4")
+        try Data(repeating: 0, count: 50 * 1024 * 1024 + 1).write(to: fileURL)
+
+        await model.importAttachments([fileURL])
+
+        XCTAssertTrue(model.composerAttachments.isEmpty)
+        XCTAssertEqual(model.toast?.message, "Attachments are limited to 50 MiB each.")
+        let requests = await recorder.requests()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
     func testFilesInspectorRequestsTheSelectedCollection() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
@@ -3356,6 +3711,34 @@ final class AppModelTests: XCTestCase {
         }
         XCTAssertNotNil(artifactRequest)
         XCTAssertNotNil(uploadRequest)
+    }
+
+    func testWorkspaceCatalogRetainsPartialResultsWhenTruncated() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.showFiles(.allFiles)
+        let request = await recorder.firstRequest(after: 0) {
+            if case .listWorkspaceFiles = $0 { return true }
+            return false
+        }
+        guard case .listWorkspaceFiles(let requestID, _, _) = try XCTUnwrap(request)
+        else { return XCTFail("Expected workspace file request") }
+        let file = WorkspaceFileRecord(path: "Sources/App.swift", size: 3)
+
+        model.handle(.workspaceFiles(
+            requestID: requestID,
+            sessionID: "chat-1",
+            files: [file],
+            truncated: true
+        ))
+
+        XCTAssertEqual(model.workspaceFiles, [file])
+        XCTAssertTrue(model.workspaceFilesTruncated)
+        XCTAssertFalse(model.isLoadingWorkspaceFiles)
     }
 
     func testArtifactListIgnoresAResponseForAnotherSession() async throws {
@@ -4108,7 +4491,8 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.attentionSessionIDs, ["chat-1"])
         XCTAssertEqual(model.toast?.tone, .success)
 
-        model.destination = .chat
+        model.destination = .chats
+        model.chatRoute = .session("chat-1")
         model.setChatVisible(true)
         XCTAssertFalse(model.unreadSessionIDs.contains("chat-1"))
         XCTAssertTrue(model.attentionSessionIDs.isEmpty)
@@ -5245,6 +5629,51 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.displayedTranscript.count, 301)
         XCTAssertFalse(model.hasEarlierHistory)
+    }
+
+    func testLiveGrowthKeepsTheVisibleTranscriptStartStable() throws {
+        let model = try model()
+        model.transcript = (0..<299).map { index in
+            TranscriptEntry(
+                id: "entry-\(index)",
+                text: "\(index)",
+                kind: index == 298 ? .event : .assistant,
+                format: "plain_text",
+                pending: false
+            )
+        }
+        let before = model.transcriptProjection(breakBefore: nil)
+
+        model.reduce(record: RecordedEvent(
+            sequence: 1,
+            recordedAtMs: 1_000,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("tool_call_begin")
+            ])),
+            streamMetrics: [],
+            blocks: (0..<2).map { index in
+                RenderedBlock(capability: "tools", block: FrontendBlock(
+                    id: "tail-event-\(index)",
+                    group: nil,
+                    update: .replace,
+                    state: .pending,
+                    role: .tool,
+                    title: "Run command",
+                    text: "Arguments",
+                    symbol: nil,
+                    format: "plain_text",
+                    tone: "neutral",
+                    files: []
+                ))
+            },
+            preview: nil
+        ))
+        let after = model.transcriptProjection(breakBefore: nil)
+
+        XCTAssertEqual(model.displayedTranscript.count, 301)
+        XCTAssertEqual(model.displayedTranscript.first?.presentationID, "entry-0")
+        XCTAssertEqual(after.rows.last?.id, before.rows.last?.id)
+        XCTAssertEqual(after.structuralRevision, before.structuralRevision)
     }
 
     func testCachedTranscriptSuppliesTheOpenCursorAndRestoresOnce() async throws {
@@ -6703,7 +7132,10 @@ final class TranscriptProjectionTests: XCTestCase {
         XCTAssertEqual(continued.waiting, .standaloneLine(phrase))
     }
 
-    func testFileOnlyActivityRowCannotHideTheWaitingPhrase() {
+    /// A run with nothing but files still owns the phrase. It is not hidden: `EventGroupView`
+    /// draws its summary slot whenever it holds one, so the phrase appears in the row rather
+    /// than as a second line below it that would have to leave again.
+    func testFileOnlyActivityRowOwnsTheWaitingPhrase() {
         let event = entry("event:1")
         event.text = ""
         event.files = [SessionFileReference(
@@ -6715,7 +7147,7 @@ final class TranscriptProjectionTests: XCTestCase {
 
         let projection = TranscriptProjection(entries: [event], waitingPhrase: phrase)
 
-        XCTAssertEqual(projection.waiting, .standaloneLine(phrase))
+        XCTAssertEqual(projection.waiting, .row("event:1", phrase))
     }
 
     func testStandaloneWaitingLineIsInitialStructure() {
@@ -6827,7 +7259,7 @@ final class TranscriptProjectionTests: XCTestCase {
             .fixedSummary,
             .fixedSummary,
             .intrinsic,
-            .revealedIntrinsic,
+            .intrinsic,
         ])
     }
 }
@@ -7157,5 +7589,164 @@ final class FileTreeNodeTests: XCTestCase {
         XCTAssertEqual(src?[0].id, "src/lib")
         XCTAssertEqual(src?[1].id, "src/main.rs")
         XCTAssertEqual(src?[0].children?.map(\.name), ["mod.rs"])
+    }
+}
+
+/// What the transcript does while a run arrives, step by step.
+///
+/// The scroll view animates its bottom-anchor correction on `structuralRevision`, so one
+/// logical arrival that bumps it more than once is one bump the reader sees.
+final class TranscriptRunArrivalTests: XCTestCase {
+    private func message(_ id: String) -> TranscriptEntry {
+        TranscriptEntry(
+            id: id,
+            presentationID: "step:final_answer:0",
+            text: "a settled answer",
+            kind: .assistant,
+            format: "plain_text",
+            pending: false
+        )
+    }
+
+    /// `hasActivityLineContent` is `!title.isEmpty || !text.isEmpty`, so an event that has not
+    /// named itself yet is a row the group draws nothing for.
+    private func activity(_ id: String, title: String) -> TranscriptEntry {
+        TranscriptEntry(
+            id: id,
+            text: "",
+            kind: .event,
+            role: .tool,
+            title: title,
+            format: "plain_text",
+            pending: false
+        )
+    }
+
+    private var phrase: TranscriptWaitingPhrase {
+        TranscriptWaitingPhrase(startedAt: Date(timeIntervalSince1970: 0), order: ["thinking"])
+    }
+
+    /// Replays a sequence of transcript states the way `TranscriptView` consumes them and
+    /// reports every state the scroll view would react to.
+    private func trace(
+        _ steps: [(label: String, entries: [TranscriptEntry], waiting: Bool)]
+    ) -> [(label: String, revision: UInt64, rows: [String], waiting: TranscriptWaitingSlot)] {
+        var previous: TranscriptProjection?
+        var out: [(String, UInt64, [String], TranscriptWaitingSlot)] = []
+        for step in steps {
+            let projection = TranscriptProjection(
+                entries: step.entries,
+                waitingPhrase: step.waiting ? phrase : nil,
+                previous: previous
+            )
+            previous = projection
+            out.append((
+                step.label,
+                projection.structuralRevision,
+                projection.rows.map(\.id),
+                projection.waiting
+            ))
+        }
+        return out
+    }
+
+    private func report(
+        _ trace: [(label: String, revision: UInt64, rows: [String], waiting: TranscriptWaitingSlot)]
+    ) {
+        var lines = ["--- rev | rows | waiting ---"]
+        for step in trace {
+            let waiting: String
+            switch step.waiting {
+            case .absent: waiting = "absent"
+            case .standaloneLine: waiting = "STANDALONE LINE (own row)"
+            case .row(let id, _): waiting = "in row \(id)"
+            }
+            lines.append("  \(step.revision)  \(step.label.padding(toLength: 26, withPad: " ", startingAt: 0)) rows=\(step.rows) \(waiting)")
+        }
+        let url = URL(fileURLWithPath: "/tmp/horus-trace.txt")
+        let text = lines.joined(separator: "\n") + "\n\n"
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(Data(text.utf8))
+            try? handle.close()
+        } else {
+            try? text.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Three tool calls landing together, each one already carrying its title.
+    func testParallelBatchWhereEveryEventArrivesNamed() {
+        let answer = message("wire:1")
+        let a = activity("event:a", title: "Read")
+        let b = activity("event:b", title: "Grep")
+        let c = activity("event:c", title: "Bash")
+        let steps = [
+            ("answer, waiting", [answer], true),
+            ("+ a", [answer, a], true),
+            ("+ b", [answer, a, b], true),
+            ("+ c", [answer, a, b, c], true),
+        ]
+        let trace = self.trace(steps)
+        report(trace)
+        XCTAssertEqual(trace.map(\.revision).reduce(into: Set()) { $0.insert($1) }.count, 2)
+    }
+
+    /// The same batch, but the first event has not named itself when its row is created.
+    func testParallelBatchWhereTheFirstEventArrivesUnnamed() {
+        let answer = message("wire:1")
+        let a = activity("event:a", title: "")
+        let named = activity("event:a", title: "Read")
+        let b = activity("event:b", title: "Grep")
+        let steps = [
+            ("answer, waiting", [answer], true),
+            ("+ a (unnamed)", [answer, a], true),
+            ("a named", [answer, named], true),
+            ("+ b", [answer, named, b], true),
+        ]
+        let trace = self.trace(steps)
+        report(trace)
+        XCTAssertEqual(
+            Set(trace.map(\.revision)).count, 2,
+            "one arrival must move the transcript once, not twice"
+        )
+        XCTAssertEqual(trace[1].waiting, .row("event:a", phrase))
+    }
+
+    /// A batch whose records land out of sequence order, which is what `mergeHistory`
+    /// rebuilding by sequence would produce.
+    func testBatchArrivingOutOfSequenceOrder() {
+        let answer = message("wire:1")
+        let a = activity("event:a", title: "Read")
+        let b = activity("event:b", title: "Grep")
+        let steps = [
+            ("answer, waiting", [answer], true),
+            ("+ b arrives first", [answer, b], true),
+            ("a sorts ahead of b", [answer, a, b], true),
+        ]
+        let trace = self.trace(steps)
+        report(trace)
+        XCTAssertEqual(
+            trace[1].rows.last, trace[2].rows.last,
+            "the run changed identity when an earlier record sorted ahead of it"
+        )
+        XCTAssertEqual(trace[1].revision, trace[2].revision)
+    }
+
+    func testBatchKeepsItsIdentityAcrossWindowShiftAndHistoryPrepend() {
+        let a = activity("event:a", title: "Read")
+        let b = activity("event:b", title: "Grep")
+        let c = activity("event:c", title: "Bash")
+        let first = TranscriptProjection(entries: [a, b])
+        let shifted = TranscriptProjection(entries: [b, c], previous: first)
+        let restored = TranscriptProjection(
+            entries: [a, b, c],
+            breakBefore: b.presentationID,
+            previous: shifted
+        )
+
+        XCTAssertEqual(first.rows.last?.id, shifted.rows.last?.id)
+        XCTAssertEqual(first.structuralRevision, shifted.structuralRevision)
+        XCTAssertEqual(shifted.rows.last?.id, restored.rows.last?.id)
+        XCTAssertEqual(Set(restored.rows.map(\.id)).count, restored.rows.count)
     }
 }

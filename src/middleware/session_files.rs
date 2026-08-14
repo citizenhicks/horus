@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::SystemTime;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -15,14 +16,15 @@ use uuid::Uuid;
 use crate::protocol::SessionFileReference;
 use crate::{Error, Result};
 
-pub const MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_SESSION_BYTES: u64 = 250 * 1024 * 1024;
 pub const MAX_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
 pub const MAX_READ_CHUNK_BYTES: usize = 256 * 1024;
 const MAX_SESSION_FILES: usize = 128;
 const MAX_SESSION_ID_BYTES: usize = 4 * 1024;
+const MAX_VALIDATED_BLOBS: usize = 1_024;
+const BLOB_DIR: &str = "blobs";
 const METADATA_FILE: &str = ".session-file.json";
-const PAYLOAD_FILE: &str = "payload";
 
 /// One bounded range read from a stored session file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,10 +40,18 @@ pub struct SessionFileChunk {
 #[derive(Clone)]
 pub struct SessionFileStore {
     root: Arc<PathBuf>,
-    // ponytail: session files are small and infrequent; one lock keeps quota checks atomic.
+    // ponytail: one commit lock keeps quota checks and publication atomic.
     commits: Arc<Mutex<()>>,
     reservations: Arc<StdMutex<BTreeMap<String, ReservationTotals>>>,
+    // ponytail: immutable private blobs reuse one verified SHA-256 while metadata is unchanged.
+    validated_blobs: Arc<StdMutex<BTreeMap<String, BlobValidationStamp>>>,
     initialized: Arc<OnceCell<()>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BlobValidationStamp {
+    size: u64,
+    modified: SystemTime,
 }
 
 #[derive(Default)]
@@ -69,6 +79,7 @@ enum SessionFileOrigin {
 struct StoredSessionFile {
     origin: SessionFileOrigin,
     file: SessionFileReference,
+    content_hash: String,
 }
 
 impl SessionFileStore {
@@ -79,6 +90,7 @@ impl SessionFileStore {
             root: Arc::new(state_dir.join("session-files")),
             commits: Arc::new(Mutex::new(())),
             reservations: Arc::new(StdMutex::new(BTreeMap::new())),
+            validated_blobs: Arc::new(StdMutex::new(BTreeMap::new())),
             initialized: Arc::new(OnceCell::new()),
         }
     }
@@ -167,6 +179,7 @@ impl SessionFileStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        gc_unreferenced_blobs(&self.root).await?;
         Ok(())
     }
 
@@ -218,6 +231,29 @@ impl SessionFileStore {
         Ok(())
     }
 
+    /// Resolves an owned upload to its private content-addressed identity.
+    pub(crate) async fn upload_content_hash(
+        &self,
+        session_id: &str,
+        expected: &SessionFileReference,
+    ) -> Result<String> {
+        let (record, _) = self.resolve_upload_record(session_id, &expected.id).await?;
+        if &record.file != expected {
+            return Err(Error::Tool(
+                "session file metadata does not match the uploaded file".into(),
+            ));
+        }
+        Ok(record.content_hash)
+    }
+
+    /// Reads a content-addressed blob after validating its size and SHA-256 identity.
+    pub(crate) async fn read_content_blob(&self, content_hash: &str, size: u64) -> Result<Vec<u8>> {
+        validate_content_hash(content_hash)?;
+        let path = self.blob_path(content_hash);
+        validate_content_blob(&path, content_hash, size, &self.validated_blobs).await?;
+        Ok(tokio::fs::read(path).await?)
+    }
+
     pub(crate) async fn read_upload_chunk(
         &self,
         session_id: &str,
@@ -249,7 +285,7 @@ impl SessionFileStore {
         let _commit = self.commits.lock().await;
         let session_dir = self.session_dir(session_id);
         ensure_private_dir(&session_dir).await?;
-        let existing = list_completed(&session_dir).await?;
+        let existing = list_completed(&session_dir, &self.blob_dir()).await?;
         let reservation = self.reserve(session_id, size, &existing)?;
         let record = StoredSessionFile {
             origin,
@@ -259,6 +295,7 @@ impl SessionFileStore {
                 size,
                 media_type,
             },
+            content_hash: String::new(),
         };
         let temporary = tempfile::NamedTempFile::new_in(&session_dir)?;
         set_private_file(temporary.path()).await?;
@@ -281,12 +318,14 @@ impl SessionFileStore {
     ) -> Result<Vec<SessionFileReference>> {
         validate_session_id(session_id)?;
         self.ensure_initialized().await?;
-        Ok(list_completed(&self.session_dir(session_id))
-            .await?
-            .into_iter()
-            .filter(|record| record.origin == origin)
-            .map(|record| record.file)
-            .collect())
+        Ok(
+            list_completed(&self.session_dir(session_id), &self.blob_dir())
+                .await?
+                .into_iter()
+                .filter(|record| record.origin == origin)
+                .map(|record| record.file)
+                .collect(),
+        )
     }
 
     async fn resolve(
@@ -305,14 +344,15 @@ impl SessionFileStore {
                 "session file metadata has an invalid ID".into(),
             ));
         }
-        validate_reference(&metadata.file)?;
-        let path = directory.join(PAYLOAD_FILE);
-        require_regular_file(&path).await?;
-        if tokio::fs::metadata(&path).await?.len() != metadata.file.size {
-            return Err(Error::Tool(
-                "session file size does not match metadata".into(),
-            ));
-        }
+        validate_stored_file(&metadata)?;
+        let path = self.blob_path(&metadata.content_hash);
+        validate_content_blob(
+            &path,
+            &metadata.content_hash,
+            metadata.file.size,
+            &self.validated_blobs,
+        )
+        .await?;
         Ok((metadata, path))
     }
 
@@ -321,19 +361,36 @@ impl SessionFileStore {
         session_id: &str,
         file_id: &str,
     ) -> Result<(SessionFileReference, PathBuf)> {
+        let (record, path) = self.resolve_upload_record(session_id, file_id).await?;
+        Ok((record.file, path))
+    }
+
+    async fn resolve_upload_record(
+        &self,
+        session_id: &str,
+        file_id: &str,
+    ) -> Result<(StoredSessionFile, PathBuf)> {
         let (record, path) = self.resolve(session_id, file_id).await?;
         if record.origin != SessionFileOrigin::Upload {
             return Err(Error::Tool(
                 "session file is not a file uploaded by the user".into(),
             ));
         }
-        Ok((record.file, path))
+        Ok((record, path))
     }
 
     fn session_dir(&self, session_id: &str) -> PathBuf {
         let digest = Sha256::digest(session_id.as_bytes());
         self.root
             .join(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest))
+    }
+
+    fn blob_dir(&self) -> PathBuf {
+        self.root.join(BLOB_DIR)
+    }
+
+    fn blob_path(&self, content_hash: &str) -> PathBuf {
+        self.blob_dir().join(content_hash)
     }
 
     async fn ensure_initialized(&self) -> Result<()> {
@@ -486,32 +543,53 @@ impl PendingSessionFileWrite {
 
         let _guard = self.store.commits.lock().await;
         let session_dir = self.store.session_dir(&self.session_id);
-        let existing = list_completed(&session_dir).await?;
+        let existing = list_completed(&session_dir, &self.store.blob_dir()).await?;
         self.store
             .validate_reserved_capacity(&self.session_id, &existing)?;
 
         let directory = session_dir.join(&self.record.file.id);
-        let staging = session_dir.join(format!(".{}-partial", self.record.file.id));
-        create_private_dir(&staging).await?;
-        let destination = staging.join(PAYLOAD_FILE);
-        let path = self
+        if tokio::fs::symlink_metadata(&directory).await.is_ok() {
+            return Err(Error::Tool("session file ID already exists".into()));
+        }
+        let source = self
             .path
             .take()
             .ok_or_else(|| Error::Tool("session file temporary file is missing".into()))?;
-        if let Err(error) = path.persist_noclobber(&destination) {
-            let _ = tokio::fs::remove_dir_all(&staging).await;
-            return Err(error.error.into());
+        let source_path = source.to_path_buf();
+        let content_hash = hash_file(&source_path).await?;
+        validate_content_hash(&content_hash)?;
+        self.record.content_hash = content_hash.clone();
+
+        let blob_dir = self.store.blob_dir();
+        ensure_private_dir(&blob_dir).await?;
+        let blob_path = self.store.blob_path(&content_hash);
+        match tokio::fs::hard_link(&source_path, &blob_path).await {
+            Ok(()) => set_private_file(&blob_path).await?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                validate_content_blob(
+                    &blob_path,
+                    &content_hash,
+                    self.record.file.size,
+                    &self.store.validated_blobs,
+                )
+                .await?;
+            }
+            Err(error) => return Err(error.into()),
         }
+        tokio::fs::remove_file(&source_path).await?;
+
+        let staging = session_dir.join(format!(".{}-partial", self.record.file.id));
+        create_private_dir(&staging).await?;
         if let Err(error) = save_metadata(&staging, &self.record).await {
             let _ = tokio::fs::remove_dir_all(&staging).await;
+            let _ = gc_unreferenced_blobs(&self.store.root).await;
             return Err(error);
         }
-        set_private_file(&destination).await?;
-        if tokio::fs::symlink_metadata(&directory).await.is_ok() {
+        if let Err(error) = tokio::fs::rename(&staging, &directory).await {
             let _ = tokio::fs::remove_dir_all(&staging).await;
-            return Err(Error::Tool("session file ID already exists".into()));
+            let _ = gc_unreferenced_blobs(&self.store.root).await;
+            return Err(error.into());
         }
-        tokio::fs::rename(&staging, &directory).await?;
         self.reservation.release();
         Ok(self.record.file.clone())
     }
@@ -576,8 +654,13 @@ async fn read_resolved_chunk(
 }
 
 async fn cleanup_stale_files(root: &Path) -> Result<()> {
+    let blob_root = root.join(BLOB_DIR);
+    ensure_private_dir(&blob_root).await?;
     let mut sessions = tokio::fs::read_dir(root).await?;
     while let Some(session) = sessions.next_entry().await? {
+        if session.file_name() == BLOB_DIR {
+            continue;
+        }
         let file_type = session.file_type().await?;
         if !file_type.is_dir() || file_type.is_symlink() {
             continue;
@@ -603,10 +686,20 @@ async fn cleanup_stale_files(root: &Path) -> Result<()> {
             }
         }
     }
-    Ok(())
+    let mut blobs = tokio::fs::read_dir(&blob_root).await?;
+    while let Some(blob) = blobs.next_entry().await? {
+        let file_type = blob.file_type().await?;
+        let Some(name) = blob.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if file_type.is_file() && name.starts_with(".tmp") {
+            tokio::fs::remove_file(blob.path()).await?;
+        }
+    }
+    gc_unreferenced_blobs(root).await
 }
 
-async fn list_completed(session_dir: &Path) -> Result<Vec<StoredSessionFile>> {
+async fn list_completed(session_dir: &Path, blob_root: &Path) -> Result<Vec<StoredSessionFile>> {
     match tokio::fs::symlink_metadata(session_dir).await {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => {
@@ -630,19 +723,14 @@ async fn list_completed(session_dir: &Path) -> Result<Vec<StoredSessionFile>> {
             continue;
         }
         let record = load_metadata(&entry.path().join(METADATA_FILE)).await?;
-        validate_reference(&record.file)?;
+        validate_stored_file(&record)?;
         if record.file.id != id {
             return Err(Error::Tool(
                 "session file directory and metadata IDs differ".into(),
             ));
         }
-        let path = entry.path().join(PAYLOAD_FILE);
-        require_regular_file(&path).await?;
-        if tokio::fs::metadata(path).await?.len() != record.file.size {
-            return Err(Error::Tool(
-                "session file size does not match metadata".into(),
-            ));
-        }
+        let path = blob_root.join(&record.content_hash);
+        validate_content_blob_metadata(&path, record.file.size).await?;
         records.push(record);
     }
     records.sort_by(|left, right| {
@@ -652,6 +740,50 @@ async fn list_completed(session_dir: &Path) -> Result<Vec<StoredSessionFile>> {
             .then(left.file.id.cmp(&right.file.id))
     });
     Ok(records)
+}
+
+async fn gc_unreferenced_blobs(root: &Path) -> Result<()> {
+    let blob_root = root.join(BLOB_DIR);
+    let mut referenced = BTreeMap::new();
+    let mut sessions = tokio::fs::read_dir(root).await?;
+    while let Some(session) = sessions.next_entry().await? {
+        if session.file_name() == BLOB_DIR {
+            continue;
+        }
+        let file_type = session.file_type().await?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        for record in list_completed(&session.path(), &blob_root).await? {
+            referenced.insert(record.content_hash, ());
+        }
+    }
+
+    let mut blobs = tokio::fs::read_dir(&blob_root).await?;
+    while let Some(blob) = blobs.next_entry().await? {
+        let file_type = blob.file_type().await?;
+        if file_type.is_symlink() {
+            return Err(Error::Tool("session blob path is a symbolic link".into()));
+        }
+        if !file_type.is_file() {
+            return Err(Error::Tool(
+                "session blob path is not a regular file".into(),
+            ));
+        }
+        let file_name = blob.file_name();
+        let name = file_name
+            .to_str()
+            .ok_or_else(|| Error::Tool("session blob name is not valid UTF-8".into()))?;
+        if name.starts_with(".tmp") {
+            tokio::fs::remove_file(blob.path()).await?;
+            continue;
+        }
+        validate_content_hash(name)?;
+        if !referenced.contains_key(name) {
+            tokio::fs::remove_file(blob.path()).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn load_metadata(path: &Path) -> Result<StoredSessionFile> {
@@ -686,6 +818,99 @@ fn validate_reference(file: &SessionFileReference) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_stored_file(file: &StoredSessionFile) -> Result<()> {
+    validate_reference(&file.file)?;
+    validate_content_hash(&file.content_hash)
+}
+
+fn validate_content_hash(content_hash: &str) -> Result<()> {
+    if content_hash.len() != 64
+        || !content_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Error::Tool("session file content hash is invalid".into()));
+    }
+    Ok(())
+}
+
+async fn hash_file(path: &Path) -> Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_hash(&hasher.finalize()))
+}
+
+async fn validate_content_blob(
+    path: &Path,
+    content_hash: &str,
+    size: u64,
+    validated_blobs: &StdMutex<BTreeMap<String, BlobValidationStamp>>,
+) -> Result<()> {
+    let metadata = validate_content_blob_metadata(path, size).await?;
+    let stamp = metadata
+        .modified()
+        .ok()
+        .map(|modified| BlobValidationStamp {
+            size: metadata.len(),
+            modified,
+        });
+    let cached = stamp.is_some_and(|stamp| {
+        validated_blobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(content_hash)
+            == Some(&stamp)
+    });
+    if cached {
+        return Ok(());
+    }
+    if hash_file(path).await? != content_hash {
+        return Err(Error::Tool(
+            "session file content hash does not match metadata".into(),
+        ));
+    }
+    if let Some(stamp) = stamp {
+        remember_validated_blob(validated_blobs, content_hash, stamp);
+    }
+    Ok(())
+}
+
+fn remember_validated_blob(
+    validated_blobs: &StdMutex<BTreeMap<String, BlobValidationStamp>>,
+    content_hash: &str,
+    stamp: BlobValidationStamp,
+) {
+    let mut validated_blobs = validated_blobs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if validated_blobs.len() >= MAX_VALIDATED_BLOBS && !validated_blobs.contains_key(content_hash) {
+        validated_blobs.pop_first();
+    }
+    validated_blobs.insert(content_hash.into(), stamp);
+}
+
+async fn validate_content_blob_metadata(path: &Path, size: u64) -> Result<std::fs::Metadata> {
+    let metadata = require_regular_file(path).await?;
+    if metadata.len() != size {
+        return Err(Error::Tool(
+            "session file size does not match metadata".into(),
+        ));
+    }
+    Ok(metadata)
+}
+
+fn hex_hash(hash: &[u8]) -> String {
+    hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn validate_session_id(id: &str) -> Result<()> {
@@ -755,10 +980,10 @@ async fn require_directory(path: &Path) -> Result<()> {
     }
 }
 
-async fn require_regular_file(path: &Path) -> Result<()> {
+async fn require_regular_file(path: &Path) -> Result<std::fs::Metadata> {
     let metadata = tokio::fs::symlink_metadata(path).await?;
     if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-        Ok(())
+        Ok(metadata)
     } else {
         Err(Error::Tool(
             "session file path is not a regular file".into(),
@@ -837,7 +1062,13 @@ mod tests {
                     .mode();
                 assert_eq!(mode & 0o777, 0o700);
             }
-            for path in [directory.join(PAYLOAD_FILE), directory.join(METADATA_FILE)] {
+            let metadata = load_metadata(&directory.join(METADATA_FILE))
+                .await
+                .expect("metadata");
+            for path in [
+                store.blob_path(&metadata.content_hash),
+                directory.join(METADATA_FILE),
+            ] {
                 let mode = std::fs::metadata(path)
                     .expect("file mode")
                     .permissions()
@@ -882,6 +1113,141 @@ mod tests {
                 .expect("retained artifacts")
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_payloads_share_one_content_blob() {
+        let state = tempfile::tempdir().expect("state");
+        let store = SessionFileStore::new(state.path());
+        let first = store
+            .publish_artifact("first", "one.txt".into(), "text/plain".into(), b"same")
+            .await
+            .expect("first artifact");
+        let second = store
+            .publish_artifact("second", "two.txt".into(), "text/plain".into(), b"same")
+            .await
+            .expect("second artifact");
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(blob_entries(&store), 1);
+    }
+
+    #[tokio::test]
+    async fn tampered_content_blob_is_rejected() {
+        let state = tempfile::tempdir().expect("state");
+        let store = SessionFileStore::new(state.path());
+        let file = store
+            .publish_artifact("session", "result.txt".into(), "text/plain".into(), b"safe")
+            .await
+            .expect("artifact");
+        let metadata = load_metadata(
+            &store
+                .session_dir("session")
+                .join(&file.id)
+                .join(METADATA_FILE),
+        )
+        .await
+        .expect("metadata");
+        std::fs::write(store.blob_path(&metadata.content_hash), b"evil").expect("tamper");
+
+        assert!(store.read_chunk("session", &file.id, 0, 4).await.is_err());
+    }
+
+    #[test]
+    fn validated_blob_cache_is_bounded() {
+        let cache = StdMutex::new(BTreeMap::new());
+        let stamp = BlobValidationStamp {
+            size: 1,
+            modified: SystemTime::now(),
+        };
+
+        for index in 0..=MAX_VALIDATED_BLOBS {
+            remember_validated_blob(&cache, &format!("{index:064x}"), stamp);
+        }
+
+        let cache = cache.into_inner().expect("validation cache");
+        assert_eq!(cache.len(), MAX_VALIDATED_BLOBS);
+        assert!(cache.contains_key(&format!("{:064x}", MAX_VALIDATED_BLOBS)));
+    }
+
+    #[tokio::test]
+    async fn private_content_identity_round_trips_without_wire_changes() {
+        let state = tempfile::tempdir().expect("state");
+        let store = SessionFileStore::new(state.path());
+        let file = store
+            .publish_artifact(
+                "session",
+                "upload.txt".into(),
+                "text/plain".into(),
+                b"hello",
+            )
+            .await
+            .expect("artifact");
+        assert!(store.upload_content_hash("session", &file).await.is_err());
+
+        let mut pending = store
+            .begin_upload("session", "upload.txt".into(), 5, "text/plain".into())
+            .await
+            .expect("upload");
+        pending.append(0, b"hello").await.expect("append");
+        let upload = pending.finish().await.expect("finish");
+        let hash = store
+            .upload_content_hash("session", &upload)
+            .await
+            .expect("private hash");
+        assert_eq!(
+            store
+                .read_content_blob(&hash, upload.size)
+                .await
+                .expect("private blob"),
+            b"hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_last_reference_garbage_collects_the_blob() {
+        let state = tempfile::tempdir().expect("state");
+        let store = SessionFileStore::new(state.path());
+        store
+            .publish_artifact("first", "one.txt".into(), "text/plain".into(), b"same")
+            .await
+            .expect("first artifact");
+        store
+            .publish_artifact("second", "two.txt".into(), "text/plain".into(), b"same")
+            .await
+            .expect("second artifact");
+
+        store.delete_session("first").await.expect("delete first");
+        assert_eq!(blob_entries(&store), 1);
+        store.delete_session("second").await.expect("delete second");
+        assert_eq!(blob_entries(&store), 0);
+    }
+
+    #[tokio::test]
+    async fn accepts_50_mib_and_rejects_larger_files() {
+        let state = tempfile::tempdir().expect("state");
+        let store = SessionFileStore::new(state.path());
+        let pending = store
+            .begin_upload(
+                "session",
+                "large.bin".into(),
+                MAX_FILE_BYTES,
+                "application/octet-stream".into(),
+            )
+            .await
+            .expect("50 MiB upload");
+        drop(pending);
+        assert!(
+            store
+                .begin_upload(
+                    "session",
+                    "too-large.bin".into(),
+                    MAX_FILE_BYTES + 1,
+                    "application/octet-stream".into(),
+                )
+                .await
+                .is_err()
         );
     }
 
@@ -1051,7 +1417,7 @@ mod tests {
         std::fs::write(&temporary, b"partial").expect("temporary upload");
         let staging = session.join(format!(".{}-partial", Uuid::new_v4()));
         std::fs::create_dir(&staging).expect("staging directory");
-        std::fs::write(staging.join(PAYLOAD_FILE), b"partial").expect("staged file");
+        std::fs::write(staging.join("payload"), b"partial").expect("staged file");
 
         assert!(
             store
@@ -1062,5 +1428,11 @@ mod tests {
         );
         assert!(!temporary.exists());
         assert!(!staging.exists());
+    }
+
+    fn blob_entries(store: &SessionFileStore) -> usize {
+        std::fs::read_dir(store.blob_dir())
+            .expect("blob directory")
+            .count()
     }
 }

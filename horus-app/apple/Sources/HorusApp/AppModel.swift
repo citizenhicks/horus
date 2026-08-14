@@ -4,7 +4,7 @@ import Observation
 import UniformTypeIdentifiers
 
 enum AppDestination: Equatable {
-    case chat
+    case chats
     case gateway
     case agent
     case providers
@@ -14,13 +14,25 @@ enum AppDestination: Equatable {
 
     var glyph: HorusGlyph {
         switch self {
-        case .chat: .chatsCircle
+        case .chats: .note01
         case .gateway: .cellTower
         case .agent: .slidersHorizontal
         case .providers: .plugsConnected
         case .cron: .calendarDots
         case .profile: .gear
         case .contribution: .squaresFour
+        }
+    }
+}
+
+enum ChatRoute: Identifiable, Hashable {
+    case session(String)
+
+    var id: String { sessionID }
+
+    var sessionID: String {
+        switch self {
+        case .session(let sessionID): sessionID
         }
     }
 }
@@ -191,7 +203,7 @@ private enum AttachmentImportError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notAFile: "Choose a regular file."
-        case .tooLarge: "Attachments are limited to 25 MiB each."
+        case .tooLarge: "Attachments are limited to 50 MiB each."
         case .totalTooLarge: "Attachments in one message are limited to 100 MiB total."
         case .changedWhileReading: "The file changed while Horus was reading it. Try again."
         }
@@ -370,9 +382,9 @@ struct AppLockAuthenticator {
 
 private let appLockEnabledKey = "app-lock-enabled"
 private let sharesHorusDiagnosticsKey = "shares-horus-diagnostics"
-private let maximumAttachmentBytes = 25 * 1024 * 1024
+private let maximumAttachmentBytes = 50 * 1024 * 1024
 private let maximumComposerAttachmentBytes: Int64 = 100 * 1024 * 1024
-private let maximumPresentedFileBytes = 25 * 1024 * 1024
+private let maximumPresentedFileBytes = 50 * 1024 * 1024
 private let maximumHighlightedPreviewBytes = 1024 * 1024
 
 @Observable
@@ -472,7 +484,6 @@ typealias TranscriptPresentationID = String
 enum TranscriptRowSizing: Equatable {
     case fixedSummary
     case intrinsic
-    case revealedIntrinsic
 }
 
 struct TranscriptPresentationRow: Identifiable {
@@ -540,7 +551,7 @@ struct TranscriptProjection {
         waitingPhrase: TranscriptWaitingPhrase? = nil,
         previous: TranscriptProjection? = nil
     ) {
-        let rows = Self.rows(from: entries, breakBefore: boundaryID)
+        let rows = Self.rows(from: entries, breakBefore: boundaryID, previous: previous)
         let waiting = Self.waitingSlot(
             for: waitingPhrase,
             rows: rows
@@ -564,17 +575,18 @@ struct TranscriptProjection {
         self.structure = structure
     }
 
-    /// Only the current tail can own the phrase, and only when it has a visible summary header.
-    /// File-only groups keep their cards in the row while the phrase uses the standalone slot.
+    /// Only the current tail can own the phrase, and it owns it from the moment it exists.
+    ///
+    /// Waiting for the run to have named itself first cost a bump: the row is created by the
+    /// first event of a batch, which may arrive before its title, so for that beat the
+    /// transcript held a run *and* a standalone line, then lost the line once the name landed.
+    /// Two height changes for one arrival. A run takes the slot as soon as it has one.
     private static func waitingSlot(
         for phrase: TranscriptWaitingPhrase?,
         rows: [TranscriptPresentationRow]
     ) -> TranscriptWaitingSlot {
         guard let phrase else { return .absent }
-        guard let tailRun = rows.last,
-              tailRun.kind == .activityGroup,
-              tailRun.records.contains(where: { $0.hasActivityLineContent })
-        else {
+        guard let tailRun = rows.last, tailRun.kind == .activityGroup else {
             return .standaloneLine(phrase)
         }
         return .row(tailRun.id, phrase)
@@ -582,7 +594,8 @@ struct TranscriptProjection {
 
     private static func rows(
         from entries: [TranscriptEntry],
-        breakBefore boundaryID: TranscriptPresentationID?
+        breakBefore boundaryID: TranscriptPresentationID?,
+        previous: TranscriptProjection?
     ) -> [TranscriptPresentationRow] {
         var rows: [TranscriptPresentationRow] = []
         var activity: [TranscriptEntry] = []
@@ -609,12 +622,60 @@ struct TranscriptProjection {
             rows.append(TranscriptPresentationRow(
                 id: entry.presentationID,
                 records: [entry],
-                sizing: isUser ? .intrinsic : .revealedIntrinsic,
+                sizing: .intrinsic,
                 kind: isUser ? .user : .narrative
             ))
         }
         appendActivity()
-        return rows
+
+        var previousActivityRows = previous?.rows.filter { $0.kind == .activityGroup } ?? []
+        var reusedIDs: [Int: TranscriptPresentationID] = [:]
+
+        // Claim old anchors first. Once its original record leaves the display window, an ID
+        // is only an identity: loading that record back must not steal it from the visible run.
+        // ponytail: O(n²) over the 300-entry display cap; index only if that cap grows.
+        for (index, row) in rows.enumerated() where row.kind == .activityGroup {
+            let recordIDs = Set(row.records.map(\.presentationID))
+            guard let match = previousActivityRows.firstIndex(where: { previousRow in
+                previousRow.records.contains { $0.presentationID == previousRow.id }
+                    && recordIDs.contains(previousRow.id)
+            }) else { continue }
+            reusedIDs[index] = previousActivityRows.remove(at: match).id
+        }
+        for (index, row) in rows.enumerated()
+            where row.kind == .activityGroup && reusedIDs[index] == nil {
+            let recordIDs = Set(row.records.map(\.presentationID))
+            guard let match = previousActivityRows.firstIndex(where: { previousRow in
+                previousRow.records.contains { recordIDs.contains($0.presentationID) }
+            }) else { continue }
+            reusedIDs[index] = previousActivityRows.remove(at: match).id
+        }
+
+        let reservedIDs = Set(reusedIDs.values)
+        let defaultIDs = Set(rows.map(\.id))
+        var claimedIDs = Set<TranscriptPresentationID>()
+        return rows.enumerated().map { index, row in
+            var id = reusedIDs[index] ?? row.id
+            if row.kind == .activityGroup,
+               reusedIDs[index] == nil,
+               reservedIDs.contains(id) || claimedIDs.contains(id) {
+                var suffix = 1
+                repeat {
+                    id = "\(row.id):activity-group:\(suffix)"
+                    suffix += 1
+                } while reservedIDs.contains(id)
+                    || defaultIDs.contains(id)
+                    || claimedIDs.contains(id)
+            }
+            claimedIDs.insert(id)
+            guard id != row.id else { return row }
+            return TranscriptPresentationRow(
+                id: id,
+                records: row.records,
+                sizing: row.sizing,
+                kind: row.kind
+            )
+        }
     }
 }
 
@@ -802,7 +863,16 @@ final class AppModel {
     var accounts: [GatewayAccount]
     var selectedAccountID: UUID?
     var connectionState: ConnectionState = .disconnected
-    var destination: AppDestination? = .chat
+    var destination: AppDestination? = .chats
+    var chatRoute: ChatRoute?
+    /// Keeps the one supported chat destination in sync with SwiftUI's stack path.
+    var chatNavigationPath: [ChatRoute] {
+        get {
+            guard let chatRoute, chatRoute.sessionID == selectedSessionID else { return [] }
+            return [chatRoute]
+        }
+        set { chatRoute = newValue.last }
+    }
     var workspace: WorkspaceInfo?
     var gitStatus: GitStatus?
     private(set) var gitDiffRevision = 0
@@ -866,14 +936,6 @@ final class AppModel {
         )
     }
 
-    /// Replay can restore a session with an active turn. Only entries from the latest live
-    /// gateway record should receive the arrival reveal; restored commentary starts settled.
-    func isLiveTranscriptEntry(_ entry: TranscriptEntry) -> Bool {
-        guard let liveTranscriptSequence,
-              let sourceSequence = entry.sourceSequence
-        else { return false }
-        return sourceSequence == liveTranscriptSequence
-    }
     var isLoadingTranscript: Bool {
         guard connectionState == .loading,
               sessionRequestID != nil || replayRequestID != nil
@@ -922,6 +984,7 @@ final class AppModel {
     var activeOperation: String?
     private(set) var steeringDeliveryRevision = 0
     var contextTokens = 0
+    private(set) var sessionCompactionCount: UInt64 = 0
     var modelContextWindow: Int64?
     var pendingApproval: PendingApproval?
     var modelChoices: [ModelChoice] = []
@@ -943,6 +1006,7 @@ final class AppModel {
     var workspaceFiles: [WorkspaceFileRecord] = [] {
         didSet { workspaceFilesRevision &+= 1 }
     }
+    private(set) var workspaceFilesTruncated = false
     private(set) var isLoadingGitDiff = false
     private(set) var isLoadingWorkspaceFiles = false
     var profile: ProfileSnapshot?
@@ -1035,6 +1099,7 @@ final class AppModel {
     @ObservationIgnored private var pendingPresentedTranscript: [TranscriptEntry]?
     private var sessionMutationRequestID: String?
     @ObservationIgnored private var pendingDeletedSessionID: String?
+    @ObservationIgnored private var pendingDeletedPresentedSessionID: String?
     @ObservationIgnored private var sessionToRestoreID: String?
     @ObservationIgnored private var configRequestID: String?
     @ObservationIgnored private var defaultConfigRequestID: String?
@@ -1064,7 +1129,6 @@ final class AppModel {
     @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
     @ObservationIgnored private var isChatVisible = false
     @ObservationIgnored private var latestSequence: UInt64?
-    @ObservationIgnored private var liveTranscriptSequence: UInt64?
     @ObservationIgnored private var sessionOpenCursor: UInt64?
     @ObservationIgnored private var replayRequestID: String?
     @ObservationIgnored private var replaySnapshotSequence: UInt64?
@@ -1152,6 +1216,11 @@ final class AppModel {
 
     var selectedAccount: GatewayAccount? {
         accounts.first { $0.id == selectedAccountID }
+    }
+
+    private var presentedChatSessionID: String? {
+        guard destination == .chats else { return nil }
+        return chatRoute?.sessionID
     }
 
     var canOpenSession: Bool {
@@ -1781,7 +1850,7 @@ final class AppModel {
             let account = accounts.first(where: { $0.endpoint == endpoint })
                 ?? GatewayAccount(endpoint: endpoint)
             let sameGateway = account.id == selectedAccountID
-            let sessionID = sameGateway ? selectedSessionID : nil
+            let sessionID = sameGateway ? presentedChatSessionID : nil
             let generation = resetGatewayState(
                 preservingDrafts: sameGateway,
                 preservingSession: sessionID != nil
@@ -1917,12 +1986,22 @@ final class AppModel {
     }
 
     func openNewSession() {
+        guard canCreateSession else { return }
+        destination = .chats
+        chatRoute = nil
         openWorkspaceBrowser()
     }
 
     func openNewSessionInCurrentWorkspace() {
         guard let path = workspace?.path else { return }
         chooseWorkspace(path)
+    }
+
+    func openChat(_ sessionID: String) {
+        guard canOpenSession || sessionID == selectedSessionID else { return }
+        destination = .chats
+        openSession(sessionID)
+        chatRoute = .session(sessionID)
     }
 
     func openSession(_ sessionID: String) {
@@ -2104,6 +2183,9 @@ final class AppModel {
 
     func deleteSession(_ session: SessionRecord) {
         guard sessionMutationRequestID == nil else { return }
+        let deletesSelectedSession = session.sessionId == selectedSessionID
+        let deletesPresentedSession = destination == .chats
+            && chatRoute?.sessionID == session.sessionId
         if let accountID = selectedAccountID {
             enqueueTranscriptIO { [store] in
                 await store.removeTranscript(accountID: accountID, sessionID: session.sessionId)
@@ -2112,14 +2194,28 @@ final class AppModel {
         let id = requestID("session-delete")
         sessionMutationRequestID = id
         pendingDeletedSessionID = session.sessionId
+        pendingDeletedPresentedSessionID = deletesPresentedSession ? session.sessionId : nil
         transmit(.deleteSession(
             requestID: id,
             sessionID: session.sessionId
         )) { [weak self] _ in
-            guard self?.sessionMutationRequestID == id else { return }
-            self?.sessionMutationRequestID = nil
-            self?.pendingDeletedSessionID = nil
+            guard let self, self.sessionMutationRequestID == id else { return }
+            let sessionID = self.pendingDeletedPresentedSessionID
+            self.sessionMutationRequestID = nil
+            self.pendingDeletedSessionID = nil
+            self.pendingDeletedPresentedSessionID = nil
+            self.restoreDeletedPresentedSession(sessionID)
         }
+        if deletesSelectedSession { clearSelectedSession() }
+    }
+
+    private func restoreDeletedPresentedSession(_ sessionID: String?) {
+        guard let sessionID,
+              destination == .chats,
+              chatRoute == nil
+        else { return }
+        chatRoute = .session(sessionID)
+        restoreSession(sessionID)
     }
 
     private func refreshWorkspaceChanges() {
@@ -2151,6 +2247,7 @@ final class AppModel {
         else { return }
         let id = requestID("workspace-files")
         workspaceFilesRequestID = id
+        workspaceFilesTruncated = false
         isLoadingWorkspaceFiles = true
         transmit(.listWorkspaceFiles(
             requestID: id,
@@ -2288,7 +2385,7 @@ final class AppModel {
     ) {
         guard let sessionID = selectedSessionID else { return }
         guard file.size <= Int64(maximumPresentedFileBytes) else {
-            showToast("File downloads are limited to 25 MiB.", tone: .warning)
+            showToast("File downloads are limited to 50 MiB.", tone: .warning)
             return
         }
         discardFilePresentation()
@@ -2321,7 +2418,7 @@ final class AppModel {
     func previewWorkspaceFile(_ file: WorkspaceFileRecord) {
         guard let sessionID = selectedSessionID else { return }
         guard file.size <= UInt64(maximumPresentedFileBytes) else {
-            showToast("Quick Look previews are limited to 25 MiB.", tone: .warning)
+            showToast("Quick Look previews are limited to 50 MiB.", tone: .warning)
             return
         }
         discardFilePresentation()
@@ -2968,7 +3065,7 @@ final class AppModel {
         let id = requestID("cron-setup")
         cronRequestIDs.insert(id)
         cronError = nil
-        destination = .chat
+        openChat(sessionID)
         transmit(.startCronSetup(
             requestID: id,
             sessionID: sessionID,
@@ -3105,7 +3202,7 @@ final class AppModel {
             automaticReconnectBlocked = false
         }
         let sameGateway = account.id == selectedAccountID
-        let sessionID = sameGateway ? selectedSessionID : nil
+        let sessionID = sameGateway ? presentedChatSessionID : nil
         let generation = resetGatewayState(
             preservingDrafts: sameGateway,
             preservingSession: sessionID != nil
@@ -3246,7 +3343,10 @@ final class AppModel {
                 cacheSelectedTranscript()
             }
         case .sessions(let requestID, let sessions):
-            if requestID == sessionMutationRequestID { sessionMutationRequestID = nil }
+            if requestID == sessionMutationRequestID {
+                sessionMutationRequestID = nil
+                pendingDeletedPresentedSessionID = nil
+            }
             applySessions(sessions)
         case .clients:
             break
@@ -3305,13 +3405,14 @@ final class AppModel {
             gitDiffRequestID = nil
             isLoadingGitDiff = false
             gitDiff = diff
-        case .workspaceFiles(let requestID, let sessionID, let files):
+        case .workspaceFiles(let requestID, let sessionID, let files, let truncated):
             guard requestID == workspaceFilesRequestID,
                   sessionID == selectedSessionID
             else { break }
             workspaceFilesRequestID = nil
             isLoadingWorkspaceFiles = false
             workspaceFiles = files
+            workspaceFilesTruncated = truncated
         case .workspaceFileChunk(
             let requestID,
             let sessionID,
@@ -3405,10 +3506,12 @@ final class AppModel {
 
     private func applyAgentEvent(_ buffered: BufferedAgentEvent) {
         guard latestSequence.map({ buffered.record.sequence > $0 }) ?? true else { return }
+        let isLiveEvent = replayRequestID == nil
         observeReplayCompletion(buffered)
         latestSequence = buffered.record.sequence
-        if replayRequestID == nil {
-            liveTranscriptSequence = buffered.record.sequence
+        if isLiveEvent,
+           buffered.record.event.msg["type"]?.stringValue == "context_compacted" {
+            sessionCompactionCount += 1
         }
         transcriptRecords[buffered.record.sequence] = buffered.record
         reduce(
@@ -3490,14 +3593,16 @@ final class AppModel {
         refreshProfile()
         guard sessionRequestID == nil else { return }
         if let sessionToRestoreID {
+            guard presentedChatSessionID == sessionToRestoreID else {
+                clearSelectedSession()
+                return
+            }
             if let session = sessions.first(where: { $0.sessionId == sessionToRestoreID }) {
                 restoreSession(session.sessionId)
             } else {
                 showToast("The previously selected chat is no longer available.", tone: .error)
                 clearSelectedSession()
             }
-        } else if selectedSessionID == nil, let session = sessions.first {
-            openSession(session.sessionId)
         }
     }
 
@@ -3532,6 +3637,7 @@ final class AppModel {
 
     func applyGatewayCatalog(_ payload: ReadyPayload) {
         gatewayMachineName = payload.machineName
+        rememberGatewayMachineName(payload.machineName)
         let previousDefault = defaultAgentSnapshot
         let pendingDefaultDraft: AgentComposition? = if defaultConfigRequestID != nil
             || providerRegistrationRequestID != nil {
@@ -3554,6 +3660,15 @@ final class AppModel {
         if providerDraft == nil, let provider = providerStatuses.first {
             selectProvider(provider.provider)
         }
+    }
+
+    private func rememberGatewayMachineName(_ machineName: String) {
+        guard let account = selectedAccount,
+              account.machineName != machineName,
+              let index = accounts.firstIndex(where: { $0.id == account.id })
+        else { return }
+        accounts[index].machineName = machineName
+        try? store.recordMachineName(machineName, for: account)
     }
 
     private func applySessionReady(
@@ -3579,7 +3694,6 @@ final class AppModel {
         if opened {
             latestSequence = cursor
             self.replayRequestID = replayRequestID
-            liveTranscriptSequence = nil
             replaySnapshotSequence = payload.latestSequence
             sessionOpenCursor = nil
             sessionOpeningID = nil
@@ -3608,7 +3722,11 @@ final class AppModel {
         isChangingWorkspace = false
         showsWorkspaceBrowser = false
         selectedSessionID = payload.session.sessionId
-        if createdByThisClient { prepareChatTitle(for: payload.session.sessionId) }
+        if createdByThisClient {
+            destination = .chats
+            chatRoute = .session(payload.session.sessionId)
+            prepareChatTitle(for: payload.session.sessionId)
+        }
         if isChatVisible {
             unreadSessionIDs.remove(payload.session.sessionId)
         }
@@ -3624,6 +3742,7 @@ final class AppModel {
             upsertWidget(MountedWidget(capability: widget.capability, widget: widget.item))
         }
         runStats = payload.runStats
+        sessionCompactionCount = payload.compactionCount
         activeTurnID = payload.runStats.active?.turnId
         awaitsSteeringDelivery = false
         activeOperation = payload.contributions.compactMap(\.activeInput?.operation).first
@@ -3680,11 +3799,7 @@ final class AppModel {
               !sessions.contains(where: { $0.sessionId == selectedSessionID }),
               sessionRequestID == nil
         else { return }
-        if let next = sessions.first {
-            openSession(next.sessionId)
-        } else {
-            clearSelectedSession()
-        }
+        clearSelectedSession()
     }
 
     private func applyExecutionStats(_ stats: ExecutionStats) {
@@ -3747,7 +3862,9 @@ final class AppModel {
         changeComposerDraftOwner(to: nil)
         latestSequence = nil
         sessionOpenCursor = nil
+        sessionToRestoreID = nil
         selectedSessionID = nil
+        chatRoute = nil
         resetSessionState()
         connectionState = .ready
     }
@@ -3774,6 +3891,7 @@ final class AppModel {
                 }
             }
             pendingDeletedSessionID = nil
+            pendingDeletedPresentedSessionID = nil
             transmit(.listSessions(requestID: requestID)) { [weak self] _ in
                 if self?.sessionMutationRequestID == requestID {
                     self?.sessionMutationRequestID = nil
@@ -3792,6 +3910,9 @@ final class AppModel {
     }
 
     private func handleRejected(_ rejection: GatewayRejection) {
+        let deletedPresentedSessionID = rejection.requestId == sessionMutationRequestID
+            ? pendingDeletedPresentedSessionID
+            : nil
         if rejection.requestId == historyRequestID {
             finishHistoryLoad()
         }
@@ -3801,6 +3922,7 @@ final class AppModel {
         }
         if rejection.requestId == sessionMutationRequestID {
             pendingDeletedSessionID = nil
+            pendingDeletedPresentedSessionID = nil
             if let sessionID = pendingChatTitles.first(where: {
                 $0.value.renameRequestID == rejection.requestId
             })?.key {
@@ -3879,6 +4001,7 @@ final class AppModel {
         }
         if rejection.requestId == sessionMutationRequestID {
             sessionMutationRequestID = nil
+            restoreDeletedPresentedSession(deletedPresentedSessionID)
         }
         if rejection.requestId == directoryRequestID {
             directoryError = rejection.message
@@ -3932,6 +4055,15 @@ final class AppModel {
     }
 
     func reduce(record: RecordedEvent) {
+        let hiddenPrefixCount = replayRequestID == nil
+            ? max(0, transcript.count - visibleTranscriptLimit)
+            : nil
+        defer {
+            if let hiddenPrefixCount {
+                let limit = max(0, transcript.count - hiddenPrefixCount)
+                if limit != visibleTranscriptLimit { visibleTranscriptLimit = limit }
+            }
+        }
         let event = record.event
         let blocks = record.blocks
         let type = event.msg["type"]?.stringValue ?? "unknown"
@@ -4112,7 +4244,7 @@ final class AppModel {
                 modelContextWindow = Int64(window)
             }
         case "session_resume_requested":
-            if let sessionID = event.msg["sessionId"]?.stringValue { openSession(sessionID) }
+            if let sessionID = event.msg["sessionId"]?.stringValue { openChat(sessionID) }
         case "exec_approval_request":
             approvalRequestID = nil
             pendingApproval = decodeApproval(event.msg)
@@ -4493,6 +4625,15 @@ final class AppModel {
     }
 
     private func flushStreamDeltas() {
+        let hiddenPrefixCount = replayRequestID == nil
+            ? max(0, transcript.count - visibleTranscriptLimit)
+            : nil
+        defer {
+            if let hiddenPrefixCount {
+                let limit = max(0, transcript.count - hiddenPrefixCount)
+                if limit != visibleTranscriptLimit { visibleTranscriptLimit = limit }
+            }
+        }
         deltaFlushTask?.cancel()
         deltaFlushTask = nil
         for buffered in bufferedDeltas {
@@ -5839,6 +5980,7 @@ final class AppModel {
         pendingPresentedTranscript = nil
         sessionMutationRequestID = nil
         pendingDeletedSessionID = nil
+        pendingDeletedPresentedSessionID = nil
         if preservingSession {
             for sessionID in Array(pendingChatTitles.keys) {
                 pendingChatTitles[sessionID]?.renameRequestID = nil
@@ -5878,6 +6020,7 @@ final class AppModel {
             sessions = []
             gatewayMachineName = ""
             selectedSessionID = nil
+            chatRoute = nil
             sessionToRename = nil
             sessionRenameDraft = ""
             sessionToDelete = nil
@@ -5916,6 +6059,7 @@ final class AppModel {
         gitDiffRequestID = nil
         isLoadingGitDiff = false
         workspaceFiles = []
+        workspaceFilesTruncated = false
         workspaceFilesRequestID = nil
         isLoadingWorkspaceFiles = false
         filesInspectorTab = .unstaged
@@ -5952,7 +6096,6 @@ final class AppModel {
         transcriptRecordBase = []
         transcriptRecordBaseSequence = nil
         transcriptRecords.removeAll(keepingCapacity: true)
-        liveTranscriptSequence = nil
         replayCompletionSubmissionIDs.removeAll(keepingCapacity: true)
         replayUserMessages.removeAll(keepingCapacity: true)
         completedComposerEditReplay = false
@@ -5964,6 +6107,7 @@ final class AppModel {
         awaitsSteeringDelivery = false
         runStats = RunStats()
         contextTokens = 0
+        sessionCompactionCount = 0
         modelContextWindow = nil
         pendingApproval = nil
         approvalRequestID = nil

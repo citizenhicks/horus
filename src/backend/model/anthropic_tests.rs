@@ -20,6 +20,73 @@ fn advertised_web_search_modes_build() {
 }
 
 #[test]
+fn anthropic_reports_provider_owned_cache_pricing() {
+    let provider = Anthropic::new("test-key", "claude-haiku-4-5").expect("provider");
+    let usage = TokenUsage {
+        input_tokens: 1_000_000,
+        cached_input_tokens: 200_000,
+        cache_write_input_tokens: 300_000,
+        output_tokens: 1_000_000,
+        total_tokens: 2_000_000,
+        ..TokenUsage::default()
+    };
+
+    assert_eq!(
+        provider
+            .pricing()
+            .and_then(|pricing| pricing.estimate_microusd(&usage)),
+        Some(5_895_000)
+    );
+    assert_eq!(
+        provider.prompt_cache_capability(),
+        PromptCacheCapability::Explicit
+    );
+}
+
+#[test]
+fn sonnet_5_pricing_changes_at_the_standard_rate_date() {
+    let usage = TokenUsage {
+        input_tokens: 1_000_000,
+        cached_input_tokens: 200_000,
+        cache_write_input_tokens: 300_000,
+        output_tokens: 1_000_000,
+        total_tokens: 2_000_000,
+        ..TokenUsage::default()
+    };
+    let before = anthropic_model_pricing_at(
+        "claude-sonnet-5",
+        SONNET_5_STANDARD_PRICING_START_UNIX_SECONDS - 1,
+    )
+    .and_then(|pricing| pricing.estimate_microusd(&usage));
+    let after = anthropic_model_pricing_at(
+        "claude-sonnet-5",
+        SONNET_5_STANDARD_PRICING_START_UNIX_SECONDS,
+    )
+    .and_then(|pricing| pricing.estimate_microusd(&usage));
+
+    assert_eq!((before, after), (Some(11_790_000), Some(17_685_000)));
+}
+
+#[test]
+fn explicit_prompt_cache_breakpoint_is_sent_on_the_marked_content_block() {
+    let provider = Anthropic::new("test-key", "claude-sonnet-5").expect("provider");
+    let mut input = user_message("stable prefix");
+    assert!(crate::backend::model::mark_prompt_cache_breakpoint(
+        &mut input
+    ));
+
+    let body = provider
+        .request_body("instructions", &[input], &[], false)
+        .expect("request body");
+
+    assert!(body.get("cache_control").is_none());
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+}
+
+#[test]
 fn hosted_search_can_be_disabled_per_request() {
     assert!(wire_tools(&[], false).is_empty());
     assert_eq!(wire_tools(&[], true)[0]["name"], "web_search");

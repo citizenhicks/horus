@@ -6,12 +6,16 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::Model;
 use super::ModelEventSink;
 use super::ModelInfo;
 use super::ModelOutput;
+use super::ModelPricing;
 use super::ModelRequest;
+use super::PROMPT_CACHE_BREAKPOINT_FIELD;
+use super::PromptCacheCapability;
 use super::REPLAY_REASONING_FIELD;
 use super::TOOL_ERROR_FIELD;
 use super::ToolDefinition;
@@ -50,6 +54,26 @@ const API_VERSION: &str = "2023-06-01";
 const MAX_OUTPUT_TOKENS: u64 = 64_000;
 const MAX_CONTENT_BLOCKS: usize = 1_024;
 const RAW_CONTENT: &str = "_anthropic_content";
+const SONNET_5_STANDARD_PRICING_START_UNIX_SECONDS: u64 = 1_788_220_800;
+
+fn anthropic_model_pricing(model: &str) -> Option<ModelPricing> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    anthropic_model_pricing_at(model, now)
+}
+
+pub(super) fn anthropic_model_pricing_at(model: &str, unix_seconds: u64) -> Option<ModelPricing> {
+    match model {
+        "claude-sonnet-5" if unix_seconds < SONNET_5_STANDARD_PRICING_START_UNIX_SECONDS => {
+            Some(ModelPricing::new(2_000_000, 200_000, 2_500_000, 10_000_000))
+        }
+        "claude-sonnet-5" => Some(ModelPricing::new(3_000_000, 300_000, 3_750_000, 15_000_000)),
+        "claude-opus-4-8" => Some(ModelPricing::new(5_000_000, 500_000, 6_250_000, 25_000_000)),
+        "claude-haiku-4-5" => Some(ModelPricing::new(1_000_000, 100_000, 1_250_000, 5_000_000)),
+        _ => None,
+    }
+}
 
 /// Anthropic's native Messages API provider.
 pub struct Anthropic {
@@ -162,7 +186,6 @@ impl Anthropic {
             "system": instructions,
             "messages": translate_messages(input)?,
             "tools": wire_tools(tools, self.web_search && allow_hosted_tools),
-            "cache_control": {"type": "ephemeral"},
             "stream": true
         });
         self.apply_reasoning(&mut body);
@@ -203,6 +226,14 @@ impl Model for Anthropic {
 
     fn supports_image_input(&self) -> bool {
         true
+    }
+
+    fn prompt_cache_capability(&self) -> PromptCacheCapability {
+        PromptCacheCapability::Explicit
+    }
+
+    fn pricing(&self) -> Option<ModelPricing> {
+        anthropic_model_pricing(&self.model)
     }
 
     fn respond<'a>(
@@ -674,10 +705,19 @@ fn translate_messages(input: &[Value]) -> Result<Vec<Value>> {
                     {
                         match part.get("type").and_then(Value::as_str) {
                             Some("input_text" | "output_text") => {
-                                blocks.push(serde_json::json!({
+                                let mut block = serde_json::json!({
                                     "type": "text",
                                     "text": part.get("text").and_then(Value::as_str).unwrap_or_default()
-                                }));
+                                });
+                                if part
+                                    .get(PROMPT_CACHE_BREAKPOINT_FIELD)
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false)
+                                {
+                                    block["cache_control"] =
+                                        serde_json::json!({"type": "ephemeral"});
+                                }
+                                blocks.push(block);
                             }
                             Some("input_image") => {
                                 let Some((media_type, data)) = image_input(part, "Anthropic")?

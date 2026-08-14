@@ -50,6 +50,7 @@ const MAX_MODEL_ROUTE_BYTES: usize = 4 * 1024;
 
 pub(crate) struct BuiltAgent {
     pub(crate) agent: Agent,
+    pub(crate) model_router: Arc<ModelRouter>,
     pub(crate) gateway_sandbox: Arc<GatewaySandbox>,
     pub(crate) subagent_template: Option<Arc<OnceLock<AgentConfig>>>,
 }
@@ -70,6 +71,7 @@ pub(crate) async fn assemble(
     session_id: Option<String>,
     origin_label: &str,
     override_saved_model_route: bool,
+    reusable_model_router: Option<Arc<ModelRouter>>,
 ) -> Result<BuiltAgent> {
     if let Some(session_id) = session_id.as_deref() {
         validate_session_id(session_id)?;
@@ -79,17 +81,23 @@ pub(crate) async fn assemble(
         .map_err(|_| Error::Config("gateway configuration lock is poisoned".into()))?
         .clone();
     let model_providers = configured_model_providers(&gateway_config, store, &credentials)?;
-    let (models, context_window) =
-        if credential_is_configured(&chat.agent.config.provider, store, &credentials)? {
-            build_models(
-                &gateway_config,
-                &chat.agent.config.provider,
-                store,
-                &credentials,
-            )?
-        } else {
-            unavailable_models(&gateway_config, &chat.agent.config.provider)?
-        };
+    let (models, context_window) = if let Some(models) = reusable_model_router {
+        let context_window = models
+            .choices()
+            .find(|choice| choice.route == models.default_provider())
+            .and_then(|choice| choice.context_window)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        (models, context_window)
+    } else if credential_is_configured(&chat.agent.config.provider, store, &credentials)? {
+        build_models(
+            &gateway_config,
+            &chat.agent.config.provider,
+            store,
+            &credentials,
+        )?
+    } else {
+        unavailable_models(&gateway_config, &chat.agent.config.provider)?
+    };
     let gateway_sandbox = Arc::new(GatewaySandbox::new(
         &chat.workspace,
         store.state_dir(),
@@ -180,8 +188,11 @@ pub(crate) async fn assemble(
             .set(agent_config.clone())
             .map_err(|_| Error::Config("subagent launcher was initialized twice".into()))?;
     }
+    let agent = create_agent(agent_config).await?;
+    let model_router = agent.model_router();
     Ok(BuiltAgent {
-        agent: create_agent(agent_config).await?,
+        agent,
+        model_router,
         gateway_sandbox,
         subagent_template: template,
     })
@@ -1082,6 +1093,8 @@ mod tests {
             .save(&checkpoint, &[], None)
             .await
             .expect("seed checkpoint");
+        let (reusable_router, _) = unavailable_models(&gateway, &original.agent.config.provider)
+            .expect("unavailable model router");
         let mut composition = original.agent.config.clone();
         composition.middleware.set_enabled("cron", false);
         composition.middleware.set_enabled("scratchpad", false);
@@ -1103,9 +1116,11 @@ mod tests {
             Some("chat".into()),
             "test",
             true,
+            Some(Arc::clone(&reusable_router)),
         )
         .await
         .expect("assemble chat");
+        assert!(Arc::ptr_eq(&reusable_router, &built.model_router));
         let scratchpad = built
             .agent
             .frontend()

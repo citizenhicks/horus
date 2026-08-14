@@ -4,11 +4,11 @@ import UniformTypeIdentifiers
 import CoreTransferable
 import PhotosUI
 
-private struct ImportedPhotoFile: Transferable {
+private struct ImportedMediaFile: Transferable {
     let url: URL
 
     static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(importedContentType: .image) { received in
+        FileRepresentation(importedContentType: .item) { received in
             let directory = URL.temporaryDirectory.appending(
                 path: UUID().uuidString,
                 directoryHint: .isDirectory
@@ -57,12 +57,12 @@ struct ComposerOptionsView: View {
             isPresented: $isPhotoPickerPresented,
             selection: $photoSelection,
             maxSelectionCount: 16,
-            matching: .images
+            matching: .any(of: [.images, .videos])
         )
         .onChange(of: photoSelection) { _, items in
             guard !items.isEmpty else { return }
             photoSelection = []
-            Task { await importPhotos(items) }
+            Task { await importMedia(items) }
         }
         .confirmationDialog(
             "Enable full access?",
@@ -252,16 +252,18 @@ struct ComposerOptionsView: View {
     }
 
     /// Keep the filename supplied by Photos while taking the same import path and limits as Files.
-    private func importPhotos(_ items: [PhotosPickerItem]) async {
+    private func importMedia(_ items: [PhotosPickerItem]) async {
         var urls: [URL] = []
         for item in items {
-            guard let photo = try? await item.loadTransferable(type: ImportedPhotoFile.self) else {
+            guard let media = try? await item.loadTransferable(type: ImportedMediaFile.self) else {
                 continue
             }
-            urls.append(photo.url)
+            urls.append(media.url)
         }
         guard !urls.isEmpty else {
-            if !items.isEmpty { model.showToast("Could not read the selected photos.", tone: .error) }
+            if !items.isEmpty {
+                model.showToast("Could not read the selected photos or videos.", tone: .error)
+            }
             return
         }
         await model.importAttachments(urls)

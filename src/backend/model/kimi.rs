@@ -15,7 +15,10 @@ use super::transport::status_error;
 use super::transport::streaming_client;
 use super::transport::take_sse_frame;
 use super::usage_i64;
-use super::{Model, ModelEventSink, ModelInfo, ModelOutput, ModelRequest, ToolDefinition};
+use super::{
+    Model, ModelEventSink, ModelInfo, ModelOutput, ModelRequest, PromptCacheCapability,
+    ToolDefinition,
+};
 use super::{image_data_url, image_input};
 use crate::protocol::FrontendSymbol;
 
@@ -112,9 +115,11 @@ impl Kimi {
             "model": self.model,
             "messages": wire_messages(request.instructions, request.input)?,
             "stream": true,
-            "stream_options": {"include_usage": true},
-            "prompt_cache_key": request.session_id
+            "stream_options": {"include_usage": true}
         });
+        if let Some(prompt_cache) = request.prompt_cache {
+            body["prompt_cache_key"] = Value::String(prompt_cache.key.into());
+        }
         if !request.tools.is_empty() {
             body["tools"] = Value::Array(wire_tools(request.tools));
             body["tool_choice"] = Value::String("auto".into());
@@ -155,6 +160,10 @@ impl Model for Kimi {
 
     fn supports_image_input(&self) -> bool {
         true
+    }
+
+    fn prompt_cache_capability(&self) -> PromptCacheCapability {
+        PromptCacheCapability::Implicit
     }
 
     fn respond<'a>(

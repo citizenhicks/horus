@@ -449,6 +449,7 @@ pub enum ServerMessage {
         request_id: String,
         session_id: String,
         files: Vec<WorkspaceFileRecord>,
+        truncated: bool,
     },
     WorkspaceFileChunk {
         request_id: String,
@@ -500,6 +501,7 @@ pub struct SessionReadyPayload {
     pub contributions: Vec<FrontendContribution>,
     pub widgets: Vec<SessionWidget>,
     pub tool_count: usize,
+    pub compaction_count: u64,
     pub run_stats: RunStats,
     pub config: VersionedAgentConfig,
 }
@@ -1518,8 +1520,19 @@ mod tests {
             scope: WorkspaceFileScope::Modified,
         }))
         .expect("encode workspace file request");
+        let response = serde_json::to_value(ServerFrame::new(ServerMessage::WorkspaceFiles {
+            request_id: "request-files".into(),
+            session_id: "session-a".into(),
+            files: vec![WorkspaceFileRecord {
+                path: "src/main.rs".into(),
+                size: 12,
+            }],
+            truncated: true,
+        }))
+        .expect("encode workspace file response");
 
         assert_eq!(request["scope"], "modified");
+        assert_eq!(response["truncated"], true);
     }
 
     #[test]
@@ -1772,6 +1785,7 @@ mod tests {
                 }],
                 "widgets": [],
                 "tool_count": 3,
+                "compaction_count": 2,
                 "run_stats": {
                     "run_count": 0,
                     "failed_run_count": 0,
@@ -1829,9 +1843,10 @@ mod tests {
                 request_id.as_str(),
                 payload.session.session_id.as_str(),
                 payload.next_before_sequence,
+                payload.compaction_count,
                 payload.contributions[0].widgets[0].action.is_some(),
             ),
-            ("request-open", "session-a", Some(2), true)
+            ("request-open", "session-a", Some(2), 2, true)
         );
     }
 

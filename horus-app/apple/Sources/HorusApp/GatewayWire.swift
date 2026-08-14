@@ -171,11 +171,18 @@ struct GatewayAccount: Identifiable, Hashable, Codable, Sendable {
     let id: UUID
     var endpoint: GatewayEndpoint
     var displayName: String
+    var machineName: String
 
-    init(id: UUID = UUID(), endpoint: GatewayEndpoint, displayName: String? = nil) {
+    init(
+        id: UUID = UUID(),
+        endpoint: GatewayEndpoint,
+        displayName: String? = nil,
+        machineName: String? = nil
+    ) {
         self.id = id
         self.endpoint = endpoint
         self.displayName = displayName ?? endpoint.displayName
+        self.machineName = machineName ?? endpoint.displayName
     }
 }
 
@@ -768,7 +775,12 @@ enum GatewayEnvelope: Decodable, Sendable {
         truncated: Bool
     )
     case gitDiff(requestID: String, sessionID: String, scope: GitDiffScope, diff: String)
-    case workspaceFiles(requestID: String, sessionID: String, files: [WorkspaceFileRecord])
+    case workspaceFiles(
+        requestID: String,
+        sessionID: String,
+        files: [WorkspaceFileRecord],
+        truncated: Bool
+    )
     case workspaceFileChunk(
         requestID: String,
         sessionID: String,
@@ -929,7 +941,8 @@ enum GatewayEnvelope: Decodable, Sendable {
             self = .workspaceFiles(
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 sessionID: try container.decode(String.self, forKey: "sessionId"),
-                files: try container.decode([WorkspaceFileRecord].self, forKey: "files")
+                files: try container.decode([WorkspaceFileRecord].self, forKey: "files"),
+                truncated: try container.decodeIfPresent(Bool.self, forKey: "truncated") ?? false
             )
         case "workspace_file_chunk":
             self = .workspaceFileChunk(
@@ -1048,6 +1061,7 @@ struct SessionReadyPayload: Decodable, Sendable {
     let contributions: [FrontendContribution]
     let widgets: [SessionWidget]
     let toolCount: Int
+    let compactionCount: UInt64
     let runStats: RunStats
     let config: VersionedAgentConfig
 }

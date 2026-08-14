@@ -112,13 +112,33 @@ extension String {
 
 private struct WorkspaceFileList: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
     @State private var tree: [FileTreeNode] = []
     @State private var query = ""
     @State private var matches: [WorkspaceFileRecord] = []
     @State private var matchedQuery = ""
 
     var body: some View {
-        content
+        VStack(spacing: 0) {
+            if model.workspaceFilesTruncated && !model.isLoadingWorkspaceFiles {
+                HStack(spacing: HorusSpace.s) {
+                    HorusIcon(
+                        .warning,
+                        size: HorusStyle.glyphInline,
+                        foreground: palette.warning
+                    )
+                    Text("Some workspace files are not shown. Ignore generated folders to keep the catalog focused.")
+                        .font(HorusStyle.metadataFont)
+                        .foregroundStyle(palette.muted)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, HorusSpace.m)
+                .padding(.vertical, HorusSpace.s)
+                .accessibilityElement(children: .combine)
+                Divider()
+            }
+            content
+        }
             .searchable(text: $query, placement: .toolbar, prompt: "Search files")
             .task(id: model.workspaceFilesRevision) {
                 let files = model.workspaceFiles

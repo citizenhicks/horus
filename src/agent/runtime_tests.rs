@@ -32,6 +32,7 @@ use crate::backend::model::ModelEventSink;
 use crate::backend::model::ModelOutput;
 use crate::backend::model::ModelRequest;
 use crate::backend::model::ModelRouter;
+use crate::backend::model::PromptCacheCapability;
 use crate::backend::model::STREAM_RETRY_LIMIT;
 use crate::backend::model::TOOL_ERROR_FIELD;
 use crate::backend::model::ToolCall;
@@ -938,6 +939,10 @@ impl Model for InterruptedStreamModel {
 }
 
 impl Model for NativeCompactionModel {
+    fn prompt_cache_capability(&self) -> PromptCacheCapability {
+        PromptCacheCapability::Explicit
+    }
+
     fn respond<'a>(
         &'a self,
         _request: ModelRequest,
@@ -1202,6 +1207,19 @@ async fn model_step_lifecycle_preserves_correlation_usage_and_content() {
     assert_eq!(completed.model_step_id, started.model_step_id);
     assert_eq!(completed.started_at_ms, started.started_at_ms);
     assert!(completed.completed_at_ms >= completed.started_at_ms);
+    let diagnostics = completed.diagnostics.as_ref().expect("step diagnostics");
+    assert_eq!(diagnostics.provider, "test");
+    assert_eq!(
+        diagnostics.prompt_cache.capability,
+        crate::protocol::PromptCacheMode::Unsupported
+    );
+    assert_eq!(
+        diagnostics.prompt_cache.outcome,
+        crate::protocol::PromptCacheOutcome::Unsupported
+    );
+    assert_eq!(diagnostics.prompt_cache.context_epoch, 0);
+    assert!(diagnostics.prompt_cache.rewrite_reasons.is_empty());
+    assert_eq!(diagnostics.estimated_cost_microusd, None);
     assert_eq!(
         completed.outcome,
         ModelStepOutcome::Completed {
@@ -1902,13 +1920,20 @@ async fn compaction_marker_survives_transcript_replay() {
         .expect("submit input");
 
     let mut live_markers = 0;
+    let mut completed = None;
     loop {
         match agent.next_event().await.expect("agent event").msg {
             EventMsg::ContextCompacted => live_markers += 1,
+            EventMsg::ModelStepCompleted(event) => completed = Some(event),
             EventMsg::TurnComplete(_) => break,
             _ => {}
         }
     }
+    let checkpoint = checkpoints
+        .load("durable-compaction")
+        .await
+        .expect("load checkpoint")
+        .expect("saved checkpoint");
     let transcript = checkpoints
         .transcript_page(
             "durable-compaction",
@@ -1923,6 +1948,43 @@ async fn compaction_marker_survives_transcript_replay() {
     let replayed = crate::protocol::replay_events(&transcript, "durable-compaction");
 
     assert_eq!(live_markers, 1);
+    assert_eq!(checkpoint.context_epoch, 1);
+    assert_eq!(checkpoint.compaction_count, 1);
+    assert_eq!(
+        checkpoint
+            .last_context_rewrite
+            .expect("context rewrite")
+            .reasons,
+        [crate::backend::checkpoint::ContextRewriteReason::Compaction]
+    );
+    assert_eq!(
+        checkpoint
+            .context
+            .iter()
+            .flat_map(|item| {
+                item.get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter(|part| {
+                part.get(crate::backend::model::PROMPT_CACHE_BREAKPOINT_FIELD)
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            })
+            .count(),
+        1
+    );
+    let diagnostics = completed
+        .expect("completed model step")
+        .diagnostics
+        .expect("step diagnostics");
+    assert_eq!(diagnostics.prompt_cache.context_epoch, 1);
+    assert_eq!(
+        diagnostics.prompt_cache.outcome,
+        crate::protocol::PromptCacheOutcome::ContextRewrite
+    );
+    assert_eq!(diagnostics.prompt_cache.rewrite_reasons, ["compaction"]);
     assert_eq!(
         replayed
             .iter()

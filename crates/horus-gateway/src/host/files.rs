@@ -17,11 +17,16 @@ pub(crate) struct WorkspaceRead {
     pub(crate) next_offset: Option<u64>,
 }
 
+pub(crate) struct WorkspaceFiles {
+    pub(crate) files: Vec<WorkspaceFileRecord>,
+    pub(crate) truncated: bool,
+}
+
 pub(super) async fn list(
     sandbox: &GatewaySandbox,
     workspace: &Path,
     scope: WorkspaceFileScope,
-) -> std::result::Result<Vec<WorkspaceFileRecord>, Rejection> {
+) -> std::result::Result<WorkspaceFiles, Rejection> {
     tokio::time::timeout(FILE_TIMEOUT, list_inner(sandbox, workspace, scope))
         .await
         .map_err(|_| timeout())?
@@ -50,7 +55,7 @@ async fn list_inner(
     sandbox: &GatewaySandbox,
     workspace: &Path,
     scope: WorkspaceFileScope,
-) -> std::result::Result<Vec<WorkspaceFileRecord>, Rejection> {
+) -> std::result::Result<WorkspaceFiles, Rejection> {
     let args = match scope {
         WorkspaceFileScope::Modified => &[
             "ls-files",
@@ -72,9 +77,9 @@ async fn list_inner(
     };
     let mut output = sandbox.execute_git(args).await.map_err(error_rejection)?;
     if output.exit_code == 0 {
-        validate_git_paths(&output.stdout)?;
+        let mut truncated = retain_complete_git_paths(&mut output.stdout, output.stdout_truncated)?;
         if scope == WorkspaceFileScope::Modified {
-            let staged = sandbox
+            let mut staged = sandbox
                 .execute_git(&[
                     "diff",
                     "--cached",
@@ -93,12 +98,12 @@ async fn list_inner(
                     staged.stderr.trim()
                 )));
             }
-            validate_git_paths(&staged.stdout)?;
+            truncated |= retain_complete_git_paths(&mut staged.stdout, staged.stdout_truncated)?;
             output.stdout.push_str(&staged.stdout);
         }
         let workspace = workspace.to_path_buf();
         return tokio::task::spawn_blocking(move || {
-            git_workspace_files(&workspace, &output.stdout)
+            git_workspace_files(&workspace, &output.stdout, truncated)
         })
         .await
         .map_err(error_rejection)?;
@@ -110,7 +115,10 @@ async fn list_inner(
         )));
     }
     if scope == WorkspaceFileScope::Modified {
-        return Ok(Vec::new());
+        return Ok(WorkspaceFiles {
+            files: Vec::new(),
+            truncated: false,
+        });
     }
     Err(invalid(
         "all-files catalog requires a Git repository so ignore rules remain authoritative",
@@ -120,7 +128,8 @@ async fn list_inner(
 fn git_workspace_files(
     workspace: &Path,
     output: &str,
-) -> std::result::Result<Vec<WorkspaceFileRecord>, Rejection> {
+    mut truncated: bool,
+) -> std::result::Result<WorkspaceFiles, Rejection> {
     validate_git_paths(output)?;
     let mut files = Vec::new();
     let mut path_bytes = 0_usize;
@@ -134,19 +143,30 @@ fn git_workspace_files(
         if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
             continue;
         }
-        path_bytes = path_bytes.saturating_add(path.len());
-        if path_bytes > MAX_WORKSPACE_PATH_BYTES {
-            return Err(limit());
+        let next_path_bytes = path_bytes.saturating_add(path.len());
+        if next_path_bytes > MAX_WORKSPACE_PATH_BYTES || files.len() == MAX_WORKSPACE_FILES {
+            truncated = true;
+            break;
         }
+        path_bytes = next_path_bytes;
         files.push(WorkspaceFileRecord {
             path: path.into(),
             size: metadata.len(),
         });
-        if files.len() > MAX_WORKSPACE_FILES {
-            return Err(limit());
-        }
     }
-    Ok(files)
+    Ok(WorkspaceFiles { files, truncated })
+}
+
+fn retain_complete_git_paths(
+    output: &mut String,
+    truncated: bool,
+) -> std::result::Result<bool, Rejection> {
+    if truncated {
+        let complete = output.rfind('\0').map_or(0, |index| index + 1);
+        output.truncate(complete);
+    }
+    validate_git_paths(output)?;
+    Ok(truncated)
 }
 
 fn validate_git_paths(output: &str) -> std::result::Result<(), Rejection> {
@@ -189,14 +209,6 @@ fn timeout() -> Rejection {
     Rejection {
         code: "workspace_file_timeout",
         message: "workspace file operation exceeded 5 seconds".into(),
-        fatal: false,
-    }
-}
-
-fn limit() -> Rejection {
-    Rejection {
-        code: "workspace_file_limit",
-        message: "workspace file catalog exceeds its bounded result limit".into(),
         fatal: false,
     }
 }
@@ -248,14 +260,25 @@ mod tests {
         std::fs::write(workspace.path().join("included.txt"), b"included").expect("included file");
         let (_state, sandbox) = sandbox(workspace.path());
 
-        let files = list(&sandbox, workspace.path(), WorkspaceFileScope::All)
+        let catalog = list(&sandbox, workspace.path(), WorkspaceFileScope::All)
             .await
             .expect("workspace files");
 
-        assert!(files.iter().any(|file| file.path == ".gitignore"));
-        assert!(files.iter().any(|file| file.path == "included.txt"));
-        assert!(files.iter().all(|file| !file.path.starts_with("ignored/")));
-        assert!(files.iter().all(|file| !file.path.starts_with(".git/")));
+        assert!(!catalog.truncated);
+        assert!(catalog.files.iter().any(|file| file.path == ".gitignore"));
+        assert!(catalog.files.iter().any(|file| file.path == "included.txt"));
+        assert!(
+            catalog
+                .files
+                .iter()
+                .all(|file| !file.path.starts_with("ignored/"))
+        );
+        assert!(
+            catalog
+                .files
+                .iter()
+                .all(|file| !file.path.starts_with(".git/"))
+        );
         assert!(read(&sandbox, ".git/config", 0, 16).await.is_err());
     }
 
@@ -293,12 +316,16 @@ mod tests {
         std::fs::remove_file(workspace.path().join("deleted.txt")).expect("deleted file");
         let (_state, sandbox) = sandbox(workspace.path());
 
-        let files = list(&sandbox, workspace.path(), WorkspaceFileScope::Modified)
+        let catalog = list(&sandbox, workspace.path(), WorkspaceFileScope::Modified)
             .await
             .expect("modified files");
 
         assert_eq!(
-            files.into_iter().map(|file| file.path).collect::<Vec<_>>(),
+            catalog
+                .files
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>(),
             ["staged.txt", "unstaged.txt", "untracked.txt"]
         );
     }
@@ -332,12 +359,12 @@ mod tests {
         git(repository.path(), &["add", "."]);
         let (_state, sandbox) = sandbox(&workspace);
 
-        let files = list(&sandbox, &workspace, WorkspaceFileScope::Modified)
+        let catalog = list(&sandbox, &workspace, WorkspaceFileScope::Modified)
             .await
             .expect("modified files");
 
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "inside.txt");
+        assert_eq!(catalog.files.len(), 1);
+        assert_eq!(catalog.files[0].path, "inside.txt");
     }
 
     #[tokio::test]
@@ -364,12 +391,27 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::write(workspace.path().join("file.txt"), b"file").expect("file");
 
-        assert!(git_workspace_files(workspace.path(), "file.txt").is_err());
+        assert!(git_workspace_files(workspace.path(), "file.txt", false).is_err());
     }
 
     #[test]
     fn each_git_catalog_stream_requires_a_terminator() {
         assert!(validate_git_paths("first\0").is_ok());
         assert!(validate_git_paths("truncated").is_err());
+    }
+
+    #[test]
+    fn truncated_git_catalog_keeps_only_complete_records() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("first.txt"), b"file").expect("file");
+        let mut output = "first.txt\0partial".to_string();
+
+        let truncated = retain_complete_git_paths(&mut output, true).expect("Git paths");
+        let catalog =
+            git_workspace_files(workspace.path(), &output, truncated).expect("workspace files");
+
+        assert!(catalog.truncated);
+        assert_eq!(catalog.files.len(), 1);
+        assert_eq!(catalog.files[0].path, "first.txt");
     }
 }

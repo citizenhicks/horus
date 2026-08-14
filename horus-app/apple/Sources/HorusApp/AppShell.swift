@@ -137,33 +137,7 @@ struct AppShell: View {
             SidebarDrawer(isOpen: $sidebarIsOpen) {
                 SidebarView(showDetail: showDetail)
             } detail: {
-                NavigationStack {
-                    destination
-                        .toolbar {
-                            ToolbarItem(placement: .topBarLeading) {
-                                Button {
-                                    // The keyboard belongs to the page being slid away; left
-                                    // up, it animates against a screen the reader just left.
-                                    model.dismissComposerFocus()
-                                    withAnimation(SidebarDrawerMetrics.animation) {
-                                        sidebarIsOpen.toggle()
-                                    }
-                                } label: {
-                                    // A bare glyph is a 16pt target. Every other icon button
-                                    // in the app pads itself out to a full one, and without
-                                    // that this took two or three tries to hit.
-                                    HorusIcon(.menu, foreground: .primary)
-                                        .frame(
-                                            width: HorusStyle.iconButtonSize,
-                                            height: HorusStyle.iconButtonSize
-                                        )
-                                        .contentShape(Rectangle())
-                                }
-                                .tint(.primary)
-                                .accessibilityLabel(sidebarIsOpen ? "Hide sidebar" : "Show sidebar")
-                            }
-                        }
-                }
+                detailNavigation
             }
         } else {
             splitView
@@ -178,15 +152,53 @@ struct AppShell: View {
             SidebarView(showDetail: showDetail)
                 .navigationSplitViewColumnWidth(min: 230, ideal: 272, max: 340)
         } detail: {
-            destination
+            detailNavigation
         }
         .navigationSplitViewStyle(.balanced)
     }
 
+    private var detailNavigation: some View {
+        @Bindable var model = model
+        return NavigationStack(path: $model.chatNavigationPath) {
+            destination
+                .navigationDestination(for: ChatRoute.self) { route in
+                    switch route {
+                    case .session: ChatView()
+                    }
+                }
+                .toolbar {
+                    if horizontalSizeClass == .compact && model.chatNavigationPath.isEmpty {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button {
+                                // The keyboard belongs to the page being slid away; left
+                                // up, it animates against a screen the reader just left.
+                                model.dismissComposerFocus()
+                                withAnimation(SidebarDrawerMetrics.animation) {
+                                    sidebarIsOpen.toggle()
+                                }
+                            } label: {
+                                // A bare glyph is a 16pt target. Every other icon button
+                                // in the app pads itself out to a full one, and without
+                                // that this took two or three tries to hit.
+                                HorusIcon(.menu, foreground: .primary)
+                                    .frame(
+                                        width: HorusStyle.iconButtonSize,
+                                        height: HorusStyle.iconButtonSize
+                                    )
+                                    .contentShape(Rectangle())
+                            }
+                            .tint(.primary)
+                            .accessibilityLabel(sidebarIsOpen ? "Hide sidebar" : "Show sidebar")
+                        }
+                    }
+                }
+        }
+    }
+
     @ViewBuilder
     private var destination: some View {
-        switch model.destination ?? .chat {
-        case .chat: ChatView()
+        switch model.destination ?? .chats {
+        case .chats: ChatsView()
         case .gateway: GatewayView()
         case .agent: AgentSettingsView(scope: .gatewayDefault)
         case .providers: ProvidersView()
@@ -222,28 +234,31 @@ struct AppShell: View {
         // round trip through `.sidebar` here to re-fire a transition; nothing pushes now.
         if horizontalSizeClass == .compact {
             withAnimation(SidebarDrawerMetrics.animation) {
+                model.chatRoute = nil
                 model.destination = destination
                 sidebarIsOpen = false
             }
             return
         }
+        model.chatRoute = nil
         model.destination = destination
         compactColumn = .detail
     }
 
     private var chatIsVisible: Bool {
         guard !model.accounts.isEmpty,
-              model.destination == .chat,
+              model.destination == .chats,
+              !model.chatNavigationPath.isEmpty,
               scenePhase == .active,
               !model.isAppLocked,
               !model.showsPairing,
-              !model.showsWorkspaceBrowser
+              !model.showsWorkspaceBrowser,
+              !model.showsInspector
         else { return false }
         // The drawer, not the split view's column, decides whether the chat is on screen in
         // compact: `compactColumn` no longer moves there, so reading it would report the chat
         // permanently hidden and stop delivering it as visible.
-        return horizontalSizeClass != .compact
-            || !sidebarIsOpen && !model.showsInspector
+        return horizontalSizeClass != .compact || !sidebarIsOpen
     }
 }
 
@@ -679,6 +694,7 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
 
     private func accepts(_ value: DragGesture.Value) -> Bool {
         guard abs(value.translation.width) > abs(value.translation.height) else { return false }
+        if !isOpen, !model.chatNavigationPath.isEmpty { return false }
         return isOpen || value.startLocation.x <= SidebarDrawerMetrics.edgeCatch
     }
 
@@ -694,16 +710,11 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
 }
 
 struct SidebarView: View {
-    private static let sessionPageSize = 10
-
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.horusPalette) private var palette
     let showDetail: (AppDestination) -> Void
-    @State private var collapsedWorkspaces: Set<String> = []
-    @State private var visibleSessionCounts: [String: Int] = [:]
     @State private var showsConnectionDetails = false
-    @State private var showsAttentionOnly = false
 
     var body: some View {
         ScrollView {
@@ -746,6 +757,7 @@ struct SidebarView: View {
                 .padding(.vertical, HorusSpace.m)
 
                 VStack(alignment: .leading, spacing: HorusSpace.xxs) {
+                    navigationButton("Chats", destination: .chats)
                     navigationButton("Gateway", destination: .gateway)
                     navigationButton("Providers", destination: .providers)
                     navigationButton("Default agent", destination: .agent)
@@ -756,41 +768,6 @@ struct SidebarView: View {
                 }
                 .padding(.horizontal, HorusSpace.m)
                 .padding(.bottom, HorusSpace.m)
-
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack(spacing: 0) {
-                        navigationButton("Chats", destination: .chat)
-                        Button {
-                            showsAttentionOnly.toggle()
-                        } label: {
-                            HorusIcon(.notificationSquare)
-                        }
-                        .buttonStyle(HorusIconButtonStyle(
-                            prominent: showsAttentionOnly,
-                            bare: true
-                        ))
-                        .accessibilityLabel("Filter chats needing attention")
-                        .accessibilityValue(showsAttentionOnly ? "On" : "Off")
-                        .accessibilityAddTraits(showsAttentionOnly ? .isSelected : [])
-                        .help(
-                            showsAttentionOnly
-                                ? "Show all chats"
-                                : "Show active and unread chats"
-                        )
-                    }
-                    .padding(.horizontal, HorusSpace.m)
-
-                    LazyVStack(alignment: .leading, spacing: HorusSpace.xxs) {
-                        if sessionGroups.isEmpty {
-                            Text(emptySessionsMessage)
-                                .foregroundStyle(palette.muted)
-                        }
-                        ForEach(sessionGroups) { group in
-                            workspaceGroup(group)
-                        }
-                    }
-                    .padding(.horizontal, HorusSpace.l)
-                }
             }
             .frame(maxWidth: .infinity)
         }
@@ -799,32 +776,21 @@ struct SidebarView: View {
         // the page slides over this, so it sits a step under the canvas rather than matching it.
         .background { palette.recessed.ignoresSafeArea() }
         .safeAreaInset(edge: .bottom) {
-            HStack {
-                Button {
-                    model.openNewSession()
-                    showDetail(.chat)
-                } label: {
-                    HorusLabel(title: "New chat", glyph: .notePencil)
-                        .font(HorusStyle.controlFont)
-                }
-                .horusProminentButton()
-                .buttonBorderShape(.capsule)
-                .controlSize(.large)
-                .disabled(!model.canCreateSession)
-                .help("New chat")
-                Spacer()
-                Button {
-                    showDetail(.profile)
-                } label: {
-                    HorusIcon(.gear)
-                }
-                .buttonStyle(HorusIconButtonStyle())
-                .accessibilityLabel("Settings")
-                .help("Settings")
-            }
-            .padding(HorusSpace.m)
+            settingsButton
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, HorusSpace.m)
+                .padding(.vertical, HorusSpace.s)
         }
         .toolbarVisibility(.hidden, for: .navigationBar)
+    }
+
+    private var settingsButton: some View {
+        Button("Settings", glyph: AppDestination.profile.glyph) {
+            showDetail(.profile)
+        }
+        .labelStyle(.iconOnly)
+        .buttonStyle(HorusIconButtonStyle(prominent: model.destination == .profile))
+        .help("Settings")
     }
 
     private var connectionDetails: some View {
@@ -917,279 +883,6 @@ struct SidebarView: View {
         .frame(minHeight: HorusStyle.iconButtonSize)
     }
 
-    private var displayedSessions: [SessionRecord] {
-        guard showsAttentionOnly else { return model.sessions }
-        let attentionSessionIDs = model.attentionSessionIDs
-        return model.sessions.filter { attentionSessionIDs.contains($0.sessionId) }
-    }
-
-    private var emptySessionsMessage: String {
-        if model.sessions.isEmpty {
-            return model.connectionState.isReady ? "No chats yet" : model.connectionState.label
-        }
-        return "No chats need attention"
-    }
-
-    private var sessionGroups: [WorkspaceSessions] {
-        Dictionary(grouping: displayedSessions) {
-            $0.sessionContext.workspaceId ?? $0.sessionContext.workspaceLabel ?? "workspace"
-        }
-        .map { id, sessions in
-            let path = sessions.first?.sessionContext.workspaceLabel ?? "Workspace"
-            let name = URL(fileURLWithPath: path).lastPathComponent.nonEmpty ?? path
-            return WorkspaceSessions(
-                id: id,
-                name: name,
-                path: path,
-                sessions: sessions.sorted {
-                    if $0.pinned != $1.pinned { return $0.pinned }
-                    return $0.updatedAt > $1.updatedAt
-                }
-            )
-        }
-        .sorted {
-            if $0.id == model.workspace?.id { return true }
-            if $1.id == model.workspace?.id { return false }
-            return ($0.sessions.first?.updatedAt ?? 0) > ($1.sessions.first?.updatedAt ?? 0)
-        }
-    }
-
-    private func expansionBinding(for id: String) -> Binding<Bool> {
-        Binding(
-            get: { !collapsedWorkspaces.contains(id) },
-            set: { expanded in
-                if expanded { collapsedWorkspaces.remove(id) }
-                else { collapsedWorkspaces.insert(id) }
-            }
-        )
-    }
-
-    private func workspaceGroup(_ group: WorkspaceSessions) -> some View {
-        let visibleCount = min(
-            visibleSessionCounts[group.id, default: Self.sessionPageSize],
-            group.sessions.count
-        )
-        return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 0) {
-                Button {
-                    expansionBinding(for: group.id).wrappedValue.toggle()
-                } label: {
-                    HStack(spacing: HorusSpace.s) {
-                        HorusIcon(.folder, foreground: palette.muted)
-                        Text(group.name)
-                            .font(HorusStyle.controlFont)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        HorusIcon(
-                            collapsedWorkspaces.contains(group.id)
-                                ? .caretRight
-                                : .caretDown,
-                            size: 12,
-                            foreground: palette.muted
-                        )
-                    }
-                    .frame(
-                        maxWidth: .infinity,
-                        minHeight: HorusStyle.iconButtonSize,
-                        alignment: .leading
-                    )
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.horusPlain)
-                .accessibilityValue(
-                    collapsedWorkspaces.contains(group.id) ? "Collapsed" : "Expanded"
-                )
-                .help(group.path)
-
-                Button {
-                    model.chooseWorkspace(group.path)
-                    showDetail(.chat)
-                } label: {
-                    HorusLabel(
-                        title: "New chat in \(group.name)",
-                        glyph: .notePencil,
-                        iconColor: palette.muted,
-                        iconSize: HorusStyle.glyphInline
-                    )
-                    .labelStyle(.iconOnly)
-                    .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.horusPlain)
-                .disabled(!model.canCreateSession)
-                .help("New chat in \(group.path)")
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            if !collapsedWorkspaces.contains(group.id) {
-                ForEach(group.sessions.prefix(visibleCount)) { session in
-                    sessionRow(session)
-                }
-                if visibleCount < group.sessions.count {
-                    Button {
-                        visibleSessionCounts[group.id] = visibleCount + Self.sessionPageSize
-                    } label: {
-                        HorusLabel(
-                            title: "Load more",
-                            glyph: .arrowDown,
-                            iconColor: palette.muted,
-                            iconSize: HorusStyle.glyphInline
-                        )
-                        .font(HorusStyle.metadataFont)
-                        .foregroundStyle(palette.muted)
-                        .frame(
-                            maxWidth: .infinity,
-                            minHeight: HorusStyle.iconButtonSize,
-                            alignment: .leading
-                        )
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.horusPlain)
-                    .padding(.horizontal, HorusSpace.s)
-                    .accessibilityLabel("Load more chats in \(group.name)")
-                }
-            }
-        }
-    }
-
-    private func sessionRow(_ session: SessionRecord) -> some View {
-        let isSelected = session.sessionId == model.selectedSessionID
-        let isUnread = model.unreadSessionIDs.contains(session.sessionId)
-        let title = model.displayedTitle(for: session)
-        let activityValue: String
-        switch session.activity.state {
-        case .running:
-            activityValue = "In progress"
-        case .awaitingApproval:
-            activityValue = "Awaiting approval"
-        case .idle:
-            activityValue = isUnread ? "Finished, unread" : ""
-        }
-        return HStack(spacing: HorusSpace.xs) {
-            Button {
-                model.openSession(session.sessionId)
-                showDetail(.chat)
-            } label: {
-                HStack(spacing: HorusSpace.s) {
-                    HorusTitleText(
-                        title: title,
-                        cursorColor: isSelected ? palette.accent : .primary
-                    )
-                        .fontWeight(isSelected ? .semibold : nil)
-                        .lineLimit(1)
-                        .foregroundStyle(isSelected ? palette.accent : .primary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    SessionActivityIndicator(
-                        state: session.activity.state,
-                        isUnread: isUnread
-                    )
-                }
-                .frame(minHeight: HorusStyle.iconButtonSize)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.horusPlain)
-            .disabled(!model.canOpenSession && session.sessionId != model.selectedSessionID)
-            .accessibilityValue(activityValue)
-            .accessibilityAddTraits(isSelected ? .isSelected : [])
-
-            if session.pinned {
-                HorusIcon(.pushPin, size: HorusStyle.glyphMark, foreground: palette.accent)
-            }
-
-            Menu {
-                Button {
-                    model.setSessionPinned(session, pinned: !session.pinned)
-                } label: {
-                    HorusLabel(
-                        title: session.pinned ? "Unpin" : "Pin",
-                        glyph: session.pinned ? .pushPinSlash : .pushPin
-                    )
-                }
-                Button {
-                    model.beginRenamingSession(session)
-                } label: {
-                    HorusLabel(
-                        title: "Rename",
-                        glyph: .pencilSimple
-                    )
-                }
-                Divider()
-                Button(role: .destructive) {
-                    model.beginDeletingSession(session)
-                } label: {
-                    HorusLabel(
-                        title: "Delete",
-                        glyph: .trash
-                    )
-                }
-            } label: {
-                HorusIcon(.dotsThree)
-                    .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
-                    .contentShape(Rectangle())
-            }
-            .labelStyle(.titleAndIcon)
-            .buttonStyle(.horusPlain)
-            .tint(.primary)
-            .menuIndicator(.hidden)
-            .accessibilityLabel("Chat actions")
-            .help("Chat actions")
-        }
-        .padding(.horizontal, HorusSpace.s)
-        .frame(minHeight: HorusStyle.iconButtonSize)
-        .background(
-            isSelected ? palette.accentSoft.opacity(0.55) : .clear,
-            in: HorusStyle.controlShape
-        )
-        .overlay {
-            HorusStyle.controlShape.stroke(
-                isSelected ? palette.accent.opacity(0.5) : .clear,
-                lineWidth: HorusStyle.borderWidth
-            )
-            .allowsHitTesting(false)
-        }
-    }
-
-}
-
-private struct SessionActivityIndicator: View {
-    @Environment(\.horusPalette) private var palette
-    let state: SessionActivityState
-    let isUnread: Bool
-
-    var body: some View {
-        Group {
-            switch state {
-            case .running:
-                HorusSpinner(size: HorusStyle.glyphMark, foreground: palette.accent)
-            case .awaitingApproval:
-                Circle()
-                    .trim(from: 0.08, to: 0.76)
-                    .stroke(
-                        palette.warning,
-                        style: StrokeStyle(lineWidth: 1.7, lineCap: .round)
-                    )
-                    .rotationEffect(.degrees(-90))
-                    .frame(width: 11, height: 11)
-            case .idle:
-                if isUnread {
-                    Circle()
-                        .fill(palette.accent)
-                        .frame(width: 7, height: 7)
-                        .frame(width: 11, height: 11)
-                } else {
-                    Color.clear.frame(width: 11, height: 11)
-                }
-            }
-        }
-        .accessibilityHidden(true)
-    }
-}
-
-private struct WorkspaceSessions: Identifiable {
-    let id: String
-    let name: String
-    let path: String
-    let sessions: [SessionRecord]
 }
 
 struct PairingView: View {

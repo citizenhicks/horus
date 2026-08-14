@@ -26,7 +26,7 @@ pub mod local;
 mod process_group;
 
 pub(crate) const MAX_FILE_BYTES: usize = 1024 * 1024;
-const MAX_BINARY_FILE_BYTES: usize = 25 * 1024 * 1024;
+const MAX_BINARY_FILE_BYTES: usize = 50 * 1024 * 1024;
 
 mod text {
     include!(concat!(
@@ -169,7 +169,9 @@ pub enum SandboxMode {
 pub struct CommandOutput {
     pub exit_code: i32,
     pub stdout: String,
+    pub stdout_truncated: bool,
     pub stderr: String,
+    pub stderr_truncated: bool,
 }
 
 /// One byte stream emitted by a sandboxed command.

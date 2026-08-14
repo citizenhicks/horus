@@ -17,7 +17,7 @@ use super::{
     FrontendEventSink, Middleware, MiddlewareCommandContext, MiddlewareCommandOutput, ModelContext,
     PromptSection, RuntimeContext,
 };
-use crate::backend::checkpoint::CheckpointStore;
+use crate::backend::checkpoint::{CheckpointStore, ContextRewriteReason};
 use crate::backend::model::{ToolDefinition, internal_user_message};
 use crate::protocol::{
     EventMsg, FrontendAction, FrontendActionListItem, FrontendBlock, FrontendCommand,
@@ -40,6 +40,9 @@ const MAX_NOTES: usize = 20;
 const MAX_NOTE_BYTES: usize = 500;
 const MAX_BASIS_ID_BYTES: usize = 4 * 1024;
 const MAX_INJECTION_BYTES: usize = 4 * 1024;
+const PROJECTION_FIELD: &str = "_horus_scratchpad_projection";
+const BASELINE_KIND: &str = "scratchpad_baseline";
+const DELTA_KIND: &str = "scratchpad_delta";
 
 /// Configuration and presentation metadata for durable agent notes.
 pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
@@ -81,7 +84,7 @@ impl Basis {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Snapshot {
     session: Vec<Entry>,
     global: Vec<Entry>,
@@ -297,6 +300,21 @@ impl Middleware for Scratchpad {
             .then(|| PromptSection::new(text::PROMPT_MAIN)))
     }
 
+    fn seed_session<'a>(
+        &'a self,
+        runtime: &'a RuntimeContext,
+    ) -> BoxFuture<'a, Result<Vec<Value>>> {
+        Box::pin(async move {
+            if !self.agent_enabled {
+                return Ok(Vec::new());
+            }
+            let snapshot = self.store.snapshot(&runtime.session_id).await?;
+            Ok(scratchpad_message(&snapshot)
+                .into_iter()
+                .collect::<Vec<_>>())
+        })
+    }
+
     fn frontend(&self) -> FrontendContribution {
         FrontendContribution {
             capability: self.name().into(),
@@ -427,17 +445,17 @@ impl Middleware for Scratchpad {
         })
     }
 
-    fn decorate_model_request<'a>(
-        &'a self,
-        context: &'a mut ModelContext<'_>,
-    ) -> BoxFuture<'a, Result<()>> {
+    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             if !self.agent_enabled {
+                if let Some(input) = without_projection_items(context.input()) {
+                    context.rewrite_input(ContextRewriteReason::Scratchpad, input)?;
+                }
                 return Ok(());
             }
             let snapshot = self.store.snapshot(context.session_id).await?;
-            if let Some(input) = refreshed_input(context.request_input(), &snapshot) {
-                context.replace_request_input(input);
+            if let Some(item) = next_projection(context.input(), &snapshot)? {
+                context.append_model_input(item);
             }
             Ok(())
         })
@@ -881,24 +899,51 @@ fn basis_label(basis: &Basis) -> &'static str {
     }
 }
 
-fn refreshed_input(input: &[Value], snapshot: &Snapshot) -> Option<Vec<Value>> {
-    let mut refreshed = input
-        .iter()
-        .filter(|item| internal_message_kind(item) != Some("scratchpad"))
-        .cloned()
-        .collect::<Vec<_>>();
-    if let Some(message) = scratchpad_message(snapshot) {
-        let insertion = usize::from(
-            refreshed
-                .first()
-                .is_some_and(|item| internal_message_kind(item) == Some("compaction")),
-        );
-        refreshed.insert(insertion, message);
+pub(crate) fn is_projection_item(item: &Value) -> bool {
+    matches!(
+        internal_message_kind(item),
+        Some(BASELINE_KIND) | Some(DELTA_KIND)
+    ) && item.get(PROJECTION_FIELD).is_some()
+}
+
+fn without_projection_items(input: &[Value]) -> Option<Vec<Value>> {
+    input.iter().any(is_projection_item).then(|| {
+        input
+            .iter()
+            .filter(|item| !is_projection_item(item))
+            .cloned()
+            .collect()
+    })
+}
+
+fn next_projection(input: &[Value], snapshot: &Snapshot) -> Result<Option<Value>> {
+    let Some(previous) = latest_projection(input)? else {
+        return Ok(scratchpad_message(snapshot));
+    };
+    if previous == *snapshot {
+        return Ok(None);
     }
-    (refreshed != input).then_some(refreshed)
+    Ok(Some(scratchpad_delta(&previous, snapshot)))
+}
+
+fn latest_projection(input: &[Value]) -> Result<Option<Snapshot>> {
+    let Some(item) = input.iter().rev().find(|item| is_projection_item(item)) else {
+        return Ok(None);
+    };
+    let projection = item
+        .get(PROJECTION_FIELD)
+        .cloned()
+        .ok_or_else(|| Error::Checkpoint("scratchpad projection is missing data".into()))?;
+    serde_json::from_value(projection)
+        .map(Some)
+        .map_err(|error| Error::Checkpoint(format!("invalid scratchpad projection: {error}")))
 }
 
 fn scratchpad_message(snapshot: &Snapshot) -> Option<Value> {
+    scratchpad_text(snapshot).map(|text| projection_item(BASELINE_KIND, text, snapshot))
+}
+
+fn scratchpad_text(snapshot: &Snapshot) -> Option<String> {
     if snapshot.session.is_empty() && snapshot.global.is_empty() {
         return None;
     }
@@ -917,7 +962,77 @@ fn scratchpad_message(snapshot: &Snapshot) -> Option<Value> {
     append_scope(&mut text, "Session", &snapshot.session, session_budget);
     append_scope(&mut text, "Global", &snapshot.global, global_budget);
     text.push_str(FOOTER);
-    Some(internal_user_message("scratchpad", &text))
+    Some(text)
+}
+
+fn projection_item(kind: &str, text: String, snapshot: &Snapshot) -> Value {
+    let mut item = internal_user_message(kind, &text);
+    item[PROJECTION_FIELD] = serde_json::to_value(snapshot).expect("scratchpad is serializable");
+    item
+}
+
+fn scratchpad_delta(previous: &Snapshot, current: &Snapshot) -> Value {
+    const HEADER: &str =
+        "<scratchpad update>\nApply these changes to the prior scratchpad context.\n";
+    const FOOTER: &str = "</scratchpad update>";
+    let mut text = String::with_capacity(MAX_INJECTION_BYTES);
+    text.push_str(HEADER);
+    let limit = MAX_INJECTION_BYTES - FOOTER.len();
+    append_delta_scope(
+        &mut text,
+        "Session",
+        &previous.session,
+        &current.session,
+        limit,
+    );
+    append_delta_scope(
+        &mut text,
+        "Global",
+        &previous.global,
+        &current.global,
+        limit,
+    );
+    text.push_str(FOOTER);
+    projection_item(DELTA_KIND, text, current)
+}
+
+fn append_delta_scope(
+    output: &mut String,
+    label: &str,
+    previous: &[Entry],
+    current: &[Entry],
+    limit: usize,
+) {
+    let heading = format!("{label}:\n");
+    if output.len() + heading.len() > limit {
+        return;
+    }
+    let mut lines = Vec::new();
+    for entry in current {
+        let operation = match previous.iter().find(|old| old.id == entry.id) {
+            None => "added",
+            Some(old) if old != entry => "updated",
+            Some(_) => continue,
+        };
+        lines.push((operation, entry));
+    }
+    for entry in previous {
+        if current.iter().all(|new| new.id != entry.id) {
+            lines.push(("removed", entry));
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    output.push_str(&heading);
+    for (operation, entry) in lines {
+        let note = serde_json::to_string(&entry.note).unwrap_or_else(|_| "\"invalid note\"".into());
+        let line = format!("- {operation} [{id}] {note}\n", id = entry.id);
+        if output.len() + line.len() > limit {
+            break;
+        }
+        output.push_str(&line);
+    }
 }
 
 fn append_scope(output: &mut String, label: &str, entries: &[Entry], budget: usize) {
@@ -1245,36 +1360,116 @@ mod tests {
         );
     }
 
+    fn runtime(store: &ScratchpadStore, session_id: &str) -> RuntimeContext {
+        RuntimeContext {
+            checkpoints: Arc::clone(&store.checkpoints),
+            session_id: session_id.into(),
+            model_route: "model".into(),
+            session_context: crate::protocol::SessionContext::default(),
+            metadata: Default::default(),
+            queued_input: crate::middleware::QueuedInputSnapshot::default(),
+            frontend: frontend_sink(),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_session_seeds_one_bounded_baseline_projection() {
+        let (_temporary, store) = store().await;
+        store
+            .write_session("session", "remember this")
+            .await
+            .expect("write note");
+        let middleware = Scratchpad::new(store.clone());
+        let seeded = middleware
+            .seed_session(&runtime(&store, "session"))
+            .await
+            .expect("seed session");
+
+        assert_eq!(seeded.len(), 1);
+        assert_eq!(internal_message_kind(&seeded[0]), Some(BASELINE_KIND));
+        assert!(is_projection_item(&seeded[0]));
+        assert!(
+            seeded[0]["content"][0]["text"]
+                .as_str()
+                .expect("baseline text")
+                .len()
+                <= MAX_INJECTION_BYTES
+        );
+        assert_eq!(
+            serde_json::from_value::<Snapshot>(seeded[0][PROJECTION_FIELD].clone())
+                .expect("projection"),
+            store.snapshot("session").await.expect("snapshot")
+        );
+    }
+
     #[test]
-    fn injection_is_fresh_deduplicated_bounded_and_keeps_compaction_first() {
-        let long = "x".repeat(MAX_NOTE_BYTES);
+    fn unchanged_projection_is_a_no_op() {
         let snapshot = Snapshot {
-            session: (0..MAX_NOTES).map(|_| entry(&long)).collect(),
-            global: (0..MAX_NOTES).map(|_| entry(&long)).collect(),
+            session: vec![entry("same")],
+            global: Vec::new(),
         };
+        let input = vec![scratchpad_message(&snapshot).expect("baseline")];
+
+        assert!(
+            next_projection(&input, &snapshot)
+                .expect("compare projection")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn disabled_scratchpad_removes_durable_projection_items() {
+        let snapshot = Snapshot {
+            session: vec![entry("private note")],
+            global: Vec::new(),
+        };
+        let user = crate::backend::model::user_message("hello");
         let input = vec![
-            internal_user_message("compaction", "summary"),
-            internal_user_message("scratchpad", "stale"),
-            internal_user_message("scratchpad", "duplicate"),
+            scratchpad_message(&snapshot).expect("baseline"),
+            user.clone(),
+        ];
+
+        let cleaned = without_projection_items(&input).expect("projection cleanup");
+
+        assert_eq!(cleaned, vec![user]);
+    }
+
+    #[test]
+    fn changed_projection_appends_a_bounded_delta_without_replacing_context() {
+        let previous = Snapshot {
+            session: vec![entry("old")],
+            global: Vec::new(),
+        };
+        let mut current = previous.clone();
+        current.session.push(entry("new"));
+        let baseline = scratchpad_message(&previous).expect("baseline");
+        let input = vec![
+            baseline.clone(),
             crate::backend::model::user_message("hello"),
         ];
 
-        let refreshed = refreshed_input(&input, &snapshot).expect("refresh");
-        assert_eq!(internal_message_kind(&refreshed[0]), Some("compaction"));
-        assert_eq!(
-            refreshed
-                .iter()
-                .filter(|item| internal_message_kind(item) == Some("scratchpad"))
-                .count(),
-            1
+        let delta = next_projection(&input, &current)
+            .expect("compare projection")
+            .expect("delta");
+        assert_eq!(internal_message_kind(&delta), Some(DELTA_KIND));
+        assert!(is_projection_item(&delta));
+        assert!(
+            delta["content"][0]["text"]
+                .as_str()
+                .expect("delta text")
+                .contains("added")
         );
-        let text = refreshed[1]["content"][0]["text"]
-            .as_str()
-            .expect("scratchpad text");
-        assert!(text.len() <= MAX_INJECTION_BYTES);
-        assert!(text.contains("Session (newest first)"));
-        assert!(text.contains("Global (newest first)"));
-        assert!(refreshed_input(&refreshed, &snapshot).is_none());
+        assert!(
+            delta["content"][0]["text"]
+                .as_str()
+                .expect("delta text")
+                .len()
+                <= MAX_INJECTION_BYTES
+        );
+        assert_eq!(
+            input,
+            vec![baseline, crate::backend::model::user_message("hello")]
+        );
     }
 
     #[test]

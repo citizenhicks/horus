@@ -17,8 +17,10 @@ use crate::Result;
 use crate::backend::checkpoint::ExecutionOutcome;
 use crate::backend::checkpoint::PendingApproval;
 use crate::backend::model::ModelRequest;
+use crate::backend::model::PromptCacheIdentity;
 use crate::backend::model::ToolCall;
 use crate::backend::model::ToolDefinition;
+use crate::backend::model::prompt_cache_key;
 use crate::backend::model::tool_output;
 use crate::backend::model::user_message;
 use crate::backend::sandbox::ApprovalReviewerConfig;
@@ -190,10 +192,15 @@ impl Runner {
         self.record_model_call()?;
         let model = Arc::clone(&self.config.model);
         let review_session_id = self.review_session_id.clone();
+        let cache_key = prompt_cache_key(&review_session_id);
         let response = model.respond(
             &route,
             ModelRequest {
                 session_id: &review_session_id,
+                prompt_cache: Some(PromptCacheIdentity {
+                    key: &cache_key,
+                    context_epoch: 0,
+                }),
                 instructions: &instructions,
                 input: &input,
                 tools: &[],
