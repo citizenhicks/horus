@@ -20,6 +20,36 @@ fn model_request() -> ModelRequest<'static> {
     }
 }
 
+#[test]
+fn implicit_prompt_cache_omits_options() {
+    let provider = OpenAiSocket::with_authorization(
+        Arc::new(ApiKeyAuthorization::new("test-key".into())),
+        "https://example.com/v1",
+        "wss://example.com/v1/responses",
+        "test-model",
+        reqwest::Client::new(),
+    )
+    .expect("provider");
+    let body = response_body(
+        "test-model",
+        &model_request(),
+        &[],
+        None,
+        None,
+        &[],
+        provider.explicit_prompt_cache,
+    )
+    .expect("response body");
+
+    assert_eq!(
+        (
+            provider.prompt_cache_capability(),
+            body.get("prompt_cache_options")
+        ),
+        (PromptCacheCapability::Implicit, None)
+    );
+}
+
 fn completed_events(text: &str, response_id: &str) -> [Value; 2] {
     [
         serde_json::json!({

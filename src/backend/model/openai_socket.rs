@@ -93,6 +93,7 @@ pub struct OpenAiSocket {
     model: String,
     reasoning_effort: Option<String>,
     hosted_tools: Vec<Value>,
+    explicit_prompt_cache: bool,
     sessions: Mutex<BTreeMap<String, Arc<Mutex<SocketState>>>>,
     http: OpenAi,
 }
@@ -166,6 +167,7 @@ impl OpenAiSocket {
             model,
             client,
         )
+        .map(Self::with_explicit_prompt_cache)
     }
 
     pub(super) fn with_authorization(
@@ -176,17 +178,23 @@ impl OpenAiSocket {
         client: reqwest::Client,
     ) -> Result<Self> {
         let model = model.into();
-        let http = OpenAi::with_authorization(Arc::clone(&auth), http_url, model.clone(), client)?
-            .with_explicit_prompt_cache();
+        let http = OpenAi::with_authorization(Arc::clone(&auth), http_url, model.clone(), client)?;
         Ok(Self {
             auth,
             socket_url: socket_url.into(),
             model,
             reasoning_effort: None,
             hosted_tools: Vec::new(),
+            explicit_prompt_cache: false,
             sessions: Mutex::new(BTreeMap::new()),
             http,
         })
+    }
+
+    fn with_explicit_prompt_cache(mut self) -> Self {
+        self.explicit_prompt_cache = true;
+        self.http = self.http.with_explicit_prompt_cache();
+        self
     }
 
     /// Selects a Responses reasoning effort.
@@ -292,6 +300,7 @@ impl OpenAiSocket {
                 previous_response_id.as_deref(),
                 self.reasoning_effort.as_deref(),
                 &self.hosted_tools,
+                self.explicit_prompt_cache,
             )?;
             match exchange(&mut connection, &body, &events).await? {
                 Exchange::Completed(response) => {
@@ -528,7 +537,11 @@ impl Model for OpenAiSocket {
     }
 
     fn prompt_cache_capability(&self) -> PromptCacheCapability {
-        PromptCacheCapability::Explicit
+        if self.explicit_prompt_cache {
+            PromptCacheCapability::Explicit
+        } else {
+            PromptCacheCapability::Implicit
+        }
     }
 
     fn pricing(&self) -> Option<ModelPricing> {
@@ -824,12 +837,13 @@ fn response_body(
     previous_response_id: Option<&str>,
     reasoning_effort: Option<&str>,
     hosted_tools: &[Value],
+    explicit_prompt_cache: bool,
 ) -> Result<Value> {
     let mut body = serde_json::json!({
         "type": "response.create",
         "model": model,
         "instructions": request.instructions,
-        "input": wire_input_with_cache(input, true, true)?,
+        "input": wire_input_with_cache(input, true, explicit_prompt_cache)?,
         "tools": wire_tools(request.tools, hosted_tools, request.allow_hosted_tools),
         "tool_choice": "auto",
         "parallel_tool_calls": true,
@@ -839,7 +853,9 @@ fn response_body(
     if let Some(prompt_cache) = request.prompt_cache {
         body["prompt_cache_key"] = Value::String(prompt_cache.key.into());
     }
-    body["prompt_cache_options"] = serde_json::json!({"mode": "explicit"});
+    if explicit_prompt_cache {
+        body["prompt_cache_options"] = serde_json::json!({"mode": "explicit"});
+    }
     if let Some(response_id) = previous_response_id {
         body["previous_response_id"] = Value::String(response_id.into());
     }
