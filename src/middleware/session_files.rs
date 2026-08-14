@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
 
 use base64::Engine as _;
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tempfile::TempPath;
@@ -24,6 +26,7 @@ const MAX_SESSION_FILES: usize = 128;
 const MAX_SESSION_ID_BYTES: usize = 4 * 1024;
 const MAX_VALIDATED_BLOBS: usize = 1_024;
 const BLOB_DIR: &str = "blobs";
+const ATTACHMENT_WORKSPACE_FILE: &str = ".attachment-workspace.json";
 const METADATA_FILE: &str = ".session-file.json";
 
 /// One bounded range read from a stored session file.
@@ -80,6 +83,12 @@ struct StoredSessionFile {
     origin: SessionFileOrigin,
     file: SessionFileReference,
     content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAttachmentWorkspace {
+    path: PathBuf,
 }
 
 impl SessionFileStore {
@@ -151,6 +160,36 @@ impl SessionFileStore {
             .await
     }
 
+    pub(crate) async fn register_attachment_workspace(
+        &self,
+        session_id: &str,
+        workspace: &Path,
+    ) -> Result<()> {
+        validate_session_id(session_id)?;
+        let workspace = tokio::fs::canonicalize(workspace).await?;
+        if !workspace.is_dir() {
+            return Err(Error::Config(
+                "attachment workspace is not a directory".into(),
+            ));
+        }
+        self.ensure_initialized().await?;
+        let _commit = self.commits.lock().await;
+        let directory = self.session_dir(session_id);
+        ensure_private_dir(&directory).await?;
+        let stored = StoredAttachmentWorkspace { path: workspace };
+        let destination = directory.join(ATTACHMENT_WORKSPACE_FILE);
+        match load_attachment_workspace(&destination).await {
+            Ok(existing) if existing == stored => Ok(()),
+            Ok(_) => Err(Error::Config(
+                "attachment workspace changed for the active session".into(),
+            )),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                save_attachment_workspace(&directory, &stored).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Permanently removes every upload and artifact owned by one idle session.
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
         validate_session_id(session_id)?;
@@ -169,6 +208,10 @@ impl SessionFileStore {
         let directory = self.session_dir(session_id);
         match tokio::fs::symlink_metadata(&directory).await {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                let workspace = load_optional_attachment_workspace(&directory).await?;
+                if let Some(workspace) = workspace {
+                    remove_staged_attachments(&workspace.path, session_id).await?;
+                }
                 tokio::fs::remove_dir_all(directory).await?;
             }
             Ok(_) => {
@@ -248,21 +291,16 @@ impl SessionFileStore {
 
     /// Reads a content-addressed blob after validating its size and SHA-256 identity.
     pub(crate) async fn read_content_blob(&self, content_hash: &str, size: u64) -> Result<Vec<u8>> {
-        validate_content_hash(content_hash)?;
-        let path = self.blob_path(content_hash);
-        validate_content_blob(&path, content_hash, size, &self.validated_blobs).await?;
+        let path = self.content_blob_path(content_hash, size).await?;
         Ok(tokio::fs::read(path).await?)
     }
 
-    pub(crate) async fn read_upload_chunk(
-        &self,
-        session_id: &str,
-        file_id: &str,
-        offset: u64,
-        max_bytes: usize,
-    ) -> Result<SessionFileChunk> {
-        let (file, path) = self.resolve_upload(session_id, file_id).await?;
-        read_resolved_chunk(file, path, offset, max_bytes).await
+    /// Resolves a validated content blob for workspace staging.
+    pub(crate) async fn content_blob_path(&self, content_hash: &str, size: u64) -> Result<PathBuf> {
+        validate_content_hash(content_hash)?;
+        let path = self.blob_path(content_hash);
+        validate_content_blob(&path, content_hash, size, &self.validated_blobs).await?;
+        Ok(path)
     }
 
     async fn begin(
@@ -797,6 +835,63 @@ async fn load_metadata(path: &Path) -> Result<StoredSessionFile> {
     serde_json::from_slice(&bytes).map_err(Into::into)
 }
 
+async fn load_attachment_workspace(path: &Path) -> Result<StoredAttachmentWorkspace> {
+    require_regular_file(path).await?;
+    let bytes = tokio::fs::read(path).await?;
+    if bytes.len() > 4 * 1024 {
+        return Err(Error::Tool(
+            "attachment workspace metadata exceeds size limit".into(),
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(Into::into)
+}
+
+async fn load_optional_attachment_workspace(
+    directory: &Path,
+) -> Result<Option<StoredAttachmentWorkspace>> {
+    let path = directory.join(ATTACHMENT_WORKSPACE_FILE);
+    match load_attachment_workspace(&path).await {
+        Ok(workspace) => Ok(Some(workspace)),
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn save_attachment_workspace(
+    directory: &Path,
+    workspace: &StoredAttachmentWorkspace,
+) -> Result<()> {
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    serde_json::to_writer(&mut temporary, workspace)?;
+    temporary.as_file().sync_all()?;
+    let destination = directory.join(ATTACHMENT_WORKSPACE_FILE);
+    temporary
+        .persist_noclobber(&destination)
+        .map_err(|error| error.error)?;
+    set_private_file(&destination).await
+}
+
+async fn remove_staged_attachments(workspace: &Path, session_id: &str) -> Result<()> {
+    let workspace = workspace.to_path_buf();
+    let staged = PathBuf::from(".horus")
+        .join("attachments")
+        .join(attachment_staging_session_name(session_id));
+    tokio::task::spawn_blocking(move || {
+        let directory = match Dir::open_ambient_dir(workspace, ambient_authority()) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(Error::from(error)),
+        };
+        match directory.remove_dir_all(staged) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    })
+    .await
+    .map_err(|error| Error::Tool(format!("attachment cleanup task failed: {error}")))?
+}
+
 async fn save_metadata(directory: &Path, file: &StoredSessionFile) -> Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
     serde_json::to_writer(&mut temporary, file)?;
@@ -834,6 +929,10 @@ fn validate_content_hash(content_hash: &str) -> Result<()> {
         return Err(Error::Tool("session file content hash is invalid".into()));
     }
     Ok(())
+}
+
+pub(crate) fn attachment_staging_session_name(session_id: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(session_id.as_bytes()))
 }
 
 async fn hash_file(path: &Path) -> Result<String> {
@@ -1331,13 +1430,6 @@ mod tests {
         );
         assert!(store.read_upload_all("session", &file).await.is_err());
         assert!(store.verify_upload("session", &file).await.is_err());
-        assert!(
-            store
-                .read_upload_chunk("session", &file.id, 0, 16)
-                .await
-                .is_err()
-        );
-
         let reopened = SessionFileStore::new(state.path());
         assert_eq!(
             reopened

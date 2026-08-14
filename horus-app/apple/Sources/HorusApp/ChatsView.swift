@@ -74,14 +74,14 @@ struct ChatsView: View {
             ToolbarItem(placement: .primaryAction) {
                 organizationMenu
             }
-            ToolbarSpacer(.flexible, placement: .bottomBar)
+            DefaultToolbarItem(kind: .search, placement: .bottomBar)
+            ToolbarSpacer(.fixed, placement: .bottomBar)
             ToolbarItem(placement: .bottomBar) {
                 newChatButton
             }
-            DefaultToolbarItem(kind: .search, placement: .bottomBar)
         }
         .searchable(text: $searchText, prompt: "Search chats")
-        .searchToolbarBehavior(.minimize)
+        .searchToolbarBehavior(.automatic)
         .searchPresentationToolbarBehavior(.avoidHidingContent)
     }
 
@@ -150,15 +150,14 @@ struct ChatsView: View {
     }
 
     private var newChatButton: some View {
-        Button {
+        Button("New chat", glyph: .notePencil) {
             model.openNewSession()
-        } label: {
-            HorusLabel(title: "New chat", glyph: .notePencil)
-                .font(HorusStyle.controlFont)
         }
+        .labelStyle(.iconOnly)
         .horusProminentButton()
-        .buttonBorderShape(.capsule)
+        .buttonBorderShape(.circle)
         .controlSize(.large)
+        .frame(width: HorusStyle.iconButtonSize, height: HorusStyle.iconButtonSize)
         .disabled(!model.canCreateSession)
         .accessibilityHint("Choose a workspace for the new chat")
         .help("New chat")

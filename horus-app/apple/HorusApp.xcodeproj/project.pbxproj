@@ -21,7 +21,7 @@
 		20000000000000000000000B /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000000B /* Assets.xcassets */; };
 		20000000000000000000000C /* GatewayWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000007 /* GatewayWire.swift */; };
 		20000000000000000000000D /* GatewayWireTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000000C /* GatewayWireTests.swift */; };
-		200000000000000000000011 /* MarkdownView in Frameworks */ = {isa = PBXBuildFile; productRef = 800000000000000000000001 /* MarkdownView */; };
+		200000000000000000000011 /* SwiftStreamingMarkdown in Frameworks */ = {isa = PBXBuildFile; productRef = 800000000000000000000001 /* SwiftStreamingMarkdown */; };
 		200000000000000000000012 /* HighlightSwift in Frameworks */ = {isa = PBXBuildFile; productRef = 800000000000000000000002 /* HighlightSwift */; };
 		200000000000000000000013 /* GatewayStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000006 /* GatewayStore.swift */; };
 		200000000000000000000014 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000010 /* PrivacyInfo.xcprivacy */; };
@@ -100,7 +100,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				200000000000000000000011 /* MarkdownView in Frameworks */,
+				200000000000000000000011 /* SwiftStreamingMarkdown in Frameworks */,
 				200000000000000000000012 /* HighlightSwift in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -210,7 +210,7 @@
 			);
 			name = HorusApp;
 			packageProductDependencies = (
-				800000000000000000000001 /* MarkdownView */,
+				800000000000000000000001 /* SwiftStreamingMarkdown */,
 				800000000000000000000002 /* HighlightSwift */,
 			);
 			productName = Horus;
@@ -263,7 +263,7 @@
 			);
 			mainGroup = 000000000000000000000002;
 			packageReferences = (
-				700000000000000000000001 /* XCRemoteSwiftPackageReference "MarkdownView" */,
+				700000000000000000000001 /* XCRemoteSwiftPackageReference "SwiftStreamingMarkdown" */,
 				700000000000000000000002 /* XCRemoteSwiftPackageReference "HighlightSwift" */,
 			);
 			productRefGroup = 000000000000000000000003 /* Products */;
@@ -456,7 +456,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 104;
+				CURRENT_PROJECT_VERSION = 109;
 				DEVELOPMENT_TEAM = 3T68GZFAR6;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -474,7 +474,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.8.0;
+				MARKETING_VERSION = 0.8.1;
 				PRODUCT_BUNDLE_IDENTIFIER = app.horus.client;
 				PRODUCT_NAME = Horus;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -493,7 +493,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 104;
+				CURRENT_PROJECT_VERSION = 109;
 				DEVELOPMENT_TEAM = 3T68GZFAR6;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/HorusApp/Info.plist;
@@ -510,7 +510,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.8.0;
+				MARKETING_VERSION = 0.8.1;
 				PRODUCT_BUNDLE_IDENTIFIER = app.horus.client;
 				PRODUCT_NAME = Horus;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -595,12 +595,12 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		700000000000000000000001 /* XCRemoteSwiftPackageReference "MarkdownView" */ = {
+		700000000000000000000001 /* XCRemoteSwiftPackageReference "SwiftStreamingMarkdown" */ = {
 			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/LiYanan2004/MarkdownView.git";
+			repositoryURL = "https://github.com/microsoft/SwiftStreamingMarkdown.git";
 			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 3.0.0;
+				kind = revision;
+				revision = 5f7c04e0558df6146f90d482edb62cb456986bda;
 			};
 		};
 		700000000000000000000002 /* XCRemoteSwiftPackageReference "HighlightSwift" */ = {
@@ -614,10 +614,10 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		800000000000000000000001 /* MarkdownView */ = {
+		800000000000000000000001 /* SwiftStreamingMarkdown */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 700000000000000000000001 /* XCRemoteSwiftPackageReference "MarkdownView" */;
-			productName = MarkdownView;
+			package = 700000000000000000000001 /* XCRemoteSwiftPackageReference "SwiftStreamingMarkdown" */;
+			productName = SwiftStreamingMarkdown;
 		};
 		800000000000000000000002 /* HighlightSwift */ = {
 			isa = XCSwiftPackageProductDependency;

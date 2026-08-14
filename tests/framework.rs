@@ -1078,17 +1078,26 @@ async fn attachment_hydration_runs_after_native_compaction_replaces_context() {
 }
 
 #[tokio::test]
-async fn video_attachments_do_not_require_image_input_support() {
+async fn video_attachments_are_exposed_as_workspace_files() {
     let workspace = TempDir::new().expect("create workspace");
+    let state = TempDir::new().expect("create state directory");
     let session_id = "video-attachment";
-    let store = SessionFileStore::new(workspace.path());
+    let store = SessionFileStore::new(state.path());
+    let video = b"\0\0\0\x14ftypqt  \xff";
     let attachment =
-        upload_attachment(&store, session_id, "clip.mov", "video/quicktime", b"video").await;
-    let model = Arc::new(ScriptedModel::new(vec![text_response("done")]));
+        upload_attachment(&store, session_id, "clip.mov", "video/quicktime", video).await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        tool_response("list-video", "list_attachments", serde_json::json!({})),
+        text_response("done"),
+    ]));
     let config = test_config(
         workspace.path(),
         Arc::clone(&model),
-        vec![Arc::new(Attachments::new(store))],
+        vec![Arc::new(
+            Attachments::new(store.clone())
+                .with_workspace(workspace.path())
+                .expect("configure attachment workspace"),
+        )],
     )
     .session_id(session_id);
     let mut agent = create_agent(config).await.expect("create agent");
@@ -1102,11 +1111,73 @@ async fn video_attachments_do_not_require_image_input_support() {
         .expect("submit attachment turn");
 
     assert_eq!(final_message(&mut agent).await, "done");
-    let requests = model.requests.lock().expect("requests");
-    assert_eq!(request_image_count(&requests[0].input), 0);
-    let input = serde_json::to_string(&requests[0].input).expect("serialize request");
-    assert!(input.contains("User-attached files available"));
-    assert!(input.contains(&attachment.id));
+    {
+        let requests = model.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["list_attachments"]
+        );
+        assert_eq!(request_image_count(&requests[0].input), 0);
+        let input = serde_json::to_string(&requests[0].input).expect("serialize request");
+        assert!(input.contains("User-attached files available"));
+        assert!(input.contains(&attachment.id));
+        assert!(input.contains("path: .horus/attachments/"));
+        let tool_output = requests[1]
+            .input
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .and_then(|item| item.get("output"))
+            .and_then(Value::as_str)
+            .expect("attachment list output");
+        assert!(tool_output.contains(".horus/attachments/"));
+    }
+
+    let attachments = workspace.path().join(".horus/attachments");
+    let session = std::fs::read_dir(&attachments)
+        .expect("list staged sessions")
+        .next()
+        .expect("staged session")
+        .expect("read staged session")
+        .path();
+    let attachment_dir = session.join(&attachment.id);
+    assert_eq!(
+        std::fs::read_dir(&attachment_dir)
+            .expect("list staged attachment")
+            .count(),
+        1
+    );
+    let staged_file = attachment_dir.join(&attachment.name);
+    assert_eq!(
+        std::fs::read(&staged_file).expect("read staged video"),
+        video
+    );
+    let blob = std::fs::read_dir(state.path().join("session-files/blobs"))
+        .expect("list blobs")
+        .next()
+        .expect("stored blob")
+        .expect("read stored blob")
+        .path();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let staged = std::fs::metadata(&staged_file).expect("staged metadata");
+        let blob = std::fs::metadata(&blob).expect("blob metadata");
+        assert_ne!((staged.dev(), staged.ino()), (blob.dev(), blob.ino()));
+    }
+    std::fs::write(&staged_file, b"workspace edit").expect("edit staged copy");
+    assert_eq!(std::fs::read(&blob).expect("read private blob"), video);
+
+    store
+        .delete_session(session_id)
+        .await
+        .expect("delete session files");
+    assert!(!session.exists());
 }
 
 #[tokio::test]

@@ -1,16 +1,17 @@
-//! User uploads and session-bound model access.
+//! User uploads exposed to the owning workspace.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine as _;
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::manifest::MiddlewareManifest;
-use super::session_files::{SessionFileChunk, SessionFileStore};
-use super::tools::{
-    Catalog, ExecutionMode, Tool, ToolContext, labeled_tool_heading, render_tool_event,
-};
+use super::session_files::{SessionFileStore, attachment_staging_session_name};
+use super::tools::{Catalog, ExecutionMode, Tool, ToolContext, render_tool_event};
 use super::{Middleware, ModelContext, PromptSection, RuntimeContext};
 use crate::backend::model::{ToolDefinition, internal_user_message};
 use crate::protocol::{
@@ -26,7 +27,6 @@ mod text {
     ));
 }
 
-const MAX_TOOL_READ_BYTES: usize = 32 * 1024;
 const MAX_DIRECT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MATERIALIZED_ATTACHMENTS_FIELD: &str = "_horus_attachment_blobs";
 
@@ -36,6 +36,8 @@ struct MaterializedAttachment {
     reference: SessionFileReference,
     content_hash: Option<String>,
     image_media_type: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
     unavailable_reason: Option<String>,
 }
 /// Configuration metadata for protected user uploads.
@@ -48,16 +50,40 @@ pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
     settings: &[],
 };
 
-/// Optional middleware exposing user uploads to the active session only.
+/// Optional middleware exposing user uploads to the owning workspace.
 #[derive(Clone)]
 pub struct Attachments {
     store: SessionFileStore,
+    workspace: Option<Arc<Dir>>,
+    workspace_path: Option<PathBuf>,
 }
 
 impl Attachments {
     #[must_use]
     pub fn new(store: SessionFileStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            workspace: None,
+            workspace_path: None,
+        }
+    }
+
+    /// Exposes uploads as workspace-local copies below the workspace's `.horus` directory.
+    ///
+    /// Every session using that workspace can read those project-local files.
+    pub fn with_workspace(mut self, workspace: impl AsRef<Path>) -> Result<Self> {
+        let workspace = std::fs::canonicalize(workspace)?;
+        if !workspace.is_dir() {
+            return Err(Error::Config(
+                "attachment workspace is not a directory".into(),
+            ));
+        }
+        self.workspace = Some(Arc::new(Dir::open_ambient_dir(
+            &workspace,
+            ambient_authority(),
+        )?));
+        self.workspace_path = Some(workspace);
+        Ok(self)
     }
 }
 
@@ -70,11 +96,19 @@ impl Middleware for Attachments {
         catalog.register(Arc::new(ListAttachments {
             store: self.store.clone(),
             session_id: runtime.session_id.clone(),
-        }))?;
-        catalog.register(Arc::new(ReadAttachment {
-            store: self.store.clone(),
-            session_id: runtime.session_id.clone(),
+            workspace: self.workspace.clone(),
         }))
+    }
+
+    fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let Some(workspace) = self.workspace_path.as_deref() else {
+                return Ok(());
+            };
+            self.store
+                .register_attachment_workspace(&context.session_id, workspace)
+                .await
+        })
     }
 
     fn prompt_section(&self, _runtime: &RuntimeContext) -> Result<Option<PromptSection>> {
@@ -92,14 +126,8 @@ impl Middleware for Attachments {
     fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
         render_tool_event(
             event,
-            |name| matches!(name, "list_attachments" | "read_attachment"),
-            |name, arguments| match name {
-                "list_attachments" => text::RENDER_LIST_ATTACHMENTS.into(),
-                "read_attachment" => {
-                    labeled_tool_heading(text::RENDER_READ_ATTACHMENT, "attachment_id", arguments)
-                }
-                _ => unreachable!("renderer is guarded by the owned tool names"),
-            },
+            |name| name == "list_attachments",
+            |_, _| text::RENDER_LIST_ATTACHMENTS.into(),
         )
     }
 
@@ -110,6 +138,20 @@ impl Middleware for Attachments {
                 return Ok(());
             };
             if materialization_matches(context.input(), message_index, &references)? {
+                for reference in &references {
+                    let content_hash = self
+                        .store
+                        .upload_content_hash(context.session_id, reference)
+                        .await?;
+                    stage_attachment(
+                        &self.store,
+                        self.workspace.as_deref(),
+                        context.session_id,
+                        reference,
+                        &content_hash,
+                    )
+                    .await?;
+                }
                 return Ok(());
             }
             if message_index + 1 != context.input().len() {
@@ -136,6 +178,32 @@ impl Middleware for Attachments {
                             reference,
                             content_hash: None,
                             image_media_type: None,
+                            path: None,
+                            unavailable_reason: Some(reason),
+                        });
+                        continue;
+                    }
+                };
+                let path = match stage_attachment(
+                    &self.store,
+                    self.workspace.as_deref(),
+                    context.session_id,
+                    &reference,
+                    &content_hash,
+                )
+                .await
+                {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let reason = error.to_string();
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        materialized.push(MaterializedAttachment {
+                            reference,
+                            content_hash: Some(content_hash),
+                            image_media_type: None,
+                            path: None,
                             unavailable_reason: Some(reason),
                         });
                         continue;
@@ -173,6 +241,7 @@ impl Middleware for Attachments {
                                         reference,
                                         content_hash: Some(content_hash),
                                         image_media_type: None,
+                                        path,
                                         unavailable_reason: Some(reason),
                                     });
                                     continue;
@@ -188,6 +257,7 @@ impl Middleware for Attachments {
                                 reference,
                                 content_hash: Some(content_hash),
                                 image_media_type: None,
+                                path,
                                 unavailable_reason: Some(reason),
                             });
                             continue;
@@ -200,6 +270,7 @@ impl Middleware for Attachments {
                     reference,
                     content_hash: Some(content_hash),
                     image_media_type,
+                    path,
                     unavailable_reason: None,
                 });
             }
@@ -313,12 +384,10 @@ fn materialization_message(attachments: &[MaterializedAttachment]) -> Result<Val
     let available = attachments
         .iter()
         .filter(|attachment| attachment.unavailable_reason.is_none())
-        .map(|attachment| attachment.reference.clone())
         .collect::<Vec<_>>();
     let unavailable = attachments
         .iter()
         .filter(|attachment| attachment.unavailable_reason.is_some())
-        .map(|attachment| attachment.reference.clone())
         .collect::<Vec<_>>();
     let mut message = internal_user_message(
         ATTACHMENT_CONTEXT_MARKER,
@@ -356,6 +425,117 @@ fn materialization_matches(
         .iter()
         .map(|attachment| &attachment.reference)
         .eq(references))
+}
+
+async fn stage_attachment(
+    store: &SessionFileStore,
+    workspace: Option<&Dir>,
+    session_id: &str,
+    reference: &SessionFileReference,
+    content_hash: &str,
+) -> Result<Option<String>> {
+    let Some(workspace) = workspace else {
+        return Ok(None);
+    };
+    let relative = staged_attachment_path(session_id, reference);
+    let destination = ensure_staging_directories(workspace, session_id, &reference.id)?;
+    let source = store
+        .content_blob_path(content_hash, reference.size)
+        .await?;
+    replace_with_copy(&source, &destination, &reference.name)?;
+    let path = relative
+        .to_str()
+        .ok_or_else(|| Error::Tool("attachment workspace path is not UTF-8".into()))?;
+    Ok(Some(path.into()))
+}
+
+fn staged_attachment_path(session_id: &str, reference: &SessionFileReference) -> PathBuf {
+    PathBuf::from(".horus")
+        .join("attachments")
+        .join(attachment_staging_session_name(session_id))
+        .join(&reference.id)
+        .join(&reference.name)
+}
+
+fn ensure_staging_directories(
+    workspace: &Dir,
+    session_id: &str,
+    attachment_id: &str,
+) -> Result<Dir> {
+    let horus = open_or_create_dir(workspace, ".horus")?;
+    let attachments = open_or_create_dir(&horus, "attachments")?;
+    let session = open_or_create_dir(&attachments, &attachment_staging_session_name(session_id))?;
+    open_or_create_dir(&session, attachment_id)
+}
+
+fn open_or_create_dir(parent: &Dir, name: &str) -> Result<Dir> {
+    match parent.create_dir(name) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let before = parent.symlink_metadata(name)?;
+    if before.is_symlink() || !before.is_dir() {
+        return Err(Error::Tool(format!(
+            "attachment workspace path is not a directory: {name}"
+        )));
+    }
+    let directory = parent.open_dir(name)?;
+    if !same_file(&before, &directory.dir_metadata()?) {
+        return Err(Error::Tool(
+            "attachment workspace directory changed while opening it".into(),
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn same_file(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_left: &cap_std::fs::Metadata, _right: &cap_std::fs::Metadata) -> bool {
+    true
+}
+
+fn replace_with_copy(source: &Path, destination: &Dir, name: &str) -> Result<()> {
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| Error::Tool("attachment blob path has no filename".into()))?;
+    let source_dir = Dir::open_ambient_dir(
+        source
+            .parent()
+            .ok_or_else(|| Error::Tool("attachment blob path has no parent".into()))?,
+        ambient_authority(),
+    )?;
+    if let Ok(existing) = destination.symlink_metadata(name)
+        && existing.is_file()
+        && !existing.is_symlink()
+    {
+        #[cfg(unix)]
+        if let Ok(source) = source_dir.metadata(source_name)
+            && !same_file(&source, &existing)
+        {
+            return Ok(());
+        }
+    }
+    let temporary = format!(".{}.copy", uuid::Uuid::new_v4());
+    source_dir
+        .copy(source_name, destination, &temporary)
+        .map_err(|error| {
+            Error::Tool(format!(
+                "attachment cannot be copied into the workspace: {error}"
+            ))
+        })?;
+    if let Err(error) = destination.rename(&temporary, destination, name) {
+        let _ = destination.remove_file(&temporary);
+        return Err(error.into());
+    }
+    let _ = destination.remove_file(&temporary);
+    Ok(())
 }
 
 fn raster_media_type(bytes: &[u8]) -> Result<&'static str> {
@@ -462,6 +642,7 @@ fn skip_gif_sub_blocks(bytes: &[u8], mut offset: usize) -> Result<usize> {
 struct ListAttachments {
     store: SessionFileStore,
     session_id: String,
+    workspace: Option<Arc<Dir>>,
 }
 
 impl Tool for ListAttachments {
@@ -488,9 +669,31 @@ impl Tool for ListAttachments {
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let _: EmptyArgs = serde_json::from_value(arguments)?;
-            Ok(serde_json::to_string(
-                &self.store.list_uploads(&self.session_id).await?,
-            )?)
+            let references = self.store.list_uploads(&self.session_id).await?;
+            let mut listed = Vec::with_capacity(references.len());
+            for reference in references {
+                let content_hash = self
+                    .store
+                    .upload_content_hash(&self.session_id, &reference)
+                    .await?;
+                let path = stage_attachment(
+                    &self.store,
+                    self.workspace.as_deref(),
+                    &self.session_id,
+                    &reference,
+                    &content_hash,
+                )
+                .await?;
+                let mut value = serde_json::to_value(reference)?;
+                if let Some(path) = path {
+                    value
+                        .as_object_mut()
+                        .expect("session file references serialize as objects")
+                        .insert("path".into(), Value::String(path));
+                }
+                listed.push(value);
+            }
+            Ok(Value::Array(listed).to_string())
         })
     }
 }
@@ -498,85 +701,6 @@ impl Tool for ListAttachments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyArgs {}
-
-struct ReadAttachment {
-    store: SessionFileStore,
-    session_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReadArgs {
-    attachment_id: String,
-    #[serde(default)]
-    offset: u64,
-}
-
-impl Tool for ReadAttachment {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_attachment".into(),
-            description: text::TOOL_READ_ATTACHMENT_DESCRIPTION.into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "attachment_id": {"type": "string", "format": "uuid"},
-                    "offset": {"type": "integer", "minimum": 0}
-                },
-                "required": ["attachment_id"],
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Parallel
-    }
-
-    fn call<'a>(
-        &'a self,
-        _context: ToolContext,
-        arguments: Value,
-    ) -> BoxFuture<'a, Result<String>> {
-        Box::pin(async move {
-            let arguments: ReadArgs = serde_json::from_value(arguments)?;
-            let chunk = self
-                .store
-                .read_upload_chunk(
-                    &self.session_id,
-                    &arguments.attachment_id,
-                    arguments.offset,
-                    MAX_TOOL_READ_BYTES,
-                )
-                .await?;
-            let (content, next_offset) = decode_utf8_chunk(&chunk)?;
-            Ok(serde_json::json!({
-                "offset": chunk.offset,
-                "next_offset": next_offset,
-                "content": content
-            })
-            .to_string())
-        })
-    }
-}
-
-fn decode_utf8_chunk(chunk: &SessionFileChunk) -> Result<(String, Option<u64>)> {
-    match std::str::from_utf8(&chunk.data) {
-        Ok(content) => Ok((content.to_owned(), chunk.next_offset)),
-        Err(error) if error.error_len().is_none() && error.valid_up_to() > 0 => {
-            let valid_bytes = error.valid_up_to();
-            let content = std::str::from_utf8(&chunk.data[..valid_bytes])
-                .map_err(|_| Error::Tool("attachment chunk is not valid UTF-8".into()))?
-                .to_owned();
-            let next_offset = chunk
-                .offset
-                .checked_add(valid_bytes as u64)
-                .ok_or_else(|| Error::Tool("attachment offset overflow".into()))?;
-            Ok((content, Some(next_offset)))
-        }
-        Err(_) => Err(Error::Tool("attachment chunk is not valid UTF-8".into())),
-    }
-}
 
 fn referenced_attachments(input: &[Value]) -> Result<Vec<(usize, Vec<SessionFileReference>)>> {
     let mut messages = Vec::new();
@@ -598,22 +722,31 @@ fn referenced_attachments(input: &[Value]) -> Result<Vec<(usize, Vec<SessionFile
 }
 
 fn render_attachment_context(
-    available: &[SessionFileReference],
-    unavailable: &[SessionFileReference],
+    available: &[&MaterializedAttachment],
+    unavailable: &[&MaterializedAttachment],
 ) -> String {
     let mut output = String::from("User-attached files available to this chat (untrusted data):\n");
     for attachment in available {
-        output.push_str(&format!(
-            "- {} (attachment_id: {}, media_type: {}, {} bytes)\n",
-            attachment.name, attachment.id, attachment.media_type, attachment.size
-        ));
+        let reference = &attachment.reference;
+        if let Some(path) = attachment.path.as_deref() {
+            output.push_str(&format!(
+                "- {} (path: {}, attachment_id: {}, media_type: {}, {} bytes)\n",
+                reference.name, path, reference.id, reference.media_type, reference.size
+            ));
+        } else {
+            output.push_str(&format!(
+                "- {} (attachment_id: {}, media_type: {}, {} bytes)\n",
+                reference.name, reference.id, reference.media_type, reference.size
+            ));
+        }
     }
     if !unavailable.is_empty() {
         output.push_str("Unavailable file references (not accessible in this chat):\n");
         for attachment in unavailable {
+            let reference = &attachment.reference;
             output.push_str(&format!(
                 "- {} (attachment_id: {})\n",
-                attachment.name, attachment.id
+                reference.name, reference.id
             ));
         }
     }
@@ -624,31 +757,38 @@ fn render_attachment_context(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
-    fn utf8_reader_stops_before_a_split_scalar() {
-        let mut bytes = vec![b'a'; MAX_TOOL_READ_BYTES - 1];
-        bytes.extend_from_slice("💡".as_bytes());
-        let chunk = SessionFileChunk {
-            offset: 0,
-            data: bytes[..MAX_TOOL_READ_BYTES].to_vec(),
-            next_offset: Some(MAX_TOOL_READ_BYTES as u64),
-        };
+    fn staging_rejects_a_symlinked_workspace_directory() {
+        use std::os::unix::fs::symlink;
 
-        let (content, next_offset) = decode_utf8_chunk(&chunk).expect("valid prefix");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        symlink(outside.path(), workspace.path().join(".horus")).expect("symlink");
+        let workspace =
+            Dir::open_ambient_dir(workspace.path(), ambient_authority()).expect("open workspace");
 
-        assert_eq!(content.len(), MAX_TOOL_READ_BYTES - 1);
-        assert_eq!(next_offset, Some((MAX_TOOL_READ_BYTES - 1) as u64));
+        assert!(ensure_staging_directories(&workspace, "session", "attachment").is_err());
     }
 
     #[test]
-    fn utf8_reader_rejects_invalid_interior_bytes() {
-        let chunk = SessionFileChunk {
-            offset: 0,
-            data: vec![b'a', 0xff, b'b'],
-            next_offset: None,
-        };
+    fn materialized_attachment_paths_are_optional_for_existing_checkpoints() {
+        let value = serde_json::json!({
+            "reference": {
+                "id": "attachment",
+                "name": "note.txt",
+                "size": 4,
+                "media_type": "text/plain"
+            },
+            "content_hash": "hash",
+            "image_media_type": null,
+            "unavailable_reason": null
+        });
 
-        assert!(decode_utf8_chunk(&chunk).is_err());
+        let materialized: MaterializedAttachment =
+            serde_json::from_value(value).expect("decode old attachment context");
+
+        assert_eq!(materialized.path, None);
     }
 
     #[test]

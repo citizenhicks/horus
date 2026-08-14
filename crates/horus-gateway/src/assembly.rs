@@ -734,7 +734,9 @@ fn build_middleware(
     }) {
         let middleware: Arc<dyn Middleware> = match feature.kind {
             BuiltinMiddleware::Sandbox => continue,
-            BuiltinMiddleware::Attachments => Arc::new(Attachments::new(session_files.clone())),
+            BuiltinMiddleware::Attachments => {
+                Arc::new(Attachments::new(session_files.clone()).with_workspace(workspace)?)
+            }
             BuiltinMiddleware::Artifacts => Arc::new(Artifacts::new(session_files.clone())),
             BuiltinMiddleware::Tools => Arc::new(Tools::coding()),
             BuiltinMiddleware::Instructions => Arc::new(Instructions::discover(workspace)?),
