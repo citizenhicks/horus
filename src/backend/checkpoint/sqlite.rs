@@ -1362,6 +1362,10 @@ mod tests {
 
     use super::*;
     use crate::backend::checkpoint::ExecutionOutcome;
+    use crate::backend::checkpoint::event_turn_page;
+    use crate::protocol::TurnAbortedEvent;
+    use crate::protocol::TurnCompleteEvent;
+    use crate::protocol::TurnStartedEvent;
 
     fn execution(session_id: &str, turn: u64) -> ExecutionRecord {
         let started_at_ms = i64::try_from(turn * 100).expect("execution start");
@@ -1857,6 +1861,137 @@ mod tests {
         assert_eq!(newest.events[0].recorded_at_ms, 20);
         assert_eq!(newest.next_before_sequence, Some(2));
         assert_eq!(older.events[0].sequence, 1);
+        assert_eq!(older.next_before_sequence, None);
+    }
+
+    #[tokio::test]
+    async fn event_turn_page_keeps_long_turns_whole() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("open checkpoint database");
+        store
+            .save(&Checkpoint::empty("session"), &[], None)
+            .await
+            .expect("save session");
+
+        for event in [
+            EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "older".into(),
+                model_context_window: None,
+            }),
+            EventMsg::Warning(crate::protocol::WarningEvent {
+                message: "older work".into(),
+            }),
+        ] {
+            store
+                .append_event(
+                    "session",
+                    0,
+                    &Event {
+                        submission_id: None,
+                        msg: event,
+                    },
+                )
+                .await
+                .expect("append older turn event");
+        }
+        for index in 0..100 {
+            store
+                .append_event(
+                    "session",
+                    index,
+                    &Event {
+                        submission_id: None,
+                        msg: EventMsg::Warning(crate::protocol::WarningEvent {
+                            message: format!("older work {index}"),
+                        }),
+                    },
+                )
+                .await
+                .expect("append long older turn");
+        }
+        store
+            .append_event(
+                "session",
+                100,
+                &Event {
+                    submission_id: None,
+                    msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                        turn_id: "older".into(),
+                        reason: "interrupted".into(),
+                    }),
+                },
+            )
+            .await
+            .expect("complete older turn");
+        store
+            .append_event(
+                "session",
+                101,
+                &Event {
+                    submission_id: None,
+                    msg: EventMsg::TurnStarted(TurnStartedEvent {
+                        turn_id: "latest".into(),
+                        model_context_window: None,
+                    }),
+                },
+            )
+            .await
+            .expect("start latest turn");
+        store
+            .append_event(
+                "session",
+                102,
+                &Event {
+                    submission_id: None,
+                    msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                        turn_id: "latest".into(),
+                    }),
+                },
+            )
+            .await
+            .expect("complete latest turn");
+        store
+            .append_event(
+                "session",
+                103,
+                &Event {
+                    submission_id: None,
+                    msg: EventMsg::Warning(crate::protocol::WarningEvent {
+                        message: "between turns".into(),
+                    }),
+                },
+            )
+            .await
+            .expect("append inter-turn metadata");
+
+        let latest = event_turn_page(&store, "session", None)
+            .await
+            .expect("load latest turn");
+        let older = event_turn_page(&store, "session", latest.next_before_sequence)
+            .await
+            .expect("load older turn");
+
+        assert!(matches!(
+            latest.into_chronological().as_slice(),
+            [
+                JournalEvent {
+                    event: Event {
+                        msg: EventMsg::TurnStarted(started),
+                        ..
+                    },
+                    ..
+                },
+                JournalEvent {
+                    event: Event {
+                        msg: EventMsg::TurnComplete(completed),
+                        ..
+                    },
+                    ..
+                }
+            ] if started.turn_id == "latest" && completed.turn_id == "latest"
+        ));
+        assert_eq!(older.events.len(), 103);
         assert_eq!(older.next_before_sequence, None);
     }
 

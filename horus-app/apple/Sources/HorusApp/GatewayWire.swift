@@ -1,7 +1,7 @@
 import Foundation
 import UIKit
 
-let gatewayProtocolVersion = 27
+let gatewayProtocolVersion = 28
 let maximumGatewayFrameBytes = 20 * 1024 * 1024
 let maximumComposerBytes = 1024 * 1024
 let maximumSessionFileReferences = 16
@@ -470,8 +470,7 @@ enum GatewayRequest: Encodable, Sendable {
     case getSessionHistory(
         requestID: String,
         sessionID: String,
-        beforeSequence: UInt64?,
-        maxEvents: Int
+        beforeSequence: UInt64?
     )
     case renameSession(requestID: String, sessionID: String, title: String)
     case setSessionPinned(requestID: String, sessionID: String, pinned: Bool)
@@ -522,6 +521,7 @@ enum GatewayRequest: Encodable, Sendable {
     )
     case switchGitBranch(requestID: String, sessionID: String, branch: String)
     case listDirectories(requestID: String, path: String, includeFiles: Bool)
+    case createWorkspaceDirectory(requestID: String, parent: String, name: String)
     case setProviderCredential(requestID: String, provider: String, apiKey: String)
     case setProviderEndpointCredential(
         requestID: String,
@@ -578,12 +578,11 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
             try container.encode(lastSequence, forKey: "lastSequence")
-        case .getSessionHistory(let requestID, let sessionID, let beforeSequence, let maxEvents):
+        case .getSessionHistory(let requestID, let sessionID, let beforeSequence):
             try container.encode("get_session_history", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
             try container.encode(beforeSequence, forKey: "beforeSequence")
-            try container.encode(maxEvents, forKey: "maxEvents")
         case .renameSession(let requestID, let sessionID, let title):
             try container.encode("rename_session", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -670,6 +669,11 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(requestID, forKey: "requestId")
             try container.encode(path, forKey: "path")
             try container.encode(includeFiles, forKey: "includeFiles")
+        case .createWorkspaceDirectory(let requestID, let parent, let name):
+            try container.encode("create_workspace_directory", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(parent, forKey: "parent")
+            try container.encode(name, forKey: "name")
         case .setProviderCredential(let requestID, let provider, let apiKey):
             try container.encode("set_provider_credential", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -1616,6 +1620,7 @@ enum FrontendPreviewUpdate: String, Decodable, Sendable {
 }
 
 struct RenderedEventRecord: Decodable, Sendable {
+    let recordedAtMs: Int64
     let event: JSONValue
     let blocks: [RenderedBlock]
 
@@ -1644,8 +1649,15 @@ struct RenderedEventRecord: Decodable, Sendable {
 }
 
 extension RenderedEventRecord {
+    init(event: JSONValue, blocks: [RenderedBlock], recordedAtMs: Int64 = 0) {
+        self.recordedAtMs = recordedAtMs
+        self.event = event
+        self.blocks = blocks
+    }
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: DynamicCodingKey.self)
+        recordedAtMs = try container.decode(Int64.self, forKey: "recordedAtMs")
         let event = try container.decode(JSONValue.self, forKey: "event")
         try AgentEventRecord.validate(event)
         self.event = event

@@ -108,6 +108,7 @@ struct HorusGlyph: Hashable {
     static let circleDot = Self("hi.circleDot")
     static let circleDotDashed = Self("hi.circleDotDashed")
     static let clock = Self("hi.clock")
+    static let combine = Self("hi.combine")
     static let copy = Self("hi.copy")
     static let cpu = Self("hi.cpu")
     static let csv = Self("hi.csv")
@@ -176,6 +177,7 @@ struct HorusGlyph: Hashable {
     static let typeCursor = Self("hi.typeCursor")
     static let typeScript = Self("hi.typeScript")
     static let userFocus = Self("hi.userFocus")
+    static let volumeHigh = Self("hi.volumeHigh")
     static let warning = Self("hi.warning")
     static let warningOctagon = Self("hi.warningOctagon")
     static let x = Self("hi.x")
@@ -583,9 +585,7 @@ enum HorusSymbol {
 
 struct HorusPalette: Sendable {
     let canvas: Color
-    /// One step under `canvas`, for the surface the canvas slides over: the compact drawer
-    /// puts the sidebar directly behind the page, and two surfaces at the same value read as
-    /// one sheet however clean the cut between them is.
+    /// Base surface behind the compact drawer and embedded document views.
     let recessed: Color
     let panel: Color
     let raised: Color
@@ -606,9 +606,10 @@ struct HorusPalette: Sendable {
     let muted: Color
     /// Label colour for anything filled with `accentFill`.
     let onAccent: Color
+    let sidebarScrim: Color
 
-    // Nord (nordtheme.com): the canvas sits below Polar Night so nord0–nord3 read as
-    // raised surfaces, with the darker Frost blue as the accent.
+    // Keep the Nord surface steps distinct: chat bubbles, tool details, and diff rows rely
+    // on this hierarchy instead of carrying one-off borders and backgrounds.
     init(_ scheme: ColorScheme) {
         onAccent = .nord6
         if scheme == .dark {
@@ -625,6 +626,7 @@ struct HorusPalette: Sendable {
             warning = .nord13
             danger = .nord11
             muted = Color(red: 0.541, green: 0.588, blue: 0.671)
+            sidebarScrim = .nord3
         } else {
             canvas = .nord6
             recessed = .nord5
@@ -640,6 +642,7 @@ struct HorusPalette: Sendable {
             warning = Color(red: 0.565, green: 0.435, blue: 0.153)
             danger = Color(red: 0.639, green: 0.263, blue: 0.310)
             muted = .nord3
+            sidebarScrim = .nord6
         }
     }
 
@@ -654,13 +657,13 @@ struct HorusPalette: Sendable {
 }
 
 private extension Color {
-    static let nord0 = Color(red: 0.180, green: 0.204, blue: 0.251)
+    static let nord0 = Color(red: 46.0 / 255.0, green: 52.0 / 255.0, blue: 64.0 / 255.0)
     static let nord1 = Color(red: 0.231, green: 0.259, blue: 0.322)
     static let nord2 = Color(red: 0.263, green: 0.298, blue: 0.369)
-    static let nord3 = Color(red: 0.298, green: 0.337, blue: 0.416)
-    static let nord4 = Color(red: 0.847, green: 0.871, blue: 0.914)
+    static let nord3 = Color(red: 76.0 / 255.0, green: 86.0 / 255.0, blue: 106.0 / 255.0)
+    static let nord4 = Color(red: 216.0 / 255.0, green: 222.0 / 255.0, blue: 233.0 / 255.0)
     static let nord5 = Color(red: 0.898, green: 0.914, blue: 0.941)
-    static let nord6 = Color(red: 0.925, green: 0.937, blue: 0.957)
+    static let nord6 = Color(red: 236.0 / 255.0, green: 239.0 / 255.0, blue: 244.0 / 255.0)
     static let nord8 = Color(red: 0.533, green: 0.753, blue: 0.816)
     static let nord10 = Color(red: 0.369, green: 0.506, blue: 0.675)
     static let nord11 = Color(red: 0.749, green: 0.380, blue: 0.416)

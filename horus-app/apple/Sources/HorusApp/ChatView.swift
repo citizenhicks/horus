@@ -268,6 +268,35 @@ private struct ChatOptionsMenu: View {
     }
 }
 
+@MainActor
+private final class MessageSpeaker {
+    private let synthesizer = AVSpeechSynthesizer()
+    private var speechTask: Task<Void, Never>?
+
+    init() {
+        synthesizer.usesApplicationAudioSession = false
+    }
+
+    func speak(_ markdown: String) {
+        speechTask?.cancel()
+        _ = synthesizer.stopSpeaking(at: .immediate)
+        speechTask = Task { [weak self] in
+            let text = await markdown.markdownToPlainText()
+            guard let self,
+                  !Task.isCancelled,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return }
+            synthesizer.speak(AVSpeechUtterance(string: text))
+        }
+    }
+
+    func stop() {
+        speechTask?.cancel()
+        speechTask = nil
+        _ = synthesizer.stopSpeaking(at: .immediate)
+    }
+}
+
 /// The transcript body shared by the full chat and read-only agent previews.
 /// Navigation, pagination, and composing controls stay with their owning surface.
 ///
@@ -277,6 +306,7 @@ struct TranscriptRowsView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var visibleRowIDs = Set<TranscriptPresentationID>()
     @State private var hasAppeared = false
+    @State private var speaker = MessageSpeaker()
     let projection: TranscriptProjection
     var activeStepID: TranscriptPresentationID?
     var collapsesLongMessages = false
@@ -301,6 +331,9 @@ struct TranscriptRowsView: View {
                 visibleRowIDs = Set(rowIDs)
             }
         }
+        .onDisappear {
+            speaker.stop()
+        }
     }
 
     @ViewBuilder
@@ -313,11 +346,18 @@ struct TranscriptRowsView: View {
                 waiting: projection.waiting.phrase(forRow: row.id),
                 onExpand: onExpandActivityGroup
             )
+        case .workedGroup:
+            WorkedForGroupView(
+                entries: row.records,
+                elapsedMs: row.elapsedMs,
+                onExpand: onExpandActivityGroup
+            )
         case .user, .narrative:
             if let entry = row.records.first {
                 TranscriptRow(
                     entry: entry,
                     isUser: row.kind == .user,
+                    speaker: speaker,
                     collapsesLongMessages: collapsesLongMessages
                 )
             }
@@ -358,12 +398,14 @@ struct TranscriptPaginationButton: View {
 ///
 /// The bottom anchor and an explicit `scrollTo` both correct the same offset, so leaving both
 /// live means the visible result is whichever ran last. Exactly one is active per mode.
+private let transcriptOrbSize: CGFloat = 144
+
 private enum TranscriptScrollMode {
     /// Parked at the end. The bottom anchor follows content growth; nothing else scrolls.
     case followingTail
     /// The reader is somewhere else. Nothing follows, and structure lands without animation.
     case freeScrolling
-    /// A page of history was prepended. The previously visible row is restored, not the tail.
+    /// A page of history was prepended. The previously visible turn is restored, not the tail.
     case restoringHistory
 
     var followsContentGrowth: Bool { self == .followingTail }
@@ -473,10 +515,6 @@ private struct TranscriptView: View {
         .onChange(of: scrollToBottomRequest) {
             withAnimation(.easeOut(duration: 0.2)) { position.scrollTo(edge: .bottom) }
         }
-        .onChange(of: model.displayedTranscript.first?.presentationID) { previous, _ in
-            guard let historyBoundaryID, historyBoundaryID == previous else { return }
-            restoreHistoryAnchor()
-        }
         .onChange(of: model.historyLoadCompletionRevision) { restoreHistoryAnchor() }
         .onChange(of: model.selectedSessionID) {
             historyBoundaryID = nil
@@ -532,8 +570,12 @@ private struct TranscriptView: View {
 
     private func restoreHistoryAnchor() {
         guard scrollMode == .restoringHistory else { return }
-        if let historyAnchorID {
-            position.scrollTo(id: historyAnchorID, anchor: .top)
+        let anchorRow = projection.rows.first { row in
+            row.id == historyAnchorID
+                || row.records.contains { $0.presentationID == historyBoundaryID }
+        }
+        if let anchorRow {
+            position.scrollTo(id: anchorRow.id, anchor: .top)
         }
         scrollMode = .freeScrolling
     }
@@ -546,7 +588,7 @@ private struct TranscriptView: View {
 
     private var emptyState: some View {
         HorusComposingOrb()
-            .frame(width: 144, height: 144)
+            .frame(width: transcriptOrbSize, height: transcriptOrbSize)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.bottom, bottomInset)
             .accessibilityHidden(true)
@@ -560,7 +602,7 @@ private struct TranscriptLoadingView: View {
         ZStack {
             HorusBackdrop()
             HorusComposingOrb()
-                .frame(width: 112, height: 112)
+                .frame(width: transcriptOrbSize, height: transcriptOrbSize)
                 .offset(y: -bottomInset / 2)
         }
         .accessibilityElement(children: .ignore)
@@ -571,10 +613,12 @@ private struct TranscriptLoadingView: View {
 private struct TranscriptRow: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
+    @State private var showsCopyConfirmation = false
     let entry: TranscriptEntry
     /// Activity never reaches this view: a run is a group row, whatever its length. The
     /// projection sends only what the reader wrote and what the agent said back.
     let isUser: Bool
+    let speaker: MessageSpeaker
     var collapsesLongMessages = false
 
     @ViewBuilder
@@ -627,8 +671,18 @@ private struct TranscriptRow: View {
 
     private var controls: some View {
         HStack(spacing: 0) {
-            MessageActionButton(title: "Copy", glyph: .copy) {
+            MessageActionButton(
+                title: showsCopyConfirmation ? "Copied" : "Copy",
+                glyph: showsCopyConfirmation ? .check : .copy
+            ) {
                 copyToPasteboard(entry.text)
+                showsCopyConfirmation = true
+            }
+            .task(id: showsCopyConfirmation) {
+                guard showsCopyConfirmation else { return }
+                try? await Task.sleep(for: .seconds(1.5))
+                guard !Task.isCancelled else { return }
+                showsCopyConfirmation = false
             }
             if let target = entry.messageTarget {
                 ForEach(model.messageActionWidgets) { widget in
@@ -639,6 +693,11 @@ private struct TranscriptRow: View {
                         model.submitMessageAction(widget, target: target)
                     }
                     .disabled(!model.canModifySelectedSession)
+                }
+            }
+            if !entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                MessageActionButton(title: "Speak", glyph: .volumeHigh) {
+                    speaker.speak(entry.text)
                 }
             }
         }
@@ -938,6 +997,7 @@ extension FileCard where Trailing == EmptyView {
 
 private struct MessageActionButton: View {
     @Environment(\.horusPalette) private var palette
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovered = false
     let title: String
     let glyph: HorusGlyph
@@ -947,19 +1007,80 @@ private struct MessageActionButton: View {
         // Secondary actions, so a smaller glyph in a smaller box than a standalone icon button:
         // the box is what spaces these apart, and the context menu carries the same actions.
         Button(action: action) {
-            HorusIcon(
-                glyph,
-                size: 13,
-                foreground: isHovered ? palette.accent : palette.muted
-            )
+            ZStack {
+                HorusIcon(
+                    glyph,
+                    size: 13,
+                    foreground: isHovered ? palette.accent : palette.muted
+                )
+                .id(glyph)
+                .transition(.scale(scale: 0.7).combined(with: .opacity))
+            }
             .frame(width: 26, height: 26)
             .contentShape(Rectangle())
+            .animation(reduceMotion ? nil : .snappy(duration: 0.18), value: glyph)
         }
         .buttonStyle(.horusPlain)
         .onHover { isHovered = $0 }
         .animation(.easeOut(duration: 0.12), value: isHovered)
         .accessibilityLabel(title)
         .help(title)
+    }
+}
+
+/// A completed turn becomes one disclosure without changing how the same rows render live.
+private struct WorkedForGroupView: View {
+    @Environment(\.horusPalette) private var palette
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ScaledMetric(relativeTo: .body) private var summaryHeight = HorusStyle.rowRegular
+    @State private var isExpanded = false
+    let entries: [TranscriptEntry]
+    let elapsedMs: UInt64?
+    var onExpand: () -> Void = {}
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: HorusSpace.s) {
+            Button {
+                if !isExpanded { onExpand() }
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.16)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: HorusSpace.s) {
+                    HorusIcon(.combine, size: HorusStyle.glyphInline, foreground: palette.muted)
+                    Text(title)
+                        .font(HorusStyle.bodyFont)
+                        .foregroundStyle(palette.muted)
+                        .lineLimit(1)
+                    Spacer(minLength: HorusSpace.s)
+                    HorusIcon(.caretRight, size: HorusStyle.glyphMark, foreground: palette.muted)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .animation(
+                            reduceMotion ? nil : .snappy(duration: 0.18),
+                            value: isExpanded
+                        )
+                }
+                .frame(minHeight: summaryHeight)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.horusPlain)
+            .accessibilityLabel(title)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+            .accessibilityHint(isExpanded ? "Collapses the completed work" : "Shows the completed work")
+
+            if isExpanded {
+                TranscriptRowsView(
+                    projection: TranscriptProjection(entries: entries),
+                    rowSpacing: HorusSpace.s,
+                    onExpandActivityGroup: onExpand
+                )
+            }
+        }
+    }
+
+    private var title: String {
+        let elapsed = TimeInterval(elapsedMs ?? 0) / 1_000
+        return "Worked for \(formatDuration(elapsed))"
     }
 }
 
@@ -1390,7 +1511,7 @@ private struct HorusMarkdownDocument: View {
                 headerTextColor: .primary,
                 regularTextColor: .primary,
                 headerBackgroundColor: palette.raised,
-                borderColor: palette.line,
+                borderColor: palette.muted.opacity(0.42),
                 actionButtonColor: palette.accent
             ),
             inlineStyle: .init(
@@ -1404,7 +1525,8 @@ private struct HorusMarkdownDocument: View {
             ),
             codeBlockConfig: CodeBlockConfig(
                 theme: .xcode,
-                backgroundColor: palette.recessed,
+                backgroundColor: palette.raised,
+                foregroundColor: palette.muted,
                 codeTextFonts: codeFonts,
                 chromeTextFonts: .horus(.footnote, context: fontResolutionContext)
             ),

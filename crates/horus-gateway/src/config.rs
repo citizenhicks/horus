@@ -7,7 +7,7 @@ use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +39,7 @@ const MAX_PROVIDER_CATALOG_ENTRY_BYTES: usize = 1024;
 const MAX_PROVIDER_CATALOG_BYTES: usize = 16 * 1024;
 const MAX_CUSTOM_MODEL_ROUTES: usize = 64;
 const MAX_CLOUDFLARE_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_WORKSPACE_DIRECTORY_NAME_BYTES: usize = 255;
 const SECONDS_PER_DAY: u64 = 86_400;
 const USAGE_HISTORY_DAYS: u64 = 52 * 7;
 
@@ -1067,20 +1068,99 @@ fn validate_chat_workspace(
             "workspace must be an existing non-root directory".into(),
         ));
     }
+    validate_workspace_boundaries(&path, state_dir, tls)?;
+    Ok(path)
+}
+
+pub(crate) fn create_workspace_directory(
+    parent: &Path,
+    name: &str,
+    state_dir: &Path,
+    tls: Option<&TlsConfig>,
+) -> Result<PathBuf> {
+    let parent = fs::canonicalize(parent)?;
+    if !parent.is_dir() {
+        return Err(Error::Config("workspace parent must be a directory".into()));
+    }
+
+    let name = name.trim();
+    if name.is_empty()
+        || name.len() > MAX_WORKSPACE_DIRECTORY_NAME_BYTES
+        || name.as_bytes().contains(&0)
+        || name.bytes().any(|byte| byte == b'/' || byte == b'\\')
+    {
+        return Err(Error::Config(format!(
+            "workspace directory name must be 1–{MAX_WORKSPACE_DIRECTORY_NAME_BYTES} bytes and contain no path separators"
+        )));
+    }
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(Error::Config(
+            "workspace directory name must be one path component".into(),
+        ));
+    }
+
+    let path = parent.join(name);
+    validate_workspace_boundaries(&path, state_dir, tls)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            return Err(Error::Config("workspace directory already exists".into()));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    fs::create_dir(&path)?;
+    let created = validate_chat_workspace(&path, state_dir, tls).and_then(|path| {
+        initialize_workspace_repository(&path)?;
+        Ok(path)
+    });
+    match created {
+        Ok(path) => Ok(path),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&path);
+            Err(error)
+        }
+    }
+}
+
+fn initialize_workspace_repository(path: &Path) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["init", "--quiet", "--initial-branch", "main"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .current_dir(path)
+        .output()?;
+    if !output.status.success() {
+        return Err(Error::Config(
+            "failed to initialize workspace Git repository".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_boundaries(
+    path: &Path,
+    state_dir: &Path,
+    tls: Option<&TlsConfig>,
+) -> Result<()> {
     let state_dir = fs::canonicalize(state_dir)?;
-    if path.starts_with(&state_dir) || state_dir.starts_with(&path) {
+    if path.starts_with(&state_dir) || state_dir.starts_with(path) {
         return Err(Error::Config(
             "gateway state directory and chat workspace must not overlap".into(),
         ));
     }
     if tls.is_some_and(|tls| {
-        fs::canonicalize(&tls.private_key).is_ok_and(|key| key.starts_with(&path))
+        fs::canonicalize(&tls.private_key).is_ok_and(|key| key.starts_with(path))
     }) {
         return Err(Error::Config(
             "TLS private key must be stored outside every chat workspace".into(),
         ));
     }
-    Ok(path)
+    Ok(())
 }
 
 fn prepare_state_dir(path: PathBuf) -> Result<PathBuf> {
@@ -1834,6 +1914,67 @@ mod tests {
                 .to_string()
                 .contains("must not overlap")
         );
+    }
+
+    #[test]
+    fn workspace_directory_creation_creates_one_canonical_git_workspace() {
+        let root = tempfile::tempdir().expect("root");
+        let parent = root.path().join("parent");
+        let state = root.path().join("state");
+        fs::create_dir(&parent).expect("parent");
+        fs::create_dir(&state).expect("state");
+
+        let created = create_workspace_directory(&parent, "new workspace", &state, None)
+            .expect("create workspace directory");
+
+        assert_eq!(
+            created,
+            fs::canonicalize(parent.join("new workspace")).expect("created")
+        );
+        assert!(created.is_dir());
+        assert!(created.join(".git").is_dir());
+        assert_eq!(
+            fs::read_to_string(created.join(".git/HEAD")).expect("Git HEAD"),
+            "ref: refs/heads/main\n"
+        );
+        assert!(!created.join("nested").exists());
+    }
+
+    #[test]
+    fn workspace_directory_creation_rejects_invalid_names_and_existing_targets() {
+        let root = tempfile::tempdir().expect("root");
+        let parent = root.path().join("parent");
+        let state = root.path().join("state");
+        fs::create_dir(&parent).expect("parent");
+        fs::create_dir(&state).expect("state");
+        fs::create_dir(parent.join("existing")).expect("existing");
+
+        for name in ["", ".", "..", "../escape", "nested/name", "nested\\name"] {
+            assert!(
+                create_workspace_directory(&parent, name, &state, None).is_err(),
+                "invalid name should be rejected: {name:?}"
+            );
+        }
+        assert!(
+            create_workspace_directory(&parent, "existing", &state, None).is_err(),
+            "existing target should be rejected"
+        );
+        assert!(!root.path().join("escape").exists());
+    }
+
+    #[test]
+    fn workspace_directory_creation_rejects_gateway_state_overlap() {
+        let root = tempfile::tempdir().expect("root");
+        let parent = root.path().join("parent");
+        let state = root.path().join("state");
+        fs::create_dir(&parent).expect("parent");
+        fs::create_dir(&state).expect("state");
+
+        let error = create_workspace_directory(&state, "workspace", &state, None)
+            .expect_err("workspace inside gateway state must fail");
+
+        assert!(error.to_string().contains("must not overlap"));
+        assert!(!state.join("workspace").exists());
     }
 
     #[test]

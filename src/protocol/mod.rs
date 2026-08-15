@@ -490,6 +490,13 @@ pub struct FrontendAction {
     pub op: Op,
 }
 
+/// One timestamped semantic event shown inside a capability preview.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrontendPreviewEvent {
+    pub recorded_at_ms: i64,
+    pub event: EventMsg,
+}
+
 /// Generic capability UI updates understood by every frontend.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "frontend_type", rename_all = "snake_case")]
@@ -516,7 +523,7 @@ pub enum FrontendEvent {
         subtitle: String,
         page_id: String,
         update: FrontendPreviewUpdate,
-        events: Vec<EventMsg>,
+        events: Vec<FrontendPreviewEvent>,
         next: Option<Op>,
     },
 }

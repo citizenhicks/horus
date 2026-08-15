@@ -12,24 +12,19 @@ use crate::Error;
 use crate::Result;
 use crate::agent::AgentSender;
 use crate::backend::checkpoint::CheckpointStore;
-use crate::backend::checkpoint::TranscriptBatch;
-use crate::backend::checkpoint::TranscriptPage;
-use crate::backend::checkpoint::TranscriptPageRequest;
+use crate::backend::checkpoint::event_turn_page;
 use crate::middleware::RuntimeContext;
 use crate::protocol::EventMsg;
 use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendEvent;
 use crate::protocol::FrontendPickerOption;
+use crate::protocol::FrontendPreviewEvent;
 use crate::protocol::FrontendSlot;
 use crate::protocol::FrontendSymbol;
 use crate::protocol::FrontendTone;
 use crate::protocol::FrontendWidget;
 use crate::protocol::FrontendWidgetContent;
-use crate::protocol::MessageTarget;
 use crate::protocol::Op;
-use crate::protocol::replay_events;
-
-use super::PreviewPosition;
 
 mod coordination;
 mod monitor;
@@ -40,9 +35,7 @@ pub(super) use monitor::monitor_agent;
 
 const STATE_KEY: &str = "subagents.v2";
 const MAX_MAILBOX_ITEMS: usize = 256;
-pub(super) const PREVIEW_TRANSCRIPT_BATCHES: usize = 50;
 pub(super) const MAX_PREVIEW_PAGE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PREVIEW_INPUT_BYTES: usize = 7 * 1024 * 1024;
 pub(super) const MAX_MESSAGE_BYTES: usize = 24_000;
 
 pub(super) struct Shared {
@@ -96,8 +89,8 @@ pub(super) enum AgentStatus {
 pub(super) struct PreviewPage {
     pub(super) subtitle: String,
     pub(super) page_id: String,
-    pub(super) events: Vec<EventMsg>,
-    pub(super) next: Option<PreviewPosition>,
+    pub(super) events: Vec<FrontendPreviewEvent>,
+    pub(super) next: Option<u64>,
 }
 
 pub(super) struct AgentPresentation {
@@ -357,7 +350,7 @@ impl Shared {
         &self,
         root_id: &str,
         path: &str,
-        position: Option<PreviewPosition>,
+        before_sequence: Option<u64>,
     ) -> Result<PreviewPage> {
         let (checkpoints, session_id, subtitle, terminal_error) = {
             let root = self.root(root_id).await?;
@@ -371,7 +364,7 @@ impl Shared {
                 Arc::clone(&root.checkpoints),
                 entry.session_id.clone(),
                 entry.spawn_context.clone(),
-                if position.is_none() && matches!(&entry.status, AgentStatus::Errored) {
+                if before_sequence.is_none() && matches!(&entry.status, AgentStatus::Errored) {
                     entry
                         .last_message
                         .clone()
@@ -381,83 +374,33 @@ impl Shared {
                 },
             )
         };
-        let before_sequence = match position {
-            None => None,
-            Some(PreviewPosition::BeforeSequence { before_sequence }) => Some(before_sequence),
-            Some(PreviewPosition::BeforeItem { sequence, .. }) => {
-                Some(sequence.checked_add(1).ok_or_else(invalid_preview_cursor)?)
-            }
-        };
-        let page = checkpoints
-            .transcript_page(
-                &session_id,
-                TranscriptPageRequest {
-                    before_sequence,
-                    max_batches: PREVIEW_TRANSCRIPT_BATCHES + 1,
-                },
-            )
-            .await?;
-        let store_has_more = page.next_before_sequence.is_some();
-        let mut batches = page.batches;
-        if let Some(PreviewPosition::BeforeItem {
-            sequence,
-            before_item,
-        }) = position
-        {
-            let Some(batch) = batches
-                .first_mut()
-                .filter(|batch| batch.sequence == sequence)
-            else {
-                return Err(invalid_preview_cursor());
-            };
-            if before_item >= batch.items.len() {
-                return Err(invalid_preview_cursor());
-            }
-            batch.items.truncate(before_item);
+        let page = event_turn_page(checkpoints.as_ref(), &session_id, before_sequence).await?;
+        let next = page.next_before_sequence;
+        let mut events = page
+            .into_chronological()
+            .into_iter()
+            .map(|record| FrontendPreviewEvent {
+                recorded_at_ms: record.recorded_at_ms,
+                event: record.event.msg,
+            })
+            .collect::<Vec<_>>();
+        if let Some(message) = terminal_error {
+            events.push(FrontendPreviewEvent {
+                recorded_at_ms: events.last().map_or(0, |event| event.recorded_at_ms),
+                event: EventMsg::Frontend(subagent_error_notice(message)),
+            });
         }
-        let omitted_seed = position.is_none() && batches.iter().any(|batch| batch.sequence == 0);
-        if omitted_seed {
-            batches.retain(|batch| batch.sequence != 0);
+        if serde_json::to_vec(&events)?.len() > MAX_PREVIEW_PAGE_BYTES {
+            return Err(Error::Checkpoint(format!(
+                "one subagent turn exceeds the {MAX_PREVIEW_PAGE_BYTES}-byte preview limit"
+            )));
         }
-        let continuation_before_sequence = batches
-            .get(PREVIEW_TRANSCRIPT_BATCHES.saturating_sub(1))
-            .or_else(|| batches.last())
-            .map(|batch| batch.sequence);
-        let minimum_start = batches
-            .get(PREVIEW_TRANSCRIPT_BATCHES..)
-            .unwrap_or_default()
-            .iter()
-            .map(|batch| batch.items.len())
-            .sum();
-        let transcript = positioned_items_chronological(batches);
-        let terminal_error =
-            terminal_error.map(|message| EventMsg::Frontend(subagent_error_notice(message)));
-        let trailing_bytes = terminal_error
-            .as_ref()
-            .map(serde_json::to_vec)
-            .transpose()?
-            .map_or(0, |event| event.len());
-        let (start, mut events) =
-            preview_events(&transcript, minimum_start, &session_id, trailing_bytes)?;
-        events.extend(terminal_error);
-        let has_more = store_has_more || omitted_seed || start > 0;
-        let next = if has_more {
-            transcript
-                .get(start)
-                .map(|(target, _)| position_before(*target))
-                .or_else(|| {
-                    omitted_seed.then_some(PreviewPosition::BeforeSequence { before_sequence: 1 })
-                })
-                .or_else(|| {
-                    continuation_before_sequence
-                        .map(|before_sequence| PreviewPosition::BeforeSequence { before_sequence })
-                })
-        } else {
-            None
-        };
         Ok(PreviewPage {
             subtitle,
-            page_id: position.map_or_else(|| format!("{path}:latest"), |at| at.page_id(path)),
+            page_id: before_sequence.map_or_else(
+                || format!("{path}:latest"),
+                |before| format!("{path}:before-sequence-{before}"),
+            ),
             events,
             next,
         })
@@ -562,83 +505,6 @@ impl Shared {
     }
 }
 
-fn positioned_items_chronological(batches: Vec<TranscriptBatch>) -> Vec<(MessageTarget, Value)> {
-    TranscriptPage {
-        batches,
-        next_before_sequence: None,
-    }
-    .into_positioned_items_chronological()
-}
-
-fn preview_events(
-    transcript: &[(MessageTarget, Value)],
-    minimum_start: usize,
-    session_id: &str,
-    trailing_bytes: usize,
-) -> Result<(usize, Vec<EventMsg>)> {
-    if transcript.is_empty() || minimum_start >= transcript.len() {
-        return Ok((transcript.len(), Vec::new()));
-    }
-    let mut input_bytes: usize = 0;
-    let mut candidate = transcript.len();
-    while candidate > minimum_start {
-        let item = &transcript[candidate - 1].1;
-        let item_bytes = serde_json::to_vec(item)?.len();
-        if candidate < transcript.len()
-            && input_bytes.saturating_add(item_bytes) > MAX_PREVIEW_INPUT_BYTES
-        {
-            break;
-        }
-        candidate -= 1;
-        input_bytes = input_bytes.saturating_add(item_bytes);
-        if input_bytes >= MAX_PREVIEW_INPUT_BYTES {
-            break;
-        }
-    }
-
-    let boundaries =
-        crate::backend::model::tool_complete_boundaries(transcript.iter().map(|(_, item)| item));
-    let previous = boundaries
-        .iter()
-        .copied()
-        .chain(std::iter::once(0))
-        .filter(|boundary| *boundary <= candidate)
-        .max()
-        .unwrap_or(candidate);
-    let next = boundaries
-        .iter()
-        .copied()
-        .find(|boundary| *boundary >= candidate)
-        .unwrap_or(transcript.len());
-
-    let events = replay_events(&transcript[previous..], session_id);
-    if preview_page_fits(&events, trailing_bytes)? {
-        return Ok((previous, events));
-    }
-    if next >= transcript.len() {
-        return Err(Error::Checkpoint(format!(
-            "one subagent transcript item group exceeds the {MAX_PREVIEW_PAGE_BYTES}-byte preview limit"
-        )));
-    }
-    let events = replay_events(&transcript[next..], session_id);
-    if events.is_empty() || preview_page_fits(&events, trailing_bytes)? {
-        Ok((next, events))
-    } else {
-        Err(Error::Checkpoint(format!(
-            "one subagent transcript item exceeds the {MAX_PREVIEW_PAGE_BYTES}-byte preview limit"
-        )))
-    }
-}
-
-fn preview_page_fits(events: &[EventMsg], trailing_bytes: usize) -> Result<bool> {
-    let separator_bytes = usize::from(!events.is_empty() && trailing_bytes > 0);
-    Ok(serde_json::to_vec(events)?
-        .len()
-        .saturating_add(trailing_bytes)
-        .saturating_add(separator_bytes)
-        <= MAX_PREVIEW_PAGE_BYTES)
-}
-
 fn subagent_error_notice(message: String) -> FrontendEvent {
     FrontendEvent::Render {
         capability: "subagents".into(),
@@ -656,23 +522,6 @@ fn subagent_error_notice(message: String) -> FrontendEvent {
             tone: FrontendTone::Error,
         },
     }
-}
-
-fn position_before(target: MessageTarget) -> PreviewPosition {
-    if target.batch_item_count == 1 {
-        PreviewPosition::BeforeSequence {
-            before_sequence: target.checkpoint_sequence,
-        }
-    } else {
-        PreviewPosition::BeforeItem {
-            sequence: target.checkpoint_sequence,
-            before_item: target.batch_item_count - 1,
-        }
-    }
-}
-
-fn invalid_preview_cursor() -> Error {
-    Error::Tool("invalid subagent preview cursor".into())
 }
 
 /// One staged root mutation handed to `Shared::commit_root`.
@@ -917,14 +766,37 @@ mod tests {
         );
         let root = Checkpoint::empty("root");
         checkpoints.save(&root, &[], None).await.expect("save root");
-        let transcript = serde_json::json!({"role": "user", "content": "review this"});
-        let mut child = Checkpoint::empty("child");
-        child.sequence = 1;
-        child.context.push(transcript.clone());
+        let child = Checkpoint::empty("child");
         checkpoints
-            .save(&child, &[transcript], None)
+            .save(&child, &[], None)
             .await
             .expect("save child");
+        for (recorded_at_ms, msg) in [
+            EventMsg::TurnStarted(crate::protocol::TurnStartedEvent {
+                turn_id: "turn-1".into(),
+                model_context_window: None,
+            }),
+            EventMsg::UserMessage(crate::protocol::UserMessageEvent {
+                message: "review this".into(),
+                attachments: Vec::new(),
+                message_target: None,
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            checkpoints
+                .append_event(
+                    "child",
+                    i64::try_from(recorded_at_ms).expect("timestamp"),
+                    &Event {
+                        submission_id: None,
+                        msg,
+                    },
+                )
+                .await
+                .expect("append child event");
+        }
         let shared = test_shared();
         shared
             .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
@@ -955,13 +827,20 @@ mod tests {
             .preview("root", "/root/reviewer", None)
             .await
             .expect("preview errored child");
+        let events = preview
+            .events
+            .iter()
+            .map(|event| event.event.clone())
+            .collect::<Vec<_>>();
 
         assert!(matches!(
-            preview.events.as_slice(),
+            events.as_slice(),
             [
+                EventMsg::TurnStarted(started),
                 EventMsg::UserMessage(message),
                 EventMsg::Frontend(FrontendEvent::Render { capability, block }),
-            ] if message.message == "review this"
+            ] if started.turn_id == "turn-1"
+                && message.message == "review this"
                 && capability == "subagents"
                 && block.title == "Subagent error"
                 && block.text == "provider error: servers are currently overloaded"

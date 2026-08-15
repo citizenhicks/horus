@@ -105,6 +105,10 @@ struct AppShell: View {
         .onChange(of: chatIsVisible, initial: true) { _, visible in
             model.setChatVisible(visible)
         }
+        .onChange(of: model.chatRoute) { _, route in
+            guard route != nil, horizontalSizeClass == .compact else { return }
+            withAnimation(SidebarDrawerMetrics.animation) { sidebarIsOpen = false }
+        }
         .onChange(of: model.toast?.id) { _, _ in
             guard let toast = model.toast else { return }
             AccessibilityNotification.Announcement(
@@ -332,31 +336,31 @@ private struct AppToastOverlay: View {
 }
 
 private struct AppToastView: View {
+    @Environment(AppModel.self) private var model
     @Environment(\.horusPalette) private var palette
     let toast: AppToast
     let dismiss: () -> Void
 
     var body: some View {
         HStack(spacing: HorusSpace.m) {
-            HStack(alignment: .top, spacing: HorusSpace.m) {
-                HorusIcon(
-                    toast.tone.glyph,
-                    size: 18,
-                    foreground: toast.tone.color(in: palette)
-                )
-                VStack(alignment: .leading, spacing: HorusSpace.xxs) {
-                    Text(toast.tone.title)
-                        .font(HorusStyle.controlFont.weight(.semibold))
-                        .foregroundStyle(toast.tone.color(in: palette))
-                    Text(toast.message)
-                        .font(HorusStyle.bodyFont)
-                        .foregroundStyle(.primary)
-                        .fixedSize(horizontal: false, vertical: true)
+            if let sessionID = toast.sessionID {
+                Button {
+                    model.showsInspector = false
+                    model.showsPairing = false
+                    model.showsWorkspaceBrowser = false
+                    model.openChat(sessionID)
+                    dismiss()
+                } label: {
+                    toastMessage
                 }
+                .buttonStyle(.horusPlain)
+                .accessibilityLabel(accessibilityLabel)
+                .accessibilityHint("Opens this chat")
+            } else {
+                toastMessage
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(accessibilityLabel)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("\(toast.tone.title): \(toast.message)")
 
             Button(action: dismiss) {
                 HorusIcon(.x, size: HorusStyle.glyphInline, foreground: palette.muted)
@@ -378,6 +382,31 @@ private struct AppToastView: View {
                     dismiss()
                 }
         )
+    }
+
+    private var toastMessage: some View {
+        HStack(alignment: .top, spacing: HorusSpace.m) {
+            HorusIcon(
+                toast.tone.glyph,
+                size: 18,
+                foreground: toast.tone.color(in: palette)
+            )
+            VStack(alignment: .leading, spacing: HorusSpace.xxs) {
+                Text(toast.tone.title)
+                    .font(HorusStyle.controlFont.weight(.semibold))
+                    .foregroundStyle(toast.tone.color(in: palette))
+                Text(toast.message)
+                    .font(HorusStyle.bodyFont)
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+
+    private var accessibilityLabel: String {
+        "\(toast.tone.title): \(toast.message)"
     }
 }
 
@@ -414,6 +443,8 @@ private struct WorkspaceBrowserView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @Environment(\.horusPalette) private var palette
+    @State private var newFolderName = ""
+    @State private var showsNewFolderPrompt = false
 
     var body: some View {
         NavigationStack {
@@ -423,7 +454,11 @@ private struct WorkspaceBrowserView: View {
                         path: listing.path,
                         title: "Choose a workspace for the new chat",
                         parent: listing.parent,
-                        onParent: model.loadDirectory
+                        onParent: model.loadDirectory,
+                        onCreateFolder: {
+                            newFolderName = ""
+                            showsNewFolderPrompt = true
+                        }
                     )
                     List {
                         ForEach(listing.entries) { entry in
@@ -455,6 +490,7 @@ private struct WorkspaceBrowserView: View {
                 }
             }
             .font(HorusStyle.bodyFont)
+            .disabled(model.isLoadingDirectories || model.isChangingWorkspace)
             .overlay {
                 if model.isLoadingDirectories { ProgressView() }
             }
@@ -471,10 +507,21 @@ private struct WorkspaceBrowserView: View {
                     }
                     .disabled(
                         model.directoryListing?.parent == nil
+                            || model.isLoadingDirectories
                             || model.isChangingWorkspace
                     )
                 }
             }
+        }
+        .alert("New folder", isPresented: $showsNewFolderPrompt) {
+            TextField("Folder name", text: $newFolderName)
+            Button("Cancel", role: .cancel) {}
+            Button("Create") {
+                model.createWorkspaceDirectory(named: newFolderName)
+            }
+            .disabled(newFolderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        } message: {
+            Text("Create a folder inside \(model.directoryListing?.path ?? "this location").")
         }
     }
 }
@@ -485,6 +532,7 @@ private struct DirectoryBrowserHeader: View {
     let title: String
     let parent: String?
     let onParent: (String) -> Void
+    let onCreateFolder: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: HorusSpace.xs) {
@@ -497,6 +545,10 @@ private struct DirectoryBrowserHeader: View {
                 Text(title)
                     .font(HorusStyle.controlFont)
                 Spacer()
+                Button("New folder", glyph: .folderPlus, action: onCreateFolder)
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(HorusIconButtonStyle())
+                    .help("New folder")
                 if let parent {
                     Button("Parent folder", glyph: .arrowUp) { onParent(parent) }
                         .labelStyle(.iconOnly)
@@ -577,7 +629,7 @@ enum SidebarDrawerMetrics {
     /// UIScreen knows the number and answers only to a private key, so this is the measured
     /// value for current iPhones instead; older, tighter displays round a touch generously.
     static let displayCornerRadius: CGFloat = 62
-    /// How dark the page goes once the drawer is fully open.
+    /// How strongly the page is tinted once the drawer is fully open.
     static let scrimOpacity: Double = 0.45
     /// How far behind the page the sidebar starts before it comes forward.
     static let sidebarDepth: CGFloat = 0.08
@@ -635,16 +687,16 @@ private struct SidebarDrawer<Sidebar: View, Detail: View>: View {
         ConcentricRectangle(corners: .fixed(SidebarDrawerMetrics.displayCornerRadius))
     }
 
-    /// The page dims as it slides, which is what separates it from the sidebar behind, and
+    /// The page is tinted as it slides, which separates it from the sidebar behind, and
     /// is the tap target that closes the drawer.
     ///
     /// This replaces a lit glass rim along the leading edge. That rim existed only because
     /// nothing marked the boundary — glass over the sidebar's flat canvas barely registers,
     /// so the specular edge was doing all the work, and a scrim would have washed it out.
-    /// Dimming the page states the same thing directly, and costs a colour instead of a
+    /// Tinting the page states the same thing directly, and costs a colour instead of a
     /// real-time material, a stroked gradient and a second mask on every frame of the slide.
     private var scrim: some View {
-        Color.black
+        palette.sidebarScrim
             .opacity(SidebarDrawerMetrics.scrimOpacity * progress)
             .ignoresSafeArea()
             .allowsHitTesting(progress > 0)

@@ -6,7 +6,7 @@ mod git;
 mod providers;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -15,7 +15,7 @@ use horus::agent::{AgentConfig, AgentSender};
 use horus::backend::checkpoint::{
     ActiveExecution, Checkpoint, CheckpointStore, EventPageRequest, ExecutionOutcome,
     ExecutionRecord, ExecutionStats, JournalEvent, SessionPageRequest, SessionSummary,
-    sqlite::SqliteCheckpoint,
+    event_turn_page, sqlite::SqliteCheckpoint,
 };
 use horus::backend::model::ModelRouter;
 use horus::backend::model::provider::provider;
@@ -24,8 +24,8 @@ use horus::middleware::scratchpad::ScratchpadStore;
 use horus::middleware::session_files::SessionFileStore;
 use horus::protocol::{
     Event, EventMsg, FrontendBlock, FrontendBlockFormat, FrontendBlockRole, FrontendBlockState,
-    FrontendBlockUpdate, FrontendEvent, ModelStepOutcome, Op, RenderedBlock, ReviewDecision,
-    SessionFileReference, Submission,
+    FrontendBlockUpdate, FrontendEvent, FrontendPreviewEvent, ModelStepOutcome, Op, RenderedBlock,
+    ReviewDecision, SessionFileReference, Submission,
 };
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use uuid::Uuid;
@@ -34,7 +34,10 @@ use crate::assembly::{
     BuiltAgent, assemble, configured_model_choices, configured_model_providers,
     configured_provider_for_route, provider_statuses,
 };
-use crate::config::{ChatSpec, ConfigStore, CredentialStore, GatewayConfig};
+use crate::config::{
+    ChatSpec, ConfigStore, CredentialStore, GatewayConfig,
+    create_workspace_directory as create_workspace_directory_on_disk,
+};
 use crate::cron::{ActiveCronRun, BeginRun, CronStore};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{
@@ -189,7 +192,6 @@ enum HostCommand {
     },
     HistoryPage {
         before_sequence: Option<u64>,
-        max_events: usize,
         reply: oneshot::Sender<std::result::Result<SessionHistoryPage, Rejection>>,
     },
     RenameSession {
@@ -370,6 +372,29 @@ impl GatewayHost {
         drop(state);
         self.broadcast_sessions().await?;
         Ok(host)
+    }
+
+    pub(crate) async fn create_workspace_directory(
+        &self,
+        parent: &Path,
+        name: &str,
+    ) -> std::result::Result<PathBuf, Rejection> {
+        let (state_dir, tls) = {
+            let state = self.state.lock().await;
+            let config = state
+                .config
+                .lock()
+                .map_err(|_| internal("gateway configuration lock is poisoned"))?;
+            (state.store.state_dir().to_path_buf(), config.tls.clone())
+        };
+        let parent = parent.to_owned();
+        let name = name.to_owned();
+        tokio::task::spawn_blocking(move || {
+            create_workspace_directory_on_disk(&parent, &name, &state_dir, tls.as_ref())
+        })
+        .await
+        .map_err(|error| internal(error.to_string()))?
+        .map_err(invalid_workspace)
     }
 
     pub(crate) async fn open_session(
@@ -820,12 +845,10 @@ impl HostHandle {
     pub(crate) async fn history_page(
         &self,
         before_sequence: Option<u64>,
-        max_events: usize,
     ) -> std::result::Result<SessionHistoryPage, Rejection> {
         let (reply, receiver) = oneshot::channel();
         self.send(HostCommand::HistoryPage {
             before_sequence,
-            max_events,
             reply,
         })
         .await?;
@@ -1159,10 +1182,9 @@ impl HostState {
             }
             HostCommand::HistoryPage {
                 before_sequence,
-                max_events,
                 reply,
             } => {
-                let _ = reply.send(self.history_page_value(before_sequence, max_events).await);
+                let _ = reply.send(self.history_page_value(before_sequence).await);
             }
             HostCommand::RenameSession {
                 session_id,
@@ -1284,29 +1306,41 @@ impl HostState {
         &self,
         last_sequence: Option<u64>,
     ) -> std::result::Result<HostSnapshot, Rejection> {
-        let replay = self.replay_after(last_sequence)?;
-        Ok(HostSnapshot {
-            ready: self.ready().await.map_err(internal)?,
-            replay,
-        })
+        let mut ready = self.ready().await.map_err(internal)?;
+        let replay = if last_sequence.is_some() {
+            self.replay_after(last_sequence)?
+        } else {
+            let page = event_turn_page(self.checkpoints.as_ref(), &self.running.session_id, None)
+                .await
+                .map_err(internal)?;
+            ready.next_before_sequence = page.next_before_sequence;
+            let mut replay = Vec::new();
+            for journal in page.into_chronological() {
+                let frame = ServerFrame::new(ServerMessage::AgentEvent {
+                    session_id: self.running.session_id.clone(),
+                    record: project_record(&self.running.frontend, journal),
+                });
+                if replayable(&frame) {
+                    validate_event_frame(&frame).map_err(internal)?;
+                    replay.push(frame);
+                }
+            }
+            replay
+        };
+        Ok(HostSnapshot { ready, replay })
     }
 
     async fn history_page_value(
         &self,
         before_sequence: Option<u64>,
-        max_events: usize,
     ) -> std::result::Result<SessionHistoryPage, Rejection> {
-        let page = self
-            .checkpoints
-            .event_page(
-                &self.running.session_id,
-                EventPageRequest {
-                    before_sequence,
-                    limit: max_events,
-                },
-            )
-            .await
-            .map_err(internal)?;
+        let page = event_turn_page(
+            self.checkpoints.as_ref(),
+            &self.running.session_id,
+            before_sequence,
+        )
+        .await
+        .map_err(internal)?;
         let next_before_sequence = page.next_before_sequence;
         let records = page
             .into_chronological()
@@ -2610,8 +2644,9 @@ fn render_preview(frontend: &FrontendExtensions, event: &EventMsg) -> Option<Ren
         events: flatten_preview(events)
             .into_iter()
             .map(|event| RenderedEvent {
-                blocks: frontend.render(&event),
-                event,
+                blocks: frontend.render(&event.event),
+                recorded_at_ms: event.recorded_at_ms,
+                event: event.event,
             })
             .collect(),
         next: next.clone(),
@@ -2674,21 +2709,39 @@ fn validate_gateway_event(event: &EventMsg) -> Result<()> {
     Ok(())
 }
 
-fn flatten_preview(events: &[EventMsg]) -> Vec<EventMsg> {
+fn flatten_preview(events: &[FrontendPreviewEvent]) -> Vec<FrontendPreviewEvent> {
     let mut flattened = Vec::new();
-    for event in events {
-        match event {
-            EventMsg::SessionHistory(history) => flattened.extend(flatten_preview(&history.events)),
-            EventMsg::Frontend(
-                FrontendEvent::Widget { .. }
-                | FrontendEvent::RemoveWidget { .. }
-                | FrontendEvent::Picker { .. }
-                | FrontendEvent::Preview { .. },
-            ) => {}
-            event => flattened.push(event.clone()),
-        }
+    for event in events.iter().cloned() {
+        flatten_preview_event(event, &mut flattened);
     }
     flattened
+}
+
+fn flatten_preview_event(event: FrontendPreviewEvent, flattened: &mut Vec<FrontendPreviewEvent>) {
+    let recorded_at_ms = event.recorded_at_ms;
+    match event.event {
+        EventMsg::SessionHistory(history) => {
+            for nested in history.events {
+                flatten_preview_event(
+                    FrontendPreviewEvent {
+                        recorded_at_ms,
+                        event: nested,
+                    },
+                    flattened,
+                );
+            }
+        }
+        EventMsg::Frontend(
+            FrontendEvent::Widget { .. }
+            | FrontendEvent::RemoveWidget { .. }
+            | FrontendEvent::Picker { .. }
+            | FrontendEvent::Preview { .. },
+        ) => {}
+        event => flattened.push(FrontendPreviewEvent {
+            recorded_at_ms,
+            event,
+        }),
+    }
 }
 
 fn event_sequence(frame: &ServerFrame) -> Option<u64> {
@@ -3012,7 +3065,10 @@ mod tests {
             subtitle: "Full context".into(),
             page_id: "/root/reviewer:latest".into(),
             update: horus::protocol::FrontendPreviewUpdate::Replace,
-            events: vec![EventMsg::ContextCompacted],
+            events: vec![FrontendPreviewEvent {
+                recorded_at_ms: 1,
+                event: EventMsg::ContextCompacted,
+            }],
             next: None,
         });
 
@@ -3315,7 +3371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_event_journal_restores_replay_and_history_cursor() {
+    async fn durable_event_journal_restores_complete_turn_pages() {
         let root = tempfile::tempdir().expect("root");
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
@@ -3336,28 +3392,51 @@ mod tests {
         assert!(host.stop_if_idle().await);
         gateway.state.lock().await.sessions.remove(&session_id);
         drop(host);
-        let mut latest_sequence = 0;
-        for index in 0..=REPLAY_CAPACITY {
-            let event = Event {
-                submission_id: None,
-                msg: EventMsg::Warning(horus::protocol::WarningEvent {
-                    message: format!("event {index}"),
-                }),
-            };
-            latest_sequence = checkpoints
+        let mut latest_start = 0;
+        for (index, event) in [
+            EventMsg::TurnStarted(horus::protocol::TurnStartedEvent {
+                turn_id: "older".into(),
+                model_context_window: None,
+            }),
+            EventMsg::Warning(horus::protocol::WarningEvent {
+                message: "older work".into(),
+            }),
+            EventMsg::TurnComplete(horus::protocol::TurnCompleteEvent {
+                turn_id: "older".into(),
+            }),
+            EventMsg::TurnStarted(horus::protocol::TurnStartedEvent {
+                turn_id: "latest".into(),
+                model_context_window: None,
+            }),
+            EventMsg::Warning(horus::protocol::WarningEvent {
+                message: "latest work".into(),
+            }),
+            EventMsg::TurnComplete(horus::protocol::TurnCompleteEvent {
+                turn_id: "latest".into(),
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let record = checkpoints
                 .append_event(
                     &session_id,
                     i64::try_from(index).expect("timestamp"),
-                    &event,
+                    &Event {
+                        submission_id: None,
+                        msg: event,
+                    },
                 )
                 .await
-                .expect("append journal event")
-                .sequence;
+                .expect("append journal event");
+            if index == 3 {
+                latest_start = record.sequence;
+            }
         }
         let durable_highwater = checkpoints
             .append_event(
                 &session_id,
-                i64::try_from(REPLAY_CAPACITY + 1).expect("timestamp"),
+                6,
                 &Event {
                     submission_id: None,
                     msg: EventMsg::Frontend(FrontendEvent::Preview {
@@ -3380,27 +3459,33 @@ mod tests {
             .await
             .expect("reopen session");
         let snapshot = reopened.snapshot(None).await.expect("session snapshot");
-        let newest = reopened
-            .history_page(latest_sequence.checked_add(1), 1)
+        let older = reopened
+            .history_page(snapshot.ready.next_before_sequence)
             .await
-            .expect("newest seeded event");
+            .expect("older turn");
 
         assert!(snapshot.ready.latest_sequence >= durable_highwater);
-        assert_eq!(snapshot.replay.len(), REPLAY_CAPACITY);
-        assert!(snapshot.ready.next_before_sequence.is_some());
+        assert_eq!(snapshot.replay.len(), 3);
+        assert_eq!(snapshot.ready.next_before_sequence, Some(latest_start));
         assert!(matches!(
-            &newest.records[..],
-            [RecordedEvent {
-                event: Event { msg: EventMsg::Warning(warning), .. },
-                ..
-            }] if warning.message == format!("event {REPLAY_CAPACITY}")
+            &older.records[..],
+            [
+                RecordedEvent {
+                    event: Event { msg: EventMsg::TurnStarted(started), .. },
+                    ..
+                },
+                RecordedEvent {
+                    event: Event { msg: EventMsg::Warning(warning), .. },
+                    ..
+                },
+                RecordedEvent {
+                    event: Event { msg: EventMsg::TurnComplete(completed), .. },
+                    ..
+                }
+            ] if started.turn_id == "older"
+                && warning.message == "older work"
+                && completed.turn_id == "older"
         ));
-        assert!(
-            reopened
-                .snapshot(Some(0))
-                .await
-                .is_err_and(|rejection| rejection.code == "replay_unavailable")
-        );
     }
 
     #[tokio::test]

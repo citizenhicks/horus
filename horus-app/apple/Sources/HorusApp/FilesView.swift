@@ -624,21 +624,15 @@ struct PreviewTranscriptSheet: View {
                         // This is the chat transcript surface without its navigation or composer.
                         // Exact rows avoid lazy height estimates for very long agent messages.
                         VStack(alignment: .leading, spacing: 0) {
-                            if let next = currentPreview.next {
+                            if currentPreview.next != nil {
                                 TranscriptPaginationButton(
                                     isLoading: model.isLoadingPreviewPage,
                                     isEnabled: !model.isLoadingPreviewPage
-                                ) {
-                                    retainedEntryID = currentPreview.entries.first?.presentationID
-                                    model.loadPreviewPage(next)
-                                }
+                                ) { loadEarlierPage() }
                                 .padding(.bottom, HorusSpace.m)
                             }
                             TranscriptRowsView(
-                                projection: TranscriptProjection(
-                                    entries: currentPreview.entries,
-                                    breakBefore: retainedEntryID
-                                ),
+                                projection: projection,
                                 collapsesLongMessages: true
                             )
                         }
@@ -649,9 +643,15 @@ struct PreviewTranscriptSheet: View {
                     }
                     .scrollIndicators(.hidden)
                     .refreshable { loadEarlierPage() }
-                    .onChange(of: currentPreview.entries.count) { _, _ in
-                        guard let retainedEntryID else { return }
-                        proxy.scrollTo(retainedEntryID, anchor: .top)
+                    .onChange(of: model.isLoadingPreviewPage) { _, loading in
+                        guard !loading, let retainedEntryID else { return }
+                        let row = projection.rows.first { row in
+                            row.id == retainedEntryID
+                                || row.records.contains {
+                                    $0.presentationID == retainedEntryID
+                                }
+                        }
+                        if let row { proxy.scrollTo(row.id, anchor: .top) }
                         self.retainedEntryID = nil
                     }
                 }
@@ -732,6 +732,13 @@ struct PreviewTranscriptSheet: View {
             return presented
         }
         return model.previews.first(where: { $0.id == preview.id }) ?? preview
+    }
+
+    private var projection: TranscriptProjection {
+        TranscriptProjection(
+            entries: currentPreview.entries,
+            breakBefore: retainedEntryID
+        )
     }
 
     private var agentName: String {

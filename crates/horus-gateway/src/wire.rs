@@ -45,7 +45,7 @@ mod base64_bytes {
 }
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 27;
+pub const PROTOCOL_VERSION: u16 = 28;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 20 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -124,6 +124,11 @@ pub enum ClientMessage {
         request_id: String,
         workspace: PathBuf,
     },
+    CreateWorkspaceDirectory {
+        request_id: String,
+        parent: PathBuf,
+        name: String,
+    },
     OpenSession {
         request_id: String,
         session_id: String,
@@ -133,7 +138,6 @@ pub enum ClientMessage {
         request_id: String,
         session_id: String,
         before_sequence: Option<u64>,
-        max_events: usize,
     },
     RenameSession {
         request_id: String,
@@ -799,6 +803,7 @@ pub struct RenderedPreview {
 /// One preview event and its capability-rendered blocks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderedEvent {
+    pub recorded_at_ms: i64,
     pub event: EventMsg,
     pub blocks: Vec<RenderedBlock>,
 }
@@ -1264,11 +1269,15 @@ mod tests {
             subtitle: "Last 1 turn".into(),
             page_id: "/root/reviewer:before-51".into(),
             update: FrontendPreviewUpdate::Prepend,
-            events: Vec::new(),
+            events: vec![RenderedEvent {
+                recorded_at_ms: 42,
+                event: EventMsg::ContextCompacted,
+                blocks: Vec::new(),
+            }],
             next: Some(Op::CapabilityCommand {
                 capability: "subagents".into(),
-                command: "preview_page".into(),
-                arguments: r#"{"path":"/root/reviewer","position":{"kind":"before_sequence","before_sequence":2}}"#.into(),
+                command: "subagents".into(),
+                arguments: r#"{"path":"/root/reviewer","before_sequence":2}"#.into(),
                 input: None,
                 target: None,
             }),
@@ -1280,6 +1289,7 @@ mod tests {
 
         assert_eq!(encoded["update"], "prepend");
         assert_eq!(encoded["page_id"], "/root/reviewer:before-51");
+        assert_eq!(encoded["events"][0]["recorded_at_ms"], 42);
         assert_eq!(actual, expected);
     }
 
@@ -1323,6 +1333,28 @@ mod tests {
                 "type": "create_session",
                 "request_id": "request-a",
                 "workspace": "/srv/horus/project"
+            })
+        );
+    }
+
+    #[test]
+    fn workspace_directory_creation_uses_a_gateway_host_parent_and_name() {
+        let frame = ClientFrame::new(ClientMessage::CreateWorkspaceDirectory {
+            request_id: "request-directory".into(),
+            parent: PathBuf::from("/srv/horus"),
+            name: "project".into(),
+        });
+
+        let encoded = serde_json::to_value(frame).expect("encode workspace directory creation");
+
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "type": "create_workspace_directory",
+                "request_id": "request-directory",
+                "parent": "/srv/horus",
+                "name": "project"
             })
         );
     }
@@ -1870,7 +1902,6 @@ mod tests {
             request_id: "request-history".into(),
             session_id: "session-a".into(),
             before_sequence: Some(9),
-            max_events: 20,
         }))
         .expect("encode history request");
         let response = serde_json::to_value(ServerFrame::new(ServerMessage::SessionHistory {
@@ -1895,7 +1926,6 @@ mod tests {
             (
                 request["type"].as_str(),
                 request["before_sequence"].as_u64(),
-                request["max_events"].as_u64(),
                 response["type"].as_str(),
                 response["next_before_sequence"].as_u64(),
                 response["records"][0]["event"]["msg"]["type"].as_str(),
@@ -1903,7 +1933,6 @@ mod tests {
             (
                 Some("get_session_history"),
                 Some(9),
-                Some(20),
                 Some("session_history"),
                 Some(4),
                 Some("context_compacted"),

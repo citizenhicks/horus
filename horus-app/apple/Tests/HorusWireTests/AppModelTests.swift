@@ -1174,6 +1174,68 @@ final class AppModelTests: XCTestCase {
         XCTAssertNotNil(request)
     }
 
+    func testCreatingWorkspaceDirectoryUsesCurrentListingAndEntersCreatedFolder() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        model.connectionState = .ready
+        model.directoryListing = DirectoryListing(
+            path: "/srv",
+            parent: "/",
+            entries: []
+        )
+
+        let requestCount = await recorder.requestCount()
+        model.createWorkspaceDirectory(named: "  New Project  ")
+
+        let request = await recorder.firstRequest(after: requestCount) { request in
+            if case .createWorkspaceDirectory = request { return true }
+            return false
+        }
+        guard case .createWorkspaceDirectory(let requestID, let parent, let name) = try XCTUnwrap(request) else {
+            return XCTFail("Expected a create-workspace-directory request")
+        }
+        XCTAssertEqual(parent, "/srv")
+        XCTAssertEqual(name, "New Project")
+        XCTAssertTrue(model.isLoadingDirectories)
+
+        let created = DirectoryListing(
+            path: "/srv/New Project",
+            parent: "/srv",
+            entries: []
+        )
+        model.handle(.directories(requestID: requestID, listing: created))
+
+        XCTAssertEqual(model.directoryListing, created)
+        XCTAssertFalse(model.isLoadingDirectories)
+        XCTAssertNil(model.directoryError)
+        let requests = await recorder.requests()
+        XCTAssertFalse(requests.contains { request in
+            if case .createSession = request { return true }
+            return false
+        })
+    }
+
+    func testCreatingWorkspaceDirectoryRejectsNestedNameBeforeSending() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        model.connectionState = .ready
+        model.directoryListing = DirectoryListing(
+            path: "/srv",
+            parent: "/",
+            entries: []
+        )
+
+        model.createWorkspaceDirectory(named: "../escape")
+        try await Task.sleep(for: .milliseconds(20))
+
+        XCTAssertEqual(model.directoryError, "Enter a single folder name.")
+        let requests = await recorder.requests()
+        XCTAssertFalse(requests.contains { request in
+            if case .createWorkspaceDirectory = request { return true }
+            return false
+        })
+    }
+
     func testGatewayReadyPopulatesChatCatalogWithoutOpeningSession() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model { request in await recorder.record(request) }
@@ -1405,6 +1467,75 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(model.transcript.map(\.text), ["thinking"])
         XCTAssertFalse(try XCTUnwrap(model.transcript.first).pending)
+    }
+
+    func testTaskCompleteCollapsesCompactionIntoFinishedTurnWork() throws {
+        let model = try model()
+        let turnID = "turn-1"
+        model.reduce(record: recorded(1, .object([
+            "type": .string("task_started"),
+            "turnId": .string(turnID),
+        ])))
+        model.reduce(record: recorded(2, .object([
+            "type": .string("user_message"),
+            "message": .string("Start"),
+        ])))
+        model.reduce(record: recorded(3, .object([
+            "type": .string("agent_message"),
+            "turnId": .string(turnID),
+            "modelStepId": .string("step-1"),
+            "phase": .string("commentary"),
+            "message": .string("Checking"),
+        ])))
+        model.reduce(record: recorded(4, .object([
+            "type": .string("context_compacted"),
+        ]), blocks: [RenderedBlock(capability: "compaction", block: FrontendBlock(
+            id: nil,
+            group: nil,
+            update: .replace,
+            state: .complete,
+            role: .notice,
+            title: "context compacted",
+            text: "",
+            symbol: nil,
+            format: "plain_text",
+            tone: "neutral",
+            files: []
+        ))]))
+        model.reduce(record: recorded(5, .object([
+            "type": .string("user_message"),
+            "message": .string("Also check tests"),
+        ])))
+        model.reduce(record: recorded(6, .object([
+            "type": .string("agent_message"),
+            "turnId": .string(turnID),
+            "modelStepId": .string("step-2"),
+            "phase": .string("final_answer"),
+            "message": .string("Done"),
+        ])))
+
+        XCTAssertEqual(
+            model.transcriptProjection(breakBefore: nil).rows.map(\.kind),
+            [.user, .narrative, .activityGroup, .user, .narrative]
+        )
+
+        model.reduce(record: recorded(7, .object([
+            "type": .string("task_complete"),
+            "turnId": .string(turnID),
+        ])))
+
+        let projection = model.transcriptProjection(breakBefore: nil)
+        XCTAssertEqual(projection.rows.map(\.kind), [.user, .workedGroup, .narrative])
+        XCTAssertEqual(
+            projection.rows[1].records.map(\.text),
+            ["Checking", "", "Also check tests"]
+        )
+        XCTAssertEqual(projection.rows[1].records.map(\.title), ["", "context compacted", ""])
+        XCTAssertEqual(projection.rows[1].elapsedMs, 500)
+        XCTAssertEqual(model.transcript.map(\.turnID), Array(repeating: turnID, count: 5))
+        XCTAssertEqual(model.transcript.map(\.startsTurn), [true, false, false, false, false])
+        XCTAssertEqual(TranscriptProjection.turnCount(in: model.transcript), 1)
+        XCTAssertEqual(model.transcript.last?.turnElapsedMs, 500)
     }
 
     func testOnlyLatestActivityStepIsActiveDuringTurn() throws {
@@ -2797,6 +2928,112 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.showsInspector)
     }
 
+    func testSubagentPreviewProjectsOneCompleteWorkedTurn() throws {
+        let model = try model()
+        let turnID = "turn-1"
+        let compacted = RenderedBlock(capability: "agent", block: FrontendBlock(
+            id: nil,
+            group: turnID,
+            update: .replace,
+            state: .complete,
+            role: .notice,
+            title: "Context compacted",
+            text: "",
+            symbol: nil,
+            format: "plain_text",
+            tone: "neutral",
+            files: []
+        ))
+        let events = [
+            RenderedEventRecord(
+                event: .object([
+                    "type": .string("task_started"),
+                    "turnId": .string(turnID),
+                ]),
+                blocks: [],
+                recordedAtMs: 1_000
+            ),
+            RenderedEventRecord(
+                event: .object([
+                    "type": .string("user_message"),
+                    "message": .string("Please review this"),
+                ]),
+                blocks: [],
+                recordedAtMs: 1_100
+            ),
+            RenderedEventRecord(
+                event: .object([
+                    "type": .string("agent_message"),
+                    "turnId": .string(turnID),
+                    "modelStepId": .string("step-1"),
+                    "phase": .string("commentary"),
+                    "message": .string("Checking"),
+                ]),
+                blocks: [],
+                recordedAtMs: 2_000
+            ),
+            RenderedEventRecord(
+                event: .object(["type": .string("context_compacted")]),
+                blocks: [compacted],
+                recordedAtMs: 2_200
+            ),
+            RenderedEventRecord(
+                event: .object([
+                    "type": .string("user_message"),
+                    "message": .string("Use the smaller patch"),
+                ]),
+                blocks: [],
+                recordedAtMs: 2_500
+            ),
+            RenderedEventRecord(
+                event: .object([
+                    "type": .string("agent_message"),
+                    "turnId": .string(turnID),
+                    "modelStepId": .string("step-2"),
+                    "phase": .string("final_answer"),
+                    "message": .string("Done"),
+                ]),
+                blocks: [],
+                recordedAtMs: 4_000
+            ),
+            RenderedEventRecord(
+                event: .object([
+                    "type": .string("task_complete"),
+                    "turnId": .string(turnID),
+                ]),
+                blocks: [],
+                recordedAtMs: 4_200
+            ),
+        ]
+
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("frontend"),
+                "frontendType": .string("preview"),
+            ])),
+            blocks: [],
+            preview: RenderedPreview(
+                id: "/root/reviewer",
+                title: "reviewer",
+                subtitle: "Full context",
+                pageId: "latest",
+                update: .replace,
+                events: events,
+                next: nil
+            )
+        )
+
+        let preview = try XCTUnwrap(model.previews.first)
+        let rows = TranscriptProjection(entries: preview.entries).rows
+        XCTAssertEqual(rows.map(\.kind), [.user, .workedGroup, .narrative])
+        XCTAssertEqual(
+            rows[1].records.map(\.text),
+            ["Checking", "", "Use the smaller patch"]
+        )
+        XCTAssertEqual(rows[1].elapsedMs, 3_100)
+        XCTAssertEqual(rows[2].records.map(\.text), ["Done"])
+    }
+
     func testSelectedPickerPreviewPresentsOneTranscriptWithAgentMetadata() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
@@ -2879,7 +3116,7 @@ final class AppModelTests: XCTestCase {
         model.selectedSessionID = "chat-1"
         let next = AgentOperation.capabilityCommand(
             capability: "subagents",
-            command: "subagents_page",
+            command: "subagents",
             arguments: #"{"path":"/root/reviewer","before_sequence":12}"#,
             input: nil,
             target: nil
@@ -2960,7 +3197,7 @@ final class AppModelTests: XCTestCase {
         model.selectedSessionID = "chat-1"
         let next = AgentOperation.capabilityCommand(
             capability: "subagents",
-            command: "preview_page",
+            command: "subagents",
             arguments: #"{"path":"/root/reviewer","before_sequence":12}"#,
             input: nil,
             target: nil
@@ -3081,7 +3318,7 @@ final class AppModelTests: XCTestCase {
         model.selectedSessionID = "chat-1"
         let operation = AgentOperation.capabilityCommand(
             capability: "subagents",
-            command: "preview_page",
+            command: "subagents",
             arguments: #"{"path":"/root/reviewer","before_sequence":12}"#,
             input: nil,
             target: nil
@@ -4463,11 +4700,88 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.transcript.map(\.text), ["Horus", "Stopped"])
         XCTAssertEqual(model.transcript.map(\.role), [.webSearch, .notice])
         XCTAssertEqual(model.transcript.map(\.tone), ["success", "warning"])
+        XCTAssertEqual(model.transcript.map(\.turnTerminal), [false, true])
+        let projection = model.transcriptProjection(breakBefore: nil)
+        XCTAssertEqual(projection.rows.map(\.kind), [.workedGroup, .activityGroup])
+        XCTAssertEqual(projection.rows[0].records.map(\.title), ["Searched the web"])
+        XCTAssertEqual(projection.rows[1].records.map(\.title), ["Turn aborted"])
         XCTAssertEqual(model.currentUsage.inputTokens, 1_000)
         XCTAssertEqual(model.lastUsage.cachedInputTokens, 20)
         XCTAssertEqual(model.lastUsage.cacheWriteInputTokens, 5)
         XCTAssertEqual(model.contextTokens, 99)
         XCTAssertEqual(model.modelContextWindow, 200)
+    }
+
+    func testLiveCanonicalAssistantBackfillsTurnIDBeforeTaskCompletion() throws {
+        let model = try model()
+        model.activeTurnID = nil
+        model.transcript = [
+            TranscriptEntry(
+                id: "prompt",
+                text: "Prompt",
+                kind: .user,
+                format: "plain_text",
+                pending: false,
+                turnID: "turn-live",
+                startsTurn: true,
+                recordedAtMs: 1_000
+            ),
+            TranscriptEntry(
+                id: "work",
+                text: "Work",
+                kind: .event,
+                format: "plain_text",
+                pending: false,
+                turnID: "turn-live",
+                recordedAtMs: 1_100
+            ),
+        ]
+
+        model.reduce(record: RecordedEvent(
+            sequence: 1,
+            recordedAtMs: 1_200,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("agent_message"),
+                "modelStepId": .string("step-live"),
+                "phase": .string("final_answer"),
+                "message": .string("Answer")
+            ])),
+            streamMetrics: [],
+            blocks: [],
+            preview: nil
+        ))
+        model.reduce(record: RecordedEvent(
+            sequence: 2,
+            recordedAtMs: 1_250,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("agent_message"),
+                "turnId": .string("turn-live"),
+                "modelStepId": .string("step-live"),
+                "phase": .string("final_answer"),
+                "message": .string("Answer")
+            ])),
+            streamMetrics: [],
+            blocks: [],
+            preview: nil
+        ))
+        model.reduce(record: RecordedEvent(
+            sequence: 3,
+            recordedAtMs: 1_300,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("task_complete"),
+                "turnId": .string("turn-live")
+            ])),
+            streamMetrics: [],
+            blocks: [],
+            preview: nil
+        ))
+
+        XCTAssertEqual(model.transcript.last?.turnID, "turn-live")
+        XCTAssertEqual(model.transcript.last?.turnTerminal, true)
+        XCTAssertEqual(
+            model.transcriptProjection(breakBefore: nil).rows.map(\.kind),
+            [.user, .workedGroup, .narrative]
+        )
     }
 
     func testSessionSnapshotsDriveActivityAndOnlyUnseenCompletion() throws {
@@ -4490,6 +4804,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.unreadSessionIDs.contains("chat-1"))
         XCTAssertEqual(model.attentionSessionIDs, ["chat-1"])
         XCTAssertEqual(model.toast?.tone, .success)
+        XCTAssertEqual(model.toast?.sessionID, "chat-1")
 
         model.destination = .chats
         model.chatRoute = .session("chat-1")
@@ -5328,6 +5643,8 @@ final class AppModelTests: XCTestCase {
         )
 
         model.connectionState = .ready
+        model.activeTurnID = "turn-live"
+        XCTAssertTrue(model.canLoadEarlierHistory)
         let readyRequestCount = await recorder.requestCount()
         model.loadEarlierHistory()
         model.loadEarlierHistory()
@@ -5346,17 +5663,36 @@ final class AppModelTests: XCTestCase {
         guard case .getSessionHistory(
             let historyID,
             "chat-1",
-            40,
-            let pageSize
+            40
         ) = try XCTUnwrap(historyRequest) else {
             return XCTFail("Expected paged history request")
         }
-        // The gateway rejects pages outside 1...100 events.
-        XCTAssertTrue((1...100).contains(pageSize))
+
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            record: recorded(9, .object([
+                "type": .string("agent_message"),
+                "turnId": .string("turn-live"),
+                "modelStepId": .string("step-live"),
+                "phase": .string("commentary"),
+                "message": .string("Still working"),
+            ]))
+        ))
 
         let events = [
             RenderedEventRecord(event: .object([
                 "type": .string("user_message"),
+                "turnId": .string("turn-oldest"),
+                "message": .string("Oldest question")
+            ]), blocks: []),
+            RenderedEventRecord(event: .object([
+                "type": .string("agent_message"),
+                "turnId": .string("turn-oldest"),
+                "message": .string("Oldest answer")
+            ]), blocks: []),
+            RenderedEventRecord(event: .object([
+                "type": .string("user_message"),
+                "turnId": .string("turn-older"),
                 "message": .string("Older question")
             ]), blocks: []),
             RenderedEventRecord(event: .object([
@@ -5365,11 +5701,13 @@ final class AppModelTests: XCTestCase {
             ]), blocks: []),
             RenderedEventRecord(event: .object([
                 "type": .string("agent_message"),
+                "turnId": .string("turn-older"),
                 "phase": .string("commentary"),
                 "message": .string("Earlier update")
             ]), blocks: []),
             RenderedEventRecord(event: .object([
                 "type": .string("agent_message"),
+                "turnId": .string("turn-older"),
                 "message": .string("Older answer")
             ]), blocks: []),
         ]
@@ -5389,7 +5727,7 @@ final class AppModelTests: XCTestCase {
             records: records,
             nextBeforeSequence: nil
         ))
-        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Current"])
+        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Current", "Still working"])
 
         model.handle(.sessionHistory(
             requestID: historyID,
@@ -5400,14 +5738,53 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(
             model.displayedTranscript.map(\.text),
-            ["Older question", "Earlier update", "Older answer", "Current"]
+            ["Older question", "Earlier update", "Older answer", "Current", "Still working"]
         )
         XCTAssertEqual(
             model.displayedTranscript.map(\.kind),
-            [.user, .commentary, .assistant, .assistant]
+            [.user, .commentary, .assistant, .assistant, .commentary]
         )
         XCTAssertEqual(model.selectedModelRoute, "current-route")
+        XCTAssertTrue(model.hasEarlierHistory)
+
+        model.loadEarlierHistory()
+        XCTAssertEqual(
+            model.displayedTranscript.map(\.text),
+            [
+                "Oldest question",
+                "Oldest answer",
+                "Older question",
+                "Earlier update",
+                "Older answer",
+                "Current",
+                "Still working",
+            ]
+        )
         XCTAssertFalse(model.hasEarlierHistory)
+
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            record: recorded(10, .object([
+                "type": .string("agent_message"),
+                "turnId": .string("turn-live"),
+                "modelStepId": .string("step-more"),
+                "phase": .string("commentary"),
+                "message": .string("More work"),
+            ]))
+        ))
+        XCTAssertEqual(
+            model.displayedTranscript.map(\.text),
+            [
+                "Oldest question",
+                "Oldest answer",
+                "Older question",
+                "Earlier update",
+                "Older answer",
+                "Current",
+                "Still working",
+                "More work",
+            ]
+        )
 
         model.restoreSession("chat-1")
         try await Task.sleep(for: .milliseconds(30))
@@ -5420,6 +5797,276 @@ final class AppModelTests: XCTestCase {
             payload: sessionReady(latestSequence: 8, nextBeforeSequence: 40)
         ))
         model.handle(.sessionReplayComplete(requestID: reconnectID, sessionID: "chat-1"))
+        XCTAssertEqual(model.displayedTranscript.map(\.text), ["Still working", "More work"])
+        XCTAssertTrue(model.hasEarlierHistory)
+    }
+
+    func testHistoryMergeDoesNotReplayABufferedDeltaTwice() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+
+        model.openSession("chat-1")
+        let openRequest = await recorder.firstRequest(after: 0) {
+            guard case .openSession(_, "chat-1", _) = $0 else { return false }
+            return true
+        }
+        guard case .openSession(let openID, _, _) = try XCTUnwrap(openRequest) else {
+            return XCTFail("Expected session open")
+        }
+        model.handle(.sessionOpened(
+            requestID: openID,
+            payload: sessionReady(latestSequence: 8, nextBeforeSequence: 40)
+        ))
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            record: recorded(8, .object([
+                "type": .string("agent_message"),
+                "sessionId": .string("chat-1"),
+                "turnId": .string("turn-current"),
+                "modelStepId": .string("step-current"),
+                "phase": .string("final_answer"),
+                "message": .string("Current"),
+                "messageTarget": .null,
+            ]))
+        ))
+        model.handle(.sessionReplayComplete(requestID: openID, sessionID: "chat-1"))
+        model.activeTurnID = "turn-live"
+
+        let requestCount = await recorder.requestCount()
+        model.loadEarlierHistory()
+        let historyRequest = await recorder.firstRequest(after: requestCount) {
+            guard case .getSessionHistory = $0 else { return false }
+            return true
+        }
+        guard case .getSessionHistory(let historyID, _, _) = try XCTUnwrap(historyRequest)
+        else { return XCTFail("Expected history request") }
+
+        model.handle(.agentEvent(
+            sessionID: "chat-1",
+            record: recorded(9, .object([
+                "type": .string("agent_message_content_delta"),
+                "sessionId": .string("chat-1"),
+                "turnId": .string("turn-live"),
+                "modelStepId": .string("step-live"),
+                "phase": .string("commentary"),
+                "delta": .string("Still working"),
+            ]))
+        ))
+        XCTAssertEqual(model.transcript.map(\.text), ["Current"])
+
+        model.handle(.sessionHistory(
+            requestID: historyID,
+            sessionID: "chat-1",
+            records: [recorded(1, .object([
+                "type": .string("user_message"),
+                "message": .string("Older question"),
+            ]))],
+            nextBeforeSequence: nil
+        ))
+        try await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertEqual(
+            model.transcript.map(\.text),
+            ["Older question", "Current", "Still working"]
+        )
+    }
+
+    func testHistoryPagesReconnectTurnMetadataAcrossAPageBoundary() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+
+        model.openSession("chat-1")
+        let openRequest = await recorder.firstRequest(after: 0) {
+            guard case .openSession(_, "chat-1", _) = $0 else { return false }
+            return true
+        }
+        guard case .openSession(let openID, _, _) = try XCTUnwrap(openRequest) else {
+            return XCTFail("Expected session open")
+        }
+        model.handle(.sessionOpened(
+            requestID: openID,
+            payload: sessionReady(latestSequence: 8, nextBeforeSequence: 9)
+        ))
+        model.handle(.sessionReplayComplete(requestID: openID, sessionID: "chat-1"))
+
+        model.loadEarlierHistory()
+        let firstRequest = await recorder.firstRequest(after: 1) {
+            guard case .getSessionHistory = $0 else { return false }
+            return true
+        }
+        guard case .getSessionHistory(let firstID, _, 9) = try XCTUnwrap(firstRequest) else {
+            return XCTFail("Expected first history page")
+        }
+        let turnID = "turn-1"
+        model.handle(.sessionHistory(
+            requestID: firstID,
+            sessionID: "chat-1",
+            records: [
+                recorded(5, .object([
+                    "type": .string("user_message"),
+                    "message": .string("Use the smaller patch"),
+                ])),
+                recorded(6, .object([
+                    "type": .string("agent_message"),
+                    "turnId": .string(turnID),
+                    "modelStepId": .string("step-2"),
+                    "phase": .string("commentary"),
+                    "message": .string("After steering"),
+                ])),
+                recorded(7, .object([
+                    "type": .string("agent_message"),
+                    "turnId": .string(turnID),
+                    "modelStepId": .string("step-3"),
+                    "phase": .string("final_answer"),
+                    "message": .string("Done"),
+                ])),
+                recorded(8, .object([
+                    "type": .string("task_complete"),
+                    "turnId": .string(turnID),
+                ])),
+            ],
+            nextBeforeSequence: 5
+        ))
+
+        XCTAssertEqual(model.transcript.map(\.turnID), Array(repeating: turnID, count: 3))
+        XCTAssertEqual(
+            model.transcriptProjection(breakBefore: nil).rows.map(\.kind),
+            [.user, .workedGroup, .narrative]
+        )
+
+        let requestCount = await recorder.requestCount()
+        model.loadEarlierHistory()
+        let secondRequest = await recorder.firstRequest(after: requestCount) {
+            guard case .getSessionHistory = $0 else { return false }
+            return true
+        }
+        guard case .getSessionHistory(let secondID, _, 5) = try XCTUnwrap(secondRequest) else {
+            return XCTFail("Expected second history page")
+        }
+        model.handle(.sessionHistory(
+            requestID: secondID,
+            sessionID: "chat-1",
+            records: [
+                recorded(1, .object([
+                    "type": .string("task_started"),
+                    "turnId": .string(turnID),
+                ])),
+                recorded(2, .object([
+                    "type": .string("user_message"),
+                    "message": .string("Start"),
+                ])),
+                recorded(3, .object([
+                    "type": .string("agent_message"),
+                    "turnId": .string(turnID),
+                    "modelStepId": .string("step-1"),
+                    "phase": .string("commentary"),
+                    "message": .string("Before steering"),
+                ])),
+            ],
+            nextBeforeSequence: nil
+        ))
+
+        XCTAssertEqual(
+            model.transcript.map(\.text),
+            ["Start", "Before steering", "Use the smaller patch", "After steering", "Done"]
+        )
+        XCTAssertEqual(model.transcript.map(\.turnID), Array(repeating: turnID, count: 5))
+        XCTAssertEqual(model.transcript.map(\.startsTurn), [true, false, false, false, false])
+        let projection = model.transcriptProjection(breakBefore: nil)
+        XCTAssertEqual(projection.rows.map(\.kind), [.user, .workedGroup, .narrative])
+        XCTAssertEqual(
+            projection.rows[1].records.map(\.text),
+            ["Before steering", "Use the smaller patch", "After steering"]
+        )
+    }
+
+    func testHistoricalInterruptedTurnCollapsesAroundAbortNotice() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        model.accounts = [account]
+        model.selectedAccountID = account.id
+        model.connectionState = .ready
+
+        model.openSession("chat-1")
+        let openRequest = await recorder.firstRequest(after: 0) {
+            guard case .openSession(_, "chat-1", _) = $0 else { return false }
+            return true
+        }
+        guard case .openSession(let openID, _, _) = try XCTUnwrap(openRequest) else {
+            return XCTFail("Expected session open")
+        }
+        model.handle(.sessionOpened(
+            requestID: openID,
+            payload: sessionReady(latestSequence: 4, nextBeforeSequence: 5)
+        ))
+        model.handle(.sessionReplayComplete(requestID: openID, sessionID: "chat-1"))
+
+        let requestCount = await recorder.requestCount()
+        model.loadEarlierHistory()
+        let historyRequest = await recorder.firstRequest(after: requestCount) {
+            if case .getSessionHistory = $0 { return true }
+            return false
+        }
+        guard case .getSessionHistory(let historyID, _, 5) = try XCTUnwrap(historyRequest)
+        else { return XCTFail("Expected history request") }
+
+        let turnID = "turn-1"
+        model.handle(.sessionHistory(
+            requestID: historyID,
+            sessionID: "chat-1",
+            records: [
+                recorded(1, .object([
+                    "type": .string("task_started"),
+                    "turnId": .string(turnID),
+                ])),
+                recorded(2, .object([
+                    "type": .string("user_message"),
+                    "message": .string("Start"),
+                ])),
+                recorded(3, .object([
+                    "type": .string("agent_message"),
+                    "turnId": .string(turnID),
+                    "modelStepId": .string("step-1"),
+                    "phase": .string("commentary"),
+                    "message": .string("Checking"),
+                ])),
+                recorded(4, .object([
+                    "type": .string("turn_aborted"),
+                    "turnId": .string(turnID),
+                    "reason": .string("Stopped"),
+                ]), blocks: [RenderedBlock(capability: "agent", block: FrontendBlock(
+                    id: nil,
+                    group: turnID,
+                    update: .replace,
+                    state: .complete,
+                    role: .notice,
+                    title: "Turn aborted",
+                    text: "Stopped",
+                    symbol: nil,
+                    format: "plain_text",
+                    tone: "warning",
+                    files: []
+                ))]),
+            ],
+            nextBeforeSequence: nil
+        ))
+
+        XCTAssertEqual(model.displayedTranscript.map(\.turnID), Array(repeating: turnID, count: 3))
+        XCTAssertEqual(model.displayedTranscript.map(\.turnTerminal), [false, false, true])
+        let projection = model.transcriptProjection(breakBefore: nil)
+        XCTAssertEqual(projection.rows.map(\.kind), [.user, .workedGroup, .activityGroup])
+        XCTAssertEqual(projection.rows[1].records.map(\.text), ["Checking"])
+        XCTAssertEqual(projection.rows[2].records.map(\.title), ["Turn aborted"])
+        XCTAssertEqual(projection.rows[1].elapsedMs, 200)
         XCTAssertFalse(model.hasEarlierHistory)
     }
 
@@ -5452,7 +6099,7 @@ final class AppModelTests: XCTestCase {
             if case .getSessionHistory = $0 { return true }
             return false
         }
-        guard case .getSessionHistory(let rejectedID, _, _, _) = try XCTUnwrap(rejectedRequest)
+        guard case .getSessionHistory(let rejectedID, _, _) = try XCTUnwrap(rejectedRequest)
         else { return XCTFail("Expected rejected history request") }
 
         model.handle(.rejected(GatewayRejection(
@@ -5471,7 +6118,7 @@ final class AppModelTests: XCTestCase {
             if case .getSessionHistory = $0 { return true }
             return false
         }
-        guard case .getSessionHistory(let emptyID, _, _, _) = try XCTUnwrap(emptyRequest)
+        guard case .getSessionHistory(let emptyID, _, _) = try XCTUnwrap(emptyRequest)
         else { return XCTFail("Expected empty history request") }
 
         model.handle(.sessionHistory(
@@ -5549,7 +6196,7 @@ final class AppModelTests: XCTestCase {
             guard case .getSessionHistory = $0 else { return false }
             return true
         }
-        guard case .getSessionHistory(let firstID, _, 7, _) = try XCTUnwrap(firstHistory) else {
+        guard case .getSessionHistory(let firstID, _, 7) = try XCTUnwrap(firstHistory) else {
             return XCTFail("Expected first history page")
         }
         let partial = recorded(6, .object([
@@ -5574,7 +6221,7 @@ final class AppModelTests: XCTestCase {
             guard case .getSessionHistory = $0 else { return false }
             return true
         }
-        guard case .getSessionHistory(let secondID, _, 6, _) = try XCTUnwrap(secondHistory) else {
+        guard case .getSessionHistory(let secondID, _, 6) = try XCTUnwrap(secondHistory) else {
             return XCTFail("Expected second history page")
         }
         let toolBegin = recorded(5, .object([
@@ -5608,40 +6255,97 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.transcript.allSatisfy { !$0.pending })
     }
 
-    func testTranscriptStartsWithABoundedVisibleTail() throws {
+    func testTranscriptStartsWithABoundedTurnTail() throws {
         let model = try model()
-        model.transcript = (0..<301).map { index in
+        model.transcript = (0..<2).map { index in
             TranscriptEntry(
                 id: "entry-\(index)",
                 text: "\(index)",
                 kind: .assistant,
                 format: "plain_text",
-                pending: false
+                pending: false,
+                turnID: "turn-\(index)",
+                startsTurn: true
             )
         }
         model.connectionState = .ready
 
-        XCTAssertEqual(model.displayedTranscript.count, 300)
+        XCTAssertEqual(model.displayedTranscript.count, 1)
         XCTAssertEqual(model.displayedTranscript.first?.text, "1")
+        XCTAssertEqual(TranscriptProjection.turnCount(in: model.displayedTranscript), 1)
         XCTAssertTrue(model.hasEarlierHistory)
 
         model.loadEarlierHistory()
 
-        XCTAssertEqual(model.displayedTranscript.count, 301)
+        XCTAssertEqual(model.displayedTranscript.count, 2)
+        XCTAssertFalse(model.hasEarlierHistory)
+    }
+
+    func testTranscriptPaginationKeepsCompletedTurnsWhole() throws {
+        let model = try model()
+        model.transcript = (0..<2).flatMap { index in
+            let turnID = "turn-\(index)"
+            return [
+                TranscriptEntry(
+                    id: "user-\(index)",
+                    text: "Question \(index)",
+                    kind: .user,
+                    format: "plain_text",
+                    pending: false,
+                    turnID: turnID,
+                    startsTurn: true
+                ),
+                TranscriptEntry(
+                    id: "work-\(index)",
+                    text: "Work \(index)",
+                    kind: .commentary,
+                    format: "plain_text",
+                    pending: false,
+                    turnID: turnID
+                ),
+                TranscriptEntry(
+                    id: "final-\(index)",
+                    text: "Answer \(index)",
+                    kind: .assistant,
+                    format: "plain_text",
+                    pending: false,
+                    turnID: turnID,
+                    turnTerminal: true
+                ),
+            ]
+        }
+        model.connectionState = .ready
+
+        XCTAssertEqual(model.displayedTranscript.count, 3)
+        XCTAssertEqual(model.displayedTranscript.first?.id, "user-1")
+        XCTAssertEqual(model.displayedTranscript.prefix(3).map(\.turnID), [
+            "turn-1", "turn-1", "turn-1",
+        ])
+        XCTAssertEqual(
+            model.transcriptProjection(breakBefore: nil).rows.prefix(3).map(\.kind),
+            [.user, .workedGroup, .narrative]
+        )
+        XCTAssertTrue(model.hasEarlierHistory)
+
+        model.loadEarlierHistory()
+
+        XCTAssertEqual(model.displayedTranscript.count, 6)
+        XCTAssertEqual(model.displayedTranscript.first?.id, "user-0")
         XCTAssertFalse(model.hasEarlierHistory)
     }
 
     func testLiveGrowthKeepsTheVisibleTranscriptStartStable() throws {
         let model = try model()
-        model.transcript = (0..<299).map { index in
-            TranscriptEntry(
-                id: "entry-\(index)",
-                text: "\(index)",
-                kind: index == 298 ? .event : .assistant,
-                format: "plain_text",
-                pending: false
-            )
-        }
+        model.transcript = [TranscriptEntry(
+            id: "entry-0",
+            text: "0",
+            kind: .event,
+            format: "plain_text",
+            pending: false,
+            turnID: "turn-0",
+            startsTurn: true
+        )]
+        model.activeTurnID = "turn-0"
         let before = model.transcriptProjection(breakBefore: nil)
 
         model.reduce(record: RecordedEvent(
@@ -5670,10 +6374,63 @@ final class AppModelTests: XCTestCase {
         ))
         let after = model.transcriptProjection(breakBefore: nil)
 
-        XCTAssertEqual(model.displayedTranscript.count, 301)
+        XCTAssertEqual(model.displayedTranscript.count, 3)
         XCTAssertEqual(model.displayedTranscript.first?.presentationID, "entry-0")
         XCTAssertEqual(after.rows.last?.id, before.rows.last?.id)
         XCTAssertEqual(after.structuralRevision, before.structuralRevision)
+    }
+
+    func testStructuralTranscriptGrowthInvalidatesThePinnedWindow() throws {
+        let model = try model()
+        let original = (0..<2).map { index in
+            TranscriptEntry(
+                id: "entry-\(index)",
+                text: "\(index)",
+                kind: .assistant,
+                format: "plain_text",
+                pending: false,
+                turnID: "turn-\(index)",
+                startsTurn: true
+            )
+        }
+        model.transcript = original
+        XCTAssertEqual(model.displayedTranscript.first?.id, "entry-1")
+        model.activeTurnID = "turn-1"
+
+        model.reduce(record: RecordedEvent(
+            sequence: 1,
+            recordedAtMs: 100,
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("web_search_begin")
+            ])),
+            streamMetrics: [],
+            blocks: [],
+            preview: nil
+        ))
+
+        var rewritten = model.transcript
+        rewritten[1] = TranscriptEntry(
+            id: "replacement-1",
+            text: "Replacement",
+            kind: .assistant,
+            format: "plain_text",
+            pending: false,
+            turnID: "turn-1",
+            startsTurn: true
+        )
+        rewritten.append(TranscriptEntry(
+            id: "appended",
+            text: "Appended",
+            kind: .assistant,
+            format: "plain_text",
+            pending: false,
+            turnID: "turn-1"
+        ))
+        model.transcript = rewritten
+
+        XCTAssertTrue(model.displayedTranscript.contains { $0.id == "replacement-1" })
+        XCTAssertFalse(model.displayedTranscript.contains { $0.id == "entry-1" })
+        XCTAssertEqual(model.displayedTranscript.last?.id, "appended")
     }
 
     func testCachedTranscriptSuppliesTheOpenCursorAndRestoresOnce() async throws {
@@ -5703,7 +6460,11 @@ final class AppModelTests: XCTestCase {
                 text: "Already rendered",
                 kind: .assistant,
                 format: "plain_text",
-                pending: false
+                pending: false,
+                turnID: "turn-cached",
+                startsTurn: true,
+                turnTerminal: true,
+                turnElapsedMs: 1_250
             )],
             currentUsage: currentUsage,
             lastUsage: lastUsage
@@ -5730,6 +6491,10 @@ final class AppModelTests: XCTestCase {
 
         model.handle(.sessionOpened(requestID: requestID, payload: sessionReady(latestSequence: 7)))
         XCTAssertEqual(model.transcript.map(\.text), ["Already rendered"])
+        XCTAssertEqual(model.transcript.first?.turnID, "turn-cached")
+        XCTAssertEqual(model.transcript.first?.startsTurn, true)
+        XCTAssertEqual(model.transcript.first?.turnTerminal, true)
+        XCTAssertEqual(model.transcript.first?.turnElapsedMs, 1_250)
         XCTAssertFalse(model.isLoadingTranscript)
         XCTAssertEqual(model.currentUsage.totalTokens, 55)
         XCTAssertEqual(model.contextTokens, 42)
@@ -5748,6 +6513,59 @@ final class AppModelTests: XCTestCase {
             preview: nil
         ))
         XCTAssertEqual(model.transcript.map(\.text), ["Already rendered"])
+    }
+
+    func testLegacyTranscriptCacheIsRejectedBeforeReplay() async throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let store = GatewayStore(defaults: defaults, transcriptDirectory: directory)
+        let accountID = UUID()
+        await store.saveTranscript(
+            accountID: accountID,
+            sessionID: "chat-legacy",
+            sequence: 7,
+            transcript: [TranscriptEntry(
+                id: "answer-1",
+                text: "Already rendered",
+                kind: .assistant,
+                format: "plain_text",
+                pending: false,
+                turnID: "turn-legacy",
+                turnTerminal: true
+            )],
+            currentUsage: TokenUsage(),
+            lastUsage: TokenUsage()
+        )
+
+        let accountDirectory = directory.appendingPathComponent(
+            accountID.uuidString,
+            isDirectory: true
+        )
+        let cacheURL = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(
+                at: accountDirectory,
+                includingPropertiesForKeys: nil
+            ).first
+        )
+        var legacy = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL))
+                as? [String: Any]
+        )
+        legacy.removeValue(forKey: "schemaVersion")
+        try JSONSerialization.data(withJSONObject: legacy).write(to: cacheURL, options: .atomic)
+
+        let restored = await store.loadTranscript(
+            accountID: accountID,
+            sessionID: "chat-legacy"
+        )
+        XCTAssertNil(restored)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cacheURL.path))
     }
 
     func testReconnectKeepsTheRetainedTranscriptVisibleWhileReplayLoads() throws {
@@ -7063,7 +7881,13 @@ final class TranscriptProjectionTests: XCTestCase {
     private func entry(
         _ id: String,
         presentationID: String? = nil,
-        kind: TranscriptEntry.Kind = .event
+        kind: TranscriptEntry.Kind = .event,
+        pending: Bool = false,
+        turnID: String? = nil,
+        startsTurn: Bool = false,
+        turnTerminal: Bool = false,
+        turnElapsedMs: UInt64? = nil,
+        recordedAtMs: Int64? = nil
     ) -> TranscriptEntry {
         TranscriptEntry(
             id: id,
@@ -7072,7 +7896,12 @@ final class TranscriptProjectionTests: XCTestCase {
             kind: kind,
             role: kind == .assistant ? nil : .tool,
             format: "plain_text",
-            pending: false
+            pending: pending,
+            turnID: turnID,
+            startsTurn: startsTurn,
+            turnTerminal: turnTerminal,
+            turnElapsedMs: turnElapsedMs,
+            recordedAtMs: recordedAtMs
         )
     }
 
@@ -7191,15 +8020,32 @@ final class TranscriptProjectionTests: XCTestCase {
         XCTAssertTrue(second.rows[0].records[0] === message)
     }
 
-    func testStepJoiningExistingActivityGroupLeavesStructuralRevisionUnchanged() {
-        let firstEvent = entry("event:1")
+    func testSequentialActivityWithDifferentTurnIDsStaysGrouped() {
+        let firstEvent = entry("event:1", turnID: "child-turn-1")
         let first = TranscriptProjection(entries: [firstEvent])
-        let secondEvent = entry("event:2")
+        let secondEvent = entry("event:2", turnID: "child-turn-2")
         let second = TranscriptProjection(entries: [firstEvent, secondEvent], previous: first)
 
         XCTAssertEqual(second.rows.count, 1)
         XCTAssertEqual(second.rows[0].records.map(\.presentationID), ["event:1", "event:2"])
         XCTAssertEqual(second.structuralRevision, first.structuralRevision)
+    }
+
+    func testCompletedTurnCollapsesMixedChildActivityIntoWorkedGroup() {
+        let entries = [
+            entry("user", kind: .user, turnID: "turn-root", startsTurn: true),
+            entry("root-work", turnID: "turn-root"),
+            entry("child-work", turnID: "turn-child"),
+            entry("final", kind: .assistant, turnID: "turn-root", turnTerminal: true),
+        ]
+
+        let projection = TranscriptProjection(entries: entries)
+
+        XCTAssertEqual(projection.rows.map(\.kind), [.user, .workedGroup, .narrative])
+        XCTAssertEqual(
+            projection.rows[1].records.map(\.id),
+            ["root-work", "child-work"]
+        )
     }
 
     func testNewActivityRunBumpsStructuralRevisionOnce() {
@@ -7261,6 +8107,175 @@ final class TranscriptProjectionTests: XCTestCase {
             .intrinsic,
             .intrinsic,
         ])
+    }
+
+    func testCompletedTurnCollapsesWorkOnlyAfterTheFinalMessageFinishes() {
+        let turnID = "turn-1"
+        let user = entry(
+            "user",
+            kind: .user,
+            turnID: turnID,
+            startsTurn: true,
+            recordedAtMs: 1_000
+        )
+        let commentary = entry(
+            "commentary",
+            kind: .commentary,
+            turnID: turnID,
+            recordedAtMs: 1_500
+        )
+        let event = entry(
+            "event",
+            turnID: turnID,
+            recordedAtMs: 2_000
+        )
+        let steering = entry(
+            "steering",
+            kind: .user,
+            turnID: turnID,
+            recordedAtMs: 2_500
+        )
+        let final = entry(
+            "final",
+            kind: .assistant,
+            pending: true,
+            turnID: turnID,
+            turnTerminal: true,
+            recordedAtMs: 4_200
+        )
+
+        let running = TranscriptProjection(
+            entries: [user, commentary, event, steering, final]
+        )
+        XCTAssertEqual(running.rows.map(\.kind), [
+            .user,
+            .narrative,
+            .activityGroup,
+            .user,
+            .narrative,
+        ])
+
+        final.pending = false
+        let completed = TranscriptProjection(
+            entries: [user, commentary, event, steering, final],
+            previous: running
+        )
+
+        XCTAssertEqual(completed.rows.map(\.kind), [.user, .workedGroup, .narrative])
+        XCTAssertEqual(
+            completed.rows[1].records.map(\.id),
+            ["commentary", "event", "steering"]
+        )
+        XCTAssertEqual(completed.rows[1].elapsedMs, 3_200)
+        XCTAssertEqual(TranscriptProjection.turnCount(
+            in: [user, commentary, event, steering, final]
+        ), 1)
+    }
+
+    func testTurnWindowKeepsSteeringInsideCompletedTurn() {
+        let turnID = "turn-1"
+        let earlier = [
+            entry("earlier-user", kind: .user, turnID: "turn-0", startsTurn: true),
+            entry("earlier-final", kind: .assistant, turnID: "turn-0", turnTerminal: true),
+        ]
+        let user = entry(
+            "user",
+            kind: .user,
+            turnID: turnID,
+            startsTurn: true,
+            recordedAtMs: 1_000
+        )
+        let commentary = entry(
+            "commentary",
+            kind: .commentary,
+            turnID: turnID,
+            recordedAtMs: 1_500
+        )
+        let steering = entry(
+            "steering",
+            kind: .user,
+            turnID: turnID,
+            recordedAtMs: 2_500
+        )
+        let final = entry(
+            "final",
+            kind: .assistant,
+            turnID: turnID,
+            turnTerminal: true,
+            turnElapsedMs: 3_200,
+            recordedAtMs: 4_200
+        )
+
+        let currentTurn = [user, commentary, steering, final]
+        let window = TranscriptProjection.turnWindow(
+            from: earlier + currentTurn,
+            maximumTurns: 1
+        )
+        let projection = TranscriptProjection(entries: window.entries)
+
+        XCTAssertEqual(window.entries.map(\.id), currentTurn.map(\.id))
+        XCTAssertEqual(window.turnCount, 1)
+        XCTAssertTrue(window.hasEarlierEntries)
+        XCTAssertEqual(projection.rows.map(\.kind), [.user, .workedGroup, .narrative])
+        XCTAssertEqual(projection.rows[1].records.map(\.id), ["commentary", "steering"])
+        XCTAssertEqual(projection.rows[1].elapsedMs, 3_200)
+
+        let bothTurns = TranscriptProjection.turnWindow(
+            from: earlier + currentTurn,
+            maximumTurns: 2
+        )
+        XCTAssertEqual(bothTurns.entries.map(\.id), (earlier + currentTurn).map(\.id))
+        XCTAssertEqual(bothTurns.turnCount, 2)
+        XCTAssertFalse(bothTurns.hasEarlierEntries)
+    }
+
+    func testTurnWindowMatchesWholeTurnSuffixes() {
+        let turns = (0..<5).map { index in
+            let turnID = "turn-\(index)"
+            return [
+                entry("user-\(index)", kind: .user, turnID: turnID, startsTurn: true),
+                entry("work-\(index)", kind: .commentary, turnID: turnID),
+                entry(
+                    "final-\(index)",
+                    kind: .assistant,
+                    turnID: turnID,
+                    turnTerminal: true
+                ),
+            ]
+        }
+        let entries = turns.flatMap { $0 }
+
+        for maximumTurns in 1...(turns.count + 2) {
+            let expectedTurns = Array(turns.suffix(maximumTurns))
+            let expectedEntries = expectedTurns.flatMap { $0 }
+            let window = TranscriptProjection.turnWindow(
+                from: entries,
+                maximumTurns: maximumTurns
+            )
+
+            XCTAssertEqual(window.entries.map(\.id), expectedEntries.map(\.id))
+            XCTAssertEqual(window.turnCount, expectedTurns.count)
+            XCTAssertEqual(window.hasEarlierEntries, turns.count > expectedTurns.count)
+            XCTAssertTrue(zip(window.entries, expectedEntries).allSatisfy { $0 === $1 })
+        }
+    }
+
+    func testTurnWindowDoesNotCountAnUnmarkedPrefixPastItsLimit() {
+        let prefix = entry("partial", kind: .commentary, turnID: "turn-0")
+        let latest = [
+            entry("user", kind: .user, turnID: "turn-1", startsTurn: true),
+            entry("work", kind: .commentary, turnID: "turn-1"),
+            entry("final", kind: .assistant, turnID: "turn-1", turnTerminal: true),
+        ]
+
+        let window = TranscriptProjection.turnWindow(
+            from: [prefix] + latest,
+            maximumTurns: 1
+        )
+
+        XCTAssertEqual(window.entries.map(\.id), latest.map(\.id))
+        XCTAssertEqual(window.turnCount, 1)
+        XCTAssertTrue(window.hasEarlierEntries)
     }
 }
 

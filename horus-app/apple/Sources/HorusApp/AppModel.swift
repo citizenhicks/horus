@@ -91,6 +91,13 @@ struct AppToast: Identifiable {
     let id = UUID()
     let message: String
     let tone: ToastTone
+    let sessionID: String?
+
+    init(message: String, tone: ToastTone, sessionID: String? = nil) {
+        self.message = message
+        self.tone = tone
+        self.sessionID = sessionID
+    }
 }
 
 enum ComposerAttachmentState: Equatable {
@@ -386,6 +393,7 @@ private let maximumAttachmentBytes = 50 * 1024 * 1024
 private let maximumComposerAttachmentBytes: Int64 = 100 * 1024 * 1024
 private let maximumPresentedFileBytes = 50 * 1024 * 1024
 private let maximumHighlightedPreviewBytes = 1024 * 1024
+private let transcriptTurnsPerPage = 1
 
 @Observable
 final class TranscriptEntry: Identifiable {
@@ -412,6 +420,10 @@ final class TranscriptEntry: Identifiable {
     var tone: String
     var pending: Bool
     var modelStepID: String?
+    var turnID: String?
+    var startsTurn: Bool
+    var turnTerminal: Bool
+    var turnElapsedMs: UInt64?
     var sourceSequence: UInt64?
     var recordedAtMs: Int64?
     var messageTarget: MessageTarget?
@@ -432,6 +444,10 @@ final class TranscriptEntry: Identifiable {
         tone: String = "neutral",
         pending: Bool,
         modelStepID: String? = nil,
+        turnID: String? = nil,
+        startsTurn: Bool = false,
+        turnTerminal: Bool = false,
+        turnElapsedMs: UInt64? = nil,
         sourceSequence: UInt64? = nil,
         recordedAtMs: Int64? = nil,
         messageTarget: MessageTarget? = nil,
@@ -451,6 +467,10 @@ final class TranscriptEntry: Identifiable {
         self.tone = tone
         self.pending = pending
         self.modelStepID = modelStepID
+        self.turnID = turnID
+        self.startsTurn = startsTurn
+        self.turnTerminal = turnTerminal
+        self.turnElapsedMs = turnElapsedMs
         self.sourceSequence = sourceSequence
         self.recordedAtMs = recordedAtMs
         self.messageTarget = messageTarget
@@ -491,12 +511,28 @@ struct TranscriptPresentationRow: Identifiable {
         case user
         case narrative
         case activityGroup
+        case workedGroup
     }
 
     let id: TranscriptPresentationID
     let records: [TranscriptEntry]
     let sizing: TranscriptRowSizing
     let kind: Kind
+    let elapsedMs: UInt64?
+
+    init(
+        id: TranscriptPresentationID,
+        records: [TranscriptEntry],
+        sizing: TranscriptRowSizing,
+        kind: Kind,
+        elapsedMs: UInt64? = nil
+    ) {
+        self.id = id
+        self.records = records
+        self.sizing = sizing
+        self.kind = kind
+        self.elapsedMs = elapsedMs
+    }
 }
 
 struct TranscriptWaitingPhrase: Equatable {
@@ -575,6 +611,57 @@ struct TranscriptProjection {
         self.structure = structure
     }
 
+    static func turnWindow(
+        from entries: [TranscriptEntry],
+        maximumTurns: Int
+    ) -> (entries: [TranscriptEntry], turnCount: Int, hasEarlierEntries: Bool) {
+        let maximumTurns = max(0, maximumTurns)
+        guard maximumTurns > 0, !entries.isEmpty else {
+            return ([], 0, !entries.isEmpty)
+        }
+
+        let turnStarts = entries.indices.filter { entries[$0].startsTurn }
+        if !turnStarts.isEmpty {
+            let includedMarkedTurns = min(maximumTurns, turnStarts.count)
+            let firstIncludedTurn = turnStarts.count - includedMarkedTurns
+            let includesLeadingTurn = turnStarts[0] > entries.startIndex
+                && maximumTurns > includedMarkedTurns
+            let start = includesLeadingTurn
+                ? entries.startIndex
+                : turnStarts[firstIncludedTurn]
+            return (
+                Array(entries[start...]),
+                includedMarkedTurns + (includesLeadingTurn ? 1 : 0),
+                start > entries.startIndex
+            )
+        }
+
+        var start = entries.index(before: entries.endIndex)
+        var turnCount = 1
+        while start > entries.startIndex {
+            if entries[start].turnID != entries[start - 1].turnID {
+                if turnCount == maximumTurns { break }
+                turnCount += 1
+            }
+            start -= 1
+        }
+        return (Array(entries[start...]), turnCount, start > entries.startIndex)
+    }
+
+    static func turnCount(in entries: [TranscriptEntry]) -> Int {
+        guard !entries.isEmpty else { return 0 }
+        let turnStarts = entries.indices.filter { entries[$0].startsTurn }
+        if let firstTurnStart = turnStarts.first {
+            return turnStarts.count + (firstTurnStart > entries.startIndex ? 1 : 0)
+        }
+        var count = 1
+        for index in entries.indices.dropFirst()
+            where entries[index].turnID != entries[index - 1].turnID {
+            count += 1
+        }
+        return count
+    }
+
     /// Only the current tail can own the phrase, and it owns it from the moment it exists.
     ///
     /// Waiting for the run to have named itself first cost a bump: the row is created by the
@@ -614,7 +701,9 @@ struct TranscriptProjection {
         for entry in entries {
             if entry.presentationID == boundaryID { appendActivity() }
             if entry.kind.isActivity {
+                if entry.turnTerminal { appendActivity() }
                 activity.append(entry)
+                if entry.turnTerminal { appendActivity() }
                 continue
             }
             appendActivity()
@@ -633,7 +722,7 @@ struct TranscriptProjection {
 
         // Claim old anchors first. Once its original record leaves the display window, an ID
         // is only an identity: loading that record back must not steal it from the visible run.
-        // ponytail: O(n²) over the 300-entry display cap; index only if that cap grows.
+        // ponytail: O(n²) over the bounded visible transcript; index only if profiling asks.
         for (index, row) in rows.enumerated() where row.kind == .activityGroup {
             let recordIDs = Set(row.records.map(\.presentationID))
             guard let match = previousActivityRows.firstIndex(where: { previousRow in
@@ -654,7 +743,7 @@ struct TranscriptProjection {
         let reservedIDs = Set(reusedIDs.values)
         let defaultIDs = Set(rows.map(\.id))
         var claimedIDs = Set<TranscriptPresentationID>()
-        return rows.enumerated().map { index, row in
+        let stableRows = rows.enumerated().map { index, row in
             var id = reusedIDs[index] ?? row.id
             if row.kind == .activityGroup,
                reusedIDs[index] == nil,
@@ -673,9 +762,122 @@ struct TranscriptProjection {
                 id: id,
                 records: row.records,
                 sizing: row.sizing,
-                kind: row.kind
+                kind: row.kind,
+                elapsedMs: row.elapsedMs
             )
         }
+        return collapseCompletedWork(in: stableRows)
+    }
+
+    private static func collapseCompletedWork(
+        in rows: [TranscriptPresentationRow]
+    ) -> [TranscriptPresentationRow] {
+        guard rows.contains(where: isTurnStart) else {
+            return collapseBySharedTurnID(in: rows)
+        }
+
+        var collapsed: [TranscriptPresentationRow] = []
+        var start = 0
+        for end in rows.indices.dropFirst() where isTurnStart(rows[end]) {
+            collapsed.append(contentsOf: collapseTurnSegment(Array(rows[start..<end])))
+            start = end
+        }
+        collapsed.append(contentsOf: collapseTurnSegment(Array(rows[start...])))
+        return collapsed
+    }
+
+    private static func collapseBySharedTurnID(
+        in rows: [TranscriptPresentationRow]
+    ) -> [TranscriptPresentationRow] {
+        var collapsed: [TranscriptPresentationRow] = []
+        var start = 0
+        while start < rows.count {
+            guard let turnID = sharedTurnID(for: rows[start]) else {
+                collapsed.append(rows[start])
+                start += 1
+                continue
+            }
+            var end = start + 1
+            while end < rows.count, sharedTurnID(for: rows[end]) == turnID { end += 1 }
+            collapsed.append(contentsOf: collapsedTurn(
+                Array(rows[start..<end]),
+                turnID: turnID
+            ))
+            start = end
+        }
+        return collapsed
+    }
+
+    private static func collapseTurnSegment(
+        _ rows: [TranscriptPresentationRow]
+    ) -> [TranscriptPresentationRow] {
+        guard let terminalID = rows
+            .flatMap(\.records)
+            .first(where: \.turnTerminal)?
+            .turnID
+        else { return rows }
+        return collapsedTurn(rows, turnID: terminalID)
+    }
+
+    private static func isTurnStart(_ row: TranscriptPresentationRow) -> Bool {
+        row.records.contains(where: \.startsTurn)
+    }
+
+    private static func collapsedTurn(
+        _ rows: [TranscriptPresentationRow],
+        turnID: String
+    ) -> [TranscriptPresentationRow] {
+        let terminalRows = rows.filter { row in
+            row.records.contains(where: \.turnTerminal)
+        }
+        guard !terminalRows.isEmpty,
+              terminalRows.allSatisfy({ row in row.records.allSatisfy { !$0.pending } })
+        else { return rows }
+
+        let primaryUserIndex = rows.firstIndex { row in
+            row.kind == .user && row.records.contains(where: \.startsTurn)
+        }
+        let workRows: [TranscriptPresentationRow] = rows.enumerated().compactMap {
+            index, row -> TranscriptPresentationRow? in
+            guard index != primaryUserIndex,
+                  !terminalRows.contains(where: { $0.id == row.id })
+            else { return nil }
+            return row
+        }
+        guard !workRows.isEmpty else { return rows }
+
+        let records = workRows.flatMap(\.records)
+        let elapsedMs = terminalRows
+            .flatMap(\.records)
+            .compactMap(\.turnElapsedMs)
+            .max() ?? {
+                let startedAtMs = rows.flatMap(\.records).compactMap(\.recordedAtMs).min()
+                let completedAtMs = terminalRows
+                    .flatMap(\.records)
+                    .compactMap(\.recordedAtMs)
+                    .max()
+                return startedAtMs.flatMap { startedAtMs in
+                    completedAtMs.map { UInt64(max(0, $0 - startedAtMs)) }
+                }
+            }()
+        var result: [TranscriptPresentationRow] = []
+        if let primaryUserIndex { result.append(rows[primaryUserIndex]) }
+        result.append(TranscriptPresentationRow(
+            id: "turn-work:\(turnID.utf8.count):\(turnID)",
+            records: records,
+            sizing: .fixedSummary,
+            kind: .workedGroup,
+            elapsedMs: elapsedMs
+        ))
+        result.append(contentsOf: terminalRows)
+        return result
+    }
+
+    private static func sharedTurnID(for row: TranscriptPresentationRow) -> String? {
+        guard let turnID = row.records.first?.turnID,
+              row.records.allSatisfy({ $0.turnID == turnID })
+        else { return nil }
+        return turnID
     }
 }
 
@@ -752,6 +954,23 @@ private struct TranscriptProjectionKey: Equatable {
     let firstID: String?
     let lastID: String?
     let waitingPhrase: TranscriptWaitingPhrase?
+}
+
+private struct TranscriptWindowCache {
+    let entries: [TranscriptEntry]
+    let turnCount: Int
+    let hasEarlierEntries: Bool
+}
+
+private enum TranscriptWindowAnchor: Equatable {
+    case tail
+    case visibleTurns(Int)
+}
+
+private struct TranscriptHistoryTurnState {
+    var turnID: String?
+    var unassignedEntryStart: Int?
+    var awaitingInitialUserTurnID: String?
 }
 
 private struct BufferedAgentEvent {
@@ -899,21 +1118,35 @@ final class AppModel {
     var sessionToDelete: SessionRecord?
     private(set) var unreadSessionIDs: Set<String> = []
     var transcript: [TranscriptEntry] = [] {
-        didSet { invalidateTranscriptProjection() }
+        didSet { updateTranscriptWindow(after: oldValue) }
     }
     private var replayPresentedTranscript: [TranscriptEntry]? {
+        didSet { transcriptWindowAnchor = .tail }
+    }
+    private var transcriptWindowAnchor = TranscriptWindowAnchor.tail {
         didSet { invalidateTranscriptProjection() }
     }
-    private var visibleTranscriptLimit = 300 {
-        didSet { invalidateTranscriptProjection() }
-    }
-    /// The gateway rejects history requests outside 1...100 events per page.
-    private let historyPageSize = 100
     var displayedTranscript: [TranscriptEntry] {
+        transcriptWindow.entries
+    }
+    private var transcriptWindow: TranscriptWindowCache {
+        if let transcriptWindowCache { return transcriptWindowCache }
         let source = replayPresentedTranscript ?? transcript
-        return source.count > visibleTranscriptLimit
-            ? Array(source.suffix(visibleTranscriptLimit))
-            : source
+        let maximumTurns = switch transcriptWindowAnchor {
+        case .tail: transcriptTurnsPerPage
+        case .visibleTurns(let count): count
+        }
+        let window = TranscriptProjection.turnWindow(
+            from: source,
+            maximumTurns: maximumTurns
+        )
+        let cached = TranscriptWindowCache(
+            entries: window.entries,
+            turnCount: window.turnCount,
+            hasEarlierEntries: window.hasEarlierEntries
+        )
+        transcriptWindowCache = cached
+        return cached
     }
     /// The one visible activity label that represents the live turn's current step.
     var activeTranscriptStepID: String? {
@@ -947,16 +1180,13 @@ final class AppModel {
     private(set) var isLoadingEarlierHistory = false
     private(set) var historyLoadCompletionRevision = 0
     var hasEarlierHistory: Bool {
-        let source = replayPresentedTranscript ?? transcript
-        return source.count > visibleTranscriptLimit
+        transcriptWindow.hasEarlierEntries
             || nextHistoryBeforeSequence != nil
             || isLoadingEarlierHistory
     }
     var canLoadEarlierHistory: Bool {
         hasEarlierHistory
             && connectionState.isReady
-            && activeTurnID == nil
-            && pendingApproval == nil
             && historyRequestID == nil
     }
     var composer = "" {
@@ -964,7 +1194,9 @@ final class AppModel {
     }
     @ObservationIgnored private var transcriptProjectionCache:
         (key: TranscriptProjectionKey, projection: TranscriptProjection)?
+    @ObservationIgnored private var transcriptWindowCache: TranscriptWindowCache?
     @ObservationIgnored private var transcriptProjectionVersion = 0
+    @ObservationIgnored private var transcriptMutationPreservesPrefix = false
     private(set) var composerFocusRequest = 0
     /// Counterpart to `composerFocusRequest`: the composer owns the focus state, so anything
     /// outside it that needs the keyboard gone asks rather than reaching in.
@@ -1064,12 +1296,14 @@ final class AppModel {
     @ObservationIgnored private var reconnectAttempt = 0
     @ObservationIgnored private var automaticReconnectBlocked = false
     @ObservationIgnored private var deltaFlushTask: Task<Void, Never>?
+    @ObservationIgnored private var awaitingInitialUserTurnID: String?
     @ObservationIgnored private var bufferedDeltas:
         [(
             id: String,
             delta: String,
             kind: TranscriptEntry.Kind,
             modelStepID: String,
+            turnID: String?,
             sourceSequence: UInt64,
             recordedAtMs: Int64
         )] = []
@@ -1395,8 +1629,12 @@ final class AppModel {
         runStats.failedToolCalls + (runStats.active?.failedToolCalls ?? 0)
     }
 
-    func showToast(_ message: String, tone: ToastTone = .info) {
-        let toast = AppToast(message: message, tone: tone)
+    func showToast(
+        _ message: String,
+        tone: ToastTone = .info,
+        sessionID: String? = nil
+    ) {
+        let toast = AppToast(message: message, tone: tone, sessionID: sessionID)
         toastDismissTask?.cancel()
         self.toast = toast
         let duration: Duration = tone == .error || tone == .warning ? .seconds(7) : .seconds(4)
@@ -1458,6 +1696,54 @@ final class AppModel {
 
     private func invalidateTranscriptProjection() {
         transcriptProjectionVersion &+= 1
+        transcriptWindowCache = nil
+    }
+
+    private func updateTranscriptWindow(after previous: [TranscriptEntry]) {
+        guard transcriptMutationPreservesPrefix,
+              replayPresentedTranscript == nil,
+              case .visibleTurns = transcriptWindowAnchor,
+              let cached = transcriptWindowCache,
+              transcript.count > previous.count,
+              previous.isEmpty
+                || (transcript.first === previous.first
+                    && transcript[previous.count - 1] === previous.last)
+        else {
+            invalidateTranscriptProjection()
+            return
+        }
+        let entries = cached.entries + transcript.dropFirst(previous.count)
+        let updated = TranscriptWindowCache(
+            entries: entries,
+            turnCount: TranscriptProjection.turnCount(in: entries),
+            hasEarlierEntries: cached.hasEarlierEntries
+        )
+        transcriptWindowAnchor = .visibleTurns(updated.turnCount)
+        transcriptWindowCache = updated
+    }
+
+    private func mutateTranscriptPreservingPrefix(
+        _ mutation: (inout [TranscriptEntry]) -> Void
+    ) {
+        let wasPreservingPrefix = transcriptMutationPreservesPrefix
+        transcriptMutationPreservesPrefix = true
+        defer { transcriptMutationPreservesPrefix = wasPreservingPrefix }
+        mutation(&transcript)
+    }
+
+    private func pinTranscriptWindowIfNeeded() {
+        guard replayRequestID == nil,
+              historyRequestID == nil,
+              let cached = transcriptWindowCache
+        else { return }
+        switch transcriptWindowAnchor {
+        case .visibleTurns:
+            return
+        case .tail:
+            break
+        }
+        transcriptWindowAnchor = .visibleTurns(cached.turnCount)
+        transcriptWindowCache = cached
     }
 
     /// Starts the on-device rewrite with the submitted first message. The task is stored,
@@ -1956,6 +2242,30 @@ final class AppModel {
         }
     }
 
+    func createWorkspaceDirectory(named rawName: String) {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            directoryError = "Enter a folder name."
+            return
+        }
+        guard name != ".", name != "..", !name.contains("/"), !name.contains("\\") else {
+            directoryError = "Enter a single folder name."
+            return
+        }
+        guard let parent = directoryListing?.path, canCreateSession else { return }
+        let id = requestID("create-directory")
+        directoryRequestID = id
+        directoryError = nil
+        isLoadingDirectories = true
+        transmit(.createWorkspaceDirectory(requestID: id, parent: parent, name: name)) {
+            [weak self] message in
+            guard self?.directoryRequestID == id else { return }
+            self?.directoryRequestID = nil
+            self?.isLoadingDirectories = false
+            self?.directoryError = message
+        }
+    }
+
     func forgetSelectedGateway() {
         guard let account = selectedAccount else { return }
         cancelReconnect()
@@ -2034,9 +2344,12 @@ final class AppModel {
 
     func loadEarlierHistory() {
         guard canLoadEarlierHistory else { return }
-        let source = replayPresentedTranscript ?? transcript
-        if source.count > visibleTranscriptLimit {
-            visibleTranscriptLimit = min(source.count, visibleTranscriptLimit + 300)
+        let window = transcriptWindow
+        if window.hasEarlierEntries {
+            transcriptWindowAnchor = .visibleTurns(
+                window.turnCount + transcriptTurnsPerPage
+            )
+            _ = transcriptWindow
             historyLoadCompletionRevision &+= 1
             return
         }
@@ -2046,11 +2359,12 @@ final class AppModel {
         let id = requestID("history")
         historyRequestID = id
         isLoadingEarlierHistory = true
+        transcriptWindowAnchor = .visibleTurns(window.turnCount)
+        transcriptWindowCache = window
         transmit(.getSessionHistory(
             requestID: id,
             sessionID: sessionID,
-            beforeSequence: beforeSequence,
-            maxEvents: historyPageSize
+            beforeSequence: beforeSequence
         )) { [weak self] _ in
             guard self?.historyRequestID == id else { return }
             self?.finishHistoryLoad()
@@ -3321,8 +3635,14 @@ final class AppModel {
             let nextBeforeSequence
         ):
             guard requestID == historyRequestID, sessionID == selectedSessionID else { break }
+            flushStreamDeltas()
             mergeHistory(records)
             self.nextHistoryBeforeSequence = nextBeforeSequence
+            if !records.isEmpty,
+               case .visibleTurns(let count) = transcriptWindowAnchor {
+                transcriptWindowAnchor = .visibleTurns(count + transcriptTurnsPerPage)
+                _ = transcriptWindow
+            }
             finishHistoryLoad()
         case .sessionChanged(let payload):
             guard payload.session.sessionId == selectedSessionID,
@@ -3840,7 +4160,7 @@ final class AppModel {
         switch outcome {
         case .completed:
             guard !isActiveChat else { return }
-            showToast("\(sessionTitle(sessionID)) is ready.", tone: .success)
+            showToast("\(sessionTitle(sessionID)) is ready.", tone: .success, sessionID: sessionID)
         case .aborted:
             guard !isActiveChat else { return }
             let detail = activity.message.map { ": \($0)" } ?? ""
@@ -4055,18 +4375,11 @@ final class AppModel {
     }
 
     func reduce(record: RecordedEvent) {
-        let hiddenPrefixCount = replayRequestID == nil
-            ? max(0, transcript.count - visibleTranscriptLimit)
-            : nil
-        defer {
-            if let hiddenPrefixCount {
-                let limit = max(0, transcript.count - hiddenPrefixCount)
-                if limit != visibleTranscriptLimit { visibleTranscriptLimit = limit }
-            }
-        }
+        pinTranscriptWindowIfNeeded()
         let event = record.event
         let blocks = record.blocks
         let type = event.msg["type"]?.stringValue ?? "unknown"
+        let turnID = event.msg["turnId"]?.stringValue ?? activeTurnID
         // Queue removal also happens for edits and turn cleanup; only the immediately
         // following targeted user message proves that steering reached the model input.
         let confirmsSteeringDelivery = awaitsSteeringDelivery
@@ -4110,22 +4423,26 @@ final class AppModel {
                 rendered,
                 sequence: record.sequence,
                 blockIndex: index,
-                recordedAtMs: record.recordedAtMs
+                recordedAtMs: record.recordedAtMs,
+                turnID: turnID
             )
         }
         if let preview = record.preview {
-            if event.submissionId == previewPageRequestID {
+            let completesPageLoad = event.submissionId == previewPageRequestID
+            if completesPageLoad {
                 previewPageRequestID = nil
-                isLoadingPreviewPage = false
             }
             apply(
                 preview,
                 selection: event.submissionId.flatMap { previewSelections.removeValue(forKey: $0) }
             )
+            if completesPageLoad { isLoadingPreviewPage = false }
         }
 
         switch type {
         case "user_message":
+            let startsTurn = turnID != nil && awaitingInitialUserTurnID == turnID
+            if startsTurn { awaitingInitialUserTurnID = nil }
             let attachments = event.msg["attachments"]?.arrayValue?.compactMap {
                 try? SessionFileReference(json: $0)
             } ?? []
@@ -4133,6 +4450,8 @@ final class AppModel {
                 event.msg["message"]?.stringValue,
                 kind: .user,
                 id: "event:\(record.sequence):user",
+                turnID: turnID,
+                startsTurn: startsTurn,
                 sourceSequence: record.sequence,
                 recordedAtMs: record.recordedAtMs,
                 messageTarget: messageTarget(from: event.msg),
@@ -4147,6 +4466,7 @@ final class AppModel {
                 delta: event.msg["delta"]?.stringValue ?? "",
                 kind: commentary ? .commentary : .assistant,
                 modelStepID: modelStepID,
+                turnID: turnID,
                 record: record
             )
         case "agent_reasoning_content_delta":
@@ -4156,10 +4476,11 @@ final class AppModel {
                 delta: event.msg["delta"]?.stringValue ?? "",
                 kind: .reasoning,
                 modelStepID: modelStepID,
+                turnID: turnID,
                 record: record
             )
         case "model_step_completed":
-            applyModelStepCompletion(event.msg, record: record)
+            applyModelStepCompletion(event.msg, turnID: turnID, record: record)
         case "model_step_started":
             if replayRequestID == nil { runStats.active?.modelCalls += 1 }
         case "agent_message":
@@ -4169,11 +4490,16 @@ final class AppModel {
                transcript.contains(where: {
                    $0.modelStepID == modelStepID && $0.kind == kind && !$0.pending
                }) {
-                if let messageTarget = messageTarget(from: event.msg),
-                   let index = transcript.lastIndex(where: {
-                       $0.modelStepID == modelStepID && $0.kind == kind
-                   }) {
-                    transcript[index].messageTarget = messageTarget
+                if let index = transcript.lastIndex(where: {
+                    $0.modelStepID == modelStepID && $0.kind == kind
+                }) {
+                    if let turnID, transcript[index].turnID != turnID {
+                        transcript[index].turnID = turnID
+                        invalidateTranscriptProjection()
+                    }
+                    if let messageTarget = messageTarget(from: event.msg) {
+                        transcript[index].messageTarget = messageTarget
+                    }
                 }
             } else if wasRendered {
                 transcript.removeAll { $0.pending && $0.kind == kind }
@@ -4182,6 +4508,7 @@ final class AppModel {
                     text: event.msg["message"]?.stringValue ?? "",
                     kind: kind,
                     modelStepID: event.msg["modelStepId"]?.stringValue,
+                    turnID: turnID,
                     messageTarget: messageTarget(from: event.msg),
                     sourceSequence: record.sequence,
                     recordedAtMs: record.recordedAtMs
@@ -4189,6 +4516,7 @@ final class AppModel {
             }
         case "task_started":
             activeTurnID = event.msg["turnId"]?.stringValue
+            awaitingInitialUserTurnID = activeTurnID
             if replayRequestID == nil,
                let turnID = activeTurnID,
                runStats.active?.turnId != turnID {
@@ -4211,6 +4539,14 @@ final class AppModel {
             }
         case "task_complete":
             finishPendingTranscriptEntries()
+            if let turnID {
+                markTranscriptTurnFinished(
+                    turnID,
+                    finishedAtMs: record.recordedAtMs,
+                    in: &transcript
+                )
+            }
+            awaitingInitialUserTurnID = nil
             activeTurnID = nil
             if replayRequestID == nil { runStats.active = nil }
             refreshWorkspaceChanges()
@@ -4222,6 +4558,15 @@ final class AppModel {
             break
         case "turn_aborted":
             finishPendingTranscriptEntries()
+            if let turnID {
+                markTranscriptTurnFinished(
+                    turnID,
+                    terminalSourceSequence: record.sequence,
+                    finishedAtMs: record.recordedAtMs,
+                    in: &transcript
+                )
+            }
+            awaitingInitialUserTurnID = nil
             activeTurnID = nil
             if replayRequestID == nil { runStats.active = nil }
             refreshWorkspaceChanges()
@@ -4345,15 +4690,19 @@ final class AppModel {
         _ rendered: RenderedBlock,
         sequence: UInt64,
         blockIndex: Int,
-        recordedAtMs: Int64
+        recordedAtMs: Int64,
+        turnID: String?
     ) {
-        apply(
-            rendered,
-            sequence: sequence,
-            blockIndex: blockIndex,
-            recordedAtMs: recordedAtMs,
-            to: &transcript
-        )
+        mutateTranscriptPreservingPrefix { entries in
+            apply(
+                rendered,
+                sequence: sequence,
+                blockIndex: blockIndex,
+                recordedAtMs: recordedAtMs,
+                turnID: turnID,
+                to: &entries
+            )
+        }
         let block = rendered.block
         if block.format == "unified_diff", !block.pending {
             refreshWorkspaceChanges()
@@ -4368,6 +4717,7 @@ final class AppModel {
         sequence: UInt64,
         blockIndex: Int,
         recordedAtMs: Int64,
+        turnID: String?,
         recordID: String? = nil,
         to entries: inout [TranscriptEntry]
     ) {
@@ -4394,6 +4744,10 @@ final class AppModel {
             entries[index].title = block.title
             entries[index].symbol = block.symbol
             if block.group != nil { entries[index].group = block.group }
+            if let turnID, entries[index].turnID != turnID {
+                entries[index].turnID = turnID
+                invalidateTranscriptProjection()
+            }
             entries[index].pending = block.pending
             entries[index].sourceSequence = sequence
             entries[index].recordedAtMs = recordedAtMs
@@ -4421,6 +4775,7 @@ final class AppModel {
                 format: block.format,
                 tone: block.tone,
                 pending: block.pending,
+                turnID: turnID,
                 sourceSequence: sequence,
                 recordedAtMs: recordedAtMs,
                 files: block.files
@@ -4451,17 +4806,19 @@ final class AppModel {
 
     private func apply(_ preview: RenderedPreview, selection: FrontendPickerOption?) {
         var pageEntries: [TranscriptEntry] = []
+        var turnState = TranscriptHistoryTurnState()
         for (index, rendered) in preview.events.enumerated() {
             reduceHistory(
                 RecordedEvent(
                     sequence: UInt64(index + 1),
-                    recordedAtMs: 0,
+                    recordedAtMs: rendered.recordedAtMs,
                     event: AgentEventRecord(submissionId: nil, msg: rendered.event),
                     streamMetrics: [],
                     blocks: rendered.blocks,
                     preview: nil
                 ),
                 into: &pageEntries,
+                turnState: &turnState,
                 recordID: "\(preview.pageId):\(index)"
             )
         }
@@ -4524,24 +4881,30 @@ final class AppModel {
         id: String? = nil,
         presentationID: String? = nil,
         modelStepID: String? = nil,
+        turnID: String? = nil,
+        startsTurn: Bool = false,
         sourceSequence: UInt64? = nil,
         recordedAtMs: Int64? = nil,
         messageTarget: MessageTarget? = nil,
         files: [SessionFileReference] = []
     ) {
-        appendText(
-            text,
-            kind: kind,
-            tone: tone,
-            id: id,
-            presentationID: presentationID,
-            modelStepID: modelStepID,
-            sourceSequence: sourceSequence,
-            recordedAtMs: recordedAtMs,
-            messageTarget: messageTarget,
-            files: files,
-            to: &transcript
-        )
+        mutateTranscriptPreservingPrefix { entries in
+            appendText(
+                text,
+                kind: kind,
+                tone: tone,
+                id: id,
+                presentationID: presentationID,
+                modelStepID: modelStepID,
+                turnID: turnID,
+                startsTurn: startsTurn,
+                sourceSequence: sourceSequence,
+                recordedAtMs: recordedAtMs,
+                messageTarget: messageTarget,
+                files: files,
+                to: &entries
+            )
+        }
     }
 
     private func appendText(
@@ -4551,6 +4914,8 @@ final class AppModel {
         id: String? = nil,
         presentationID: String? = nil,
         modelStepID: String? = nil,
+        turnID: String? = nil,
+        startsTurn: Bool = false,
         sourceSequence: UInt64? = nil,
         recordedAtMs: Int64? = nil,
         messageTarget: MessageTarget? = nil,
@@ -4568,6 +4933,8 @@ final class AppModel {
             tone: tone,
             pending: false,
             modelStepID: modelStepID,
+            turnID: turnID,
+            startsTurn: startsTurn,
             sourceSequence: sourceSequence,
             recordedAtMs: recordedAtMs,
             messageTarget: messageTarget,
@@ -4596,11 +4963,13 @@ final class AppModel {
         delta: String,
         kind: TranscriptEntry.Kind,
         modelStepID: String,
+        turnID: String?,
         record: RecordedEvent
     ) {
         guard !delta.isEmpty else { return }
         if let last = bufferedDeltas.indices.last, bufferedDeltas[last].id == id {
             bufferedDeltas[last].delta += delta
+            if bufferedDeltas[last].turnID == nil { bufferedDeltas[last].turnID = turnID }
             bufferedDeltas[last].sourceSequence = record.sequence
             bufferedDeltas[last].recordedAtMs = record.recordedAtMs
         } else {
@@ -4609,6 +4978,7 @@ final class AppModel {
                 delta: delta,
                 kind: kind,
                 modelStepID: modelStepID,
+                turnID: turnID,
                 sourceSequence: record.sequence,
                 recordedAtMs: record.recordedAtMs
             ))
@@ -4625,52 +4995,56 @@ final class AppModel {
     }
 
     private func flushStreamDeltas() {
-        let hiddenPrefixCount = replayRequestID == nil
-            ? max(0, transcript.count - visibleTranscriptLimit)
-            : nil
-        defer {
-            if let hiddenPrefixCount {
-                let limit = max(0, transcript.count - hiddenPrefixCount)
-                if limit != visibleTranscriptLimit { visibleTranscriptLimit = limit }
-            }
-        }
+        pinTranscriptWindowIfNeeded()
         deltaFlushTask?.cancel()
         deltaFlushTask = nil
         for buffered in bufferedDeltas {
             if let index = transcript.lastIndex(where: { $0.id == buffered.id }) {
                 transcript[index].text.append(buffered.delta)
+                if transcript[index].turnID == nil, let turnID = buffered.turnID {
+                    transcript[index].turnID = turnID
+                    invalidateTranscriptProjection()
+                }
                 transcript[index].sourceSequence = buffered.sourceSequence
                 transcript[index].recordedAtMs = buffered.recordedAtMs
             } else {
-                transcript.append(TranscriptEntry(
-                    id: buffered.id,
-                    presentationID: buffered.kind.narrativePhase.map {
-                        TranscriptEntry.narrativePresentationID(
-                            modelStepID: buffered.modelStepID,
-                            phase: $0,
-                            ordinal: 0
-                        )
-                    },
-                    text: buffered.delta,
-                    kind: buffered.kind,
-                    format: "plain_text",
-                    tone: "neutral",
-                    pending: true,
-                    modelStepID: buffered.modelStepID,
-                    sourceSequence: buffered.sourceSequence,
-                    recordedAtMs: buffered.recordedAtMs
-                ))
+                mutateTranscriptPreservingPrefix { entries in
+                    entries.append(TranscriptEntry(
+                        id: buffered.id,
+                        presentationID: buffered.kind.narrativePhase.map {
+                            TranscriptEntry.narrativePresentationID(
+                                modelStepID: buffered.modelStepID,
+                                phase: $0,
+                                ordinal: 0
+                            )
+                        },
+                        text: buffered.delta,
+                        kind: buffered.kind,
+                        format: "plain_text",
+                        tone: "neutral",
+                        pending: true,
+                        modelStepID: buffered.modelStepID,
+                        turnID: buffered.turnID,
+                        sourceSequence: buffered.sourceSequence,
+                        recordedAtMs: buffered.recordedAtMs
+                    ))
+                }
             }
         }
         bufferedDeltas.removeAll()
     }
 
-    private func applyModelStepCompletion(_ event: JSONValue, record: RecordedEvent) {
-        applyModelStepCompletion(event, record: record, to: &transcript)
+    private func applyModelStepCompletion(
+        _ event: JSONValue,
+        turnID: String?,
+        record: RecordedEvent
+    ) {
+        applyModelStepCompletion(event, turnID: turnID, record: record, to: &transcript)
     }
 
     private func applyModelStepCompletion(
         _ event: JSONValue,
+        turnID: String?,
         record: RecordedEvent,
         to entries: inout [TranscriptEntry]
     ) {
@@ -4678,7 +5052,6 @@ final class AppModel {
               let outcome = event["outcome"],
               let status = outcome["status"]?.stringValue
         else { return }
-
         guard status == "completed" else {
             // Block source ids are namespaced by model step, so a step that ends without
             // completing can never finish its pending blocks. The backend closes live
@@ -4693,12 +5066,14 @@ final class AppModel {
                 }) == true
             {
                 entry.pending = false
+                if entry.turnID == nil { entry.turnID = turnID }
                 entry.tone = "warning"
                 entry.sourceSequence = record.sequence
                 entry.recordedAtMs = record.recordedAtMs
             }
             for entry in entries where entry.modelStepID == modelStepID && entry.pending {
                 entry.pending = false
+                if entry.turnID == nil { entry.turnID = turnID }
                 if status == "retrying" { entry.tone = "warning" }
                 entry.sourceSequence = record.sequence
                 entry.recordedAtMs = record.recordedAtMs
@@ -4751,6 +5126,7 @@ final class AppModel {
                 tone: "neutral",
                 pending: false,
                 modelStepID: modelStepID,
+                turnID: turnID,
                 sourceSequence: record.sequence,
                 recordedAtMs: record.recordedAtMs
             )
@@ -4764,25 +5140,30 @@ final class AppModel {
         text: String,
         kind: TranscriptEntry.Kind,
         modelStepID: String?,
+        turnID: String?,
         messageTarget: MessageTarget?,
         sourceSequence: UInt64?,
         recordedAtMs: Int64?
     ) {
-        completeStream(
-            text: text,
-            kind: kind,
-            modelStepID: modelStepID,
-            messageTarget: messageTarget,
-            sourceSequence: sourceSequence,
-            recordedAtMs: recordedAtMs,
-            in: &transcript
-        )
+        mutateTranscriptPreservingPrefix { entries in
+            completeStream(
+                text: text,
+                kind: kind,
+                modelStepID: modelStepID,
+                turnID: turnID,
+                messageTarget: messageTarget,
+                sourceSequence: sourceSequence,
+                recordedAtMs: recordedAtMs,
+                in: &entries
+            )
+        }
     }
 
     private func completeStream(
         text: String,
         kind: TranscriptEntry.Kind,
         modelStepID: String?,
+        turnID: String?,
         messageTarget: MessageTarget?,
         sourceSequence: UInt64?,
         recordedAtMs: Int64?,
@@ -4793,7 +5174,9 @@ final class AppModel {
                 && (modelStepID == nil || $0.modelStepID == modelStepID)
         }) {
             entries[index].text = text
+            if entries[index].pending { invalidateTranscriptProjection() }
             entries[index].pending = false
+            if entries[index].turnID == nil { entries[index].turnID = turnID }
             entries[index].messageTarget = messageTarget
             if let sourceSequence { entries[index].sourceSequence = sourceSequence }
             if let recordedAtMs { entries[index].recordedAtMs = recordedAtMs }
@@ -4812,6 +5195,7 @@ final class AppModel {
                 kind: kind,
                 presentationID: presentationID,
                 modelStepID: modelStepID,
+                turnID: turnID,
                 sourceSequence: sourceSequence,
                 recordedAtMs: recordedAtMs,
                 messageTarget: messageTarget,
@@ -4825,9 +5209,60 @@ final class AppModel {
     }
 
     private func finishPendingTranscriptEntries() {
+        let changed = transcript.contains(where: \.pending)
         for entry in transcript where entry.pending {
             entry.pending = false
         }
+        if changed { invalidateTranscriptProjection() }
+    }
+
+    private func markTranscriptTurnFinished(
+        _ turnID: String,
+        terminalSourceSequence: UInt64? = nil,
+        finishedAtMs: Int64?,
+        in entries: inout [TranscriptEntry]
+    ) {
+        let terminalEntries: [TranscriptEntry]
+        if let terminalSourceSequence {
+            guard let terminal = entries.last(where: {
+                $0.turnID == turnID && $0.sourceSequence == terminalSourceSequence
+            }) else { return }
+            terminalEntries = [terminal]
+        } else {
+            guard let final = entries.last(where: {
+                $0.turnID == turnID && $0.kind == .assistant
+            }) else { return }
+            let finalModelStepID = final.modelStepID
+            let finalSourceSequence = final.sourceSequence
+            terminalEntries = entries.filter { entry in
+                entry.turnID == turnID
+                    && entry.kind == .assistant
+                    && (finalModelStepID.map { entry.modelStepID == $0 }
+                        ?? (entry === final
+                            || finalSourceSequence.map { entry.sourceSequence == $0 } == true))
+            }
+        }
+        let startedAtMs = entries
+            .filter { $0.turnID == turnID }
+            .compactMap(\.recordedAtMs)
+            .min()
+        let terminalAtMs = finishedAtMs
+            ?? terminalEntries.compactMap(\.recordedAtMs).max()
+        let elapsedMs = startedAtMs.flatMap { startedAtMs in
+            terminalAtMs.map { UInt64(max(0, $0 - startedAtMs)) }
+        }
+        var changed = false
+        for entry in terminalEntries {
+            if !entry.turnTerminal {
+                entry.turnTerminal = true
+                changed = true
+            }
+            if let elapsedMs, entry.turnElapsedMs != elapsedMs {
+                entry.turnElapsedMs = elapsedMs
+                changed = true
+            }
+        }
+        if changed { invalidateTranscriptProjection() }
     }
 
     /// Rebuilds record-owned presentation in sequence order because a replace/append pair
@@ -4837,13 +5272,23 @@ final class AppModel {
 
         var earlier: [TranscriptEntry] = []
         var rebuilt = copiedTranscript(transcriptRecordBase)
+        var earlierTurnState = TranscriptHistoryTurnState()
+        var rebuiltTurnState = TranscriptHistoryTurnState(turnID: rebuilt.last?.turnID)
         let records = transcriptRecords.values.sorted { $0.sequence < $1.sequence }
         for record in records {
             if let baseSequence = transcriptRecordBaseSequence,
                record.sequence <= baseSequence {
-                reduceHistory(record, into: &earlier)
+                reduceHistory(
+                    record,
+                    into: &earlier,
+                    turnState: &earlierTurnState
+                )
             } else {
-                reduceHistory(record, into: &rebuilt)
+                reduceHistory(
+                    record,
+                    into: &rebuilt,
+                    turnState: &rebuiltTurnState
+                )
             }
         }
         let baseIDs = Set(transcriptRecordBase.map(\.id))
@@ -4852,10 +5297,8 @@ final class AppModel {
             baseIDs.contains($0.id)
                 || $0.messageTarget.map(baseTargets.contains) == true
         }
-        let previousCount = transcript.count
         rebuilt.insert(contentsOf: earlier, at: 0)
         transcript = rebuilt
-        visibleTranscriptLimit += max(0, rebuilt.count - previousCount)
     }
 
     private func copiedTranscript(_ entries: [TranscriptEntry]) -> [TranscriptEntry] {
@@ -4875,6 +5318,10 @@ final class AppModel {
                 tone: entry.tone,
                 pending: entry.pending,
                 modelStepID: entry.modelStepID,
+                turnID: entry.turnID,
+                startsTurn: entry.startsTurn,
+                turnTerminal: entry.turnTerminal,
+                turnElapsedMs: entry.turnElapsedMs,
                 sourceSequence: entry.sourceSequence,
                 recordedAtMs: entry.recordedAtMs,
                 messageTarget: entry.messageTarget,
@@ -4886,16 +5333,49 @@ final class AppModel {
     private func reduceHistory(
         _ record: RecordedEvent,
         into entries: inout [TranscriptEntry],
+        turnState: inout TranscriptHistoryTurnState,
         recordID: String? = nil
     ) {
         let event = record.event.msg
         let type = event["type"]?.stringValue ?? "unknown"
+        let explicitTurnID = event["turnId"]?.stringValue
+        if type == "task_started" {
+            turnState = TranscriptHistoryTurnState(
+                turnID: explicitTurnID,
+                awaitingInitialUserTurnID: explicitTurnID
+            )
+        } else if let explicitTurnID {
+            if turnState.turnID == nil,
+               let start = turnState.unassignedEntryStart,
+               start < entries.count {
+                for index in start..<entries.count where entries[index].turnID == nil {
+                    entries[index].turnID = explicitTurnID
+                }
+                if let firstUser = entries[start...].firstIndex(where: {
+                    $0.kind == .user && !$0.startsTurn
+                }) {
+                    entries[firstUser].startsTurn = true
+                }
+            }
+            turnState.turnID = explicitTurnID
+            turnState.unassignedEntryStart = nil
+        }
+        let turnID = explicitTurnID ?? turnState.turnID
+        let entryStart = entries.count
+        defer {
+            if turnID == nil,
+               entries.count > entryStart,
+               turnState.unassignedEntryStart == nil {
+                turnState.unassignedEntryStart = entryStart
+            }
+        }
         for (index, block) in record.blocks.enumerated() {
             apply(
                 block,
                 sequence: record.sequence,
                 blockIndex: index,
                 recordedAtMs: record.recordedAtMs,
+                turnID: turnID,
                 recordID: recordID,
                 to: &entries
             )
@@ -4903,6 +5383,8 @@ final class AppModel {
 
         switch type {
         case "user_message":
+            let startsTurn = turnID != nil && turnState.awaitingInitialUserTurnID == turnID
+            if startsTurn { turnState.awaitingInitialUserTurnID = nil }
             let attachments = event["attachments"]?.arrayValue?.compactMap {
                 try? SessionFileReference(json: $0)
             } ?? []
@@ -4910,6 +5392,8 @@ final class AppModel {
                 event["message"]?.stringValue,
                 kind: .user,
                 id: "event:\(recordID ?? String(record.sequence)):user",
+                turnID: turnID,
+                startsTurn: startsTurn,
                 sourceSequence: record.sequence,
                 recordedAtMs: record.recordedAtMs,
                 messageTarget: messageTarget(from: event),
@@ -4929,6 +5413,7 @@ final class AppModel {
             guard !delta.isEmpty else { return }
             if let index = entries.lastIndex(where: { $0.id == id }) {
                 entries[index].text.append(delta)
+                if entries[index].turnID == nil { entries[index].turnID = turnID }
                 entries[index].sourceSequence = record.sequence
                 entries[index].recordedAtMs = record.recordedAtMs
             } else {
@@ -4945,12 +5430,13 @@ final class AppModel {
                     tone: "neutral",
                     pending: true,
                     modelStepID: modelStepID,
+                    turnID: turnID,
                     sourceSequence: record.sequence,
                     recordedAtMs: record.recordedAtMs
                 ))
             }
         case "model_step_completed":
-            applyModelStepCompletion(event, record: record, to: &entries)
+            applyModelStepCompletion(event, turnID: turnID, record: record, to: &entries)
         case "agent_message":
             let kind: TranscriptEntry.Kind = event["phase"]?.stringValue == "commentary"
                 ? .commentary
@@ -4959,12 +5445,14 @@ final class AppModel {
                let index = entries.lastIndex(where: {
                    $0.modelStepID == modelStepID && $0.kind == kind && !$0.pending
                }) {
+                if entries[index].turnID == nil { entries[index].turnID = turnID }
                 entries[index].messageTarget = messageTarget(from: event)
             } else {
                 completeStream(
                     text: event["message"]?.stringValue ?? "",
                     kind: kind,
                     modelStepID: event["modelStepId"]?.stringValue,
+                    turnID: turnID,
                     messageTarget: messageTarget(from: event),
                     sourceSequence: record.sequence,
                     recordedAtMs: record.recordedAtMs,
@@ -4973,8 +5461,25 @@ final class AppModel {
             }
         case "task_complete":
             for entry in entries where entry.pending { entry.pending = false }
+            if let turnID {
+                markTranscriptTurnFinished(
+                    turnID,
+                    finishedAtMs: record.recordedAtMs,
+                    in: &entries
+                )
+            }
+            turnState = TranscriptHistoryTurnState()
         case "turn_aborted":
             for entry in entries where entry.pending { entry.pending = false }
+            if let turnID {
+                markTranscriptTurnFinished(
+                    turnID,
+                    terminalSourceSequence: record.sequence,
+                    finishedAtMs: record.recordedAtMs,
+                    in: &entries
+                )
+            }
+            turnState = TranscriptHistoryTurnState()
         default:
             break
         }
@@ -5961,7 +6466,8 @@ final class AppModel {
         finishHistoryLoad()
         if !preservingSession {
             nextHistoryBeforeSequence = nil
-            visibleTranscriptLimit = 300
+            transcriptWindowAnchor = .tail
+            awaitingInitialUserTurnID = nil
         }
         if !preservingSession { replayPresentedTranscript = nil }
         if preservingDrafts {
@@ -6101,8 +6607,9 @@ final class AppModel {
         completedComposerEditReplay = false
         finishHistoryLoad()
         nextHistoryBeforeSequence = nil
-        visibleTranscriptLimit = 300
+        transcriptWindowAnchor = .tail
         activeTurnID = nil
+        awaitingInitialUserTurnID = nil
         activeOperation = nil
         awaitsSteeringDelivery = false
         runStats = RunStats()

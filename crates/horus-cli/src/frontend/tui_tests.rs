@@ -60,6 +60,7 @@ fn preview_record(
             events: messages
                 .iter()
                 .map(|message| RenderedEvent {
+                    recorded_at_ms: 0,
                     event: EventMsg::UserMessage(horus::protocol::UserMessageEvent {
                         message: (*message).into(),
                         attachments: Vec::new(),
@@ -95,7 +96,7 @@ fn preview_messages(snapshot: &SnapshotPreview) -> Vec<&str> {
 fn preview_continuation(arguments: &str) -> Op {
     Op::CapabilityCommand {
         capability: "subagents".into(),
-        command: "preview_page".into(),
+        command: "subagents".into(),
         arguments: arguments.into(),
         input: None,
         target: None,
@@ -689,6 +690,7 @@ fn snapshot_preview_scrolls_with_the_mouse_wheel() {
                 update: horus::protocol::FrontendPreviewUpdate::Replace,
                 events: (0..30)
                     .map(|index| RenderedEvent {
+                        recorded_at_ms: i64::from(index),
                         event: EventMsg::UserMessage(horus::protocol::UserMessageEvent {
                             message: format!("subagent row {index}"),
                             attachments: Vec::new(),

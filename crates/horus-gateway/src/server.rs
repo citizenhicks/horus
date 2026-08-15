@@ -48,7 +48,6 @@ const MAX_CONNECTIONS: usize = 32;
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(72 * 60 * 60);
 const SCHEDULER_TICK: Duration = Duration::from_secs(15);
 const MAX_DIRECTORY_ENTRIES: usize = 512;
-const MAX_HISTORY_EVENTS: usize = 100;
 const MAX_PENDING_UPLOADS: usize = 8;
 const WEBSOCKET_BRIDGE_BYTES: usize = 16 * 1024;
 
@@ -835,6 +834,32 @@ async fn handle_message(
             Ok(host) => open_selected(writer, selected, request_id, host, None).await,
             Err(rejection) => write_rejection(writer, request_id, rejection).await,
         },
+        ClientMessage::CreateWorkspaceDirectory {
+            request_id,
+            parent,
+            name,
+        } => {
+            let result = match gateway.create_workspace_directory(&parent, &name).await {
+                Ok(path) => tokio::task::spawn_blocking(move || list_directories(&path, false))
+                    .await
+                    .map_err(|error| internal_rejection(error.to_string()))
+                    .and_then(std::convert::identity),
+                Err(rejection) => Err(rejection),
+            };
+            match result {
+                Ok(listing) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::Directories {
+                            request_id,
+                            listing,
+                        }),
+                    )
+                    .await
+                }
+                Err(rejection) => write_rejection(writer, request_id, rejection).await,
+            }
+        }
         ClientMessage::OpenSession {
             request_id,
             session_id,
@@ -847,24 +872,12 @@ async fn handle_message(
             request_id,
             session_id,
             before_sequence,
-            max_events,
         } => {
             let host = match require_selected(selected, &session_id) {
                 Ok(host) => host,
                 Err(rejection) => return write_rejection(writer, request_id, rejection).await,
             };
-            if let Err(rejection) = validate_history_page_size(max_events) {
-                return write_rejection(writer, request_id, rejection).await;
-            }
-            write_session_history(
-                writer,
-                host,
-                request_id,
-                session_id,
-                before_sequence,
-                max_events,
-            )
-            .await
+            write_session_history(writer, host, request_id, session_id, before_sequence).await
         }
         ClientMessage::RenameSession {
             request_id,
@@ -1478,63 +1491,36 @@ async fn handle_message(
     }
 }
 
-fn validate_history_page_size(max_events: usize) -> std::result::Result<(), Rejection> {
-    if (1..=MAX_HISTORY_EVENTS).contains(&max_events) {
-        return Ok(());
-    }
-    Err(Rejection {
-        code: "invalid_history_page",
-        message: format!("history page size must be between 1 and {MAX_HISTORY_EVENTS} events"),
-        fatal: false,
-    })
-}
-
 async fn write_session_history(
     writer: &mut (impl AsyncWrite + Unpin),
     host: &HostHandle,
     request_id: String,
     session_id: String,
     before_sequence: Option<u64>,
-    max_events: usize,
 ) -> Result<()> {
-    let mut lower = 1;
-    let mut upper = max_events;
-    let mut selected = None;
-    while lower <= upper {
-        let events = lower + (upper - lower) / 2;
-        let page = match host.history_page(before_sequence, events).await {
-            Ok(page) => page,
-            Err(rejection) => return write_rejection(writer, request_id, rejection).await,
-        };
-        let frame = ServerFrame::new(ServerMessage::SessionHistory {
-            request_id: request_id.clone(),
-            session_id: session_id.clone(),
-            records: page.records,
-            next_before_sequence: page.next_before_sequence,
-        });
-        if encoded_frame_fits(&frame)? {
-            selected = Some(frame);
-            lower = events + 1;
-        } else {
-            upper = events.saturating_sub(1);
-        }
+    let page = match host.history_page(before_sequence).await {
+        Ok(page) => page,
+        Err(rejection) => return write_rejection(writer, request_id, rejection).await,
+    };
+    let frame = ServerFrame::new(ServerMessage::SessionHistory {
+        request_id: request_id.clone(),
+        session_id,
+        records: page.records,
+        next_before_sequence: page.next_before_sequence,
+    });
+    if encoded_frame_fits(&frame)? {
+        return write_frame(writer, &frame).await;
     }
-    match selected {
-        Some(frame) => write_frame(writer, &frame).await,
-        None => {
-            write_rejection(
-                writer,
-                request_id,
-                Rejection {
-                    code: "history_event_too_large",
-                    message: "the next durable history event exceeds the gateway frame limit"
-                        .into(),
-                    fatal: false,
-                },
-            )
-            .await
-        }
-    }
+    write_rejection(
+        writer,
+        request_id,
+        Rejection {
+            code: "history_turn_too_large",
+            message: "the next durable turn exceeds the gateway frame limit".into(),
+            fatal: false,
+        },
+    )
+    .await
 }
 
 fn encoded_frame_fits(frame: &ServerFrame) -> Result<bool> {
@@ -1775,12 +1761,17 @@ fn list_directories(
         .map_err(directory_rejection)?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if name == ".git" {
+                return None;
+            }
             let is_directory = entry.path().is_dir();
             if !is_directory && !include_files {
                 return None;
             }
             Some(DirectoryEntry {
-                name: entry.file_name().to_str()?.to_owned(),
+                name: name.to_owned(),
                 path: entry.path().to_str().map(PathBuf::from)?,
                 is_directory,
             })
@@ -2980,6 +2971,71 @@ mod tests {
         assert!(error.to_string().contains("certificate file is empty"));
     }
 
+    #[tokio::test]
+    async fn paired_client_creates_workspace_directory_and_receives_its_listing() {
+        let root = tempfile::tempdir().expect("root");
+        let parent = root.path().join("projects");
+        fs::create_dir(&parent).expect("parent");
+        let (server, grant) = GatewayServer::bootstrap(
+            root.path().join("state"),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .expect("bootstrap gateway");
+        let listen = server.listen_addr();
+        let (shutdown, signal) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(server.serve_until(async move {
+            let _ = signal.await;
+        }));
+        let endpoint = format!("tcp://{listen}")
+            .parse::<Endpoint>()
+            .expect("endpoint");
+        let (connection, _) =
+            GatewayClient::pair(&endpoint, grant.code, "directory test", ClientKind::Ios)
+                .await
+                .expect("connect client");
+        let (sender, mut events) = connection.into_parts();
+        wait_gateway_ready(&mut events).await;
+
+        let request_id = "create-directory".to_string();
+        sender
+            .send(ClientMessage::CreateWorkspaceDirectory {
+                request_id: request_id.clone(),
+                parent: parent.clone(),
+                name: "new-project".into(),
+            })
+            .await
+            .expect("create workspace directory");
+        loop {
+            match next_gateway_message(&mut events).await {
+                ServerMessage::Directories {
+                    request_id: actual,
+                    listing,
+                } if actual == request_id => {
+                    assert_eq!(
+                        listing.path,
+                        fs::canonicalize(parent.join("new-project")).expect("created path")
+                    );
+                    assert!(listing.entries.is_empty());
+                    break;
+                }
+                ServerMessage::Rejected {
+                    request_id: actual,
+                    code,
+                    message,
+                    ..
+                } if actual == request_id => {
+                    panic!("directory creation rejected ({code}): {message}");
+                }
+                _ => {}
+            }
+        }
+        assert!(parent.join("new-project").is_dir());
+
+        shutdown.send(()).expect("stop gateway");
+        serving.await.expect("gateway task").expect("gateway stop");
+    }
+
     #[test]
     fn directory_listing_is_sorted_and_excludes_files() {
         let root = tempfile::tempdir().expect("temporary directory");
@@ -3003,6 +3059,7 @@ mod tests {
     fn directory_listing_can_include_files() {
         let root = tempfile::tempdir().expect("temporary directory");
         fs::create_dir(root.path().join("tasks")).expect("create directory");
+        fs::create_dir(root.path().join(".git")).expect("create Git metadata");
         fs::write(root.path().join("daily.md"), b"task").expect("create file");
 
         let listing = list_directories(root.path(), true).expect("list directory entries");
@@ -3023,15 +3080,7 @@ mod tests {
     }
 
     #[test]
-    fn history_page_size_rejects_values_outside_the_wire_bound() {
-        assert!([0, MAX_HISTORY_EVENTS + 1].into_iter().all(|limit| {
-            validate_history_page_size(limit)
-                .is_err_and(|rejection| rejection.code == "invalid_history_page")
-        }));
-    }
-
-    #[test]
-    fn history_frame_bound_rejects_one_oversized_event() {
+    fn history_frame_bound_rejects_one_oversized_turn() {
         let frame = ServerFrame::new(ServerMessage::SessionHistory {
             request_id: "history".into(),
             session_id: "session".into(),

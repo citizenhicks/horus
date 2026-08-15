@@ -2,6 +2,8 @@ import Foundation
 import Security
 
 struct CachedTranscript: Codable, Sendable {
+    static let currentSchemaVersion = 2
+
     private struct HistoryState: Codable, Sendable {
         let nextBeforeSequence: UInt64?
     }
@@ -20,6 +22,10 @@ struct CachedTranscript: Codable, Sendable {
         let tone: String
         let pending: Bool
         let modelStepID: String?
+        let turnID: String?
+        let startsTurn: Bool?
+        let turnTerminal: Bool?
+        let turnElapsedMs: UInt64?
         let sourceSequence: UInt64?
         let recordedAtMs: Int64?
         let messageTarget: MessageTarget?
@@ -39,6 +45,10 @@ struct CachedTranscript: Codable, Sendable {
             tone = entry.tone
             pending = entry.pending
             modelStepID = entry.modelStepID
+            turnID = entry.turnID
+            startsTurn = entry.startsTurn
+            turnTerminal = entry.turnTerminal
+            turnElapsedMs = entry.turnElapsedMs
             sourceSequence = entry.sourceSequence
             recordedAtMs = entry.recordedAtMs
             messageTarget = entry.messageTarget
@@ -60,6 +70,10 @@ struct CachedTranscript: Codable, Sendable {
                 tone: tone,
                 pending: pending,
                 modelStepID: modelStepID,
+                turnID: turnID,
+                startsTurn: startsTurn ?? false,
+                turnTerminal: turnTerminal ?? false,
+                turnElapsedMs: turnElapsedMs,
                 sourceSequence: sourceSequence,
                 recordedAtMs: recordedAtMs,
                 messageTarget: messageTarget,
@@ -68,6 +82,7 @@ struct CachedTranscript: Codable, Sendable {
         }
     }
 
+    let schemaVersion: Int
     let sequence: UInt64
     let currentUsage: TokenUsage
     let lastUsage: TokenUsage
@@ -81,6 +96,7 @@ struct CachedTranscript: Codable, Sendable {
         currentUsage: TokenUsage,
         lastUsage: TokenUsage
     ) {
+        schemaVersion = Self.currentSchemaVersion
         self.sequence = sequence
         self.currentUsage = currentUsage
         self.lastUsage = lastUsage
@@ -109,6 +125,7 @@ struct CachedTranscript: Codable, Sendable {
                   consume(entry.title),
                   consume(entry.symbol),
                   consume(entry.group),
+                  consume(entry.turnID),
                   consume(entry.format),
                   consume(entry.tone),
                   entry.files.allSatisfy({ file in
@@ -171,7 +188,8 @@ private actor GatewayDiskStore {
         else { return nil }
         guard size <= maximumCachedTranscriptBytes,
               let data = try? Data(contentsOf: url),
-              let cached = try? decoder.decode(CachedTranscript.self, from: data)
+              let cached = try? decoder.decode(CachedTranscript.self, from: data),
+              cached.schemaVersion == CachedTranscript.currentSchemaVersion
         else {
             try? FileManager.default.removeItem(at: url)
             return nil

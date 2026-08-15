@@ -13,6 +13,7 @@ use crate::backend::model::ToolCall;
 use crate::backend::sandbox::NetworkAccess;
 use crate::backend::sandbox::SandboxMode;
 use crate::protocol::Event;
+use crate::protocol::EventMsg;
 use crate::protocol::MAX_CAPABILITY_INPUT_BYTES;
 use crate::protocol::MessageTarget;
 use crate::protocol::ModelStepContentPhase;
@@ -23,6 +24,7 @@ pub mod sqlite;
 
 pub(crate) const CHECKPOINT_VERSION: u32 = 6;
 pub(crate) const MAX_QUEUED_INPUTS: usize = 1_024;
+const TURN_PAGE_BATCH_SIZE: usize = 100;
 const MAX_QUEUED_OWNER_BYTES: usize = 256;
 const MAX_QUEUED_ID_BYTES: usize = 4 * 1024;
 
@@ -440,6 +442,81 @@ impl EventPage {
         self.events.reverse();
         self.events
     }
+}
+
+/// Loads the newest logical turn before a durable event cursor.
+pub async fn event_turn_page(
+    checkpoints: &dyn CheckpointStore,
+    session_id: &str,
+    before_sequence: Option<u64>,
+) -> Result<EventPage> {
+    let mut cursor = before_sequence;
+    let mut latest_sequence = 0;
+    let mut events = Vec::new();
+    let mut found_start = false;
+    let mut has_earlier_turn = false;
+
+    loop {
+        let page = checkpoints
+            .event_page(
+                session_id,
+                EventPageRequest {
+                    before_sequence: cursor,
+                    limit: TURN_PAGE_BATCH_SIZE,
+                },
+            )
+            .await?;
+        if events.is_empty() {
+            latest_sequence = page.latest_sequence;
+        }
+        for event in page.events {
+            if found_start {
+                if matches!(&event.event.msg, EventMsg::TurnStarted(_)) {
+                    has_earlier_turn = true;
+                    break;
+                }
+            } else {
+                found_start = matches!(&event.event.msg, EventMsg::TurnStarted(_));
+                events.push(event);
+            }
+        }
+        if has_earlier_turn {
+            break;
+        }
+        let Some(next) = page.next_before_sequence else {
+            break;
+        };
+        cursor = Some(next);
+    }
+
+    let Some((start_index, turn_id)) = events.iter().enumerate().find_map(|(index, event)| {
+        let EventMsg::TurnStarted(started) = &event.event.msg else {
+            return None;
+        };
+        Some((index, started.turn_id.as_str()))
+    }) else {
+        return Ok(EventPage {
+            latest_sequence,
+            events: Vec::new(),
+            next_before_sequence: None,
+        });
+    };
+    let page_start = events[..start_index]
+        .iter()
+        .position(|event| match &event.event.msg {
+            EventMsg::TurnComplete(completed) => completed.turn_id == turn_id,
+            EventMsg::TurnAborted(aborted) => aborted.turn_id == turn_id,
+            _ => false,
+        })
+        .unwrap_or(0);
+    let next_before_sequence = has_earlier_turn.then_some(events[start_index].sequence);
+    let events = events.drain(page_start..=start_index).collect();
+
+    Ok(EventPage {
+        latest_sequence,
+        events,
+        next_before_sequence,
+    })
 }
 
 impl TranscriptPage {

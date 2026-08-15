@@ -229,10 +229,22 @@ struct ComposerOptionsView: View {
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
                 .help("Stop")
         } else {
-            Button(
-                model.activeTurnID == nil ? "Send" : "Send steering message",
-                glyph: model.activeTurnID == nil ? .arrowUp02 : .arrowUpRight01
-            ) { model.sendMessage() }
+            Button(action: model.sendMessage) {
+                Label {
+                    Text(model.activeTurnID == nil ? "Send" : "Send steering message")
+                } icon: {
+                    if isWaitingForGateway {
+                        HorusSpinner(
+                            size: HorusStyle.iconSize,
+                            foreground: palette.onAccent
+                        )
+                    } else {
+                        HorusIcon(
+                            model.activeTurnID == nil ? .arrowUp02 : .arrowUpRight01
+                        )
+                    }
+                }
+            }
                 .labelStyle(.iconOnly)
                 .buttonStyle(HorusIconButtonStyle(prominent: true))
                 // `sendMessage()` also needs a session: a gateway with no chats left the button
@@ -384,6 +396,13 @@ struct ComposerOptionsView: View {
               model.activeTurnID == nil || model.composerAttachments.isEmpty
         else { return false }
         return !dictation.isActive
+    }
+
+    private var isWaitingForGateway: Bool {
+        switch model.connectionState {
+        case .connecting, .authenticating, .loading: true
+        case .disconnected, .ready, .failed: false
+        }
     }
 
     private var canToggleDictation: Bool {
