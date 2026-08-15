@@ -15,6 +15,8 @@ extension AppModel {
         isLoadingArtifacts = false
         gitDiffRequestID = nil
         isLoadingGitDiff = false
+        committedGitDiffRequestID = nil
+        isLoadingCommittedGitDiff = false
         workspaceFilesRequestID = nil
         isLoadingWorkspaceFiles = false
         discardPendingComposerAttachments()
@@ -121,6 +123,8 @@ extension AppModel {
         if preservingSession {
             gitDiffRequestID = nil
             isLoadingGitDiff = false
+            committedGitDiffRequestID = nil
+            isLoadingCommittedGitDiff = false
             workspaceFilesRequestID = nil
             isLoadingWorkspaceFiles = false
             sessionUploadsRequestID = nil
@@ -177,6 +181,9 @@ extension AppModel {
         gitDiff = ""
         gitDiffRequestID = nil
         isLoadingGitDiff = false
+        committedGitDiff = ""
+        committedGitDiffRequestID = nil
+        isLoadingCommittedGitDiff = false
         workspaceFiles = []
         workspaceFilesTruncated = false
         workspaceFilesRequestID = nil

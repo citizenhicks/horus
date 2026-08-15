@@ -38,7 +38,7 @@ pub use self::router::ModelRouter;
 
 use crate::protocol::{ATTACHMENTS_FIELD, INTERNAL_MESSAGE_FIELD, SessionFileReference};
 pub(crate) use crate::protocol::{REPLAY_REASONING_FIELD, TOOL_ERROR_FIELD};
-// Leaves room for typed lifecycle metadata inside the shipped 20 MiB frontend envelope.
+// Leaves room for typed lifecycle metadata inside the frontend envelope.
 const MAX_MODEL_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 128;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;

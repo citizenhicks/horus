@@ -6,15 +6,16 @@ private struct RenderedWorkspaceDiff: Sendable {
 }
 
 struct WorkspaceDiffView: View {
-    @Environment(AppModel.self) private var model
     @State private var rendered: RenderedWorkspaceDiff?
     @State private var expandedFileIDs: Set<Int> = []
+    let source: String
+    let revision: Int
+    let isLoading: Bool
+    let title: String
 
     var body: some View {
         content
-            .task(id: model.gitDiffRevision) {
-                let revision = model.gitDiffRevision
-                let source = model.gitDiff
+            .task(id: revision) {
                 rendered = nil
                 expandedFileIDs.removeAll()
                 guard !source.isEmpty else { return }
@@ -27,18 +28,18 @@ struct WorkspaceDiffView: View {
                 } onCancel: {
                     parseTask.cancel()
                 }
-                guard !Task.isCancelled, model.gitDiffRevision == revision else { return }
+                guard !Task.isCancelled else { return }
                 rendered = RenderedWorkspaceDiff(revision: revision, document: document)
             }
     }
 
     @ViewBuilder
     private var content: some View {
-        if model.isLoadingGitDiff {
-            InspectorLoadingView(title: "Loading unstaged changes")
-        } else if model.gitDiff.isEmpty {
-            HorusUnavailable(title: "No unstaged changes", glyph: .gitBranch)
-        } else if let rendered, rendered.revision == model.gitDiffRevision {
+        if isLoading {
+            InspectorLoadingView(title: "Loading \(title)")
+        } else if source.isEmpty {
+            HorusUnavailable(title: "No \(title)", glyph: .gitBranch)
+        } else if let rendered, rendered.revision == revision {
             if rendered.document.files.isEmpty {
                 HorusUnavailable(title: "No displayable changes", glyph: .gitBranch)
             } else {
@@ -48,7 +49,7 @@ struct WorkspaceDiffView: View {
                 )
             }
         } else {
-            InspectorLoadingView(title: "Preparing unstaged changes")
+            InspectorLoadingView(title: "Preparing \(title)")
         }
     }
 }

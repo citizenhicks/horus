@@ -4,11 +4,12 @@ use std::time::Duration;
 use horus::backend::sandbox::CommandOutput;
 
 use crate::sandbox::GatewaySandbox;
-use crate::wire::{GitDiffScope, GitStatus};
+use crate::wire::{GitDiffScope, GitStatus, MAX_FRAME_BYTES};
 
 use super::Rejection;
 
-const MAX_GIT_DIFF_BYTES: usize = 400_000;
+// JSON can expand control bytes sixfold; one eighth leaves room for frame metadata.
+const MAX_GIT_DIFF_BYTES: usize = MAX_FRAME_BYTES / 8;
 const TRUNCATION_NOTE: &[u8] = b"[diff truncated]\n";
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -156,7 +157,7 @@ async fn diff_inner(
         append_untracked(sandbox, workspace, &mut diff).await?;
     }
 
-    truncate_diff(&mut diff);
+    truncate_diff(&mut diff, MAX_GIT_DIFF_BYTES);
     Ok(String::from_utf8_lossy(&diff).into_owned())
 }
 
@@ -254,13 +255,13 @@ fn append_diff(target: &mut Vec<u8>, patch: &[u8]) {
     target.extend_from_slice(patch);
 }
 
-/// A diff too large to send is still worth reading, so it is cut at the last whole line rather
-/// than rejected. The sandbox permits a larger shared read-only output budget.
-fn truncate_diff(diff: &mut Vec<u8>) {
-    if diff.len() <= MAX_GIT_DIFF_BYTES {
+/// Keep an oversized diff on a whole-line boundary within the gateway frame budget.
+fn truncate_diff(diff: &mut Vec<u8>, max_bytes: usize) {
+    if diff.len() <= max_bytes {
         return;
     }
-    let cut = diff[..MAX_GIT_DIFF_BYTES]
+    let content_bytes = max_bytes.saturating_sub(TRUNCATION_NOTE.len());
+    let cut = diff[..content_bytes]
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |index| index + 1);
@@ -526,29 +527,28 @@ mod tests {
         assert!(diff.contains("diff --git a/tracked.txt b/tracked.txt"));
     }
 
-    #[tokio::test]
-    async fn workspace_diff_truncates_oversized_output_at_a_line_boundary() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let (_state, sandbox) = test_sandbox(workspace.path());
-        run_git(workspace.path(), &["init", "--quiet"]);
-        std::fs::write(
-            workspace.path().join("large.txt"),
-            "x".repeat(MAX_GIT_DIFF_BYTES),
-        )
-        .expect("large untracked file");
+    #[test]
+    fn workspace_diff_truncates_oversized_output_at_a_line_boundary() {
+        let mut diff = b"header\nfirst line\nsecond line\n".to_vec();
 
-        let diff = diff(&sandbox, workspace.path(), GitDiffScope::Unstaged)
-            .await
-            .expect("oversized diff");
+        truncate_diff(&mut diff, 25);
 
-        let note = String::from_utf8_lossy(TRUNCATION_NOTE);
-        assert!(
-            diff.len() <= MAX_GIT_DIFF_BYTES + note.len()
-                && diff.ends_with(note.as_ref())
-                && diff.contains("diff --git a/large.txt b/large.txt"),
-            "unexpected truncation: {} bytes, tail {:?}",
-            diff.len(),
-            &diff[diff.len().saturating_sub(40)..]
-        );
+        assert_eq!(diff, b"header\n[diff truncated]\n");
+    }
+
+    #[test]
+    fn workspace_diff_budget_fits_the_encoded_gateway_frame() {
+        use crate::wire::{ServerFrame, ServerMessage};
+
+        let mut diff = vec![1; MAX_GIT_DIFF_BYTES + 1];
+        truncate_diff(&mut diff, MAX_GIT_DIFF_BYTES);
+        let frame = ServerFrame::new(ServerMessage::GitDiff {
+            request_id: "r".repeat(4 * 1024),
+            session_id: "s".repeat(4 * 1024),
+            scope: GitDiffScope::Unstaged,
+            diff: String::from_utf8(diff).expect("control bytes are valid UTF-8"),
+        });
+
+        assert!(serde_json::to_vec(&frame).expect("encoded frame").len() <= MAX_FRAME_BYTES);
     }
 }

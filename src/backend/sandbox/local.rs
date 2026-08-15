@@ -39,7 +39,7 @@ use self::files::read_file_range;
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 40_000;
 /// Read-only inspection feeds a UI rather than a model context, so it keeps a larger budget.
-const MAX_READ_ONLY_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_READ_ONLY_OUTPUT_BYTES: usize = MAX_BINARY_FILE_BYTES;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const ISOLATED_ENVIRONMENT: [&str; 8] = [
     "PATH",

@@ -451,6 +451,7 @@ extension AppModel {
 
     func refreshWorkspaceChanges() {
         refreshGitDiff()
+        if showsInspector, filesInspectorTab == .committed { refreshCommittedGitDiff() }
         refreshWorkspaceFiles()
     }
 
@@ -463,6 +464,18 @@ extension AppModel {
             guard self?.gitDiffRequestID == id else { return }
             self?.gitDiffRequestID = nil
             self?.isLoadingGitDiff = false
+        }
+    }
+
+    func refreshCommittedGitDiff() {
+        guard connectionState.isReady, let sessionID = selectedSessionID else { return }
+        let id = requestID("committed-git-diff")
+        committedGitDiffRequestID = id
+        isLoadingCommittedGitDiff = true
+        transmit(.getGitDiff(requestID: id, sessionID: sessionID, scope: .committed)) { [weak self] _ in
+            guard self?.committedGitDiffRequestID == id else { return }
+            self?.committedGitDiffRequestID = nil
+            self?.isLoadingCommittedGitDiff = false
         }
     }
 

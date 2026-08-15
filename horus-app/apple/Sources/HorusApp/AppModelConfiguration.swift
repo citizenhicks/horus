@@ -118,6 +118,7 @@ extension AppModel {
     func refreshFiles(for tab: FilesInspectorTab) {
         switch tab {
         case .unstaged: refreshGitDiff()
+        case .committed: refreshCommittedGitDiff()
         case .allFiles: refreshWorkspaceFiles()
         case .chatFiles: refreshChatFiles()
         }

@@ -57,9 +57,9 @@ mod base64_bytes {
 }
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 29;
+pub const PROTOCOL_VERSION: u16 = 30;
 /// Maximum encoded JSON payload accepted in one frame.
-pub const MAX_FRAME_BYTES: usize = 20 * 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = 50 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[cfg(test)]

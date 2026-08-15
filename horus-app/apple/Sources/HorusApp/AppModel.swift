@@ -23,6 +23,10 @@ final class AppModel {
     var gitDiff = "" {
         didSet { gitDiffRevision &+= 1 }
     }
+    private(set) var committedGitDiffRevision = 0
+    var committedGitDiff = "" {
+        didSet { committedGitDiffRevision &+= 1 }
+    }
     var sessions: [SessionRecord] = []
     /// Whether a Horus Cloud account is connected.
     ///
@@ -165,6 +169,7 @@ final class AppModel {
     }
     var workspaceFilesTruncated = false
     var isLoadingGitDiff = false
+    var isLoadingCommittedGitDiff = false
     var isLoadingWorkspaceFiles = false
     var profile: ProfileSnapshot?
     var runStats = RunStats()
@@ -266,6 +271,7 @@ final class AppModel {
     @ObservationIgnored var approvalRequestID: String?
     @ObservationIgnored var directoryRequestID: String?
     @ObservationIgnored var gitDiffRequestID: String?
+    @ObservationIgnored var committedGitDiffRequestID: String?
     @ObservationIgnored var workspaceFilesRequestID: String?
     @ObservationIgnored var sessionUploadsRequestID: String?
     @ObservationIgnored var artifactListRequestID: String?

@@ -30,7 +30,22 @@ private struct FilesContent: View {
     @ViewBuilder
     var body: some View {
         switch model.filesInspectorTab {
-        case .unstaged: WorkspaceDiffView()
+        case .unstaged:
+            WorkspaceDiffView(
+                source: model.gitDiff,
+                revision: model.gitDiffRevision,
+                isLoading: model.isLoadingGitDiff,
+                title: "unstaged changes"
+            )
+            .id(FilesInspectorTab.unstaged)
+        case .committed:
+            WorkspaceDiffView(
+                source: model.committedGitDiff,
+                revision: model.committedGitDiffRevision,
+                isLoading: model.isLoadingCommittedGitDiff,
+                title: "last commit"
+            )
+            .id(FilesInspectorTab.committed)
         case .allFiles: WorkspaceFileList()
         case .chatFiles: ChatFileList()
         }
@@ -62,6 +77,7 @@ private extension FilesInspectorTab {
     var title: String {
         switch self {
         case .unstaged: "Unstaged"
+        case .committed: "Committed"
         case .allFiles: "All Files"
         case .chatFiles: "Chat Files"
         }

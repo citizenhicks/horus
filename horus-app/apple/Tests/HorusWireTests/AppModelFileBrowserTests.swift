@@ -19,7 +19,8 @@ extension AppModelTests {
             return false
         }
         let unstagedRequests = await recorder.requests()
-        guard case .getGitDiff(_, let sessionID, let diffScope) = try XCTUnwrap(unstagedRequest)
+        guard case let .getGitDiff(unstagedRequestID, sessionID, diffScope) =
+            try XCTUnwrap(unstagedRequest)
         else { return XCTFail("Expected unstaged Git diff") }
         XCTAssertEqual(sessionID, "chat-1")
         XCTAssertEqual(diffScope, .unstaged)
@@ -27,6 +28,32 @@ extension AppModelTests {
             if case .listWorkspaceFiles = $0 { return true }
             return false
         })
+        model.handle(.gitDiff(
+            requestID: unstagedRequestID,
+            sessionID: "chat-1",
+            scope: .unstaged,
+            diff: "unstaged diff"
+        ))
+        XCTAssertFalse(model.isLoadingGitDiff)
+
+        requestCount = await recorder.requestCount()
+        model.selectFilesInspectorTab(.committed)
+        let committedRequest = await recorder.firstRequest(after: requestCount) {
+            guard case .getGitDiff(_, "chat-1", .committed) = $0 else { return false }
+            return true
+        }
+        guard case let .getGitDiff(committedRequestID, _, .committed) =
+            try XCTUnwrap(committedRequest)
+        else { return XCTFail("Expected committed Git diff") }
+        model.handle(.gitDiff(
+            requestID: committedRequestID,
+            sessionID: "chat-1",
+            scope: .committed,
+            diff: "committed diff"
+        ))
+        XCTAssertEqual(model.committedGitDiff, "committed diff")
+        XCTAssertEqual(model.gitDiff, "unstaged diff")
+        XCTAssertFalse(model.isLoadingCommittedGitDiff)
 
         requestCount = await recorder.requestCount()
         model.selectFilesInspectorTab(.allFiles)

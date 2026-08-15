@@ -881,13 +881,13 @@ async fn read_frame_rejects_an_oversized_declared_payload() {
 }
 
 #[tokio::test]
-async fn write_frame_accepts_payloads_above_the_previous_two_mebibyte_limit() {
+async fn write_frame_accepts_payloads_above_the_previous_twenty_mebibyte_limit() {
     let mut writer = tokio::io::sink();
-    let payload = "x".repeat(2 * 1024 * 1024 + 1);
+    let payload = "x".repeat(20 * 1024 * 1024 + 1);
 
     write_frame(&mut writer, &payload)
         .await
-        .expect("20 MiB envelope accepts a larger payload");
+        .expect("50 MiB envelope accepts a larger payload");
 }
 
 #[test]

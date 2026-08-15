@@ -204,13 +204,16 @@ extension AppModel {
             self.artifacts = artifacts
             artifactsTruncated = truncated
         case .gitDiff(let requestID, let sessionID, let scope, let diff):
-            guard requestID == gitDiffRequestID,
-                  sessionID == selectedSessionID,
-                  scope == .unstaged
-            else { break }
-            gitDiffRequestID = nil
-            isLoadingGitDiff = false
-            gitDiff = diff
+            guard sessionID == selectedSessionID else { break }
+            if scope == .unstaged, requestID == gitDiffRequestID {
+                gitDiffRequestID = nil
+                isLoadingGitDiff = false
+                gitDiff = diff
+            } else if scope == .committed, requestID == committedGitDiffRequestID {
+                committedGitDiffRequestID = nil
+                isLoadingCommittedGitDiff = false
+                committedGitDiff = diff
+            }
         case .workspaceFiles(let requestID, let sessionID, let files, let truncated):
             guard requestID == workspaceFilesRequestID,
                   sessionID == selectedSessionID
@@ -817,6 +820,10 @@ extension AppModel {
         if rejection.requestId == gitDiffRequestID {
             gitDiffRequestID = nil
             isLoadingGitDiff = false
+        }
+        if rejection.requestId == committedGitDiffRequestID {
+            committedGitDiffRequestID = nil
+            isLoadingCommittedGitDiff = false
         }
         if rejection.requestId == workspaceFilesRequestID {
             workspaceFilesRequestID = nil

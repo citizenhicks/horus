@@ -225,6 +225,7 @@ enum ThemePreference: String, CaseIterable, Identifiable {
 
 enum FilesInspectorTab: String, CaseIterable, Identifiable {
     case unstaged
+    case committed
     case allFiles
     case chatFiles
 
