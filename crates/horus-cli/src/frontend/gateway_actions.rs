@@ -32,18 +32,9 @@ pub(super) fn render_response(
         ServerMessage::Rejected { message, .. } | ServerMessage::Error { message, .. } => {
             Some(message.clone())
         }
-        ServerMessage::ProviderCredentialStatus {
-            provider,
-            configured,
-            ..
-        } => Some(format!(
-            "{provider}: {}",
-            if *configured {
-                "configured"
-            } else {
-                "not configured"
-            }
-        )),
+        ServerMessage::ProviderCredentialSaved { provider, .. } => {
+            Some(format!("{provider}: configured"))
+        }
         ServerMessage::PairingCode {
             code, expires_at, ..
         } => Some(format!("one-time code {code} · expires {expires_at}")),

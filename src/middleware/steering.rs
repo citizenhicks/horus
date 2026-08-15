@@ -57,6 +57,7 @@ pub const MANIFEST: MiddlewareManifest = MiddlewareManifest {
 const OPERATION: &str = "steer";
 const EDIT_COMMAND: &str = "edit";
 const STALE_EDIT: &str = "steering message is no longer queued";
+const INVALID_EDIT: &str = "steering edit requires non-empty text";
 const OPERATIONS: &[&str] = &[OPERATION];
 
 /// Injects queued steering exactly once at the next model boundary.
@@ -177,12 +178,26 @@ impl Middleware for Steering {
             if context.command != EDIT_COMMAND {
                 return Ok(None);
             }
-            if context.queued_input.take(context.arguments)?.is_none() {
+            let Some(input) = context.input.filter(|input| !input.trim().is_empty()) else {
+                return Ok(Some(ActiveSubmissionResult::Rejected(INVALID_EDIT.into())));
+            };
+            if input.len() > MAX_CAPABILITY_INPUT_BYTES {
+                return Ok(Some(ActiveSubmissionResult::Rejected(
+                    "steering message exceeds editable size limit".into(),
+                )));
+            }
+            if !context
+                .queued_input
+                .replace(context.arguments, context.submission_id, input)?
+            {
                 return Ok(Some(ActiveSubmissionResult::Rejected(STALE_EDIT.into())));
             }
             context
                 .events
                 .push(EventMsg::Frontend(self.remove_widget(context.arguments)));
+            context.events.push(EventMsg::Frontend(
+                self.queued_widget(context.submission_id, input),
+            ));
             Ok(Some(ActiveSubmissionResult::Accepted))
         })
     }
@@ -237,11 +252,13 @@ mod tests {
     use super::*;
     use crate::backend::checkpoint::CheckpointStore;
     use crate::backend::checkpoint::sqlite::SqliteCheckpoint;
+    use crate::backend::model::{Model, ModelEventSink, ModelOutput, ModelRequest, ModelRouter};
     use crate::middleware::DurableQueuedInput;
     use crate::middleware::MiddlewareStack;
     use crate::middleware::QueuedInputBaseline;
     use crate::middleware::QueuedInputQueue;
     use crate::middleware::QueuedInputSnapshot;
+    use crate::middleware::tools::Catalog;
     use crate::protocol::SessionContext;
 
     fn item(id: &str, text: &str) -> DurableQueuedInput {
@@ -252,6 +269,18 @@ mod tests {
         let mut queue = QueuedInputQueue::new(items, QueuedInputBaseline::default());
         queue.scope(MANIFEST.id);
         queue
+    }
+
+    struct UnusedModel;
+
+    impl Model for UnusedModel {
+        fn respond<'a>(
+            &'a self,
+            _request: ModelRequest<'a>,
+            _events: ModelEventSink,
+        ) -> BoxFuture<'a, Result<ModelOutput>> {
+            Box::pin(async { Err(Error::Provider("unused test model".into())) })
+        }
     }
 
     #[test]
@@ -450,7 +479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_command_takes_the_selected_queued_message() {
+    async fn active_command_replaces_the_selected_queued_message() {
         let steering = Steering::default();
         let mut queued = vec![item("steering-1", "older"), item("steering-2", "latest")];
         let mut events = Vec::new();
@@ -463,7 +492,7 @@ mod tests {
                 active_turn_id: "turn-1",
                 command: EDIT_COMMAND,
                 arguments: "steering-1",
-                input: Some("older"),
+                input: Some("edited older"),
                 target: None,
                 queued_input: queue(&mut queued),
                 events: &mut events,
@@ -472,16 +501,107 @@ mod tests {
             .expect("active command");
 
         assert_eq!(result, Some(ActiveSubmissionResult::Accepted));
-        assert_eq!(queued, vec![item("steering-2", "latest")]);
-        let [EventMsg::Frontend(FrontendEvent::RemoveWidget { capability, id })] =
-            events.as_slice()
+        assert_eq!(
+            queued,
+            vec![item("edit-1", "edited older"), item("steering-2", "latest")]
+        );
+        let [
+            EventMsg::Frontend(FrontendEvent::RemoveWidget { capability, id }),
+            EventMsg::Frontend(FrontendEvent::Widget {
+                item: edited_widget,
+                ..
+            }),
+        ] = events.as_slice()
         else {
-            panic!("expected the edited widget to be removed");
+            panic!("expected the edited widget to be replaced");
         };
         assert_eq!(
             (capability.as_str(), id.as_str()),
             (MANIFEST.id, "steering-1")
         );
+        assert_eq!(
+            (edited_widget.id.as_str(), edited_widget.text.as_str()),
+            ("edit-1", "edited older")
+        );
+    }
+
+    #[tokio::test]
+    async fn edited_message_reaches_the_next_model_request() {
+        let steering = Steering::default();
+        let metadata = BTreeMap::new();
+        let mut queued = vec![item("steering-1", "original")];
+        let mut edit_events = Vec::new();
+
+        let result = steering
+            .active_command(&mut ActiveCommandContext {
+                submission_id: "edit-1",
+                session_id: "session-1",
+                metadata: &metadata,
+                active_turn_id: "turn-1",
+                command: EDIT_COMMAND,
+                arguments: "steering-1",
+                input: Some("edited text"),
+                target: None,
+                queued_input: queue(&mut queued),
+                events: &mut edit_events,
+            })
+            .await
+            .expect("edit queued message");
+        assert_eq!(result, Some(ActiveSubmissionResult::Accepted));
+
+        let model = ModelRouter::new("unused", Arc::new(UnusedModel));
+        let session_context = SessionContext::default();
+        let tools = Catalog::default();
+        let mut request_input = Vec::new();
+        let mut durable_input = Vec::new();
+        let mut transcript_delta = Vec::new();
+        let mut context_epoch = 0;
+        let mut compaction_count = 0;
+        let mut rewrite_reasons = Vec::new();
+        let mut events = Vec::new();
+        let mut usage = Vec::new();
+        let mut checkpoint_changed = false;
+
+        steering
+            .before_model(&mut ModelContext {
+                model: &model,
+                provider: "unused",
+                session_id: "session-1",
+                session_context: &session_context,
+                metadata: &metadata,
+                turn_id: "turn-1",
+                model_step: 1,
+                context_window: 1_000,
+                instructions: "",
+                checkpoint_sequence: 0,
+                request_input: &mut request_input,
+                durable_input: &mut durable_input,
+                transcript_delta: &mut transcript_delta,
+                context_epoch: &mut context_epoch,
+                compaction_count: &mut compaction_count,
+                rewrite_reasons: &mut rewrite_reasons,
+                queued_input: queue(&mut queued),
+                last_usage: None,
+                tools: &tools,
+                events: &mut events,
+                usage: &mut usage,
+                checkpoint_changed: &mut checkpoint_changed,
+            })
+            .await
+            .expect("inject queued steering");
+
+        let expected = user_message("edited text");
+        assert!(queued.is_empty());
+        assert_eq!(request_input.as_slice(), std::slice::from_ref(&expected));
+        assert_eq!(durable_input.as_slice(), std::slice::from_ref(&expected));
+        assert_eq!(transcript_delta, [expected]);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                EventMsg::Frontend(FrontendEvent::RemoveWidget { id, .. }),
+                EventMsg::UserMessage(UserMessageEvent { message, .. })
+            ] if id == "edit-1" && message == "edited text"
+        ));
     }
 
     #[test]
@@ -592,10 +712,13 @@ mod tests {
             stale,
             Some(ActiveSubmissionResult::Rejected(STALE_EDIT.into()))
         );
-        assert!(queued.is_empty());
+        assert_eq!(queued, vec![item("edit-1", "original")]);
         assert!(matches!(
             first_events.as_slice(),
-            [EventMsg::Frontend(FrontendEvent::RemoveWidget { .. })]
+            [
+                EventMsg::Frontend(FrontendEvent::RemoveWidget { .. }),
+                EventMsg::Frontend(FrontendEvent::Widget { .. })
+            ]
         ));
         assert!(stale_events.is_empty());
     }

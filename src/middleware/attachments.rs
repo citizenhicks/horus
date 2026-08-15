@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::manifest::MiddlewareManifest;
-use super::session_files::{SessionFileStore, attachment_staging_session_name};
+use super::session_files::{SessionFileStore, session_storage_key};
 use super::tools::{Catalog, ExecutionMode, Tool, ToolContext, render_tool_event};
 use super::{Middleware, ModelContext, PromptSection, RuntimeContext};
 use crate::backend::model::{ToolDefinition, internal_user_message};
@@ -452,7 +452,7 @@ async fn stage_attachment(
 fn staged_attachment_path(session_id: &str, reference: &SessionFileReference) -> PathBuf {
     PathBuf::from(".horus")
         .join("attachments")
-        .join(attachment_staging_session_name(session_id))
+        .join(session_storage_key(session_id))
         .join(&reference.id)
         .join(&reference.name)
 }
@@ -464,7 +464,7 @@ fn ensure_staging_directories(
 ) -> Result<Dir> {
     let horus = open_or_create_dir(workspace, ".horus")?;
     let attachments = open_or_create_dir(&horus, "attachments")?;
-    let session = open_or_create_dir(&attachments, &attachment_staging_session_name(session_id))?;
+    let session = open_or_create_dir(&attachments, &session_storage_key(session_id))?;
     open_or_create_dir(&session, attachment_id)
 }
 

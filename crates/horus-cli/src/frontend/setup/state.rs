@@ -1,0 +1,877 @@
+use super::*;
+
+pub(super) struct ProviderEntry {
+    pub(super) status: ProviderStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Page {
+    Provider,
+    Authentication,
+    Models,
+    Agent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Flow {
+    Continue,
+    Authenticate,
+    Finish,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ApplyTarget {
+    Session,
+    Default,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MiddlewareRow {
+    Feature(usize),
+    Setting { feature: usize, setting: usize },
+}
+
+pub(super) struct Progress {
+    pub(super) title: &'static str,
+    pub(super) detail: String,
+    pub(super) verification: Option<(String, String)>,
+}
+
+pub(super) struct SetupState {
+    pub(super) mode: SetupMode,
+    pub(super) providers: Vec<ProviderEntry>,
+    pub(super) original: AgentComposition,
+    pub(super) page: Page,
+    pub(super) provider: usize,
+    pub(super) credential: String,
+    pub(super) endpoint: String,
+    pub(super) endpoint_focused: bool,
+    pub(super) authenticated: Option<(String, Option<String>)>,
+    pub(super) model: usize,
+    pub(super) custom_model: String,
+    pub(super) reasoning: usize,
+    pub(super) web_search: usize,
+    pub(super) features: Vec<MiddlewareFeature>,
+    pub(super) middleware: MiddlewareConfig,
+    pub(super) target: ApplyTarget,
+    pub(super) default_only: bool,
+    pub(super) row: usize,
+    pub(super) error: Option<String>,
+    pub(super) progress: Option<Progress>,
+}
+
+impl SetupState {
+    pub(super) fn new(
+        mode: SetupMode,
+        preferred_provider: Option<&str>,
+        gateway: &ReadyPayload,
+        original: AgentComposition,
+        default_only: bool,
+    ) -> Result<Self> {
+        let mut state = Self::from_parts(
+            mode,
+            validated_providers(&gateway.providers)?,
+            gateway.middleware_features.clone(),
+            original,
+            default_only,
+        )?;
+        if let Some(provider) = preferred_provider {
+            state.select_provider(provider)?;
+        }
+        Ok(state)
+    }
+
+    pub(super) fn from_parts(
+        mode: SetupMode,
+        providers: Vec<ProviderEntry>,
+        features: Vec<MiddlewareFeature>,
+        original: AgentComposition,
+        default_only: bool,
+    ) -> Result<Self> {
+        if providers.is_empty() {
+            return Err(Error::Config(
+                "the gateway did not advertise any providers".into(),
+            ));
+        }
+        let provider = providers
+            .iter()
+            .position(|entry| entry.status.provider == original.provider.provider)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "the gateway did not advertise the active provider `{}`",
+                    original.provider.provider
+                ))
+            })?;
+        validate_active_provider(&providers[provider].status, &original.provider)?;
+        let middleware = original.middleware.clone();
+        let mut state = Self {
+            mode,
+            providers,
+            original,
+            page: match mode {
+                SetupMode::Login => Page::Provider,
+                SetupMode::Agent => Page::Agent,
+            },
+            provider,
+            credential: String::new(),
+            endpoint: String::new(),
+            endpoint_focused: false,
+            authenticated: None,
+            model: 0,
+            custom_model: String::new(),
+            reasoning: 0,
+            web_search: 0,
+            features,
+            middleware,
+            target: if default_only {
+                ApplyTarget::Default
+            } else {
+                ApplyTarget::Session
+            },
+            default_only,
+            row: 0,
+            error: None,
+            progress: None,
+        };
+        state.reset_provider_fields();
+        Ok(state)
+    }
+
+    pub(super) fn entry(&self) -> &ProviderEntry {
+        &self.providers[self.provider]
+    }
+
+    pub(super) fn definition(&self) -> &ProviderStatus {
+        &self.entry().status
+    }
+
+    pub(super) fn select_provider(&mut self, provider: &str) -> Result<()> {
+        self.provider = self
+            .providers
+            .iter()
+            .position(|entry| entry.status.provider == provider)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "provider `{provider}` is not advertised by this gateway; run `/login` to choose an available provider"
+                ))
+            })?;
+        self.reset_provider_fields();
+        Ok(())
+    }
+
+    pub(super) fn model_choice_count(&self) -> usize {
+        self.definition().models.len().max(1)
+    }
+
+    pub(super) fn reasoning_choice_count(&self) -> usize {
+        self.definition()
+            .models
+            .get(self.model)
+            .map_or(1, |model| model.reasoning.len() + 1)
+    }
+
+    pub(super) fn search_choice_count(&self) -> usize {
+        let count = self.definition().web_search.len();
+        if count > 1 { count } else { 0 }
+    }
+
+    pub(super) fn models_action_start(&self) -> usize {
+        self.model_choice_count() + self.reasoning_choice_count() + self.search_choice_count()
+    }
+
+    pub(super) fn agent_action_start(&self) -> usize {
+        self.middleware_row_count()
+    }
+
+    pub(super) fn middleware_row_count(&self) -> usize {
+        self.features
+            .iter()
+            .map(|feature| feature.settings.len() + 1)
+            .sum()
+    }
+
+    pub(super) fn middleware_row(&self, row: usize) -> Option<MiddlewareRow> {
+        let mut start = 0;
+        for (feature, definition) in self.features.iter().enumerate() {
+            if row == start {
+                return Some(MiddlewareRow::Feature(feature));
+            }
+            let settings = start + 1..start + 1 + definition.settings.len();
+            if settings.contains(&row) {
+                return Some(MiddlewareRow::Setting {
+                    feature,
+                    setting: row - start - 1,
+                });
+            }
+            start = settings.end;
+        }
+        None
+    }
+
+    pub(super) fn apply_target_for_row(&self) -> Option<ApplyTarget> {
+        let start = match self.page {
+            Page::Models => self.models_action_start(),
+            Page::Agent => self.agent_action_start(),
+            Page::Provider | Page::Authentication => return None,
+        };
+        match (self.default_only, self.row.checked_sub(start)) {
+            (true, Some(0)) => Some(ApplyTarget::Default),
+            (false, Some(0)) => Some(ApplyTarget::Session),
+            (false, Some(1)) => Some(ApplyTarget::Default),
+            _ => None,
+        }
+    }
+
+    pub(super) fn row_count(&self) -> usize {
+        match self.page {
+            Page::Provider => self.providers.len(),
+            Page::Authentication => 0,
+            Page::Models => {
+                self.model_choice_count()
+                    + self.reasoning_choice_count()
+                    + self.search_choice_count()
+                    + if self.default_only { 1 } else { 2 }
+            }
+            Page::Agent => self.agent_action_start() + if self.default_only { 1 } else { 2 },
+        }
+    }
+
+    pub(super) fn move_selection(&mut self, delta: isize) {
+        match self.page {
+            Page::Provider => {
+                self.provider = (self.provider as isize + delta)
+                    .rem_euclid(self.providers.len() as isize)
+                    as usize;
+                self.reset_provider_fields();
+            }
+            Page::Models | Page::Agent => {
+                self.row =
+                    (self.row as isize + delta).rem_euclid(self.row_count() as isize) as usize;
+            }
+            Page::Authentication => {}
+        }
+        self.error = None;
+    }
+
+    pub(super) fn handle_key(&mut self, key: KeyEvent) -> Flow {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return Flow::Continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'd'))
+        {
+            return Flow::Cancel;
+        }
+        match self.page {
+            Page::Provider => self.handle_provider_key(key),
+            Page::Authentication => self.handle_authentication_key(key),
+            Page::Models => self.handle_models_key(key),
+            Page::Agent => self.handle_agent_key(key),
+        }
+    }
+
+    pub(super) fn handle_provider_key(&mut self, key: KeyEvent) -> Flow {
+        match key.code {
+            KeyCode::Esc => return Flow::Cancel,
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::Enter => {
+                self.endpoint_focused = self.definition().configurable_base_url()
+                    && self.definition().auth == ProviderAuthKind::DeviceCode;
+                self.page = Page::Authentication;
+                self.error = None;
+            }
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    pub(super) fn handle_authentication_key(&mut self, key: KeyEvent) -> Flow {
+        match key.code {
+            KeyCode::Esc => {
+                self.page = Page::Provider;
+                self.error = None;
+            }
+            KeyCode::Tab | KeyCode::BackTab
+                if self.definition().configurable_base_url()
+                    && self.definition().auth == ProviderAuthKind::ApiKey =>
+            {
+                self.endpoint_focused = !self.endpoint_focused;
+                self.error = None;
+            }
+            KeyCode::Enter => {
+                if let Err(error) = self.authentication_ready() {
+                    self.error = Some(error.to_string());
+                    return Flow::Continue;
+                }
+                self.error = None;
+                return Flow::Authenticate;
+            }
+            KeyCode::Backspace if self.authentication_is_editable() => {
+                if self.endpoint_focused {
+                    self.endpoint.pop();
+                } else {
+                    self.credential.pop();
+                }
+                self.error = None;
+            }
+            KeyCode::Char(character)
+                if self.authentication_is_editable()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.push_text(&character.to_string());
+            }
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    pub(super) fn handle_models_key(&mut self, key: KeyEvent) -> Flow {
+        let custom_row = self.definition().model_ids_configurable.then_some(0);
+        match key.code {
+            KeyCode::Esc => {
+                self.page = Page::Authentication;
+                self.error = None;
+            }
+            KeyCode::Backspace if Some(self.row) == custom_row => {
+                self.model = 0;
+                self.custom_model.pop();
+                self.error = None;
+            }
+            KeyCode::Char(character)
+                if Some(self.row) == custom_row
+                    && character != ' '
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.model = 0;
+                self.push_text(&character.to_string());
+            }
+            KeyCode::Up | KeyCode::BackTab => self.move_selection(-1),
+            KeyCode::Down | KeyCode::Tab => self.move_selection(1),
+            KeyCode::Char(' ') => {
+                if let Some(target) = self.apply_target_for_row() {
+                    self.target = target;
+                    return self.finish();
+                }
+                self.select_model_row();
+            }
+            KeyCode::Enter => {
+                if let Some(target) = self.apply_target_for_row() {
+                    self.target = target;
+                    return self.finish();
+                }
+                self.select_model_row();
+            }
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    pub(super) fn handle_agent_key(&mut self, key: KeyEvent) -> Flow {
+        let middleware_row = self.middleware_row(self.row);
+        match key.code {
+            KeyCode::Esc => return Flow::Cancel,
+            KeyCode::Up | KeyCode::BackTab => self.move_selection(-1),
+            KeyCode::Down | KeyCode::Tab => self.move_selection(1),
+            KeyCode::Char(' ') if matches!(middleware_row, Some(MiddlewareRow::Feature(_))) => {
+                let MiddlewareRow::Feature(index) = middleware_row.expect("guarded feature row")
+                else {
+                    unreachable!()
+                };
+                let feature = &self.features[index];
+                if !feature.required {
+                    self.middleware
+                        .set_enabled(&feature.id, !self.middleware.enabled(&feature.id));
+                }
+            }
+            KeyCode::Char(' ') | KeyCode::Right
+                if matches!(middleware_row, Some(MiddlewareRow::Setting { .. })) =>
+            {
+                self.adjust_middleware_setting(middleware_row.expect("guarded setting row"), 1);
+            }
+            KeyCode::Left if matches!(middleware_row, Some(MiddlewareRow::Setting { .. })) => {
+                self.adjust_middleware_setting(middleware_row.expect("guarded setting row"), -1);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if self.apply_target_for_row().is_some() => {
+                self.target = self
+                    .apply_target_for_row()
+                    .expect("guard requires an apply target");
+                return self.finish();
+            }
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    pub(super) fn select_model_row(&mut self) {
+        let models = self.model_choice_count();
+        if self.row < models {
+            if self.model != self.row {
+                self.model = self.row;
+                self.reasoning = 0;
+            }
+        } else if self.row < models + self.reasoning_choice_count() {
+            self.reasoning = self.row - models;
+        } else if self.row < self.models_action_start() {
+            self.web_search = self.row - models - self.reasoning_choice_count();
+        }
+        self.error = None;
+    }
+
+    pub(super) fn adjust_middleware_setting(&mut self, row: MiddlewareRow, delta: isize) {
+        let MiddlewareRow::Setting { feature, setting } = row else {
+            return;
+        };
+        self.error = self
+            .adjust_setting(feature, setting, delta)
+            .err()
+            .map(|error| error.to_string());
+    }
+
+    pub(super) fn adjust_setting(
+        &mut self,
+        feature: usize,
+        setting: usize,
+        delta: isize,
+    ) -> Result<()> {
+        let feature = &self.features[feature];
+        let setting = &feature.settings[setting];
+        if !feature.required && !self.middleware.enabled(&feature.id) {
+            return Ok(());
+        }
+        let value = match &setting.kind {
+            FrontendSettingKind::Integer { min, max, step } => {
+                let Some(FrontendSettingValue::Integer(current)) =
+                    self.middleware.setting(&feature.id, &setting.id)
+                else {
+                    return Err(Error::Config(format!(
+                        "{} requires an integer value",
+                        setting.label
+                    )));
+                };
+                let step = (*step).max(1);
+                let next = if delta.is_positive() {
+                    current.saturating_add(step)
+                } else {
+                    current.saturating_sub(step)
+                };
+                FrontendSettingValue::Integer(
+                    max.map_or(next.max(*min), |max| next.max(*min).min(max)),
+                )
+            }
+            FrontendSettingKind::Select {
+                options,
+                unset_label,
+            } => {
+                let offset = usize::from(unset_label.is_some());
+                let count = options.len() + offset;
+                if count == 0 {
+                    return Err(Error::Config(format!(
+                        "{} has no advertised choices",
+                        setting.label
+                    )));
+                }
+                let current = match self.middleware.setting(&feature.id, &setting.id) {
+                    Some(FrontendSettingValue::String(value)) => options
+                        .iter()
+                        .position(|option| option.value == *value)
+                        .map(|index| index + offset)
+                        .ok_or_else(|| {
+                            Error::Config(format!(
+                                "{} is not in the gateway catalog",
+                                setting.label
+                            ))
+                        })?,
+                    None if unset_label.is_some() => 0,
+                    Some(FrontendSettingValue::Integer(_)) | None => {
+                        return Err(Error::Config(format!(
+                            "{} requires a selected value",
+                            setting.label
+                        )));
+                    }
+                };
+                let next = (current as isize + delta).rem_euclid(count as isize) as usize;
+                if next < offset {
+                    self.middleware.set_setting(&feature.id, &setting.id, None);
+                    return Ok(());
+                }
+                FrontendSettingValue::String(options[next - offset].value.clone())
+            }
+        };
+        self.middleware
+            .set_setting(&feature.id, &setting.id, Some(value));
+        Ok(())
+    }
+
+    pub(super) fn finish(&mut self) -> Flow {
+        if let Err(error) = self.authentication_ready() {
+            self.error = Some(error.to_string());
+            return Flow::Continue;
+        }
+        if let Err(error) = self.agent_composition(&self.original) {
+            self.error = Some(error.to_string());
+            return Flow::Continue;
+        }
+        Flow::Finish
+    }
+
+    pub(super) fn authentication_is_editable(&self) -> bool {
+        self.endpoint_focused || self.definition().auth == ProviderAuthKind::ApiKey
+    }
+
+    pub(super) fn paste(&mut self, text: &str) {
+        if self.page == Page::Authentication && self.authentication_is_editable() {
+            self.push_text(text.trim());
+        } else if self.page == Page::Models
+            && self.definition().model_ids_configurable
+            && self.row == 0
+        {
+            self.model = 0;
+            self.push_text(text.trim());
+        }
+    }
+
+    pub(super) fn push_text(&mut self, text: &str) {
+        let custom = self.page == Page::Models;
+        let endpoint = self.page == Page::Authentication && self.endpoint_focused;
+        let (target, limit) = if custom {
+            (&mut self.custom_model, MAX_MODEL_IDS_BYTES)
+        } else if endpoint {
+            (&mut self.endpoint, MAX_ENDPOINT_BYTES)
+        } else {
+            (&mut self.credential, MAX_API_KEY_BYTES)
+        };
+        let mut rejected = false;
+        for character in text.chars().filter(|character| !character.is_control()) {
+            if target.len() + character.len_utf8() > limit {
+                rejected = true;
+                break;
+            }
+            target.push(character);
+        }
+        self.error = rejected.then(|| format!("input is limited to {limit} bytes"));
+    }
+
+    pub(super) fn reset_provider_fields(&mut self) {
+        self.credential.clear();
+        self.authenticated = None;
+        let definition = self.entry().status.clone();
+        let current = &self.original.provider;
+        let same_provider = current.provider == definition.provider;
+        self.endpoint = if same_provider {
+            current
+                .base_url
+                .as_deref()
+                .or(definition.default_base_url.as_deref())
+        } else {
+            definition.default_base_url.as_deref()
+        }
+        .unwrap_or_default()
+        .into();
+        self.model = if definition.model_ids_configurable {
+            0
+        } else if same_provider {
+            definition
+                .models
+                .iter()
+                .position(|model| model.id == current.model)
+                .expect("active provider model was validated")
+        } else {
+            0
+        };
+        self.custom_model = if definition.model_ids_configurable {
+            let mut model_ids = definition.model_ids.clone();
+            if same_provider && !model_ids.contains(&current.model) {
+                model_ids.insert(0, current.model.clone());
+            }
+            model_ids.join(", ")
+        } else {
+            String::new()
+        };
+        let reasoning = if same_provider {
+            current.reasoning_effort.as_deref()
+        } else {
+            definition
+                .models
+                .get(self.model)
+                .and_then(|model| model.default_reasoning.as_deref())
+        };
+        self.reasoning = definition
+            .models
+            .get(self.model)
+            .and_then(|model| {
+                reasoning.and_then(|effort| {
+                    model
+                        .reasoning
+                        .iter()
+                        .position(|preset| preset.id == effort)
+                })
+            })
+            .map_or(0, |index| index + 1);
+        self.web_search = if same_provider {
+            definition
+                .web_search
+                .iter()
+                .position(|search| *search == current.web_search)
+                .expect("active provider search mode was validated")
+        } else {
+            0
+        };
+        self.endpoint_focused = false;
+        self.row = self.model;
+        self.error = None;
+    }
+
+    pub(super) fn configured_model_ids(&self) -> Result<Vec<String>> {
+        if !self.definition().model_ids_configurable {
+            return Ok(Vec::new());
+        }
+        let model_ids = self
+            .custom_model
+            .split(',')
+            .map(str::trim)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if model_ids.iter().any(String::is_empty) {
+            return Err(Error::Config(
+                "Enter one or more model IDs separated by commas".into(),
+            ));
+        }
+        if model_ids.iter().collect::<BTreeSet<_>>().len() != model_ids.len() {
+            return Err(Error::Config("Model IDs must be unique".into()));
+        }
+        Ok(model_ids)
+    }
+
+    pub(super) fn selected_base_url(&self) -> Option<String> {
+        self.definition()
+            .configurable_base_url()
+            .then(|| self.endpoint.trim().to_string())
+    }
+
+    pub(super) fn authentication_target(&self) -> (String, Option<String>) {
+        (self.definition().provider.clone(), self.selected_base_url())
+    }
+
+    pub(super) fn authentication_succeeded(&mut self) {
+        self.authenticated = Some(self.authentication_target());
+        self.progress = None;
+        self.page = Page::Models;
+        self.row = self.model;
+    }
+
+    pub(super) fn has_matching_credential(&self) -> bool {
+        let target = self.authentication_target();
+        self.authenticated.as_ref() == Some(&target)
+            || !self.definition().configurable_base_url() && self.entry().status.configured
+    }
+
+    pub(super) fn authentication_ready(&self) -> Result<()> {
+        if self.mode == SetupMode::Agent {
+            return Ok(());
+        }
+        if self.definition().configurable_base_url()
+            && self
+                .selected_base_url()
+                .is_none_or(|url| url.trim().is_empty())
+        {
+            return Err(Error::Config("Base URL is required".into()));
+        }
+        match self.definition().auth {
+            ProviderAuthKind::ApiKey
+                if self.credential.trim().is_empty() && !self.has_matching_credential() =>
+            {
+                Err(Error::Config(
+                    "Paste an API key or configure this provider on the gateway".into(),
+                ))
+            }
+            ProviderAuthKind::ApiKey | ProviderAuthKind::DeviceCode => Ok(()),
+        }
+    }
+
+    pub(super) fn take_authentication(&mut self) -> Result<Authentication> {
+        self.authentication_ready()?;
+        if self.mode == SetupMode::Agent {
+            return Ok(Authentication::Reuse);
+        }
+        match self.definition().auth {
+            ProviderAuthKind::ApiKey => {
+                let credential = take_trimmed(&mut self.credential);
+                if !credential.is_empty() {
+                    Ok(Authentication::ApiKey(credential))
+                } else {
+                    Ok(Authentication::Reuse)
+                }
+            }
+            ProviderAuthKind::DeviceCode if self.has_matching_credential() => {
+                Ok(Authentication::Reuse)
+            }
+            ProviderAuthKind::DeviceCode => Ok(Authentication::DeviceCode),
+        }
+    }
+
+    pub(super) fn agent_composition(&self, current: &AgentComposition) -> Result<AgentComposition> {
+        let mut config = current.clone();
+        if self.mode == SetupMode::Agent {
+            config.middleware = self.middleware.clone();
+            return Ok(config);
+        }
+        let definition = self.definition();
+        let model_ids = self.configured_model_ids()?;
+        let model = definition.models.get(self.model).map_or_else(
+            || model_ids.first().map_or("", String::as_str),
+            |model| model.id.as_str(),
+        );
+        let reasoning_effort = if let Some(model) = definition.models.get(self.model) {
+            self.reasoning
+                .checked_sub(1)
+                .and_then(|index| model.reasoning.get(index))
+                .map(|preset| preset.id.to_string())
+        } else if current.provider.provider == definition.provider
+            && current.provider.model == model
+        {
+            current.provider.reasoning_effort.clone()
+        } else {
+            None
+        };
+        let web_search = definition
+            .web_search
+            .get(self.web_search)
+            .copied()
+            .ok_or_else(|| Error::Config("Hosted web-search selection is invalid".into()))?;
+        let base_url = self.selected_base_url();
+        if model.is_empty() {
+            return Err(Error::Config("Model is required".into()));
+        }
+        config.provider = ProviderConfig {
+            provider: definition.provider.clone(),
+            model: model.into(),
+            base_url,
+            reasoning_effort,
+            web_search,
+        };
+        Ok(config)
+    }
+
+    pub(super) fn set_progress(&mut self, title: &'static str, detail: impl Into<String>) {
+        self.progress = Some(Progress {
+            title,
+            detail: detail.into(),
+            verification: None,
+        });
+    }
+
+    pub(super) fn show_device_code(&mut self, verification_url: String, user_code: String) {
+        self.progress = Some(Progress {
+            title: "Complete device login",
+            detail: "Open the verification URL and enter this one-time code.".into(),
+            verification: Some((verification_url, user_code)),
+        });
+    }
+}
+
+pub(super) enum Authentication {
+    Reuse,
+    ApiKey(String),
+    DeviceCode,
+}
+
+pub(super) fn validated_providers(statuses: &[ProviderStatus]) -> Result<Vec<ProviderEntry>> {
+    let mut seen = BTreeSet::new();
+    statuses
+        .iter()
+        .map(|status| {
+            if status.provider.trim().is_empty() || !seen.insert(status.provider.as_str()) {
+                return Err(Error::Config(format!(
+                    "gateway advertised invalid or duplicate provider `{}`",
+                    status.provider
+                )));
+            }
+            if status.label.trim().is_empty()
+                || status.description.trim().is_empty()
+                || status.web_search.first() != Some(&HostedWebSearch::Off)
+                || status.model_ids_configurable != status.models.is_empty()
+                || !status.model_ids_configurable && !status.model_ids.is_empty()
+                || !status.model_ids_configurable && !status.reasoning_efforts.is_empty()
+            {
+                return Err(Error::Config(format!(
+                    "gateway advertised an incomplete manifest for `{}`",
+                    status.provider
+                )));
+            }
+            Ok(ProviderEntry {
+                status: status.clone(),
+            })
+        })
+        .collect()
+}
+
+pub(super) fn validate_active_provider(
+    status: &ProviderStatus,
+    config: &ProviderConfig,
+) -> Result<()> {
+    if !status.web_search.contains(&config.web_search) {
+        return Err(Error::Config(format!(
+            "gateway active provider `{}` has an unadvertised web-search mode",
+            status.provider
+        )));
+    }
+    if status.configurable_base_url() != config.base_url.is_some() {
+        return Err(Error::Config(format!(
+            "gateway active provider `{}` has invalid endpoint settings",
+            status.provider
+        )));
+    }
+    if status.model_ids_configurable {
+        if !status.model_ids.iter().any(|model| model == &config.model) {
+            return Err(Error::Config(format!(
+                "gateway active provider `{}` has unconfigured model `{}`",
+                status.provider, config.model
+            )));
+        }
+        if let Some(effort) = config.reasoning_effort.as_deref()
+            && !status
+                .reasoning_efforts
+                .iter()
+                .any(|choice| choice == effort)
+        {
+            return Err(Error::Config(format!(
+                "gateway active provider `{}` has unconfigured reasoning `{effort}`",
+                status.provider
+            )));
+        }
+        return Ok(());
+    }
+    let model = status
+        .models
+        .iter()
+        .find(|model| model.id == config.model)
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "gateway active provider `{}` has unadvertised model `{}`",
+                status.provider, config.model
+            ))
+        })?;
+    if let Some(effort) = config.reasoning_effort.as_deref()
+        && !model.reasoning.iter().any(|choice| choice.id == effort)
+    {
+        return Err(Error::Config(format!(
+            "gateway active model `{}` has unadvertised reasoning `{effort}`",
+            model.id
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn take_trimmed(value: &mut String) -> String {
+    let mut value = std::mem::take(value);
+    value.truncate(value.trim_end().len());
+    let start = value.len() - value.trim_start().len();
+    value.drain(..start);
+    value
+}

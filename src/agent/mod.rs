@@ -37,6 +37,7 @@ use crate::protocol::Submission;
 use crate::protocol::TokenUsage;
 use crate::protocol::WarningEvent;
 
+mod approval;
 mod input;
 mod recorder;
 mod startup;

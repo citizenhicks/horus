@@ -1,0 +1,444 @@
+use super::*;
+
+/// Gateway-wide frontend-safe state sent after authentication.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReadyPayload {
+    pub machine_name: String,
+    pub sessions: Vec<SessionRecord>,
+    pub providers: Vec<ProviderStatus>,
+    pub default_config: Option<VersionedAgentConfig>,
+    pub models: Vec<ModelChoice>,
+    pub model_providers: BTreeMap<String, String>,
+    pub middleware_features: Vec<MiddlewareFeature>,
+    pub max_active_sessions: usize,
+}
+
+/// Frontend-safe state for one opened session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionReadyPayload {
+    pub latest_sequence: u64,
+    pub next_before_sequence: Option<u64>,
+    pub workspace: WorkspaceInfo,
+    pub git: Option<GitStatus>,
+    pub session: SessionConfiguredEvent,
+    pub contributions: Vec<FrontendContribution>,
+    pub widgets: Vec<SessionWidget>,
+    pub tool_count: usize,
+    pub compaction_count: u64,
+    pub run_stats: RunStats,
+    pub config: VersionedAgentConfig,
+}
+
+/// One currently mounted capability widget and its owning namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionWidget {
+    pub capability: String,
+    pub item: FrontendWidget,
+}
+
+/// One visible session with gateway-owned catalog presentation metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    #[serde(flatten)]
+    pub summary: SessionSummary,
+    pub title: Option<String>,
+    pub pinned: bool,
+    pub activity: SessionActivity,
+}
+
+/// Gateway-observed lifecycle state for one session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionActivity {
+    pub state: SessionActivityState,
+    pub turn_id: Option<String>,
+    pub started_at: Option<i64>,
+    pub last_outcome: Option<SessionOutcome>,
+    pub message: Option<String>,
+}
+
+impl Default for SessionActivity {
+    fn default() -> Self {
+        Self {
+            state: SessionActivityState::Idle,
+            turn_id: None,
+            started_at: None,
+            last_outcome: None,
+            message: None,
+        }
+    }
+}
+
+/// Current work state advertised in the session catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActivityState {
+    Idle,
+    Running,
+    AwaitingApproval,
+}
+
+/// Most recent terminal outcome advertised in the session catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOutcome {
+    Completed,
+    Aborted,
+    Failed,
+}
+
+/// Canonical workspace identity and path for one chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceInfo {
+    pub id: String,
+    pub path: PathBuf,
+}
+
+/// Local branch state for a Git-backed workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStatus {
+    pub current_branch: String,
+    pub branches: Vec<String>,
+}
+
+/// One explicit Git patch selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitDiffScope {
+    Staged,
+    Unstaged,
+    Committed,
+}
+
+/// Which openable files to include in a workspace catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceFileScope {
+    Modified,
+    All,
+}
+
+/// One regular file confined to the selected chat workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceFileRecord {
+    pub path: String,
+    pub size: u64,
+}
+
+/// One bounded folder listing from the gateway host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryListing {
+    pub path: PathBuf,
+    pub parent: Option<PathBuf>,
+    pub entries: Vec<DirectoryEntry>,
+}
+
+/// A selectable child folder on the gateway host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_directory: bool,
+}
+
+/// A frontend-safe agent composition guarded by an optimistic revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedAgentConfig {
+    pub revision: u64,
+    pub config: AgentComposition,
+}
+
+/// Runtime settings an authenticated client may read and replace atomically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentComposition {
+    pub provider: ProviderConfig,
+    pub middleware: MiddlewareConfig,
+    pub system_prompt: String,
+    pub max_model_steps: u64,
+}
+
+/// Provider and model settings. Credentials are resolved only on the gateway host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConfig {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    pub web_search: HostedWebSearch,
+}
+
+/// Credential availability exposed without returning credential material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderStatus {
+    pub provider: String,
+    pub label: String,
+    pub symbol: FrontendSymbol,
+    pub description: String,
+    pub configured: bool,
+    pub selection: Option<ProviderConfig>,
+    pub model_ids: Vec<String>,
+    pub reasoning_efforts: Vec<String>,
+    pub model_ids_configurable: bool,
+    pub auth: ProviderAuthKind,
+    pub default_base_url: Option<String>,
+    pub default_api_key_env: Option<String>,
+    pub models: Vec<ProviderModel>,
+    pub web_search: Vec<HostedWebSearch>,
+}
+
+/// Frontend type attached to one authenticated connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientKind {
+    Cli,
+    Macos,
+    Ios,
+    Ipados,
+    GatewayDashboard,
+}
+
+/// One paired client and its current connection state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientStatus {
+    pub client_id: String,
+    pub label: String,
+    pub kinds: Vec<ClientKind>,
+    pub connections: usize,
+}
+
+impl ProviderStatus {
+    #[must_use]
+    pub fn configurable_base_url(&self) -> bool {
+        self.default_base_url.is_some()
+    }
+
+    #[must_use]
+    pub fn default_model(&self) -> Option<&ProviderModel> {
+        self.models.first()
+    }
+}
+
+/// One model advertised by a provider manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderModel {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub context_window: i64,
+    pub reasoning: Vec<ReasoningChoice>,
+    pub default_reasoning: Option<String>,
+}
+
+/// One reasoning effort advertised for a provider model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningChoice {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+}
+
+/// Frontend-safe provider authentication mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthKind {
+    ApiKey,
+    DeviceCode,
+}
+
+/// Enabled optional middleware IDs and their schema-backed settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiddlewareConfig {
+    pub(crate) enabled: BTreeSet<String>,
+    pub settings: BTreeMap<String, BTreeMap<String, FrontendSettingValue>>,
+}
+
+impl MiddlewareConfig {
+    /// Returns whether one advertised optional middleware is enabled.
+    #[must_use]
+    pub fn enabled(&self, id: &str) -> bool {
+        self.enabled.contains(id)
+    }
+
+    /// Updates one advertised optional middleware before gateway validation.
+    pub fn set_enabled(&mut self, id: impl Into<String>, enabled: bool) {
+        let id = id.into();
+        if enabled {
+            self.enabled.insert(id);
+        } else {
+            self.enabled.remove(&id);
+        }
+    }
+
+    /// Returns one advertised middleware setting.
+    #[must_use]
+    pub fn setting(&self, middleware: &str, setting: &str) -> Option<&FrontendSettingValue> {
+        self.settings.get(middleware)?.get(setting)
+    }
+
+    /// Sets or clears one advertised middleware setting before gateway validation.
+    pub fn set_setting(
+        &mut self,
+        middleware: impl Into<String>,
+        setting: impl Into<String>,
+        value: Option<FrontendSettingValue>,
+    ) {
+        let middleware = middleware.into();
+        let setting = setting.into();
+        if let Some(value) = value {
+            self.settings
+                .entry(middleware)
+                .or_default()
+                .insert(setting, value);
+        } else if let Some(settings) = self.settings.get_mut(&middleware) {
+            settings.remove(&setting);
+            if settings.is_empty() {
+                self.settings.remove(&middleware);
+            }
+        }
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &str> {
+        self.enabled.iter().map(String::as_str)
+    }
+}
+
+/// Capability-rendered preview whose inner events remain provider-neutral.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderedPreview {
+    pub id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub page_id: String,
+    pub update: FrontendPreviewUpdate,
+    pub events: Vec<RenderedEvent>,
+    pub next: Option<Op>,
+}
+
+/// One preview event and its capability-rendered blocks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderedEvent {
+    pub recorded_at_ms: i64,
+    pub event: EventMsg,
+    pub blocks: Vec<RenderedBlock>,
+}
+
+/// One timestamped semantic event and its deterministic presentation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordedEvent {
+    pub sequence: u64,
+    pub recorded_at_ms: i64,
+    pub event: Event,
+    pub stream_metrics: Vec<StreamMetrics>,
+    pub blocks: Vec<RenderedBlock>,
+    pub preview: Option<RenderedPreview>,
+}
+
+/// Gateway-owned profile and aggregate usage information.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSnapshot {
+    pub user_name: Option<String>,
+    pub daily_usage: Vec<DailyUsage>,
+    pub run_stats: RunStats,
+    pub recent_run_groups: Vec<SessionRunGroup>,
+}
+
+/// Recent executions grouped under their nearest visible session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRunGroup {
+    pub session_id: String,
+    pub title: String,
+    pub runs: Vec<RunSummary>,
+}
+
+/// Completed execution totals plus the active run, when one exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunStats {
+    pub run_count: u64,
+    pub failed_run_count: u64,
+    pub aborted_run_count: u64,
+    pub model_calls: u64,
+    pub tool_calls: u64,
+    pub failed_tool_calls: u64,
+    pub elapsed_ms: u64,
+    pub usage: TokenUsage,
+    pub active: Option<RunSummary>,
+}
+
+/// Frontend-safe summary of one completed or active user turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSummary {
+    pub session_id: String,
+    pub submission_id: String,
+    pub turn_id: String,
+    pub started_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub elapsed_ms: u64,
+    pub outcome: Option<SessionOutcome>,
+    pub model_calls: u64,
+    pub tool_calls: u64,
+    pub failed_tool_calls: u64,
+    pub usage: TokenUsage,
+}
+
+/// Usage accrued during one Unix day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DailyUsage {
+    pub unix_day: u64,
+    pub provider: String,
+    pub usage: TokenUsage,
+}
+
+/// A reusable artifact emitted for one session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactRecord {
+    pub id: String,
+    pub session_id: String,
+    pub kind: ArtifactKind,
+    pub title: String,
+    pub block: FrontendBlock,
+}
+
+/// Frontend-neutral artifact category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    CodeDiff,
+    File,
+}
+
+/// One persisted scheduled task owned by its source session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronTask {
+    pub id: String,
+    pub session_id: String,
+    pub task: PathBuf,
+    pub schedule: String,
+}
+
+/// One completed or active invocation of a scheduled task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronRun {
+    pub id: String,
+    pub task_id: String,
+    pub source_session_id: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub status: CronRunStatus,
+    pub session_id: Option<String>,
+    pub message: Option<String>,
+}
+
+/// Durable state of one cron invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CronRunStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Skipped,
+}

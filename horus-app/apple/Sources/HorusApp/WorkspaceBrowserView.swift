@@ -1,0 +1,177 @@
+import SwiftUI
+
+struct WorkspaceBrowserView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.horusPalette) private var palette
+    @State private var newFolderName = ""
+    @State private var showsNewFolderPrompt = false
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                if let listing = model.directoryListing {
+                    DirectoryBrowserHeader(
+                        path: listing.path,
+                        title: "Choose a workspace for the new chat",
+                        parent: listing.parent,
+                        onParent: model.loadDirectory,
+                        onCreateFolder: {
+                            newFolderName = ""
+                            showsNewFolderPrompt = true
+                        }
+                    )
+                    List {
+                        ForEach(listing.entries) { entry in
+                            Button { model.loadDirectory(entry.path) } label: {
+                                HorusLabel(title: entry.name, glyph: .folder)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.horusPlain)
+                            .listRowSeparator(.hidden)
+                        }
+                        if listing.entries.isEmpty && !model.isLoadingDirectories {
+                            Text("No folders")
+                                .foregroundStyle(palette.muted)
+                                .listRowSeparator(.hidden)
+                        }
+                        if let error = model.directoryError ?? model.workspaceError {
+                            HorusLabel(
+                                title: error,
+                                glyph: .warning,
+                                iconColor: palette.danger
+                            )
+                                .foregroundStyle(palette.danger)
+                                .listRowSeparator(.hidden)
+                        }
+                    }
+                    .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
+                }
+            }
+            .font(HorusStyle.bodyFont)
+            .disabled(model.isLoadingDirectories || model.isChangingWorkspace)
+            .overlay {
+                if model.isLoadingDirectories { ProgressView() }
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        model.showsWorkspaceBrowser = false
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Choose") {
+                        if let path = model.directoryListing?.path { model.chooseWorkspace(path) }
+                    }
+                    .disabled(
+                        model.directoryListing?.parent == nil
+                            || model.isLoadingDirectories
+                            || model.isChangingWorkspace
+                    )
+                }
+            }
+        }
+        .alert("New folder", isPresented: $showsNewFolderPrompt) {
+            TextField("Folder name", text: $newFolderName)
+            Button("Cancel", role: .cancel) {}
+            Button("Create") {
+                model.createWorkspaceDirectory(named: newFolderName)
+            }
+            .disabled(newFolderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        } message: {
+            Text("Create a folder inside \(model.directoryListing?.path ?? "this location").")
+        }
+    }
+}
+
+private struct DirectoryBrowserHeader: View {
+    @Environment(\.horusPalette) private var palette
+    let path: String
+    let title: String
+    let parent: String?
+    let onParent: (String) -> Void
+    let onCreateFolder: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: HorusSpace.xs) {
+            Text(path)
+                .font(HorusStyle.metadataFont.weight(.bold))
+                .tracking(1)
+                .foregroundStyle(palette.accent)
+                .lineLimit(2)
+            HStack {
+                Text(title)
+                    .font(HorusStyle.controlFont)
+                Spacer()
+                Button("New folder", glyph: .folderPlus, action: onCreateFolder)
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(HorusIconButtonStyle())
+                    .help("New folder")
+                if let parent {
+                    Button("Parent folder", glyph: .arrowUp) { onParent(parent) }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(HorusIconButtonStyle())
+                        .help("Parent folder")
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, HorusSpace.l)
+        .padding(.vertical, HorusSpace.s)
+    }
+}
+
+struct FilesInspector: View {
+    var body: some View {
+        FilesView()
+            .inspectorColumnWidth(min: 320, ideal: 520, max: 840)
+    }
+}
+
+struct FrontendContributionPage: View {
+    @Environment(AppModel.self) private var model
+    let widget: MountedWidget
+
+    var body: some View {
+        PageScaffold(title: widget.title, detail: detail) {
+            if !model.isCapabilityEnabled(widget.capability) {
+                DisabledCapabilityNotice(
+                    title: "\(widget.widget.text) is off",
+                    detail: "Saved content remains visible. Enable \(widget.widget.text) in this chat to make changes."
+                )
+            }
+            if let content = widget.widget.content {
+                Section {
+                    FrontendWidgetContentView(
+                        content: content,
+                        actionsEnabled: model.isCapabilityEnabled(widget.capability)
+                    ) { option in
+                        model.submitPickerOption(option)
+                    }
+                }
+            } else if widget.widget.action != nil {
+                Section {
+                    Button(
+                        widget.widget.text,
+                        glyph: widget.glyph,
+                        action: { model.submitWidget(widget) }
+                    )
+                }
+            } else {
+                HorusUnavailable(
+                    title: widget.widget.text,
+                    glyph: widget.glyph,
+                    detail: "No content is currently available."
+                )
+            }
+        }
+    }
+
+    private var detail: String {
+        if case .actionList? = widget.widget.content { return "" }
+        return widget.widget.text == widget.title ? "" : widget.widget.text
+    }
+}

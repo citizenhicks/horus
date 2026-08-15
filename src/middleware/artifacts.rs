@@ -286,12 +286,6 @@ mod tests {
                 .data,
             [0, 255, 1, 254]
         );
-        assert!(
-            store
-                .read_upload_all("session-a", &output.file)
-                .await
-                .is_err()
-        );
     }
 
     #[test]

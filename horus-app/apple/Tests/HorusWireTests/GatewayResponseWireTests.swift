@@ -1,0 +1,322 @@
+import Foundation
+import XCTest
+
+extension GatewayWireTests {
+    func testV28MessageTargetsAreStrict() throws {
+        let operation = try decoder().decode(
+            AgentOperation.self,
+            from: Data(
+                #"{"type":"capability_command","capability":"sessions","command":"fork","arguments":"","input":null,"target":{"checkpoint_sequence":12,"batch_item_count":3}}"#.utf8
+            )
+        )
+        guard case .capabilityCommand(_, _, _, let input, let target) = operation else {
+            return XCTFail("Expected a capability command")
+        }
+        XCTAssertNil(input)
+        XCTAssertEqual(target, MessageTarget(checkpointSequence: 12, batchItemCount: 3))
+        let request = try requestObject(.submit(
+            sessionID: "chat-1",
+            submission: Submission(id: "fork-1", op: operation)
+        ))
+        let submission = try XCTUnwrap(request["submission"] as? [String: Any])
+        let encodedOperation = try XCTUnwrap(submission["op"] as? [String: Any])
+        let encodedTarget = try XCTUnwrap(encodedOperation["target"] as? [String: Any])
+        XCTAssertEqual(encodedTarget["checkpoint_sequence"] as? Int, 12)
+        XCTAssertEqual(encodedTarget["batch_item_count"] as? Int, 3)
+
+        for fixture in [
+            #"{"type":"capability_command","capability":"sessions","command":"fork","arguments":"","input":null}"#,
+            #"{"type":"capability_command","capability":"sessions","command":"fork","arguments":"","target":null}"#,
+            #"{"type":"capability_command","capability":"sessions","command":"fork","arguments":"","input":null,"target":{"checkpoint_sequence":12,"batch_item_count":0}}"#
+        ] {
+            XCTAssertThrowsError(
+                try decoder().decode(AgentOperation.self, from: Data(fixture.utf8))
+            )
+        }
+
+        let untargeted = try decodeEnvelope(
+            #"{"version":27,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"user_message","message":"Hello","attachments":[],"message_target":null}},"stream_metrics":[],"blocks":[],"preview":null}}"#
+        )
+        guard case .agentEvent(_, let record) = untargeted else {
+            return XCTFail("Expected an agent event")
+        }
+        XCTAssertEqual(record.event.msg["messageTarget"], JSONValue.null)
+        XCTAssertThrowsError(try decodeEnvelope(
+            #"{"version":27,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"user_message","message":"Hello","attachments":[]}},"stream_metrics":[],"blocks":[],"preview":null}}"#
+        ))
+    }
+
+    func testSessionFileResponsesMatchV28() throws {
+        let record = #"{"id":"file-1","name":"scan.png","size":3,"media_type":"image/png"}"#
+
+        let started = try decodeEnvelope(#"{"version":27,"type":"session_file_upload_ready","request_id":"begin-1","session_id":"chat-1","upload_id":"upload-1","max_chunk_bytes":262144}"#)
+        guard case .sessionFileUploadReady(let requestID, let sessionID, let uploadID, let limit) = started else {
+            return XCTFail("Expected session file upload start")
+        }
+        XCTAssertEqual([requestID, sessionID, uploadID], ["begin-1", "chat-1", "upload-1"])
+        XCTAssertEqual(limit, 262_144)
+
+        let accepted = try decodeEnvelope(#"{"version":27,"type":"session_file_upload_chunk_accepted","request_id":"chunk-1","session_id":"chat-1","upload_id":"upload-1","next_offset":3}"#)
+        guard case .sessionFileUploadChunkAccepted(_, _, _, let nextOffset) = accepted else {
+            return XCTFail("Expected session file chunk acknowledgement")
+        }
+        XCTAssertEqual(nextOffset, 3)
+
+        let uploaded = try decodeEnvelope(#"{"version":27,"type":"session_file_upload_completed","request_id":"finish-1","session_id":"chat-1","file":\#(record)}"#)
+        guard case .sessionFileUploadCompleted(_, _, let file) = uploaded else {
+            return XCTFail("Expected uploaded session file")
+        }
+        XCTAssertEqual(file.mediaType, "image/png")
+
+        let listed = try decodeEnvelope(#"{"version":27,"type":"session_uploads","request_id":"list-1","session_id":"chat-1","uploads":[\#(record)]}"#)
+        guard case .sessionUploads(_, _, let uploads) = listed else {
+            return XCTFail("Expected session upload list")
+        }
+        XCTAssertEqual(uploads.first?.name, "scan.png")
+
+        let chunk = try decodeEnvelope(#"{"version":27,"type":"session_file_chunk","request_id":"read-1","session_id":"chat-1","file_id":"file-1","offset":0,"data":"AQID","next_offset":null}"#)
+        guard case .sessionFileChunk(_, _, _, let offset, let data, let finalOffset) = chunk else {
+            return XCTFail("Expected session file chunk")
+        }
+        XCTAssertEqual(offset, 0)
+        XCTAssertEqual(data, Data([1, 2, 3]))
+        XCTAssertNil(finalOffset)
+
+        let artifact = try decodeEnvelope(
+            #"{"version":27,"type":"artifacts","request_id":"artifacts-1","session_id":"chat-1","artifacts":[{"id":"artifact-1","session_id":"chat-1","kind":"file","title":"Scan","block":{"id":"artifacts/file-1","group":null,"update":"replace","state":"complete","role":"artifact","title":"Scan","text":"","symbol":"storage","files":[\#(record)],"format":"plain_text","tone":"neutral"}}],"truncated":true}"#
+        )
+        guard case .artifacts(
+            let artifactRequestID,
+            let artifactSessionID,
+            let records,
+            let truncated
+        ) = artifact else {
+            return XCTFail("Expected artifact list")
+        }
+        XCTAssertEqual(artifactRequestID, "artifacts-1")
+        XCTAssertEqual(artifactSessionID, "chat-1")
+        XCTAssertEqual(records.first?.kind, .file)
+        XCTAssertEqual(records.first?.file?.name, "scan.png")
+        XCTAssertTrue(truncated)
+    }
+
+    func testFrontendBlockRequiresFilesInV28() {
+        let fixture = #"{"id":null,"group":null,"update":"replace","state":"complete","role":"notice","title":"Done","text":"","symbol":null,"format":"plain_text","tone":"neutral"}"#
+
+        XCTAssertThrowsError(
+            try decoder().decode(FrontendBlock.self, from: Data(fixture.utf8))
+        ) { error in
+            XCTAssertEqual(
+                error as? GatewayWireError,
+                .invalidFrame("frontend block is missing a required field")
+            )
+        }
+    }
+
+    func testWorkspaceViewerResponsesMatchV28() throws {
+        let files = try decodeEnvelope(#"{"version":27,"type":"workspace_files","request_id":"files-1","session_id":"chat-1","files":[{"path":"Sources/App.swift","size":3}],"truncated":true}"#)
+        guard case .workspaceFiles(_, _, let records, let truncated) = files else {
+            return XCTFail("Expected workspace files")
+        }
+        XCTAssertEqual(records.first, WorkspaceFileRecord(path: "Sources/App.swift", size: 3))
+        XCTAssertTrue(truncated)
+
+        let complete = try decodeEnvelope(#"{"version":27,"type":"workspace_files","request_id":"files-2","session_id":"chat-1","files":[{"path":"Sources/App.swift","size":3}]}"#)
+        guard case .workspaceFiles(_, _, _, let completeTruncated) = complete else {
+            return XCTFail("Expected complete workspace files")
+        }
+        XCTAssertFalse(completeTruncated)
+
+        let chunk = try decodeEnvelope(#"{"version":27,"type":"workspace_file_chunk","request_id":"read-1","session_id":"chat-1","path":"Sources/App.swift","offset":0,"data":"AQID","next_offset":null}"#)
+        guard case .workspaceFileChunk(_, _, let path, let offset, let data, let nextOffset) = chunk else {
+            return XCTFail("Expected workspace file chunk")
+        }
+        XCTAssertEqual(path, "Sources/App.swift")
+        XCTAssertEqual(offset, 0)
+        XCTAssertEqual(data, Data([1, 2, 3]))
+        XCTAssertNil(nextOffset)
+    }
+
+    func testMalformedKnownAgentEventIsRejected() {
+        let fixtures = [
+            #"{"version":27,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"turn_aborted","turn_id":"turn-1"}},"stream_metrics":[],"blocks":[],"preview":null}}"#,
+            #"{"version":27,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"agent_message","session_id":"chat-1","turn_id":"turn-1","model_step_id":"step-1","message":"Working","phase":"future_phase","message_target":null}},"stream_metrics":[],"blocks":[],"preview":null}}"#
+        ]
+
+        for fixture in fixtures {
+            XCTAssertThrowsError(try decodeEnvelope(fixture))
+        }
+    }
+
+    func testUnknownAuxiliaryRenderedEventsAreRejected() {
+        let fixtures = [
+            #"{"version":27,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"msg":{"type":"frontend","frontend_type":"preview","id":"/root/worker","title":"Worker","subtitle":"full","page_id":"latest","update":"replace","events":[],"next":null}},"stream_metrics":[],"blocks":[],"preview":{"id":"/root/worker","title":"Worker","subtitle":"full","page_id":"latest","update":"replace","events":[{"recorded_at_ms":1000,"event":{"type":"future_event"},"blocks":[]}],"next":null}}}"#
+        ]
+
+        for fixture in fixtures {
+            XCTAssertThrowsError(try decodeEnvelope(fixture)) { error in
+                XCTAssertEqual(
+                    error as? GatewayWireError,
+                    .invalidFrame("unknown agent event future_event")
+                )
+            }
+        }
+    }
+
+    func testFrontendRenderAgentEventIsAccepted() throws {
+        let fixture = #"{"version":27,"type":"agent_event","session_id":"chat-1","record":{"sequence":8,"recorded_at_ms":1000,"event":{"submission_id":"input-1","msg":{"type":"frontend","frontend_type":"render","capability":"tools","block":{"id":"call-1","group":"turn-1","update":"replace","state":"complete","role":"tool","title":"Read file","text":"Done","symbol":"task","format":"plain_text","tone":"neutral","files":[]}}},"stream_metrics":[],"blocks":[{"capability":"tools","block":{"id":"call-1","group":"turn-1","update":"replace","state":"complete","role":"tool","title":"Read file","text":"Done","symbol":"task","format":"plain_text","tone":"neutral","files":[]}}],"preview":null}}"#
+        let envelope = try decodeEnvelope(fixture)
+
+        guard case .agentEvent(_, let record) = envelope else {
+            return XCTFail("Expected agent event envelope")
+        }
+        XCTAssertEqual(record.event.msg["frontendType"]?.stringValue, "render")
+        XCTAssertEqual(record.blocks.first?.capability, "tools")
+        XCTAssertEqual(record.blocks.first?.block.role, .tool)
+        XCTAssertEqual(record.blocks.first?.block.title, "Read file")
+        XCTAssertEqual(record.blocks.first?.block.text, "Done")
+    }
+
+    func testSessionsResponseAllowsOmittedRequestID() throws {
+        let envelope = try decodeEnvelope(
+            #"{"version":27,"type":"sessions","sessions":[\#(sessionRecordJSON)]}"#
+        )
+        guard case .sessions(let requestID, let sessions) = envelope else {
+            return XCTFail("Expected sessions envelope")
+        }
+        XCTAssertNil(requestID)
+        XCTAssertEqual(sessions.first?.sessionId, "chat-1")
+        XCTAssertEqual(sessions.first?.pinned, true)
+    }
+
+    func testScopedGitAndCronResponsesDecodeV28Fields() throws {
+        let gitDiff = try decodeEnvelope(#"{"version":27,"type":"git_diff","request_id":"diff-1","session_id":"chat-1","scope":"unstaged","diff":"diff --git a/a b/a"}"#)
+        guard case .gitDiff(let diffRequestID, let diffSessionID, let scope, let diff) = gitDiff else {
+            return XCTFail("Expected git diff envelope")
+        }
+        XCTAssertEqual(diffRequestID, "diff-1")
+        XCTAssertEqual(diffSessionID, "chat-1")
+        XCTAssertEqual(scope, .unstaged)
+        XCTAssertTrue(diff.hasPrefix("diff --git"))
+
+        let tasks = try decodeEnvelope(#"{"version":27,"type":"cron_tasks","request_id":"cron-1","session_id":"chat-1","tasks":[{"id":"task-1","session_id":"chat-1","task":"/srv/task.md","schedule":"0 9 * * *"}]}"#)
+        guard case .cronTasks(let taskRequestID, let taskSessionID, let cronTasks) = tasks else {
+            return XCTFail("Expected cron tasks envelope")
+        }
+        XCTAssertEqual(taskRequestID, "cron-1")
+        XCTAssertEqual(taskSessionID, "chat-1")
+        XCTAssertEqual(cronTasks.first?.sessionId, "chat-1")
+
+        let history = try decodeEnvelope(#"{"version":27,"type":"cron_history","request_id":"history-1","session_id":"chat-1","runs":[{"id":"run-1","task_id":"task-1","source_session_id":"chat-1","started_at":100,"finished_at":110,"status":"succeeded","session_id":"chat-2","message":null}]}"#)
+        guard case .cronHistory(let historyRequestID, let historySessionID, let runs) = history else {
+            return XCTFail("Expected cron history envelope")
+        }
+        XCTAssertEqual(historyRequestID, "history-1")
+        XCTAssertEqual(historySessionID, "chat-1")
+        XCTAssertEqual(runs.first?.sourceSessionId, "chat-1")
+        XCTAssertEqual(runs.first?.status, .succeeded)
+    }
+
+    func testUnknownCronRunStatusIsRejected() {
+        XCTAssertThrowsError(try decodeEnvelope(
+            #"{"version":27,"type":"cron_history","request_id":"history-1","session_id":"chat-1","runs":[{"id":"run-1","task_id":"task-1","source_session_id":"chat-1","started_at":100,"finished_at":110,"status":"future_status","session_id":null,"message":null}]}"#
+        ))
+    }
+
+    func testControlProviderProfileAndDirectoryResponsesDecode() throws {
+        guard case .authenticated = try decodeEnvelope(#"{"version":27,"type":"authenticated"}"#) else {
+            return XCTFail("Expected authenticated envelope")
+        }
+        guard case .accepted(let acceptedID) = try decodeEnvelope(#"{"version":27,"type":"accepted","request_id":"request-1"}"#) else {
+            return XCTFail("Expected accepted envelope")
+        }
+        XCTAssertEqual(acceptedID, "request-1")
+
+        guard case .providerCredentialSaved(let credentialID, let provider) = try decodeEnvelope(#"{"version":27,"type":"provider_credential_saved","request_id":"credential-1","provider":"openai_socket"}"#) else {
+            return XCTFail("Expected provider credential saved envelope")
+        }
+        XCTAssertEqual(credentialID, "credential-1")
+        XCTAssertEqual(provider, "openai_socket")
+
+        guard case .pairingCode(let pairingID, let code, let expiresAt) = try decodeEnvelope(#"{"version":27,"type":"pairing_code","request_id":"pairing-1","code":"123456","expires_at":500}"#) else {
+            return XCTFail("Expected pairing code envelope")
+        }
+        XCTAssertEqual(pairingID, "pairing-1")
+        XCTAssertEqual(code, "123456")
+        XCTAssertEqual(expiresAt, 500)
+
+        guard case .providerLoginStarted(let loginRequestID, let loginID, let loginProvider, let verificationURL, let userCode) = try decodeEnvelope(#"{"version":27,"type":"provider_login_started","request_id":"login-1","login_id":"device-1","provider":"openai_codex","verification_url":"https://example.com/device","user_code":"ABCD"}"#) else {
+            return XCTFail("Expected provider login started envelope")
+        }
+        XCTAssertEqual(loginRequestID, "login-1")
+        XCTAssertEqual(loginID, "device-1")
+        XCTAssertEqual(loginProvider, "openai_codex")
+        XCTAssertEqual(verificationURL, "https://example.com/device")
+        XCTAssertEqual(userCode, "ABCD")
+
+        guard case .providerLoginFinished(let finishedRequestID, let finishedLoginID, let finishedProvider) = try decodeEnvelope(#"{"version":27,"type":"provider_login_finished","request_id":"login-1","login_id":"device-1","provider":"openai_codex"}"#) else {
+            return XCTFail("Expected provider login finished envelope")
+        }
+        XCTAssertEqual(finishedRequestID, "login-1")
+        XCTAssertEqual(finishedLoginID, "device-1")
+        XCTAssertEqual(finishedProvider, "openai_codex")
+
+        let profileFixture = #"{"version":27,"type":"profile","request_id":"profile-1","profile":{"user_name":"Ada","daily_usage":[{"unix_day":100,"provider":"anthropic","usage":\#(usageJSON)},{"unix_day":100,"provider":"openai_socket","usage":\#(usageJSON)}],"run_stats":\#(runStatsJSON),"recent_run_groups":[{"session_id":"chat-1","title":"Thread title","runs":[{"session_id":"agent-1","submission_id":"input-1","turn_id":"turn-1","started_at_ms":1000,"finished_at_ms":10000,"elapsed_ms":9000,"outcome":"completed","model_calls":2,"tool_calls":3,"failed_tool_calls":0,"usage":\#(usageJSON)}]}]}}"#
+        guard case .profile(let profileID, let profile) = try decodeEnvelope(profileFixture) else {
+            return XCTFail("Expected profile envelope")
+        }
+        XCTAssertEqual(profileID, "profile-1")
+        XCTAssertEqual(profile.userName, "Ada")
+        XCTAssertEqual(profile.dailyUsage.map(\.provider), ["anthropic", "openai_socket"])
+        XCTAssertEqual(profile.dailyUsage.map(\.unixDay), [100, 100])
+        XCTAssertEqual(profile.runStats.runCount, 2)
+        XCTAssertEqual(profile.recentRunGroups.first?.title, "Thread title")
+        XCTAssertEqual(profile.recentRunGroups.first?.runs.first?.sessionId, "agent-1")
+        XCTAssertEqual(profile.recentRunGroups.first?.runs.first?.toolCalls, 3)
+
+        guard case .directories(let directoryID, let listing) = try decodeEnvelope(#"{"version":27,"type":"directories","request_id":"directories-1","listing":{"path":"/srv","parent":null,"entries":[]}}"#) else {
+            return XCTFail("Expected directories envelope")
+        }
+        XCTAssertEqual(directoryID, "directories-1")
+        XCTAssertEqual(listing.path, "/srv")
+    }
+
+    func testPairedRejectedAndErrorResponsesDecode() throws {
+        guard case .paired(let clientID, let token) = try decodeEnvelope(#"{"version":27,"type":"paired","client_id":"phone-7","token":"bearer"}"#) else {
+            return XCTFail("Expected paired envelope")
+        }
+        XCTAssertEqual(clientID, "phone-7")
+        XCTAssertEqual(token, "bearer")
+
+        guard case .rejected(let rejection) = try decodeEnvelope(#"{"version":27,"type":"rejected","request_id":"request-1","code":"conflict","message":"stale","fatal":false}"#) else {
+            return XCTFail("Expected rejected envelope")
+        }
+        XCTAssertEqual(rejection.requestId, "request-1")
+        XCTAssertEqual(rejection.code, "conflict")
+        XCTAssertFalse(rejection.fatal)
+
+        guard case .error(let failure) = try decodeEnvelope(#"{"version":27,"type":"error","code":"internal","message":"failed","fatal":true}"#) else {
+            return XCTFail("Expected error envelope")
+        }
+        XCTAssertEqual(failure.code, "internal")
+        XCTAssertTrue(failure.fatal)
+    }
+
+    func testUnknownGatewayMessageAndOperationAreRejected() {
+        XCTAssertThrowsError(try decodeEnvelope(#"{"version":27,"type":"future_message"}"#)) { error in
+            XCTAssertEqual(
+                error as? GatewayWireError,
+                .invalidFrame("unknown gateway message future_message")
+            )
+        }
+
+        let operation = #"{"type":"future_operation"}"#
+        XCTAssertThrowsError(try decoder().decode(AgentOperation.self, from: Data(operation.utf8))) { error in
+            XCTAssertEqual(
+                error as? GatewayWireError,
+                .invalidFrame("unknown agent operation future_operation")
+            )
+        }
+    }
+
+}

@@ -1,0 +1,429 @@
+import Foundation
+import SwiftUI
+import UIKit
+
+struct FrontendWidgetView: View {
+    @Environment(AppModel.self) private var model
+    @State private var showsDetail = false
+    let widget: MountedWidget
+
+    var body: some View {
+        if let content = widget.widget.content {
+            Button(action: openDetail) {
+                badge
+                    .frame(
+                        minWidth: HorusStyle.iconButtonSize,
+                        minHeight: HorusStyle.iconButtonSize
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.horusPlain)
+            .accessibilityLabel(accessibilityTitle)
+            .sensoryFeedback(.selection, trigger: showsDetail)
+            .popover(isPresented: $showsDetail, arrowEdge: .bottom) {
+                WidgetContentPopover(content: content, select: select)
+            }
+        } else if widget.widget.action != nil {
+            Button(action: submit) {
+                badge
+                    .frame(
+                        minWidth: HorusStyle.iconButtonSize,
+                        minHeight: HorusStyle.iconButtonSize
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.horusPlain)
+            .accessibilityLabel(accessibilityTitle)
+        } else {
+            badge
+                .frame(minHeight: HorusStyle.iconButtonSize)
+                .accessibilityLabel(accessibilityTitle)
+        }
+    }
+
+    /// Widget text can be as terse as a bare count, so the detail title carries the meaning.
+    private var accessibilityTitle: String {
+        widget.widget.content.map { "\($0.title) \(widget.widget.text)" } ?? widget.widget.text
+    }
+
+    private var badge: HorusBadge {
+        HorusBadge(
+            text: widget.widget.iconOnly ? "" : widget.widget.text,
+            tone: widget.widget.tone,
+            glyph: widget.widget.symbol.map { HorusSymbol.glyph(for: $0) },
+            progress: widget.widget.progress?.fraction,
+            interactive: widget.widget.content != nil || widget.widget.action != nil
+        )
+    }
+
+    private func openDetail() { showsDetail = true }
+    private func submit() { model.submitWidget(widget) }
+
+    private func select(_ option: FrontendPickerOption) {
+        model.submitPickerOption(option)
+        showsDetail = false
+    }
+}
+
+private struct WidgetContentPopover: View {
+    let content: FrontendWidgetContent
+    let select: (FrontendPickerOption) -> Void
+
+    var body: some View {
+        BadgePopover(title: content.title) {
+            FrontendWidgetContentView(content: content, select: select)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct FrontendWidgetContentView: View {
+    @Environment(\.horusPalette) private var palette
+    let content: FrontendWidgetContent
+    let actionsEnabled: Bool
+    let select: (FrontendPickerOption) -> Void
+
+    init(
+        content: FrontendWidgetContent,
+        actionsEnabled: Bool = true,
+        select: @escaping (FrontendPickerOption) -> Void
+    ) {
+        self.content = content
+        self.actionsEnabled = actionsEnabled
+        self.select = select
+    }
+
+    var body: some View {
+        switch content {
+        case .blocks(_, let blocks):
+            ForEach(blocks) { block in
+                PreviewBlockView(block: block.block)
+                    .padding(.vertical, HorusSpace.s)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+            }
+        case .picker(_, let options):
+            ForEach(options) { option in
+                Button { select(option) } label: {
+                    FrontendPickerOptionLabel(option: option)
+                }
+                .buttonStyle(.horusPlain)
+                .accessibilityLabel(option.label)
+                .accessibilityValue(option.showsDetail ? option.detail : option.description)
+                .accessibilityHint(
+                    option.showsDetail ? option.description : "Activates this option"
+                )
+                .disabled(!actionsEnabled)
+            }
+        case .actionList(_, let items):
+            if items.isEmpty {
+                Text("Nothing here yet.")
+                    .foregroundStyle(palette.muted)
+                    .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize)
+            } else {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(items) { item in
+                        FrontendActionListRow(item: item, actionsEnabled: actionsEnabled)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct FrontendActionListRow: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+    @State private var pendingAction: PendingAction?
+    @State private var editedText = ""
+    let item: FrontendActionListItem
+    let actionsEnabled: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: HorusSpace.s) {
+            if let statusGlyph {
+                HorusIcon(statusGlyph, size: HorusStyle.glyphInline, foreground: statusColor)
+                    .frame(height: HorusStyle.rowTouch)
+            }
+            Text(item.text)
+                .font(HorusStyle.bodyFont)
+                .foregroundStyle(item.state == .completed ? palette.muted : .primary)
+                .strikethrough(item.state == .completed, color: palette.muted)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
+            if !item.actions.isEmpty {
+                Menu {
+                    ForEach(item.actions) { action in
+                        Button(role: action.tone == "error" ? .destructive : nil) {
+                            activate(action)
+                        } label: {
+                            HorusLabel(
+                                title: action.label,
+                                glyph: HorusSymbol.glyph(for: action.symbol)
+                            )
+                        }
+                    }
+                } label: {
+                    HorusIcon(.dotsThree, foreground: palette.accent)
+                        .frame(
+                            width: HorusStyle.iconButtonSize,
+                            height: HorusStyle.iconButtonSize
+                        )
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("More actions")
+                .accessibilityHint("Shows available actions for this item")
+                .help("More actions")
+                .disabled(!actionsEnabled)
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(statusLabel): \(item.text)")
+        .alert(
+            pendingAction?.action.label ?? "",
+            isPresented: isPresentingAction,
+            presenting: pendingAction
+        ) { pending in
+            switch pending.kind {
+            case .edit:
+                TextField("Text", text: $editedText)
+                Button("Cancel", role: .cancel) { pendingAction = nil }
+                Button("Save") {
+                    model.submitFrontendOperation(
+                        pending.action.op.replacingCapabilityInput(with: editedText)
+                    )
+                    pendingAction = nil
+                }
+                .disabled(
+                    !actionsEnabled
+                        || editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || editedText == pending.action.op.capabilityInput
+                )
+            case .destructive:
+                Button("Cancel", role: .cancel) { pendingAction = nil }
+                Button(pending.action.label, role: .destructive) {
+                    model.submitFrontendOperation(pending.action.op)
+                    pendingAction = nil
+                }
+                .disabled(!actionsEnabled)
+            }
+        } message: { pending in
+            if pending.kind == .destructive {
+                Text(pending.itemText)
+            }
+        }
+    }
+
+    private var isPresentingAction: Binding<Bool> {
+        Binding(
+            get: { pendingAction != nil },
+            set: { if !$0 { pendingAction = nil } }
+        )
+    }
+
+    private func activate(_ action: FrontendActionListAction) {
+        guard actionsEnabled else { return }
+        if action.tone == "error" {
+            pendingAction = PendingAction(kind: .destructive, itemText: item.text, action: action)
+        } else if let input = action.op.capabilityInput {
+            editedText = input
+            pendingAction = PendingAction(kind: .edit, itemText: item.text, action: action)
+        } else {
+            model.submitFrontendOperation(action.op)
+        }
+    }
+
+    private var statusGlyph: HorusGlyph? {
+        switch item.state {
+        case .plain: nil
+        case .pending: .clock
+        case .inProgress: .arrowClockwise
+        case .completed: .checkCircle
+        }
+    }
+
+    private var statusColor: Color {
+        switch item.state {
+        case .plain, .pending: palette.muted
+        case .inProgress: palette.accent
+        case .completed: palette.signal
+        }
+    }
+
+    private var statusLabel: String {
+        switch item.state {
+        case .plain: "Item"
+        case .pending: "Pending"
+        case .inProgress: "In progress"
+        case .completed: "Completed"
+        }
+    }
+}
+
+private struct PendingAction {
+    enum Kind: Equatable {
+        case edit
+        case destructive
+    }
+
+    let kind: Kind
+    let itemText: String
+    let action: FrontendActionListAction
+}
+
+private struct FrontendPickerOptionLabel: View {
+    @Environment(\.horusPalette) private var palette
+    let option: FrontendPickerOption
+
+    var body: some View {
+        HStack(spacing: HorusSpace.s) {
+            if let symbol = option.symbol,
+               let glyph = HorusSymbol.knownGlyph(for: symbol) {
+                HorusIcon(glyph, size: HorusStyle.glyphInline, foreground: palette.accent)
+            }
+            Text(option.label)
+                .font(HorusStyle.controlFont.weight(.semibold))
+                .foregroundStyle(palette.accent)
+                .lineLimit(1)
+            if !option.description.isEmpty {
+                Text(option.description)
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(palette.muted)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: HorusSpace.xs)
+            if option.showsDetail, !option.detail.isEmpty {
+                Text(option.detail)
+                    .font(HorusStyle.metadataFont)
+                    .foregroundStyle(palette.muted)
+                    .lineLimit(1)
+            }
+            HorusIcon(.caretRight, size: HorusStyle.glyphMark, foreground: palette.muted)
+        }
+        .frame(maxWidth: .infinity, minHeight: HorusStyle.iconButtonSize, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+}
+
+struct FrontendWidgetSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let widget: MountedWidget
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if !model.isCapabilityEnabled(widget.capability) {
+                    DisabledCapabilityNotice(
+                        title: "\(currentWidget?.widget.text ?? widget.widget.text) is off",
+                        detail: "Saved content remains visible. Enable \(currentWidget?.widget.text ?? widget.widget.text) in this chat to make changes."
+                    )
+                }
+                if let content = currentWidget?.widget.content {
+                    Section {
+                        FrontendWidgetContentView(
+                            content: content,
+                            actionsEnabled: model.isCapabilityEnabled(widget.capability)
+                        ) { option in
+                            model.submitPickerOption(option)
+                            dismiss()
+                        }
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .navigationTitle(currentWidget?.title ?? widget.title)
+            .toolbarTitleDisplayMode(.inline)
+            .background(HorusBackdrop())
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+    }
+
+    private var currentWidget: MountedWidget? {
+        model.chatMenuWidgets.first { $0.id == widget.id }
+    }
+}
+
+struct FrontendPickerView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horusPalette) private var palette
+    let picker: FrontendPickerPrompt
+
+    var body: some View {
+        HorusCard {
+            VStack(alignment: .leading, spacing: HorusSpace.m) {
+                HStack {
+                    Text(picker.title)
+                        .font(HorusStyle.titleFont)
+                    Spacer(minLength: HorusSpace.s)
+                    Button { model.pendingPicker = nil } label: {
+                        HorusIcon(.x, size: HorusStyle.glyphInline, foreground: palette.muted)
+                            .frame(
+                                width: HorusStyle.iconButtonSize,
+                                height: HorusStyle.iconButtonSize
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.horusPlain)
+                    .accessibilityLabel("Dismiss \(picker.title)")
+                    .help("Dismiss")
+                }
+                // A full agent list must scroll instead of growing the card off screen.
+                ScrollView {
+                    VStack(alignment: .leading, spacing: HorusSpace.m) {
+                        ForEach(picker.options) { option in
+                            Button { model.submitPickerOption(option) } label: {
+                                FrontendPickerOptionLabel(option: option)
+                            }
+                            .buttonStyle(.horusPlain)
+                            .accessibilityLabel(option.label)
+                            .accessibilityValue(option.showsDetail ? option.detail : option.description)
+                            .accessibilityHint(
+                                option.showsDetail ? option.description : "Activates this option"
+                            )
+                        }
+                    }
+                }
+                .frame(maxHeight: HorusStyle.rowTouch * 8)
+                .scrollBounceBehavior(.basedOnSize)
+            }
+        }
+    }
+}
+
+func copyToPasteboard(_ text: String) {
+    UIPasteboard.general.string = text
+}
+
+struct DiffLineTotals: Equatable, Sendable {
+    var added = 0
+    var removed = 0
+}
+
+func diffTotals(_ text: String) -> DiffLineTotals {
+    text.split(separator: "\n", omittingEmptySubsequences: false)
+        .reduce(into: DiffLineTotals()) { result, line in
+            if line.hasPrefix("+") && !line.hasPrefix("+++") { result.added += 1 }
+            if line.hasPrefix("-") && !line.hasPrefix("---") { result.removed += 1 }
+        }
+}
+
+func formatDuration(_ interval: TimeInterval) -> String {
+    let seconds = max(0, Int(interval))
+    return Duration.seconds(seconds).formatted(.time(pattern: .minuteSecond(padMinuteToLength: 1)))
+}
+
+private func diffTitle(_ diff: String) -> String {
+    for line in diff.split(separator: "\n", omittingEmptySubsequences: false) {
+        if line.hasPrefix("+++ b/") { return String(line.dropFirst(6)) }
+        if line.hasPrefix("+++ ") { return String(line.dropFirst(4)) }
+    }
+    return "Code changes"
+}
+
+func diffSummary(_ text: String) -> String {
+    let totals = diffTotals(text)
+    return "\(diffTitle(text))  ·  +\(totals.added) −\(totals.removed)"
+}
