@@ -214,28 +214,27 @@ pub(super) async fn request_running_pairing_code(
     )))
 }
 
-pub(super) async fn hosted_pair(
+pub(super) async fn pairing_code(
     state_dir: PathBuf,
     load_local_client: fn(&Endpoint) -> Result<Option<String>>,
 ) -> Result<()> {
     let (_, config) = ConfigStore::open(state_dir)?;
-    let endpoint = hosted_loopback_endpoint(&config)?;
-    let token = load_local_client(&endpoint)?.ok_or_else(|| {
-        Error::Config("hosted gateway local control credential is unavailable".into())
-    })?;
+    let endpoint = direct_loopback_endpoint(&config)?;
+    let token = load_local_client(&endpoint)?
+        .ok_or_else(|| Error::Config("gateway local control credential is unavailable".into()))?;
     let grant = request_running_pairing_code(&endpoint, &token).await?;
-    println!("{}", hosted_pair_json(&grant)?);
+    println!("{}", pairing_code_json(&grant)?);
     Ok(())
 }
 
 #[derive(Serialize)]
-struct HostedPairOutput<'a> {
+struct PairingCodeOutput<'a> {
     code: &'a str,
     expires_at: i64,
 }
 
-pub(super) fn hosted_pair_json(grant: &PairingGrant) -> Result<String> {
-    Ok(serde_json::to_string(&HostedPairOutput {
+pub(super) fn pairing_code_json(grant: &PairingGrant) -> Result<String> {
+    Ok(serde_json::to_string(&PairingCodeOutput {
         code: &grant.code,
         expires_at: grant.expires_at,
     })?)

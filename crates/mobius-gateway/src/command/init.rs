@@ -32,28 +32,28 @@ pub(super) fn initialize_auth(store: &ConfigStore) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn initialize_hosted(
+pub(super) fn initialize_bootstrap(
     state_dir: PathBuf,
     save_local_client: fn(&Endpoint, String) -> Result<()>,
 ) -> Result<()> {
     let (store, config) = ConfigStore::initialize(state_dir, DEFAULT_LISTEN, None)?;
     let initialized = AuthStore::initialize(store.auth_path()).and_then(|(auth, _)| {
-        let endpoint = hosted_loopback_endpoint(&config)?;
+        let endpoint = direct_loopback_endpoint(&config)?;
         let issued = auth.provision_local_client()?;
         save_local_client(&endpoint, issued.token)
     });
     if let Err(error) = initialized {
         return cleanup_failed_initialization(&store, error);
     }
-    println!("initialized hosted möbius gateway");
+    println!("initialized möbius gateway bootstrap");
     print_listener(&config, None);
     Ok(())
 }
 
-pub(super) fn hosted_loopback_endpoint(config: &GatewayConfig) -> Result<Endpoint> {
+pub(super) fn direct_loopback_endpoint(config: &GatewayConfig) -> Result<Endpoint> {
     if !config.listen.ip().is_loopback() || config.tls.is_some() || config.cloudflare.is_some() {
         return Err(Error::Config(
-            "hosted commands require a direct plaintext loopback gateway".into(),
+            "bootstrap commands require a direct plaintext loopback gateway".into(),
         ));
     }
     loopback_endpoint(config)

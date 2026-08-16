@@ -3,10 +3,10 @@ use super::*;
 #[derive(Debug)]
 pub(super) enum Command {
     Init(InitOptions),
-    HostedInit {
+    Bootstrap {
         state_dir: PathBuf,
     },
-    HostedPair {
+    PairingCode {
         state_dir: PathBuf,
     },
     Connect(ConnectOptions),
@@ -61,10 +61,10 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<Command> {
     };
     if command == "init" {
         parse_init(arguments.collect()).map(Command::Init)
-    } else if command == "hosted-init" {
-        parse_state_dir(arguments.collect()).map(|state_dir| Command::HostedInit { state_dir })
-    } else if command == "hosted-pair" {
-        parse_hosted_pair(arguments.collect()).map(|state_dir| Command::HostedPair { state_dir })
+    } else if command == "bootstrap" {
+        parse_state_dir(arguments.collect()).map(|state_dir| Command::Bootstrap { state_dir })
+    } else if command == "pairing-code" {
+        parse_pairing_code(arguments.collect()).map(|state_dir| Command::PairingCode { state_dir })
     } else if command == "connect" {
         parse_connect(arguments.collect()).map(Command::Connect)
     } else if command == "serve" {
@@ -78,7 +78,7 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<Command> {
     }
 }
 
-pub(super) fn parse_hosted_pair(arguments: Vec<OsString>) -> Result<PathBuf> {
+pub(super) fn parse_pairing_code(arguments: Vec<OsString>) -> Result<PathBuf> {
     match arguments.as_slice() {
         [json] if json == "--json" => state_dir(),
         [state_dir, path, json] if state_dir == "--state-dir" && json == "--json" => {

@@ -1,14 +1,16 @@
 use super::*;
 
-static HOSTED_TEST_CLIENT: std::sync::Mutex<Option<(Endpoint, String)>> =
+static BOOTSTRAP_TEST_CLIENT: std::sync::Mutex<Option<(Endpoint, String)>> =
     std::sync::Mutex::new(None);
 
-fn save_hosted_test_client(endpoint: &Endpoint, token: String) -> Result<()> {
-    *HOSTED_TEST_CLIENT.lock().expect("hosted test client lock") = Some((endpoint.clone(), token));
+fn save_bootstrap_test_client(endpoint: &Endpoint, token: String) -> Result<()> {
+    *BOOTSTRAP_TEST_CLIENT
+        .lock()
+        .expect("bootstrap test client lock") = Some((endpoint.clone(), token));
     Ok(())
 }
 
-fn reject_hosted_test_client(_endpoint: &Endpoint, _token: String) -> Result<()> {
+fn reject_bootstrap_test_client(_endpoint: &Endpoint, _token: String) -> Result<()> {
     Err(Error::Config("test token save failed".into()))
 }
 
@@ -102,21 +104,24 @@ fn default_initialization_enables_quick_cloudflare_and_loopback() {
 }
 
 #[test]
-fn hosted_initialization_is_direct_and_saves_an_authenticated_control_client() {
+fn bootstrap_is_direct_and_saves_an_authenticated_control_client() {
     let directory = tempfile::tempdir().expect("gateway state parent");
     let state = directory.path().join("gateway");
-    *HOSTED_TEST_CLIENT.lock().expect("hosted test client lock") = None;
+    *BOOTSTRAP_TEST_CLIENT
+        .lock()
+        .expect("bootstrap test client lock") = None;
 
-    initialize_hosted(state.clone(), save_hosted_test_client).expect("initialize hosted gateway");
+    initialize_bootstrap(state.clone(), save_bootstrap_test_client)
+        .expect("initialize gateway bootstrap");
 
-    let (store, config) = ConfigStore::open(state).expect("open hosted config");
+    let (store, config) = ConfigStore::open(state).expect("open bootstrap config");
     assert!(config.listen.ip().is_loopback());
     assert!(config.tls.is_none() && config.cloudflare.is_none());
-    let (endpoint, token) = HOSTED_TEST_CLIENT
+    let (endpoint, token) = BOOTSTRAP_TEST_CLIENT
         .lock()
-        .expect("hosted test client lock")
+        .expect("bootstrap test client lock")
         .take()
-        .expect("saved hosted client");
+        .expect("saved bootstrap client");
     assert_eq!(endpoint.to_string(), "tcp://127.0.0.1:8741");
     assert!(
         AuthStore::open(store.auth_path())
@@ -127,24 +132,24 @@ fn hosted_initialization_is_direct_and_saves_an_authenticated_control_client() {
 }
 
 #[test]
-fn hosted_initialization_cleans_state_when_the_control_token_cannot_be_saved() {
+fn bootstrap_cleans_state_when_the_control_token_cannot_be_saved() {
     let directory = tempfile::tempdir().expect("gateway state parent");
     let state = directory.path().join("gateway");
     let sibling = directory.path().join("keep");
     std::fs::write(&sibling, "keep").expect("sibling state");
 
-    initialize_hosted(state.clone(), reject_hosted_test_client)
+    initialize_bootstrap(state.clone(), reject_bootstrap_test_client)
         .expect_err("token save must fail initialization");
 
     assert_eq!((state.exists(), sibling.exists()), (false, true));
 }
 
 #[test]
-fn hosted_commands_reject_tunnel_configuration() {
+fn bootstrap_commands_reject_tunnel_configuration() {
     let config = GatewayConfig::new_cloudflare(DEFAULT_LISTEN, CloudflareConfig::Quick)
         .expect("Cloudflare config");
 
-    let error = hosted_loopback_endpoint(&config).expect_err("tunnel config must fail");
+    let error = direct_loopback_endpoint(&config).expect_err("tunnel config must fail");
 
     assert!(error.to_string().contains("direct plaintext loopback"));
 }
@@ -255,42 +260,42 @@ fn parse_connect_accepts_a_public_endpoint_and_state_directory() {
 }
 
 #[test]
-fn parse_hosted_commands_accept_only_their_machine_interface() {
+fn parse_bootstrap_commands_accept_only_their_machine_interface() {
     let init = parse(vec![
-        "hosted-init".into(),
+        "bootstrap".into(),
         "--state-dir".into(),
         "/tmp/mobius".into(),
     ])
-    .expect("parse hosted init");
+    .expect("parse bootstrap");
     assert!(matches!(
         init,
-        Command::HostedInit { state_dir } if state_dir == std::path::Path::new("/tmp/mobius")
+        Command::Bootstrap { state_dir } if state_dir == std::path::Path::new("/tmp/mobius")
     ));
 
     let pair = parse(vec![
-        "hosted-pair".into(),
+        "pairing-code".into(),
         "--state-dir".into(),
         "/tmp/mobius".into(),
         "--json".into(),
     ])
-    .expect("parse hosted pair");
+    .expect("parse pairing code");
     assert!(matches!(
         pair,
-        Command::HostedPair { state_dir } if state_dir == std::path::Path::new("/tmp/mobius")
+        Command::PairingCode { state_dir } if state_dir == std::path::Path::new("/tmp/mobius")
     ));
 
-    assert!(parse(vec!["hosted-pair".into()]).is_err());
+    assert!(parse(vec!["pairing-code".into()]).is_err());
 }
 
 #[test]
-fn hosted_pair_json_contains_the_code_and_expiry_only() {
+fn pairing_code_json_contains_the_code_and_expiry_only() {
     let grant = PairingGrant {
         code: "one-time-code".into(),
         expires_at: 1_234_567_890,
     };
 
     assert_eq!(
-        hosted_pair_json(&grant).expect("hosted pair JSON"),
+        pairing_code_json(&grant).expect("pairing code JSON"),
         r#"{"code":"one-time-code","expires_at":1234567890}"#
     );
 }
