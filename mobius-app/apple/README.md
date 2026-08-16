@@ -1,6 +1,6 @@
 # möbius for iPhone and iPad
 
-One SwiftUI client target builds for iOS and iPadOS 26+. Both device families use the same `AppModel`, `GatewayClient`, pairing flow, and versioned möbius gateway protocol. The next TestFlight release is version 0.9.0 (build 119).
+One SwiftUI client target builds for iOS and iPadOS 26+. Both device families use the same `AppModel`, `GatewayClient`, pairing flow, and versioned möbius gateway protocol. The next TestFlight release is version 0.9.0.
 
 Open `MobiusApp.xcodeproj` and run the shared `MobiusApp` scheme on an iPhone or iPad destination. Command-line builds use:
 
@@ -26,14 +26,15 @@ code works through the advertised local `tcp://` endpoint. Plaintext remote
 endpoints are rejected; a direct TLS listener remains available as an advanced
 option in the gateway guide.
 
-## möbius Cloud beta placeholder
+## möbius Cloud beta
 
 The cloud offer requests `app.mobius.client.cloud.monthly` from StoreKit and
 renders its storefront-localized `displayPrice`. Configure that product in App
 Store Connect as a one-month auto-renewable subscription with a seven-day free
-introductory offer before distributing through TestFlight. The current Apple
-signup button is intentionally a UI boundary: it does not authenticate,
-purchase, or grant an entitlement yet.
+introductory offer before distributing through TestFlight. Sign in with Apple
+creates the Cloud session; a verified StoreKit purchase or restore activates the
+entitlement, waits for the hosted gateway, and pairs the app with its one-time
+grant.
 
 The one-time code is only the first pairing credential. A successful pairing
 returns a per-pairing bearer token, which this app stores in device-only Keychain
