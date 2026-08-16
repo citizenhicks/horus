@@ -16,6 +16,37 @@ struct UnifiedDiffDocument: Equatable, Sendable {
 
     var added: Int { files.reduce(0) { $0 + $1.added } }
     var removed: Int { files.reduce(0) { $0 + $1.removed } }
+
+    var fileChanges: [UnifiedDiffFileChange] {
+        var changes: [UnifiedDiffFileChange] = []
+        var indices: [String: Int] = [:]
+        for file in files {
+            if let index = indices[file.path] {
+                let change = changes[index]
+                changes[index] = UnifiedDiffFileChange(
+                    path: file.path,
+                    added: change.added + file.added,
+                    removed: change.removed + file.removed
+                )
+            } else {
+                indices[file.path] = changes.count
+                changes.append(UnifiedDiffFileChange(
+                    path: file.path,
+                    added: file.added,
+                    removed: file.removed
+                ))
+            }
+        }
+        return changes
+    }
+}
+
+struct UnifiedDiffFileChange: Identifiable, Equatable, Sendable {
+    let path: String
+    let added: Int
+    let removed: Int
+
+    var id: String { path }
 }
 
 struct UnifiedDiffFile: Identifiable, Equatable, Sendable {

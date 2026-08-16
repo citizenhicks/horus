@@ -30,21 +30,36 @@ extension AppModelTests {
         func patch(_ path: String) -> String {
             "--- \(path)\n+++ \(path)\n@@ -1 +1 @@\n-old\n+new"
         }
+        let priorFinal = entry("prior-final", "Done", turnID: "turn-1", terminal: true)
+        let firstLatestFinal = entry(
+            "latest-final-1",
+            "Almost done",
+            turnID: "turn-2",
+            terminal: true
+        )
+        let latestFinal = entry("latest-final-2", "Done", turnID: "turn-2", terminal: true)
+        let activePatch = entry("active-patch", patch("Active.swift"), turnID: "turn-3")
         model.transcript = [
             entry("prior-patch", patch("prior.swift"), turnID: "turn-1"),
-            entry("prior-final", "Done", turnID: "turn-1", terminal: true),
+            priorFinal,
             entry("latest-patch-1", patch("First.swift"), turnID: "turn-2"),
             entry("latest-artifact", patch("Artifact.swift"), turnID: "turn-2", role: .artifact),
             entry("latest-patch-2", patch("Second.swift"), turnID: "turn-2"),
-            entry("latest-final", "Done", turnID: "turn-2", terminal: true),
-            entry("active-patch", patch("Active.swift"), turnID: "turn-3")
+            firstLatestFinal,
+            latestFinal,
+            activePatch
         ]
 
         model.showFiles(.lastTurn)
         let requestCount = await recorder.requestCount()
         let document = UnifiedDiffDocument(model.lastTurnDiff)
+        let priorDocument = UnifiedDiffDocument(model.turnDiff(for: priorFinal))
 
         XCTAssertEqual(document.files.map(\.path), ["First.swift", "Second.swift"])
+        XCTAssertEqual(priorDocument.files.map(\.path), ["prior.swift"])
+        XCTAssertEqual(model.turnDiff(for: latestFinal), model.lastTurnDiff)
+        XCTAssertTrue(model.turnDiff(for: firstLatestFinal).isEmpty)
+        XCTAssertTrue(model.turnDiff(for: activePatch).isEmpty)
         XCTAssertEqual(model.modifiedFilesScope, .lastTurn)
         XCTAssertEqual(requestCount, 0)
     }

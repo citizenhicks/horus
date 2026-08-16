@@ -124,6 +124,145 @@ struct TranscriptFileCards: View {
     }
 }
 
+struct TurnDiffCard: View {
+    @Environment(\.mobiusPalette) private var palette
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var document: UnifiedDiffDocument?
+    @State private var isExpanded = false
+    @State private var showsDetails = false
+    let source: String
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let document, !document.files.isEmpty {
+                card(document)
+            }
+        }
+        .task(id: source) {
+            document = nil
+            let parseTask = Task.detached(priority: .userInitiated) {
+                UnifiedDiffDocument(source)
+            }
+            let parsed = await withTaskCancellationHandler {
+                await parseTask.value
+            } onCancel: {
+                parseTask.cancel()
+            }
+            guard !Task.isCancelled else { return }
+            document = parsed
+        }
+        .sheet(isPresented: $showsDetails) {
+            NavigationStack {
+                ZStack {
+                    MobiusBackdrop()
+                    WorkspaceDiffView(
+                        source: source,
+                        revision: 0,
+                        isLoading: false,
+                        title: "changes from this turn"
+                    )
+                }
+                .navigationTitle("Turn changes")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { showsDetails = false }
+                    }
+                }
+            }
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
+    }
+
+    private func card(_ document: UnifiedDiffDocument) -> some View {
+        let files = document.fileChanges
+        return VStack(spacing: 0) {
+            Button {
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.16)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: MobiusSpace.s) {
+                    Text("\(files.count) file\(files.count == 1 ? "" : "s") changed")
+                        .foregroundStyle(.primary)
+                    Text("+\(document.added)")
+                        .foregroundStyle(palette.signal)
+                    Text("−\(document.removed)")
+                        .foregroundStyle(palette.danger)
+                    Spacer(minLength: MobiusSpace.s)
+                    MobiusIcon(.caretRight, size: MobiusStyle.glyphInline, foreground: palette.muted)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                }
+                .font(MobiusStyle.badgeFont)
+                .padding(.horizontal, MobiusSpace.l)
+                .frame(minHeight: MobiusStyle.rowTouch)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.mobiusPlain)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(
+                "\(files.count) file\(files.count == 1 ? "" : "s") changed, "
+                    + "\(document.added) additions, "
+                    + "\(document.removed) removals"
+            )
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+            .accessibilityHint(isExpanded ? "Collapses the file list" : "Shows the file list")
+
+            if isExpanded {
+                ForEach(files.prefix(3)) { file in
+                    fileRow(file)
+                }
+                Button {
+                    showsDetails = true
+                } label: {
+                    HStack(spacing: MobiusSpace.s) {
+                        Text(detailsTitle(files.count))
+                            .foregroundStyle(palette.muted)
+                        Spacer(minLength: MobiusSpace.s)
+                        MobiusIcon(
+                            .caretRight,
+                            size: MobiusStyle.glyphInline,
+                            foreground: palette.muted
+                        )
+                    }
+                    .padding(.horizontal, MobiusSpace.l)
+                    .frame(minHeight: MobiusStyle.rowTouch)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.mobiusPlain)
+                .accessibilityHint("Opens the full diff")
+            }
+        }
+        .mobiusGlass(in: MobiusStyle.cardShape)
+    }
+
+    private func fileRow(_ file: UnifiedDiffFileChange) -> some View {
+        HStack(spacing: MobiusSpace.s) {
+            Text(file.path)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: MobiusSpace.s)
+            Text("+\(file.added)").foregroundStyle(palette.signal)
+            Text("−\(file.removed)").foregroundStyle(palette.danger)
+        }
+        .font(MobiusStyle.metadataFont)
+        .padding(.horizontal, MobiusSpace.l)
+        .frame(minHeight: MobiusStyle.rowRegular)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "File \(file.path), \(file.added) additions, \(file.removed) removals"
+        )
+    }
+
+    private func detailsTitle(_ fileCount: Int) -> String {
+        let remaining = fileCount - 3
+        return remaining > 0
+            ? "View \(remaining) more file\(remaining == 1 ? "" : "s")"
+            : "View all changes"
+    }
+}
+
 struct SessionFileCard: View {
     @Environment(AppModel.self) private var model
     let file: SessionFileReference

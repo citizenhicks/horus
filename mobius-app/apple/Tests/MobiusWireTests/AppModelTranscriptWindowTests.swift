@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 import XCTest
 
 @MainActor
@@ -126,6 +127,37 @@ extension AppModelTests {
         XCTAssertEqual(model.displayedTranscript.first?.presentationID, "entry-0")
         XCTAssertEqual(after.rows.last?.id, before.rows.last?.id)
         XCTAssertEqual(after.structuralRevision, before.structuralRevision)
+    }
+
+    func testWarmTranscriptWindowPublishesStructuralGrowth() async throws {
+        let model = try model()
+        model.transcript = [TranscriptEntry(
+            id: "first",
+            text: "First",
+            kind: .assistant,
+            format: "plain_text",
+            pending: false,
+            turnID: "turn-1"
+        )]
+        XCTAssertEqual(model.displayedTranscript.count, 1)
+
+        let changed = expectation(description: "Observed the appended transcript row")
+        withObservationTracking {
+            _ = model.displayedTranscript.count
+        } onChange: {
+            changed.fulfill()
+        }
+        model.transcript.append(TranscriptEntry(
+            id: "second",
+            text: "Second",
+            kind: .commentary,
+            format: "plain_text",
+            pending: false,
+            turnID: "turn-1"
+        ))
+
+        await fulfillment(of: [changed], timeout: 1)
+        XCTAssertEqual(model.displayedTranscript.count, 2)
     }
 
     func testStructuralTranscriptGrowthInvalidatesThePinnedWindow() throws {

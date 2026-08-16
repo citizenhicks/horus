@@ -60,8 +60,8 @@ final class AppModel {
         transcriptWindow.entries
     }
     var transcriptWindow: TranscriptWindowCache {
-        if let transcriptWindowCache { return transcriptWindowCache }
         let source = replayPresentedTranscript ?? transcript
+        if let transcriptWindowCache { return transcriptWindowCache }
         let maximumTurns = switch transcriptWindowAnchor {
         case .tail: transcriptTurnsPerPage
         case .visibleTurns(let count): count
@@ -166,9 +166,22 @@ final class AppModel {
     var filesInspectorTab: FilesInspectorTab = .modified
     var modifiedFilesScope: ModifiedFilesScope = .unstaged
     var lastTurnDiff: String {
-        guard let turnID = transcript.last(where: {
+        guard let final = transcript.last(where: {
             $0.turnTerminal && $0.kind == .assistant
         })?.turnID else { return "" }
+        return turnDiff(for: final)
+    }
+    func turnDiff(for entry: TranscriptEntry) -> String {
+        guard entry.kind == .assistant,
+              entry.turnTerminal,
+              let turnID = entry.turnID,
+              transcript.last(where: {
+                  $0.turnID == turnID && $0.turnTerminal && $0.kind == .assistant
+              })?.id == entry.id
+        else { return "" }
+        return turnDiff(for: turnID)
+    }
+    private func turnDiff(for turnID: String) -> String {
         return transcript.lazy
             .filter {
                 $0.turnID == turnID

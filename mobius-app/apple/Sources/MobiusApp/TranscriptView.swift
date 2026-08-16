@@ -45,6 +45,7 @@ struct TranscriptRowsView: View {
     var activeStepID: TranscriptPresentationID?
     var collapsesLongMessages = false
     var rowSpacing: CGFloat = 12
+    var turnDiff: (TranscriptEntry) -> String = { _ in "" }
     var onExpandActivityGroup: () -> Void = {}
 
     var body: some View {
@@ -92,6 +93,7 @@ struct TranscriptRowsView: View {
                     entry: entry,
                     isUser: row.kind == .user,
                     speaker: speaker,
+                    turnDiff: turnDiff(entry),
                     collapsesLongMessages: collapsesLongMessages
                 )
             }
@@ -189,6 +191,7 @@ struct TranscriptView: View {
                     projection: projection,
                     activeStepID: model.activeTranscriptStepID,
                     rowSpacing: rowSpacing,
+                    turnDiff: { model.turnDiff(for: $0) },
                     onExpandActivityGroup: { scrollMode = .freeScrolling }
                 )
                 TranscriptTailView(slot: projection.waiting, topSpacing: rowSpacing)
@@ -353,6 +356,7 @@ private struct TranscriptRow: View {
     /// projection sends only what the reader wrote and what the agent said back.
     let isUser: Bool
     let speaker: MessageSpeaker
+    let turnDiff: String
     var collapsesLongMessages = false
 
     @ViewBuilder
@@ -369,6 +373,10 @@ private struct TranscriptRow: View {
     private var rowContent: some View {
         VStack(alignment: isUser ? .trailing : .leading, spacing: 0) {
             content
+            if !turnDiff.isEmpty {
+                TurnDiffCard(source: turnDiff)
+                    .padding(.top, MobiusSpace.m)
+            }
             // The reader's own message carries its actions in the context menu; the agent's
             // final answer carries them under the text, where they are always available.
             if entry.kind == .assistant { controls }

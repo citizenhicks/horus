@@ -14,7 +14,6 @@ struct FilesView: View {
                 FilesInspectorTabPicker()
                     .padding(.horizontal, MobiusSpace.m)
                     .padding(.bottom, MobiusSpace.m)
-                Divider()
                 FilesContent()
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }

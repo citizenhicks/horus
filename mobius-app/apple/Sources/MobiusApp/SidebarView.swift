@@ -65,6 +65,7 @@ struct SidebarDrawer<Sidebar: View, Detail: View>: View {
                 edgeSwipeTarget
             }
         }
+        .simultaneousGesture(swipe, isEnabled: isOpen)
         .sensoryFeedback(.impact(weight: .light), trigger: drawerFeedback)
     }
 
@@ -87,7 +88,6 @@ struct SidebarDrawer<Sidebar: View, Detail: View>: View {
             .opacity(SidebarDrawerMetrics.scrimOpacity * progress)
             .ignoresSafeArea()
             .allowsHitTesting(progress > 0)
-            .gesture(swipe)
             .onTapGesture { setOpen(false) }
             .accessibilityHidden(progress == 0)
             .accessibilityLabel("Close sidebar")
