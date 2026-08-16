@@ -453,6 +453,7 @@ extension AppModel {
         refreshGitDiff()
         if showsInspector, filesInspectorTab == .modified {
             switch modifiedFilesScope {
+            case .lastTurn: break
             case .unstaged: break
             case .staged: refreshStagedGitDiff()
             case .committed: refreshCommittedGitDiff()
@@ -503,7 +504,7 @@ extension AppModel {
         refreshFiles(for: tab)
     }
 
-    func selectModifiedFilesScope(_ scope: GitDiffScope) {
+    func selectModifiedFilesScope(_ scope: ModifiedFilesScope) {
         guard modifiedFilesScope != scope else { return }
         modifiedFilesScope = scope
         refreshModifiedFiles(scope)

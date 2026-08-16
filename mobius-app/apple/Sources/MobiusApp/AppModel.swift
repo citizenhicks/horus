@@ -167,7 +167,26 @@ final class AppModel {
     var isLoadingPreviewPage = false
     var showsInspector = false
     var filesInspectorTab: FilesInspectorTab = .modified
-    var modifiedFilesScope: GitDiffScope = .unstaged
+    var modifiedFilesScope: ModifiedFilesScope = .unstaged
+    var lastTurnDiff: String {
+        guard let turnID = transcript.last(where: {
+            $0.turnTerminal && $0.kind == .assistant
+        })?.turnID else { return "" }
+        return transcript.lazy
+            .filter {
+                $0.turnID == turnID
+                    && $0.role == .tool
+                    && $0.format == "unified_diff"
+                    && !$0.pending
+            }
+            .map(\.text)
+            .joined(separator: "\n")
+    }
+    var lastTurnDiffRevision: Int {
+        transcript.lastIndex(where: {
+            $0.turnTerminal && $0.kind == .assistant
+        }) ?? -1
+    }
     private(set) var workspaceFilesRevision = 0
     var workspaceFiles: [WorkspaceFileRecord] = [] {
         didSet { workspaceFilesRevision &+= 1 }

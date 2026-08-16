@@ -231,6 +231,15 @@ enum FilesInspectorTab: String, CaseIterable, Identifiable {
     var id: Self { self }
 }
 
+enum ModifiedFilesScope: CaseIterable, Identifiable {
+    case lastTurn
+    case unstaged
+    case staged
+    case committed
+
+    var id: Self { self }
+}
+
 extension SessionRecord {
     static let untitledDisplayTitle = "new conversation"
 

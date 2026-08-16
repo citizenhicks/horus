@@ -74,6 +74,14 @@ private struct ModifiedFilesDiff: View {
     @ViewBuilder
     var body: some View {
         switch model.modifiedFilesScope {
+        case .lastTurn:
+            WorkspaceDiffView(
+                source: model.lastTurnDiff,
+                revision: model.lastTurnDiffRevision,
+                isLoading: false,
+                title: "changes from the last turn"
+            )
+            .id(ModifiedFilesScope.lastTurn)
         case .unstaged:
             WorkspaceDiffView(
                 source: model.gitDiff,
@@ -81,7 +89,7 @@ private struct ModifiedFilesDiff: View {
                 isLoading: model.isLoadingGitDiff,
                 title: "unstaged changes"
             )
-            .id(GitDiffScope.unstaged)
+            .id(ModifiedFilesScope.unstaged)
         case .staged:
             WorkspaceDiffView(
                 source: model.stagedGitDiff,
@@ -89,7 +97,7 @@ private struct ModifiedFilesDiff: View {
                 isLoading: model.isLoadingStagedGitDiff,
                 title: "staged changes"
             )
-            .id(GitDiffScope.staged)
+            .id(ModifiedFilesScope.staged)
         case .committed:
             WorkspaceDiffView(
                 source: model.committedGitDiff,
@@ -97,7 +105,7 @@ private struct ModifiedFilesDiff: View {
                 isLoading: model.isLoadingCommittedGitDiff,
                 title: "last commit"
             )
-            .id(GitDiffScope.committed)
+            .id(ModifiedFilesScope.committed)
         }
     }
 }
@@ -107,13 +115,14 @@ private struct ModifiedFilesScopePicker: View {
 
     var body: some View {
         Menu {
-            ForEach(GitDiffScope.allCases) { scope in
+            ForEach(ModifiedFilesScope.allCases) { scope in
+                let isSelected = scope == model.modifiedFilesScope
                 Button {
                     model.selectModifiedFilesScope(scope)
                 } label: {
                     MobiusLabel(
                         title: scope.title,
-                        glyph: scope == model.modifiedFilesScope ? .check : .gitBranch
+                        glyph: isSelected ? .check : .gitBranch
                     )
                 }
             }
@@ -165,9 +174,10 @@ private extension FilesInspectorTab {
     }
 }
 
-private extension GitDiffScope {
+private extension ModifiedFilesScope {
     var title: String {
         switch self {
+        case .lastTurn: "Last turn"
         case .unstaged: "Unstaged"
         case .staged: "Staged"
         case .committed: "Last Commit"

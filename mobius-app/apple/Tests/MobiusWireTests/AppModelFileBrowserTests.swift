@@ -4,6 +4,85 @@ import XCTest
 
 @MainActor
 extension AppModelTests {
+    func testLastTurnDiffUsesOnlyCompletedTurnToolPatches() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.transcript = [
+            TranscriptEntry(
+                id: "prior-patch",
+                text: "prior diff",
+                kind: .event,
+                role: .tool,
+                format: "unified_diff",
+                pending: false,
+                turnID: "turn-1"
+            ),
+            TranscriptEntry(
+                id: "prior-final",
+                text: "Done",
+                kind: .assistant,
+                format: "plain_text",
+                pending: false,
+                turnID: "turn-1",
+                turnTerminal: true
+            ),
+            TranscriptEntry(
+                id: "latest-patch-1",
+                text: "first diff",
+                kind: .event,
+                role: .tool,
+                format: "unified_diff",
+                pending: false,
+                turnID: "turn-2"
+            ),
+            TranscriptEntry(
+                id: "latest-artifact",
+                text: "artifact diff",
+                kind: .event,
+                role: .artifact,
+                format: "unified_diff",
+                pending: false,
+                turnID: "turn-2"
+            ),
+            TranscriptEntry(
+                id: "latest-patch-2",
+                text: "second diff",
+                kind: .event,
+                role: .tool,
+                format: "unified_diff",
+                pending: false,
+                turnID: "turn-2"
+            ),
+            TranscriptEntry(
+                id: "latest-final",
+                text: "Done",
+                kind: .assistant,
+                format: "plain_text",
+                pending: false,
+                turnID: "turn-2",
+                turnTerminal: true
+            ),
+            TranscriptEntry(
+                id: "active-patch",
+                text: "active diff",
+                kind: .event,
+                role: .tool,
+                format: "unified_diff",
+                pending: false,
+                turnID: "turn-3"
+            )
+        ]
+
+        model.showFiles(.lastTurn)
+        let requestCount = await recorder.requestCount()
+
+        XCTAssertEqual(model.lastTurnDiff, "first diff\nsecond diff")
+        XCTAssertEqual(model.modifiedFilesScope, .lastTurn)
+        XCTAssertEqual(requestCount, 0)
+    }
+
     func testFilesInspectorRequestsTheSelectedCollection() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
