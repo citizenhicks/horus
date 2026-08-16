@@ -74,7 +74,7 @@ möbius requires Rust 1.89 or newer.
 
 ```toml
 [dependencies]
-mobius = "0.8"
+mobius = "0.9"
 ```
 
 The caller owns composition:
