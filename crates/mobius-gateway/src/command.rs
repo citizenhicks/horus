@@ -4,6 +4,7 @@ mod args;
 mod connection;
 mod init;
 mod lifecycle;
+mod provider;
 
 use std::ffi::OsString;
 #[cfg(any(unix, test))]
@@ -65,6 +66,7 @@ pub use self::init::{
 };
 pub use self::lifecycle::ensure_background_gateway;
 use self::lifecycle::*;
+use self::provider::*;
 
 pub const USAGE: &str = "usage: mobius-gateway [--state-dir PATH]\n       \
                      mobius-gateway provider [--state-dir PATH]\n       \
@@ -73,6 +75,8 @@ pub const USAGE: &str = "usage: mobius-gateway [--state-dir PATH]\n       \
                      [--cloudflare-hostname HOST --cloudflare-token-file PATH]\n       \
                      mobius-gateway bootstrap [--state-dir PATH]\n       \
                      mobius-gateway pairing-code [--state-dir PATH] --json\n       \
+                     mobius-gateway register-provider [--state-dir PATH] --provider ID \
+                     --model ID [--base-url URL] [--credentialless]\n       \
                      mobius-gateway connect [--state-dir PATH] [--endpoint ENDPOINT]\n       \
                      mobius-gateway serve [--state-dir PATH] [--background]\n       \
                      mobius-gateway exit [--state-dir PATH]";
@@ -116,6 +120,9 @@ pub async fn run(
         Command::Init(options) => initialize(options),
         Command::Bootstrap { state_dir } => initialize_bootstrap(state_dir, save_local_client),
         Command::PairingCode { state_dir } => pairing_code(state_dir, load_local_client).await,
+        Command::RegisterProvider(options) => {
+            register_provider_command(options, load_local_client).await
+        }
         Command::Connect(options) => connect(options, load_local_client).await,
         Command::Serve {
             state_dir,

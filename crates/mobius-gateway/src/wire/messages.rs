@@ -176,6 +176,7 @@ pub enum ClientMessage {
         config: ProviderConfig,
         model_ids: Vec<String>,
         reasoning_efforts: Vec<String>,
+        replace_existing_selections: bool,
     },
     CreatePairingCode {
         request_id: String,

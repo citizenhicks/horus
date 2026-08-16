@@ -40,8 +40,8 @@ use crate::cron::CronStore;
 use crate::middleware_manifest::{BuiltinMiddleware, MIDDLEWARE};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{
-    MiddlewareConfig, ProviderAuthKind, ProviderConfig, ProviderModel, ProviderStatus,
-    ReasoningChoice, validate_session_id,
+    MiddlewareConfig, ProviderAuthKind, ProviderConfig, ProviderEndpointAuth, ProviderModel,
+    ProviderStatus, ReasoningChoice, validate_session_id,
 };
 use crate::{Error, Result};
 
@@ -232,20 +232,25 @@ pub(crate) fn provider_statuses(
     providers()
         .iter()
         .map(|definition| {
-            let configured = match definition.auth() {
-                ProviderAuth::ApiKey(default_env) => {
-                    credentials.configured(definition.id())?
-                        || (!definition.configurable_base_url()
-                            && std::env::var(default_env)
+            let configured_provider = gateway.configured_providers.get(definition.id()).cloned();
+            let configured = if configured_provider.as_ref().is_some_and(|configured| {
+                configured.selection.endpoint_auth == ProviderEndpointAuth::Credentialless
+            }) {
+                true
+            } else {
+                match definition.auth() {
+                    ProviderAuth::ApiKey(default_env) => {
+                        credentials.configured(definition.id())?
+                            || (configured_provider.as_ref().is_none_or(|configured| {
+                                definition
+                                    .uses_default_endpoint(configured.selection.base_url.as_deref())
+                            }) && std::env::var(default_env)
                                 .is_ok_and(|value| !value.trim().is_empty()))
+                    }
+                    ProviderAuth::Browser(auth) => auth.configured(&store.provider_auth_path())?,
                 }
-                ProviderAuth::Browser(auth) => auth.configured(&store.provider_auth_path())?,
             };
-            Ok(provider_status(
-                definition,
-                configured,
-                gateway.configured_providers.get(definition.id()).cloned(),
-            ))
+            Ok(provider_status(definition, configured, configured_provider))
         })
         .collect()
 }
@@ -550,13 +555,17 @@ fn instantiate_routes(
                     .or_else(|| definition.default_base_url().map(str::to_string))
             })
             .flatten();
-        let credential = match provider_credentials.get(definition.id()) {
-            Some(credential) => credential.clone(),
-            None => {
-                let credential =
-                    resolve_credential(definition, base_url.as_deref(), store, credentials)?;
-                provider_credentials.insert(definition.id().into(), credential.clone());
-                credential
+        let credential = if route.provider.endpoint_auth == ProviderEndpointAuth::Credentialless {
+            ProviderCredential::Credentialless
+        } else {
+            match provider_credentials.get(definition.id()) {
+                Some(credential) => credential.clone(),
+                None => {
+                    let credential =
+                        resolve_credential(definition, base_url.as_deref(), store, credentials)?;
+                    provider_credentials.insert(definition.id().into(), credential.clone());
+                    credential
+                }
             }
         };
         routes.push(build_route(route, definition, credential, base_url, &http)?);
@@ -575,7 +584,7 @@ fn resolve_credential(
             if let Some(value) = credentials.get(definition.id(), base_url)? {
                 return Ok(ProviderCredential::ApiKey(value));
             }
-            if definition.configurable_base_url() {
+            if !definition.uses_default_endpoint(base_url) {
                 return Err(Error::Config(format!(
                     "set a credential for `{}`",
                     definition.id()
@@ -601,6 +610,10 @@ pub(crate) fn credential_is_configured(
     credentials: &CredentialStore,
 ) -> Result<bool> {
     let definition = provider(&selection.provider)?;
+    if selection.endpoint_auth == ProviderEndpointAuth::Credentialless {
+        definition.validate_credentialless_endpoint(selection.base_url.as_deref())?;
+        return Ok(true);
+    }
     let base_url = if definition.configurable_base_url() {
         selection
             .base_url
@@ -614,7 +627,7 @@ pub(crate) fn credential_is_configured(
             if credentials.get(definition.id(), base_url)?.is_some() {
                 return Ok(true);
             }
-            if definition.configurable_base_url() {
+            if !definition.uses_default_endpoint(base_url) {
                 return Ok(false);
             }
             Ok(std::env::var(default_env).is_ok_and(|value| !value.trim().is_empty()))

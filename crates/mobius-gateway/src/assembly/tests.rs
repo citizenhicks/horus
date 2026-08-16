@@ -36,7 +36,10 @@ fn provider_status_uses_manifest_defaults() {
     let openrouter = provider_status(provider("openrouter").expect("provider"), false, None);
     assert!(openrouter.models.is_empty());
     assert!(openrouter.model_ids_configurable);
-    assert_eq!(openrouter.default_base_url, None);
+    assert_eq!(
+        openrouter.default_base_url.as_deref(),
+        Some("https://openrouter.ai/api/v1")
+    );
 }
 
 #[test]
@@ -60,6 +63,7 @@ fn configured_catalog_resolves_manifest_and_opaque_custom_routes() {
         provider: "kimi".into(),
         model: "kimi-k3".into(),
         base_url: None,
+        endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
         reasoning_effort: Some("max".into()),
         web_search: HostedWebSearch::Off,
     };
@@ -67,6 +71,7 @@ fn configured_catalog_resolves_manifest_and_opaque_custom_routes() {
         provider: "responses".into(),
         model: "vendor/model-opaque".into(),
         base_url: Some("https://example.com/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
         reasoning_effort: Some("provider-defined".into()),
         web_search: HostedWebSearch::Off,
     };
@@ -162,6 +167,7 @@ fn custom_selection_without_reasoning_uses_the_first_configured_effort() {
         provider: "responses".into(),
         model: "local-model".into(),
         base_url: Some("http://127.0.0.1:11434/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
         reasoning_effort: None,
         web_search: HostedWebSearch::Off,
     };
@@ -198,6 +204,7 @@ fn custom_responses_requires_an_endpoint_bound_stored_credential() {
         provider: "responses".into(),
         model: "custom-model".into(),
         base_url: Some("https://example.com/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
         reasoning_effort: None,
         web_search: HostedWebSearch::Off,
     };

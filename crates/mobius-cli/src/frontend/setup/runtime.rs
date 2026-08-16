@@ -194,6 +194,7 @@ pub(super) async fn register_provider(
             config,
             model_ids,
             reasoning_efforts,
+            replace_existing_selections: false,
         })
         .await
         .map_err(gateway_error)?;

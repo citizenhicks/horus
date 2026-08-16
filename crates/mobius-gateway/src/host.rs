@@ -10,7 +10,7 @@ mod session;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use chrono::Utc;
@@ -30,7 +30,7 @@ use mobius::protocol::{
     FrontendBlockUpdate, FrontendEvent, FrontendPreviewEvent, ModelStepOutcome, Op, RenderedBlock,
     ReviewDecision, SessionFileReference, Submission,
 };
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::assembly::{
@@ -96,6 +96,8 @@ struct GatewayState {
     session_files: SessionFileStore,
     // ponytail: one lock is enough for at most 32 tiny catalog writes.
     catalog_lock: Arc<Mutex<()>>,
+    session_mutations: Arc<RwLock<()>>,
+    provider_epoch: Arc<AtomicU64>,
     activities: SessionActivities,
     provider_login: Arc<StdMutex<Option<String>>>,
     sessions: HashMap<String, HostHandle>,
@@ -140,6 +142,8 @@ impl GatewayHost {
                 scratchpad,
                 session_files,
                 catalog_lock: Arc::new(Mutex::new(())),
+                session_mutations: Arc::new(RwLock::new(())),
+                provider_epoch: Arc::new(AtomicU64::new(0)),
                 activities: Arc::new(StdMutex::new(HashMap::new())),
                 provider_login: Arc::new(StdMutex::new(None)),
                 sessions: HashMap::new(),
@@ -205,6 +209,8 @@ impl GatewayHost {
             state.scratchpad.clone(),
             state.session_files.clone(),
             Arc::clone(&state.catalog_lock),
+            Arc::clone(&state.session_mutations),
+            Arc::clone(&state.provider_epoch),
             Arc::clone(&state.activities),
             self.events.clone(),
             session_id.clone(),
@@ -287,6 +293,8 @@ impl GatewayHost {
             state.scratchpad.clone(),
             state.session_files.clone(),
             Arc::clone(&state.catalog_lock),
+            Arc::clone(&state.session_mutations),
+            Arc::clone(&state.provider_epoch),
             Arc::clone(&state.activities),
             self.events.clone(),
             session_id.into(),
@@ -450,6 +458,8 @@ impl GatewayHost {
             state.scratchpad.clone(),
             state.session_files.clone(),
             Arc::clone(&state.catalog_lock),
+            Arc::clone(&state.session_mutations),
+            Arc::clone(&state.provider_epoch),
             Arc::clone(&state.activities),
             self.events.clone(),
             session_id.clone(),

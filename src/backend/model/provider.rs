@@ -184,13 +184,14 @@ pub enum ProviderAuth {
 pub enum ProviderCredential {
     ApiKey(String),
     Browser(Arc<dyn Any + Send + Sync>),
+    Credentialless,
 }
 
 impl ProviderCredential {
     pub(super) fn into_api_key(self, provider: &str) -> Result<String> {
         match self {
             Self::ApiKey(api_key) => Ok(api_key),
-            Self::Browser(_) => Err(Error::Config(format!(
+            Self::Browser(_) | Self::Credentialless => Err(Error::Config(format!(
                 "provider `{provider}` requires an API key"
             ))),
         }
@@ -200,7 +201,7 @@ impl ProviderCredential {
         match self {
             Self::Browser(credential) => Arc::downcast(credential)
                 .map_err(|_| Error::Config(format!("provider `{provider}` received wrong login"))),
-            Self::ApiKey(_) => Err(Error::Config(format!(
+            Self::ApiKey(_) | Self::Credentialless => Err(Error::Config(format!(
                 "provider `{provider}` requires browser login"
             ))),
         }
@@ -221,6 +222,7 @@ pub struct ProviderDefinition {
     web_search: &'static [HostedWebSearch],
     supports_image_input: bool,
     default_base_url: Option<&'static str>,
+    credentialless_endpoints: bool,
     builder: ProviderBuilder,
 }
 
@@ -251,6 +253,7 @@ impl ProviderDefinition {
             web_search,
             supports_image_input: false,
             default_base_url: None,
+            credentialless_endpoints: false,
             builder,
         }
     }
@@ -264,6 +267,13 @@ impl ProviderDefinition {
 
     pub(crate) const fn with_base_url(mut self, default_base_url: &'static str) -> Self {
         self.default_base_url = Some(default_base_url);
+        self
+    }
+
+    /// Allows explicitly configured non-default endpoints to omit provider credentials.
+    #[must_use]
+    pub(crate) const fn with_credentialless_endpoints(mut self) -> Self {
+        self.credentialless_endpoints = true;
         self
     }
 
@@ -324,6 +334,30 @@ impl ProviderDefinition {
         self.default_base_url
     }
 
+    /// Reports whether a resolved base URL selects the provider's default endpoint.
+    #[must_use]
+    pub fn uses_default_endpoint(&self, base_url: Option<&str>) -> bool {
+        match (self.default_base_url, base_url) {
+            (None, None) => true,
+            (Some(default), Some(base_url)) => {
+                let Ok(default) = reqwest::Url::parse(default) else {
+                    return false;
+                };
+                let Ok(base_url) = reqwest::Url::parse(base_url) else {
+                    return false;
+                };
+                same_endpoint(&default, &base_url)
+            }
+            _ => false,
+        }
+    }
+
+    /// Reports whether non-default endpoints may be configured without credentials.
+    #[must_use]
+    pub const fn supports_credentialless_endpoints(&self) -> bool {
+        self.credentialless_endpoints
+    }
+
     /// Returns a preset when the configured model is in this provider's picker.
     #[must_use]
     pub fn model(&self, id: &str) -> Option<&'static ModelPreset> {
@@ -332,6 +366,9 @@ impl ProviderDefinition {
 
     /// Builds one runtime model after validating advertised capabilities.
     pub fn build(&self, mut config: ProviderBuildConfig) -> Result<Arc<dyn Model>> {
+        if matches!(config.credential, ProviderCredential::Credentialless) {
+            self.validate_credentialless_endpoint(config.base_url.as_deref())?;
+        }
         if config.reasoning_effort.is_none() {
             config.reasoning_effort = self
                 .model(&config.model)
@@ -403,6 +440,47 @@ impl ProviderDefinition {
             (None, None) => Ok(()),
         }
     }
+
+    /// Validates an explicitly credentialless provider endpoint.
+    pub fn validate_credentialless_endpoint(&self, base_url: Option<&str>) -> Result<()> {
+        if !self.supports_credentialless_endpoints() {
+            return Err(Error::Config(format!(
+                "provider `{}` does not support credentialless endpoints",
+                self.id
+            )));
+        }
+        self.validate_base_url(base_url)?;
+        let base_url = base_url
+            .ok_or_else(|| Error::Config("credentialless endpoint requires a base URL".into()))?;
+        let endpoint = reqwest::Url::parse(base_url)
+            .map_err(|error| Error::Config(format!("invalid base URL: {error}")))?;
+        if endpoint.scheme() != "https" {
+            return Err(Error::Config(
+                "credentialless endpoint must use HTTPS".into(),
+            ));
+        }
+        if self.default_base_url.is_some_and(|default| {
+            reqwest::Url::parse(default).is_ok_and(|default| same_origin(&default, &endpoint))
+        }) {
+            return Err(Error::Config(format!(
+                "provider `{}` default endpoint requires provider authentication",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn same_endpoint(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    same_origin(left, right)
+        && left.path().trim_end_matches('/') == right.path().trim_end_matches('/')
+}
+
+fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str().map(|host| host.trim_end_matches('.'))
+            == right.host_str().map(|host| host.trim_end_matches('.'))
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 pub(super) fn validate_base_url(base_url: &str) -> Result<()> {
@@ -483,6 +561,11 @@ mod tests {
             assert!(!provider.symbol().as_str().trim().is_empty());
             assert!(!provider.description().trim().is_empty());
             assert_eq!(provider.web_search().first(), Some(&HostedWebSearch::Off));
+            assert!(
+                !provider.supports_credentialless_endpoints() || provider.configurable_base_url(),
+                "provider `{}` allows credentialless endpoints without a configurable base URL",
+                provider.id()
+            );
 
             assert_eq!(
                 provider.default_model().is_some(),
@@ -537,5 +620,17 @@ mod tests {
         ] {
             assert!(provider(id).expect("image provider").supports_image_input());
         }
+    }
+
+    #[test]
+    fn only_openrouter_advertises_credentialless_endpoints() {
+        assert!(
+            provider("openrouter")
+                .expect("OpenRouter")
+                .supports_credentialless_endpoints()
+        );
+        assert!(providers().iter().all(|definition| {
+            definition.id() == "openrouter" || !definition.supports_credentialless_endpoints()
+        }));
     }
 }

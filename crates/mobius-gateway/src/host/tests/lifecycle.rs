@@ -247,6 +247,521 @@ async fn replacement_ready_precedes_every_reconciled_startup_event() {
 }
 
 #[tokio::test]
+async fn provider_replacement_cuts_over_defaults_and_every_chat_before_ack() {
+    let root = tempfile::tempdir().expect("root");
+    let first_workspace = root.path().join("first");
+    let second_workspace = root.path().join("second");
+    std::fs::create_dir(&first_workspace).expect("first workspace");
+    std::fs::create_dir(&second_workspace).expect("second workspace");
+    let state_dir = root.path().join("state");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) = ConfigStore::initialize(state_dir.clone(), listen, None).expect("config");
+    let old = ProviderConfig {
+        provider: "openrouter".into(),
+        model: "openai/gpt-5".into(),
+        base_url: Some("https://old.example/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::Credentialless,
+        reasoning_effort: None,
+        web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+    };
+    let config = config
+        .registering_provider(old.clone(), vec![old.model.clone()], Vec::new())
+        .expect("register old provider route");
+    store.save(&config).expect("save old provider route");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+    let (stale_commands, stale_receiver) = mpsc::channel(1);
+    drop(stale_receiver);
+    let (stale_events, _) = broadcast::channel(1);
+    gateway.state.lock().await.sessions.insert(
+        "stale".into(),
+        HostHandle {
+            inner: Arc::new(HostInner {
+                session_id: "stale".into(),
+                commands: stale_commands,
+                events: stale_events,
+                accepts_file_attachments: Arc::new(AtomicBool::new(false)),
+                alive: Arc::new(AtomicBool::new(false)),
+            }),
+        },
+    );
+    let first = gateway
+        .create_session(&first_workspace)
+        .await
+        .expect("resident chat");
+    let second = gateway
+        .create_session(&second_workspace)
+        .await
+        .expect("persisted chat");
+    let first_id = first.session_id().to_owned();
+    let second_id = second.session_id().to_owned();
+    assert!(second.stop_if_idle().await);
+    while second.is_alive() {
+        tokio::task::yield_now().await;
+    }
+    gateway.state.lock().await.sessions.remove(&second_id);
+    let checkpoints = Arc::clone(&gateway.state.lock().await.checkpoints);
+    let before = checkpoints
+        .load(&first_id)
+        .await
+        .expect("load resident chat")
+        .expect("resident checkpoint");
+    let replacement = ProviderConfig {
+        base_url: Some("https://new.example/v1".into()),
+        ..old
+    };
+
+    let ready = gateway
+        .register_provider(
+            replacement.clone(),
+            vec![replacement.model.clone()],
+            Vec::new(),
+            true,
+        )
+        .await
+        .expect("replace provider route");
+
+    let default = ready.default_config.as_ref().expect("gateway default");
+    assert_eq!(default.revision, 2);
+    assert_eq!(default.config.provider, replacement);
+    assert!(first.is_alive(), "the resident chat remains available");
+    assert!(!gateway.state.lock().await.sessions.contains_key("stale"));
+    assert_eq!(
+        gateway
+            .state
+            .lock()
+            .await
+            .sessions
+            .get(&first_id)
+            .expect("resident chat")
+            .inner
+            .session_id,
+        first.inner.session_id
+    );
+    for id in [&first_id, &second_id] {
+        let checkpoint = checkpoints
+            .load(id)
+            .await
+            .expect("load replaced chat")
+            .expect("replaced checkpoint");
+        let spec = ChatSpec::from_metadata(&checkpoint.metadata, &state_dir, None)
+            .expect("replaced chat spec");
+        assert_eq!(spec.agent.revision, 2);
+        assert_eq!(spec.agent.config.provider, replacement);
+    }
+    let (_, persisted) = ConfigStore::open(state_dir).expect("persisted gateway config");
+    assert_eq!(
+        persisted
+            .default_agent
+            .expect("persisted default")
+            .config
+            .provider,
+        replacement
+    );
+
+    let reopened = gateway
+        .open_session(&first_id)
+        .await
+        .expect("reopen replaced chat");
+    assert!(Arc::ptr_eq(&reopened.inner, &first.inner));
+    let repaired = checkpoints
+        .load(&first_id)
+        .await
+        .expect("load repaired chat")
+        .expect("repaired checkpoint");
+    gateway
+        .register_provider(
+            replacement.clone(),
+            vec![replacement.model.clone()],
+            Vec::new(),
+            true,
+        )
+        .await
+        .expect("idempotent provider replacement");
+    assert!(
+        reopened.is_alive(),
+        "an exact rerun must not evict the chat"
+    );
+    assert_eq!(
+        checkpoints
+            .load(&first_id)
+            .await
+            .expect("load idempotent chat")
+            .expect("idempotent checkpoint")
+            .sequence,
+        repaired.sequence
+    );
+    assert!(repaired.sequence > before.sequence);
+}
+
+#[tokio::test]
+async fn provider_replacement_rejects_before_mutation_when_a_chat_is_busy() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let state_dir = root.path().join("state");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) = ConfigStore::initialize(state_dir.clone(), listen, None).expect("config");
+    let old = ProviderConfig {
+        provider: "openrouter".into(),
+        model: "openai/gpt-5".into(),
+        base_url: Some("https://old.example/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::Credentialless,
+        reasoning_effort: None,
+        web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+    };
+    let config = config
+        .registering_provider(old.clone(), vec![old.model.clone()], Vec::new())
+        .expect("register old provider route");
+    store.save(&config).expect("save old provider route");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+    let idle = gateway
+        .create_session(&workspace)
+        .await
+        .expect("idle resident chat");
+    let idle_id = idle.session_id().to_owned();
+    let before = gateway
+        .state
+        .lock()
+        .await
+        .checkpoints
+        .load(&idle_id)
+        .await
+        .expect("load idle chat")
+        .expect("idle checkpoint");
+    let (commands, mut receiver) = mpsc::channel(1);
+    let busy_selection = old.clone();
+    tokio::spawn(async move {
+        if let Some(HostCommand::ProviderCutoverStatus { reply }) = receiver.recv().await {
+            let _ = reply.send(ProviderCutoverStatus {
+                selection: busy_selection,
+                provider_epoch: 0,
+                idle: false,
+            });
+        }
+    });
+    let (events, _) = broadcast::channel(1);
+    gateway.state.lock().await.sessions.insert(
+        "busy".into(),
+        HostHandle {
+            inner: Arc::new(HostInner {
+                session_id: "busy".into(),
+                commands,
+                events,
+                accepts_file_attachments: Arc::new(AtomicBool::new(false)),
+                alive: Arc::new(AtomicBool::new(true)),
+            }),
+        },
+    );
+    let replacement = ProviderConfig {
+        base_url: Some("https://new.example/v1".into()),
+        ..old.clone()
+    };
+
+    let error = gateway
+        .register_provider(replacement, vec![old.model.clone()], Vec::new(), true)
+        .await
+        .expect_err("busy chat must block provider replacement");
+
+    assert_eq!(error.code, "agent_busy");
+    assert!(
+        idle.is_alive(),
+        "preflight must not stop an earlier idle chat"
+    );
+    assert!(Arc::ptr_eq(
+        &gateway.state.lock().await.sessions[&idle_id].inner,
+        &idle.inner
+    ));
+    assert_eq!(
+        gateway
+            .state
+            .lock()
+            .await
+            .checkpoints
+            .load(&idle_id)
+            .await
+            .expect("reload idle chat")
+            .expect("idle checkpoint after rejection")
+            .sequence,
+        before.sequence
+    );
+    assert_eq!(
+        gateway
+            .state
+            .lock()
+            .await
+            .config
+            .lock()
+            .expect("gateway config")
+            .configured_providers["openrouter"]
+            .selection,
+        old
+    );
+    assert_eq!(
+        ConfigStore::open(state_dir)
+            .expect("persisted gateway config")
+            .1
+            .default_agent
+            .expect("persisted default")
+            .config
+            .provider,
+        old
+    );
+}
+
+#[tokio::test]
+async fn provider_cutover_gate_rejects_a_concurrent_route_change() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let state_dir = root.path().join("state");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) = ConfigStore::initialize(state_dir, listen, None).expect("config");
+    let current = ProviderConfig {
+        provider: "kimi".into(),
+        model: "kimi-k3".into(),
+        base_url: None,
+        endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
+        reasoning_effort: Some("max".into()),
+        web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+    };
+    let retiring = ProviderConfig {
+        provider: "openrouter".into(),
+        model: "openai/gpt-5".into(),
+        base_url: Some("https://old.example/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::Credentialless,
+        reasoning_effort: None,
+        web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+    };
+    let config = config
+        .registering_provider(current.clone(), Vec::new(), Vec::new())
+        .expect("register current provider")
+        .registering_provider(retiring.clone(), vec![retiring.model.clone()], Vec::new())
+        .expect("register retiring route");
+    store.save(&config).expect("save providers");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    credentials
+        .set("kimi", "test-secret", None)
+        .expect("Kimi credential");
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+    let host = gateway.create_session(&workspace).await.expect("chat");
+    let before = host.snapshot(None).await.expect("chat snapshot").ready;
+    let gate = Arc::clone(&gateway.state.lock().await.session_mutations);
+    let _cutover = gate.write().await;
+    let mut composition = before.config.config.clone();
+    composition.provider = retiring;
+
+    let error = host
+        .configure(before.config.revision, composition)
+        .await
+        .expect_err("route change must not cross the provider cutover gate");
+
+    assert_eq!(error.code, "gateway_busy");
+    assert_eq!(
+        host.snapshot(None)
+            .await
+            .expect("unchanged chat")
+            .ready
+            .config,
+        before.config
+    );
+    assert_eq!(
+        host.snapshot(None)
+            .await
+            .expect("unchanged provider")
+            .ready
+            .config
+            .config
+            .provider,
+        current
+    );
+}
+
+#[tokio::test]
+async fn provider_replacement_save_failure_keeps_resident_chats_available() {
+    let root = tempfile::tempdir().expect("root");
+    let first_workspace = root.path().join("first");
+    let second_workspace = root.path().join("second");
+    std::fs::create_dir(&first_workspace).expect("first workspace");
+    std::fs::create_dir(&second_workspace).expect("second workspace");
+    let state_dir = root.path().join("state");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) = ConfigStore::initialize(state_dir.clone(), listen, None).expect("config");
+    let old = ProviderConfig {
+        provider: "openrouter".into(),
+        model: "openai/gpt-5".into(),
+        base_url: Some("https://old.example/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::Credentialless,
+        reasoning_effort: None,
+        web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+    };
+    let config = config
+        .registering_provider(old.clone(), vec![old.model.clone()], Vec::new())
+        .expect("register old provider route");
+    store.save(&config).expect("save old provider route");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+    let resident = gateway
+        .create_session(&first_workspace)
+        .await
+        .expect("resident chat");
+    let persisted = gateway
+        .create_session(&second_workspace)
+        .await
+        .expect("persisted chat");
+    let resident_id = resident.session_id().to_owned();
+    let persisted_id = persisted.session_id().to_owned();
+    assert!(persisted.stop_if_idle().await);
+    while persisted.is_alive() {
+        tokio::task::yield_now().await;
+    }
+    gateway.state.lock().await.sessions.remove(&persisted_id);
+    let config_path = state_dir.join("gateway.toml");
+    std::fs::remove_file(&config_path).expect("remove gateway config");
+    std::fs::create_dir(&config_path).expect("block gateway config save");
+    let replacement = ProviderConfig {
+        base_url: Some("https://new.example/v1".into()),
+        ..old.clone()
+    };
+
+    gateway
+        .register_provider(replacement, vec![old.model.clone()], Vec::new(), true)
+        .await
+        .expect_err("gateway config save must fail");
+
+    assert!(resident.is_alive());
+    assert!(Arc::ptr_eq(
+        &gateway.state.lock().await.sessions[&resident_id].inner,
+        &resident.inner
+    ));
+    assert_eq!(
+        gateway
+            .state
+            .lock()
+            .await
+            .config
+            .lock()
+            .expect("gateway config")
+            .configured_providers["openrouter"]
+            .selection,
+        old
+    );
+    let checkpoints = Arc::clone(&gateway.state.lock().await.checkpoints);
+    for id in [resident_id, persisted_id] {
+        let checkpoint = checkpoints
+            .load(&id)
+            .await
+            .expect("load chat")
+            .expect("chat checkpoint");
+        assert_eq!(
+            ChatSpec::from_metadata(&checkpoint.metadata, &state_dir, None)
+                .expect("chat spec")
+                .agent
+                .config
+                .provider,
+            old
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_replacement_retry_migrates_a_stale_resident_router() {
+    let root = tempfile::tempdir().expect("root");
+    let state_dir = root.path().join("state");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) = ConfigStore::initialize(state_dir, listen, None).expect("config");
+    let old = ProviderConfig {
+        provider: "openrouter".into(),
+        model: "openai/gpt-5".into(),
+        base_url: Some("https://old.example/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::Credentialless,
+        reasoning_effort: None,
+        web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+    };
+    let config = config
+        .registering_provider(old.clone(), vec![old.model.clone()], Vec::new())
+        .expect("register old provider route");
+    store.save(&config).expect("save old provider route");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+    let (commands, mut receiver) = mpsc::channel(4);
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task_attempts = Arc::clone(&attempts);
+    let stale_selection = old.clone();
+    tokio::spawn(async move {
+        while let Some(command) = receiver.recv().await {
+            match command {
+                HostCommand::ProviderCutoverStatus { reply } => {
+                    let _ = reply.send(ProviderCutoverStatus {
+                        selection: stale_selection.clone(),
+                        provider_epoch: 0,
+                        idle: true,
+                    });
+                }
+                HostCommand::CutOverProvider { reply, .. } => {
+                    let attempt = task_attempts.fetch_add(1, Ordering::Relaxed);
+                    let result = if attempt == 0 {
+                        Err(Rejection {
+                            code: "host_error",
+                            message: "injected migration failure".into(),
+                            fatal: false,
+                        })
+                    } else {
+                        Ok(())
+                    };
+                    let _ = reply.send(result);
+                }
+                _ => panic!("unexpected command during provider cutover"),
+            }
+        }
+    });
+    let (events, _) = broadcast::channel(1);
+    gateway.state.lock().await.sessions.insert(
+        "resident".into(),
+        HostHandle {
+            inner: Arc::new(HostInner {
+                session_id: "resident".into(),
+                commands,
+                events,
+                accepts_file_attachments: Arc::new(AtomicBool::new(false)),
+                alive: Arc::new(AtomicBool::new(true)),
+            }),
+        },
+    );
+    let replacement = ProviderConfig {
+        base_url: Some("https://new.example/v1".into()),
+        ..old.clone()
+    };
+
+    gateway
+        .register_provider(
+            replacement.clone(),
+            vec![old.model.clone()],
+            Vec::new(),
+            true,
+        )
+        .await
+        .expect_err("first actor migration must fail");
+    gateway
+        .register_provider(replacement, vec![old.model], Vec::new(), true)
+        .await
+        .expect("retry must revisit the stale resident router");
+
+    assert_eq!(attempts.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
 async fn delete_session_stops_the_host_and_removes_its_durable_tree() {
     let root = tempfile::tempdir().expect("root");
     let workspace = root.path().join("workspace");
@@ -666,11 +1181,13 @@ async fn model_selection_updates_only_the_chat_and_new_chats_keep_the_gateway_de
                 provider: "openai_socket".into(),
                 model: "gpt-5.6-sol".into(),
                 base_url: None,
+                endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: Some("medium".into()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
             Vec::new(),
             Vec::new(),
+            false,
         )
         .await
         .expect("register OpenAI");

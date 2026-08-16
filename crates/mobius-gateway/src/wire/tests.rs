@@ -291,19 +291,23 @@ fn provider_registration_is_gateway_scoped() {
             provider: "kimi".into(),
             model: "kimi-k3".into(),
             base_url: None,
+            endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
             reasoning_effort: Some("max".into()),
             web_search: HostedWebSearch::Off,
         },
         model_ids: Vec::new(),
         reasoning_efforts: Vec::new(),
+        replace_existing_selections: false,
     });
 
     let encoded = serde_json::to_value(frame).expect("encode provider registration");
 
     assert_eq!(encoded["type"], "register_provider");
     assert_eq!(encoded["config"]["provider"], "kimi");
+    assert_eq!(encoded["config"]["endpoint_auth"], "provider_default");
     assert_eq!(encoded["model_ids"], serde_json::json!([]));
     assert_eq!(encoded["reasoning_efforts"], serde_json::json!([]));
+    assert_eq!(encoded["replace_existing_selections"], false);
     assert!(encoded.get("session_id").is_none());
 }
 
@@ -316,10 +320,12 @@ fn provider_registration_requires_a_reasoning_catalog() {
         "config": {
             "provider": "openrouter",
             "model": "openai/gpt-5",
+            "endpoint_auth": "provider_default",
             "reasoning_effort": "high",
             "web_search": "off"
         },
-        "model_ids": ["openai/gpt-5"]
+        "model_ids": ["openai/gpt-5"],
+        "replace_existing_selections": false
     });
 
     let error = serde_json::from_value::<ClientFrame>(frame)
@@ -766,6 +772,7 @@ fn server_frame_decodes_session_opened_with_a_widget_action_tag() {
                     "provider": {
                         "provider": "openai_codex",
                         "model": "model-a",
+                        "endpoint_auth": "provider_default",
                         "reasoning_effort": null,
                         "web_search": "off"
                     },

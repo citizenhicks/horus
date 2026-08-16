@@ -97,6 +97,21 @@ then stores its own selected model and runtime recipe beside its durable
 checkpoint; changing one chat never changes the catalog, another chat, or its
 workspace.
 
+Automation may register an OpenRouter-compatible HTTPS endpoint without sending
+provider credentials:
+
+```sh
+mobius-gateway register-provider --provider openrouter --model MODEL \
+  --base-url https://connector.example/v1 --credentialless
+```
+
+The command authenticates over the running loopback gateway, is idempotent, and
+prints `{"provider":"openrouter"}` on success. Credentialless mode is rejected
+for the direct OpenRouter endpoint and for providers that do not advertise it.
+Replacing a registered provider also updates its new-chat default and durable
+chat selections before success. The command fails while a resident chat is busy,
+so automation can retry without retiring the previous endpoint prematurely.
+
 On macOS or Linux, open the live dashboard or gracefully stop the configured
 gateway from another terminal:
 

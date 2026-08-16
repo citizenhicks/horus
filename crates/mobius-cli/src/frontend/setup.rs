@@ -15,7 +15,8 @@ use mobius::{Error, Result};
 use mobius_gateway::client::{GatewayEvents, GatewaySender, MAX_PENDING_FRAMES};
 use mobius_gateway::wire::{
     AgentComposition, ClientMessage, MiddlewareConfig, ProviderAuthKind, ProviderConfig,
-    ProviderStatus, ReadyPayload, ServerFrame, ServerMessage, SessionReadyPayload,
+    ProviderEndpointAuth, ProviderStatus, ReadyPayload, ServerFrame, ServerMessage,
+    SessionReadyPayload,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -669,6 +670,7 @@ mod tests {
                 provider: "missing".into(),
                 model: "model".into(),
                 base_url: None,
+                endpoint_auth: ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: None,
                 web_search: HostedWebSearch::Off,
             },
@@ -681,6 +683,7 @@ mod tests {
                 provider: "openai_socket".into(),
                 model: "missing".into(),
                 base_url: None,
+                endpoint_auth: ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: None,
                 web_search: HostedWebSearch::Off,
             },
@@ -693,6 +696,7 @@ mod tests {
                 provider: "kimi".into(),
                 model: "kimi-k3".into(),
                 base_url: None,
+                endpoint_auth: ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: Some("max".into()),
                 web_search: HostedWebSearch::Live,
             },
@@ -705,6 +709,7 @@ mod tests {
                 provider: "openai_socket".into(),
                 model: "gpt-5.6-sol".into(),
                 base_url: None,
+                endpoint_auth: ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: Some("missing".into()),
                 web_search: HostedWebSearch::Off,
             },
@@ -717,6 +722,7 @@ mod tests {
                 provider: "responses".into(),
                 model: AgentComposition::default().provider.model,
                 base_url: Some("https://api.openai.com/v1".into()),
+                endpoint_auth: ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: Some("missing".into()),
                 web_search: HostedWebSearch::Off,
             },

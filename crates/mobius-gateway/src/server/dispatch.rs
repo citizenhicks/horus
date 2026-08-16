@@ -611,8 +611,14 @@ pub(super) async fn handle_message(
             config,
             model_ids,
             reasoning_efforts,
+            replace_existing_selections,
         } => match gateway
-            .register_provider(config, model_ids, reasoning_efforts)
+            .register_provider(
+                config,
+                model_ids,
+                reasoning_efforts,
+                replace_existing_selections,
+            )
             .await
         {
             Ok(payload) => {

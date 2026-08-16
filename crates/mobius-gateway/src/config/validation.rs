@@ -30,7 +30,20 @@ pub(super) fn validate_provider_config(config: &ProviderConfig) -> Result<()> {
         config.reasoning_effort.as_deref(),
         config.web_search,
     )?;
+    validate_provider_endpoint_auth(definition, config)?;
     Ok(())
+}
+
+fn validate_provider_endpoint_auth(
+    definition: &ProviderDefinition,
+    config: &ProviderConfig,
+) -> Result<()> {
+    if config.endpoint_auth == ProviderEndpointAuth::ProviderDefault {
+        return Ok(());
+    }
+    definition
+        .validate_credentialless_endpoint(config.base_url.as_deref())
+        .map_err(Error::from)
 }
 
 pub(super) fn validate_configured_provider(configured: &ConfiguredProvider) -> Result<()> {

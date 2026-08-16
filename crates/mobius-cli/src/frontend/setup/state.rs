@@ -669,6 +669,16 @@ impl SetupState {
         let target = self.authentication_target();
         self.authenticated.as_ref() == Some(&target)
             || !self.definition().configurable_base_url() && self.entry().status.configured
+            || self
+                .entry()
+                .status
+                .selection
+                .as_ref()
+                .is_some_and(|selection| {
+                    selection.endpoint_auth == ProviderEndpointAuth::Credentialless
+                        && selection.provider == target.0.as_str()
+                        && selection.base_url.as_deref() == target.1.as_deref()
+                })
     }
 
     pub(super) fn authentication_ready(&self) -> Result<()> {
@@ -745,6 +755,13 @@ impl SetupState {
             .copied()
             .ok_or_else(|| Error::Config("Hosted web-search selection is invalid".into()))?;
         let base_url = self.selected_base_url();
+        let endpoint_auth = if current.provider.provider == definition.provider
+            && current.provider.base_url.as_deref() == base_url.as_deref()
+        {
+            current.provider.endpoint_auth
+        } else {
+            ProviderEndpointAuth::ProviderDefault
+        };
         if model.is_empty() {
             return Err(Error::Config("Model is required".into()));
         }
@@ -752,6 +769,7 @@ impl SetupState {
             provider: definition.provider.clone(),
             model: model.into(),
             base_url,
+            endpoint_auth,
             reasoning_effort,
             web_search,
         };

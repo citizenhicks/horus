@@ -1,10 +1,14 @@
+use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use mobius::backend::checkpoint::CheckpointStore;
 use mobius::backend::model::provider::{ProviderAuth, provider};
 use uuid::Uuid;
 
 use crate::Error;
 use crate::assembly::{configured_model_choices, credential_is_configured};
+use crate::config::{ChatSpec, GatewayConfig};
 use crate::wire::{AgentComposition, ProviderConfig, ReadyPayload, ServerFrame, ServerMessage};
 
 use super::{GatewayHost, Rejection, gateway_ready, internal, invalid_config};
@@ -199,8 +203,11 @@ impl GatewayHost {
         selection: ProviderConfig,
         model_ids: Vec<String>,
         reasoning_efforts: Vec<String>,
+        replace_existing_selections: bool,
     ) -> std::result::Result<ReadyPayload, Rejection> {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
+        let mutation_gate = Arc::clone(&state.session_mutations);
+        let _mutation = mutation_gate.write_owned().await;
         if !credential_is_configured(&selection, &state.store, &state.credentials)
             .map_err(invalid_config)?
         {
@@ -209,16 +216,91 @@ impl GatewayHost {
                 selection.provider
             ))));
         }
-        {
-            let mut current = state
-                .config
-                .lock()
-                .map_err(|_| internal("gateway configuration lock is poisoned"))?;
-            let next = current
-                .registering_provider(selection, model_ids, reasoning_efforts)
-                .map_err(invalid_config)?;
-            state.store.save(&next).map_err(internal)?;
-            *current = next;
+        let current = state
+            .config
+            .lock()
+            .map_err(|_| internal("gateway configuration lock is poisoned"))?
+            .clone();
+        let next = provider_registration(
+            &current,
+            &selection,
+            &model_ids,
+            &reasoning_efforts,
+            replace_existing_selections,
+        )
+        .map_err(invalid_config)?;
+        let mut replacements = Vec::new();
+        let mut migrations = Vec::new();
+        let mut target_epoch = state.provider_epoch.load(Ordering::Acquire);
+        if current.configured_providers != next.configured_providers {
+            target_epoch = target_epoch
+                .checked_add(1)
+                .ok_or_else(|| internal("provider catalog epoch overflow"))?;
+        }
+        if replace_existing_selections {
+            let residents = provider_cutover_residents(&mut state).await?;
+            let resident_ids = residents
+                .iter()
+                .map(|resident| resident.session_id.clone())
+                .collect::<HashSet<_>>();
+            migrations = residents
+                .iter()
+                .filter(|resident| {
+                    resident.status.provider_epoch != target_epoch
+                        || (resident.status.selection.provider == selection.provider
+                            && resident.status.selection != selection)
+                })
+                .map(|resident| (resident.session_id.clone(), resident.host.clone()))
+                .collect();
+            replacements =
+                provider_checkpoint_replacements(&state, &selection, &next, &resident_ids)
+                    .await
+                    .map_err(internal)?;
+            if current == next && replacements.is_empty() && migrations.is_empty() {
+                return gateway_ready(&state).await;
+            }
+            if residents.iter().any(|resident| !resident.status.idle) {
+                return Err(Rejection {
+                    code: "agent_busy",
+                    message: "finish or interrupt active turns before changing gateway providers"
+                        .into(),
+                    fatal: false,
+                });
+            }
+            save_provider_checkpoint_replacements(&state.checkpoints, &replacements)
+                .await
+                .map_err(internal)?;
+        }
+        let commit = commit_provider_registration(
+            &state,
+            &selection,
+            &model_ids,
+            &reasoning_efforts,
+            replace_existing_selections,
+        );
+        let catalog_changed = match commit {
+            Ok(catalog_changed) => catalog_changed,
+            Err(error) => {
+                if replace_existing_selections
+                    && let Err(rollback) =
+                        rollback_provider_checkpoints(&state.checkpoints, &replacements).await
+                {
+                    return Err(internal(format!(
+                        "{error}; failed to roll back provider chat selections: {rollback}"
+                    )));
+                }
+                return Err(internal(error));
+            }
+        };
+        if catalog_changed {
+            state.provider_epoch.store(target_epoch, Ordering::Release);
+        }
+        for (session_id, host) in migrations {
+            host.cut_over_provider(&selection).await?;
+            if !host.is_alive() {
+                state.sessions.remove(&session_id);
+                return Err(internal("chat stopped during provider replacement"));
+            }
         }
         let payload = gateway_ready(&state).await?;
         let frame = ServerFrame::new(ServerMessage::Ready {
@@ -227,6 +309,203 @@ impl GatewayHost {
         let _ = self.events.send(frame);
         Ok(payload)
     }
+}
+
+fn provider_registration(
+    current: &GatewayConfig,
+    selection: &ProviderConfig,
+    model_ids: &[String],
+    reasoning_efforts: &[String],
+    replace_existing_selections: bool,
+) -> crate::Result<GatewayConfig> {
+    let registered = current.registering_provider(
+        selection.clone(),
+        model_ids.to_vec(),
+        reasoning_efforts.to_vec(),
+    )?;
+    if replace_existing_selections {
+        registered.replacing_provider_default(selection)
+    } else {
+        Ok(registered)
+    }
+}
+
+fn commit_provider_registration(
+    state: &super::GatewayState,
+    selection: &ProviderConfig,
+    model_ids: &[String],
+    reasoning_efforts: &[String],
+    replace_existing_selections: bool,
+) -> crate::Result<bool> {
+    let mut current = state
+        .config
+        .lock()
+        .map_err(|_| Error::Config("gateway configuration lock is poisoned".into()))?;
+    let next = provider_registration(
+        &current,
+        selection,
+        model_ids,
+        reasoning_efforts,
+        replace_existing_selections,
+    )?;
+    let catalog_changed = current.configured_providers != next.configured_providers;
+    state.store.save(&next)?;
+    *current = next;
+    Ok(catalog_changed)
+}
+
+struct ProviderCheckpointReplacement {
+    session_id: String,
+    sequence: u64,
+    original: ChatSpec,
+    updated: ChatSpec,
+}
+
+struct ProviderCutoverResident {
+    session_id: String,
+    host: super::HostHandle,
+    status: super::ProviderCutoverStatus,
+}
+
+async fn provider_cutover_residents(
+    state: &mut super::GatewayState,
+) -> std::result::Result<Vec<ProviderCutoverResident>, Rejection> {
+    let sessions = state
+        .sessions
+        .iter()
+        .map(|(id, host)| (id.clone(), host.clone()))
+        .collect::<Vec<_>>();
+    let mut residents = Vec::new();
+    let mut stopped = Vec::new();
+    for (id, host) in sessions {
+        if !host.is_alive() {
+            stopped.push(id);
+            continue;
+        }
+        match host.provider_cutover_status().await {
+            Ok(status) => residents.push(ProviderCutoverResident {
+                session_id: id,
+                host,
+                status,
+            }),
+            Err(rejection) if rejection.code == "gateway_stopped" => stopped.push(id),
+            Err(rejection) => return Err(rejection),
+        }
+    }
+    for id in stopped {
+        state.sessions.remove(&id);
+    }
+    Ok(residents)
+}
+
+async fn provider_checkpoint_replacements(
+    state: &super::GatewayState,
+    selection: &ProviderConfig,
+    gateway: &GatewayConfig,
+    excluded: &HashSet<String>,
+) -> crate::Result<Vec<ProviderCheckpointReplacement>> {
+    let sessions = super::gateway_session_summaries(&state.checkpoints).await?;
+    let mut replacements = Vec::new();
+    for session in sessions {
+        if excluded.contains(&session.session_id) {
+            continue;
+        }
+        let Some(checkpoint) = state.checkpoints.load(&session.session_id).await? else {
+            continue;
+        };
+        let Some(original) = ChatSpec::from_metadata_if_present(
+            &checkpoint.metadata,
+            state.store.state_dir(),
+            gateway.tls.as_ref(),
+        )?
+        else {
+            continue;
+        };
+        let Some(updated) = original.replacing_provider_selection(
+            selection,
+            gateway,
+            state.store.state_dir(),
+            gateway.tls.as_ref(),
+        )?
+        else {
+            continue;
+        };
+        replacements.push(ProviderCheckpointReplacement {
+            session_id: session.session_id,
+            sequence: checkpoint.sequence,
+            original,
+            updated,
+        });
+    }
+    Ok(replacements)
+}
+
+async fn save_provider_checkpoint_replacements(
+    checkpoints: &Arc<dyn CheckpointStore>,
+    replacements: &[ProviderCheckpointReplacement],
+) -> crate::Result<()> {
+    for (index, replacement) in replacements.iter().enumerate() {
+        let result = async {
+            let mut checkpoint = checkpoints
+                .load(&replacement.session_id)
+                .await?
+                .ok_or_else(|| {
+                    Error::Config("chat disappeared during provider replacement".into())
+                })?;
+            if checkpoint.sequence != replacement.sequence {
+                return Err(Error::Config(
+                    "chat changed during provider replacement".into(),
+                ));
+            }
+            checkpoint.sequence = checkpoint
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| Error::Config("checkpoint sequence overflow".into()))?;
+            checkpoint.metadata.extend(replacement.updated.metadata()?);
+            checkpoints.save(&checkpoint, &[], None).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            if let Err(rollback) =
+                rollback_provider_checkpoints(checkpoints, &replacements[..index]).await
+            {
+                return Err(Error::Config(format!(
+                    "{error}; failed to roll back provider chat selections: {rollback}"
+                )));
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+async fn rollback_provider_checkpoints(
+    checkpoints: &Arc<dyn CheckpointStore>,
+    replacements: &[ProviderCheckpointReplacement],
+) -> crate::Result<()> {
+    for replacement in replacements.iter().rev() {
+        let mut checkpoint = checkpoints
+            .load(&replacement.session_id)
+            .await?
+            .ok_or_else(|| Error::Config("chat disappeared during provider rollback".into()))?;
+        let replaced_sequence = replacement
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Config("checkpoint sequence overflow".into()))?;
+        if checkpoint.sequence != replaced_sequence {
+            return Err(Error::Config(
+                "chat changed during provider rollback".into(),
+            ));
+        }
+        checkpoint.sequence = checkpoint
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Config("checkpoint sequence overflow".into()))?;
+        checkpoint.metadata.extend(replacement.original.metadata()?);
+        checkpoints.save(&checkpoint, &[], None).await?;
+    }
+    Ok(())
 }
 
 fn ensure_provider_login_available(
@@ -278,6 +557,73 @@ mod tests {
 
     use super::super::provider_credential_matches;
     use super::*;
+
+    #[tokio::test]
+    async fn provider_registration_commits_against_the_latest_usage() {
+        let root = tempfile::tempdir().expect("root");
+        let state_dir = root.path().join("state");
+        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let (store, config) =
+            ConfigStore::initialize(state_dir.clone(), listen, None).expect("config");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+        let selection = ProviderConfig {
+            provider: "openrouter".into(),
+            model: "openai/gpt-5".into(),
+            base_url: Some("https://connector.example/v1".into()),
+            endpoint_auth: crate::wire::ProviderEndpointAuth::Credentialless,
+            reasoning_effort: None,
+            web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+        };
+        let usage = mobius::protocol::TokenUsage {
+            input_tokens: 13,
+            total_tokens: 13,
+            ..mobius::protocol::TokenUsage::default()
+        };
+        let state = gateway.state.lock().await;
+        let stale = state.config.lock().expect("gateway config").clone();
+        provider_registration(
+            &stale,
+            &selection,
+            std::slice::from_ref(&selection.model),
+            &[],
+            true,
+        )
+        .expect("stale registration plan");
+        {
+            let mut latest = state.config.lock().expect("gateway config");
+            assert!(
+                latest
+                    .observe_usage("openrouter", &usage)
+                    .expect("observe usage")
+            );
+            state.store.save(&latest).expect("persist usage");
+        }
+
+        commit_provider_registration(
+            &state,
+            &selection,
+            std::slice::from_ref(&selection.model),
+            &[],
+            true,
+        )
+        .expect("commit registration");
+
+        let latest = state.config.lock().expect("gateway config").clone();
+        assert_eq!(latest.profile().daily_usage[0].usage, usage);
+        drop(state);
+        assert_eq!(
+            ConfigStore::open(state_dir)
+                .expect("persisted gateway")
+                .1
+                .profile()
+                .daily_usage[0]
+                .usage,
+            usage
+        );
+    }
 
     #[tokio::test]
     async fn credential_endpoints_are_validated_and_persisted() {
@@ -347,11 +693,13 @@ mod tests {
                     provider: "kimi".into(),
                     model: "kimi-k3".into(),
                     base_url: None,
+                    endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
                     reasoning_effort: Some("max".into()),
                     web_search: mobius::backend::model::provider::HostedWebSearch::Off,
                 },
                 Vec::new(),
                 Vec::new(),
+                false,
             )
             .await
             .expect("register Kimi");
@@ -393,6 +741,7 @@ mod tests {
             provider: "responses".into(),
             model: "custom-model".into(),
             base_url: Some("https://first.example/v1".into()),
+            endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
             reasoning_effort: None,
             web_search: mobius::backend::model::provider::HostedWebSearch::Off,
         };

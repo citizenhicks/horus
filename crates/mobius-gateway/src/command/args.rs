@@ -9,6 +9,7 @@ pub(super) enum Command {
     PairingCode {
         state_dir: PathBuf,
     },
+    RegisterProvider(RegisterProviderOptions),
     Connect(ConnectOptions),
     Serve {
         state_dir: PathBuf,
@@ -54,6 +55,15 @@ pub(super) struct ConnectOptions {
     pub(super) endpoint: Option<Endpoint>,
 }
 
+#[derive(Debug)]
+pub(super) struct RegisterProviderOptions {
+    pub(super) state_dir: PathBuf,
+    pub(super) provider: String,
+    pub(super) model: String,
+    pub(super) base_url: Option<String>,
+    pub(super) credentialless: bool,
+}
+
 pub(super) fn parse(arguments: Vec<OsString>) -> Result<Command> {
     let mut arguments = arguments.into_iter();
     let Some(command) = arguments.next() else {
@@ -65,6 +75,8 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<Command> {
         parse_state_dir(arguments.collect()).map(|state_dir| Command::Bootstrap { state_dir })
     } else if command == "pairing-code" {
         parse_pairing_code(arguments.collect()).map(|state_dir| Command::PairingCode { state_dir })
+    } else if command == "register-provider" {
+        parse_register_provider(arguments.collect()).map(Command::RegisterProvider)
     } else if command == "connect" {
         parse_connect(arguments.collect()).map(Command::Connect)
     } else if command == "serve" {
@@ -76,6 +88,67 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<Command> {
     } else {
         Err(Error::Config(USAGE.into()))
     }
+}
+
+pub(super) fn parse_register_provider(arguments: Vec<OsString>) -> Result<RegisterProviderOptions> {
+    let mut configured_state_dir = None;
+    let mut provider = None;
+    let mut model = None;
+    let mut base_url = None;
+    let mut credentialless = false;
+    let mut arguments = arguments.into_iter();
+    while let Some(flag) = arguments.next() {
+        if flag == "--credentialless" {
+            if credentialless {
+                return Err(Error::Config("--credentialless supplied twice".into()));
+            }
+            credentialless = true;
+            continue;
+        }
+        let value = arguments
+            .next()
+            .ok_or_else(|| Error::Config(format!("{} requires a value", flag.to_string_lossy())))?;
+        if flag == "--state-dir" {
+            set_once(
+                &mut configured_state_dir,
+                PathBuf::from(value),
+                "--state-dir",
+            )?;
+        } else if flag == "--provider" {
+            set_once(
+                &mut provider,
+                value
+                    .into_string()
+                    .map_err(|_| Error::Config("--provider is not valid UTF-8".into()))?,
+                "--provider",
+            )?;
+        } else if flag == "--model" {
+            set_once(
+                &mut model,
+                value
+                    .into_string()
+                    .map_err(|_| Error::Config("--model is not valid UTF-8".into()))?,
+                "--model",
+            )?;
+        } else if flag == "--base-url" {
+            set_once(
+                &mut base_url,
+                value
+                    .into_string()
+                    .map_err(|_| Error::Config("--base-url is not valid UTF-8".into()))?,
+                "--base-url",
+            )?;
+        } else {
+            return Err(Error::Config(USAGE.into()));
+        }
+    }
+    Ok(RegisterProviderOptions {
+        state_dir: configured_state_dir.map_or_else(state_dir, Ok)?,
+        provider: provider.ok_or_else(|| Error::Config("--provider is required".into()))?,
+        model: model.ok_or_else(|| Error::Config("--model is required".into()))?,
+        base_url,
+        credentialless,
+    })
 }
 
 pub(super) fn parse_pairing_code(arguments: Vec<OsString>) -> Result<PathBuf> {

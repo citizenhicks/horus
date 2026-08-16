@@ -2,6 +2,8 @@ use super::*;
 
 static BOOTSTRAP_TEST_CLIENT: std::sync::Mutex<Option<(Endpoint, String)>> =
     std::sync::Mutex::new(None);
+static REGISTER_PROVIDER_TEST_CLIENT: std::sync::Mutex<Option<(Endpoint, String)>> =
+    std::sync::Mutex::new(None);
 
 fn save_bootstrap_test_client(endpoint: &Endpoint, token: String) -> Result<()> {
     *BOOTSTRAP_TEST_CLIENT
@@ -12,6 +14,15 @@ fn save_bootstrap_test_client(endpoint: &Endpoint, token: String) -> Result<()> 
 
 fn reject_bootstrap_test_client(_endpoint: &Endpoint, _token: String) -> Result<()> {
     Err(Error::Config("test token save failed".into()))
+}
+
+fn load_register_provider_test_client(endpoint: &Endpoint) -> Result<Option<String>> {
+    Ok(REGISTER_PROVIDER_TEST_CLIENT
+        .lock()
+        .expect("register-provider test client lock")
+        .as_ref()
+        .filter(|(configured, _)| configured == endpoint)
+        .map(|(_, token)| token.clone()))
 }
 
 #[cfg(unix)]
@@ -285,6 +296,108 @@ fn parse_bootstrap_commands_accept_only_their_machine_interface() {
     ));
 
     assert!(parse(vec!["pairing-code".into()]).is_err());
+}
+
+#[test]
+fn parse_register_provider_accepts_credentialless_endpoint_configuration() {
+    let command = parse(vec![
+        "register-provider".into(),
+        "--state-dir".into(),
+        "/tmp/mobius".into(),
+        "--provider".into(),
+        "openrouter".into(),
+        "--model".into(),
+        "openai/gpt-5".into(),
+        "--base-url".into(),
+        "https://connector.example/v1".into(),
+        "--credentialless".into(),
+    ])
+    .expect("parse provider registration");
+
+    assert!(matches!(
+        command,
+        Command::RegisterProvider(RegisterProviderOptions {
+            state_dir,
+            provider,
+            model,
+            base_url: Some(base_url),
+            credentialless: true,
+        }) if state_dir == std::path::Path::new("/tmp/mobius")
+            && provider == "openrouter"
+            && model == "openai/gpt-5"
+            && base_url == "https://connector.example/v1"
+    ));
+}
+
+#[test]
+fn register_provider_success_json_is_stable() {
+    assert_eq!(
+        register_provider_json("openrouter").expect("provider registration JSON"),
+        r#"{"provider":"openrouter"}"#
+    );
+}
+
+#[tokio::test]
+async fn register_provider_command_is_idempotent() {
+    let directory = tempfile::tempdir().expect("gateway state");
+    let state = directory.path().join("gateway");
+    let (server, grant) = GatewayServer::bootstrap(
+        state.clone(),
+        "127.0.0.1:0".parse().expect("listen address"),
+    )
+    .await
+    .expect("bootstrap gateway");
+    let endpoint: Endpoint = format!("tcp://{}", server.listen_addr())
+        .parse()
+        .expect("gateway endpoint");
+    let (shutdown, signal) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(server.serve_until(async move {
+        let _ = signal.await;
+    }));
+    let (_client, identity) = GatewayClient::pair(
+        &endpoint,
+        grant.code,
+        "provider setup",
+        ClientKind::GatewayDashboard,
+    )
+    .await
+    .expect("pair provider setup client");
+    *REGISTER_PROVIDER_TEST_CLIENT
+        .lock()
+        .expect("register-provider test client lock") = Some((endpoint, identity.token));
+
+    for _ in 0..2 {
+        register_provider_command(
+            RegisterProviderOptions {
+                state_dir: state.clone(),
+                provider: "openrouter".into(),
+                model: "openai/gpt-5".into(),
+                base_url: Some("https://connector.example/v1".into()),
+                credentialless: true,
+            },
+            load_register_provider_test_client,
+        )
+        .await
+        .expect("register provider");
+    }
+
+    let (_, config) = ConfigStore::open(state).expect("persisted gateway config");
+    let configured = &config.configured_providers["openrouter"];
+    assert_eq!(
+        (
+            config.configured_providers.len(),
+            configured.selection.endpoint_auth,
+            configured.model_ids.as_slice(),
+        ),
+        (
+            1,
+            crate::wire::ProviderEndpointAuth::Credentialless,
+            ["openai/gpt-5".to_string()].as_slice(),
+        )
+    );
+
+    shutdown.send(()).expect("stop gateway");
+    serving.await.expect("gateway task").expect("stop gateway");
 }
 
 #[test]

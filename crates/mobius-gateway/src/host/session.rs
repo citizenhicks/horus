@@ -30,6 +30,8 @@ struct HostState {
     accepts_file_attachments: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     catalog_lock: Arc<Mutex<()>>,
+    session_mutations: Arc<RwLock<()>>,
+    provider_epoch: Arc<AtomicU64>,
     activities: SessionActivities,
     running: RunningAgent,
     pending_turns: usize,
@@ -69,6 +71,18 @@ struct RunningAgent {
     gateway_sandbox: Arc<GatewaySandbox>,
     subagent_template: Option<Arc<OnceLock<AgentConfig>>>,
     tool_count: usize,
+    provider_epoch: u64,
+}
+
+struct ReusableModelRouter {
+    router: Arc<ModelRouter>,
+    provider_epoch: u64,
+}
+
+pub(super) struct ProviderCutoverStatus {
+    pub(super) selection: ProviderConfig,
+    pub(super) provider_epoch: u64,
+    pub(super) idle: bool,
 }
 
 pub(super) struct ActiveCron {
@@ -133,6 +147,13 @@ pub(super) enum HostCommand {
         base_url: Option<String>,
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
+    ProviderCutoverStatus {
+        reply: oneshot::Sender<ProviderCutoverStatus>,
+    },
+    CutOverProvider {
+        selection: ProviderConfig,
+        reply: oneshot::Sender<std::result::Result<(), Rejection>>,
+    },
     Artifacts {
         reply: oneshot::Sender<std::result::Result<Vec<ArtifactRecord>, Rejection>>,
     },
@@ -182,6 +203,8 @@ impl HostHandle {
         scratchpad: ScratchpadStore,
         session_files: SessionFileStore,
         catalog_lock: Arc<Mutex<()>>,
+        session_mutations: Arc<RwLock<()>>,
+        provider_epoch: Arc<AtomicU64>,
         activities: SessionActivities,
         gateway_events: broadcast::Sender<ServerFrame>,
         session_id: String,
@@ -200,6 +223,7 @@ impl HostHandle {
             origin_label,
             false,
             None,
+            Arc::clone(&provider_epoch),
         )
         .await?;
         let accepts_file_attachments = Arc::new(AtomicBool::new(runtime_accepts_attachments(
@@ -226,6 +250,8 @@ impl HostHandle {
             accepts_file_attachments: Arc::clone(&accepts_file_attachments),
             alive: Arc::clone(&alive),
             catalog_lock,
+            session_mutations,
+            provider_epoch,
             activities,
             running,
             pending_turns: 0,
@@ -427,6 +453,28 @@ impl HostHandle {
         receive(receiver).await
     }
 
+    pub(super) async fn provider_cutover_status(
+        &self,
+    ) -> std::result::Result<ProviderCutoverStatus, Rejection> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(HostCommand::ProviderCutoverStatus { reply })
+            .await?;
+        receiver.await.map_err(|_| stopped())
+    }
+
+    pub(super) async fn cut_over_provider(
+        &self,
+        selection: &ProviderConfig,
+    ) -> std::result::Result<(), Rejection> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(HostCommand::CutOverProvider {
+            selection: selection.clone(),
+            reply,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
     pub(crate) async fn artifacts(&self) -> std::result::Result<Vec<ArtifactRecord>, Rejection> {
         let (reply, receiver) = oneshot::channel();
         self.send(HostCommand::Artifacts { reply }).await?;
@@ -544,8 +592,12 @@ async fn start_agent(
     session_id: String,
     origin_label: &str,
     override_saved_model_route: bool,
-    reusable_model_router: Option<Arc<ModelRouter>>,
+    reusable_model_router: Option<ReusableModelRouter>,
+    provider_epoch: Arc<AtomicU64>,
 ) -> Result<RunningAgent> {
+    let reusable_provider_epoch = reusable_model_router
+        .as_ref()
+        .map(|reusable| reusable.provider_epoch);
     let BuiltAgent {
         agent,
         model_router,
@@ -563,7 +615,7 @@ async fn start_agent(
         Some(session_id),
         origin_label,
         override_saved_model_route,
-        reusable_model_router,
+        reusable_model_router.map(|reusable| reusable.router),
     )
     .await?;
     let session = agent.session().clone();
@@ -581,15 +633,20 @@ async fn start_agent(
         gateway_sandbox,
         subagent_template,
         tool_count,
+        provider_epoch: reusable_provider_epoch
+            .unwrap_or_else(|| provider_epoch.load(Ordering::Acquire)),
     })
 }
 
-pub(super) fn reusable_model_router(
+fn reusable_model_router(
     old_spec: &ChatSpec,
     next_spec: &ChatSpec,
-    router: &Arc<ModelRouter>,
-) -> Option<Arc<ModelRouter>> {
-    provider_config_unchanged(old_spec, next_spec).then(|| Arc::clone(router))
+    running: &RunningAgent,
+) -> Option<ReusableModelRouter> {
+    provider_config_unchanged(old_spec, next_spec).then(|| ReusableModelRouter {
+        router: Arc::clone(&running.model_router),
+        provider_epoch: running.provider_epoch,
+    })
 }
 
 pub(super) fn provider_config_unchanged(old_spec: &ChatSpec, next_spec: &ChatSpec) -> bool {

@@ -1,6 +1,18 @@
 use super::*;
 
 impl HostState {
+    fn begin_session_mutation(
+        &self,
+    ) -> std::result::Result<tokio::sync::OwnedRwLockReadGuard<()>, Rejection> {
+        Arc::clone(&self.session_mutations)
+            .try_read_owned()
+            .map_err(|_| Rejection {
+                code: "gateway_busy",
+                message: "retry after the gateway provider update finishes".into(),
+                fatal: false,
+            })
+    }
+
     pub(super) async fn reconcile_loaded_startup(&mut self) -> Result<()> {
         self.reconcile_startup_through(self.sequence, JournalDelivery::LoadedStartup)
             .await
@@ -162,33 +174,40 @@ impl HostState {
                 let _ = reply.send(result);
             }
             HostCommand::Submit { submission, reply } => {
-                let resumes_approval = matches!(
-                    &submission.op,
-                    Op::ExecApproval {
-                        decision: ReviewDecision::Approved
-                            | ReviewDecision::ApprovedForSession
-                            | ReviewDecision::Denied { .. },
-                        ..
+                let result = async {
+                    let _mutation = self.begin_session_mutation()?;
+                    let resumes_approval = matches!(
+                        &submission.op,
+                        Op::ExecApproval {
+                            decision: ReviewDecision::Approved
+                                | ReviewDecision::ApprovedForSession
+                                | ReviewDecision::Denied { .. },
+                            ..
+                        }
+                    );
+                    let result = match &submission.op {
+                        Op::SetModel { route } => self.set_model(route).await,
+                        _ => self.submit(submission, false),
+                    };
+                    if result.is_ok()
+                        && resumes_approval
+                        && let Err(error) = self.resume_activity().await
+                    {
+                        self.broadcast(ServerMessage::Error {
+                            code: "session_activity".into(),
+                            message: error.to_string(),
+                            fatal: false,
+                        });
                     }
-                );
-                let result = match &submission.op {
-                    Op::SetModel { route } => self.set_model(route).await,
-                    _ => self.submit(submission, false),
-                };
-                if result.is_ok()
-                    && resumes_approval
-                    && let Err(error) = self.resume_activity().await
-                {
-                    self.broadcast(ServerMessage::Error {
-                        code: "session_activity".into(),
-                        message: error.to_string(),
-                        fatal: false,
-                    });
+                    result
                 }
+                .await;
                 let _ = reply.send(result);
             }
             HostCommand::StartCronSetup { task, reply } => {
-                let result = self.start_cron_setup(task);
+                let result = self
+                    .begin_session_mutation()
+                    .and_then(|_mutation| self.start_cron_setup(task));
                 let _ = reply.send(result);
             }
             HostCommand::Configure {
@@ -196,7 +215,11 @@ impl HostState {
                 config,
                 reply,
             } => {
-                let result = self.configure(expected_revision, config).await;
+                let result = async {
+                    let _mutation = self.begin_session_mutation()?;
+                    self.configure(expected_revision, config).await
+                }
+                .await;
                 let _ = reply.send(result);
             }
             HostCommand::GitDiff { scope, reply } => {
@@ -227,7 +250,11 @@ impl HostState {
                 );
             }
             HostCommand::SwitchGitBranch { branch, reply } => {
-                let result = self.switch_git_branch(&branch).await;
+                let result = async {
+                    let _mutation = self.begin_session_mutation()?;
+                    self.switch_git_branch(&branch).await
+                }
+                .await;
                 let _ = reply.send(result);
             }
             HostCommand::RefreshProvider {
@@ -235,14 +262,31 @@ impl HostState {
                 base_url,
                 reply,
             } => {
-                let result = self.refresh_provider(&provider, base_url.as_deref()).await;
+                let result = async {
+                    let _mutation = self.begin_session_mutation()?;
+                    self.refresh_provider(&provider, base_url.as_deref()).await
+                }
+                .await;
+                let _ = reply.send(result);
+            }
+            HostCommand::ProviderCutoverStatus { reply } => {
+                let _ = reply.send(ProviderCutoverStatus {
+                    selection: self.spec.agent.config.provider.clone(),
+                    provider_epoch: self.running.provider_epoch,
+                    idle: self.is_idle(),
+                });
+            }
+            HostCommand::CutOverProvider { selection, reply } => {
+                let result = self.cut_over_provider(&selection).await;
                 let _ = reply.send(result);
             }
             HostCommand::Artifacts { reply } => {
                 let _ = reply.send(self.list_artifacts().await);
             }
             HostCommand::RunCron { run, input, reply } => {
-                let result = self.run_cron(run, input);
+                let result = self
+                    .begin_session_mutation()
+                    .and_then(|_mutation| self.run_cron(run, input));
                 let _ = reply.send(result);
             }
             HostCommand::WaitIdle { reply } => {
@@ -539,10 +583,55 @@ impl HostState {
                 gateway.tls.as_ref(),
             )
             .map_err(invalid_config)?;
+        let reusable_router = reusable_model_router(&self.spec, &next, &self.running);
+        self.replace_running(next, reusable_router).await
+    }
+
+    async fn cut_over_provider(
+        &mut self,
+        selection: &ProviderConfig,
+    ) -> std::result::Result<(), Rejection> {
+        self.require_idle()?;
+        let gateway = self
+            .gateway
+            .lock()
+            .map_err(|_| internal("gateway configuration lock is poisoned"))?
+            .clone();
+        let next = if self.spec.agent.config.provider.provider == selection.provider
+            && self.spec.agent.config.provider != *selection
+        {
+            let mut composition = self.spec.agent.config.clone();
+            composition.provider = selection.clone();
+            self.spec
+                .replacing_agent(
+                    self.spec.agent.revision,
+                    composition,
+                    &gateway,
+                    self.store.state_dir(),
+                    gateway.tls.as_ref(),
+                )
+                .map_err(invalid_config)?
+        } else {
+            self.spec.clone()
+        };
+        let models =
+            configured_model_choices(&gateway, &self.store, &self.credentials).map_err(internal)?;
+        crate::middleware_manifest::validate_choices(&next.agent.config.middleware, &models)
+            .map_err(invalid_config)?;
+        self.replace_running(next, None).await
+    }
+
+    async fn replace_running(
+        &mut self,
+        next: ChatSpec,
+        reusable_router: Option<ReusableModelRouter>,
+    ) -> std::result::Result<(), Rejection> {
         let session_id = self.running.session_id.clone();
         let old_spec = self.spec.clone();
-        let old_router = Arc::clone(&self.running.model_router);
-        let reusable_router = reusable_model_router(&old_spec, &next, &old_router);
+        let old_router = ReusableModelRouter {
+            router: Arc::clone(&self.running.model_router),
+            provider_epoch: self.running.provider_epoch,
+        };
         self.stop_and_drain_running().await.map_err(internal)?;
         let replacement = match start_agent(
             Arc::clone(&self.gateway),
@@ -557,6 +646,7 @@ impl HostState {
             "mobius-gateway",
             true,
             reusable_router,
+            Arc::clone(&self.provider_epoch),
         )
         .await
         {
@@ -575,6 +665,7 @@ impl HostState {
                     "mobius-gateway-rollback",
                     true,
                     Some(old_router),
+                    Arc::clone(&self.provider_epoch),
                 )
                 .await;
                 let recovery = match recovery {
@@ -674,6 +765,7 @@ impl HostState {
             origin_label,
             false,
             None,
+            Arc::clone(&self.provider_epoch),
         )
         .await
         .map_err(internal)?;

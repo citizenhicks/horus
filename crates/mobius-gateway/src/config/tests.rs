@@ -59,22 +59,22 @@ fn quick_cloudflare_config_round_trips_without_a_token() {
 }
 
 #[test]
-fn gateway_config_rejects_v14_without_migration() {
+fn gateway_config_rejects_v15_without_migration() {
     let root = tempfile::tempdir().expect("temporary directory");
     let state = root.path().join("state");
     ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
     let path = state.join(CONFIG_FILE);
     let contents = fs::read_to_string(&path)
         .expect("read gateway config")
-        .replacen("version = 15", "version = 14", 1);
-    fs::write(&path, contents).expect("write v14 config");
+        .replacen("version = 16", "version = 15", 1);
+    fs::write(&path, contents).expect("write v15 config");
 
-    let error = ConfigStore::open(state).expect_err("v14 must be rejected");
+    let error = ConfigStore::open(state).expect_err("v15 must be rejected");
 
     assert!(
         error
             .to_string()
-            .contains("unsupported gateway config version 14")
+            .contains("unsupported gateway config version 15")
     );
 }
 
@@ -105,7 +105,7 @@ fn generated_toml_round_trips_manifest_settings() {
     let contents = fs::read_to_string(state.join(CONFIG_FILE)).expect("read config");
     let (_, restored) = ConfigStore::open(state).expect("open config");
 
-    assert!(contents.starts_with("version = 15"));
+    assert!(contents.starts_with("version = 16"));
     assert!(contents.contains("max_model_steps = 256"));
     assert!(contents.contains("[default_agent.config.middleware.settings.context_offloading]"));
     assert!(contents.contains("[default_agent.config.middleware.settings.sessions]"));
@@ -119,6 +119,7 @@ fn provider_registration_never_silently_changes_existing_defaults() {
         provider: "kimi".into(),
         model: "kimi-k3".into(),
         base_url: None,
+        endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
         reasoning_effort: Some("max".into()),
         web_search: mobius::backend::model::provider::HostedWebSearch::Off,
     };
@@ -128,7 +129,8 @@ fn provider_registration_never_silently_changes_existing_defaults() {
     let openrouter = ProviderConfig {
         provider: "openrouter".into(),
         model: "openrouter/pareto-code".into(),
-        base_url: None,
+        base_url: Some("https://openrouter.ai/api/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
         reasoning_effort: None,
         web_search: mobius::backend::model::provider::HostedWebSearch::Off,
     };
@@ -167,6 +169,24 @@ fn provider_registration_never_silently_changes_existing_defaults() {
     let default = third.default_agent.expect("preserved default");
     assert_eq!(default.revision, 1);
     assert_eq!(default.config.provider, kimi);
+
+    let replaced = second
+        .registering_provider(updated.clone(), Vec::new(), Vec::new())
+        .expect("update registered provider")
+        .replacing_provider_default(&updated)
+        .expect("replace same-provider default");
+    let default = replaced.default_agent.as_ref().expect("replaced default");
+    assert_eq!(default.revision, 2);
+    assert_eq!(default.config.provider, updated);
+    assert_eq!(
+        replaced
+            .replacing_provider_default(&default.config.provider)
+            .expect("idempotent replacement")
+            .default_agent
+            .expect("unchanged default")
+            .revision,
+        2
+    );
 }
 
 #[test]
@@ -175,6 +195,7 @@ fn configured_custom_provider_keeps_its_endpoint_and_model() {
         provider: "responses".into(),
         model: "vendor/model-opaque".into(),
         base_url: Some("https://example.com/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
         reasoning_effort: Some("provider-defined".into()),
         web_search: mobius::backend::model::provider::HostedWebSearch::Off,
     };
@@ -206,11 +227,122 @@ fn configured_custom_provider_keeps_its_endpoint_and_model() {
 }
 
 #[test]
+fn openrouter_accepts_a_credentialless_custom_https_endpoint() {
+    let selection = ProviderConfig {
+        provider: "openrouter".into(),
+        model: "openai/gpt-5".into(),
+        base_url: Some("https://connector.example/v1".into()),
+        endpoint_auth: ProviderEndpointAuth::Credentialless,
+        reasoning_effort: None,
+        web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+    };
+
+    GatewayConfig::new(DEFAULT_LISTEN, None)
+        .expect("gateway config")
+        .registering_provider(selection.clone(), vec![selection.model], Vec::new())
+        .expect("credentialless OpenRouter endpoint");
+}
+
+#[test]
+fn credentialless_endpoint_rejects_openrouter_default_aliases() {
+    for base_url in [
+        "https://OPENROUTER.AI:443/api/v1/",
+        "https://openrouter.ai/alternate-path",
+    ] {
+        let selection = ProviderConfig {
+            provider: "openrouter".into(),
+            model: "openai/gpt-5".into(),
+            base_url: Some(base_url.into()),
+            endpoint_auth: ProviderEndpointAuth::Credentialless,
+            reasoning_effort: None,
+            web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+        };
+
+        let error = GatewayConfig::new(DEFAULT_LISTEN, None)
+            .expect("gateway config")
+            .registering_provider(selection.clone(), vec![selection.model], Vec::new())
+            .expect_err("default endpoint origin must require provider authentication");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires provider authentication")
+        );
+    }
+}
+
+#[test]
+fn credentialless_endpoint_requires_https() {
+    let selection = ProviderConfig {
+        provider: "openrouter".into(),
+        model: "openai/gpt-5".into(),
+        base_url: Some("http://127.0.0.1:8080/v1".into()),
+        endpoint_auth: ProviderEndpointAuth::Credentialless,
+        reasoning_effort: None,
+        web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+    };
+
+    let error = GatewayConfig::new(DEFAULT_LISTEN, None)
+        .expect("gateway config")
+        .registering_provider(selection.clone(), vec![selection.model], Vec::new())
+        .expect_err("credentialless endpoint must require HTTPS");
+
+    assert!(error.to_string().contains("must use HTTPS"));
+}
+
+#[test]
+fn credentialless_endpoint_rejects_secret_bearing_url_components() {
+    for base_url in [
+        "https://secret@connector.example/v1",
+        "https://connector.example/v1?token=secret",
+        "https://connector.example/v1#secret",
+    ] {
+        let selection = ProviderConfig {
+            provider: "openrouter".into(),
+            model: "openai/gpt-5".into(),
+            base_url: Some(base_url.into()),
+            endpoint_auth: ProviderEndpointAuth::Credentialless,
+            reasoning_effort: None,
+            web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+        };
+
+        GatewayConfig::new(DEFAULT_LISTEN, None)
+            .expect("gateway config")
+            .registering_provider(selection.clone(), vec![selection.model], Vec::new())
+            .expect_err("secret-bearing endpoint must be rejected");
+    }
+}
+
+#[test]
+fn credentialless_endpoint_requires_manifest_support() {
+    let selection = ProviderConfig {
+        provider: "responses".into(),
+        model: "custom-model".into(),
+        base_url: Some("https://connector.example/v1".into()),
+        endpoint_auth: ProviderEndpointAuth::Credentialless,
+        reasoning_effort: None,
+        web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+    };
+
+    let error = GatewayConfig::new(DEFAULT_LISTEN, None)
+        .expect("gateway config")
+        .registering_provider(selection.clone(), vec![selection.model], Vec::new())
+        .expect_err("manifest must allow credentialless endpoints");
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not support credentialless")
+    );
+}
+
+#[test]
 fn custom_provider_registration_validates_its_model_catalog() {
     let selection = ProviderConfig {
         provider: "openrouter".into(),
         model: "anthropic/claude-sonnet-4".into(),
-        base_url: None,
+        base_url: Some("https://openrouter.ai/api/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
         reasoning_effort: None,
         web_search: mobius::backend::model::provider::HostedWebSearch::Off,
     };
@@ -273,7 +405,8 @@ fn custom_provider_catalogs_accept_opaque_ids_but_reject_ambiguous_routes() {
             ProviderConfig {
                 provider: "openrouter".into(),
                 model: "vendor::model".into(),
-                base_url: None,
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: None,
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
@@ -286,7 +419,8 @@ fn custom_provider_catalogs_accept_opaque_ids_but_reject_ambiguous_routes() {
             ProviderConfig {
                 provider: "openrouter".into(),
                 model: "vendor:".into(),
-                base_url: None,
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: Some("high".into()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
@@ -312,7 +446,8 @@ fn custom_provider_catalogs_bound_the_total_generated_routes() {
             ProviderConfig {
                 provider: "openrouter".into(),
                 model: models[0].clone(),
-                base_url: None,
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: Some(efforts[0].clone()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
@@ -327,6 +462,7 @@ fn custom_provider_catalogs_bound_the_total_generated_routes() {
                 provider: "responses".into(),
                 model: "local-model".into(),
                 base_url: Some("http://127.0.0.1:11434/v1".into()),
+                endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: None,
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
@@ -347,7 +483,8 @@ fn provider_registration_rejects_a_catalog_that_invalidates_the_current_default(
             ProviderConfig {
                 provider: "openrouter".into(),
                 model: model.clone(),
-                base_url: None,
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: Some("high".into()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
@@ -361,7 +498,8 @@ fn provider_registration_rejects_a_catalog_that_invalidates_the_current_default(
             ProviderConfig {
                 provider: "openrouter".into(),
                 model: model.clone(),
-                base_url: None,
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: Some("medium".into()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
@@ -386,7 +524,8 @@ fn default_and_persisted_config_validate_custom_reasoning_membership() {
             ProviderConfig {
                 provider: "openrouter".into(),
                 model: model.clone(),
-                base_url: None,
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: Some("high".into()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
@@ -430,7 +569,8 @@ fn chat_replacement_rejects_out_of_catalog_model_and_reasoning() {
             ProviderConfig {
                 provider: "openrouter".into(),
                 model: model.clone(),
-                base_url: None,
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: Some("high".into()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
@@ -830,7 +970,11 @@ fn provider_credentials_are_owner_only_and_absent_from_agent_snapshots() {
     let credentials = CredentialStore::open(path.clone()).expect("credential store");
 
     credentials
-        .set("openrouter", "write-only-secret", None)
+        .set(
+            "openrouter",
+            "write-only-secret",
+            Some("https://openrouter.ai/api/v1"),
+        )
         .expect("store credential");
 
     let mode = fs::metadata(path)

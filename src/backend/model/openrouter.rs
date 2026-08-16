@@ -34,11 +34,27 @@ pub(super) const fn provider() -> ProviderDefinition {
         build_provider,
     )
     .with_image_input()
+    .with_base_url(BASE_URL)
+    .with_credentialless_endpoints()
 }
 
 fn build_provider(config: ProviderBuildConfig) -> Result<Arc<dyn Model>> {
-    let api_key = config.credential.into_api_key("openrouter")?;
-    let provider = OpenAi::with_client(api_key, BASE_URL, config.model, config.http)?;
+    let base_url = config
+        .base_url
+        .ok_or_else(|| Error::Config("OpenRouter requires a base URL".into()))?;
+    let provider = match config.credential {
+        super::provider::ProviderCredential::ApiKey(api_key) => {
+            OpenAi::with_client(api_key, base_url, config.model, config.http)?
+        }
+        super::provider::ProviderCredential::Credentialless => {
+            OpenAi::without_authorization(base_url, config.model, config.http)?
+        }
+        super::provider::ProviderCredential::Browser(_) => {
+            return Err(Error::Config(
+                "OpenRouter requires an API key or credentialless endpoint".into(),
+            ));
+        }
+    };
     let provider = match config.reasoning_effort {
         Some(effort) => provider.with_reasoning_effort(effort)?,
         None => provider,
@@ -70,7 +86,7 @@ mod tests {
                 .build(ProviderBuildConfig {
                     credential: ProviderCredential::ApiKey("test-key".into()),
                     model: "test-model".into(),
-                    base_url: None,
+                    base_url: Some(BASE_URL.into()),
                     reasoning_effort: None,
                     web_search,
                     http: reqwest::Client::new(),

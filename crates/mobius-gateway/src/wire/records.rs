@@ -166,9 +166,18 @@ pub struct ProviderConfig {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    pub endpoint_auth: ProviderEndpointAuth,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     pub web_search: HostedWebSearch,
+}
+
+/// Authentication applied when calling one configured provider endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderEndpointAuth {
+    ProviderDefault,
+    Credentialless,
 }
 
 /// Credential availability exposed without returning credential material.

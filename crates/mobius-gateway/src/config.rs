@@ -25,8 +25,8 @@ use serde_json::Value;
 use sha2::Digest as _;
 
 use crate::wire::{
-    AgentComposition, DailyUsage, ProfileSnapshot, ProviderConfig, VersionedAgentConfig,
-    WorkspaceInfo,
+    AgentComposition, DailyUsage, ProfileSnapshot, ProviderConfig, ProviderEndpointAuth,
+    VersionedAgentConfig, WorkspaceInfo,
 };
 use crate::{Error, Result};
 
@@ -38,7 +38,7 @@ pub(crate) use self::validation::{effective_reasoning_effort, model_route_id};
 use self::workspace::*;
 pub(crate) use self::workspace::{create_workspace_directory, local_user_name};
 
-const CONFIG_VERSION: u32 = 15;
+const CONFIG_VERSION: u32 = 16;
 const CHAT_SPEC_VERSION: u32 = 7;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "mobius_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
@@ -130,6 +130,7 @@ impl Default for AgentComposition {
                 provider: provider.id().into(),
                 model: model.id.into(),
                 base_url: provider.default_base_url().map(str::to_string),
+                endpoint_auth: ProviderEndpointAuth::ProviderDefault,
                 reasoning_effort: model.default_reasoning.map(str::to_string),
                 web_search: *provider
                     .web_search()
@@ -192,6 +193,32 @@ impl GatewayConfig {
                 config,
             });
         }
+        next.validate()?;
+        Ok(next)
+    }
+
+    /// Replaces a same-provider new-chat default during an explicit fleet cutover.
+    pub(crate) fn replacing_provider_default(&self, selection: &ProviderConfig) -> Result<Self> {
+        let Some(current) = self.default_agent.as_ref() else {
+            return Err(Error::Config(
+                "register a provider before replacing its default".into(),
+            ));
+        };
+        if current.config.provider.provider != selection.provider
+            || current.config.provider == *selection
+        {
+            return Ok(self.clone());
+        }
+        let mut next = self.clone();
+        let mut config = current.config.clone();
+        config.provider = selection.clone();
+        next.default_agent = Some(VersionedAgentConfig {
+            revision: current
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| Error::Config("configuration revision overflow".into()))?,
+            config,
+        });
         next.validate()?;
         Ok(next)
     }
@@ -357,12 +384,22 @@ impl ChatSpec {
         state_dir: &Path,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
-        let value = metadata.get(CHAT_SPEC_METADATA_KEY).ok_or_else(|| {
+        Self::from_metadata_if_present(metadata, state_dir, tls)?.ok_or_else(|| {
             Error::Config("chat checkpoint has no gateway runtime configuration".into())
-        })?;
+        })
+    }
+
+    pub(crate) fn from_metadata_if_present(
+        metadata: &BTreeMap<String, Value>,
+        state_dir: &Path,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Option<Self>> {
+        let Some(value) = metadata.get(CHAT_SPEC_METADATA_KEY) else {
+            return Ok(None);
+        };
         let spec: Self = serde_json::from_value(value.clone())?;
         spec.validate(state_dir, tls)?;
-        Ok(spec)
+        Ok(Some(spec))
     }
 
     pub(crate) fn metadata(&self) -> Result<BTreeMap<String, Value>> {
@@ -406,6 +443,24 @@ impl ChatSpec {
         next.validate(state_dir, tls)?;
         gateway.validate_provider_selection(&next.agent.config.provider)?;
         Ok(next)
+    }
+
+    pub(crate) fn replacing_provider_selection(
+        &self,
+        selection: &ProviderConfig,
+        gateway: &GatewayConfig,
+        state_dir: &Path,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Option<Self>> {
+        if self.agent.config.provider.provider != selection.provider
+            || self.agent.config.provider == *selection
+        {
+            return Ok(None);
+        }
+        let mut composition = self.agent.config.clone();
+        composition.provider = selection.clone();
+        self.replacing_agent(self.agent.revision, composition, gateway, state_dir, tls)
+            .map(Some)
     }
 
     fn validate(&self, state_dir: &Path, tls: Option<&TlsConfig>) -> Result<()> {

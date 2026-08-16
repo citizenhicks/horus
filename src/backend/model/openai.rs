@@ -67,7 +67,7 @@ fn openai_model_pricing(model: &str) -> Option<ModelPricing> {
 /// OpenAI Responses API configuration.
 pub struct OpenAi {
     client: Client,
-    auth: Arc<dyn OpenAiAuthorization>,
+    auth: Option<Arc<dyn OpenAiAuthorization>>,
     base_url: String,
     model: String,
     reasoning_effort: Option<String>,
@@ -108,6 +108,23 @@ impl OpenAi {
 
     pub(super) fn with_authorization(
         auth: Arc<dyn OpenAiAuthorization>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        client: Client,
+    ) -> Result<Self> {
+        Self::from_parts(Some(auth), base_url, model, client)
+    }
+
+    pub(super) fn without_authorization(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        client: Client,
+    ) -> Result<Self> {
+        Self::from_parts(None, base_url, model, client)
+    }
+
+    fn from_parts(
+        auth: Option<Arc<dyn OpenAiAuthorization>>,
         base_url: impl Into<String>,
         model: impl Into<String>,
         client: Client,
@@ -309,13 +326,16 @@ impl OpenAi {
         session_id: Option<&str>,
     ) -> Result<reqwest::Response> {
         for attempt in 0..2 {
-            let authorization = self.auth.authorize_http(streaming, session_id).await?;
-            let rejected_token = authorization.token.clone();
             let mut request = self
                 .client
                 .post(format!("{}/{endpoint}", self.base_url))
-                .json(body)
-                .bearer_auth(authorization.token);
+                .json(body);
+            let Some(auth) = &self.auth else {
+                return Ok(request.send().await?);
+            };
+            let authorization = auth.authorize_http(streaming, session_id).await?;
+            let rejected_token = authorization.token.clone();
+            request = request.bearer_auth(authorization.token);
             for (name, value) in authorization.headers {
                 request = request.header(name, value);
             }
@@ -323,7 +343,7 @@ impl OpenAi {
             if response.status() != reqwest::StatusCode::UNAUTHORIZED || attempt == 1 {
                 return Ok(response);
             }
-            if !self.auth.recover_unauthorized(&rejected_token).await? {
+            if !auth.recover_unauthorized(&rejected_token).await? {
                 return Ok(response);
             }
         }
