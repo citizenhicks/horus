@@ -236,6 +236,7 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(config, forKey: "config")
             try container.encode(modelIds, forKey: "modelIds")
             try container.encode(reasoningEfforts, forKey: "reasoningEfforts")
+            try container.encode(false, forKey: "replaceExistingSelections")
         case .createPairingCode(let requestID):
             try container.encode("create_pairing_code", forKey: "type")
             try container.encode(requestID, forKey: "requestId")

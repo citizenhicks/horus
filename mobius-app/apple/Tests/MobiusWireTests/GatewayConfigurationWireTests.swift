@@ -31,6 +31,7 @@ extension GatewayWireTests {
         XCTAssertNil(provider["api_key_env"])
         XCTAssertEqual(registered["model_ids"] as? [String], ["gpt-5.6-sol", "gpt-5.6-mini"])
         XCTAssertEqual(registered["reasoning_efforts"] as? [String], ["medium", "high"])
+        XCTAssertEqual(registered["replace_existing_selections"] as? Bool, false)
 
         let directory = try requestObject(.createWorkspaceDirectory(
             requestID: "create-directory-1",
