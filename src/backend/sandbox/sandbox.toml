@@ -3,9 +3,9 @@ label = "Sandbox"
 description = "Control mutation approval and command isolation"
 
 [prompt]
-linux = "Horus is running on Linux."
-macos = "Horus is running on macOS."
-other = "Horus is running on an unsupported operating system."
+linux = "möbius is running on Linux."
+macos = "möbius is running on macOS."
+other = "möbius is running on an unsupported operating system."
 
 [defaults]
 approval_policy = "auto_approve"

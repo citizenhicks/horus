@@ -28,7 +28,7 @@ mod text {
 }
 
 const MAX_DIRECT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-const MATERIALIZED_ATTACHMENTS_FIELD: &str = "_horus_attachment_blobs";
+const MATERIALIZED_ATTACHMENTS_FIELD: &str = "_mobius_attachment_blobs";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,7 +68,7 @@ impl Attachments {
         }
     }
 
-    /// Exposes uploads as workspace-local copies below the workspace's `.horus` directory.
+    /// Exposes uploads as workspace-local copies below the workspace's `.mobius` directory.
     ///
     /// Every session using that workspace can read those project-local files.
     pub fn with_workspace(mut self, workspace: impl AsRef<Path>) -> Result<Self> {
@@ -450,7 +450,7 @@ async fn stage_attachment(
 }
 
 fn staged_attachment_path(session_id: &str, reference: &SessionFileReference) -> PathBuf {
-    PathBuf::from(".horus")
+    PathBuf::from(".mobius")
         .join("attachments")
         .join(session_storage_key(session_id))
         .join(&reference.id)
@@ -462,8 +462,8 @@ fn ensure_staging_directories(
     session_id: &str,
     attachment_id: &str,
 ) -> Result<Dir> {
-    let horus = open_or_create_dir(workspace, ".horus")?;
-    let attachments = open_or_create_dir(&horus, "attachments")?;
+    let mobius = open_or_create_dir(workspace, ".mobius")?;
+    let attachments = open_or_create_dir(&mobius, "attachments")?;
     let session = open_or_create_dir(&attachments, &session_storage_key(session_id))?;
     open_or_create_dir(&session, attachment_id)
 }
@@ -764,7 +764,7 @@ mod tests {
 
         let workspace = tempfile::tempdir().expect("workspace");
         let outside = tempfile::tempdir().expect("outside");
-        symlink(outside.path(), workspace.path().join(".horus")).expect("symlink");
+        symlink(outside.path(), workspace.path().join(".mobius")).expect("symlink");
         let workspace =
             Dir::open_ambient_dir(workspace.path(), ambient_authority()).expect("open workspace");
 

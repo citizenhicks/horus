@@ -14,12 +14,12 @@ use crate::protocol::ToolCallBeginEvent;
 use crate::protocol::ToolCallEndEvent;
 use crate::protocol::UserMessageEvent;
 
-pub(crate) const INTERNAL_MESSAGE_FIELD: &str = "_horus_internal";
+pub(crate) const INTERNAL_MESSAGE_FIELD: &str = "_mobius_internal";
 pub(crate) const CONTEXT_COMPACTED_MARKER: &str = "context_compacted";
 pub(crate) const ATTACHMENT_CONTEXT_MARKER: &str = "attachments";
-pub(crate) const ATTACHMENTS_FIELD: &str = "_horus_attachments";
-pub(crate) const REPLAY_REASONING_FIELD: &str = "_horus_reasoning";
-pub(crate) const TOOL_ERROR_FIELD: &str = "_horus_is_error";
+pub(crate) const ATTACHMENTS_FIELD: &str = "_mobius_attachments";
+pub(crate) const REPLAY_REASONING_FIELD: &str = "_mobius_reasoning";
+pub(crate) const TOOL_ERROR_FIELD: &str = "_mobius_is_error";
 const FORKED_ATTACHMENT_PLACEHOLDER: &str = "[Attachment unavailable in this fork]";
 
 pub(crate) fn strip_attachment_references(items: &mut Vec<Value>) {
@@ -239,7 +239,7 @@ mod tests {
             serde_json::json!({
                 "role": "assistant",
                 "content": "done",
-                "_horus_reasoning": "neutral",
+                "_mobius_reasoning": "neutral",
                 "_anthropic_content": "provider-private"
             }),
             internal_user_message("compaction", "hidden"),
@@ -325,7 +325,7 @@ mod tests {
         let item = serde_json::json!({
             "role": "user",
             "content": [{"type": "input_text", "text": ""}],
-            "_horus_attachments": [{
+            "_mobius_attachments": [{
                 "id": "3d46beff-7e84-46ea-859a-e66b4614a79b",
                 "name": "photo.png",
                 "size": 4,
@@ -381,7 +381,7 @@ mod tests {
             serde_json::json!({
                 "role": "user",
                 "content": [{"type": "input_text", "text": ""}],
-                "_horus_attachments": [{
+                "_mobius_attachments": [{
                     "id": "3d46beff-7e84-46ea-859a-e66b4614a79b",
                     "name": "photo.png",
                     "size": 4,

@@ -113,7 +113,7 @@ impl From<&str> for ProviderError {
     }
 }
 
-/// Errors returned by Horus modules.
+/// Errors returned by möbius modules.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("configuration error: {0}")]
@@ -155,7 +155,7 @@ pub enum Error {
     ),
 }
 
-/// Result type shared by Horus modules.
+/// Result type shared by möbius modules.
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) fn preview_json(value: &serde_json::Value) -> String {

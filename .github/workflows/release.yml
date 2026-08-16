@@ -3,9 +3,9 @@ name: Release
 on:
   push:
     tags:
-      - horus-v*
-      - horus-gateway-v*
-      - horus-cli-v*
+      - mobius-v*
+      - mobius-gateway-v*
+      - mobius-cli-v*
 
 permissions:
   contents: read
@@ -51,8 +51,8 @@ jobs:
       - run: cargo test --workspace --all-targets --all-features --locked
 
   publish-framework:
-    name: Publish horus
-    if: startsWith(github.ref_name, 'horus-v')
+    name: Publish mobius
+    if: startsWith(github.ref_name, 'mobius-v')
     needs: verify
     runs-on: ubuntu-latest
     steps:
@@ -63,18 +63,18 @@ jobs:
           rustup default stable
       - name: Verify tag version
         run: |
-          version="${GITHUB_REF_NAME#horus-v}"
+          version="${GITHUB_REF_NAME#mobius-v}"
           manifest_version="$(cargo metadata --no-deps --format-version 1 |
-            jq -r '.packages[] | select(.name == "horus") | .version')"
+            jq -r '.packages[] | select(.name == "mobius") | .version')"
           test "$version" = "$manifest_version"
       - name: Publish
-        run: cargo publish --locked -p horus
+        run: cargo publish --locked -p mobius
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-cli:
-    name: Publish horus-cli
-    if: startsWith(github.ref_name, 'horus-cli-v')
+    name: Publish mobius-cli
+    if: startsWith(github.ref_name, 'mobius-cli-v')
     needs: verify
     runs-on: ubuntu-latest
     steps:
@@ -85,27 +85,27 @@ jobs:
           rustup default stable
       - name: Verify tag version
         run: |
-          version="${GITHUB_REF_NAME#horus-cli-v}"
+          version="${GITHUB_REF_NAME#mobius-cli-v}"
           manifest_version="$(cargo metadata --no-deps --format-version 1 |
-            jq -r '.packages[] | select(.name == "horus-cli") | .version')"
+            jq -r '.packages[] | select(.name == "mobius-cli") | .version')"
           test "$version" = "$manifest_version"
       - name: Verify dependencies were published first
         run: |
           metadata="$(cargo metadata --no-deps --format-version 1)"
-          horus_version="$(jq -r '.packages[] | select(.name == "horus-cli") |
-            .dependencies[] | select(.name == "horus") | .req | ltrimstr("=")' <<<"$metadata")"
-          gateway_version="$(jq -r '.packages[] | select(.name == "horus-cli") |
-            .dependencies[] | select(.name == "horus-gateway") | .req | ltrimstr("=")' <<<"$metadata")"
-          cargo info --registry crates-io "horus@$horus_version" >/dev/null
-          cargo info --registry crates-io "horus-gateway@$gateway_version" >/dev/null
+          mobius_version="$(jq -r '.packages[] | select(.name == "mobius-cli") |
+            .dependencies[] | select(.name == "mobius") | .req | ltrimstr("=")' <<<"$metadata")"
+          gateway_version="$(jq -r '.packages[] | select(.name == "mobius-cli") |
+            .dependencies[] | select(.name == "mobius-gateway") | .req | ltrimstr("=")' <<<"$metadata")"
+          cargo info --registry crates-io "mobius@$mobius_version" >/dev/null
+          cargo info --registry crates-io "mobius-gateway@$gateway_version" >/dev/null
       - name: Publish
-        run: cargo publish --locked -p horus-cli
+        run: cargo publish --locked -p mobius-cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-gateway:
-    name: Publish horus-gateway
-    if: startsWith(github.ref_name, 'horus-gateway-v')
+    name: Publish mobius-gateway
+    if: startsWith(github.ref_name, 'mobius-gateway-v')
     needs: verify
     runs-on: ubuntu-latest
     steps:
@@ -116,24 +116,24 @@ jobs:
           rustup default stable
       - name: Verify tag version
         run: |
-          version="${GITHUB_REF_NAME#horus-gateway-v}"
+          version="${GITHUB_REF_NAME#mobius-gateway-v}"
           manifest_version="$(cargo metadata --no-deps --format-version 1 |
-            jq -r '.packages[] | select(.name == "horus-gateway") | .version')"
+            jq -r '.packages[] | select(.name == "mobius-gateway") | .version')"
           test "$version" = "$manifest_version"
-      - name: Verify horus was published first
+      - name: Verify mobius was published first
         run: |
-          horus_version="$(cargo metadata --no-deps --format-version 1 |
-            jq -r '.packages[] | select(.name == "horus-gateway") |
-              .dependencies[] | select(.name == "horus") | .req | ltrimstr("=")')"
-          cargo info --registry crates-io "horus@$horus_version" >/dev/null
+          mobius_version="$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "mobius-gateway") |
+              .dependencies[] | select(.name == "mobius") | .req | ltrimstr("=")')"
+          cargo info --registry crates-io "mobius@$mobius_version" >/dev/null
       - name: Publish
-        run: cargo publish --locked -p horus-gateway
+        run: cargo publish --locked -p mobius-gateway
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   gateway-binaries:
     name: Gateway binary (${{ matrix.os }})
-    if: startsWith(github.ref_name, 'horus-gateway-v')
+    if: startsWith(github.ref_name, 'mobius-gateway-v')
     needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
@@ -150,11 +150,11 @@ jobs:
           rustup default stable
       - name: Verify tag version
         run: |
-          version="${GITHUB_REF_NAME#horus-gateway-v}"
+          version="${GITHUB_REF_NAME#mobius-gateway-v}"
           manifest_version="$(cargo metadata --no-deps --format-version 1 |
-            jq -r '.packages[] | select(.name == "horus-gateway") | .version')"
+            jq -r '.packages[] | select(.name == "mobius-gateway") | .version')"
           test "$version" = "$manifest_version"
-      - run: cargo build --release --locked -p horus-cli --bin horus-gateway
+      - run: cargo build --release --locked -p mobius-cli --bin mobius-gateway
       - name: Bundle pinned cloudflared
         run: |
           host="$(rustc -vV | sed -n 's/^host: //p')"
@@ -197,12 +197,12 @@ jobs:
       - name: Package binary
         run: |
           host="$(rustc -vV | sed -n 's/^host: //p')"
-          version="${GITHUB_REF_NAME#horus-gateway-v}"
-          archive="horus-gateway-${version}-${host}.tar.gz"
+          version="${GITHUB_REF_NAME#mobius-gateway-v}"
+          archive="mobius-gateway-${version}-${host}.tar.gz"
           mkdir dist
-          cp target/release/horus-gateway LICENSE NOTICE package/
+          cp target/release/mobius-gateway LICENSE NOTICE package/
           tar -C package -czf "dist/$archive" \
-            horus-gateway cloudflared cloudflared-LICENSE LICENSE NOTICE
+            mobius-gateway cloudflared cloudflared-LICENSE LICENSE NOTICE
           cd dist
           shasum -a 256 "$archive" > "$archive.sha256"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -213,7 +213,7 @@ jobs:
 
   cli-binaries:
     name: CLI binary (${{ matrix.os }})
-    if: startsWith(github.ref_name, 'horus-cli-v')
+    if: startsWith(github.ref_name, 'mobius-cli-v')
     needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
@@ -230,11 +230,11 @@ jobs:
           rustup default stable
       - name: Verify tag version
         run: |
-          version="${GITHUB_REF_NAME#horus-cli-v}"
+          version="${GITHUB_REF_NAME#mobius-cli-v}"
           manifest_version="$(cargo metadata --no-deps --format-version 1 |
-            jq -r '.packages[] | select(.name == "horus-cli") | .version')"
+            jq -r '.packages[] | select(.name == "mobius-cli") | .version')"
           test "$version" = "$manifest_version"
-      - run: cargo build --release --locked -p horus-cli
+      - run: cargo build --release --locked -p mobius-cli
       - name: Bundle pinned cloudflared
         run: |
           host="$(rustc -vV | sed -n 's/^host: //p')"
@@ -277,12 +277,12 @@ jobs:
       - name: Package binary
         run: |
           host="$(rustc -vV | sed -n 's/^host: //p')"
-          version="${GITHUB_REF_NAME#horus-cli-v}"
-          archive="horus-${version}-${host}.tar.gz"
+          version="${GITHUB_REF_NAME#mobius-cli-v}"
+          archive="mobius-${version}-${host}.tar.gz"
           mkdir dist
-          cp target/release/horus target/release/horus-gateway LICENSE NOTICE package/
+          cp target/release/mobius target/release/mobius-gateway LICENSE NOTICE package/
           tar -C package -czf "dist/$archive" \
-            horus horus-gateway cloudflared cloudflared-LICENSE LICENSE NOTICE
+            mobius mobius-gateway cloudflared cloudflared-LICENSE LICENSE NOTICE
           cd dist
           shasum -a 256 "$archive" > "$archive.sha256"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -293,7 +293,7 @@ jobs:
 
   framework-release:
     name: Framework GitHub release
-    if: startsWith(github.ref_name, 'horus-v')
+    if: startsWith(github.ref_name, 'mobius-v')
     needs: publish-framework
     runs-on: ubuntu-latest
     permissions:
@@ -305,15 +305,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          version="${GITHUB_REF_NAME#horus-v}"
+          version="${GITHUB_REF_NAME#mobius-v}"
           gh release create "$GITHUB_REF_NAME" \
             --notes-file ".github/release-notes/${GITHUB_REF_NAME}.md" \
-            --title "Horus $version" \
+            --title "möbius $version" \
             --verify-tag
 
   gateway-release:
     name: Gateway GitHub release
-    if: startsWith(github.ref_name, 'horus-gateway-v')
+    if: startsWith(github.ref_name, 'mobius-gateway-v')
     needs:
       - publish-gateway
       - gateway-binaries
@@ -331,15 +331,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          version="${GITHUB_REF_NAME#horus-gateway-v}"
+          version="${GITHUB_REF_NAME#mobius-gateway-v}"
           gh release create "$GITHUB_REF_NAME" dist/* \
             --notes-file ".github/release-notes/${GITHUB_REF_NAME}.md" \
-            --title "Horus Gateway $version" \
+            --title "möbius Gateway $version" \
             --verify-tag
 
   cli-release:
     name: CLI GitHub release
-    if: startsWith(github.ref_name, 'horus-cli-v')
+    if: startsWith(github.ref_name, 'mobius-cli-v')
     needs:
       - publish-cli
       - cli-binaries
@@ -357,8 +357,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          version="${GITHUB_REF_NAME#horus-cli-v}"
+          version="${GITHUB_REF_NAME#mobius-cli-v}"
           gh release create "$GITHUB_REF_NAME" dist/* \
             --notes-file ".github/release-notes/${GITHUB_REF_NAME}.md" \
-            --title "Horus CLI $version" \
+            --title "möbius CLI $version" \
             --verify-tag

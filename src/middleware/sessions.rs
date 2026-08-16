@@ -739,7 +739,7 @@ mod tests {
         parent.context = vec![serde_json::json!({
             "role": "user",
             "content": "Hello",
-            "_horus_attachments": [{
+            "_mobius_attachments": [{
                 "id": "378b8581-e96c-4413-a138-93e74561cb87",
                 "name": "photo.png",
                 "size": 1,
@@ -760,7 +760,7 @@ mod tests {
 
         let fork = manual_fork_checkpoint(&parent, parent.context.clone());
 
-        assert!(fork.context[0].get("_horus_attachments").is_none());
+        assert!(fork.context[0].get("_mobius_attachments").is_none());
         assert_eq!(fork.first_user_message, parent.first_user_message);
         assert_eq!(fork.metadata, parent.metadata);
         assert_eq!(

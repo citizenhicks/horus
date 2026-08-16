@@ -1,0 +1,816 @@
+use super::*;
+
+#[tokio::test]
+async fn durable_event_journal_restores_complete_turn_pages() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) =
+        ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway =
+        GatewayHost::start(store, config, credentials, Arc::clone(&cron)).expect("gateway");
+    let host = gateway
+        .create_session(&workspace)
+        .await
+        .expect("create session");
+    let checkpoints = Arc::clone(&gateway.state.lock().await.checkpoints);
+    let session_id = host.session_id().to_owned();
+    assert!(host.stop_if_idle().await);
+    gateway.state.lock().await.sessions.remove(&session_id);
+    drop(host);
+    let mut latest_start = 0;
+    for (index, event) in [
+        EventMsg::TurnStarted(mobius::protocol::TurnStartedEvent {
+            turn_id: "older".into(),
+            model_context_window: None,
+        }),
+        EventMsg::Warning(mobius::protocol::WarningEvent {
+            message: "older work".into(),
+        }),
+        EventMsg::TurnComplete(mobius::protocol::TurnCompleteEvent {
+            turn_id: "older".into(),
+        }),
+        EventMsg::TurnStarted(mobius::protocol::TurnStartedEvent {
+            turn_id: "latest".into(),
+            model_context_window: None,
+        }),
+        EventMsg::Warning(mobius::protocol::WarningEvent {
+            message: "latest work".into(),
+        }),
+        EventMsg::TurnComplete(mobius::protocol::TurnCompleteEvent {
+            turn_id: "latest".into(),
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let record = checkpoints
+            .append_event(
+                &session_id,
+                i64::try_from(index).expect("timestamp"),
+                &Event {
+                    submission_id: None,
+                    msg: event,
+                },
+            )
+            .await
+            .expect("append journal event");
+        if index == 3 {
+            latest_start = record.sequence;
+        }
+    }
+    let durable_highwater = checkpoints
+        .append_event(
+            &session_id,
+            6,
+            &Event {
+                submission_id: None,
+                msg: EventMsg::Frontend(FrontendEvent::Preview {
+                    id: "transient".into(),
+                    title: "Transient".into(),
+                    subtitle: String::new(),
+                    page_id: "transient:latest".into(),
+                    update: mobius::protocol::FrontendPreviewUpdate::Replace,
+                    events: Vec::new(),
+                    next: None,
+                }),
+            },
+        )
+        .await
+        .expect("advance journal high-water")
+        .sequence;
+
+    let reopened = gateway
+        .open_session(&session_id)
+        .await
+        .expect("reopen session");
+    let snapshot = reopened.snapshot(None).await.expect("session snapshot");
+    let older = reopened
+        .history_page(snapshot.ready.next_before_sequence)
+        .await
+        .expect("older turn");
+
+    assert!(snapshot.ready.latest_sequence >= durable_highwater);
+    assert_eq!(snapshot.replay.len(), 3);
+    assert_eq!(snapshot.ready.next_before_sequence, Some(latest_start));
+    assert!(matches!(
+        &older.records[..],
+        [
+            RecordedEvent {
+                event: Event { msg: EventMsg::TurnStarted(started), .. },
+                ..
+            },
+            RecordedEvent {
+                event: Event { msg: EventMsg::Warning(warning), .. },
+                ..
+            },
+            RecordedEvent {
+                event: Event { msg: EventMsg::TurnComplete(completed), .. },
+                ..
+            }
+        ] if started.turn_id == "older"
+            && warning.message == "older work"
+            && completed.turn_id == "older"
+    ));
+}
+
+#[tokio::test]
+async fn initial_snapshot_restores_transient_widgets_without_replaying_them() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) =
+        ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+    let host = gateway
+        .create_session(&workspace)
+        .await
+        .expect("create session");
+
+    let snapshot = host.snapshot(None).await.expect("session snapshot");
+
+    assert!(!snapshot.ready.widgets.is_empty());
+    assert!(snapshot.replay.iter().all(|frame| {
+        !matches!(
+            &frame.message,
+            ServerMessage::AgentEvent {
+                record: RecordedEvent {
+                    event: Event {
+                        msg: EventMsg::Frontend(
+                            FrontendEvent::Widget { .. } | FrontendEvent::RemoveWidget { .. }
+                        ),
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        )
+    }));
+}
+
+#[tokio::test]
+async fn replacement_ready_precedes_every_reconciled_startup_event() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) =
+        ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
+    let config = config
+        .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
+        .expect("register provider");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+    let host = gateway
+        .create_session(&workspace)
+        .await
+        .expect("create session");
+    let before = host.snapshot(None).await.expect("initial snapshot").ready;
+    let mut composition = before.config.config.clone();
+    composition.middleware.set_enabled("cron", false);
+    let mut updates = host.subscribe();
+
+    host.configure(before.config.revision, composition)
+        .await
+        .expect("replace agent");
+
+    let changed = updates.try_recv().expect("session changed");
+    let ServerMessage::SessionChanged { payload } = changed.message else {
+        panic!("replacement must publish ready before startup events");
+    };
+    let startup = std::iter::from_fn(|| updates.try_recv().ok()).collect::<Vec<_>>();
+    assert!(!payload.widgets.is_empty());
+    assert!(startup.iter().any(|frame| {
+        matches!(
+            &frame.message,
+            ServerMessage::AgentEvent {
+                record: RecordedEvent {
+                    event: Event {
+                        msg: EventMsg::Frontend(FrontendEvent::Widget { .. }),
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        )
+    }));
+    assert!(startup.iter().all(|frame| {
+        event_sequence(frame).is_none_or(|sequence| {
+            sequence > before.latest_sequence && sequence <= payload.latest_sequence
+        })
+    }));
+
+    host.submit(Submission {
+        id: "post-replacement".into(),
+        op: Op::Interrupt {
+            turn_id: "not-active".into(),
+        },
+    })
+    .await
+    .expect("submit after replacement");
+    let sequences = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let mut sequences = Vec::new();
+        loop {
+            let frame = updates.recv().await.expect("post-replacement event");
+            let ServerMessage::AgentEvent { record, .. } = frame.message else {
+                continue;
+            };
+            sequences.push(record.sequence);
+            if record.event.submission_id.as_deref() == Some("post-replacement") {
+                return sequences;
+            }
+        }
+    })
+    .await
+    .expect("post-replacement delivery");
+    assert_eq!(
+        sequences.first().copied(),
+        payload.latest_sequence.checked_add(1)
+    );
+    assert!(
+        sequences
+            .windows(2)
+            .all(|pair| pair[1] == pair[0].saturating_add(1))
+    );
+}
+
+#[tokio::test]
+async fn delete_session_stops_the_host_and_removes_its_durable_tree() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) =
+        ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway =
+        GatewayHost::start(store, config, credentials, Arc::clone(&cron)).expect("gateway");
+    let deleted = gateway
+        .create_session(&workspace)
+        .await
+        .expect("create deleted session");
+    let retained = gateway
+        .create_session(&workspace)
+        .await
+        .expect("create retained session");
+    let deleted_id = deleted.session_id().to_owned();
+    let retained_id = retained.session_id().to_owned();
+    let (checkpoints, session_files) = {
+        let state = gateway.state.lock().await;
+        (Arc::clone(&state.checkpoints), state.session_files.clone())
+    };
+    let parent = checkpoints
+        .load(&deleted_id)
+        .await
+        .expect("load parent")
+        .expect("parent checkpoint");
+    checkpoints
+        .fork(
+            &deleted_id,
+            parent.sequence,
+            &Checkpoint::empty("deleted-child"),
+        )
+        .await
+        .expect("fork child");
+    for session_id in [&deleted_id, "deleted-child"] {
+        session_files
+            .publish_artifact(
+                session_id,
+                "result.txt".into(),
+                "text/plain".into(),
+                b"result",
+            )
+            .await
+            .expect("publish artifact");
+    }
+    deleted
+        .rename_session(deleted_id.clone(), "Deleted".into())
+        .await
+        .expect("title deleted session");
+    retained
+        .rename_session(retained_id.clone(), "Retained".into())
+        .await
+        .expect("title retained session");
+    let task = cron
+        .add_for_test(&deleted_id, "scheduled task", "0 9 * * *")
+        .expect("schedule task");
+    let run = match cron.begin_run(&task.id).expect("begin run") {
+        BeginRun::Started(run) => run,
+        BeginRun::Skipped => panic!("new run must start"),
+    };
+    cron.finish_run(run, CronRunStatus::Succeeded, None)
+        .expect("finish run");
+
+    gateway
+        .delete_session(&deleted_id)
+        .await
+        .expect("delete session");
+
+    assert!(
+        checkpoints
+            .load(&deleted_id)
+            .await
+            .expect("load deleted")
+            .is_none()
+    );
+    assert!(
+        checkpoints
+            .load("deleted-child")
+            .await
+            .expect("load deleted child")
+            .is_none()
+    );
+    assert!(
+        session_files
+            .list_artifacts(&deleted_id)
+            .await
+            .expect("deleted artifacts")
+            .is_empty()
+    );
+    let metadata = load_session_metadata(&checkpoints)
+        .await
+        .expect("catalog metadata");
+    assert!(!metadata.contains_key(&deleted_id));
+    assert_eq!(metadata[&retained_id].title.as_deref(), Some("Retained"));
+    assert!(
+        cron.list(&deleted_id)
+            .expect("deleted schedules")
+            .is_empty()
+    );
+    assert!(
+        cron.history(&deleted_id, None)
+            .expect("deleted schedule history")
+            .is_empty()
+    );
+    assert!(!task.task.exists());
+    assert!(deleted.snapshot(None).await.is_err());
+    assert_eq!(
+        gateway
+            .sessions()
+            .await
+            .expect("remaining sessions")
+            .into_iter()
+            .map(|session| session.summary.session_id)
+            .collect::<Vec<_>>(),
+        [retained_id]
+    );
+}
+
+#[tokio::test]
+async fn delete_session_keeps_all_resident_hosts_when_a_descendant_is_busy() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) =
+        ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+    let root_host = gateway
+        .create_session(&workspace)
+        .await
+        .expect("create root session");
+    let root_id = root_host.session_id().to_owned();
+    let checkpoints = Arc::clone(&gateway.state.lock().await.checkpoints);
+    let root_checkpoint = checkpoints
+        .load(&root_id)
+        .await
+        .expect("load root")
+        .expect("root checkpoint");
+    checkpoints
+        .fork(
+            &root_id,
+            root_checkpoint.sequence,
+            &Checkpoint::empty("child"),
+        )
+        .await
+        .expect("fork child");
+
+    let (commands, mut receiver) = mpsc::channel(1);
+    tokio::spawn(async move {
+        if let Some(HostCommand::StopIfIdle { reply }) = receiver.recv().await {
+            let _ = reply.send(false);
+        }
+    });
+    let (events, _) = broadcast::channel(1);
+    gateway.state.lock().await.sessions.insert(
+        "child".into(),
+        HostHandle {
+            inner: Arc::new(HostInner {
+                session_id: "child".into(),
+                commands,
+                events,
+                accepts_file_attachments: Arc::new(AtomicBool::new(false)),
+                alive: Arc::new(AtomicBool::new(true)),
+            }),
+        },
+    );
+
+    let error = gateway
+        .delete_session(&root_id)
+        .await
+        .expect_err("busy descendant must reject deletion");
+
+    assert_eq!(error.code, "agent_busy");
+    let state = gateway.state.lock().await;
+    assert!(state.sessions.contains_key(&root_id));
+    assert!(state.sessions.contains_key("child"));
+}
+
+#[tokio::test]
+async fn open_session_rejects_invalid_ids_before_checkpoint_lookup() {
+    let root = tempfile::tempdir().expect("root");
+    let (store, config) = ConfigStore::initialize(
+        root.path().join("state"),
+        "127.0.0.1:8741".parse().expect("listen address"),
+        None,
+    )
+    .expect("config");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+
+    for session_id in [" ".to_owned(), "x".repeat(4097)] {
+        let error = match gateway.open_session(&session_id).await {
+            Ok(_) => panic!("invalid session ID must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "invalid_session_id");
+        assert_eq!(error.message, "session ID must be 1–4096 bytes");
+    }
+}
+
+#[test]
+fn cron_execution_inherits_the_chat_recipe_without_transcript_state() {
+    let mut source = Checkpoint::empty("source");
+    source.context.push(serde_json::json!({"role": "user"}));
+    source.first_user_message = Some("source message".into());
+    source.model_route = Some("kimi::kimi-k2.5::high".into());
+    source.metadata.insert(
+        "mobius_gateway.chat".into(),
+        serde_json::json!({"version": 1}),
+    );
+    source.session_context.workspace_id = Some("workspace".into());
+
+    let execution = cron_execution_checkpoint(&source, "execution", "cron · task");
+
+    assert_eq!(execution.model_route, source.model_route);
+    assert_eq!(execution.metadata, source.metadata);
+    assert_eq!(
+        execution.session_context,
+        mobius::protocol::SessionContext {
+            workspace_id: Some("workspace".into()),
+            origin_label: Some("cron · task".into()),
+            ..mobius::protocol::SessionContext::default()
+        }
+    );
+    assert!(execution.context.is_empty());
+    assert!(execution.first_user_message.is_none());
+    assert_eq!(execution.sequence, 0);
+}
+
+#[test]
+fn stopped_agent_finishes_its_active_cron_run() {
+    let state = tempfile::tempdir().expect("state");
+    let cron = CronStore::open(state.path()).expect("cron");
+    let task = cron
+        .add_for_test("source", "do work", "17 3 * * *")
+        .expect("task");
+    let run = match cron.begin_run(&task.id).expect("begin run") {
+        BeginRun::Started(run) => run,
+        BeginRun::Skipped => panic!("new task must start"),
+    };
+    let mut active = Some(ActiveCron {
+        run,
+        submission_id: "submission".into(),
+        turn_id: None,
+        failure: None,
+    });
+
+    fail_active_cron(&cron, &mut active, "agent stopped").expect("finish run");
+    let history = cron.history("source", Some(&task.id)).expect("history");
+
+    assert!(active.is_none());
+    assert_eq!(history[0].status, CronRunStatus::Failed);
+    assert_eq!(history[0].message.as_deref(), Some("agent stopped"));
+}
+
+#[tokio::test]
+async fn overlapping_cron_does_not_create_a_visible_execution_chat() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    let state_dir = root.path().join("state");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) = ConfigStore::initialize(state_dir, listen, None).expect("config");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway =
+        GatewayHost::start(store, config, credentials, Arc::clone(&cron)).expect("gateway");
+    let source = gateway
+        .create_session(&workspace)
+        .await
+        .expect("source chat");
+    let task = cron
+        .add_for_test(source.session_id(), "do work", "* * * * *")
+        .expect("task");
+    let held = match cron.begin_run(&task.id).expect("claim run") {
+        BeginRun::Started(run) => run,
+        BeginRun::Skipped => panic!("first run must start"),
+    };
+    let before = gateway.sessions().await.expect("sessions before");
+
+    let error = gateway
+        .run_cron(source.session_id().into(), task.id)
+        .await
+        .expect_err("overlap must fail");
+    let after = gateway.sessions().await.expect("sessions after");
+    cron.finish_run(held, CronRunStatus::Succeeded, None)
+        .expect("finish held run");
+
+    assert_eq!(error.code, "cron_overlap");
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn chats_keep_independent_workspace_and_agent_configuration() {
+    let root = tempfile::tempdir().expect("root");
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    let state = root.path().join("state");
+    std::fs::create_dir(&first).expect("first workspace");
+    std::fs::create_dir(&second).expect("second workspace");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) = ConfigStore::initialize(state, listen, None).expect("config");
+    let config = config
+        .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
+        .expect("register provider");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway =
+        GatewayHost::start(store, config, credentials, Arc::clone(&cron)).expect("gateway");
+    let first_host = gateway.create_session(&first).await.expect("first chat");
+    let second_host = gateway.create_session(&second).await.expect("second chat");
+    let scheduled = cron
+        .add_for_test(first_host.session_id(), "keep scheduled work", "0 9 * * *")
+        .expect("scheduled task");
+    let first_before = first_host
+        .snapshot(None)
+        .await
+        .expect("first snapshot")
+        .ready;
+    let second_before = second_host
+        .snapshot(None)
+        .await
+        .expect("second snapshot")
+        .ready;
+    let mut composition = first_before.config.config.clone();
+    composition.middleware.set_enabled("cron", false);
+
+    first_host
+        .configure(first_before.config.revision, composition)
+        .await
+        .expect("configure first chat");
+    let first_after = first_host
+        .snapshot(None)
+        .await
+        .expect("first updated")
+        .ready;
+    let second_after = second_host
+        .snapshot(None)
+        .await
+        .expect("second unchanged")
+        .ready;
+
+    assert_ne!(first_after.workspace, second_after.workspace);
+    assert!(!first_after.config.config.middleware.enabled("cron"));
+    assert_eq!(first_after.tool_count + 1, first_before.tool_count);
+    assert_eq!(
+        first_host
+            .start_cron_setup(None)
+            .await
+            .expect_err("disabled scheduler must reject setup")
+            .code,
+        "capability_disabled"
+    );
+    assert_eq!(
+        cron.list(first_host.session_id())
+            .expect("existing schedules")
+            .first()
+            .map(|task| task.id.as_str()),
+        Some(scheduled.id.as_str())
+    );
+    assert!(
+        first_after
+            .contributions
+            .iter()
+            .any(|contribution| contribution.capability == "sessions"),
+        "the /resume picker is gateway-standard, not an optional agent feature"
+    );
+    assert_eq!(second_after.config, second_before.config);
+
+    let first_id = first_host.session_id().to_owned();
+    let second_id = second_host.session_id().to_owned();
+    let (first_renamed, second_renamed) = tokio::join!(
+        first_host.rename_session(first_id.clone(), "first".into()),
+        second_host.rename_session(second_id.clone(), "second".into())
+    );
+    first_renamed.expect("rename first chat");
+    second_renamed.expect("rename second chat");
+    let checkpoints = Arc::clone(&gateway.state.lock().await.checkpoints);
+    let metadata = load_session_metadata(&checkpoints)
+        .await
+        .expect("catalog metadata");
+    assert_eq!(metadata[&first_id].title.as_deref(), Some("first"));
+    assert_eq!(metadata[&second_id].title.as_deref(), Some("second"));
+}
+
+#[tokio::test]
+async fn model_selection_updates_only_the_chat_and_new_chats_keep_the_gateway_default() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    let state = root.path().join("state");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) = ConfigStore::initialize(state, listen, None).expect("config");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
+    credentials
+        .set("openai_socket", "test-secret", None)
+        .expect("OpenAI credential");
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+    let mut gateway_updates = gateway.subscribe();
+    let ready = gateway
+        .register_provider(
+            ProviderConfig {
+                provider: "openai_socket".into(),
+                model: "gpt-5.6-sol".into(),
+                base_url: None,
+                reasoning_effort: Some("medium".into()),
+                web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("register OpenAI");
+    let broadcast = gateway_updates
+        .try_recv()
+        .expect("gateway-wide catalog update");
+    assert!(matches!(
+        broadcast.message,
+        ServerMessage::Ready { payload } if payload.models == ready.models
+    ));
+    let alternate = ready
+        .models
+        .iter()
+        .find(|choice| {
+            choice.model == "gpt-5.6-terra" && choice.reasoning_effort.as_deref() == Some("high")
+        })
+        .expect("alternate OpenAI model")
+        .route
+        .clone();
+    let selected = gateway
+        .create_session(&workspace)
+        .await
+        .expect("selected chat");
+    let mut selected_config = selected
+        .snapshot(None)
+        .await
+        .expect("selected snapshot")
+        .ready
+        .config
+        .config;
+    selected_config.provider.web_search = mobius::backend::model::provider::HostedWebSearch::Live;
+    selected
+        .configure(1, selected_config)
+        .await
+        .expect("configure selected chat search");
+
+    selected
+        .submit(Submission {
+            id: "set-model".into(),
+            op: Op::SetModel {
+                route: alternate.clone(),
+            },
+        })
+        .await
+        .expect("select alternate model");
+    let selected_ready = selected
+        .snapshot(None)
+        .await
+        .expect("selected snapshot")
+        .ready;
+    let fresh = gateway
+        .create_session(&workspace)
+        .await
+        .expect("fresh chat");
+    let fresh_ready = fresh.snapshot(None).await.expect("fresh snapshot").ready;
+
+    assert_eq!(selected_ready.session.model.route, alternate);
+    assert_eq!(selected_ready.config.config.provider.model, "gpt-5.6-terra");
+    assert_eq!(
+        selected_ready.config.config.provider.web_search,
+        mobius::backend::model::provider::HostedWebSearch::Live
+    );
+    assert_eq!(fresh_ready.config.config.provider.model, "gpt-5.6-sol");
+    assert_eq!(
+        fresh_ready.config.config.provider.web_search,
+        mobius::backend::model::provider::HostedWebSearch::Off
+    );
+    assert_ne!(selected.session_id(), fresh.session_id());
+}
+
+#[tokio::test]
+async fn opening_a_stopped_cached_chat_creates_a_fresh_actor() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let state_dir = root.path().join("state");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) = ConfigStore::initialize(state_dir, listen, None).expect("config");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+    let original = gateway
+        .create_session(&workspace)
+        .await
+        .expect("create chat");
+    let session_id = original.session_id().to_string();
+
+    assert!(original.stop_if_idle().await);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while original.is_alive() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actor stopped");
+    let reopened = gateway
+        .open_session(&session_id)
+        .await
+        .expect("reopen chat");
+
+    assert!(reopened.is_alive());
+    assert!(!Arc::ptr_eq(&original.inner, &reopened.inner));
+}
+
+#[tokio::test]
+async fn capacity_reclaims_an_unreferenced_idle_chat() {
+    let root = tempfile::tempdir().expect("root");
+    let state_dir = root.path().join("state");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) = ConfigStore::initialize(state_dir, listen, None).expect("config");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+    let mut state = gateway.state.lock().await;
+    for index in 0..MAX_ACTIVE_SESSIONS {
+        let (commands, mut receiver) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Some(HostCommand::StopIfIdle { reply }) = receiver.recv().await {
+                let _ = reply.send(true);
+            }
+        });
+        let (events, _) = broadcast::channel(1);
+        let id = format!("chat-{index}");
+        state.sessions.insert(
+            id.clone(),
+            HostHandle {
+                inner: Arc::new(HostInner {
+                    session_id: id.into(),
+                    commands,
+                    events,
+                    accepts_file_attachments: Arc::new(AtomicBool::new(false)),
+                    alive: Arc::new(AtomicBool::new(true)),
+                }),
+            },
+        );
+    }
+
+    state.ensure_capacity().await.expect("reclaim capacity");
+
+    assert_eq!(state.sessions.len(), MAX_ACTIVE_SESSIONS - 1);
+}

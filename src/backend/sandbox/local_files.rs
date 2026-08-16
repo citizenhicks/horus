@@ -106,7 +106,7 @@ pub(super) fn atomic_write(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let temporary = format!(".horus-write-{}.tmp", uuid::Uuid::new_v4());
+    let temporary = format!(".mobius-write-{}.tmp", uuid::Uuid::new_v4());
     let result = (|| {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);

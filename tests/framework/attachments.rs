@@ -125,7 +125,7 @@ async fn video_attachments_are_exposed_as_workspace_files() {
         let input = serde_json::to_string(&requests[0].input).expect("serialize request");
         assert!(input.contains("User-attached files available"));
         assert!(input.contains(&attachment.id));
-        assert!(input.contains("path: .horus/attachments/"));
+        assert!(input.contains("path: .mobius/attachments/"));
         let tool_output = requests[1]
             .input
             .iter()
@@ -133,10 +133,10 @@ async fn video_attachments_are_exposed_as_workspace_files() {
             .and_then(|item| item.get("output"))
             .and_then(Value::as_str)
             .expect("attachment list output");
-        assert!(tool_output.contains(".horus/attachments/"));
+        assert!(tool_output.contains(".mobius/attachments/"));
     }
 
-    let attachments = workspace.path().join(".horus/attachments");
+    let attachments = workspace.path().join(".mobius/attachments");
     let session = std::fs::read_dir(&attachments)
         .expect("list staged sessions")
         .next()
@@ -234,7 +234,7 @@ async fn materialized_image_keeps_an_exact_prefix_on_later_turns() {
             .input
             .iter()
             .filter(
-                |item| item.get("_horus_internal").and_then(Value::as_str) == Some("attachments")
+                |item| item.get("_mobius_internal").and_then(Value::as_str) == Some("attachments")
             )
             .count(),
         1

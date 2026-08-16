@@ -1,0 +1,77 @@
+//! möbius terminal frontend.
+
+use mobius::Result;
+use mobius::protocol::FrontendBlock;
+use mobius_gateway::client::{GatewayEvents, GatewaySender};
+use mobius_gateway::wire::{ReadyPayload, SessionReadyPayload};
+
+mod catalog;
+mod cloudflare_setup;
+mod dashboard;
+mod gateway;
+mod gateway_actions;
+mod headless;
+mod reinitialize;
+mod setup;
+mod terminal;
+mod theme;
+mod tui;
+
+pub use headless::run as run_headless;
+pub use tui::terminal_text;
+
+pub use cloudflare_setup::{CloudflareInit, run as run_cloudflare_setup};
+pub use dashboard::{run as run_gateway_dashboard, run_provider as run_gateway_provider};
+pub use reinitialize::confirm as confirm_gateway_reinitialize;
+
+fn block_text(block: &FrontendBlock) -> String {
+    let mut text = block.title.clone();
+    if !block.text.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&block.text);
+    }
+    for file in &block.files {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "[file] {} · {} · {} bytes",
+            file.name, file.media_type, file.size
+        ));
+    }
+    text
+}
+
+pub async fn run(
+    sender: GatewaySender,
+    events: GatewayEvents,
+    gateway: &mut ReadyPayload,
+    session: &mut SessionReadyPayload,
+    local_gateway: bool,
+    gateway_endpoint: String,
+) -> Result<(FrontendExit, GatewaySender, GatewayEvents)> {
+    let workspace = session.workspace.path.clone();
+    let catalog = catalog::UiCatalog::build(&session.contributions, &gateway.models, &workspace)?;
+    tui::runtime::run(
+        sender,
+        events,
+        gateway,
+        session,
+        catalog,
+        local_gateway,
+        gateway_endpoint,
+    )
+    .await
+}
+
+/// Why a frontend returned control to its launcher.
+pub enum FrontendExit {
+    Exit,
+    Discard,
+    New,
+    Resume(String),
+    Reload,
+    Reconnect,
+}

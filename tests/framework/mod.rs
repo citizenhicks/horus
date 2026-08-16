@@ -7,59 +7,59 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use horus::BoxFuture;
-use horus::Error;
-use horus::Result;
-use horus::agent::AgentConfig;
-use horus::agent::create_agent;
-use horus::backend::checkpoint::Checkpoint;
-use horus::backend::checkpoint::CheckpointStore;
-use horus::backend::checkpoint::EventPage;
-use horus::backend::checkpoint::EventPageRequest;
-use horus::backend::checkpoint::ExecutionRecord;
-use horus::backend::checkpoint::JournalEvent;
-use horus::backend::checkpoint::SessionPageRequest;
-use horus::backend::checkpoint::TimestampedEvent;
-use horus::backend::checkpoint::TranscriptPageRequest;
-use horus::backend::checkpoint::sqlite::SqliteCheckpoint;
-use horus::backend::model::CompactOutput;
-use horus::backend::model::CompactRequest;
-use horus::backend::model::Model;
-use horus::backend::model::ModelChoice;
-use horus::backend::model::ModelEventSink;
-use horus::backend::model::ModelOutput;
-use horus::backend::model::ModelRequest;
-use horus::backend::model::ModelRouter;
-use horus::backend::model::ToolDefinition;
-use horus::backend::sandbox::ApprovalPolicy;
-use horus::backend::sandbox::CommandOutputSink;
-use horus::backend::sandbox::NetworkAccess;
-use horus::backend::sandbox::Sandbox;
-use horus::backend::sandbox::SandboxBackend;
-use horus::backend::sandbox::SandboxMode;
-use horus::backend::sandbox::local::LocalSandbox;
-use horus::middleware::Middleware;
-use horus::middleware::MiddlewareStack;
-use horus::middleware::PromptSection;
-use horus::middleware::RuntimeContext;
-use horus::middleware::attachments::Attachments;
-use horus::middleware::compaction::Compaction;
-use horus::middleware::cron::Cron;
-use horus::middleware::session_files::{MAX_UPLOAD_CHUNK_BYTES, SessionFileStore};
-use horus::middleware::skills::Skills;
-use horus::middleware::steering::Steering;
-use horus::middleware::subagents::SubagentLaunch;
-use horus::middleware::subagents::SubagentLauncher;
-use horus::middleware::subagents::Subagents;
-use horus::middleware::tools::Tools;
-use horus::protocol::Event;
-use horus::protocol::EventMsg;
-use horus::protocol::MessageTarget;
-use horus::protocol::ModelEvent;
-use horus::protocol::Op;
-use horus::protocol::ReviewDecision;
-use horus::protocol::SessionFileReference;
-use horus::protocol::TokenUsage;
+use mobius::BoxFuture;
+use mobius::Error;
+use mobius::Result;
+use mobius::agent::AgentConfig;
+use mobius::agent::create_agent;
+use mobius::backend::checkpoint::Checkpoint;
+use mobius::backend::checkpoint::CheckpointStore;
+use mobius::backend::checkpoint::EventPage;
+use mobius::backend::checkpoint::EventPageRequest;
+use mobius::backend::checkpoint::ExecutionRecord;
+use mobius::backend::checkpoint::JournalEvent;
+use mobius::backend::checkpoint::SessionPageRequest;
+use mobius::backend::checkpoint::TimestampedEvent;
+use mobius::backend::checkpoint::TranscriptPageRequest;
+use mobius::backend::checkpoint::sqlite::SqliteCheckpoint;
+use mobius::backend::model::CompactOutput;
+use mobius::backend::model::CompactRequest;
+use mobius::backend::model::Model;
+use mobius::backend::model::ModelChoice;
+use mobius::backend::model::ModelEventSink;
+use mobius::backend::model::ModelOutput;
+use mobius::backend::model::ModelRequest;
+use mobius::backend::model::ModelRouter;
+use mobius::backend::model::ToolDefinition;
+use mobius::backend::sandbox::ApprovalPolicy;
+use mobius::backend::sandbox::CommandOutputSink;
+use mobius::backend::sandbox::NetworkAccess;
+use mobius::backend::sandbox::Sandbox;
+use mobius::backend::sandbox::SandboxBackend;
+use mobius::backend::sandbox::SandboxMode;
+use mobius::backend::sandbox::local::LocalSandbox;
+use mobius::middleware::Middleware;
+use mobius::middleware::MiddlewareStack;
+use mobius::middleware::PromptSection;
+use mobius::middleware::RuntimeContext;
+use mobius::middleware::attachments::Attachments;
+use mobius::middleware::compaction::Compaction;
+use mobius::middleware::cron::Cron;
+use mobius::middleware::session_files::{MAX_UPLOAD_CHUNK_BYTES, SessionFileStore};
+use mobius::middleware::skills::Skills;
+use mobius::middleware::steering::Steering;
+use mobius::middleware::subagents::SubagentLaunch;
+use mobius::middleware::subagents::SubagentLauncher;
+use mobius::middleware::subagents::Subagents;
+use mobius::middleware::tools::Tools;
+use mobius::protocol::Event;
+use mobius::protocol::EventMsg;
+use mobius::protocol::MessageTarget;
+use mobius::protocol::ModelEvent;
+use mobius::protocol::Op;
+use mobius::protocol::ReviewDecision;
+use mobius::protocol::SessionFileReference;
+use mobius::protocol::TokenUsage;
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -385,7 +385,7 @@ fn test_config_with_router(
     )
 }
 
-async fn final_message(agent: &mut horus::agent::Agent) -> String {
+async fn final_message(agent: &mut mobius::agent::Agent) -> String {
     let mut message = String::new();
     while let Some(event) = agent.next_event().await {
         match event.msg {
@@ -398,7 +398,7 @@ async fn final_message(agent: &mut horus::agent::Agent) -> String {
     panic!("agent disconnected")
 }
 
-async fn failed_turn(agent: &mut horus::agent::Agent) -> String {
+async fn failed_turn(agent: &mut mobius::agent::Agent) -> String {
     let mut message = None;
     while let Some(event) = agent.next_event().await {
         match event.msg {

@@ -48,7 +48,7 @@ const GLOBAL_STATE_KEY: &str = "entries.v1";
 const MAX_NOTES: usize = 20;
 const MAX_NOTE_BYTES: usize = 500;
 const MAX_INJECTION_BYTES: usize = 4 * 1024;
-const PROJECTION_FIELD: &str = "_horus_scratchpad_projection";
+const PROJECTION_FIELD: &str = "_mobius_scratchpad_projection";
 const BASELINE_KIND: &str = "scratchpad_baseline";
 const DELTA_KIND: &str = "scratchpad_delta";
 

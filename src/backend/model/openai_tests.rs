@@ -115,7 +115,7 @@ fn responses_input_strips_only_top_level_provider_metadata() {
         serde_json::json!({
             "type": "function_call",
             "arguments": {"_keep": true},
-            "_horus_reasoning": "Plan.",
+            "_mobius_reasoning": "Plan.",
             "_provider_internal": [{"type": "thinking"}]
         }),
         serde_json::json!({
@@ -184,7 +184,7 @@ fn compatible_responses_are_implicit_while_first_party_breakpoints_are_explicit(
         "content": [{
             "type": "input_text",
             "text": "stable prefix",
-            "_horus_prompt_cache_breakpoint": true
+            "_mobius_prompt_cache_breakpoint": true
         }]
     })];
     let request = ModelRequest {
@@ -624,14 +624,14 @@ fn responses_web_search_preserves_every_query() {
     let action = decode_web_action(&serde_json::json!({
         "action": {
             "type": "search",
-            "queries": ["Horus framework", "Horus gateway"]
+            "queries": ["möbius framework", "möbius gateway"]
         }
     }));
 
     assert_eq!(
         action,
         WebSearchAction::Search {
-            queries: vec!["Horus framework".into(), "Horus gateway".into()]
+            queries: vec!["möbius framework".into(), "möbius gateway".into()]
         }
     );
 }
@@ -641,14 +641,14 @@ fn responses_web_search_accepts_a_singular_query() {
     let action = decode_web_action(&serde_json::json!({
         "action": {
             "type": "search",
-            "query": "Horus framework"
+            "query": "möbius framework"
         }
     }));
 
     assert_eq!(
         action,
         WebSearchAction::Search {
-            queries: vec!["Horus framework".into()]
+            queries: vec!["möbius framework".into()]
         }
     );
 }

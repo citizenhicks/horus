@@ -264,7 +264,7 @@ mod tests {
         let search = ModelEvent::WebSearchCompleted {
             call_id: "search-1".into(),
             action: WebSearchAction::Search {
-                queries: vec!["Horus framework".into(), "Horus gateway".into()],
+                queries: vec!["möbius framework".into(), "möbius gateway".into()],
             },
         }
         .into_event("session-1", "turn-1", "step-1");
@@ -290,7 +290,7 @@ mod tests {
                 "call_id": "search-1",
                 "action": {
                     "type": "search",
-                    "queries": ["Horus framework", "Horus gateway"]
+                    "queries": ["möbius framework", "möbius gateway"]
                 }
             })
         );

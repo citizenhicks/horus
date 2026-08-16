@@ -698,7 +698,7 @@ mod tests {
             serde_json::json!({
                 "role": "user",
                 "content": [{"type": "input_text", "text": "secret diary"}],
-                "_horus_internal": "scratchpad"
+                "_mobius_internal": "scratchpad"
             }),
         ];
         let calls = [ToolCall {

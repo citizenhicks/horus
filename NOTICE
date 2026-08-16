@@ -1,4 +1,4 @@
-Horus
+möbius
 
 This product includes software derived from OpenAI Codex:
 
@@ -10,7 +10,7 @@ OpenAI Codex includes code derived from Ratatui
 Copyright (c) 2016-2022 Florian Dehau
 Copyright (c) 2023-2025 The Ratatui Developers
 
-The Horus terminal color palette is adapted from Sora
+The möbius terminal color palette is adapted from Sora
 (https://github.com/Aejkatappaja/sora), licensed under the MIT License.
 Copyright (c) 2026 aejkatappaja
 
@@ -37,7 +37,7 @@ SOFTWARE.
 --------------------------------------------------------------------------------
 
 The Apple client bundles icon artwork from HugeIcons (the free set), redrawn as
-SVG assets under horus-app/apple/Sources/HorusApp/Assets.xcassets as hi.*.
+SVG assets under mobius-app/apple/Sources/MobiusApp/Assets.xcassets as hi.*.
 
   Hugeicons Core Free Icons — https://hugeicons.com
   Copyright (c) Hugeicons
@@ -47,7 +47,7 @@ The Apple client uses HighlightSwift (https://github.com/appstefan/HighlightSwif
 licensed under the MIT License reproduced above.
 Copyright (c) 2023 Stefan Britton
 
-The Horus logo is adapted from the Composing preset in thinking-orbs
+The möbius logo is adapted from the Composing preset in thinking-orbs
 (https://github.com/Jakubantalik/thinking-orbs), licensed under the MIT License
 reproduced above.
 Copyright (c) 2026 Jakub Antalik

@@ -52,7 +52,7 @@ const ISOLATED_ENVIRONMENT: [&str; 8] = [
     "SDKROOT",
 ];
 #[cfg(target_os = "linux")]
-const ISOLATED_HOME: &str = "/tmp/horus-home";
+const ISOLATED_HOME: &str = "/tmp/mobius-home";
 #[cfg(target_os = "macos")]
 const SEATBELT_POLICY_SUFFIX: &str = r#"
 (allow file-read*)
@@ -138,7 +138,7 @@ impl LocalSandbox {
             }
             let root_dir = Dir::open_ambient_dir(&root, ambient_authority())?;
             validate_root(&root, &root_dir)?;
-            let temp = tempfile::Builder::new().prefix("horus-").tempdir()?;
+            let temp = tempfile::Builder::new().prefix("mobius-").tempdir()?;
             Ok(Self {
                 root,
                 root_dir,
@@ -452,7 +452,7 @@ impl LocalSandbox {
             "--norc",
             "-c",
             MACOS_COMMAND_WRAPPER,
-            "horus-command",
+            "mobius-command",
         ]);
         append_invocation(&mut command, invocation, self.isolated_home);
         Ok(command)
@@ -525,7 +525,7 @@ impl LocalSandbox {
             "--norc",
             "-c",
             MACOS_COMMAND_WRAPPER,
-            "horus-command",
+            "mobius-command",
         ]);
         append_invocation(&mut command, invocation, self.isolated_home);
         Ok(command)

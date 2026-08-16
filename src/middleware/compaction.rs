@@ -586,7 +586,7 @@ mod tests {
         let user = serde_json::json!({
             "role": "user",
             "content": [{"type": "input_text", "text": "inspect"}],
-            "_horus_attachments": [{"id": "upload-1"}]
+            "_mobius_attachments": [{"id": "upload-1"}]
         });
         let materialization = internal_user_message(
             crate::protocol::ATTACHMENT_CONTEXT_MARKER,

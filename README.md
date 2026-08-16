@@ -1,43 +1,43 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/citizenhicks/horus/main/horus-app/apple/Sources/HorusApp/Assets.xcassets/HorusLogo.imageset/HorusLogo.svg" width="160" height="160" alt="Horus">
+  <img src="https://raw.githubusercontent.com/citizenhicks/mobius/main/mobius-app/apple/Sources/MobiusApp/Assets.xcassets/MobiusLogo.imageset/MobiusLogo.svg" width="160" height="160" alt="möbius">
 </p>
 
-# Horus
+# möbius
 
-Horus is a small, frontend-neutral Rust framework for coding agents. Its shipped
-runtime has one headless composition root: `horus-gateway`. The terminal and
+möbius is a small, frontend-neutral Rust framework for coding agents. Its shipped
+runtime has one headless composition root: `mobius-gateway`. The terminal and
 Apple apps are thin clients of that gateway; they do not own agent behavior.
 
 | Component | Boundary |
 | --- | --- |
-| [`horus`](https://crates.io/crates/horus) | Embeddable agent loop, provider and storage interfaces, sandbox policy, middleware, and frontend-neutral protocol |
-| [`horus-gateway`](https://crates.io/crates/horus-gateway) | The only shipped owner of an `Agent`; composes capabilities and owns authentication, chats, workspaces, artifacts, usage, and cron |
-| [`horus-cli`](https://crates.io/crates/horus-cli) | Ratatui gateway client and local gateway launcher |
-| [iOS app](horus-app/apple/README.md) | SwiftUI gateway client for iPhone and iPad |
+| [`mobius`](https://crates.io/crates/mobius) | Embeddable agent loop, provider and storage interfaces, sandbox policy, middleware, and frontend-neutral protocol |
+| [`mobius-gateway`](https://crates.io/crates/mobius-gateway) | The only shipped owner of an `Agent`; composes capabilities and owns authentication, chats, workspaces, artifacts, usage, and cron |
+| [`mobius-cli`](https://crates.io/crates/mobius-cli) | Ratatui gateway client and local gateway launcher |
+| [iOS app](mobius-app/apple/README.md) | SwiftUI gateway client for iPhone and iPad |
 
 ## Install
 
-Download `horus-<version>-<target>.tar.gz` and its checksum from
-[GitHub Releases](https://github.com/citizenhicks/horus/releases). The archive
-contains `horus`, `horus-gateway`, and `cloudflared`. Rust users can install the
-two Horus commands with Rust 1.89 or newer:
+Download `mobius-<version>-<target>.tar.gz` and its checksum from
+[GitHub Releases](https://github.com/citizenhicks/mobius/releases). The archive
+contains `mobius`, `mobius-gateway`, and `cloudflared`. Rust users can install the
+two möbius commands with Rust 1.89 or newer:
 
 ```sh
-cargo install --locked horus-cli
+cargo install --locked mobius-cli
 ```
 
 Cargo does not install `cloudflared`; Quick Connect requires it beside
-`horus-gateway` or on `PATH`.
+`mobius-gateway` or on `PATH`.
 
 Users upgrading from the earlier split packages should run
-`cargo install --force --locked horus-cli` once so Cargo transfers both commands to the CLI
+`cargo install --force --locked mobius-cli` once so Cargo transfers both commands to the CLI
 package.
 
-Then run `horus` from the workspace it should own:
+Then run `mobius` from the workspace it should own:
 
 ```sh
 cd /path/to/repository
-horus
+mobius
 ```
 
 On first use, the CLI initializes the machine-wide gateway with a loopback listener
@@ -48,33 +48,33 @@ creates an independent chat for its current directory; other terminal and app
 frontends can connect to the same gateway and open separate or shared chats.
 Workspace, model, reasoning, agent features, approval policy, and prompt are
 chat-scoped. The gateway owns the available-model catalog and new-chat default;
-a chat only selects from that catalog. The core `horus` crate is linked into the
+a chat only selects from that catalog. The core `mobius` crate is linked into the
 binaries and is not a separate runtime prerequisite.
 
-Plaintext remains limited to loopback. Run `horus-gateway connect` to advertise
+Plaintext remains limited to loopback. Run `mobius-gateway connect` to advertise
 both that local TCP endpoint and the Quick Tunnel's public WSS endpoint with one
 single-use pairing code; pairing through either exchanges it for a per-client
 token used on later connections. A direct TLS listener remains available as an advanced
 alternative. See the
-[gateway guide](https://github.com/citizenhicks/horus/blob/main/crates/horus-gateway/README.md),
-the [CLI guide](https://github.com/citizenhicks/horus/blob/main/crates/horus-cli/README.md),
-and the [Apple guide](https://github.com/citizenhicks/horus/blob/main/horus-app/apple/README.md)
+[gateway guide](https://github.com/citizenhicks/mobius/blob/main/crates/mobius-gateway/README.md),
+the [CLI guide](https://github.com/citizenhicks/mobius/blob/main/crates/mobius-cli/README.md),
+and the [Apple guide](https://github.com/citizenhicks/mobius/blob/main/mobius-app/apple/README.md)
 for manual and remote setup.
 
 To run the Rust binaries from this checkout:
 
 ```sh
-cargo build -p horus-cli
-cargo run -p horus-cli --bin horus
+cargo build -p mobius-cli
+cargo run -p mobius-cli --bin mobius
 ```
 
 ## Framework
 
-Horus requires Rust 1.89 or newer.
+möbius requires Rust 1.89 or newer.
 
 ```toml
 [dependencies]
-horus = "0.8"
+mobius = "0.8"
 ```
 
 The caller owns composition:
@@ -83,13 +83,13 @@ The caller owns composition:
 use std::path::Path;
 use std::sync::Arc;
 
-use horus::Result;
-use horus::agent::{Agent, AgentConfig, create_agent};
-use horus::backend::checkpoint::{CheckpointStore, sqlite::SqliteCheckpoint};
-use horus::backend::model::{Model, ModelRouter, openai::OpenAi};
-use horus::backend::sandbox::{ApprovalPolicy, Sandbox, local::LocalSandbox};
-use horus::middleware::{Middleware, MiddlewareStack};
-use horus::middleware::tools::Tools;
+use mobius::Result;
+use mobius::agent::{Agent, AgentConfig, create_agent};
+use mobius::backend::checkpoint::{CheckpointStore, sqlite::SqliteCheckpoint};
+use mobius::backend::model::{Model, ModelRouter, openai::OpenAi};
+use mobius::backend::sandbox::{ApprovalPolicy, Sandbox, local::LocalSandbox};
+use mobius::middleware::{Middleware, MiddlewareStack};
+use mobius::middleware::tools::Tools;
 
 async fn build_agent(
     workspace: &Path,
@@ -107,7 +107,7 @@ async fn build_agent(
         ApprovalPolicy::Ask,
     ));
     let checkpoints: Arc<dyn CheckpointStore> =
-        Arc::new(SqliteCheckpoint::new(workspace.join("horus.sqlite3"))?);
+        Arc::new(SqliteCheckpoint::new(workspace.join("mobius.sqlite3"))?);
     let middleware: Vec<Arc<dyn Middleware>> = vec![Arc::new(Tools::coding())];
 
     create_agent(AgentConfig::new(
@@ -122,7 +122,7 @@ async fn build_agent(
 ```
 
 Frontends submit
-[`protocol::Op`](https://docs.rs/horus/latest/horus/protocol/enum.Op.html) values and consume
+[`protocol::Op`](https://docs.rs/mobius/latest/mobius/protocol/enum.Op.html) values and consume
 events from `Agent`. Framework capabilities may also contribute frontend-neutral commands,
 references, widgets, and rendered blocks. A frontend decides how those contributions look;
 capability implementations do not depend on terminal code. Interrupts target a specific turn, and
@@ -133,7 +133,7 @@ distinct.
 
 ```text
 Terminal client ─┐
-Apple client ────┼── versioned gateway protocol ⇄ horus-gateway ──> Agent
+Apple client ────┼── versioned gateway protocol ⇄ mobius-gateway ──> Agent
 Other clients ───┘                                     │
                                                         ├─ model router
                                                         ├─ sandbox
@@ -154,9 +154,9 @@ do not dispatch tools or implement middleware behavior.
 | `src/backend/checkpoint/` | Durable checkpoints, journals, transcript pages, and the session catalog |
 | `src/middleware/` | Vertical optional capabilities, including their tools, hooks, state, settings, and UI contributions |
 | `src/protocol/` | Frontend-neutral operations, events, approvals, usage, and presentation records |
-| `crates/horus-gateway/` | Runtime composition, authentication, client sessions, workspaces, artifacts, Git, usage, cron, and the wire protocol |
-| `crates/horus-cli/src/frontend/` | Terminal lifecycle, input, and rendering only |
-| `horus-app/apple/` | Apple lifecycle, platform storage, and SwiftUI rendering only |
+| `crates/mobius-gateway/` | Runtime composition, authentication, client sessions, workspaces, artifacts, Git, usage, cron, and the wire protocol |
+| `crates/mobius-cli/src/frontend/` | Terminal lifecycle, input, and rendering only |
+| `mobius-app/apple/` | Apple lifecycle, platform storage, and SwiftUI rendering only |
 
 Middleware declaration order is observable hook and prompt-section order. Each
 capability owns its complete vertical slice; adding one to the shipped runtime
@@ -182,18 +182,18 @@ and any other files or services available to the gateway account.
 
 ## Contributing
 
-Read [AGENTS.md](https://github.com/citizenhicks/horus/blob/main/AGENTS.md) before changing the framework. It defines module ownership,
+Read [AGENTS.md](https://github.com/citizenhicks/mobius/blob/main/AGENTS.md) before changing the framework. It defines module ownership,
 capability extension points, required checks, and the no-compatibility rule while
 the public contract remains under active development.
 
 Release tags are intentionally separate:
 
-- `horus-vX.Y.Z` publishes the framework crate and creates its GitHub Release.
-- `horus-gateway-vX.Y.Z` publishes the gateway crate and attaches server binaries.
-- `horus-cli-vX.Y.Z` publishes the CLI crate and attaches downloadable binaries to a GitHub
+- `mobius-vX.Y.Z` publishes the framework crate and creates its GitHub Release.
+- `mobius-gateway-vX.Y.Z` publishes the gateway crate and attaches server binaries.
+- `mobius-cli-vX.Y.Z` publishes the CLI crate and attaches downloadable binaries to a GitHub
   Release.
 
-Publish `horus`, then `horus-gateway`, then `horus-cli`, waiting for each dependency to appear in
+Publish `mobius`, then `mobius-gateway`, then `mobius-cli`, waiting for each dependency to appear in
 the crates.io index. Creating a tag is a release action; ordinary pushes and pull requests only
 run CI. The release workflow expects a `CARGO_REGISTRY_TOKEN` repository secret for
 crates.io publication.

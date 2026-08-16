@@ -231,7 +231,7 @@ pub(super) async fn save_attachment_workspace(
 
 pub(super) async fn remove_staged_attachments(workspace: &Path, session_id: &str) -> Result<()> {
     let workspace = workspace.to_path_buf();
-    let staged = PathBuf::from(".horus")
+    let staged = PathBuf::from(".mobius")
         .join("attachments")
         .join(session_storage_key(session_id));
     tokio::task::spawn_blocking(move || {

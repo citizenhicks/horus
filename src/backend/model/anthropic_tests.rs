@@ -110,7 +110,7 @@ fn anthropic_web_search_normalizes_query_to_a_singleton() {
                 "type": "server_tool_use",
                 "id": "search-1",
                 "name": "web_search",
-                "input": {"query": "Horus framework"}
+                "input": {"query": "möbius framework"}
             }
         }),
         serde_json::json!({
@@ -135,7 +135,7 @@ fn anthropic_web_search_normalizes_query_to_a_singleton() {
             ModelEvent::WebSearchCompleted {
                 call_id: "search-1".into(),
                 action: WebSearchAction::Search {
-                    queries: vec!["Horus framework".into()]
+                    queries: vec!["möbius framework".into()]
                 }
             }
         ]

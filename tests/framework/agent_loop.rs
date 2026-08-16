@@ -76,7 +76,7 @@ async fn middleware_prompt_is_composed_once_per_agent() {
         "an unsupported operating system"
     };
     let expected = format!(
-        "**instructions**\n\ntest system prompt\n\n**sandbox**\n\nHorus is running on {platform}.\n\n**prompt extension**\n\ncapability prompt"
+        "**instructions**\n\ntest system prompt\n\n**sandbox**\n\nmöbius is running on {platform}.\n\n**prompt extension**\n\ncapability prompt"
     );
     assert!(
         model

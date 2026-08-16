@@ -1,6 +1,6 @@
-# Contributing to Horus
+# Contributing to möbius
 
-Horus is a small framework whose shipped runtime has one headless composition
+möbius is a small framework whose shipped runtime has one headless composition
 root. Keep changes local to the module that owns the behavior; do not add adapter
 layers, parallel registries, or speculative extension points.
 
@@ -14,10 +14,10 @@ layers, parallel registries, or speculative extension points.
 | `src/backend/checkpoint/` | Durable checkpoints, journals, and session catalog |
 | `src/middleware/` | Optional capabilities and their tools, hooks, state, and UI contributions |
 | `src/protocol/` | Frontend-neutral operations, events, and presentation records |
-| `crates/horus-gateway/` | Headless composition, auth, sessions, artifacts, usage, and cron |
-| `crates/horus-cli/src/frontend/` | Thin terminal gateway client and rendering |
+| `crates/mobius-gateway/` | Headless composition, auth, sessions, artifacts, usage, and cron |
+| `crates/mobius-cli/src/frontend/` | Thin terminal gateway client and rendering |
 
-`horus-gateway` is the only shipped owner of an `Agent`. The CLI sends gateway
+`mobius-gateway` is the only shipped owner of an `Agent`. The CLI sends gateway
 operations and renders gateway events; capability behavior remains in its framework
 module.
 
@@ -43,7 +43,7 @@ module.
   and render presentation types rather than branching on middleware names.
 - Removing a provider or middleware means deleting its module and explicit composition
   entry. Adding one provider or tool changes only its module and that registry entry.
-- Keep Ratatui and terminal concepts out of `horus`. Keep provider and sandbox
+- Keep Ratatui and terminal concepts out of `mobius`. Keep provider and sandbox
   details out of the agent loop.
 - Validate external data at its boundary and keep sandbox execution fail-closed.
 - Add the smallest behavior-focused test that would catch the change.
@@ -69,8 +69,8 @@ Implement `middleware::Middleware` in one vertical module. Register tools in
 `register`, lifecycle behavior in the relevant hook, and UI metadata in
 `frontend` or `render`. Handle declared commands in `command`.
 
-Only middleware shipped by `horus-gateway` needs one composition setting and one
-construction branch in `crates/horus-gateway/src/assembly.rs`. Do not edit the
+Only middleware shipped by `mobius-gateway` needs one composition setting and one
+construction branch in `crates/mobius-gateway/src/assembly.rs`. Do not edit the
 agent loop or any frontend for capability-specific behavior.
 
 Approval-required tools are always handled by the sandbox.
@@ -92,7 +92,7 @@ gateway wire records carrying those types; an embedded library frontend submits
 Both decide how semantic slots, formats, and tones look.
 
 CLI-only lifecycle and composer behavior belongs in
-`crates/horus-cli/src/frontend/catalog.rs`. Extend `protocol` only when an
+`crates/mobius-cli/src/frontend/catalog.rs`. Extend `protocol` only when an
 existing operation, event, or contribution cannot express a frontend-neutral
 need.
 
@@ -120,7 +120,7 @@ for local iteration.
 
 ## Releases
 
-`horus`, `horus-gateway`, and `horus-cli` have separate versions and releases.
+`mobius`, `mobius-gateway`, and `mobius-cli` have separate versions and releases.
 Publish them in that order because each depends on the previous published crate.
 Release automation belongs in `.github/workflows/`; do not mix it into capability
 code.

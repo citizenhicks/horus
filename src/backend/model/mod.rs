@@ -44,7 +44,7 @@ const MAX_TOOL_CALLS: usize = 128;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_CALL_ID_BYTES: usize = 4 * 1024;
 const MAX_TOOL_NAME_BYTES: usize = 256;
-pub(crate) const PROMPT_CACHE_BREAKPOINT_FIELD: &str = "_horus_prompt_cache_breakpoint";
+pub(crate) const PROMPT_CACHE_BREAKPOINT_FIELD: &str = "_mobius_prompt_cache_breakpoint";
 pub(crate) const STREAM_RETRY_LIMIT: usize = 5;
 
 /// Returns one-based context boundaries with no unfinished tool calls.
@@ -254,7 +254,7 @@ fn priced_tokens(tokens: u64, rate: u64, multiplier_millis: u32) -> Option<u128>
 #[must_use]
 pub fn prompt_cache_key(session_id: &str) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"horus/prompt-cache/v1/");
+    digest.update(b"mobius/prompt-cache/v1/");
     digest.update(session_id.as_bytes());
     format!("{:x}", digest.finalize())
 }

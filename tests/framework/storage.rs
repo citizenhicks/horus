@@ -40,12 +40,12 @@ async fn local_sandbox_confines_command_writes_to_the_workspace() {
     let output = sandbox
         .execute(
             &format!(
-                "printf horus > command.txt; printf blocked > ../{}",
+                "printf mobius > command.txt; printf blocked > ../{}",
                 outside.file_name().expect("outside name").to_string_lossy()
             ),
             SandboxMode::WorkspaceWrite,
             NetworkAccess::Denied,
-            horus::backend::sandbox::CommandMode::Foreground,
+            mobius::backend::sandbox::CommandMode::Foreground,
             CommandOutputSink::default(),
         )
         .await
@@ -59,21 +59,21 @@ async fn local_sandbox_confines_command_writes_to_the_workspace() {
         .unwrap_or_else(|error| {
             panic!("read workspace output: {error}; command output: {output:?}")
         });
-    assert_eq!(workspace_output, "horus");
+    assert_eq!(workspace_output, "mobius");
     assert!(!escaped);
 }
 
 #[tokio::test]
 async fn sqlite_persists_latest_checkpoint_transcript_and_fork_lineage() {
     let workspace = TempDir::new().expect("create workspace");
-    let path = workspace.path().join("horus.sqlite3");
+    let path = workspace.path().join("mobius.sqlite3");
     let store = SqliteCheckpoint::new(&path).expect("open checkpoint database");
     let empty = Checkpoint::empty("session");
     store
         .save(&empty, &[], None)
         .await
         .expect("save empty checkpoint");
-    let first_user = horus::backend::model::user_message("parent question");
+    let first_user = mobius::backend::model::user_message("parent question");
     let assistant = serde_json::json!({
         "role": "assistant",
         "content": [{"type": "output_text", "text": "parent answer"}]
@@ -105,7 +105,7 @@ async fn sqlite_persists_latest_checkpoint_transcript_and_fork_lineage() {
         "role": "assistant",
         "content": [{"type": "output_text", "text": "compact summary"}]
     });
-    let post_compaction = horus::backend::model::user_message("parent follow-up");
+    let post_compaction = mobius::backend::model::user_message("parent follow-up");
     let mut compacted = grown;
     compacted.sequence = 4;
     compacted.context = vec![compacted_item.clone(), post_compaction.clone()];
@@ -113,7 +113,7 @@ async fn sqlite_persists_latest_checkpoint_transcript_and_fork_lineage() {
         .save(&compacted, std::slice::from_ref(&post_compaction), None)
         .await
         .expect("replace context and append transcript");
-    let branch_user = horus::backend::model::user_message("branch question");
+    let branch_user = mobius::backend::model::user_message("branch question");
     let latest = compacted;
     let mut branch = Checkpoint::empty("branch");
     branch.context.clone_from(&latest.context);

@@ -208,7 +208,7 @@ impl ChatGptLogin {
             .append_pair("state", &state)
             .append_pair("id_token_add_organizations", "true")
             .append_pair("codex_cli_simplified_flow", "true")
-            .append_pair("originator", "horus");
+            .append_pair("originator", "mobius");
         Ok(Self {
             listener,
             verifier,
@@ -415,7 +415,7 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
         respond(
             &mut stream,
             "200 OK",
-            "Authorization received. You can return to Horus.",
+            "Authorization received. You can return to möbius.",
         )
         .await?;
         return Ok(code);
@@ -466,8 +466,8 @@ async fn read_callback_request(stream: &mut TcpStream) -> Result<reqwest::Url> {
 
 async fn respond(stream: &mut TcpStream, status: &str, message: &str) -> Result<()> {
     let body = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>Horus</title>\
-         <h1>Horus</h1><p>{message}</p>"
+        "<!doctype html><meta charset=\"utf-8\"><title>möbius</title>\
+         <h1>möbius</h1><p>{message}</p>"
     );
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
@@ -708,11 +708,11 @@ impl OpenAiAuthorization for ChatGptAuth {
             let (token, account_id) = self.authorization().await?;
             let mut headers = vec![
                 ("chatgpt-account-id".into(), account_id),
-                ("originator".into(), "horus".into()),
+                ("originator".into(), "mobius".into()),
                 ("version".into(), CODEX_COMPAT_VERSION.into()),
                 (
                     "user-agent".into(),
-                    concat!("horus/", env!("CARGO_PKG_VERSION")).into(),
+                    concat!("mobius/", env!("CARGO_PKG_VERSION")).into(),
                 ),
             ];
             if let Some(session_id) = session_id {
@@ -736,11 +736,11 @@ impl OpenAiAuthorization for ChatGptAuth {
                 token,
                 headers: vec![
                     ("chatgpt-account-id".into(), account_id),
-                    ("originator".into(), "horus".into()),
+                    ("originator".into(), "mobius".into()),
                     ("version".into(), CODEX_COMPAT_VERSION.into()),
                     (
                         "user-agent".into(),
-                        concat!("horus/", env!("CARGO_PKG_VERSION")).into(),
+                        concat!("mobius/", env!("CARGO_PKG_VERSION")).into(),
                     ),
                     (
                         "openai-beta".into(),

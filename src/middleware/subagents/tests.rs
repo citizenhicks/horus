@@ -562,7 +562,7 @@ fn forked_context_drops_session_owned_attachment_references() {
     let context = vec![serde_json::json!({
         "role": "user",
         "content": [{"type": "input_text", "text": "inspect"}],
-        "_horus_attachments": [{
+        "_mobius_attachments": [{
             "id": "378b8581-e96c-4413-a138-93e74561cb87",
             "name": "photo.png",
             "size": 1,
@@ -572,7 +572,7 @@ fn forked_context_drops_session_owned_attachment_references() {
 
     let fork = fork_context(&context, ForkTurns::All);
 
-    assert!(fork[0].get("_horus_attachments").is_none());
+    assert!(fork[0].get("_mobius_attachments").is_none());
 }
 
 #[tokio::test]

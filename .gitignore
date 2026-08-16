@@ -1,6 +1,6 @@
 /target
-/.horus
+/.mobius
 .env
 xcuserdata/
-/horus-app/apple/DerivedData*/
+/mobius-app/apple/DerivedData*/
 *.profraw

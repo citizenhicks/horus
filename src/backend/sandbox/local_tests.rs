@@ -222,7 +222,7 @@ async fn authorized_commands_can_modify_the_whole_workspace() {
         ("background", CommandMode::Background),
     ] {
         let script = format!(
-            "mkdir -p .agents .codex && touch .agents/{label} .codex/{label} {label}.txt && git init --quiet && git add -- {label}.txt && git -c user.name=Horus -c user.email=horus@example.invalid commit --quiet -m {label}"
+            "mkdir -p .agents .codex && touch .agents/{label} .codex/{label} {label}.txt && git init --quiet && git add -- {label}.txt && git -c user.name=möbius -c user.email=mobius@example.invalid commit --quiet -m {label}"
         );
         let output = sandbox
             .execute(
@@ -296,12 +296,12 @@ async fn denied_environment_is_removed_from_full_access_commands() {
     let workspace = tempfile::tempdir().expect("workspace");
     let sandbox = local_sandbox(workspace.path())
         .isolated_home()
-        .deny_environment("HORUS_TEST_SECRET");
+        .deny_environment("MOBIUS_TEST_SECRET");
 
     let output = sandbox
         .execute_invocation(
             Invocation::Shell(
-                r#"printf '%s:%s' "${HORUS_TEST_SECRET-unset}" "$HORUS_TEST_VISIBLE""#,
+                r#"printf '%s:%s' "${MOBIUS_TEST_SECRET-unset}" "$MOBIUS_TEST_VISIBLE""#,
             ),
             CommandIsolation {
                 sandbox_mode: SandboxMode::DangerFullAccess,
@@ -310,8 +310,8 @@ async fn denied_environment_is_removed_from_full_access_commands() {
             CommandMode::Foreground,
             CommandOutputSink::default(),
             &[
-                ("HORUS_TEST_SECRET", "secret"),
-                ("HORUS_TEST_VISIBLE", "visible"),
+                ("MOBIUS_TEST_SECRET", "secret"),
+                ("MOBIUS_TEST_VISIBLE", "visible"),
             ],
             WorkspaceAccess::Writable,
         )
@@ -604,7 +604,7 @@ async fn writes_replace_files_without_partial_state_or_permission_drift() {
                 .expect("workspace entry")
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".horus-write-"))
+                .starts_with(".mobius-write-"))
     );
 }
 

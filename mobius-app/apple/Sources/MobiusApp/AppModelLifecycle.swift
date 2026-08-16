@@ -1,0 +1,260 @@
+import Foundation
+
+extension AppModel {
+    func connectionEnded(generation: UUID, message: String) {
+        guard connectionGeneration == generation else { return }
+        connectionGeneration = UUID()
+        transcriptLoadGeneration = UUID()
+        eventTask = nil
+        connectionState = .failed(message)
+        sessionFileUploadRequests.removeAll()
+        activeSessionFileUpload = nil
+        sessionUploadsRequestID = nil
+        isLoadingSessionUploads = false
+        artifactListRequestID = nil
+        isLoadingArtifacts = false
+        gitDiffRequestID = nil
+        isLoadingGitDiff = false
+        stagedGitDiffRequestID = nil
+        isLoadingStagedGitDiff = false
+        committedGitDiffRequestID = nil
+        isLoadingCommittedGitDiff = false
+        workspaceFilesRequestID = nil
+        isLoadingWorkspaceFiles = false
+        discardPendingComposerAttachments()
+        discardFilePresentation()
+        restorePendingDrafts()
+        if pendingPairingAccount != nil { pairingError = message }
+        if reconnectAttempt == 0 { showToast(message, tone: .error) }
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        guard reconnectTask == nil,
+              !automaticReconnectBlocked,
+              pendingPairingAccount == nil,
+              let account = selectedAccount
+        else { return }
+        guard !appIsInBackground else {
+            reconnectsOnActivation = true
+            return
+        }
+        let attempt = reconnectAttempt
+        reconnectAttempt += 1
+        let generation = connectionGeneration
+        reconnectTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(for: reconnectDelay(attempt))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  generation == connectionGeneration,
+                  selectedAccountID == account.id
+            else { return }
+            reconnectTask = nil
+            connect(to: account, retrying: true)
+        }
+    }
+
+    func cancelReconnect() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+    }
+
+    @discardableResult
+    func resetGatewayState(
+        preservingDrafts: Bool,
+        preservingSession: Bool = false
+    ) -> UUID {
+        if !preservingSession { changeComposerDraftOwner(to: nil) }
+        if preservingSession { flushStreamDeltas() }
+        connectionGeneration = UUID()
+        transcriptLoadGeneration = UUID()
+        eventTask?.cancel()
+        eventTask = nil
+        if !preservingSession {
+            latestSequence = nil
+        }
+        sessionOpenCursor = nil
+        replayRequestID = nil
+        replaySnapshotSequence = nil
+        finishHistoryLoad()
+        if !preservingSession {
+            nextHistoryBeforeSequence = nil
+            transcriptWindowAnchor = .tail
+            awaitingInitialUserTurnID = nil
+        }
+        if !preservingSession { replayPresentedTranscript = nil }
+        if preservingDrafts {
+            discardPendingComposerAttachments()
+        } else {
+            pendingDrafts.removeAll()
+            composer = ""
+            discardComposerAttachments()
+        }
+        pendingPairingAccount = nil
+        connectionState = .disconnected
+        dismissToast()
+        sessionRequestID = nil
+        sessionOpeningID = nil
+        pendingCachedTranscript = nil
+        pendingPresentedTranscript = nil
+        sessionMutationRequestID = nil
+        pendingDeletedSessionID = nil
+        pendingDeletedPresentedSessionID = nil
+        if preservingSession {
+            for sessionID in Array(pendingChatTitles.keys) {
+                pendingChatTitles[sessionID]?.renameRequestID = nil
+            }
+        }
+        sessionToRestoreID = nil
+        configRequestID = nil
+        defaultConfigRequestID = nil
+        submittedDefaultAgentDraft = nil
+        chatAgentApplyState = .idle
+        defaultAgentApplyState = .idle
+        workspaceError = nil
+        isChangingWorkspace = false
+        showsWorkspaceBrowser = false
+        directoryListing = nil
+        directoryError = nil
+        directoryRequestID = nil
+        isLoadingDirectories = false
+        if preservingSession {
+            gitDiffRequestID = nil
+            isLoadingGitDiff = false
+            stagedGitDiffRequestID = nil
+            isLoadingStagedGitDiff = false
+            committedGitDiffRequestID = nil
+            isLoadingCommittedGitDiff = false
+            workspaceFilesRequestID = nil
+            isLoadingWorkspaceFiles = false
+            sessionUploadsRequestID = nil
+            isLoadingSessionUploads = false
+            artifactListRequestID = nil
+            isLoadingArtifacts = false
+            sessionFileUploadRequests.removeAll()
+            activeSessionFileUpload = nil
+            discardFilePresentation()
+        }
+        if !preservingSession {
+            chatTitleTasks.values.forEach { $0.cancel() }
+            chatTitleTasks.removeAll()
+            titleEligibleSessionIDs.removeAll()
+            pendingChatTitles.removeAll()
+            sessions = []
+            gatewayMachineName = ""
+            selectedSessionID = nil
+            chatRoute = nil
+            sessionToRename = nil
+            sessionRenameDraft = ""
+            sessionToDelete = nil
+            unreadSessionIDs.removeAll()
+            profile = nil
+            modelChoices = []
+            modelProviders = [:]
+            middlewareFeatures = []
+            providerStatuses = []
+            defaultAgentSnapshot = nil
+            defaultAgentDraft = nil
+            setupProviderDraft = nil
+        }
+        providerAPIKey = ""
+        providerModelIDsText = ""
+        providerReasoningEffortsText = ""
+        providerActionState = .idle
+        credentialRequestID = nil
+        providerLoginRequestID = nil
+        providerRegistrationRequestID = nil
+        pairingCodeRequestID = nil
+        pairingCodeExpiryTask?.cancel()
+        pairingCodeExpiryTask = nil
+        pairingCodeInfo = nil
+        pairingCode = ""
+        pairingError = nil
+        if !preservingSession { resetSessionState() }
+        if preservingDrafts { restorePendingDrafts() }
+        return connectionGeneration
+    }
+
+    func resetSessionState() {
+        workspace = nil
+        gitStatus = nil
+        gitDiff = ""
+        gitDiffRequestID = nil
+        isLoadingGitDiff = false
+        stagedGitDiff = ""
+        stagedGitDiffRequestID = nil
+        isLoadingStagedGitDiff = false
+        committedGitDiff = ""
+        committedGitDiffRequestID = nil
+        isLoadingCommittedGitDiff = false
+        workspaceFiles = []
+        workspaceFilesTruncated = false
+        workspaceFilesRequestID = nil
+        isLoadingWorkspaceFiles = false
+        filesInspectorTab = .modified
+        modifiedFilesScope = .unstaged
+        gitBranchRequestID = nil
+        discardComposerAttachments()
+        sessionUploads = []
+        sessionUploadsRequestID = nil
+        isLoadingSessionUploads = false
+        artifacts = []
+        artifactsTruncated = false
+        artifactListRequestID = nil
+        isLoadingArtifacts = false
+        sessionFileUploadRequests.removeAll()
+        activeSessionFileUpload = nil
+        discardFilePresentation()
+        selectedModelRoute = ""
+        contributions = []
+        agentSnapshot = nil
+        agentDraft = nil
+        chatAgentApplyState = .idle
+        configRequestID = nil
+        cronTasks = []
+        cronRuns = []
+        cronTaskDraft = ""
+        cronError = nil
+        cronRequestIDs.removeAll()
+        transcript = []
+        deltaFlushTask?.cancel()
+        deltaFlushTask = nil
+        bufferedDeltas.removeAll()
+        replayRequestID = nil
+        replaySnapshotSequence = nil
+        replayPresentedTranscript = nil
+        transcriptRecordBase = []
+        transcriptRecordBaseSequence = nil
+        transcriptRecords.removeAll(keepingCapacity: true)
+        replayCompletionSubmissionIDs.removeAll(keepingCapacity: true)
+        replayUserMessages.removeAll(keepingCapacity: true)
+        completedComposerEditReplay = false
+        finishHistoryLoad()
+        nextHistoryBeforeSequence = nil
+        transcriptWindowAnchor = .tail
+        activeTurnID = nil
+        awaitingInitialUserTurnID = nil
+        activeOperation = nil
+        awaitsSteeringDelivery = false
+        runStats = RunStats()
+        contextTokens = 0
+        sessionCompactionCount = 0
+        modelContextWindow = nil
+        pendingApproval = nil
+        approvalRequestID = nil
+        pendingPicker = nil
+        mountedWidgets = []
+        previews = []
+        presentedPreview = nil
+        previewSelections.removeAll()
+        previewPageRequestID = nil
+        isLoadingPreviewPage = false
+        showsInspector = false
+        currentUsage = TokenUsage()
+        lastUsage = TokenUsage()
+    }
+}
