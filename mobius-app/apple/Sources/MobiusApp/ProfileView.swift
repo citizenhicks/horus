@@ -144,22 +144,6 @@ private struct SettingsInformationRow: View {
     }
 }
 
-/// The included-usage line. It belongs to the subscription, not to the usage dashboard,
-/// which counts what this device has spent against any provider.
-private struct CloudAllowanceStatus: View {
-    @Environment(\.mobiusPalette) private var palette
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: MobiusSpace.m) {
-            Text("Included Luna usage")
-            Spacer(minLength: MobiusSpace.s)
-            Text("Cloud only")
-                .foregroundStyle(palette.muted)
-        }
-        .accessibilityElement(children: .combine)
-    }
-}
-
 private struct CloudAccountSettings: View {
     @Environment(AppModel.self) private var model
     @Environment(\.mobiusPalette) private var palette
@@ -169,7 +153,6 @@ private struct CloudAccountSettings: View {
     /// until there is a Cloud session to authenticate them.
     var body: some View {
         if model.hasCloudAccount {
-            CloudAllowanceStatus()
             Button("Manage subscription", glyph: .sealCheck) {
                 showsSubscriptionManagement = true
             }

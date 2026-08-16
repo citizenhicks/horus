@@ -156,7 +156,7 @@ struct GatewayView: View {
             .settingsStandaloneRow()
 
             Section("möbius Cloud") {
-                SettingsCaption("Let möbius provision and manage a private gateway for you, with a 7-day trial and included Luna usage.")
+                SettingsCaption("Let möbius provision and manage a private gateway for you.")
                 MobiusCloudOfferButton()
             }
         }
