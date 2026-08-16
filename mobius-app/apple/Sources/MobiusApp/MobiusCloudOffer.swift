@@ -120,8 +120,8 @@ private struct MobiusCloudOfferSheet: View {
             VStack(alignment: .leading, spacing: 0) {
                 CloudBenefit(
                     glyph: .sparkle,
-                    title: "2 million Luna tokens included",
-                    detail: "Use up to 2 million tokens each month with Luna, the default möbius model."
+                    title: "The open-source gateway, hosted for you",
+                    detail: "Run the same generic möbius gateway in a private, persistent workspace."
                 )
                 Divider().padding(.leading, MobiusStyle.glyphGutter + MobiusSpace.m)
                 CloudBenefit(
@@ -133,7 +133,7 @@ private struct MobiusCloudOfferSheet: View {
                 CloudBenefit(
                     glyph: .key,
                     title: "Bring your own keys",
-                    detail: "Connect your own provider credentials whenever you need another model or account."
+                    detail: "Connect your own model provider account without storing its API key in möbius Cloud or the gateway filesystem."
                 )
                 Divider().padding(.leading, MobiusStyle.glyphGutter + MobiusSpace.m)
                 CloudBenefit(
