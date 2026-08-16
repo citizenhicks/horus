@@ -55,8 +55,14 @@ struct ProviderConfig: Codable, Equatable, Sendable {
     var provider: String
     var model: String
     var baseUrl: String?
+    var endpointAuth: ProviderEndpointAuth = .providerDefault
     var reasoningEffort: String?
     var webSearch: HostedWebSearch
+}
+
+enum ProviderEndpointAuth: String, Codable, Sendable {
+    case providerDefault = "provider_default"
+    case credentialless
 }
 
 enum HostedWebSearch: String, Codable, CaseIterable, Identifiable, Sendable {

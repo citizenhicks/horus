@@ -26,6 +26,7 @@ extension GatewayWireTests {
             reasoningEfforts: ["medium", "high"]
         ))
         let provider = try XCTUnwrap(registered["config"] as? [String: Any])
+        XCTAssertEqual(provider["endpoint_auth"] as? String, "provider_default")
         XCTAssertEqual(provider["reasoning_effort"] as? String, "high")
         XCTAssertNil(provider["api_key_env"])
         XCTAssertEqual(registered["model_ids"] as? [String], ["gpt-5.6-sol", "gpt-5.6-mini"])
