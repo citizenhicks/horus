@@ -32,9 +32,9 @@ use qrcode::render::unicode::Dense1x2;
 #[cfg(any(unix, test))]
 use url::Url;
 
-use crate::auth::AuthStore;
 #[cfg(unix)]
 use crate::auth::PairingStatus;
+use crate::auth::{AuthStore, PairingGrant};
 use crate::client::{Endpoint, GatewayClient, MAX_PENDING_FRAMES};
 use crate::cloudflare::CloudflareTunnel;
 use crate::config::{
@@ -49,12 +49,12 @@ use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
 use nix::unistd::Pid;
 #[cfg(any(unix, test))]
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 #[cfg(unix)]
 use tokio::process::{Child, Command as TokioCommand};
 #[cfg(unix)]
 use tokio::signal::unix::{Signal as TokioSignal, SignalKind, signal};
-#[cfg(unix)]
 use uuid::Uuid;
 
 use self::args::*;
@@ -71,6 +71,8 @@ pub const USAGE: &str = "usage: mobius-gateway [--state-dir PATH]\n       \
                      mobius-gateway init [--state-dir PATH] [--listen ADDR] \
                      [--tls-cert PATH --tls-key PATH] \
                      [--cloudflare-hostname HOST --cloudflare-token-file PATH]\n       \
+                     mobius-gateway hosted-init [--state-dir PATH]\n       \
+                     mobius-gateway hosted-pair [--state-dir PATH] --json\n       \
                      mobius-gateway connect [--state-dir PATH] [--endpoint ENDPOINT]\n       \
                      mobius-gateway serve [--state-dir PATH] [--background]\n       \
                      mobius-gateway exit [--state-dir PATH]";
@@ -112,6 +114,8 @@ pub async fn run(
     }
     match parse(arguments)? {
         Command::Init(options) => initialize(options),
+        Command::HostedInit { state_dir } => initialize_hosted(state_dir, save_local_client),
+        Command::HostedPair { state_dir } => hosted_pair(state_dir, load_local_client).await,
         Command::Connect(options) => connect(options, load_local_client).await,
         Command::Serve {
             state_dir,

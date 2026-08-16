@@ -1,5 +1,17 @@
 use super::*;
 
+static HOSTED_TEST_CLIENT: std::sync::Mutex<Option<(Endpoint, String)>> =
+    std::sync::Mutex::new(None);
+
+fn save_hosted_test_client(endpoint: &Endpoint, token: String) -> Result<()> {
+    *HOSTED_TEST_CLIENT.lock().expect("hosted test client lock") = Some((endpoint.clone(), token));
+    Ok(())
+}
+
+fn reject_hosted_test_client(_endpoint: &Endpoint, _token: String) -> Result<()> {
+    Err(Error::Config("test token save failed".into()))
+}
+
 #[cfg(unix)]
 #[test]
 fn reset_gateway_state_removes_an_empty_directory() {
@@ -87,6 +99,54 @@ fn default_initialization_enables_quick_cloudflare_and_loopback() {
         (config.cloudflare, config.listen),
         (Some(CloudflareConfig::Quick), DEFAULT_LISTEN)
     );
+}
+
+#[test]
+fn hosted_initialization_is_direct_and_saves_an_authenticated_control_client() {
+    let directory = tempfile::tempdir().expect("gateway state parent");
+    let state = directory.path().join("gateway");
+    *HOSTED_TEST_CLIENT.lock().expect("hosted test client lock") = None;
+
+    initialize_hosted(state.clone(), save_hosted_test_client).expect("initialize hosted gateway");
+
+    let (store, config) = ConfigStore::open(state).expect("open hosted config");
+    assert!(config.listen.ip().is_loopback());
+    assert!(config.tls.is_none() && config.cloudflare.is_none());
+    let (endpoint, token) = HOSTED_TEST_CLIENT
+        .lock()
+        .expect("hosted test client lock")
+        .take()
+        .expect("saved hosted client");
+    assert_eq!(endpoint.to_string(), "tcp://127.0.0.1:8741");
+    assert!(
+        AuthStore::open(store.auth_path())
+            .expect("open hosted auth")
+            .authenticate(&token)
+            .is_ok()
+    );
+}
+
+#[test]
+fn hosted_initialization_cleans_state_when_the_control_token_cannot_be_saved() {
+    let directory = tempfile::tempdir().expect("gateway state parent");
+    let state = directory.path().join("gateway");
+    let sibling = directory.path().join("keep");
+    std::fs::write(&sibling, "keep").expect("sibling state");
+
+    initialize_hosted(state.clone(), reject_hosted_test_client)
+        .expect_err("token save must fail initialization");
+
+    assert_eq!((state.exists(), sibling.exists()), (false, true));
+}
+
+#[test]
+fn hosted_commands_reject_tunnel_configuration() {
+    let config = GatewayConfig::new_cloudflare(DEFAULT_LISTEN, CloudflareConfig::Quick)
+        .expect("Cloudflare config");
+
+    let error = hosted_loopback_endpoint(&config).expect_err("tunnel config must fail");
+
+    assert!(error.to_string().contains("direct plaintext loopback"));
 }
 
 #[test]
@@ -192,6 +252,47 @@ fn parse_connect_accepts_a_public_endpoint_and_state_directory() {
             if state_dir == std::path::Path::new("/tmp/mobius")
                 && endpoint.to_string() == "tls://gateway.example:443"
     ));
+}
+
+#[test]
+fn parse_hosted_commands_accept_only_their_machine_interface() {
+    let init = parse(vec![
+        "hosted-init".into(),
+        "--state-dir".into(),
+        "/tmp/mobius".into(),
+    ])
+    .expect("parse hosted init");
+    assert!(matches!(
+        init,
+        Command::HostedInit { state_dir } if state_dir == std::path::Path::new("/tmp/mobius")
+    ));
+
+    let pair = parse(vec![
+        "hosted-pair".into(),
+        "--state-dir".into(),
+        "/tmp/mobius".into(),
+        "--json".into(),
+    ])
+    .expect("parse hosted pair");
+    assert!(matches!(
+        pair,
+        Command::HostedPair { state_dir } if state_dir == std::path::Path::new("/tmp/mobius")
+    ));
+
+    assert!(parse(vec!["hosted-pair".into()]).is_err());
+}
+
+#[test]
+fn hosted_pair_json_contains_the_code_and_expiry_only() {
+    let grant = PairingGrant {
+        code: "one-time-code".into(),
+        expires_at: 1_234_567_890,
+    };
+
+    assert_eq!(
+        hosted_pair_json(&grant).expect("hosted pair JSON"),
+        r#"{"code":"one-time-code","expires_at":1234567890}"#
+    );
 }
 
 #[test]
@@ -426,10 +527,11 @@ async fn running_gateway_issues_a_code_for_another_client() {
         .await
         .expect("pair first client");
 
-    let code = request_running_pairing_code(&endpoint, &identity.token)
+    let grant = request_running_pairing_code(&endpoint, &identity.token)
         .await
         .expect("request another code");
-    let (_second, _) = GatewayClient::pair(&endpoint, code, "second", ClientKind::Ios)
+    assert!(grant.expires_at > 0);
+    let (_second, _) = GatewayClient::pair(&endpoint, grant.code, "second", ClientKind::Ios)
         .await
         .expect("pair second client");
 

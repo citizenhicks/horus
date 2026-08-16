@@ -27,15 +27,46 @@ pub(super) fn initialize(options: InitOptions) -> Result<()> {
 
 pub(super) fn initialize_auth(store: &ConfigStore) -> Result<()> {
     if let Err(error) = AuthStore::initialize(store.auth_path()) {
-        std::fs::remove_dir_all(store.state_dir()).map_err(|cleanup| {
-            Error::Config(format!(
-                "{error}; failed to remove incomplete gateway state at {}: {cleanup}",
-                store.state_dir().display()
-            ))
-        })?;
-        return Err(error);
+        return cleanup_failed_initialization(store, error);
     }
     Ok(())
+}
+
+pub(super) fn initialize_hosted(
+    state_dir: PathBuf,
+    save_local_client: fn(&Endpoint, String) -> Result<()>,
+) -> Result<()> {
+    let (store, config) = ConfigStore::initialize(state_dir, DEFAULT_LISTEN, None)?;
+    let initialized = AuthStore::initialize(store.auth_path()).and_then(|(auth, _)| {
+        let endpoint = hosted_loopback_endpoint(&config)?;
+        let issued = auth.provision_local_client()?;
+        save_local_client(&endpoint, issued.token)
+    });
+    if let Err(error) = initialized {
+        return cleanup_failed_initialization(&store, error);
+    }
+    println!("initialized hosted möbius gateway");
+    print_listener(&config, None);
+    Ok(())
+}
+
+pub(super) fn hosted_loopback_endpoint(config: &GatewayConfig) -> Result<Endpoint> {
+    if !config.listen.ip().is_loopback() || config.tls.is_some() || config.cloudflare.is_some() {
+        return Err(Error::Config(
+            "hosted commands require a direct plaintext loopback gateway".into(),
+        ));
+    }
+    loopback_endpoint(config)
+}
+
+fn cleanup_failed_initialization<T>(store: &ConfigStore, error: Error) -> Result<T> {
+    std::fs::remove_dir_all(store.state_dir()).map_err(|cleanup| {
+        Error::Config(format!(
+            "{error}; failed to remove incomplete gateway state at {}: {cleanup}",
+            store.state_dir().display()
+        ))
+    })?;
+    Err(error)
 }
 
 pub(super) fn provision_cloudflare_local_client(

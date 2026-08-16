@@ -18,11 +18,11 @@ pub(super) async fn connect(
             )
         })?;
         drop(startup);
-        let code = request_running_pairing_code(&client_endpoint, &token).await?;
+        let grant = request_running_pairing_code(&client_endpoint, &token).await?;
         print_connection(
             &pairing_endpoint,
             config.cloudflare.is_some().then_some(&client_endpoint),
-            &code,
+            &grant.code,
         )?;
         println!("gateway remains running");
         return Ok(());
@@ -176,11 +176,10 @@ pub(super) fn running_connection_endpoints(
     Ok(Some((client_endpoint, pairing_endpoint)))
 }
 
-#[cfg(unix)]
 pub(super) async fn request_running_pairing_code(
     client_endpoint: &Endpoint,
     token: &str,
-) -> Result<String> {
+) -> Result<PairingGrant> {
     let client =
         GatewayClient::connect(client_endpoint, token, ClientKind::GatewayDashboard).await?;
     let (sender, mut events) = client.into_parts();
@@ -199,8 +198,8 @@ pub(super) async fn request_running_pairing_code(
             ServerMessage::PairingCode {
                 request_id: actual,
                 code,
-                ..
-            } if actual == request_id => return Ok(code),
+                expires_at,
+            } if actual == request_id => return Ok(PairingGrant { code, expires_at }),
             ServerMessage::Rejected {
                 request_id: actual,
                 message,
@@ -213,6 +212,33 @@ pub(super) async fn request_running_pairing_code(
     Err(Error::Protocol(format!(
         "gateway sent {MAX_PENDING_FRAMES} unrelated frames before the pairing response"
     )))
+}
+
+pub(super) async fn hosted_pair(
+    state_dir: PathBuf,
+    load_local_client: fn(&Endpoint) -> Result<Option<String>>,
+) -> Result<()> {
+    let (_, config) = ConfigStore::open(state_dir)?;
+    let endpoint = hosted_loopback_endpoint(&config)?;
+    let token = load_local_client(&endpoint)?.ok_or_else(|| {
+        Error::Config("hosted gateway local control credential is unavailable".into())
+    })?;
+    let grant = request_running_pairing_code(&endpoint, &token).await?;
+    println!("{}", hosted_pair_json(&grant)?);
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct HostedPairOutput<'a> {
+    code: &'a str,
+    expires_at: i64,
+}
+
+pub(super) fn hosted_pair_json(grant: &PairingGrant) -> Result<String> {
+    Ok(serde_json::to_string(&HostedPairOutput {
+        code: &grant.code,
+        expires_at: grant.expires_at,
+    })?)
 }
 
 pub(super) fn connection_endpoint(
