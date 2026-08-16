@@ -1,7 +1,6 @@
+import AuthenticationServices
 import StoreKit
 import SwiftUI
-
-private let mobiusCloudMonthlyProductID = "app.mobius.client.cloud.monthly"
 
 struct MobiusCloudOfferButton: View {
     @Environment(\.mobiusPalette) private var palette
@@ -38,7 +37,7 @@ struct MobiusCloudOfferButton: View {
         .buttonSizing(.flexible)
         .task { await loadProduct() }
         .sheet(isPresented: $showsOffer) {
-            MobiusCloudOfferSheet(product: product)
+            MobiusCloudOfferSheet()
                 .presentationDragIndicator(.visible)
         }
         .accessibilityHint("Explains the managed möbius Cloud subscription")
@@ -57,10 +56,12 @@ struct MobiusCloudOfferButton: View {
 }
 
 private struct MobiusCloudOfferSheet: View {
+    @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @Environment(\.mobiusPalette) private var palette
-    @State private var showsUnavailable = false
-    let product: Product?
+    @State private var appleNonce: MobiusCloudAppleNonce?
+    @State private var product: Product?
+    @State private var productLoadFailed = false
 
     var body: some View {
         NavigationStack {
@@ -89,21 +90,15 @@ private struct MobiusCloudOfferSheet: View {
             }
             .safeAreaInset(edge: .bottom) { signupBoundary }
         }
-        .alert("Cloud signup is not available yet", isPresented: $showsUnavailable) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(
-                "This beta includes the möbius Cloud offer and storefront pricing preview. Sign in with Apple and subscription purchase are not connected yet."
-            )
-        }
+        .interactiveDismissDisabled(model.cloudAction.isRunning)
+        .task { await loadProduct() }
     }
 
     /// One voice per line: a mark, the promise, and the shape of the offer. The price is not
     /// here — it belongs beside the button that charges it, not at the top in accent.
     private var hero: some View {
         VStack(alignment: .leading, spacing: MobiusSpace.l) {
-            // The app's own mark, not a stock globe. The free trial is not announced twice:
-            // it is stated once, next to the price it applies to.
+            // The app's own mark, not a stock globe.
             MobiusComposingOrb()
                 .frame(width: 64, height: 64)
                 .frame(maxWidth: .infinity)
@@ -154,7 +149,7 @@ private struct MobiusCloudOfferSheet: View {
         VStack(alignment: .leading, spacing: MobiusSpace.s) {
             Text("You stay in control")
                 .font(MobiusStyle.titleFont)
-            Text("Manage the gateway or permanently delete your cloud from the möbius app or website.")
+            Text("Manage your subscription from the möbius app or App Store.")
                 .font(MobiusStyle.bodyFont)
                 .foregroundStyle(palette.muted)
                 .fixedSize(horizontal: false, vertical: true)
@@ -173,23 +168,59 @@ private struct MobiusCloudOfferSheet: View {
                 .font(MobiusStyle.bodyFont)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("Signup and billing are not enabled in this beta.")
-                .font(MobiusStyle.captionFont)
-                .foregroundStyle(palette.muted)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-            Button {
-                showsUnavailable = true
-            } label: {
-                Label("Continue with Apple", systemImage: "apple.logo")
-                    .font(MobiusStyle.titleFont)
-                    .foregroundStyle(.black)
-                    .frame(maxWidth: .infinity, minHeight: 50)
-                    .contentShape(Capsule())
+            if let cloudError = model.cloudError {
+                Text(cloudError)
+                    .font(MobiusStyle.captionFont)
+                    .foregroundStyle(palette.danger)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .buttonStyle(.plain)
-            .background(.white, in: Capsule())
-            .shadow(color: .black.opacity(0.32), radius: 14, y: 6)
+            if model.cloudAction.isRunning {
+                HStack(spacing: MobiusSpace.s) {
+                    ProgressView()
+                    Text(model.cloudAction.label)
+                }
+                .font(MobiusStyle.controlFont)
+                .frame(maxWidth: .infinity, minHeight: 50)
+                .accessibilityElement(children: .combine)
+            } else if let product {
+                if model.hasCloudAccount {
+                    Button("Subscribe for \(product.displayPrice) a month") {
+                        Task {
+                            if await model.purchaseCloud(product) { dismiss() }
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.extraLarge)
+                    .frame(maxWidth: .infinity)
+                } else {
+                    SignInWithAppleButton(.continue) { request in
+                        configureAppleRequest(request)
+                    } onCompletion: { result in
+                        completeAppleSignIn(result, product: product)
+                    }
+                    .signInWithAppleButtonStyle(.white)
+                    .frame(maxWidth: .infinity, minHeight: 50)
+                }
+            } else if productLoadFailed {
+                VStack(spacing: MobiusSpace.s) {
+                    Text("The App Store price could not be loaded.")
+                        .font(MobiusStyle.captionFont)
+                        .foregroundStyle(palette.muted)
+                    Button("Retry App Store") {
+                        Task { await loadProduct() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                }
+                .frame(maxWidth: .infinity, minHeight: 50)
+            } else {
+                Button("Connecting to the App Store…") {}
+                    .buttonStyle(.bordered)
+                    .controlSize(.extraLarge)
+                    .disabled(true)
+                    .frame(maxWidth: .infinity)
+            }
         }
         .frame(maxWidth: 680)
         .padding(.horizontal, MobiusSpace.l)
@@ -210,12 +241,70 @@ private struct MobiusCloudOfferSheet: View {
     private var billingDescription: Text {
         guard let product else {
             return Text(
-                "7 days free, then billed monthly. \(Text("Price shown at purchase.").foregroundStyle(palette.muted))"
+                "Billed monthly. \(Text("Price shown at purchase.").foregroundStyle(palette.muted))"
             )
         }
         return Text(
-            "7 days free, then \(product.displayPrice) a month. \(Text("Cancel anytime.").foregroundStyle(palette.muted))"
+            "\(product.displayPrice) a month. \(Text("Cancel anytime.").foregroundStyle(palette.muted))"
         )
+    }
+
+    private func loadProduct() async {
+        guard product == nil else { return }
+        productLoadFailed = false
+        do {
+            product = try await Product.products(for: [mobiusCloudMonthlyProductID]).first
+            productLoadFailed = product == nil
+        } catch {
+            productLoadFailed = true
+        }
+    }
+
+    private func configureAppleRequest(_ request: ASAuthorizationAppleIDRequest) {
+        do {
+            let nonce = try MobiusCloudAppleNonce.make()
+            appleNonce = nonce
+            request.requestedScopes = [.email]
+            request.nonce = nonce.requestValue
+        } catch {
+            appleNonce = nil
+            model.reportCloudSignInFailure()
+        }
+    }
+
+    private func completeAppleSignIn(
+        _ result: Result<ASAuthorization, Error>,
+        product: Product
+    ) {
+        switch result {
+        case .failure(let error):
+            appleNonce = nil
+            if let authorizationError = error as? ASAuthorizationError,
+               authorizationError.code == .canceled {
+                return
+            }
+            model.reportCloudSignInFailure()
+        case .success(let authorization):
+            guard let nonce = appleNonce,
+                  let credential = authorization.credential as? ASAuthorizationAppleIDCredential,
+                  let data = credential.authorizationCode,
+                  let authorizationCode = String(data: data, encoding: .utf8)
+            else {
+                appleNonce = nil
+                model.reportCloudSignInFailure()
+                return
+            }
+            appleNonce = nil
+            Task {
+                if await model.signInAndPurchaseCloud(
+                    authorizationCode: authorizationCode,
+                    nonce: nonce.rawValue,
+                    product: product
+                ) {
+                    dismiss()
+                }
+            }
+        }
     }
 }
 

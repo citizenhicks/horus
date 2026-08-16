@@ -16,6 +16,10 @@ extension AppModel {
         prefillPairing { try GatewayPairingSetup(rawValue) }
     }
 
+    func applyPairingSetup(_ setup: GatewayPairingSetup) {
+        prefillPairing { setup }
+    }
+
     func applyPairingURL(_ url: URL) {
         prefillPairing { try GatewayPairingSetup(url: url) }
     }

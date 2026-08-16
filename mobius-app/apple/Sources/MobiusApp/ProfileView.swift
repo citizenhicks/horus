@@ -163,12 +163,10 @@ private struct CloudAllowanceStatus: View {
 private struct CloudAccountSettings: View {
     @Environment(AppModel.self) private var model
     @Environment(\.mobiusPalette) private var palette
-    @State private var isRestoringPurchases = false
     @State private var showsSubscriptionManagement = false
 
-    /// Signed out, this is an offer; signed in, it is an account. The rows that only make
-    /// sense with an account are absent rather than greyed out — the one exception is
-    /// Restore Purchases, which has to stay reachable whether or not a purchase is known.
+    /// Signed out, this is an offer; signed in, it is an account. Account actions stay absent
+    /// until there is a Cloud session to authenticate them.
     var body: some View {
         if model.hasCloudAccount {
             CloudAllowanceStatus()
@@ -177,34 +175,19 @@ private struct CloudAccountSettings: View {
             }
             .accessibilityHint("Opens App Store subscription management, where you can unsubscribe")
             .manageSubscriptionsSheet(isPresented: $showsSubscriptionManagement)
-            Button("Delete account", glyph: .trash, role: .destructive) {}
+            Button(
+                model.cloudAction == .restoring ? "Restoring purchases…" : "Restore purchases",
+                glyph: .arrowClockwise
+            ) {
+                Task { _ = await model.restoreCloudPurchases() }
+            }
+            .disabled(model.cloudAction.isRunning)
         } else {
             Text("möbius works on its own with a gateway you run. Connect möbius Cloud to have one provisioned and managed for you.")
                 .font(MobiusStyle.bodyFont)
                 .foregroundStyle(palette.muted)
                 .fixedSize(horizontal: false, vertical: true)
             MobiusCloudOfferButton()
-        }
-
-        Button(
-            isRestoringPurchases ? "Restoring purchases…" : "Restore purchases",
-            glyph: .arrowClockwise,
-            action: restorePurchases
-        )
-        .disabled(isRestoringPurchases)
-    }
-
-    private func restorePurchases() {
-        guard !isRestoringPurchases else { return }
-        isRestoringPurchases = true
-        Task {
-            defer { isRestoringPurchases = false }
-            do {
-                try await AppStore.sync()
-                model.showToast("Purchase history refreshed.", tone: .success)
-            } catch {
-                model.showToast("Couldn’t restore purchases: \(error.localizedDescription)", tone: .error)
-            }
         }
     }
 }
@@ -214,12 +197,6 @@ private struct DataPrivacySettings: View {
     @Environment(\.mobiusPalette) private var palette
 
     var body: some View {
-        // Cloud data rows describe data that only exists once there is a cloud account.
-        if model.hasCloudAccount {
-            Button("View cloud data", glyph: .hardDrives) {}
-            Button("Delete cloud data", glyph: .trash, role: .destructive) {}
-        }
-
         Toggle("Help improve möbius", isOn: Binding(
             get: { model.sharesMobiusDiagnostics },
             set: { model.setSharesMobiusDiagnostics($0) }

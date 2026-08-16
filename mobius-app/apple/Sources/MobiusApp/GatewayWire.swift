@@ -63,7 +63,7 @@ struct GatewayPairingSetup: Equatable, Sendable {
         try self.init(endpoint: endpoint, code: code)
     }
 
-    private init(endpoint: String, code: String) throws {
+    init(endpoint: String, code: String) throws {
         guard !code.isEmpty,
               code.utf8.count <= Self.maximumCodeBytes,
               code.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e })

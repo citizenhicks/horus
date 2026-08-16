@@ -32,13 +32,10 @@ final class AppModel {
         didSet { committedGitDiffRevision &+= 1 }
     }
     var sessions: [SessionRecord] = []
-    /// Whether a möbius Cloud account is connected.
-    ///
-    /// Hard-coded until the cloud sign-in exists. Account-gated rows read this instead of
-    /// each deciding for itself, so connecting the cloud is one value to change. möbius is a
-    /// free app with an optional cloud, so the signed-out state hides account rows rather
-    /// than showing them disabled: a control nobody can enable from here teaches nothing.
-    var hasCloudAccount: Bool { false }
+    var cloudSession: MobiusCloudSession?
+    var cloudAction: MobiusCloudAction = .idle
+    var cloudError: String?
+    var hasCloudAccount: Bool { cloudSession != nil }
 
     var gatewayMachineName = ""
     @ObservationIgnored let titleWriter: ChatTitleWriter
@@ -239,6 +236,7 @@ final class AppModel {
 
     @ObservationIgnored let client: GatewayClient
     @ObservationIgnored let store: GatewayStore
+    @ObservationIgnored let cloudClient: MobiusCloudClient
     @ObservationIgnored let settingsDefaults: UserDefaults
     @ObservationIgnored let appLockAuthenticator: AppLockAuthenticator
     @ObservationIgnored let requestSender:
@@ -343,14 +341,18 @@ final class AppModel {
                 -> AsyncThrowingStream<GatewayEnvelope, Error>
         )? = nil,
         reconnectDelay: (@Sendable (Int) -> Duration)? = nil,
-        titleWriter: ChatTitleWriter? = nil
+        titleWriter: ChatTitleWriter? = nil,
+        cloudClient: MobiusCloudClient? = nil
     ) {
         let client = client ?? GatewayClient()
         let store = store ?? GatewayStore()
+        let cloudClient = cloudClient ?? MobiusCloudClient()
         let appLockAuthenticator = appLockAuthenticator ?? AppLockAuthenticator()
         let appLockEnabled = settingsDefaults.bool(forKey: appLockEnabledKey)
         self.client = client
         self.store = store
+        self.cloudClient = cloudClient
+        self.cloudSession = try? cloudClient.loadSession()
         self.settingsDefaults = settingsDefaults
         self.appLockAuthenticator = appLockAuthenticator
         self.titleWriter = titleWriter ?? ChatTitleWriter()
