@@ -9,76 +9,42 @@ extension AppModelTests {
         let model = try model(requestSender: { request in
             await recorder.record(request)
         })
-        model.transcript = [
+        func entry(
+            _ id: String,
+            _ text: String,
+            turnID: String,
+            role: FrontendBlockRole = .tool,
+            terminal: Bool = false
+        ) -> TranscriptEntry {
             TranscriptEntry(
-                id: "prior-patch",
-                text: "prior diff",
-                kind: .event,
-                role: .tool,
-                format: "unified_diff",
+                id: id,
+                text: text,
+                kind: terminal ? .assistant : .event,
+                role: terminal ? nil : role,
+                format: terminal ? "plain_text" : "unified_diff",
                 pending: false,
-                turnID: "turn-1"
-            ),
-            TranscriptEntry(
-                id: "prior-final",
-                text: "Done",
-                kind: .assistant,
-                format: "plain_text",
-                pending: false,
-                turnID: "turn-1",
-                turnTerminal: true
-            ),
-            TranscriptEntry(
-                id: "latest-patch-1",
-                text: "first diff",
-                kind: .event,
-                role: .tool,
-                format: "unified_diff",
-                pending: false,
-                turnID: "turn-2"
-            ),
-            TranscriptEntry(
-                id: "latest-artifact",
-                text: "artifact diff",
-                kind: .event,
-                role: .artifact,
-                format: "unified_diff",
-                pending: false,
-                turnID: "turn-2"
-            ),
-            TranscriptEntry(
-                id: "latest-patch-2",
-                text: "second diff",
-                kind: .event,
-                role: .tool,
-                format: "unified_diff",
-                pending: false,
-                turnID: "turn-2"
-            ),
-            TranscriptEntry(
-                id: "latest-final",
-                text: "Done",
-                kind: .assistant,
-                format: "plain_text",
-                pending: false,
-                turnID: "turn-2",
-                turnTerminal: true
-            ),
-            TranscriptEntry(
-                id: "active-patch",
-                text: "active diff",
-                kind: .event,
-                role: .tool,
-                format: "unified_diff",
-                pending: false,
-                turnID: "turn-3"
+                turnID: turnID,
+                turnTerminal: terminal
             )
+        }
+        func patch(_ path: String) -> String {
+            "--- \(path)\n+++ \(path)\n@@ -1 +1 @@\n-old\n+new"
+        }
+        model.transcript = [
+            entry("prior-patch", patch("prior.swift"), turnID: "turn-1"),
+            entry("prior-final", "Done", turnID: "turn-1", terminal: true),
+            entry("latest-patch-1", patch("First.swift"), turnID: "turn-2"),
+            entry("latest-artifact", patch("Artifact.swift"), turnID: "turn-2", role: .artifact),
+            entry("latest-patch-2", patch("Second.swift"), turnID: "turn-2"),
+            entry("latest-final", "Done", turnID: "turn-2", terminal: true),
+            entry("active-patch", patch("Active.swift"), turnID: "turn-3")
         ]
 
         model.showFiles(.lastTurn)
         let requestCount = await recorder.requestCount()
+        let document = UnifiedDiffDocument(model.lastTurnDiff)
 
-        XCTAssertEqual(model.lastTurnDiff, "first diff\nsecond diff")
+        XCTAssertEqual(document.files.map(\.path), ["First.swift", "Second.swift"])
         XCTAssertEqual(model.modifiedFilesScope, .lastTurn)
         XCTAssertEqual(requestCount, 0)
     }

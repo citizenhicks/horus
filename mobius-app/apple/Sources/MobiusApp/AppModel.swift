@@ -180,7 +180,7 @@ final class AppModel {
                     && !$0.pending
             }
             .map(\.text)
-            .joined(separator: "\n")
+            .joined(separator: "\ndiff --git a/turn-change b/turn-change\n")
     }
     var lastTurnDiffRevision: Int {
         transcript.lastIndex(where: {
