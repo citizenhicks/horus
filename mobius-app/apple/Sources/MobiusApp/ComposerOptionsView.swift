@@ -223,35 +223,38 @@ struct ComposerOptionsView: View {
         .accessibilityLabel(dictationLabel)
         .accessibilityValue(dictationValue)
 
-        if model.activeTurnID != nil && !canSend {
-            Button("Stop", glyph: .stopFill) { model.interrupt() }
-                .labelStyle(.iconOnly)
-                .buttonStyle(MobiusIconButtonStyle(prominent: true))
-                .help("Stop")
-        } else {
-            Button(action: model.sendMessage) {
-                Label {
-                    Text(model.activeTurnID == nil ? "Send" : "Send steering message")
-                } icon: {
-                    if isWaitingForGateway {
-                        MobiusSpinner(
-                            size: MobiusStyle.iconSize,
-                            foreground: palette.onAccent
-                        )
-                    } else {
-                        MobiusIcon(
-                            model.activeTurnID == nil ? .arrowUp02 : .arrowUpRight01
-                        )
+        Group {
+            if model.activeTurnID != nil && !canSend {
+                Button("Stop", glyph: .stopFill) { model.interrupt() }
+                    .help("Stop")
+            } else {
+                Button(action: model.sendMessage) {
+                    Label {
+                        Text(model.activeTurnID == nil ? "Send" : "Send steering message")
+                    } icon: {
+                        if isWaitingForGateway {
+                            MobiusSpinner(
+                                size: MobiusStyle.iconSize,
+                                foreground: palette.onAccent
+                            )
+                        } else {
+                            MobiusIcon(
+                                model.activeTurnID == nil ? .arrowUp02 : .arrowUpRight01
+                            )
+                        }
                     }
                 }
+                    // `sendMessage()` also needs a session: a gateway with no chats left the
+                    // button enabled and the tap silent.
+                    .disabled(!canSend)
+                    .help(model.activeTurnID == nil ? "Send" : "Send steering message")
             }
-                .labelStyle(.iconOnly)
-                .buttonStyle(MobiusIconButtonStyle(prominent: true))
-                // `sendMessage()` also needs a session: a gateway with no chats left the button
-                // enabled and the tap silent.
-                .disabled(!canSend)
-                .help(model.activeTurnID == nil ? "Send" : "Send steering message")
         }
+        .labelStyle(.iconOnly)
+        .mobiusProminentButton()
+        .buttonBorderShape(.circle)
+        .controlSize(.regular)
+        .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
     }
 
     private func importFiles(_ result: Result<[URL], Error>) {

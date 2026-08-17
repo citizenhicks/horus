@@ -200,7 +200,7 @@ final class UnifiedDiffTests: XCTestCase {
         XCTAssertEqual(file.rows.map(\.text), ["@@ -1,3 +1,3 @@", "first", "old", "new", "last"])
     }
 
-    func testFileChangesCoalescesRepeatedPathsInFirstSeenOrder() {
+    func testRepeatedFilesCoalesceInFirstSeenOrder() throws {
         let document = UnifiedDiffDocument(
             """
             diff --git a/Same.swift b/Same.swift
@@ -223,6 +223,11 @@ final class UnifiedDiffTests: XCTestCase {
             """
         )
 
+        XCTAssertEqual(document.files.map(\.path), ["Same.swift", "Other.swift"])
+        let same = try XCTUnwrap(document.files.first)
+        XCTAssertEqual(same.added, 2)
+        XCTAssertEqual(same.removed, 1)
+        XCTAssertEqual(same.rows.map(\.id), Array(same.rows.indices))
         XCTAssertEqual(document.fileChanges, [
             UnifiedDiffFileChange(path: "Same.swift", added: 2, removed: 1),
             UnifiedDiffFileChange(path: "Other.swift", added: 1, removed: 0),

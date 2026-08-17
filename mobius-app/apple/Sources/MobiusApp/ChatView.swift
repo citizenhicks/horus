@@ -232,6 +232,15 @@ private struct ChatOptionsMenu: View {
             if let session = model.selectedSession {
                 Section {
                     Button {
+                        model.setSessionPinned(session, pinned: !session.pinned)
+                    } label: {
+                        MobiusLabel(
+                            title: session.pinned ? "Unpin chat" : "Pin chat",
+                            glyph: session.pinned ? .pushPinSlash : .pushPin
+                        )
+                    }
+                    .disabled(!model.canRenameSession)
+                    Button {
                         model.beginRenamingSession(session)
                     } label: {
                         MobiusLabel(title: "Rename chat", glyph: .pencilSimple)

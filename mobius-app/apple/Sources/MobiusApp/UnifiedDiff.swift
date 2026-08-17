@@ -124,6 +124,7 @@ private struct UnifiedDiffParser {
     private static let maximumRenderedLineCharacters = 4_096
 
     private var files: [UnifiedDiffFile] = []
+    private var fileIndices: [String: Int] = [:]
     private var file: PendingDiffFile?
     private var hunk: PendingDiffHunk?
     private var nextFileID = 0
@@ -285,14 +286,36 @@ private struct UnifiedDiffParser {
             self.file = nil
             return
         }
-        files.append(UnifiedDiffFile(
-            id: nextFileID,
-            path: path,
-            rows: pending.rows,
-            added: pending.added,
-            removed: pending.removed
-        ))
-        nextFileID += 1
+        if let index = fileIndices[path] {
+            let existing = files[index]
+            let rowOffset = existing.rows.count
+            let appendedRows = pending.rows.enumerated().map { offset, row in
+                UnifiedDiffRow(
+                    id: rowOffset + offset,
+                    kind: row.kind,
+                    oldNumber: row.oldNumber,
+                    newNumber: row.newNumber,
+                    text: row.text
+                )
+            }
+            files[index] = UnifiedDiffFile(
+                id: existing.id,
+                path: path,
+                rows: existing.rows + appendedRows,
+                added: existing.added + pending.added,
+                removed: existing.removed + pending.removed
+            )
+        } else {
+            fileIndices[path] = files.count
+            files.append(UnifiedDiffFile(
+                id: nextFileID,
+                path: path,
+                rows: pending.rows,
+                added: pending.added,
+                removed: pending.removed
+            ))
+            nextFileID += 1
+        }
         self.file = nil
     }
 

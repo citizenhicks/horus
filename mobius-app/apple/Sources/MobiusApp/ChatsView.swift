@@ -397,6 +397,14 @@ struct ChatsView: View {
                         state: session.activity.state,
                         isUnread: isUnread
                     )
+                    if session.pinned {
+                        MobiusIcon(
+                            .pushPin,
+                            size: MobiusStyle.glyphMark,
+                            foreground: palette.accent
+                        )
+                        .accessibilityHidden(true)
+                    }
                 }
                 .frame(minHeight: MobiusStyle.iconButtonSize)
                 .contentShape(Rectangle())
@@ -404,48 +412,11 @@ struct ChatsView: View {
             .buttonStyle(.mobiusPlain)
             .disabled(!model.canOpenSession && session.sessionId != model.selectedSessionID)
             .accessibilityValue(
-                [showsWorkspace ? workspace : "", activityValue]
+                [showsWorkspace ? workspace : "", session.pinned ? "Pinned" : "", activityValue]
                     .filter { !$0.isEmpty }
                     .joined(separator: ", ")
             )
             .accessibilityAddTraits(isSelected ? .isSelected : [])
-
-            if session.pinned {
-                MobiusIcon(.pushPin, size: MobiusStyle.glyphMark, foreground: palette.accent)
-                    .accessibilityHidden(true)
-            }
-
-            Menu {
-                Button {
-                    model.setSessionPinned(session, pinned: !session.pinned)
-                } label: {
-                    MobiusLabel(
-                        title: session.pinned ? "Unpin" : "Pin",
-                        glyph: session.pinned ? .pushPinSlash : .pushPin
-                    )
-                }
-                Button {
-                    model.beginRenamingSession(session)
-                } label: {
-                    MobiusLabel(title: "Rename", glyph: .pencilSimple)
-                }
-                Divider()
-                Button(role: .destructive) {
-                    model.beginDeletingSession(session)
-                } label: {
-                    MobiusLabel(title: "Delete", glyph: .trash)
-                }
-            } label: {
-                MobiusIcon(.dotsThree)
-                    .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
-                    .contentShape(Rectangle())
-            }
-            .labelStyle(.titleAndIcon)
-            .buttonStyle(.mobiusPlain)
-            .tint(.primary)
-            .menuIndicator(.hidden)
-            .accessibilityLabel("Chat actions")
-            .help("Chat actions")
         }
         .padding(.horizontal, MobiusSpace.s)
         .frame(minHeight: MobiusStyle.iconButtonSize)
