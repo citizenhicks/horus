@@ -120,7 +120,7 @@ impl Middleware for Compaction {
         })
     }
 
-    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn pre_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let estimated = context.estimated_input_tokens();
             let observed = if contains_compaction(context.input()) {
@@ -135,6 +135,7 @@ impl Middleware for Compaction {
             {
                 return Ok(());
             }
+            context.pre_compact().await?;
             let output = if context.model.compaction_endpoint(context.provider)? {
                 let tools = context.tools.definitions();
                 let cache_key = prompt_cache_key(context.session_id);
@@ -176,6 +177,7 @@ impl Middleware for Compaction {
             context.record_transcript_item(internal_user_message(CONTEXT_COMPACTED_MARKER, ""));
             context.usage.push(output.usage);
             context.events.push(EventMsg::ContextCompacted);
+            context.post_compact().await?;
             Ok(())
         })
     }

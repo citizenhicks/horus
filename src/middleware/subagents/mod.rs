@@ -16,7 +16,8 @@ use super::MiddlewareCommandOutput;
 use super::ModelContext;
 use super::PromptSection;
 use super::RuntimeContext;
-use super::SessionEndContext;
+use super::SessionStartContext;
+use super::SessionStartSource;
 use super::manifest::{MiddlewareManifest, MiddlewareSettingChoices, MiddlewareSettingManifest};
 use super::tools::Catalog;
 use super::tools::labeled_tool_heading;
@@ -24,7 +25,7 @@ use super::tools::render_tool_event;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
-use crate::agent::Agent;
+use crate::agent::{Agent, AgentRole};
 use crate::backend::checkpoint::Checkpoint;
 use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::model::internal_user_message;
@@ -140,6 +141,7 @@ pub struct SubagentLaunch {
     pub model: String,
     pub reasoning_effort: Option<String>,
     pub metadata: BTreeMap<String, Value>,
+    pub role: AgentRole,
 }
 
 /// Creates one child agent for this capability.
@@ -239,6 +241,7 @@ impl AgentScope {
         model: String,
         reasoning_effort: Option<String>,
         turns: ForkTurns,
+        parent_turn_id: String,
     ) -> Result<Agent> {
         let parent = self
             .checkpoints
@@ -278,6 +281,10 @@ impl AgentScope {
             .fork(&self.session_id, parent_sequence, &checkpoint)
             .await?;
         (self.launch_agent)(SubagentLaunch {
+            role: AgentRole::Subagent {
+                parent_session_id: self.session_id.clone(),
+                parent_turn_id,
+            },
             session_id,
             model,
             reasoning_effort,
@@ -292,11 +299,16 @@ impl AgentScope {
         agent_path: String,
         depth: u8,
         model: String,
+        parent_turn_id: String,
     ) -> Result<Agent> {
         let checkpoint = self.checkpoints.load(&session_id).await?.ok_or_else(|| {
             Error::Checkpoint(format!("checkpoint for `{agent_path}` is missing"))
         })?;
         (self.launch_agent)(SubagentLaunch {
+            role: AgentRole::Subagent {
+                parent_session_id: self.session_id.clone(),
+                parent_turn_id,
+            },
             session_id,
             model,
             reasoning_effort: None,
@@ -505,8 +517,14 @@ impl Middleware for Subagents {
         MANIFEST.id
     }
 
-    fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
-        Box::pin(self.shared.initialize(context))
+    fn session_start<'a>(
+        &'a self,
+        context: &'a mut SessionStartContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        if context.source() == SessionStartSource::Compact {
+            return Box::pin(async { Ok(()) });
+        }
+        Box::pin(self.shared.session_start((*context.runtime).clone()))
     }
 
     fn register(&self, catalog: &mut Catalog, runtime: &RuntimeContext) -> Result<()> {
@@ -637,7 +655,7 @@ impl Middleware for Subagents {
         })
     }
 
-    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn pre_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let identity = AgentIdentity::read(context.session_id, context.metadata)?;
             let acknowledged = context
@@ -665,10 +683,10 @@ impl Middleware for Subagents {
         })
     }
 
-    fn shutdown<'a>(&'a self, context: SessionEndContext) -> BoxFuture<'a, Result<()>> {
+    fn session_end<'a>(&'a self, runtime: &'a RuntimeContext) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let identity = AgentIdentity::read(&context.session_id, &context.metadata)?;
-            if identity.depth == 0 {
+            let identity = AgentIdentity::read(&runtime.session_id, &runtime.metadata)?;
+            if matches!(runtime.role, AgentRole::Main) && identity.depth == 0 {
                 self.shared.remove_root(&identity.root_session_id).await;
             }
             Ok(())

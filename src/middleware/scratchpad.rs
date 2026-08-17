@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -13,7 +12,7 @@ use super::manifest::MiddlewareManifest;
 use super::tools::{Catalog, labeled_tool_heading, render_tool_event};
 use super::{
     Middleware, MiddlewareCommandContext, MiddlewareCommandOutput, ModelContext, PromptSection,
-    RuntimeContext,
+    RuntimeContext, SessionStartContext, SessionStartSource,
 };
 use crate::backend::checkpoint::{CheckpointStore, ContextRewriteReason};
 use crate::protocol::{
@@ -296,21 +295,6 @@ impl Middleware for Scratchpad {
             .then(|| PromptSection::new(text::PROMPT_MAIN)))
     }
 
-    fn seed_session<'a>(
-        &'a self,
-        runtime: &'a RuntimeContext,
-    ) -> BoxFuture<'a, Result<Vec<Value>>> {
-        Box::pin(async move {
-            if !self.agent_enabled {
-                return Ok(Vec::new());
-            }
-            let snapshot = self.store.snapshot(&runtime.session_id).await?;
-            Ok(scratchpad_message(&snapshot)
-                .into_iter()
-                .collect::<Vec<_>>())
-        })
-    }
-
     fn frontend(&self) -> FrontendContribution {
         FrontendContribution {
             capability: self.name().into(),
@@ -343,10 +327,26 @@ impl Middleware for Scratchpad {
         )
     }
 
-    fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
+    fn session_start<'a>(
+        &'a self,
+        context: &'a mut SessionStartContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let snapshot = self.store.snapshot(&context.session_id).await?;
-            publish_widgets(&context.frontend, &snapshot)
+            let snapshot = self.store.snapshot(&context.runtime.session_id).await?;
+            if self.agent_enabled
+                && matches!(
+                    context.source(),
+                    SessionStartSource::Startup | SessionStartSource::Compact
+                )
+                && !context.input.iter().any(is_projection_item)
+                && let Some(item) = scratchpad_message(&snapshot)
+            {
+                context.push_input(item);
+            }
+            if context.source() != SessionStartSource::Compact {
+                publish_widgets(&context.runtime.frontend, &snapshot)?;
+            }
+            Ok(())
         })
     }
 
@@ -441,7 +441,7 @@ impl Middleware for Scratchpad {
         })
     }
 
-    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn pre_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             if !self.agent_enabled {
                 if let Some(input) = without_projection_items(context.input()) {

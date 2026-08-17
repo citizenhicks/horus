@@ -115,7 +115,7 @@ fn image_input_requires_explicit_provider_support() {
 
 #[test]
 fn normalized_output_derives_text_and_validates_tool_calls() {
-    let output = ModelOutput::from_output(
+    let mut output = ModelOutput::from_output(
         vec![
             serde_json::json!({
                 "type": "message",
@@ -143,6 +143,12 @@ fn normalized_output_derives_text_and_validates_tool_calls() {
             arguments: serde_json::json!({"path": "README.md"}),
         }]
     );
+    output.tool_calls[0].name = "search".into();
+    output.tool_calls[0].arguments = serde_json::json!({"query": "hooks"});
+    output.sync_tool_calls().expect("rewritten calls");
+    assert_eq!(output.tool_calls()[0].name, "search");
+    assert_eq!(output.output()[1]["name"], "search");
+    assert_eq!(output.output()[1]["arguments"], r#"{"query":"hooks"}"#);
 }
 
 #[test]

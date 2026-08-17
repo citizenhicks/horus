@@ -45,9 +45,11 @@ pub mod tools;
 
 pub(crate) use context::QueuedInputBaseline;
 pub use context::{
-    ActiveCommandContext, ActiveSubmissionContext, ActiveSubmissionResult, FrontendEventSink,
-    MiddlewareCommandContext, ModelContext, QueuedInputQueue, QueuedInputSnapshot,
-    QueuedInputValue, QueuedInputView, RuntimeContext, SessionEndContext, TurnEndContext,
+    ActiveCommandContext, ActiveSubmissionContext, ActiveSubmissionResult, CompactContext,
+    FrontendEventSink, MiddlewareCommandContext, ModelContext, ModelRequestContext,
+    PermissionDecision, PermissionRequestContext, PostToolUseContext, PreToolUseContext,
+    QueuedInputQueue, QueuedInputSnapshot, QueuedInputValue, QueuedInputView, RuntimeContext,
+    SessionStartContext, SessionStartSource, StopContext, TurnEndContext, UserPromptSubmitContext,
 };
 
 use tools::Catalog;
@@ -150,14 +152,6 @@ pub trait Middleware: Send + Sync {
         Ok(None)
     }
 
-    /// Seeds provider context for a newly created session before initialization.
-    fn seed_session<'a>(
-        &'a self,
-        _runtime: &'a RuntimeContext,
-    ) -> BoxFuture<'a, Result<Vec<Value>>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
     /// Declares commands and status data that any frontend may render.
     fn frontend(&self) -> FrontendContribution {
         FrontendContribution::default()
@@ -184,8 +178,19 @@ pub trait Middleware: Send + Sync {
         })
     }
 
-    /// Restores middleware-owned durable state for this agent tree.
-    fn initialize<'a>(&'a self, _context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
+    /// Starts or re-enters a session lifecycle.
+    fn session_start<'a>(
+        &'a self,
+        _context: &'a mut SessionStartContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Intercepts a user prompt before it enters durable context.
+    fn user_prompt_submit<'a>(
+        &'a self,
+        _context: &'a mut UserPromptSubmitContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -217,26 +222,71 @@ pub trait Middleware: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
-    /// Observes a turn ending and may clear capability-owned transient UI.
-    fn turn_ended(&self, _context: &mut TurnEndContext<'_>) -> Result<()> {
-        Ok(())
-    }
-
     /// Mutates durable context before the next model request is assembled.
-    fn before_model<'a>(&'a self, _context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn pre_model<'a>(&'a self, _context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Ok(()) })
     }
 
     /// Applies request-only context after every durable transform has completed.
-    fn decorate_model_request<'a>(
+    fn model_request<'a>(
         &'a self,
-        _context: &'a mut ModelContext<'_>,
+        _context: &'a mut ModelRequestContext<'_>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Ok(()) })
     }
 
+    /// Intercepts one normalized tool call before authorization and persistence.
+    fn pre_tool_use<'a>(
+        &'a self,
+        _context: &'a mut PreToolUseContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Decides whether an approval request should be deferred, allowed, or denied.
+    fn permission_request<'a>(
+        &'a self,
+        _context: &'a mut PermissionRequestContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Transforms model-visible feedback after a tool has executed.
+    fn post_tool_use<'a>(
+        &'a self,
+        _context: &'a mut PostToolUseContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Observes context immediately before compaction.
+    fn pre_compact<'a>(
+        &'a self,
+        _context: &'a mut CompactContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Observes context after compaction has committed its rewrite.
+    fn post_compact<'a>(
+        &'a self,
+        _context: &'a mut CompactContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Decides whether a naturally stopped model should continue once more.
+    fn stop<'a>(&'a self, _context: &'a mut StopContext<'_>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Observes terminal bookkeeping for a completed or aborted turn.
+    fn turn_end<'a>(&'a self, _context: &'a mut TurnEndContext<'_>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Releases session-local state when the agent runtime stops.
-    fn shutdown<'a>(&'a self, _context: SessionEndContext) -> BoxFuture<'a, Result<()>> {
+    fn session_end<'a>(&'a self, _runtime: &'a RuntimeContext) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -285,17 +335,23 @@ impl Middleware for Sandbox {
         Sandbox::render(self, event)
     }
 
-    fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
+    fn session_start<'a>(
+        &'a self,
+        context: &'a mut SessionStartContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            for event in Sandbox::initialize(self, &context.session_id)? {
-                (context.frontend)(event)?;
+            if context.source() == SessionStartSource::Compact {
+                return Ok(());
+            }
+            for event in Sandbox::session_start(self, &context.runtime.session_id)? {
+                (context.runtime.frontend)(event)?;
             }
             Ok(())
         })
     }
 
-    fn shutdown<'a>(&'a self, context: SessionEndContext) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move { Sandbox::shutdown(self, &context.session_id).await })
+    fn session_end<'a>(&'a self, runtime: &'a RuntimeContext) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { Sandbox::session_end(self, &runtime.session_id).await })
     }
 }
 
@@ -383,14 +439,6 @@ impl MiddlewareStack {
         Ok(prompt)
     }
 
-    pub(crate) async fn seed_session(&self, runtime: &RuntimeContext) -> Result<Vec<Value>> {
-        let mut input = Vec::new();
-        for entry in &self.entries {
-            input.extend(entry.seed_session(runtime).await?);
-        }
-        Ok(input)
-    }
-
     /// Builds and validates the frontend-neutral capability catalog.
     pub fn frontend(&self) -> Result<Vec<FrontendContribution>> {
         let contributions = self.declared_frontend()?;
@@ -460,23 +508,30 @@ impl MiddlewareStack {
         entry.active_command(context).await
     }
 
-    pub(crate) async fn initialize(
+    pub(crate) async fn session_start(
         &self,
-        context: RuntimeContext,
+        runtime: &RuntimeContext,
         queued_input: &[DurableQueuedInput],
+        source: SessionStartSource,
+        input: &mut Vec<Value>,
     ) -> Result<()> {
-        let end = SessionEndContext {
-            session_id: context.session_id.clone(),
-            metadata: context.metadata.clone(),
+        let compact_input_len = (source == SessionStartSource::Compact).then_some(input.len());
+        let mut context = SessionStartContext {
+            runtime,
+            source,
+            queued_input: QueuedInputSnapshot::default(),
+            input,
         };
         for (index, entry) in self.entries.iter().enumerate() {
-            let mut scoped_context = context.clone();
-            scoped_context.queued_input =
-                QueuedInputSnapshot::for_owner(entry.name(), queued_input);
-            if let Err(error) = entry.initialize(scoped_context).await {
+            context.queued_input = QueuedInputSnapshot::for_owner(entry.name(), queued_input);
+            if let Err(error) = entry.session_start(&mut context).await {
+                if let Some(input_len) = compact_input_len {
+                    context.input.truncate(input_len);
+                    return Err(error);
+                }
                 let mut rollback_error = None;
-                for initialized in self.entries[..index].iter().rev() {
-                    if let Err(error) = initialized.shutdown(end.clone()).await
+                for started in self.entries[..index].iter().rev() {
+                    if let Err(error) = started.session_end(runtime).await
                         && rollback_error.is_none()
                     {
                         rollback_error = Some(error);
@@ -494,36 +549,98 @@ impl MiddlewareStack {
         Ok(())
     }
 
-    pub(crate) fn turn_ended(&self, mut context: TurnEndContext<'_>) -> Result<()> {
+    pub(crate) async fn user_prompt_submit(
+        &self,
+        context: &mut UserPromptSubmitContext<'_>,
+    ) -> Result<()> {
         for entry in &self.entries {
-            context.owner = Some(entry.name());
-            entry.turn_ended(&mut context)?;
+            entry.user_prompt_submit(context).await?;
         }
         Ok(())
     }
 
-    pub(crate) async fn shutdown(&self, context: SessionEndContext) -> Result<()> {
+    pub(crate) async fn prepare_model(&self, mut context: ModelContext<'_>) -> Result<()> {
+        for entry in &self.entries {
+            context.queued_input.scope(entry.name());
+            entry.pre_model(&mut context).await?;
+        }
+        for entry in &self.entries {
+            let mut request = ModelRequestContext {
+                model: context.model,
+                provider: context.provider,
+                session_id: context.session_id,
+                turn_id: context.turn_id,
+                model_step: context.model_step,
+                input: context.request_input,
+            };
+            entry.model_request(&mut request).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn pre_tool_use(&self, context: &mut PreToolUseContext<'_>) -> Result<()> {
+        for entry in &self.entries {
+            entry.pre_tool_use(context).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn permission_request(
+        &self,
+        context: &mut PermissionRequestContext<'_>,
+    ) -> Result<()> {
+        for entry in &self.entries {
+            entry.permission_request(context).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn post_tool_use(&self, context: &mut PostToolUseContext<'_>) -> Result<()> {
+        for entry in &self.entries {
+            entry.post_tool_use(context).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn pre_compact(&self, mut context: CompactContext<'_>) -> Result<()> {
+        for entry in &self.entries {
+            entry.pre_compact(&mut context).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn post_compact(&self, mut context: CompactContext<'_>) -> Result<()> {
+        for entry in &self.entries {
+            entry.post_compact(&mut context).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn stop(&self, context: &mut StopContext<'_>) -> Result<()> {
+        for entry in &self.entries {
+            entry.stop(context).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn turn_end(&self, mut context: TurnEndContext<'_>) -> Result<()> {
+        for entry in &self.entries {
+            context.owner = Some(entry.name());
+            entry.turn_end(&mut context).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn session_end(&self, runtime: &RuntimeContext) -> Result<()> {
         let mut first_error = None;
         for entry in self.entries.iter().rev() {
-            if let Err(error) = entry.shutdown(context.clone()).await
+            if let Err(error) = entry.session_end(runtime).await
                 && first_error.is_none()
             {
                 first_error = Some(error);
             }
         }
         first_error.map_or(Ok(()), Err)
-    }
-
-    pub(crate) async fn before_model(&self, mut context: ModelContext<'_>) -> Result<()> {
-        for entry in &self.entries {
-            context.queued_input.scope(entry.name());
-            entry.before_model(&mut context).await?;
-        }
-        for entry in &self.entries {
-            context.queued_input.scope(entry.name());
-            entry.decorate_model_request(&mut context).await?;
-        }
-        Ok(())
     }
 
     pub(crate) async fn command(

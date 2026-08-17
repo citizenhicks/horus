@@ -48,7 +48,9 @@ use crate::middleware::ActiveSubmissionResult;
 use crate::middleware::Middleware;
 use crate::middleware::MiddlewareStack;
 use crate::middleware::ModelContext;
+use crate::middleware::ModelRequestContext;
 use crate::middleware::RuntimeContext;
+use crate::middleware::SessionStartContext;
 use crate::middleware::compaction::Compaction;
 use crate::middleware::steering::Steering;
 use crate::middleware::tools::ApprovalRequirement;
@@ -209,7 +211,7 @@ impl Middleware for QueueingMiddleware {
         accept_queued_input(context)
     }
 
-    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn pre_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             consume_queued_input(context);
             Ok(())
@@ -233,7 +235,7 @@ impl Middleware for BlockingBeforeModelMiddleware {
         accept_queued_input(context)
     }
 
-    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn pre_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             if !self.blocked.swap(true, Ordering::SeqCst) {
                 self.started.notify_one();
@@ -250,7 +252,7 @@ impl Middleware for BlockingTailMiddleware {
         "blocking_tail"
     }
 
-    fn before_model<'a>(&'a self, _context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn pre_model<'a>(&'a self, _context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             if !self.blocked.swap(true, Ordering::SeqCst) {
                 self.started.notify_one();
@@ -266,10 +268,13 @@ impl Middleware for SaturatingMiddleware {
         "saturating"
     }
 
-    fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
+    fn session_start<'a>(
+        &'a self,
+        context: &'a mut SessionStartContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             for index in 0..=EVENT_QUEUE_CAPACITY {
-                (context.frontend)(FrontendEvent::RemoveWidget {
+                (context.runtime.frontend)(FrontendEvent::RemoveWidget {
                     capability: "saturating".into(),
                     id: index.to_string(),
                 })?;
@@ -299,14 +304,17 @@ impl Middleware for RequestOnlyMiddleware {
         "request_only"
     }
 
-    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn model_request<'a>(
+        &'a self,
+        context: &'a mut ModelRequestContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let mut input = context.request_input().to_vec();
+            let mut input = context.input().to_vec();
             input.push(crate::backend::model::internal_user_message(
                 "request_only",
                 "temporary",
             ));
-            context.replace_request_input(input);
+            context.replace_input(input);
             Ok(())
         })
     }
@@ -317,7 +325,7 @@ impl Middleware for DurableBeforeModel {
         "durable_before_model"
     }
 
-    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn pre_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             context.push_input(crate::backend::model::internal_user_message(
                 "settled", "durable",
@@ -334,7 +342,7 @@ impl Middleware for FailingBeforeModel {
         "failing_before_model"
     }
 
-    fn before_model<'a>(&'a self, _context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn pre_model<'a>(&'a self, _context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Err(Error::Provider("later middleware failed".into())) })
     }
 }

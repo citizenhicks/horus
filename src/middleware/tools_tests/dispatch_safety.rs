@@ -97,6 +97,7 @@ async fn each_call_receives_its_own_permissions() {
             &calls,
             test_sandbox(),
             &test_permissions(&["allowed"]),
+            "turn",
         )
         .await,
         vec![
@@ -141,7 +142,7 @@ async fn parallel_tool_panic_preserves_call_identity() {
     );
 
     assert_eq!(
-        execute_batch(&catalog, &calls, sandbox, &permissions).await,
+        execute_batch(&catalog, &calls, sandbox, &permissions, "turn").await,
         vec![ToolResult {
             call_id: "call-1".into(),
             name: "panicking".into(),
@@ -173,7 +174,7 @@ async fn approval_required_handler_cannot_run_without_exact_call_authority() {
         ["different-call".into()],
     );
 
-    let result = execute_batch(&catalog, &calls, sandbox, &permissions)
+    let result = execute_batch(&catalog, &calls, sandbox, &permissions, "turn")
         .await
         .pop()
         .expect("tool result");

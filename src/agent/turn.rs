@@ -11,10 +11,10 @@ use crate::backend::checkpoint::{ActiveExecution, ExecutionOutcome, QueuedInput}
 use crate::backend::model::{
     has_prompt_cache_breakpoint, mark_prompt_cache_breakpoint, user_message_with_attachments,
 };
-use crate::middleware::{QueuedInputBaseline, TurnEndContext};
+use crate::middleware::{QueuedInputBaseline, TurnEndContext, UserPromptSubmitContext};
 use crate::protocol::{
     ErrorEvent, Event, EventMsg, MessageTarget, Submission, TokenCountEvent, TokenUsageInfo,
-    TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+    TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, WarningEvent,
 };
 use crate::{Error, Result};
 
@@ -73,6 +73,34 @@ impl Runner {
                 "cannot start a turn while another execution is active".into(),
             ));
         }
+        let mut hook_messages = Vec::new();
+        let (hook_input, rejection) = {
+            let mut context = UserPromptSubmitContext {
+                session_id: &self.config.session_id,
+                turn_id: &turn_id,
+                message: &message,
+                attachments: &attachments,
+                events: &mut hook_messages,
+                input: Vec::new(),
+                rejection: None,
+            };
+            self.config
+                .middleware
+                .user_prompt_submit(&mut context)
+                .await?;
+            (context.input, context.rejection)
+        };
+        if let Some(rejection) = rejection {
+            for message in hook_messages {
+                self.emit(&submission_id, message).await?;
+            }
+            self.emit(
+                &submission_id,
+                EventMsg::Warning(WarningEvent { message: rejection }),
+            )
+            .await?;
+            return Ok(());
+        }
         self.state.active_execution = Some(ActiveExecution {
             submission_id: submission_id.clone(),
             turn_id: turn_id.clone(),
@@ -82,6 +110,7 @@ impl Runner {
             failed_tool_calls: 0,
             usage: crate::protocol::TokenUsage::default(),
         });
+        self.state.context.extend(hook_input);
         if self.state.first_user_message.is_none() && !message.trim().is_empty() {
             self.state.first_user_message = Some(message.clone());
         }
@@ -96,30 +125,30 @@ impl Runner {
             .sequence
             .checked_add(1)
             .ok_or_else(|| Error::Checkpoint("checkpoint sequence overflow".into()))?;
-        self.persist_with_events(
-            vec![
-                turn_event(
-                    &submission_id,
-                    EventMsg::TurnStarted(TurnStartedEvent {
-                        turn_id: turn_id.clone(),
-                        model_context_window: Some(self.config.context_window),
-                    }),
-                ),
-                turn_event(
-                    &submission_id,
-                    EventMsg::UserMessage(UserMessageEvent {
-                        message: message.clone(),
-                        attachments,
-                        message_target: Some(MessageTarget {
-                            checkpoint_sequence,
-                            batch_item_count,
-                        }),
-                    }),
-                ),
-            ],
-            None,
-        )
-        .await?;
+        let mut events = vec![turn_event(
+            &submission_id,
+            EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn_id.clone(),
+                model_context_window: Some(self.config.context_window),
+            }),
+        )];
+        events.extend(
+            hook_messages
+                .into_iter()
+                .map(|message| turn_event(&submission_id, message)),
+        );
+        events.push(turn_event(
+            &submission_id,
+            EventMsg::UserMessage(UserMessageEvent {
+                message: message.clone(),
+                attachments,
+                message_target: Some(MessageTarget {
+                    checkpoint_sequence,
+                    batch_item_count,
+                }),
+            }),
+        ));
+        self.persist_with_events(events, None).await?;
         self.continue_turn(commands, submission_id, turn_id).await
     }
 
@@ -173,9 +202,21 @@ impl Runner {
         ))
     }
 
-    async fn complete_turn(&mut self, submission_id: &str, turn_id: &str) -> Result<()> {
-        let mut events =
-            self.turn_ended_events(submission_id, turn_id, &self.state.pending_input)?;
+    async fn complete_turn(
+        &mut self,
+        submission_id: &str,
+        turn_id: &str,
+        mut events: Vec<Event>,
+    ) -> Result<()> {
+        events.extend(
+            self.turn_end_events(
+                submission_id,
+                turn_id,
+                &self.state.pending_input,
+                ExecutionOutcome::Completed,
+            )
+            .await?,
+        );
         events.push(turn_event(
             submission_id,
             EventMsg::TurnComplete(TurnCompleteEvent {
@@ -208,9 +249,12 @@ impl Runner {
     ) -> Result<()> {
         self.finish_pending_tools(submission_id, turn_id, reason)
             .await?;
-        let pending_input = std::mem::take(&mut self.state.pending_input);
         self.state.pending_approval = None;
-        events.extend(self.turn_ended_events(submission_id, turn_id, &pending_input)?);
+        events.extend(
+            self.turn_end_events(submission_id, turn_id, &self.state.pending_input, outcome)
+                .await?,
+        );
+        self.state.pending_input.clear();
         events.push(turn_event(
             submission_id,
             EventMsg::TurnAborted(TurnAbortedEvent {
@@ -222,20 +266,25 @@ impl Runner {
         Ok(())
     }
 
-    fn turn_ended_events(
+    async fn turn_end_events(
         &self,
         submission_id: &str,
         turn_id: &str,
         queued_input: &[QueuedInput],
+        outcome: ExecutionOutcome,
     ) -> Result<Vec<Event>> {
         let mut messages = Vec::new();
-        self.config.middleware.turn_ended(TurnEndContext {
-            session_id: &self.config.session_id,
-            turn_id,
-            queued_input,
-            owner: None,
-            events: &mut messages,
-        })?;
+        self.config
+            .middleware
+            .turn_end(TurnEndContext {
+                session_id: &self.config.session_id,
+                turn_id,
+                outcome,
+                queued_input,
+                owner: None,
+                events: &mut messages,
+            })
+            .await?;
         Ok(messages
             .into_iter()
             .map(|message| turn_event(submission_id, message))

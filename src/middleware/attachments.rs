@@ -12,7 +12,10 @@ use serde_json::Value;
 use super::manifest::MiddlewareManifest;
 use super::session_files::{SessionFileStore, session_storage_key};
 use super::tools::{Catalog, ExecutionMode, Tool, ToolContext, render_tool_event};
-use super::{Middleware, ModelContext, PromptSection, RuntimeContext};
+use super::{
+    Middleware, ModelContext, ModelRequestContext, PromptSection, RuntimeContext,
+    SessionStartContext, SessionStartSource,
+};
 use crate::backend::model::{ToolDefinition, internal_user_message};
 use crate::protocol::{
     ATTACHMENT_CONTEXT_MARKER, ATTACHMENTS_FIELD, EventMsg, FrontendBlock, FrontendContribution,
@@ -100,13 +103,19 @@ impl Middleware for Attachments {
         }))
     }
 
-    fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
+    fn session_start<'a>(
+        &'a self,
+        context: &'a mut SessionStartContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            if context.source() == SessionStartSource::Compact {
+                return Ok(());
+            }
             let Some(workspace) = self.workspace_path.as_deref() else {
                 return Ok(());
             };
             self.store
-                .register_attachment_workspace(&context.session_id, workspace)
+                .register_attachment_workspace(&context.runtime.session_id, workspace)
                 .await
         })
     }
@@ -131,7 +140,7 @@ impl Middleware for Attachments {
         )
     }
 
-    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn pre_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let Some((message_index, references)) = referenced_attachments(context.input())?.pop()
             else {
@@ -279,15 +288,15 @@ impl Middleware for Attachments {
         })
     }
 
-    fn decorate_model_request<'a>(
+    fn model_request<'a>(
         &'a self,
-        context: &'a mut ModelContext<'_>,
+        context: &'a mut ModelRequestContext<'_>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let latest_user = context.request_input().iter().rposition(is_real_user);
+            let latest_user = context.input().iter().rposition(is_real_user);
             let supports_image_input = context.model.supports_image_input(context.provider)?;
             let mut direct_image_bytes = 0_usize;
-            let mut input = context.request_input().to_vec();
+            let mut input = context.input().to_vec();
             let mut changed = false;
             for message_index in (0..input.len()).rev() {
                 let Some(materialized) = materialized_attachments(&input[message_index])? else {
@@ -358,7 +367,7 @@ impl Middleware for Attachments {
                 changed = true;
             }
             if changed {
-                context.replace_request_input(input);
+                context.replace_input(input);
             }
             Ok(())
         })

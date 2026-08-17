@@ -507,3 +507,64 @@ async fn malformed_automatic_review_durably_asks_without_dropping_network_access
         [1, 0]
     );
 }
+
+#[tokio::test]
+async fn escalated_review_and_deferred_approval_are_saved_atomically() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let database = workspace.path().join("checkpoints.sqlite3");
+    let checkpoints = Arc::new(SqliteCheckpoint::new(&database).expect("checkpoint store"));
+    rusqlite::Connection::open(&database)
+        .expect("open checkpoint database")
+        .execute_batch(
+            "CREATE TRIGGER reject_approval_request
+             BEFORE INSERT ON event_journal
+             WHEN NEW.event_kind = 'exec_approval_request'
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced approval request failure');
+             END;",
+        )
+        .expect("install approval request failure");
+    let model = Arc::new(ScriptedModel {
+        outputs: Mutex::new(VecDeque::from([
+            scripted_tool_call(),
+            scripted_message("not a review decision"),
+        ])),
+        tool_counts: Mutex::new(Vec::new()),
+        inputs: Mutex::new(Vec::new()),
+    });
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let mut agent = create_agent(auto_review_config(
+        workspace.path(),
+        checkpoint_store,
+        model,
+        "review-atomicity",
+    ))
+    .await
+    .expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "do it".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit input");
+    while agent.next_event().await.is_some() {}
+
+    let events = checkpoints
+        .event_page(
+            "review-atomicity",
+            EventPageRequest {
+                before_sequence: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("event journal")
+        .events;
+
+    assert!(!events.iter().any(|event| matches!(
+        &event.event.msg,
+        EventMsg::ExecApprovalReview(review)
+            if review.status == ApprovalReviewStatus::Escalated
+    )));
+}

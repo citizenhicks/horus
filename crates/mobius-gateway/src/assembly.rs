@@ -485,6 +485,7 @@ fn subagent_launcher(template: &Arc<OnceLock<AgentConfig>>) -> SubagentLauncher 
                 .clone()
                 .session_id(launch.session_id)
                 .metadata(launch.metadata)
+                .role(launch.role)
                 .model_route(&launch.model, launch.reasoning_effort.as_deref())?;
             create_agent(config).await
         })

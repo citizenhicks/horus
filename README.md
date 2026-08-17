@@ -8,12 +8,103 @@ möbius is a small, frontend-neutral Rust framework for coding agents. Its shipp
 runtime has one headless composition root: `mobius-gateway`. The terminal and
 Apple apps are thin clients of that gateway; they do not own agent behavior.
 
-| Component | Boundary |
+## Architecture
+
+```text
+Terminal client ─┐
+SwiftUI client ──┼── versioned gateway protocol ⇄ mobius-gateway ──> Agent
+Other clients ───┘                                     │
+                                                        ├─ model router
+                                                        ├─ sandbox
+                                                        ├─ checkpoints
+                                                        └─ middleware stack
+```
+
+### Core and agent
+
+The [`mobius`](https://crates.io/crates/mobius) crate is the embeddable core.
+[`src/agent/`](src/agent/) owns one durable session and its linear command,
+model, approval, and tool loop. [`src/protocol/`](src/protocol/) defines the
+frontend-neutral operations, events, and presentation records around that loop.
+A library caller supplies an `AgentConfig`; the core does not select a frontend
+or hide runtime dependencies behind global state.
+
+### Middleware
+
+[`src/middleware/`](src/middleware/) contains optional capabilities. One
+middleware owns its tools, state, prompt section, runtime hooks, commands,
+widgets, references, event rendering, and tests. `MiddlewareStack` validates one
+ordered list, and that declaration order is observable.
+
+The core exposes one typed hook suite directly on `Middleware`:
+
+| Hook | Purpose |
 | --- | --- |
-| [`mobius`](https://crates.io/crates/mobius) | Embeddable agent loop, provider and storage interfaces, sandbox policy, middleware, and frontend-neutral protocol |
-| [`mobius-gateway`](https://crates.io/crates/mobius-gateway) | The only shipped owner of an `Agent`; composes capabilities and owns authentication, chats, workspaces, artifacts, usage, and cron |
-| [`mobius-cli`](https://crates.io/crates/mobius-cli) | Ratatui gateway client and local gateway launcher |
-| [iOS app](mobius-app/apple/README.md) | SwiftUI gateway client for iPhone and iPad |
+| `session_start` (`SessionStart`) | Start or resume a main agent or subagent; after compaction, re-establish hidden context. Startup failures unwind completed starts in reverse order. |
+| `user_prompt_submit` (`UserPromptSubmit`) | Inspect, enrich, or reject a prompt before it enters durable context. |
+| `pre_model` (`PreModel`) | Apply durable context changes before a primary model step. |
+| `model_request` (`ModelRequest`) | Add request-only material after every `pre_model` hook has finished. |
+| `pre_tool_use` (`PreToolUse`) | Inspect, rewrite, or deny each normalized tool call before it is persisted or authorized. |
+| `permission_request` (`PermissionRequest`) | Allow, deny, or defer a sandbox request immediately before the user would be asked. |
+| `post_tool_use` (`PostToolUse`) | Change model-visible feedback after a real tool execution, without pretending to undo its side effects. |
+| `pre_compact` (`PreCompact`) | Observe the exact context immediately before compaction. |
+| `post_compact` (`PostCompact`) | Observe the committed compacted context before `session_start(compact)` rebuilds hidden state. |
+| `stop` (`Stop`) | Finish normally or request one bounded continuation. The context identifies whether the agent is main or subagent. |
+| `turn_end` (`TurnEnd`) | Clean up transient turn state after either completion or abort. |
+| `session_end` (`SessionEnd`) | Release session resources in reverse declaration order. |
+
+All hooks run in declaration order except `session_end`. `pre_model` and
+`model_request` are two complete stack passes, so no request-only decoration can
+precede a later durable rewrite. Policy decisions are typed outcomes; hook
+errors remain infrastructure failures. Static prompt sections are composed once
+when the agent is created, and changing a chat recipe recreates its prompt and
+tool catalog without adding either to conversation history.
+
+### Providers
+
+[`src/backend/model/`](src/backend/model/) owns the `Model` transport contract,
+`ModelRouter`, and built-in `ProviderDefinition` manifests. A manifest supplies
+generic setup metadata, authentication, model choices, and advertised
+capabilities. Each adapter converts its private wire format into `ModelEvent`
+and `ModelOutput` before the agent loop sees it, so setup screens and model
+pickers do not branch on provider IDs.
+
+### Backends
+
+[`src/backend/checkpoint/`](src/backend/checkpoint/) defines `CheckpointStore`
+and owns durable checkpoints, event journals, transcript pages, and the session
+catalog. [`src/backend/sandbox/`](src/backend/sandbox/) defines
+`SandboxBackend`; `Sandbox` wraps an injected backend with approval policy,
+background-process ownership, and frontend contributions.
+
+Protected local modes use Seatbelt on macOS and Bubblewrap on Linux and fail
+closed when the selected platform sandbox is unavailable. Filesystem confinement
+stays active under every approval policy except **Full access**. Full-access
+shell commands can reach anything available to the gateway account, including
+gateway state and credentials; file tools remain workspace-scoped.
+
+### Gateway
+
+[`mobius-gateway`](https://crates.io/crates/mobius-gateway) is the only shipped
+owner of an `Agent`. It explicitly assembles one agent per active chat and owns
+authentication, paired clients, chat recipes, workspaces, artifacts, Git, usage,
+and cron. Its versioned wire protocol translates authenticated client requests
+into core operations and publishes core events plus capability contributions.
+
+### CLI
+
+[`mobius-cli`](https://crates.io/crates/mobius-cli) provides the `mobius`
+Ratatui client and the `mobius-gateway` executable. The terminal frontend sends
+gateway operations and renders gateway events and the capability catalog;
+[`crates/mobius-cli/src/frontend/`](crates/mobius-cli/src/frontend/) owns only
+terminal lifecycle, input, and presentation.
+
+### SwiftUI app
+
+[`mobius-app/apple/`](mobius-app/apple/) is one SwiftUI gateway client for iPhone
+and iPad. It uses the same versioned protocol and capability contributions as the
+CLI, keeps paired client credentials in Keychain, and owns Apple lifecycle,
+storage, navigation, and rendering—not agent, provider, or middleware behavior.
 
 ## Install
 
@@ -68,7 +159,7 @@ cargo build -p mobius-cli
 cargo run -p mobius-cli --bin mobius
 ```
 
-## Framework
+## Embed the core
 
 möbius requires Rust 1.89 or newer.
 
@@ -128,57 +219,6 @@ references, widgets, and rendered blocks. A frontend decides how those contribut
 capability implementations do not depend on terminal code. Interrupts target a specific turn, and
 events carry an optional submission ID so command-driven and unsolicited system events remain
 distinct.
-
-## Architecture
-
-```text
-Terminal client ─┐
-Apple client ────┼── versioned gateway protocol ⇄ mobius-gateway ──> Agent
-Other clients ───┘                                     │
-                                                        ├─ model router
-                                                        ├─ sandbox
-                                                        ├─ checkpoints
-                                                        └─ middleware stack
-```
-
-The gateway is the shipped composition root. It creates one `Agent` per active
-chat and translates authenticated wire operations into frontend-neutral core
-operations. Frontends render gateway events and capability contributions; they
-do not dispatch tools or implement middleware behavior.
-
-| Path | Owns |
-| --- | --- |
-| `src/agent/` | The linear session, model, and tool loop |
-| `src/backend/model/` | Provider transports, provider manifests, and model routing |
-| `src/backend/sandbox/` | File and command boundaries, approval policy, and background processes |
-| `src/backend/checkpoint/` | Durable checkpoints, journals, transcript pages, and the session catalog |
-| `src/middleware/` | Vertical optional capabilities, including their tools, hooks, state, settings, and UI contributions |
-| `src/protocol/` | Frontend-neutral operations, events, approvals, usage, and presentation records |
-| `crates/mobius-gateway/` | Runtime composition, authentication, client sessions, workspaces, artifacts, Git, usage, cron, and the wire protocol |
-| `crates/mobius-cli/src/frontend/` | Terminal lifecycle, input, and rendering only |
-| `mobius-app/apple/` | Apple lifecycle, platform storage, and SwiftUI rendering only |
-
-Middleware declaration order is observable hook and prompt-section order. Each
-capability owns its complete vertical slice; adding one to the shipped runtime
-changes its module and the explicit gateway registry, not the agent loop or a
-frontend-specific dispatcher. Static prompt sections are composed once at
-agent creation. Changing a chat recipe recreates that agent, so enabled sections refresh without
-entering conversation history; dynamic turn state enters through runtime hooks.
-
-Checkpoint backends expose cursor-paginated session catalogs and
-sequence-bounded transcript pages. Context offloading and compaction remain
-middleware policy, and provider adapters normalize private wire formats before
-the agent loop sees them.
-
-The sandbox enforces approval policy for every approval-required tool. For protected
-modes, the local backend uses Seatbelt on macOS and Bubblewrap on Linux and fails
-closed when the platform sandbox is unavailable. Linux must permit the selected `bwrap` binary
-to create user, PID, and network namespaces; AppArmor-restricted hosts need a
-matching Bubblewrap profile. Filesystem confinement remains active under every
-approval policy except **Full access**, which grants shell commands host filesystem
-and network access without approval; file tools remain workspace-scoped. Full-access
-shell commands can access gateway state, TLS credentials, stored provider credentials,
-and any other files or services available to the gateway account.
 
 ## Contributing
 

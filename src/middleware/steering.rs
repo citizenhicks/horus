@@ -5,7 +5,8 @@ use super::ActiveSubmissionContext;
 use super::ActiveSubmissionResult;
 use super::Middleware;
 use super::ModelContext;
-use super::RuntimeContext;
+use super::SessionStartContext;
+use super::SessionStartSource;
 use super::TurnEndContext;
 use super::manifest::{MiddlewareManifest, MiddlewareSettingManifest};
 use crate::BoxFuture;
@@ -202,25 +203,22 @@ impl Middleware for Steering {
         })
     }
 
-    fn turn_ended(&self, context: &mut TurnEndContext<'_>) -> Result<()> {
-        let removals = context
-            .queued_input()
-            .map(|message| EventMsg::Frontend(self.remove_widget(message.id())))
-            .collect::<Vec<_>>();
-        context.events.extend(removals);
-        Ok(())
-    }
-
-    fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
+    fn session_start<'a>(
+        &'a self,
+        context: &'a mut SessionStartContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            for message in context.queued_input.views() {
-                (context.frontend)(self.queued_widget(message.id(), message.text()))?;
+            if context.source() == SessionStartSource::Compact {
+                return Ok(());
+            }
+            for message in context.queued_input().views() {
+                (context.runtime.frontend)(self.queued_widget(message.id(), message.text()))?;
             }
             Ok(())
         })
     }
 
-    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn pre_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let queued = context.queued_input.drain();
             for message in &queued {
@@ -241,6 +239,17 @@ impl Middleware for Steering {
             Ok(())
         })
     }
+
+    fn turn_end<'a>(&'a self, context: &'a mut TurnEndContext<'_>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let removals = context
+                .queued_input()
+                .map(|message| EventMsg::Frontend(self.remove_widget(message.id())))
+                .collect::<Vec<_>>();
+            context.events.extend(removals);
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -251,13 +260,15 @@ mod tests {
 
     use super::*;
     use crate::backend::checkpoint::CheckpointStore;
+    use crate::backend::checkpoint::ExecutionOutcome;
     use crate::backend::checkpoint::sqlite::SqliteCheckpoint;
     use crate::backend::model::{Model, ModelEventSink, ModelOutput, ModelRequest, ModelRouter};
     use crate::middleware::DurableQueuedInput;
     use crate::middleware::MiddlewareStack;
     use crate::middleware::QueuedInputBaseline;
     use crate::middleware::QueuedInputQueue;
-    use crate::middleware::QueuedInputSnapshot;
+    use crate::middleware::RuntimeContext;
+    use crate::middleware::SessionStartSource;
     use crate::middleware::tools::Catalog;
     use crate::protocol::SessionContext;
 
@@ -295,7 +306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_restores_every_owned_queue_widget() {
+    async fn session_start_restores_every_owned_queue_widget() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
             SqliteCheckpoint::new(temporary.path().join("checkpoints.sqlite3"))
@@ -309,7 +320,7 @@ mod tests {
             model_route: "model".into(),
             session_context: SessionContext::default(),
             metadata: BTreeMap::new(),
-            queued_input: QueuedInputSnapshot::default(),
+            role: crate::agent::AgentRole::Main,
             frontend: Arc::new(move |event| {
                 sink_events.lock().expect("frontend events").push(event);
                 Ok(())
@@ -321,11 +332,12 @@ mod tests {
             item("steering-2", "latest"),
         ];
         let stack = MiddlewareStack::new(vec![Arc::new(Steering::default())]).expect("stack");
+        let mut input = Vec::new();
 
         stack
-            .initialize(runtime, &pending)
+            .session_start(&runtime, &pending, SessionStartSource::Startup, &mut input)
             .await
-            .expect("initialize middleware");
+            .expect("start middleware");
 
         let events = frontend_events.lock().expect("frontend events");
         let [
@@ -561,9 +573,23 @@ mod tests {
         let mut events = Vec::new();
         let mut usage = Vec::new();
         let mut checkpoint_changed = false;
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let runtime = RuntimeContext {
+            checkpoints: Arc::new(
+                SqliteCheckpoint::new(temporary.path().join("runtime.sqlite3"))
+                    .expect("checkpoint store"),
+            ),
+            session_id: "session-1".into(),
+            model_route: "unused".into(),
+            session_context: session_context.clone(),
+            metadata: metadata.clone(),
+            role: crate::agent::AgentRole::Main,
+            frontend: Arc::new(|_| Ok(())),
+        };
+        let hooks = MiddlewareStack::new(Vec::new()).expect("empty hook stack");
 
         steering
-            .before_model(&mut ModelContext {
+            .pre_model(&mut ModelContext {
                 model: &model,
                 provider: "unused",
                 session_id: "session-1",
@@ -586,6 +612,8 @@ mod tests {
                 events: &mut events,
                 usage: &mut usage,
                 checkpoint_changed: &mut checkpoint_changed,
+                runtime: &runtime,
+                hooks: &hooks,
             })
             .await
             .expect("inject queued steering");
@@ -604,8 +632,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn turn_ended_removes_each_pending_widget_by_id() {
+    #[tokio::test]
+    async fn turn_end_removes_each_pending_widget_by_id() {
         let stack = MiddlewareStack::new(vec![Arc::new(Steering::default())]).expect("stack");
         let queued = vec![
             DurableQueuedInput::new("other", "private", "hidden").expect("other item"),
@@ -615,13 +643,15 @@ mod tests {
         let mut events = Vec::new();
 
         stack
-            .turn_ended(TurnEndContext {
+            .turn_end(TurnEndContext {
                 session_id: "session-1",
                 turn_id: "turn-1",
+                outcome: ExecutionOutcome::Completed,
                 queued_input: &queued,
                 owner: None,
                 events: &mut events,
             })
+            .await
             .expect("turn ended");
 
         assert_eq!(

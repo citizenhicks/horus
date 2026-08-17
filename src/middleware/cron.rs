@@ -200,6 +200,7 @@ mod tests {
                 ToolContext {
                     sandbox,
                     permissions,
+                    turn_id: "turn".into(),
                 },
                 serde_json::json!({
                     "task": "Review open pull requests",

@@ -5,11 +5,12 @@ use super::*;
 #[tokio::test]
 async fn middleware_event_saturation_fails_agent_creation_instead_of_dropping_updates() {
     let workspace = tempfile::tempdir().expect("workspace");
-    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+    let checkpoints = Arc::new(
         SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
             .expect("checkpoint store"),
     );
-    let mut agent_config = config(workspace.path(), checkpoints, "saturating-events");
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let mut agent_config = config(workspace.path(), checkpoint_store, "saturating-events");
     agent_config.middleware =
         MiddlewareStack::new(vec![Arc::new(SaturatingMiddleware)]).expect("middleware");
 
@@ -20,6 +21,13 @@ async fn middleware_event_saturation_fails_agent_creation_instead_of_dropping_up
     assert_eq!(
         error.to_string(),
         "agent stopped: event recorder queue is full"
+    );
+    assert!(
+        checkpoints
+            .load("saturating-events")
+            .await
+            .expect("load failed session")
+            .is_none()
     );
 }
 
@@ -191,7 +199,7 @@ async fn zero_model_step_limit_is_rejected_at_agent_creation() {
 }
 
 #[tokio::test]
-async fn completed_before_model_effects_are_settled_when_a_later_hook_fails() {
+async fn completed_pre_model_effects_are_settled_when_a_later_hook_fails() {
     let workspace = tempfile::tempdir().expect("workspace");
     let checkpoints = Arc::new(
         SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))

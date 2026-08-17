@@ -136,7 +136,7 @@ async fn errored_subagent_preview_ends_with_its_terminal_message() {
     }
     let shared = test_shared();
     shared
-        .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
+        .session_start(test_context(checkpoints, Arc::new(|_| Ok(()))))
         .await
         .expect("initialize runtime");
     shared
@@ -377,7 +377,7 @@ async fn failed_persist_does_not_mutate_runtime_state() {
         saved_state: StdMutex::new(None),
     });
     shared
-        .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
+        .session_start(test_context(checkpoints, Arc::new(|_| Ok(()))))
         .await
         .expect("initialize runtime");
 
@@ -422,7 +422,7 @@ async fn empty_initial_tree_is_silent_and_empty_transition_removes_widget() {
     let frontend_events = Arc::new(StdMutex::new(Vec::new()));
     let events = Arc::clone(&frontend_events);
     shared
-        .initialize(test_context(
+        .session_start(test_context(
             checkpoints,
             Arc::new(move |event| {
                 events.lock().expect("frontend events").push(event);
@@ -472,7 +472,7 @@ async fn wait_returns_immediately_without_an_active_peer() {
         saved_state: StdMutex::new(None),
     });
     shared
-        .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
+        .session_start(test_context(checkpoints, Arc::new(|_| Ok(()))))
         .await
         .expect("initialize runtime");
     shared
@@ -510,7 +510,7 @@ async fn reserve_enforces_configured_concurrency_including_root() {
         saved_state: StdMutex::new(None),
     });
     shared
-        .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
+        .session_start(test_context(checkpoints, Arc::new(|_| Ok(()))))
         .await
         .expect("initialize runtime");
     for index in 0..2 {
@@ -553,7 +553,7 @@ async fn reserve_enforces_configured_agent_limit_including_root() {
         saved_state: StdMutex::new(None),
     });
     shared
-        .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
+        .session_start(test_context(checkpoints, Arc::new(|_| Ok(()))))
         .await
         .expect("initialize runtime");
     for index in 0..2 {
@@ -602,7 +602,7 @@ async fn mail_is_retained_until_its_checkpoint_marker_is_acknowledged() {
     });
     let checkpoints: Arc<dyn CheckpointStore> = store.clone();
     shared
-        .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
+        .session_start(test_context(checkpoints, Arc::new(|_| Ok(()))))
         .await
         .expect("initialize runtime");
     shared
@@ -647,7 +647,7 @@ async fn remove_root_evicts_runtime_state() {
         saved_state: StdMutex::new(None),
     });
     shared
-        .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
+        .session_start(test_context(checkpoints, Arc::new(|_| Ok(()))))
         .await
         .expect("initialize runtime");
 
@@ -667,7 +667,7 @@ async fn terminal_persist_failure_is_retried_as_a_durable_error() {
     let events = Arc::clone(&frontend_events);
     let checkpoints: Arc<dyn CheckpointStore> = store.clone();
     shared
-        .initialize(test_context(
+        .session_start(test_context(
             checkpoints,
             Arc::new(move |event| {
                 events.lock().expect("frontend events").push(event);
@@ -746,7 +746,7 @@ async fn terminal_persist_failure_notifies_after_the_retry_commits() {
     });
     let checkpoints: Arc<dyn CheckpointStore> = store.clone();
     shared
-        .initialize(test_context(checkpoints, Arc::new(|_| Ok(()))))
+        .session_start(test_context(checkpoints, Arc::new(|_| Ok(()))))
         .await
         .expect("initialize runtime");
     shared
@@ -799,7 +799,7 @@ fn test_context(
         model_route: "test".into(),
         session_context: Default::default(),
         metadata: Default::default(),
-        queued_input: crate::middleware::QueuedInputSnapshot::default(),
+        role: crate::agent::AgentRole::Main,
         frontend,
     }
 }

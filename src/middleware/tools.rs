@@ -84,6 +84,7 @@ pub enum ApprovalRequirement {
 pub struct ToolContext {
     pub sandbox: Arc<Sandbox>,
     pub permissions: ToolPermissions,
+    pub turn_id: String,
 }
 
 /// A named tool Adapter registered by middleware.
@@ -188,6 +189,21 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
+impl ToolResult {
+    pub(crate) fn error(call: &ToolCall, output: impl AsRef<str>) -> Self {
+        Self {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            output: capped(output.as_ref(), MAX_TOOL_OUTPUT_BYTES),
+            is_error: true,
+        }
+    }
+
+    pub(crate) fn replace(&mut self, output: impl AsRef<str>) {
+        self.output = capped(output.as_ref(), MAX_TOOL_OUTPUT_BYTES);
+    }
+}
+
 /// Executes maximal runs of parallel-safe calls concurrently.
 /// Exclusive and unknown calls form barriers and execute alone.
 pub(crate) async fn execute_batch(
@@ -195,6 +211,7 @@ pub(crate) async fn execute_batch(
     calls: &[ToolCall],
     sandbox: Arc<Sandbox>,
     permissions: &SandboxPermissions,
+    turn_id: &str,
 ) -> Vec<ToolResult> {
     let mut results = Vec::with_capacity(calls.len());
     let mut index = 0;
@@ -210,13 +227,22 @@ pub(crate) async fn execute_batch(
                     calls[index..end]
                         .iter()
                         .cloned()
-                        .map(|call| execute_call(catalog, call, &sandbox, permissions)),
+                        .map(|call| execute_call(catalog, call, &sandbox, permissions, turn_id)),
                 )
                 .await,
             );
             index = end;
         } else {
-            results.push(execute_call(catalog, calls[index].clone(), &sandbox, permissions).await);
+            results.push(
+                execute_call(
+                    catalog,
+                    calls[index].clone(),
+                    &sandbox,
+                    permissions,
+                    turn_id,
+                )
+                .await,
+            );
             index += 1;
         }
     }
@@ -234,33 +260,24 @@ async fn execute_call(
     call: ToolCall,
     sandbox: &Arc<Sandbox>,
     permissions: &SandboxPermissions,
+    turn_id: &str,
 ) -> ToolResult {
     let context = ToolContext {
         sandbox: Arc::clone(sandbox),
         permissions: permissions.for_call(&call.call_id),
+        turn_id: turn_id.into(),
     };
-    let tool = catalog.get(&call.name).cloned();
+    let Some(tool) = catalog.get(&call.name).cloned() else {
+        return ToolResult::error(&call, format!("unknown tool `{}`", call.name));
+    };
+    if tool.approval == ApprovalRequirement::Always && !context.permissions.allows_mutation() {
+        return ToolResult::error(&call, "tool call is not authorized to mutate state");
+    }
     let ToolCall {
         call_id,
         name,
         arguments,
     } = call;
-    let Some(tool) = tool else {
-        return ToolResult {
-            call_id,
-            output: capped(&format!("unknown tool `{name}`"), MAX_TOOL_OUTPUT_BYTES),
-            name,
-            is_error: true,
-        };
-    };
-    if tool.approval == ApprovalRequirement::Always && !context.permissions.allows_mutation() {
-        return ToolResult {
-            call_id,
-            name,
-            output: "tool call is not authorized to mutate state".into(),
-            is_error: true,
-        };
-    }
     let result = AssertUnwindSafe(async move { tool.handler.call(context, arguments).await })
         .catch_unwind()
         .await;

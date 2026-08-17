@@ -31,6 +31,7 @@ use crate::backend::sandbox::SandboxPermissions;
 use crate::backend::sandbox::SandboxReview;
 use crate::middleware::QueuedInputBaseline;
 use crate::middleware::tools::ToolResult;
+use crate::middleware::{PermissionDecision, PermissionRequestContext};
 use crate::protocol::ApprovalCall;
 use crate::protocol::ApprovalReviewEscalation;
 use crate::protocol::ApprovalReviewStatus;
@@ -239,9 +240,28 @@ impl Runner {
         calls: Vec<ToolCall>,
         request: SandboxApprovalRequest,
         permissions: SandboxPermissions,
-        leading_events: Vec<Event>,
+        mut leading_events: Vec<Event>,
     ) -> Result<Option<Vec<ToolResult>>> {
         validate_approval_selection(&calls, &request.call_ids)?;
+        let decision = {
+            let mut context = PermissionRequestContext {
+                session_id: &self.config.session_id,
+                turn_id,
+                calls: &calls,
+                requested_call_ids: &request.call_ids,
+                reason: &request.reason,
+                decision: PermissionDecision::Defer,
+            };
+            self.config
+                .middleware
+                .permission_request(&mut context)
+                .await?;
+            context.decision
+        };
+        if !matches!(&decision, PermissionDecision::Defer) && !leading_events.is_empty() {
+            self.persist_with_events(std::mem::take(&mut leading_events), None)
+                .await?;
+        }
         let pending = PendingApproval {
             submission_id: submission_id.to_string(),
             turn_id: turn_id.to_string(),
@@ -254,11 +274,34 @@ impl Runner {
             network_access: permissions.network_access(),
             decision_received: false,
         };
-        self.state.pending_approval = Some(pending.clone());
-        let mut events = leading_events;
-        events.push(approval_event(&pending));
-        self.persist_with_events(events, None).await?;
-        self.resolve_pending(commands, &pending, false).await
+        match decision {
+            PermissionDecision::Allow => {
+                self.apply_approval(
+                    commands,
+                    &pending,
+                    ReviewDecision::Approved,
+                    permissions,
+                    submission_id,
+                )
+                .await
+            }
+            PermissionDecision::Deny(rejection) => {
+                self.apply_approval(
+                    commands,
+                    &pending,
+                    ReviewDecision::Denied { rejection },
+                    permissions,
+                    submission_id,
+                )
+                .await
+            }
+            PermissionDecision::Defer => {
+                self.state.pending_approval = Some(pending.clone());
+                leading_events.push(approval_event(&pending));
+                self.persist_with_events(leading_events, None).await?;
+                self.resolve_pending(commands, &pending, false).await
+            }
+        }
     }
 
     pub(super) async fn resume_pending(
@@ -296,18 +339,35 @@ impl Runner {
             current.decision_received = true;
             self.save().await?;
         }
-        let approval_call_ids = pending.approval_call_ids.clone();
-        let permissions = self.config.sandbox.resolve_approval(
-            &self.config.session_id,
-            &pending.calls,
-            &approval_call_ids,
-            &decision,
+        self.apply_approval(
+            commands,
+            pending,
+            decision,
             SandboxPermissions::restore(
                 &self.config.session_id,
                 pending.sandbox_mode,
                 pending.network_access,
                 pending.authorized_call_ids.clone(),
             ),
+            &approval.submission_id,
+        )
+        .await
+    }
+
+    async fn apply_approval(
+        &mut self,
+        commands: &mut mpsc::Receiver<Submission>,
+        pending: &PendingApproval,
+        decision: ReviewDecision,
+        permissions: SandboxPermissions,
+        abort_submission_id: &str,
+    ) -> Result<Option<Vec<ToolResult>>> {
+        let permissions = self.config.sandbox.resolve_approval(
+            &self.config.session_id,
+            &pending.calls,
+            &pending.approval_call_ids,
+            &decision,
+            permissions,
         )?;
         match decision {
             ReviewDecision::Approved | ReviewDecision::ApprovedForSession => {
@@ -323,7 +383,8 @@ impl Runner {
                 self.ready_or_aborted(execution, &pending.turn_id).await
             }
             ReviewDecision::Denied { rejection } => {
-                let approval_call_ids = approval_call_ids
+                let approval_call_ids = pending
+                    .approval_call_ids
                     .iter()
                     .map(String::as_str)
                     .collect::<BTreeSet<_>>();
@@ -369,7 +430,7 @@ impl Runner {
                 )
                 .await?;
                 self.abort(
-                    &approval.submission_id,
+                    abort_submission_id,
                     &pending.turn_id,
                     "approval aborted",
                     ExecutionOutcome::Aborted,
@@ -619,12 +680,7 @@ fn automatic_review_outcome(text: &str, call_ids: &[String]) -> AutomaticReviewO
 fn denied_results(calls: &[ToolCall], rejection: &str) -> Vec<ToolResult> {
     calls
         .iter()
-        .map(|call| ToolResult {
-            call_id: call.call_id.clone(),
-            name: call.name.clone(),
-            output: format!("tool denied: {rejection}"),
-            is_error: true,
-        })
+        .map(|call| ToolResult::error(call, format!("tool denied: {rejection}")))
         .collect()
 }
 

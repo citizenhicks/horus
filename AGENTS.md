@@ -25,8 +25,9 @@ module.
 
 - Reuse an existing trait or protocol record before adding a new abstraction.
 - Keep dependencies explicit. Registries assemble objects; they are not service locators.
-- Middleware declaration order is observable hook and prompt-section order.
-- `prompt_section` is composed once at agent creation; use `before_model` only for dynamic state.
+- Middleware declaration order is observable hook and prompt-section order;
+  `session_end` alone unwinds in reverse.
+- `prompt_section` is composed once at agent creation; use `pre_model` for dynamic durable state and `model_request` for request-only decoration.
 - Keep prompt sections short and capability-local. Do not repeat tool schemas or
   eagerly inject full skill instructions.
 - Expose meaningful policy as middleware construction options. The middleware owns

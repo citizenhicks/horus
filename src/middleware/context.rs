@@ -4,14 +4,20 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use super::MiddlewareStack;
 use super::approximate_tokens;
 use super::tools::Catalog;
+use super::tools::ToolResult;
+use crate::agent::AgentRole;
 use crate::backend::checkpoint::{
-    Checkpoint, CheckpointStore, ContextRewriteReason, MAX_QUEUED_INPUTS,
+    Checkpoint, CheckpointStore, ContextRewriteReason, ExecutionOutcome, MAX_QUEUED_INPUTS,
     QueuedInput as DurableQueuedInput,
 };
-use crate::backend::model::ModelRouter;
-use crate::protocol::{EventMsg, FrontendEvent, MessageTarget, SessionContext, TokenUsage};
+use crate::backend::model::{ModelRouter, ToolCall};
+use crate::protocol::{
+    EventMsg, FrontendEvent, MAX_CAPABILITY_INPUT_BYTES, MessageTarget, SessionContext,
+    SessionFileReference, TokenUsage,
+};
 use crate::{Error, Result};
 
 /// Sends middleware-owned UI updates without depending on a concrete frontend.
@@ -254,7 +260,7 @@ impl<'a> QueuedInputQueue<'a> {
     }
 }
 
-/// Durable runtime identity exposed while middleware is initialized.
+/// Durable runtime identity exposed while middleware starts a session.
 #[derive(Clone)]
 pub struct RuntimeContext {
     pub checkpoints: Arc<dyn CheckpointStore>,
@@ -262,8 +268,68 @@ pub struct RuntimeContext {
     pub model_route: String,
     pub session_context: SessionContext,
     pub metadata: BTreeMap<String, Value>,
-    pub queued_input: QueuedInputSnapshot,
+    pub role: AgentRole,
     pub frontend: FrontendEventSink,
+}
+
+/// Why [`Middleware::session_start`](super::Middleware::session_start) is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStartSource {
+    Startup,
+    Resume,
+    Compact,
+}
+
+/// Mutable state shared by the declaration-ordered `SessionStart` hooks.
+pub struct SessionStartContext<'a> {
+    pub runtime: &'a RuntimeContext,
+    pub(crate) source: SessionStartSource,
+    pub(crate) queued_input: QueuedInputSnapshot,
+    pub(crate) input: &'a mut Vec<Value>,
+}
+
+impl SessionStartContext<'_> {
+    #[must_use]
+    pub fn source(&self) -> SessionStartSource {
+        self.source
+    }
+
+    #[must_use]
+    pub fn queued_input(&self) -> &QueuedInputSnapshot {
+        &self.queued_input
+    }
+
+    /// Appends hidden provider context produced while the session starts.
+    pub fn push_input(&mut self, item: Value) {
+        self.input.push(item);
+    }
+}
+
+/// Mutable state exposed before a submitted user prompt enters durable context.
+pub struct UserPromptSubmitContext<'a> {
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+    pub message: &'a str,
+    pub attachments: &'a [SessionFileReference],
+    pub events: &'a mut Vec<EventMsg>,
+    pub(crate) input: Vec<Value>,
+    pub(crate) rejection: Option<String>,
+}
+
+impl UserPromptSubmitContext<'_> {
+    /// Adds provider-neutral context immediately before the submitted user message.
+    pub fn push_input(&mut self, item: Value) {
+        self.input.push(item);
+    }
+
+    /// Rejects the submission without treating the policy decision as a hook failure.
+    pub fn reject(&mut self, reason: impl Into<String>) -> Result<()> {
+        let reason = hook_message("prompt rejection", reason)?;
+        if self.rejection.is_none() {
+            self.rejection = Some(reason);
+        }
+        Ok(())
+    }
 }
 
 /// Mutable state exposed immediately before a model request.
@@ -291,6 +357,8 @@ pub struct ModelContext<'a> {
     pub usage: &'a mut Vec<TokenUsage>,
     /// Set when this hook changes durable checkpoint state.
     pub checkpoint_changed: &'a mut bool,
+    pub(crate) runtime: &'a RuntimeContext,
+    pub(crate) hooks: &'a MiddlewareStack,
 }
 
 impl ModelContext<'_> {
@@ -326,11 +394,6 @@ impl ModelContext<'_> {
         Ok(())
     }
 
-    /// Replaces only the input sent by the next model request.
-    pub fn replace_request_input(&mut self, input: Vec<Value>) {
-        *self.request_input = input;
-    }
-
     /// Appends a durable replay item without adding it to provider context.
     pub(crate) fn record_transcript_item(&mut self, item: Value) {
         self.transcript_delta.push(item);
@@ -362,6 +425,233 @@ impl ModelContext<'_> {
         }
         i64::try_from(approximate_tokens(bytes.0)).unwrap_or(i64::MAX)
     }
+
+    pub(crate) async fn pre_compact(&mut self) -> Result<()> {
+        let hooks = self.hooks;
+        hooks
+            .pre_compact(CompactContext {
+                session_id: self.session_id,
+                turn_id: self.turn_id,
+                model_step: self.model_step,
+                compaction_count: *self.compaction_count,
+                input: self.durable_input,
+                events: self.events,
+            })
+            .await
+    }
+
+    pub(crate) async fn post_compact(&mut self) -> Result<()> {
+        let hooks = self.hooks;
+        hooks
+            .post_compact(CompactContext {
+                session_id: self.session_id,
+                turn_id: self.turn_id,
+                model_step: self.model_step,
+                compaction_count: *self.compaction_count,
+                input: self.durable_input,
+                events: self.events,
+            })
+            .await?;
+        hooks
+            .session_start(
+                self.runtime,
+                self.queued_input.items,
+                SessionStartSource::Compact,
+                self.durable_input,
+            )
+            .await?;
+        self.request_input.clone_from(self.durable_input);
+        Ok(())
+    }
+}
+
+/// Request-only model input exposed after every durable `PreModel` hook.
+pub struct ModelRequestContext<'a> {
+    pub model: &'a ModelRouter,
+    pub provider: &'a str,
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+    pub model_step: usize,
+    pub(crate) input: &'a mut Vec<Value>,
+}
+
+impl ModelRequestContext<'_> {
+    /// Returns the input currently prepared for this one model request.
+    #[must_use]
+    pub fn input(&self) -> &[Value] {
+        self.input
+    }
+
+    /// Replaces only the input sent by this model request.
+    pub fn replace_input(&mut self, input: Vec<Value>) {
+        *self.input = input;
+    }
+}
+
+/// Mutable policy boundary for one normalized model-requested tool call.
+pub struct PreToolUseContext<'a> {
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+    pub(crate) call: &'a mut ToolCall,
+    pub(crate) denial: Option<String>,
+}
+
+impl PreToolUseContext<'_> {
+    /// Returns the call after any earlier middleware rewrites.
+    #[must_use]
+    pub fn call(&self) -> &ToolCall {
+        self.call
+    }
+
+    /// Replaces the tool name and arguments while preserving the provider call ID.
+    pub fn replace(&mut self, name: impl Into<String>, arguments: Value) -> Result<()> {
+        self.call.replace(name.into(), arguments)
+    }
+
+    /// Denies the call. Later middleware may observe but cannot undo the denial.
+    pub fn deny(&mut self, reason: impl Into<String>) -> Result<()> {
+        let reason = hook_message("tool denial", reason)?;
+        if self.denial.is_none() {
+            self.denial = Some(reason);
+        }
+        Ok(())
+    }
+
+    /// Returns the first denial made by the ordered middleware chain.
+    #[must_use]
+    pub fn denial(&self) -> Option<&str> {
+        self.denial.as_deref()
+    }
+}
+
+/// Aggregate decision made immediately before the sandbox would ask the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Defer,
+    Allow,
+    Deny(String),
+}
+
+/// Mutable policy boundary for a sandbox approval request.
+pub struct PermissionRequestContext<'a> {
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+    pub calls: &'a [ToolCall],
+    pub requested_call_ids: &'a [String],
+    pub reason: &'a str,
+    pub(crate) decision: PermissionDecision,
+}
+
+impl PermissionRequestContext<'_> {
+    /// Returns the decision accumulated from earlier middleware.
+    #[must_use]
+    pub fn decision(&self) -> &PermissionDecision {
+        &self.decision
+    }
+
+    /// Allows this request unless an earlier middleware denied it.
+    pub fn allow(&mut self) {
+        if !matches!(self.decision, PermissionDecision::Deny(_)) {
+            self.decision = PermissionDecision::Allow;
+        }
+    }
+
+    /// Denies this request. The decision cannot be weakened by later middleware.
+    pub fn deny(&mut self, reason: impl Into<String>) -> Result<()> {
+        let reason = hook_message("permission denial", reason)?;
+        if !matches!(self.decision, PermissionDecision::Deny(_)) {
+            self.decision = PermissionDecision::Deny(reason);
+        }
+        Ok(())
+    }
+}
+
+/// Mutable model-visible result exposed after an executed tool call.
+pub struct PostToolUseContext<'a> {
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+    pub call: &'a ToolCall,
+    pub(crate) result: &'a mut ToolResult,
+}
+
+impl PostToolUseContext<'_> {
+    /// Returns the result after any earlier middleware changes.
+    #[must_use]
+    pub fn result(&self) -> &ToolResult {
+        self.result
+    }
+
+    /// Replaces the feedback returned to the model without changing past side effects.
+    pub fn replace(&mut self, output: impl Into<String>) {
+        self.result.replace(output.into());
+    }
+}
+
+/// Read-only state exposed immediately before or after context compaction.
+pub struct CompactContext<'a> {
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+    pub model_step: usize,
+    pub compaction_count: u64,
+    pub input: &'a [Value],
+    pub events: &'a mut Vec<EventMsg>,
+}
+
+/// Mutable policy boundary immediately before normal turn completion.
+pub struct StopContext<'a> {
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+    pub model_step: usize,
+    pub events: &'a mut Vec<EventMsg>,
+    pub(crate) role: &'a AgentRole,
+    pub(crate) stop_hook_active: bool,
+    pub(crate) last_assistant_message: Option<&'a str>,
+    pub(crate) continuation: Option<String>,
+}
+
+impl StopContext<'_> {
+    #[must_use]
+    pub fn role(&self) -> &AgentRole {
+        self.role
+    }
+
+    #[must_use]
+    pub fn stop_hook_active(&self) -> bool {
+        self.stop_hook_active
+    }
+
+    #[must_use]
+    pub fn last_assistant_message(&self) -> Option<&str> {
+        self.last_assistant_message
+    }
+
+    /// Returns the first continuation requested by the middleware chain.
+    #[must_use]
+    pub fn continuation(&self) -> Option<&str> {
+        self.continuation.as_deref()
+    }
+
+    /// Requests one more model step with hidden context.
+    pub fn continue_with(&mut self, prompt: impl Into<String>) -> Result<()> {
+        if self.stop_hook_active {
+            return Err(Error::Config(
+                "a stop hook may continue a turn only once".into(),
+            ));
+        }
+        let prompt = hook_message("stop continuation prompt", prompt)?;
+        if self.continuation.is_none() {
+            self.continuation = Some(prompt);
+        }
+        Ok(())
+    }
+}
+
+fn hook_message(name: &str, value: impl Into<String>) -> Result<String> {
+    let value = value.into();
+    if value.trim().is_empty() || value.len() > MAX_CAPABILITY_INPUT_BYTES {
+        return Err(Error::Config(format!("{name} is empty or too long")));
+    }
+    Ok(value)
 }
 
 pub(super) fn provisional_message_target(
@@ -428,12 +718,18 @@ pub enum ActiveSubmissionResult {
 pub struct TurnEndContext<'a> {
     pub session_id: &'a str,
     pub turn_id: &'a str,
+    pub(crate) outcome: ExecutionOutcome,
     pub(crate) queued_input: &'a [DurableQueuedInput],
     pub(crate) owner: Option<&'static str>,
     pub events: &'a mut Vec<EventMsg>,
 }
 
 impl TurnEndContext<'_> {
+    #[must_use]
+    pub fn outcome(&self) -> ExecutionOutcome {
+        self.outcome
+    }
+
     /// Returns queued input still pending for this middleware, oldest first.
     pub fn queued_input(&self) -> impl Iterator<Item = QueuedInputView<'_>> {
         let owner = self.owner;
@@ -445,13 +741,6 @@ impl TurnEndContext<'_> {
                 text: item.text(),
             })
     }
-}
-
-/// Durable identity exposed when one agent runtime stops.
-#[derive(Clone)]
-pub struct SessionEndContext {
-    pub session_id: String,
-    pub metadata: BTreeMap<String, Value>,
 }
 
 /// State available to a middleware-owned frontend command.

@@ -11,6 +11,203 @@ use crate::protocol::FrontendSymbol;
 use crate::protocol::Op;
 use crate::protocol::SessionContext;
 
+struct LifecycleProbe {
+    id: &'static str,
+    fail: bool,
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Middleware for LifecycleProbe {
+    fn name(&self) -> &'static str {
+        self.id
+    }
+
+    fn session_start<'a>(
+        &'a self,
+        context: &'a mut SessionStartContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .expect("lifecycle calls")
+                .push(format!("start:{}", self.id));
+            context.push_input(serde_json::json!(self.id));
+            if self.fail {
+                return Err(Error::Config(format!("{} failed", self.id)));
+            }
+            Ok(())
+        })
+    }
+
+    fn session_end<'a>(&'a self, _runtime: &'a RuntimeContext) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .expect("lifecycle calls")
+                .push(format!("end:{}", self.id));
+            Ok(())
+        })
+    }
+}
+
+fn lifecycle_probe(
+    id: &'static str,
+    fail: bool,
+    calls: &Arc<std::sync::Mutex<Vec<String>>>,
+) -> Arc<dyn Middleware> {
+    Arc::new(LifecycleProbe {
+        id,
+        fail,
+        calls: Arc::clone(calls),
+    })
+}
+
+fn lifecycle_runtime(path: &std::path::Path) -> RuntimeContext {
+    RuntimeContext {
+        checkpoints: Arc::new(
+            SqliteCheckpoint::new(path.join("checkpoints.sqlite3")).expect("checkpoint store"),
+        ),
+        session_id: "session".into(),
+        model_route: "model".into(),
+        session_context: SessionContext::default(),
+        metadata: BTreeMap::new(),
+        role: crate::agent::AgentRole::Main,
+        frontend: Arc::new(|_| Ok(())),
+    }
+}
+
+#[tokio::test]
+async fn session_lifecycle_starts_forward_and_ends_or_rolls_back_in_reverse() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stack = MiddlewareStack::new(vec![
+        lifecycle_probe("a", false, &calls),
+        lifecycle_probe("b", false, &calls),
+    ])
+    .expect("middleware stack");
+
+    let runtime = lifecycle_runtime(temporary.path());
+    let mut input = Vec::new();
+    stack
+        .session_start(&runtime, &[], SessionStartSource::Startup, &mut input)
+        .await
+        .expect("session start");
+    stack.session_end(&runtime).await.expect("session end");
+    assert_eq!(input, [serde_json::json!("a"), serde_json::json!("b")]);
+    assert_eq!(
+        *calls.lock().expect("lifecycle calls"),
+        ["start:a", "start:b", "end:b", "end:a"]
+    );
+
+    calls.lock().expect("lifecycle calls").clear();
+    let failing = MiddlewareStack::new(vec![
+        lifecycle_probe("a", false, &calls),
+        lifecycle_probe("b", true, &calls),
+    ])
+    .expect("middleware stack");
+    let mut failing_input = Vec::new();
+    assert!(
+        failing
+            .session_start(
+                &runtime,
+                &[],
+                SessionStartSource::Resume,
+                &mut failing_input,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        *calls.lock().expect("lifecycle calls"),
+        ["start:a", "start:b", "end:a"]
+    );
+
+    calls.lock().expect("lifecycle calls").clear();
+    let mut compact_input = vec![serde_json::json!("compacted")];
+    assert!(
+        failing
+            .session_start(
+                &runtime,
+                &[],
+                SessionStartSource::Compact,
+                &mut compact_input,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(compact_input, [serde_json::json!("compacted")]);
+    assert_eq!(
+        *calls.lock().expect("lifecycle calls"),
+        ["start:a", "start:b"]
+    );
+}
+
+#[test]
+fn hook_policy_decisions_are_monotonic_and_stop_continuation_is_bounded() {
+    let mut permission = PermissionRequestContext {
+        session_id: "session",
+        turn_id: "turn",
+        calls: &[],
+        requested_call_ids: &[],
+        reason: "test",
+        decision: PermissionDecision::Defer,
+    };
+    permission.allow();
+    permission.deny("blocked").expect("deny permission");
+    permission.allow();
+    assert_eq!(
+        permission.decision(),
+        &PermissionDecision::Deny("blocked".into())
+    );
+
+    let mut events = Vec::new();
+    let mut stop = StopContext {
+        session_id: "session",
+        turn_id: "turn",
+        role: &crate::agent::AgentRole::Main,
+        model_step: 0,
+        stop_hook_active: false,
+        last_assistant_message: Some("done"),
+        events: &mut events,
+        continuation: None,
+    };
+    stop.continue_with("first").expect("first continuation");
+    stop.continue_with("second").expect("first decision wins");
+    assert_eq!(stop.continuation(), Some("first"));
+    let mut active = StopContext {
+        stop_hook_active: true,
+        continuation: None,
+        ..stop
+    };
+    assert!(active.continue_with("again").is_err());
+}
+
+#[test]
+fn pre_tool_rewrite_rejects_invalid_calls_without_mutation() {
+    let original = crate::backend::model::ToolCall {
+        call_id: "call".into(),
+        name: "read".into(),
+        arguments: serde_json::json!({"path": "README.md"}),
+    };
+    for (name, arguments) in [
+        ("", serde_json::json!({})),
+        ("search", serde_json::json!([])),
+    ] {
+        let mut call = original.clone();
+        let error = PreToolUseContext {
+            session_id: "session",
+            turn_id: "turn",
+            call: &mut call,
+            denial: None,
+        }
+        .replace(name, arguments)
+        .expect_err("invalid rewrite must fail");
+
+        assert!(matches!(error, Error::Tool(_)));
+        assert_eq!(call, original);
+    }
+}
+
 fn queued(owner: &str, id: &str, text: &str) -> DurableQueuedInput {
     DurableQueuedInput::new(owner, id, text).expect("valid queued input")
 }
@@ -218,7 +415,7 @@ fn catalog_requires_the_registering_middleware_to_render_its_tools() {
         model_route: "model".into(),
         session_context: SessionContext::default(),
         metadata: BTreeMap::new(),
-        queued_input: QueuedInputSnapshot::default(),
+        role: crate::agent::AgentRole::Main,
         frontend: Arc::new(|_| Ok(())),
     };
     let stack = MiddlewareStack::new(vec![Arc::new(CatchAllRenderer), Arc::new(ToolOwner)])

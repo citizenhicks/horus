@@ -64,11 +64,7 @@ impl Tool for SpawnAgent {
         }
     }
 
-    fn call<'a>(
-        &'a self,
-        _context: ToolContext,
-        arguments: Value,
-    ) -> BoxFuture<'a, Result<String>> {
+    fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let arguments: SpawnArgs = serde_json::from_value(arguments)?;
             validate_task_name(&arguments.task_name)?;
@@ -104,7 +100,14 @@ impl Tool for SpawnAgent {
                     )
                     .await?;
                 let agent = match scope
-                    .fork(session_id, path.clone(), model, reasoning_effort, turns)
+                    .fork(
+                        session_id,
+                        path.clone(),
+                        model,
+                        reasoning_effort,
+                        turns,
+                        context.turn_id,
+                    )
                     .await
                 {
                     Ok(agent) => agent,
@@ -194,11 +197,7 @@ impl Tool for FollowupTask {
         message_definition("followup_task", text::TOOL_FOLLOWUP_TASK_DESCRIPTION)
     }
 
-    fn call<'a>(
-        &'a self,
-        _context: ToolContext,
-        arguments: Value,
-    ) -> BoxFuture<'a, Result<String>> {
+    fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let arguments: MessageArgs = serde_json::from_value(arguments)?;
             let message = validate_message("message", arguments.message)?;
@@ -230,6 +229,7 @@ impl Tool for FollowupTask {
                                 arguments.target.clone(),
                                 record.depth,
                                 record.model,
+                                context.turn_id,
                             )
                             .await
                         {

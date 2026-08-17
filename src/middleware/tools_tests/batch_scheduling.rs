@@ -144,7 +144,9 @@ fn spawn_test_batch(
     permissions: SandboxPermissions,
 ) -> tokio::task::JoinHandle<Vec<ToolResult>> {
     let sandbox = test_sandbox();
-    tokio::spawn(async move { execute_batch(&catalog, &calls, sandbox, &permissions).await })
+    tokio::spawn(
+        async move { execute_batch(&catalog, &calls, sandbox, &permissions, "turn").await },
+    )
 }
 
 async fn next_scheduler_event(

@@ -93,6 +93,43 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+impl ToolCall {
+    pub(crate) fn replace(&mut self, name: String, arguments: Value) -> Result<()> {
+        if name.trim().is_empty() {
+            return Err(Error::Tool(format!(
+                "tool call `{}` name is empty",
+                self.call_id
+            )));
+        }
+        if name.len() > MAX_TOOL_NAME_BYTES {
+            return Err(Error::Tool(format!(
+                "tool call `{}` name exceeded size limit",
+                self.call_id
+            )));
+        }
+        if !arguments.is_object() {
+            return Err(Error::Tool(format!(
+                "tool call `{}` arguments must be a JSON object",
+                self.call_id
+            )));
+        }
+        let mut writer = SizeWriter::new(MAX_TOOL_ARGUMENT_BYTES);
+        if let Err(error) = serde_json::to_writer(&mut writer, &arguments) {
+            return Err(Error::Tool(if writer.exceeded {
+                format!("tool call `{}` arguments exceeded size limit", self.call_id)
+            } else {
+                format!(
+                    "tool call `{}` arguments are invalid: {error}",
+                    self.call_id
+                )
+            }));
+        }
+        self.name = name;
+        self.arguments = arguments;
+        Ok(())
+    }
+}
+
 /// Input for one model turn.
 #[derive(Debug)]
 pub struct ModelRequest<'a> {
@@ -372,6 +409,28 @@ impl ModelOutput {
     #[must_use]
     pub fn content(&self) -> &[ModelStepContent] {
         &self.content
+    }
+
+    pub(crate) fn sync_tool_calls(&mut self) -> Result<()> {
+        for (item, call) in self
+            .output
+            .iter_mut()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .zip(&self.tool_calls)
+        {
+            let object = item
+                .as_object_mut()
+                .expect("validated function call must be an object");
+            object.insert("name".into(), Value::String(call.name.clone()));
+            object.insert(
+                "arguments".into(),
+                Value::String(serde_json::to_string(&call.arguments)?),
+            );
+        }
+        ensure_output_size(&self.output).map_err(|_| {
+            Error::Tool("rewritten tool calls exceeded model output size limit".into())
+        })?;
+        Ok(())
     }
 }
 

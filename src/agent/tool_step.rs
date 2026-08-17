@@ -14,6 +14,7 @@ use crate::Result;
 use crate::backend::model::ToolCall;
 use crate::backend::model::tool_output;
 use crate::backend::sandbox::SandboxPermissions;
+use crate::middleware::PostToolUseContext;
 use crate::middleware::QueuedInputBaseline;
 use crate::middleware::tools::ToolResult;
 use crate::middleware::tools::execute_batch;
@@ -51,11 +52,16 @@ impl Runner {
             calls,
             Arc::clone(&self.config.sandbox),
             &permissions,
+            turn_id,
         );
         tokio::pin!(execution);
+        let mut executed = false;
         let results = loop {
             tokio::select! {
-                results = &mut execution => break Wait::Ready(results),
+                results = &mut execution => {
+                    executed = true;
+                    break Wait::Ready(results);
+                }
                 submission = commands.recv() => {
                     let Some(submission) = submission else {
                         return Err(Error::Stopped("frontend disconnected".into()));
@@ -94,12 +100,33 @@ impl Runner {
                 }
             }
         };
-        let results = match results {
+        let mut results = match results {
             Wait::Ready(results) => results,
             Wait::Interrupted { submission_id } => {
                 return Ok(Wait::Interrupted { submission_id });
             }
         };
+        if !executed {
+            return Ok(Wait::Ready(results));
+        }
+        let raw_results = results.clone();
+        for result in &mut results {
+            let call = calls
+                .iter()
+                .find(|call| call.call_id == result.call_id)
+                .ok_or_else(|| Error::Tool("tool result has no matching call".into()))?;
+            let mut context = PostToolUseContext {
+                session_id: &self.config.session_id,
+                turn_id,
+                call,
+                result,
+            };
+            if let Err(error) = self.config.middleware.post_tool_use(&mut context).await {
+                self.persist_tool_results(submission_id, turn_id, raw_results)
+                    .await?;
+                return Err(error);
+            }
+        }
         Ok(Wait::Ready(results))
     }
 
@@ -109,6 +136,9 @@ impl Runner {
         turn_id: &str,
         results: Vec<ToolResult>,
     ) -> Result<()> {
+        if results.is_empty() {
+            return Ok(());
+        }
         let events = tool_result_events(submission_id, turn_id, &results);
         self.append_tool_results(results)?;
         self.persist_with_events(events, None).await?;
@@ -178,12 +208,7 @@ fn tool_result_events(submission_id: &str, turn_id: &str, results: &[ToolResult]
 fn interrupted_results(calls: &[ToolCall], message: &str) -> Vec<ToolResult> {
     calls
         .iter()
-        .map(|call| ToolResult {
-            call_id: call.call_id.clone(),
-            name: call.name.clone(),
-            output: message.to_string(),
-            is_error: true,
-        })
+        .map(|call| ToolResult::error(call, message))
         .collect()
 }
 

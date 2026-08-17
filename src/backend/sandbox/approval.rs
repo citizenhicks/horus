@@ -253,7 +253,7 @@ impl Approval {
         }
     }
 
-    pub(super) fn initialize(&self, session_id: &str) -> Result<Vec<FrontendEvent>> {
+    pub(super) fn session_start(&self, session_id: &str) -> Result<Vec<FrontendEvent>> {
         self.states
             .lock()
             .map_err(|_| state_lock_error())?
@@ -367,7 +367,7 @@ impl Approval {
         Ok(permissions)
     }
 
-    pub(super) fn shutdown(&self, session_id: &str) -> Result<()> {
+    pub(super) fn session_end(&self, session_id: &str) -> Result<()> {
         self.states
             .lock()
             .map_err(|_| state_lock_error())?
@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn full_access_authorizes_mutations_without_review() {
         let approval = Approval::new(ApprovalPolicy::FullAccess);
-        approval.initialize("session").expect("initialize");
+        approval.session_start("session").expect("session start");
         let calls = [ToolCall {
             call_id: "write".into(),
             name: "write_file".into(),

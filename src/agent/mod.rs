@@ -25,6 +25,7 @@ use crate::backend::sandbox::Sandbox;
 use crate::middleware::FrontendExtensions;
 use crate::middleware::MiddlewareCommandContext;
 use crate::middleware::MiddlewareStack;
+use crate::middleware::RuntimeContext;
 use crate::middleware::tools::Catalog;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
@@ -61,6 +62,17 @@ type UsageObserver = Arc<dyn Fn(&str, &TokenUsage) -> Result<()> + Send + Sync>;
 /// Default maximum number of primary model steps in one turn.
 pub const DEFAULT_MAX_MODEL_STEPS: usize = 256;
 
+/// Whether one runtime owns the primary conversation or a delegated child task.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AgentRole {
+    #[default]
+    Main,
+    Subagent {
+        parent_session_id: String,
+        parent_turn_id: String,
+    },
+}
+
 /// Dependencies and policy for one agent session.
 #[derive(Clone)]
 pub struct AgentConfig {
@@ -80,6 +92,7 @@ pub struct AgentConfig {
     model_route_configured: bool,
     initial_replay_batches: usize,
     max_model_steps: usize,
+    role: AgentRole,
 }
 
 impl AgentConfig {
@@ -110,6 +123,7 @@ impl AgentConfig {
             model_route_configured: false,
             initial_replay_batches: DEFAULT_INITIAL_REPLAY_BATCHES,
             max_model_steps: DEFAULT_MAX_MODEL_STEPS,
+            role: AgentRole::Main,
         }
     }
 
@@ -147,6 +161,13 @@ impl AgentConfig {
     #[must_use]
     pub fn max_model_steps(mut self, max_steps: usize) -> Self {
         self.max_model_steps = max_steps;
+        self
+    }
+
+    /// Marks this runtime as a primary agent or delegated subagent.
+    #[must_use]
+    pub fn role(mut self, role: AgentRole) -> Self {
+        self.role = role;
         self
     }
 
@@ -439,6 +460,7 @@ impl AgentEvents {
 
 struct Runner {
     config: AgentConfig,
+    runtime: RuntimeContext,
     system_prompt: Arc<str>,
     catalog: Catalog,
     state: Checkpoint,
@@ -543,6 +565,7 @@ impl Runner {
                 return Ok(());
             }
         };
+        let active_route = choice.route.clone();
         self.state.model_route = Some(choice.route.clone());
         self.persist_with_events(
             vec![Event {
@@ -557,6 +580,7 @@ impl Runner {
             None,
         )
         .await?;
+        self.runtime.model_route = active_route;
         Ok(())
     }
 

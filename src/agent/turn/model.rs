@@ -10,11 +10,14 @@ use crate::agent::input::{ActiveRoute, ActiveTurnRouter, Wait};
 use crate::agent::{EventRecorder, Runner, send_event, try_send_event, unix_timestamp_ms};
 use crate::backend::checkpoint::{ActiveModelStep, Checkpoint, ContextRewrite, ExecutionOutcome};
 use crate::backend::model::{
-    ModelEventSink, ModelRequest, PromptCacheIdentity, STREAM_RETRY_LIMIT, prompt_cache_key,
-    tool_complete_boundaries,
+    ModelEventSink, ModelRequest, PromptCacheIdentity, STREAM_RETRY_LIMIT, internal_user_message,
+    prompt_cache_key, tool_complete_boundaries,
 };
 use crate::backend::sandbox::SandboxAuthorization;
-use crate::middleware::{ModelContext, QueuedInputBaseline, QueuedInputQueue};
+use crate::middleware::tools::ToolResult;
+use crate::middleware::{
+    ModelContext, PreToolUseContext, QueuedInputBaseline, QueuedInputQueue, StopContext,
+};
 use crate::protocol::{
     AgentMessageEvent, AgentMessagePhase, Event, EventMsg, MessageTarget, ModelStepCompletedEvent,
     ModelStepDiagnostics, ModelStepOutcome, ModelStepStartedEvent, Submission, WebSearchAction,
@@ -25,8 +28,8 @@ use crate::{Error, Result};
 const STREAM_RETRY_BASE_DELAY_MS: u64 = 200;
 const STREAM_RETRY_MAX_DELAY_MS: u64 = 3_200;
 
-/// Outcome of `Runner::before_model_phase`.
-enum BeforeModel {
+/// Outcome of `Runner::prepare_model_phase`.
+enum PreparedModel {
     /// An interrupt aborted the turn; `continue_turn` returns.
     Aborted,
     /// Middleware queued input during the phase; re-run it before the model call.
@@ -39,7 +42,7 @@ enum BeforeModel {
 }
 
 impl Runner {
-    async fn persist_before_model_changes(
+    async fn persist_model_hook_changes(
         &mut self,
         submission_id: &str,
         mut middleware_events: Vec<EventMsg>,
@@ -76,15 +79,15 @@ impl Runner {
         Ok(())
     }
 
-    /// Runs `before_model` middleware with interruption routing, folds usage and
+    /// Runs `PreModel` and `ModelRequest` with interruption routing, folds usage and
     /// events into state, and persists when anything changed.
-    async fn before_model_phase(
+    async fn prepare_model_phase(
         &mut self,
         commands: &mut mpsc::Receiver<Submission>,
         submission_id: &str,
         turn_id: &str,
         model_step: usize,
-    ) -> Result<BeforeModel> {
+    ) -> Result<PreparedModel> {
         let mut middleware_events = Vec::new();
         let mut middleware_usage = Vec::new();
         let provisional_target_sequence = self
@@ -104,7 +107,7 @@ impl Runner {
         let (control, mut queued_during_middleware, queue_changed) = {
             let mut queued_during_middleware = Vec::new();
             let mut queue_changed = false;
-            let before_model = self.config.middleware.before_model(ModelContext {
+            let prepare_model = self.config.middleware.prepare_model(ModelContext {
                 model: &self.config.model,
                 provider: &self.config.provider,
                 session_id: &self.config.session_id,
@@ -130,11 +133,13 @@ impl Runner {
                 events: &mut middleware_events,
                 usage: &mut middleware_usage,
                 checkpoint_changed: &mut checkpoint_changed,
+                runtime: &self.runtime,
+                hooks: &self.config.middleware,
             });
-            tokio::pin!(before_model);
+            tokio::pin!(prepare_model);
             let control = loop {
                 tokio::select! {
-                    output = &mut before_model => break Wait::Ready(output),
+                    output = &mut prepare_model => break Wait::Ready(output),
                     submission = commands.recv() => {
                         let Some(submission) = submission else {
                             return Err(Error::Stopped("frontend disconnected".into()));
@@ -201,7 +206,7 @@ impl Runner {
         }
         checkpoint_changed |= usage_changed || had_queued_input || queue_changed;
         if let Some(error) = hook_error {
-            self.persist_before_model_changes(
+            self.persist_model_hook_changes(
                 submission_id,
                 middleware_events,
                 usage_changed,
@@ -212,7 +217,7 @@ impl Runner {
             return Err(error);
         }
         if let Some(interrupt_submission_id) = interrupted_by {
-            self.persist_before_model_changes(
+            self.persist_model_hook_changes(
                 submission_id,
                 middleware_events,
                 usage_changed,
@@ -227,10 +232,10 @@ impl Runner {
                 ExecutionOutcome::Aborted,
             )
             .await?;
-            return Ok(BeforeModel::Aborted);
+            return Ok(PreparedModel::Aborted);
         }
         if queue_changed {
-            self.persist_before_model_changes(
+            self.persist_model_hook_changes(
                 submission_id,
                 middleware_events,
                 usage_changed,
@@ -238,14 +243,14 @@ impl Runner {
                 provisional_target_sequence,
             )
             .await?;
-            return Ok(BeforeModel::Repeat(rewrite_reasons));
+            return Ok(PreparedModel::Repeat(rewrite_reasons));
         }
         if !self.state.pending_input.is_empty() {
             return Err(Error::Config(
                 "queued active input was not consumed by its middleware".into(),
             ));
         }
-        self.persist_before_model_changes(
+        self.persist_model_hook_changes(
             submission_id,
             middleware_events,
             usage_changed,
@@ -253,7 +258,7 @@ impl Runner {
             provisional_target_sequence,
         )
         .await?;
-        Ok(BeforeModel::Ready {
+        Ok(PreparedModel::Ready {
             input: request_input,
             rewrite_reasons,
         })
@@ -305,6 +310,7 @@ impl Runner {
         turn_id: String,
     ) -> Result<()> {
         let mut model_step = 0;
+        let mut stop_continued = false;
         loop {
             if let Some(interrupt_submission_id) = self.drain_commands(commands, &turn_id).await? {
                 self.abort(
@@ -325,14 +331,14 @@ impl Runner {
             let mut rewrite_reasons = Vec::new();
             let request_input = loop {
                 match self
-                    .before_model_phase(commands, &submission_id, &turn_id, model_step)
+                    .prepare_model_phase(commands, &submission_id, &turn_id, model_step)
                     .await?
                 {
-                    BeforeModel::Aborted => return Ok(()),
-                    BeforeModel::Repeat(reasons) => {
+                    PreparedModel::Aborted => return Ok(()),
+                    PreparedModel::Repeat(reasons) => {
                         extend_rewrite_reasons(&mut rewrite_reasons, reasons);
                     }
-                    BeforeModel::Ready {
+                    PreparedModel::Ready {
                         input,
                         rewrite_reasons: reasons,
                     } => {
@@ -349,7 +355,7 @@ impl Runner {
             let cache_key = prompt_cache_key(&model_session_id);
             let instructions = Arc::clone(&self.system_prompt);
             let mut stream_retries = 0;
-            let (model_step_started, output, pending_searches) = loop {
+            let (model_step_started, mut output, pending_searches) = loop {
                 let model_step_started = ModelStepStartedEvent {
                     session_id: self.state.session_id.clone(),
                     turn_id: turn_id.clone(),
@@ -512,6 +518,48 @@ impl Runner {
                 return Err(error);
             }
             self.state.last_usage = Some(output.usage.clone());
+            let original_tool_calls = output.tool_calls.clone();
+            let mut executable_calls = Vec::new();
+            let mut denied_results = Vec::new();
+            for call in &mut output.tool_calls {
+                let mut context = PreToolUseContext {
+                    session_id: &self.config.session_id,
+                    turn_id: &turn_id,
+                    call,
+                    denial: None,
+                };
+                if let Err(error) = self.config.middleware.pre_tool_use(&mut context).await {
+                    self.fail_model_step(
+                        &submission_id,
+                        &model_step_started,
+                        ModelStepOutcome::Failed,
+                        &pending_searches,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                if let Some(reason) = context.denial().map(str::to_owned) {
+                    let denied = context.call();
+                    denied_results.push(ToolResult::error(
+                        denied,
+                        format!("tool call denied: {reason}"),
+                    ));
+                } else {
+                    executable_calls.push(call.clone());
+                }
+            }
+            if output.tool_calls != original_tool_calls
+                && let Err(error) = output.sync_tool_calls()
+            {
+                self.fail_model_step(
+                    &submission_id,
+                    &model_step_started,
+                    ModelStepOutcome::Failed,
+                    &pending_searches,
+                )
+                .await?;
+                return Err(error);
+            }
             let context_before = self.state.context.len();
             let batch_before = self.transcript_delta.len();
             let message_index = output.output.iter().rposition(has_visible_output_text);
@@ -598,19 +646,73 @@ impl Runner {
                 if !complete {
                     continue;
                 }
-                self.complete_turn(&submission_id, &turn_id).await?;
+                let mut hook_events = Vec::new();
+                let decision = {
+                    let mut context = StopContext {
+                        session_id: &self.config.session_id,
+                        turn_id: &turn_id,
+                        role: &self.runtime.role,
+                        model_step: model_step.saturating_sub(1),
+                        stop_hook_active: stop_continued,
+                        last_assistant_message: (!output.text().is_empty())
+                            .then_some(output.text()),
+                        events: &mut hook_events,
+                        continuation: None,
+                    };
+                    self.config.middleware.stop(&mut context).await?;
+                    context.continuation
+                };
+                let hook_events = hook_events
+                    .into_iter()
+                    .map(|message| turn_event(&submission_id, message))
+                    .collect::<Vec<_>>();
+                if let Some(interrupt_submission_id) =
+                    self.drain_commands(commands, &turn_id).await?
+                {
+                    if !hook_events.is_empty() {
+                        self.persist_with_events(hook_events, None).await?;
+                    }
+                    self.abort(
+                        &interrupt_submission_id,
+                        &turn_id,
+                        "interrupted",
+                        ExecutionOutcome::Aborted,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                if !self.state.pending_input.is_empty() {
+                    if !hook_events.is_empty() {
+                        self.persist_with_events(hook_events, None).await?;
+                    }
+                    continue;
+                }
+                if let Some(prompt) = decision {
+                    stop_continued = true;
+                    self.push_context(internal_user_message("stop_continuation", &prompt));
+                    self.persist_with_events(hook_events, None).await?;
+                    continue;
+                }
+                self.complete_turn(&submission_id, &turn_id, hook_events)
+                    .await?;
                 return Ok(());
             }
 
-            let mutation_call_ids = output
-                .tool_calls
+            let mutation_call_ids = executable_calls
                 .iter()
                 .filter(|call| self.catalog.requires_approval(&call.name))
                 .map(|call| call.call_id.clone())
                 .collect::<Vec<_>>();
+            if !denied_results.is_empty() {
+                self.persist_tool_results(&submission_id, &turn_id, denied_results)
+                    .await?;
+            }
+            if executable_calls.is_empty() {
+                continue;
+            }
             let authorization = self.config.sandbox.authorize(
                 &self.config.session_id,
-                &output.tool_calls,
+                &executable_calls,
                 &mutation_call_ids,
             )?;
             let results = match authorization {
@@ -620,7 +722,7 @@ impl Runner {
                             commands,
                             &submission_id,
                             &turn_id,
-                            &output.tool_calls,
+                            &executable_calls,
                             permissions,
                         )
                         .await?;
@@ -638,7 +740,7 @@ impl Runner {
                             commands,
                             &submission_id,
                             &turn_id,
-                            output.tool_calls,
+                            executable_calls.clone(),
                             request,
                             permissions,
                             Vec::new(),
@@ -655,7 +757,7 @@ impl Runner {
                             commands,
                             &submission_id,
                             &turn_id,
-                            output.tool_calls,
+                            executable_calls,
                             review,
                         )
                         .await?

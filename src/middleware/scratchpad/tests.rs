@@ -208,7 +208,7 @@ async fn disabled_agent_keeps_read_only_surfaces_without_prompt_or_tools() {
         model_route: "model".into(),
         session_context: crate::protocol::SessionContext::default(),
         metadata: Default::default(),
-        queued_input: crate::middleware::QueuedInputSnapshot::default(),
+        role: crate::agent::AgentRole::Main,
         frontend: Arc::new(move |event| {
             captured_events.lock().expect("frontend events").push(event);
             Ok(())
@@ -225,7 +225,17 @@ async fn disabled_agent_keeps_read_only_surfaces_without_prompt_or_tools() {
     assert_eq!(contribution.commands.len(), 1);
     assert_eq!(contribution.commands[0].name, "scratchpad");
     assert_eq!(contribution.widgets.len(), 2);
-    middleware.initialize(runtime).await.expect("initialize");
+    let mut input = Vec::new();
+    let mut start = crate::middleware::SessionStartContext {
+        runtime: &runtime,
+        source: crate::middleware::SessionStartSource::Startup,
+        queued_input: Default::default(),
+        input: &mut input,
+    };
+    middleware
+        .session_start(&mut start)
+        .await
+        .expect("session start");
     assert!(
         frontend_events
             .lock()
@@ -240,7 +250,7 @@ async fn disabled_agent_keeps_read_only_surfaces_without_prompt_or_tools() {
                             if items.iter().any(|item| item.text == "historical note")
                     )
             )),
-        "initialize should restore historical notes in the management widget"
+        "session start should restore historical notes in the management widget"
     );
 
     let checkpoint = crate::backend::checkpoint::Checkpoint::empty("session");
@@ -303,7 +313,7 @@ fn runtime(store: &ScratchpadStore, session_id: &str) -> RuntimeContext {
         model_route: "model".into(),
         session_context: crate::protocol::SessionContext::default(),
         metadata: Default::default(),
-        queued_input: crate::middleware::QueuedInputSnapshot::default(),
+        role: crate::agent::AgentRole::Main,
         frontend: frontend_sink(),
     }
 }
@@ -316,11 +326,18 @@ async fn new_session_seeds_one_bounded_baseline_projection() {
         .await
         .expect("write note");
     let middleware = Scratchpad::new(store.clone());
-    let seeded = middleware
-        .seed_session(&runtime(&store, "session"))
+    let runtime = runtime(&store, "session");
+    let mut seeded = Vec::new();
+    let mut start = crate::middleware::SessionStartContext {
+        runtime: &runtime,
+        source: crate::middleware::SessionStartSource::Startup,
+        queued_input: Default::default(),
+        input: &mut seeded,
+    };
+    middleware
+        .session_start(&mut start)
         .await
-        .expect("seed session");
-
+        .expect("session start");
     assert_eq!(seeded.len(), 1);
     assert_eq!(internal_message_kind(&seeded[0]), Some(BASELINE_KIND));
     assert!(is_projection_item(&seeded[0]));
@@ -336,6 +353,33 @@ async fn new_session_seeds_one_bounded_baseline_projection() {
             .expect("projection"),
         store.snapshot("session").await.expect("snapshot")
     );
+}
+
+#[tokio::test]
+async fn startup_keeps_one_inherited_baseline_projection() {
+    let (_temporary, store) = store().await;
+    store
+        .write_session("session", "remember this")
+        .await
+        .expect("write note");
+    let snapshot = store.snapshot("session").await.expect("snapshot");
+    let inherited = scratchpad_message(&snapshot).expect("baseline");
+    let middleware = Scratchpad::new(store.clone());
+    let runtime = runtime(&store, "session");
+    let mut input = vec![inherited.clone()];
+    let mut start = crate::middleware::SessionStartContext {
+        runtime: &runtime,
+        source: crate::middleware::SessionStartSource::Startup,
+        queued_input: Default::default(),
+        input: &mut input,
+    };
+
+    middleware
+        .session_start(&mut start)
+        .await
+        .expect("session start");
+
+    assert_eq!(input, [inherited]);
 }
 
 #[test]

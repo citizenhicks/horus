@@ -374,8 +374,8 @@ impl Sandbox {
         self.approval.render(event)
     }
 
-    pub(crate) fn initialize(&self, session_id: &str) -> Result<Vec<FrontendEvent>> {
-        self.approval.initialize(session_id)
+    pub(crate) fn session_start(&self, session_id: &str) -> Result<Vec<FrontendEvent>> {
+        self.approval.session_start(session_id)
     }
 
     pub(crate) fn authorize(
@@ -400,8 +400,8 @@ impl Sandbox {
             .resolve(session_id, calls, approval_call_ids, decision, permissions)
     }
 
-    pub(crate) async fn shutdown(&self, session_id: &str) -> Result<()> {
-        let approval = self.approval.shutdown(session_id);
+    pub(crate) async fn session_end(&self, session_id: &str) -> Result<()> {
+        let approval = self.approval.session_end(session_id);
         let background = self.background.shutdown(session_id).await;
         approval.and(background)
     }

@@ -72,7 +72,7 @@ impl Middleware for ContextOffloading {
         MANIFEST.id
     }
 
-    fn before_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
+    fn pre_model<'a>(&'a self, context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             if let Some(input) = mask_stale_outputs(context.input(), self.stale_after_tokens) {
                 context.rewrite_input(ContextRewriteReason::ContextOffloading, input)?;

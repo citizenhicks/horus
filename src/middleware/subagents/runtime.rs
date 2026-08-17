@@ -134,7 +134,7 @@ impl Shared {
         })
     }
 
-    pub(super) async fn initialize(&self, context: RuntimeContext) -> Result<()> {
+    pub(super) async fn session_start(&self, context: RuntimeContext) -> Result<()> {
         let identity = super::AgentIdentity::read(&context.session_id, &context.metadata)?;
         let root_id = identity.root_session_id;
         let existing = self.roots.lock().await.get(&root_id).cloned();

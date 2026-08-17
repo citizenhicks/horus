@@ -9,6 +9,7 @@ use super::manifest::MiddlewareManifest;
 use super::tools::{Catalog, Tool, ToolContext, render_tool_event};
 use super::{
     Middleware, MiddlewareCommandContext, MiddlewareCommandOutput, PromptSection, RuntimeContext,
+    SessionStartContext, SessionStartSource,
 };
 use crate::backend::checkpoint::CheckpointStore;
 use crate::backend::model::ToolDefinition;
@@ -107,10 +108,17 @@ impl Middleware for Tasks {
         )
     }
 
-    fn initialize<'a>(&'a self, context: RuntimeContext) -> BoxFuture<'a, Result<()>> {
+    fn session_start<'a>(
+        &'a self,
+        context: &'a mut SessionStartContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let todos = load_todos(&context.checkpoints, &context.session_id).await?;
-            (context.frontend)(widget_event(&todos))
+            if context.source() == SessionStartSource::Compact {
+                return Ok(());
+            }
+            let todos =
+                load_todos(&context.runtime.checkpoints, &context.runtime.session_id).await?;
+            (context.runtime.frontend)(widget_event(&todos))
         })
     }
 
@@ -316,7 +324,7 @@ mod tests {
             model_route: "default".into(),
             session_context: SessionContext::default(),
             metadata: BTreeMap::new(),
-            queued_input: crate::middleware::QueuedInputSnapshot::default(),
+            role: crate::agent::AgentRole::Main,
             frontend: Arc::new(move |event| {
                 events.lock().expect("frontend events").push(event);
                 Ok(())
@@ -348,6 +356,7 @@ mod tests {
             }],
             sandbox,
             &permissions,
+            "turn-a",
         )
         .await
         .pop()

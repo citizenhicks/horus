@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 
 use super::Agent;
 use super::AgentConfig;
+use super::AgentRole;
 use super::AgentSender;
 use super::COMMAND_QUEUE_CAPACITY;
 use super::EventRecorder;
@@ -22,7 +23,8 @@ use crate::backend::checkpoint::TranscriptPageRequest;
 use crate::backend::model::user_message;
 use crate::middleware::FrontendExtensions;
 use crate::middleware::RuntimeContext;
-use crate::middleware::SessionEndContext;
+use crate::middleware::SessionStartSource;
+use crate::middleware::TurnEndContext;
 use crate::protocol::ErrorEvent;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
@@ -59,6 +61,24 @@ fn drain_pending_input(
                 message_target: None,
             }),
         });
+    }
+}
+
+fn initial_hook_source(is_new: bool, sequence: u64, role: &AgentRole) -> SessionStartSource {
+    if is_new || (sequence == 0 && matches!(role, AgentRole::Subagent { .. })) {
+        SessionStartSource::Startup
+    } else {
+        SessionStartSource::Resume
+    }
+}
+
+async fn failed_start(config: &AgentConfig, runtime: &RuntimeContext, primary: Error) -> Error {
+    match config.middleware.session_end(runtime).await {
+        Err(rollback) => Error::Rollback {
+            primary: Box::new(primary),
+            rollback: Box::new(rollback),
+        },
+        Ok(()) => primary,
     }
 }
 
@@ -135,6 +155,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
     let mut recovery_delta = Vec::new();
     let mut recovery_execution: Option<ExecutionRecord> = None;
     let mut recovery_events = Vec::new();
+    let recovery_queued_input = state.pending_input.clone();
     let route = if config.model_route_configured {
         config.provider.clone()
     } else {
@@ -167,14 +188,27 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         msg: EventMsg::SessionConfigured(session.clone()),
     };
     let middleware_events = event_tx.clone();
+    let pending_frontend = Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+    let queued_frontend = Arc::clone(&pending_frontend);
     let runtime = RuntimeContext {
         checkpoints: Arc::clone(&config.checkpoints),
         session_id: config.session_id.clone(),
         model_route: config.provider.clone(),
         session_context: config.session_context.clone(),
         metadata: config.metadata.clone(),
-        queued_input: Default::default(),
+        role: config.role.clone(),
         frontend: Arc::new(move |update| {
+            let mut queued = queued_frontend
+                .lock()
+                .map_err(|_| Error::Stopped("middleware frontend queue poisoned".into()))?;
+            if let Some(events) = queued.as_mut() {
+                if events.len() >= super::EVENT_QUEUE_CAPACITY {
+                    return Err(Error::Stopped("event recorder queue is full".into()));
+                }
+                events.push(update);
+                return Ok(());
+            }
+            drop(queued);
             try_send_event(
                 &middleware_events,
                 Event {
@@ -184,11 +218,6 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             )
         }),
     };
-    if is_new {
-        state
-            .context
-            .extend(config.middleware.seed_session(&runtime).await?);
-    }
     let system_prompt: Arc<str> = config
         .middleware
         .system_prompt(&config.system_prompt, &runtime)?
@@ -275,7 +304,38 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             Some(state.finish_execution(ExecutionOutcome::Aborted, unix_timestamp_ms()?)?);
         state_changed = true;
     }
+    let context_len = state.context.len();
+    let start_source = initial_hook_source(is_new, state.sequence, &config.role);
+    config
+        .middleware
+        .session_start(
+            &runtime,
+            &state.pending_input,
+            start_source,
+            &mut state.context,
+        )
+        .await?;
+    state_changed |= state.context.len() != context_len;
     if let Some(execution) = &recovery_execution {
+        let mut messages = Vec::new();
+        if let Err(error) = config
+            .middleware
+            .turn_end(TurnEndContext {
+                session_id: &config.session_id,
+                turn_id: &execution.turn_id,
+                outcome: ExecutionOutcome::Aborted,
+                queued_input: &recovery_queued_input,
+                owner: None,
+                events: &mut messages,
+            })
+            .await
+        {
+            return Err(failed_start(&config, &runtime, error).await);
+        }
+        recovery_events.extend(messages.into_iter().map(|msg| Event {
+            submission_id: Some(execution.submission_id.clone()),
+            msg,
+        }));
         recovery_events.push(Event {
             submission_id: Some(execution.submission_id.clone()),
             msg: EventMsg::TurnAborted(TurnAbortedEvent {
@@ -284,70 +344,88 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             }),
         });
     }
-    if is_new || state_changed {
-        if !is_new {
-            state.sequence = state
-                .sequence
-                .checked_add(1)
-                .ok_or_else(|| Error::Checkpoint("checkpoint sequence overflow".into()))?;
+    let finish_start = async {
+        if is_new || state_changed {
+            if !is_new {
+                state.sequence = state
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Checkpoint("checkpoint sequence overflow".into()))?;
+            }
+            let mut startup_events = vec![session_event];
+            startup_events.append(&mut recovery_events);
+            event_tx
+                .save(
+                    &state,
+                    &recovery_delta,
+                    recovery_execution.as_ref(),
+                    startup_events,
+                )
+                .await?;
+        } else {
+            send_event(&event_tx, session_event).await?;
         }
-        let mut startup_events = vec![session_event];
-        startup_events.append(&mut recovery_events);
-        event_tx
-            .save(
-                &state,
-                &recovery_delta,
-                recovery_execution.as_ref(),
-                startup_events,
+        let frontend_events = pending_frontend
+            .lock()
+            .map_err(|_| Error::Stopped("middleware frontend queue poisoned".into()))?
+            .take()
+            .unwrap_or_default();
+        for update in frontend_events {
+            send_event(
+                &event_tx,
+                Event {
+                    submission_id: None,
+                    msg: EventMsg::Frontend(update),
+                },
             )
             .await?;
-    } else {
-        send_event(&event_tx, session_event).await?;
-    }
-    if config.initial_replay_batches == 0 {
-        for msg in replay {
+        }
+        if config.initial_replay_batches == 0 {
+            for msg in replay {
+                try_send_event(
+                    &event_tx,
+                    Event {
+                        submission_id: None,
+                        msg,
+                    },
+                )?;
+            }
+        } else if !replay.is_empty() {
             try_send_event(
                 &event_tx,
                 Event {
                     submission_id: None,
-                    msg,
+                    msg: EventMsg::SessionHistory(SessionHistoryEvent { events: replay }),
                 },
             )?;
         }
-    } else if !replay.is_empty() {
-        try_send_event(
-            &event_tx,
-            Event {
-                submission_id: None,
-                msg: EventMsg::SessionHistory(SessionHistoryEvent { events: replay }),
-            },
-        )?;
-    }
-    if let Some(last_token_usage) = state.last_usage.clone() {
-        try_send_event(
-            &event_tx,
-            Event {
-                submission_id: None,
-                msg: EventMsg::TokenCount(TokenCountEvent {
-                    info: Some(TokenUsageInfo {
-                        total_token_usage: state.total_usage.clone(),
-                        last_token_usage,
-                        model_context_window: Some(config.context_window),
+        if let Some(last_token_usage) = state.last_usage.clone() {
+            try_send_event(
+                &event_tx,
+                Event {
+                    submission_id: None,
+                    msg: EventMsg::TokenCount(TokenCountEvent {
+                        info: Some(TokenUsageInfo {
+                            total_token_usage: state.total_usage.clone(),
+                            last_token_usage,
+                            model_context_window: Some(config.context_window),
+                        }),
+                        rate_limits: None,
                     }),
-                    rate_limits: None,
-                }),
-            },
-        )?;
+                },
+            )?;
+        }
+        event_tx.flush().await
+    }
+    .await;
+    if let Err(error) = finish_start {
+        return Err(failed_start(&config, &runtime, error).await);
     }
     let model_choices = config.model.choices().cloned().collect();
-    config
-        .middleware
-        .initialize(runtime, &state.pending_input)
-        .await?;
-    event_tx.flush().await?;
     let model_router = Arc::clone(&config.model);
     let mut runner = Runner {
         config,
+        runtime,
         system_prompt,
         catalog,
         state,
@@ -356,14 +434,10 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         deferred: VecDeque::new(),
         events: event_tx.clone(),
     };
-    let end_context = SessionEndContext {
-        session_id: runner.config.session_id.clone(),
-        metadata: runner.config.metadata.clone(),
-    };
     tokio::spawn(async move {
         let run = runner.run(command_rx).await;
-        let shutdown = runner.config.middleware.shutdown(end_context).await;
-        if let Some(error) = run.err().or_else(|| shutdown.err()) {
+        let session_end = runner.config.middleware.session_end(&runner.runtime).await;
+        if let Some(error) = run.err().or_else(|| session_end.err()) {
             let _ = send_event(
                 &event_tx,
                 Event {
@@ -387,4 +461,30 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         tool_count,
         next_before_sequence,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_forked_subagent_starts_before_it_resumes() {
+        let child = AgentRole::Subagent {
+            parent_session_id: "parent".into(),
+            parent_turn_id: "turn".into(),
+        };
+
+        assert_eq!(
+            initial_hook_source(false, 0, &child),
+            SessionStartSource::Startup
+        );
+        assert_eq!(
+            initial_hook_source(false, 1, &child),
+            SessionStartSource::Resume
+        );
+        assert_eq!(
+            initial_hook_source(false, 0, &AgentRole::Main),
+            SessionStartSource::Resume
+        );
+    }
 }

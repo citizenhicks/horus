@@ -201,7 +201,6 @@ mod tests {
     use crate::backend::checkpoint::{CheckpointStore, sqlite::SqliteCheckpoint};
     use crate::backend::sandbox::local::LocalSandbox;
     use crate::backend::sandbox::{ApprovalPolicy, NetworkAccess, Sandbox, SandboxPermissions};
-    use crate::middleware::QueuedInputSnapshot;
     use crate::protocol::{SessionContext, ToolCallEndEvent};
 
     #[test]
@@ -218,7 +217,7 @@ mod tests {
             model_route: "model".into(),
             session_context: SessionContext::default(),
             metadata: BTreeMap::new(),
-            queued_input: QueuedInputSnapshot::default(),
+            role: crate::agent::AgentRole::Main,
             frontend: Arc::new(|_| Ok(())),
         };
         let mut second_runtime = runtime.clone();
@@ -263,6 +262,7 @@ mod tests {
                 ToolContext {
                     sandbox,
                     permissions,
+                    turn_id: "turn".into(),
                 },
                 serde_json::json!({"path": "report.xlsx"}),
             )

@@ -199,13 +199,13 @@ async fn active_command_emits_a_subagent_transcript_preview() {
     .expect("subagents middleware");
     middleware
         .shared
-        .initialize(RuntimeContext {
+        .session_start(RuntimeContext {
             checkpoints,
             session_id: root.session_id.clone(),
             model_route: "test".into(),
             session_context: root.session_context.clone(),
             metadata: root.metadata.clone(),
-            queued_input: crate::middleware::QueuedInputSnapshot::default(),
+            role: crate::agent::AgentRole::Main,
             frontend: Arc::new(|_| Ok(())),
         })
         .await
@@ -341,13 +341,13 @@ async fn preview_continuation_loads_one_older_turn_through_registered_command() 
     let middleware = Arc::new(test_middleware());
     middleware
         .shared
-        .initialize(RuntimeContext {
+        .session_start(RuntimeContext {
             checkpoints: Arc::clone(&checkpoints),
             session_id: root.session_id.clone(),
             model_route: "test".into(),
             session_context: root.session_context.clone(),
             metadata: root.metadata.clone(),
-            queued_input: crate::middleware::QueuedInputSnapshot::default(),
+            role: crate::agent::AgentRole::Main,
             frontend: Arc::new(|_| Ok(())),
         })
         .await
@@ -491,7 +491,7 @@ async fn fork_persists_the_metadata_passed_to_the_child() {
     let launcher: SubagentLauncher = Arc::new({
         let launched = Arc::clone(&launched);
         move |launch| {
-            *launched.lock().expect("launch metadata lock") = Some(launch.metadata);
+            *launched.lock().expect("launch metadata lock") = Some(launch);
             Box::pin(async { Err(Error::Stopped("test launch stopped".into())) })
         }
     });
@@ -501,7 +501,7 @@ async fn fork_persists_the_metadata_passed_to_the_child() {
         model_route: "test".into(),
         session_context: parent.session_context.clone(),
         metadata: parent.metadata.clone(),
-        queued_input: crate::middleware::QueuedInputSnapshot::default(),
+        role: crate::agent::AgentRole::Main,
         frontend: Arc::new(|_| Ok(())),
     };
     let scope = AgentScope::new(&runtime, launcher).expect("agent scope");
@@ -513,6 +513,7 @@ async fn fork_persists_the_metadata_passed_to_the_child() {
             "test".into(),
             None,
             ForkTurns::None,
+            "turn".into(),
         )
         .await;
     assert!(matches!(result, Err(Error::Stopped(_))));
@@ -528,7 +529,14 @@ async fn fork_persists_the_metadata_passed_to_the_child() {
         .expect("launched metadata");
     let identity = AgentIdentity::read("child", &child.metadata).expect("child identity");
 
-    assert_eq!(child.metadata, launched);
+    assert_eq!(child.metadata, launched.metadata);
+    assert_eq!(
+        launched.role,
+        crate::agent::AgentRole::Subagent {
+            parent_session_id: "parent".into(),
+            parent_turn_id: "turn".into(),
+        }
+    );
     assert_eq!(
         child.metadata.get("gateway.chat"),
         parent.metadata.get("gateway.chat")

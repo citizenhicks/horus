@@ -18,6 +18,7 @@ async fn rejected_patch(content: &str, patch: &str) -> String {
             ["patch".into()],
         )
         .for_call("patch"),
+        turn_id: "turn".into(),
     };
 
     ApplyPatch
@@ -90,6 +91,7 @@ async fn apply_patch_returns_a_unified_diff_after_writing() {
         }],
         Arc::clone(&sandbox),
         &permissions,
+        "turn",
     )
     .await
     .pop()
@@ -122,6 +124,7 @@ async fn apply_patch_returns_a_unified_diff_after_writing() {
         }],
         sandbox,
         &permissions,
+        "turn",
     )
     .await
     .pop()
@@ -177,6 +180,7 @@ async fn apply_patch_supports_context_headers_and_multiple_changes() {
             ["patch".into()],
         )
         .for_call("patch"),
+        turn_id: "turn".into(),
     };
 
     ApplyPatch
@@ -311,6 +315,7 @@ async fn apply_patch_cannot_make_a_file_unreadable() {
             ["patch".into()],
         )
         .for_call("patch"),
+        turn_id: "turn".into(),
     };
 
     let error = ApplyPatch
