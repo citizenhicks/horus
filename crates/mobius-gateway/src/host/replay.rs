@@ -62,23 +62,18 @@ pub(super) async fn load_replay(
     } else {
         None
     };
-    let mut artifacts = VecDeque::with_capacity(ARTIFACT_CAPACITY);
     let mut widgets = SessionWidgets::new();
     for frame in &replay {
         let ServerMessage::AgentEvent { record, .. } = &frame.message else {
             continue;
         };
         update_widgets(&mut widgets, &record.event.msg);
-        for block in &record.blocks {
-            upsert_artifact(&mut artifacts, session_id, block);
-        }
     }
     Ok(LoadedReplay {
         latest_sequence,
         replay,
         replay_bytes,
         next_before_sequence,
-        artifacts,
         widgets,
     })
 }
@@ -236,97 +231,6 @@ pub(super) fn update_widgets(widgets: &mut SessionWidgets, event: &EventMsg) {
             widgets.retain(|((owner, widget), _)| owner != capability || widget != id);
         }
         _ => {}
-    }
-}
-
-pub(super) fn upsert_artifact(
-    artifacts: &mut VecDeque<ArtifactRecord>,
-    session_id: &str,
-    rendered: &RenderedBlock,
-) {
-    let block = &rendered.block;
-    let (kind, title) = if let Some(file) = block.files.first() {
-        (ArtifactKind::File, file.name.clone())
-    } else if block.format == FrontendBlockFormat::UnifiedDiff {
-        (ArtifactKind::CodeDiff, block.title.clone())
-    } else {
-        return;
-    };
-    let source_id = block
-        .id
-        .clone()
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let id = scoped_block_id(&rendered.capability, &source_id);
-    if let Some(index) = artifacts.iter().position(|artifact| artifact.id == id) {
-        artifacts.remove(index);
-    } else if artifacts.len() == ARTIFACT_CAPACITY {
-        artifacts.pop_front();
-    }
-    artifacts.push_back(ArtifactRecord {
-        id,
-        session_id: session_id.into(),
-        kind,
-        title,
-        block: block.clone(),
-    });
-}
-
-pub(super) fn scoped_block_id(capability: &str, source_id: &str) -> String {
-    format!("block:{}:{capability}{source_id}", capability.len())
-}
-
-pub(super) fn merge_stored_file_artifacts(
-    live: &VecDeque<ArtifactRecord>,
-    session_id: &str,
-    stored_files: Vec<SessionFileReference>,
-) -> Vec<ArtifactRecord> {
-    let stored_ids = stored_files
-        .iter()
-        .map(|file| file.id.as_str())
-        .collect::<HashSet<_>>();
-    let mut seen_files = HashSet::new();
-    let mut artifacts = Vec::with_capacity(live.len().saturating_add(stored_files.len()));
-    for artifact in live {
-        if artifact.kind == ArtifactKind::CodeDiff {
-            artifacts.push(artifact.clone());
-            continue;
-        }
-        let Some(file) = artifact.block.files.first() else {
-            continue;
-        };
-        if stored_ids.contains(file.id.as_str()) && seen_files.insert(file.id.clone()) {
-            artifacts.push(artifact.clone());
-        }
-    }
-    for file in stored_files {
-        if seen_files.insert(file.id.clone()) {
-            artifacts.push(stored_file_artifact(session_id, file));
-        }
-    }
-    artifacts
-}
-
-pub(super) fn stored_file_artifact(session_id: &str, file: SessionFileReference) -> ArtifactRecord {
-    let id = format!("artifacts/file/{}", file.id);
-    let title = file.name.clone();
-    ArtifactRecord {
-        id: id.clone(),
-        session_id: session_id.into(),
-        kind: ArtifactKind::File,
-        title: title.clone(),
-        block: FrontendBlock {
-            id: Some(id),
-            group: None,
-            update: FrontendBlockUpdate::Replace,
-            state: FrontendBlockState::Complete,
-            role: FrontendBlockRole::Artifact,
-            title: format!("Sent {title}"),
-            text: String::new(),
-            symbol: None,
-            files: vec![file],
-            format: FrontendBlockFormat::PlainText,
-            tone: mobius::protocol::FrontendTone::Success,
-        },
     }
 }
 

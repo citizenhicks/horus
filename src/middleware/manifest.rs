@@ -3,7 +3,7 @@
 use crate::backend::model::ModelChoice;
 use crate::protocol::{
     FrontendSetting, FrontendSettingKind, FrontendSettingOption, FrontendSettingValue,
-    MiddlewareFeature,
+    FrontendSymbol, FrontendTone, MiddlewareFeature,
 };
 use crate::{Error, Result};
 
@@ -56,6 +56,7 @@ pub enum MiddlewareSettingManifest {
         unset_label: Option<&'static str>,
         default: Option<&'static str>,
         max_bytes: usize,
+        composer: bool,
     },
 }
 
@@ -107,6 +108,7 @@ impl MiddlewareSettingManifest {
                 id: id.into(),
                 label: label.into(),
                 description: description.into(),
+                composer: false,
                 kind: FrontendSettingKind::Integer { min, max, step },
             },
             Self::Select {
@@ -115,11 +117,13 @@ impl MiddlewareSettingManifest {
                 description,
                 choices,
                 unset_label,
+                composer,
                 ..
             } => FrontendSetting {
                 id: id.into(),
                 label: label.into(),
                 description: description.into(),
+                composer,
                 kind: FrontendSettingKind::Select {
                     options: choices.options(models),
                     unset_label: unset_label.map(str::to_string),
@@ -226,6 +230,8 @@ impl MiddlewareSettingChoices {
                     value: choice.value.into(),
                     label: choice.label.into(),
                     description: choice.description.into(),
+                    symbol: choice.symbol.map(FrontendSymbol::from_wire),
+                    tone: choice.tone,
                 })
                 .collect(),
             Self::ModelRoutes => models
@@ -237,6 +243,8 @@ impl MiddlewareSettingChoices {
                         |effort| format!("{} · {effort}", choice.group),
                     ),
                     description: format!("{} · {}", choice.model, choice.route),
+                    symbol: None,
+                    tone: FrontendTone::Neutral,
                 })
                 .collect(),
         }
@@ -256,6 +264,8 @@ pub struct MiddlewareSettingChoice {
     pub value: &'static str,
     pub label: &'static str,
     pub description: &'static str,
+    pub symbol: Option<&'static str>,
+    pub tone: FrontendTone,
 }
 
 fn setting_type(middleware: &str, setting: &str, expected: &str) -> Error {
@@ -272,6 +282,8 @@ mod tests {
         value: "safe",
         label: "Safe",
         description: "Use the safe policy",
+        symbol: None,
+        tone: FrontendTone::Neutral,
     }];
 
     const SETTING: MiddlewareSettingManifest = MiddlewareSettingManifest::Select {
@@ -282,6 +294,7 @@ mod tests {
         unset_label: None,
         default: Some("safe"),
         max_bytes: 16,
+        composer: false,
     };
 
     #[test]

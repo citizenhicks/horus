@@ -197,12 +197,6 @@ extension AppModel {
             }
         case .profile(_, let profile):
             self.profile = profile
-        case .artifacts(let requestID, let sessionID, let artifacts, let truncated):
-            guard requestID == artifactListRequestID, sessionID == selectedSessionID else { break }
-            artifactListRequestID = nil
-            isLoadingArtifacts = false
-            self.artifacts = artifacts
-            artifactsTruncated = truncated
         case .gitDiff(let requestID, let sessionID, let scope, let diff):
             guard sessionID == selectedSessionID else { break }
             if scope == .unstaged, requestID == gitDiffRequestID {
@@ -312,6 +306,8 @@ extension AppModel {
                 eventTask?.cancel()
                 eventTask = nil
                 restorePendingDrafts()
+                extensionAction = nil
+                extensionRequestID = nil
                 connectionState = .failed(failure.message)
             }
         }
@@ -445,6 +441,8 @@ extension AppModel {
             submittedDefaultAgentDraft = nil
             defaultAgentApplyState = .applied
             showToast("Default agent saved for new chats.", tone: .success)
+        } else {
+            completeExtensionAction(requestID: requestID)
         }
     }
 
@@ -462,6 +460,8 @@ extension AppModel {
         modelChoices = payload.models
         modelProviders = payload.modelProviders
         middlewareFeatures = payload.middlewareFeatures
+        extensions = payload.extensions
+        gatewayContributions = payload.contributions
         defaultAgentSnapshot = payload.defaultConfig
         defaultAgentDraft = payload.defaultConfig.map { incomingSnapshot in
             pendingDefaultDraft ?? refreshedAgentDraft(
@@ -667,7 +667,7 @@ extension AppModel {
     private func requestSessionData() {
         guard selectedSessionID != nil else { return }
         refreshWorkspaceChanges()
-        refreshChatFiles()
+        refreshSessionUploads()
         refreshCron()
     }
 
@@ -765,10 +765,6 @@ extension AppModel {
             sessionUploadsRequestID = nil
             isLoadingSessionUploads = false
         }
-        if rejection.requestId == artifactListRequestID {
-            artifactListRequestID = nil
-            isLoadingArtifacts = false
-        }
         if rejection.requestId == sessionFileDownload?.requestID {
             sessionFileDownload = nil
             isLoadingFilePresentation = false
@@ -852,6 +848,7 @@ extension AppModel {
             defaultAgentApplyState = .failed(rejection.message)
             providerRegistrationRequestID = nil
         }
+        rejectExtensionAction(requestID: rejection.requestId)
         if rejection.requestId == pairingCodeRequestID {
             pairingCodeRequestID = nil
         }
@@ -871,6 +868,8 @@ extension AppModel {
             eventTask?.cancel()
             eventTask = nil
             restorePendingDrafts()
+            extensionAction = nil
+            extensionRequestID = nil
             connectionState = .failed(rejection.message)
         }
     }

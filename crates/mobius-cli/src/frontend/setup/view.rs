@@ -147,7 +147,7 @@ pub(super) fn page_prompt(state: &SetupState) -> (&'static str, String) {
         ),
         Page::Agent => (
             "Agent settings",
-            "Toggle capabilities and adjust their advertised settings.".into(),
+            "Toggle capabilities, adjust settings, and select installed extensions.".into(),
         ),
     }
 }
@@ -331,34 +331,78 @@ pub(super) fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState, wi
         }
         Page::Agent => {
             let layout = agent_layout(state, usize::from(width));
-            let mut row = 0;
-            for feature in &state.features {
-                agent_choice(
-                    lines,
-                    &feature.label,
-                    &feature.description,
-                    state.row == row,
-                    if feature.required || state.middleware.enabled(&feature.id) {
-                        "[x]"
-                    } else {
-                        "[ ]"
-                    },
-                    layout,
-                );
-                row += 1;
-                for setting in &feature.settings {
-                    let (value, role) =
-                        middleware_setting_value(&state.middleware, &feature.id, setting);
-                    setting_choice(
-                        lines,
-                        &setting.label,
-                        &value,
-                        role,
-                        &setting.description,
-                        state.row == row,
-                        layout,
-                    );
-                    row += 1;
+            for row in 0..state.middleware_row_count() {
+                match state
+                    .middleware_row(row)
+                    .expect("visible agent rows have a catalog entry")
+                {
+                    MiddlewareRow::Feature(feature_index) => {
+                        let feature = &state.features[feature_index];
+                        let disclosure = if !state.feature_has_children(feature_index) {
+                            ""
+                        } else if state.expanded_features.contains(&feature.id) {
+                            " ▾"
+                        } else {
+                            " ▸"
+                        };
+                        agent_choice(
+                            lines,
+                            &format!("{}{disclosure}", feature.label),
+                            &feature.description,
+                            state.row == row,
+                            if feature.required || state.middleware.enabled(&feature.id) {
+                                "[x]"
+                            } else {
+                                "[ ]"
+                            },
+                            layout,
+                        );
+                    }
+                    MiddlewareRow::Setting { feature, setting } => {
+                        let feature = &state.features[feature];
+                        let setting = &feature.settings[setting];
+                        let (value, role) =
+                            middleware_setting_value(&state.middleware, &feature.id, setting);
+                        setting_choice(
+                            lines,
+                            &setting.label,
+                            &value,
+                            role,
+                            &setting.description,
+                            state.row == row,
+                            layout,
+                        );
+                    }
+                    MiddlewareRow::Extension { extension, .. } => {
+                        let extension = &state.available_extensions[extension];
+                        let version = extension
+                            .version
+                            .as_deref()
+                            .map_or(String::new(), |version| format!(" · {version}"));
+                        let hooks = if !extension.hooks.is_empty() && !extension.hooks_trusted {
+                            " · hooks disabled until trusted"
+                        } else {
+                            ""
+                        };
+                        extension_choice(
+                            lines,
+                            &extension.name,
+                            &format!(
+                                "{}{}{} · {}",
+                                extension_kind(extension.kind),
+                                version,
+                                hooks,
+                                extension.description
+                            ),
+                            state.row == row,
+                            if state.selected_extensions.contains(&extension.id) {
+                                "[x]"
+                            } else {
+                                "[ ]"
+                            },
+                            layout,
+                        );
+                    }
                 }
             }
             render_apply_actions(lines, state, state.agent_action_start(), Some(layout));
@@ -391,12 +435,22 @@ pub(super) fn agent_layout(state: &SetupState, width: usize) -> AgentLayout {
         .map(|feature| 6 + display_width(&terminal_text(&feature.label)))
         .max()
         .unwrap_or(0);
+    let extension_end = state
+        .available_extensions
+        .iter()
+        .map(|extension| 10 + display_width(&terminal_text(&extension.name)))
+        .max()
+        .unwrap_or(0);
     let action_end = if state.default_only {
         6 + display_width(SAVE_DEFAULT_LABEL)
     } else {
         6 + display_width(CHANGE_CHAT_LABEL).max(display_width(SAVE_DEFAULT_LABEL))
     };
-    let description_column = setting_end.max(feature_end).max(action_end) + 2;
+    let description_column = setting_end
+        .max(feature_end)
+        .max(extension_end)
+        .max(action_end)
+        + 2;
 
     AgentLayout {
         width,
@@ -491,6 +545,39 @@ pub(super) fn agent_choice(
         focused,
         layout,
     );
+}
+
+pub(super) fn extension_choice(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    description: &str,
+    focused: bool,
+    marker: &str,
+    layout: AgentLayout,
+) {
+    let role = if focused { Role::Selection } else { Role::Text };
+    push_described_row(
+        lines,
+        vec![Span::styled(
+            format!(
+                "{}     {:3} {}",
+                if focused { "›" } else { " " },
+                marker,
+                terminal_text(label)
+            ),
+            current().style(role),
+        )],
+        description,
+        focused,
+        layout,
+    );
+}
+
+const fn extension_kind(kind: ExtensionKind) -> &'static str {
+    match kind {
+        ExtensionKind::Skill => "skill",
+        ExtensionKind::Plugin => "plugin",
+    }
 }
 
 pub(super) fn push_described_row(
@@ -695,7 +782,9 @@ pub(super) fn footer(state: &SetupState) -> &'static str {
         }
         Page::Authentication => "  enter continue · esc back",
         Page::Models => "  ↑↓ move · space select · enter activate · esc back",
-        Page::Agent => "  ↑↓ move · space/←→ change · enter activate · esc cancel",
+        Page::Agent => {
+            "  ↑↓ move · space change · ←→ close/open/adjust · enter open/apply · esc cancel"
+        }
     }
 }
 

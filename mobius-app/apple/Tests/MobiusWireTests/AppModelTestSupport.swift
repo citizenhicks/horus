@@ -182,7 +182,7 @@ final class AppModelTests: XCTestCase {
                 webSearch: .cached
             ),
             middleware: MiddlewareConfig(
-                enabled: ["skills", "subagents"],
+                enabled: ["extensions", "subagents"],
                 settings: [
                     "context_offloading": ["stale_after_tokens": .integer(50_000)],
                     "subagents": [
@@ -190,6 +190,7 @@ final class AppModelTests: XCTestCase {
                     ]
                 ]
             ),
+            extensions: [],
             systemPrompt: systemPrompt,
             maxModelSteps: 256
         )
@@ -220,7 +221,9 @@ final class AppModelTests: XCTestCase {
 
     func ready(
         defaultConfig: VersionedAgentConfig,
-        sessions: [SessionRecord]? = nil
+        sessions: [SessionRecord]? = nil,
+        extensions: [ExtensionRecord] = [],
+        contributions: [FrontendContribution] = []
     ) -> ReadyPayload {
         ReadyPayload(
             machineName: "snowwhite.local",
@@ -230,7 +233,33 @@ final class AppModelTests: XCTestCase {
             models: [],
             modelProviders: [:],
             middlewareFeatures: [],
+            extensions: extensions,
+            contributions: contributions,
             maxActiveSessions: 4
+        )
+    }
+
+    func extensionRecord(hooksTrusted: Bool = true) -> ExtensionRecord {
+        ExtensionRecord(
+            id: "plugin:ponytail",
+            capability: "extensions",
+            kind: .plugin,
+            name: "ponytail",
+            description: "Minimal coding guidance.",
+            version: "4.9.0",
+            source: "https://github.com/DietrichGebert/ponytail.git",
+            reference: "main",
+            subdirectory: nil,
+            resolvedRevision: "0123456789abcdef",
+            digest: "abcdef0123456789",
+            skills: ["ponytail"],
+            hooks: [ExtensionHookRecord(
+                event: "pre_tool_use",
+                matcher: "shell",
+                command: "bin/review",
+                timeoutSeconds: 10
+            )],
+            hooksTrusted: hooksTrusted
         )
     }
 

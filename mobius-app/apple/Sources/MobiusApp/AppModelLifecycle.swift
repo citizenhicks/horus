@@ -11,8 +11,6 @@ extension AppModel {
         activeSessionFileUpload = nil
         sessionUploadsRequestID = nil
         isLoadingSessionUploads = false
-        artifactListRequestID = nil
-        isLoadingArtifacts = false
         gitDiffRequestID = nil
         isLoadingGitDiff = false
         stagedGitDiffRequestID = nil
@@ -133,8 +131,6 @@ extension AppModel {
             isLoadingWorkspaceFiles = false
             sessionUploadsRequestID = nil
             isLoadingSessionUploads = false
-            artifactListRequestID = nil
-            isLoadingArtifacts = false
             sessionFileUploadRequests.removeAll()
             activeSessionFileUpload = nil
             discardFilePresentation()
@@ -156,6 +152,8 @@ extension AppModel {
             modelChoices = []
             modelProviders = [:]
             middlewareFeatures = []
+            extensions = []
+            gatewayContributions = []
             providerStatuses = []
             defaultAgentSnapshot = nil
             defaultAgentDraft = nil
@@ -165,9 +163,11 @@ extension AppModel {
         providerModelIDsText = ""
         providerReasoningEffortsText = ""
         providerActionState = .idle
+        extensionAction = nil
         credentialRequestID = nil
         providerLoginRequestID = nil
         providerRegistrationRequestID = nil
+        extensionRequestID = nil
         pairingCodeRequestID = nil
         pairingCodeExpiryTask?.cancel()
         pairingCodeExpiryTask = nil
@@ -202,10 +202,6 @@ extension AppModel {
         sessionUploads = []
         sessionUploadsRequestID = nil
         isLoadingSessionUploads = false
-        artifacts = []
-        artifactsTruncated = false
-        artifactListRequestID = nil
-        isLoadingArtifacts = false
         sessionFileUploadRequests.removeAll()
         activeSessionFileUpload = nil
         discardFilePresentation()

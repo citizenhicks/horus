@@ -26,6 +26,130 @@ private struct ImportedMediaFile: Transferable {
     }
 }
 
+private struct ComposerSettingItem: Identifiable {
+    let feature: MiddlewareFeature
+    let setting: FrontendSetting
+    let options: [FrontendSettingOption]
+    let unsetLabel: String?
+
+    var id: String { "\(feature.id)\u{0}\(setting.id)" }
+}
+
+private struct ComposerSettingMenu: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.mobiusPalette) private var palette
+    @State private var pendingDestructiveOption: FrontendSettingOption?
+    let item: ComposerSettingItem
+
+    var body: some View {
+        Menu {
+            Picker(item.setting.label, selection: selection) {
+                if let unsetLabel = item.unsetLabel {
+                    Text(unsetLabel).tag(String?.none)
+                }
+                ForEach(item.options) { option in
+                    Text(option.label).tag(Optional(option.value))
+                }
+            }
+            .labelsHidden()
+        } label: {
+            MobiusLabel(
+                title: selectedLabel,
+                glyph: selectedGlyph ?? .slidersHorizontal,
+                iconColor: palette.tone(selectedOption?.tone ?? "neutral"),
+                iconSize: MobiusStyle.glyphLead
+            )
+            .labelStyle(.iconOnly)
+            .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.mobiusPlain)
+        .sensoryFeedback(.selection, trigger: selectedValue)
+        .disabled(!isEnabled)
+        .help(selectedLabel)
+        .accessibilityLabel(item.setting.label)
+        .accessibilityValue(selectedLabel)
+        .confirmationDialog(
+            pendingDestructiveOption.map { "Enable \($0.label)?" } ?? "Confirm setting",
+            isPresented: destructiveConfirmationPresented,
+            titleVisibility: .visible,
+            presenting: pendingDestructiveOption
+        ) { option in
+            Button("Enable \(option.label)", role: .destructive) {
+                apply(option.value)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { option in
+            Text(option.description)
+        }
+    }
+
+    private var selection: Binding<String?> {
+        Binding {
+            selectedValue
+        } set: { value in
+            guard let value,
+                  let option = item.options.first(where: { $0.value == value })
+            else {
+                apply(nil)
+                return
+            }
+            if option.tone == "error", value != selectedValue {
+                pendingDestructiveOption = option
+            } else {
+                apply(value)
+            }
+        }
+    }
+
+    private var selectedValue: String? {
+        guard let configured = model.agentDraft?
+            .middleware.settings[item.feature.id]?[item.setting.id],
+              case .string(let value) = configured
+        else { return nil }
+        return value
+    }
+
+    private var selectedOption: FrontendSettingOption? {
+        item.options.first { $0.value == selectedValue }
+    }
+
+    private var selectedLabel: String {
+        selectedOption?.label ?? item.unsetLabel ?? item.setting.label
+    }
+
+    private var selectedGlyph: MobiusGlyph? {
+        selectedOption?.symbol.flatMap(MobiusSymbol.knownGlyph(for:))
+    }
+
+    private var isEnabled: Bool {
+        model.connectionState.isReady
+            && model.selectedSessionID != nil
+            && model.activeTurnID == nil
+            && !model.isApplyingConfiguration
+            && model.agentDraft != nil
+            && (item.feature.required
+                || model.agentDraft?.middleware.enabled.contains(item.feature.id) == true)
+    }
+
+    private var destructiveConfirmationPresented: Binding<Bool> {
+        Binding {
+            pendingDestructiveOption != nil
+        } set: { isPresented in
+            if !isPresented { pendingDestructiveOption = nil }
+        }
+    }
+
+    private func apply(_ value: String?) {
+        pendingDestructiveOption = nil
+        model.setAgentSettingForCurrentChat(
+            value.map(FrontendSettingValue.string),
+            middleware: item.feature.id,
+            setting: item.setting.id
+        )
+    }
+}
+
 struct ComposerOptionsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.mobiusPalette) private var palette
@@ -34,14 +158,15 @@ struct ComposerOptionsView: View {
     @State private var isFileImporterPresented = false
     @State private var isPhotoPickerPresented = false
     @State private var photoSelection: [PhotosPickerItem] = []
-    @State private var isFullAccessConfirmationPresented = false
 
     var body: some View {
         // The icon buttons already pad their own glyphs, so they need no spacing between
         // them: 44pt centres are the native rhythm, and anything more reads as drift.
         HStack(spacing: 0) {
             if model.attachmentsEnabled { addAttachmentControl }
-            approvalMenu
+            ForEach(composerSettings) { item in
+                ComposerSettingMenu(item: item)
+            }
             Spacer(minLength: MobiusSpace.s)
             modelMenu
             actionButtons
@@ -63,23 +188,6 @@ struct ComposerOptionsView: View {
             guard !items.isEmpty else { return }
             photoSelection = []
             Task { await importMedia(items) }
-        }
-        .confirmationDialog(
-            "Enable full access?",
-            isPresented: $isFullAccessConfirmationPresented,
-            titleVisibility: .visible
-        ) {
-            Button("Enable Full Access", role: .destructive) {
-                model.setApprovalPolicyForCurrentChat("full_access")
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(
-                "Shell commands run directly on the gateway host and can read, modify, or "
-                    + "delete files, use host services, and access the network without approval. "
-                    + "This includes möbius state, TLS credentials, and stored provider "
-                    + "credentials. File tools remain limited to the workspace."
-            )
         }
     }
 
@@ -130,34 +238,6 @@ struct ComposerOptionsView: View {
         .sensoryFeedback(.selection, trigger: model.selectedModelRoute)
         .accessibilityLabel("Model and reasoning")
         .accessibilityValue(modelLabel)
-    }
-
-    private var approvalMenu: some View {
-        Menu {
-            Picker("Approval policy", selection: approvalPickerSelection) {
-                ForEach(approvalOptions) { option in
-                    Text(option.label).tag(option.value)
-                }
-            }
-            .labelsHidden()
-        } label: {
-            MobiusLabel(
-                title: approvalLabel,
-                glyph: approvalGlyph,
-                iconColor: approvalForeground,
-                iconSize: MobiusStyle.glyphLead
-            )
-                .labelStyle(.iconOnly)
-                .foregroundStyle(approvalForeground)
-                .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.mobiusPlain)
-        .sensoryFeedback(.selection, trigger: approvalValue)
-        .disabled(model.agentDraft == nil || approvalOptions.isEmpty)
-        .help(approvalLabel)
-        .accessibilityLabel("Approval policy")
-        .accessibilityValue(approvalLabel)
     }
 
     @ViewBuilder
@@ -250,11 +330,7 @@ struct ComposerOptionsView: View {
                     .help(model.activeTurnID == nil ? "Send" : "Send steering message")
             }
         }
-        .labelStyle(.iconOnly)
-        .mobiusProminentButton()
-        .buttonBorderShape(.circle)
-        .controlSize(.regular)
-        .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
+        .mobiusProminentIconButton()
     }
 
     private func importFiles(_ result: Result<[URL], Error>) {
@@ -327,56 +403,19 @@ struct ComposerOptionsView: View {
         }
     }
 
-    private var approvalOptions: [FrontendSettingOption] {
-        guard let setting = model.middlewareFeatures
-            .first(where: { $0.id == "sandbox" })?
-            .settings.first(where: { $0.id == "approval_policy" }),
-              case .select(let options, _) = setting.kind
-        else { return [] }
-        return options
-    }
-
-    private var approvalValue: String? {
-        guard let value = model.agentDraft?
-            .middleware.settings["sandbox"]?["approval_policy"],
-              case .string(let policy) = value
-        else { return nil }
-        return policy
-    }
-
-    private var approvalPickerSelection: Binding<String> {
-        Binding {
-            approvalValue ?? ""
-        } set: { policy in
-            if policy == "full_access", approvalValue != "full_access" {
-                isFullAccessConfirmationPresented = true
-            } else {
-                model.setApprovalPolicyForCurrentChat(policy)
+    private var composerSettings: [ComposerSettingItem] {
+        model.middlewareFeatures.flatMap { feature in
+            feature.settings.compactMap { setting in
+                guard setting.composer,
+                      case .select(let options, let unsetLabel) = setting.kind
+                else { return nil }
+                return ComposerSettingItem(
+                    feature: feature,
+                    setting: setting,
+                    options: options,
+                    unsetLabel: unsetLabel
+                )
             }
-        }
-    }
-
-    private var approvalLabel: String {
-        approvalOptions.first(where: { $0.value == approvalValue })?.label ?? "Approval"
-    }
-
-    private var approvalGlyph: MobiusGlyph {
-        switch approvalValue {
-        case "ask": .shieldCheck
-        case "allow": .shield02
-        case "allow_network": .shieldAlert
-        case "auto_approve": .aiSecurity02
-        case "full_access": .shieldOff
-        default: .shieldCheck
-        }
-    }
-
-    private var approvalForeground: Color {
-        guard let approvalValue else { return palette.muted }
-        return switch approvalValue {
-        case "ask": palette.muted
-        case "full_access": palette.danger
-        default: palette.warning
         }
     }
 

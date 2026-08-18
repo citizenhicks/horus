@@ -333,9 +333,6 @@ extension AppModel {
         let block = rendered.block
         if block.format == "unified_diff", !block.pending {
             refreshWorkspaceChanges()
-            refreshArtifacts()
-        } else if !block.files.isEmpty, !block.pending {
-            refreshArtifacts()
         }
     }
 

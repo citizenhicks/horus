@@ -7,6 +7,7 @@ mod cloudflare;
 pub mod command;
 pub mod config;
 pub mod cron;
+mod extensions;
 mod host;
 mod middleware_manifest;
 pub mod sandbox;

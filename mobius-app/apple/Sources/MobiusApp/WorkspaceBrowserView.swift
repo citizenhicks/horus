@@ -107,13 +107,11 @@ private struct DirectoryBrowserHeader: View {
                     .font(MobiusStyle.controlFont)
                 Spacer()
                 Button("New folder", glyph: .folderPlus, action: onCreateFolder)
-                    .labelStyle(.iconOnly)
-                    .buttonStyle(MobiusIconButtonStyle())
+                    .mobiusIconButton()
                     .help("New folder")
                 if let parent {
                     Button("Parent folder", glyph: .arrowUp) { onParent(parent) }
-                        .labelStyle(.iconOnly)
-                        .buttonStyle(MobiusIconButtonStyle())
+                        .mobiusIconButton()
                         .help("Parent folder")
                 }
             }
@@ -121,13 +119,6 @@ private struct DirectoryBrowserHeader: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, MobiusSpace.l)
         .padding(.vertical, MobiusSpace.s)
-    }
-}
-
-struct FilesInspector: View {
-    var body: some View {
-        FilesView()
-            .inspectorColumnWidth(min: 320, ideal: 520, max: 840)
     }
 }
 
@@ -173,5 +164,23 @@ struct FrontendContributionPage: View {
     private var detail: String {
         if case .actionList? = widget.widget.content { return "" }
         return widget.widget.text == widget.title ? "" : widget.widget.text
+    }
+}
+
+struct ScratchpadView: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        if let widget = model.navigationWidgets.first(where: { $0.capability == "scratchpad" }) {
+            FrontendContributionPage(widget: widget)
+        } else {
+            MobiusUnavailable(
+                title: "Scratchpad unavailable",
+                glyph: .brain,
+                detail: "Open a chat to view its scratchpad."
+            )
+            .navigationTitle("Scratchpad")
+            .background(MobiusBackdrop())
+        }
     }
 }

@@ -10,7 +10,6 @@ use super::provider::ProviderBuildConfig;
 use super::provider::ProviderDefinition;
 use crate::Error;
 use crate::Result;
-use crate::protocol::FrontendSymbol;
 
 mod manifest {
     include!(concat!(
@@ -25,7 +24,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "deepseek",
         manifest::PROVIDER_LABEL,
-        FrontendSymbol::Deepseek,
+        "deepseek",
         manifest::PROVIDER_DESCRIPTION,
         ProviderAuth::ApiKey("DEEPSEEK_API_KEY"),
         manifest::MODELS,

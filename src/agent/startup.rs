@@ -166,6 +166,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             .unwrap_or_else(|| config.provider.clone())
     };
     let choice = config.select_model(&route)?;
+    let route = choice.route.clone();
     let model = crate::backend::model::ModelInfo {
         model: choice.model,
         reasoning_effort: choice.reasoning_effort,
@@ -177,7 +178,7 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         session_id: config.session_id.clone(),
         context: config.session_context.clone(),
         model: ModelChangedEvent {
-            route: config.provider.clone(),
+            route: route.clone(),
             model: model.model.clone(),
             reasoning_effort: model.reasoning_effort.clone(),
             model_context_window: Some(config.context_window),
@@ -193,7 +194,9 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
     let runtime = RuntimeContext {
         checkpoints: Arc::clone(&config.checkpoints),
         session_id: config.session_id.clone(),
-        model_route: config.provider.clone(),
+        model_route: route.clone(),
+        model: model.model.clone(),
+        approval_policy: config.sandbox.approval_policy(),
         session_context: config.session_context.clone(),
         metadata: config.metadata.clone(),
         role: config.role.clone(),
@@ -304,9 +307,8 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             Some(state.finish_execution(ExecutionOutcome::Aborted, unix_timestamp_ms()?)?);
         state_changed = true;
     }
-    let context_len = state.context.len();
     let start_source = initial_hook_source(is_new, state.sequence, &config.role);
-    config
+    let session_start = config
         .middleware
         .session_start(
             &runtime,
@@ -315,7 +317,8 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
             &mut state.context,
         )
         .await?;
-    state_changed |= state.context.len() != context_len;
+    state_changed |= session_start.input_changed;
+    let pending_session_start_stop = session_start.stop_reason;
     if let Some(execution) = &recovery_execution {
         let mut messages = Vec::new();
         if let Err(error) = config
@@ -432,6 +435,8 @@ pub async fn create_agent(mut config: AgentConfig) -> Result<Agent> {
         review_session_id: uuid::Uuid::new_v4().to_string(),
         transcript_delta: Vec::new(),
         deferred: VecDeque::new(),
+        pending_session_start_stop,
+        turn_end_turn_id: None,
         events: event_tx.clone(),
     };
     tokio::spawn(async move {

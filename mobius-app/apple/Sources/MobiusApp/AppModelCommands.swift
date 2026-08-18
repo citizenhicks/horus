@@ -627,23 +627,6 @@ extension AppModel {
         }
     }
 
-    func refreshChatFiles() {
-        refreshArtifacts()
-        refreshSessionUploads()
-    }
-
-    func refreshArtifacts() {
-        guard connectionState.isReady, let sessionID = selectedSessionID else { return }
-        let id = requestID("artifacts")
-        artifactListRequestID = id
-        isLoadingArtifacts = true
-        transmit(.listArtifacts(requestID: id, sessionID: sessionID)) { [weak self] _ in
-            guard self?.artifactListRequestID == id else { return }
-            self?.artifactListRequestID = nil
-            self?.isLoadingArtifacts = false
-        }
-    }
-
     func previewSessionFile(_ file: SessionFileReference) {
         downloadSessionFile(file, purpose: .preview)
     }

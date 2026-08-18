@@ -72,10 +72,13 @@ struct ChatsView: View {
                 .accessibilityElement(children: .combine)
             }
             if usesIPadLayout {
-                ToolbarItemGroup(placement: .primaryAction) {
+                ToolbarItem(placement: .primaryAction) {
                     organizationMenu
+                }
+                ToolbarItem(placement: .primaryAction) {
                     newChatButton
                 }
+                .sharedBackgroundVisibility(.hidden)
             } else {
                 ToolbarItem(placement: .primaryAction) {
                     organizationMenu
@@ -87,6 +90,7 @@ struct ChatsView: View {
                 ToolbarItem(placement: .bottomBar) {
                     newChatButton
                 }
+                .sharedBackgroundVisibility(.hidden)
             }
         }
         .searchable(text: $searchText, prompt: "Search chats")
@@ -108,10 +112,7 @@ struct ChatsView: View {
             } label: {
                 MobiusIcon(.notificationSquare)
             }
-            .buttonStyle(MobiusIconButtonStyle(
-                prominent: showsAttentionOnly,
-                bare: true
-            ))
+            .buttonStyle(MobiusIconButtonStyle(prominent: showsAttentionOnly, bare: true))
             .accessibilityLabel("Filter chats needing attention")
             .accessibilityValue(showsAttentionOnly ? "On" : "Off")
             .accessibilityAddTraits(showsAttentionOnly ? .isSelected : [])
@@ -150,13 +151,10 @@ struct ChatsView: View {
                 }
             }
         } label: {
-            MobiusIcon(.dotsThree, foreground: .primary)
-                .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
-                .contentShape(Rectangle())
+            MobiusLabel(title: "Organize chats", glyph: .dotsThree)
         }
-        .labelStyle(.titleAndIcon)
         .menuIndicator(.hidden)
-        .tint(.primary)
+        .mobiusIconButton()
         .accessibilityLabel("Organize chats")
         .accessibilityValue(organization.title)
         .help("Organize chats")
@@ -166,11 +164,7 @@ struct ChatsView: View {
         Button("New chat", glyph: .notePencil) {
             model.openNewSession()
         }
-        .labelStyle(.iconOnly)
-        .mobiusProminentButton()
-        .buttonBorderShape(.circle)
-        .controlSize(.large)
-        .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
+        .mobiusProminentIconButton()
         .disabled(!model.canCreateSession)
         .accessibilityHint("Choose a workspace for the new chat")
         .help("New chat")
@@ -206,7 +200,7 @@ struct ChatsView: View {
     private var emptyState: some View {
         VStack(spacing: MobiusSpace.m) {
             MobiusIcon(
-                .chatsCircle,
+                AppDestination.chats.glyph,
                 size: 32,
                 foreground: palette.muted,
                 gutter: false

@@ -206,6 +206,8 @@ async fn disabled_agent_keeps_read_only_surfaces_without_prompt_or_tools() {
         checkpoints: Arc::clone(&store.checkpoints),
         session_id: "session".into(),
         model_route: "model".into(),
+        model: "model".into(),
+        approval_policy: crate::backend::sandbox::ApprovalPolicy::Ask,
         session_context: crate::protocol::SessionContext::default(),
         metadata: Default::default(),
         role: crate::agent::AgentRole::Main,
@@ -231,6 +233,8 @@ async fn disabled_agent_keeps_read_only_surfaces_without_prompt_or_tools() {
         source: crate::middleware::SessionStartSource::Startup,
         queued_input: Default::default(),
         input: &mut input,
+        input_changed: false,
+        stop_reason: None,
     };
     middleware
         .session_start(&mut start)
@@ -311,6 +315,8 @@ fn runtime(store: &ScratchpadStore, session_id: &str) -> RuntimeContext {
         checkpoints: Arc::clone(&store.checkpoints),
         session_id: session_id.into(),
         model_route: "model".into(),
+        model: "model".into(),
+        approval_policy: crate::backend::sandbox::ApprovalPolicy::Ask,
         session_context: crate::protocol::SessionContext::default(),
         metadata: Default::default(),
         role: crate::agent::AgentRole::Main,
@@ -333,6 +339,8 @@ async fn new_session_seeds_one_bounded_baseline_projection() {
         source: crate::middleware::SessionStartSource::Startup,
         queued_input: Default::default(),
         input: &mut seeded,
+        input_changed: false,
+        stop_reason: None,
     };
     middleware
         .session_start(&mut start)
@@ -372,6 +380,8 @@ async fn startup_keeps_one_inherited_baseline_projection() {
         source: crate::middleware::SessionStartSource::Startup,
         queued_input: Default::default(),
         input: &mut input,
+        input_changed: false,
+        stop_reason: None,
     };
 
     middleware

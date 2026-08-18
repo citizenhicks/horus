@@ -34,6 +34,7 @@ pub(super) enum UiAction {
     Submit(Op),
     Gateway(GatewayAction),
     GatewaySettings,
+    Extensions,
     Setup {
         mode: SetupMode,
         provider: Option<String>,
@@ -568,6 +569,7 @@ impl TuiState {
                 }
                 CommandAction::Gateway(action) => UiAction::Gateway(action),
                 CommandAction::GatewaySettings => UiAction::GatewaySettings,
+                CommandAction::Extensions => UiAction::Extensions,
                 CommandAction::Setup { mode, provider } => UiAction::Setup { mode, provider },
                 CommandAction::Frontend(event) => {
                     self.handle_agent_event(EventMsg::Frontend(event), Vec::new());

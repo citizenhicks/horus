@@ -17,6 +17,7 @@ use super::input::UiAction;
 use super::view::render_preview;
 use crate::frontend::FrontendExit;
 use crate::frontend::catalog::UiCatalog;
+use crate::frontend::extensions;
 use crate::frontend::gateway;
 use crate::frontend::gateway_actions::{prepare, render_response};
 use crate::frontend::setup;
@@ -175,18 +176,6 @@ pub(in crate::frontend) async fn run(
                                     break 'ui;
                                 }
                             }
-                            ServerMessage::Artifacts {
-                                session_id: actual,
-                                artifacts,
-                                ..
-                            } if actual == session_id => {
-                                for artifact in artifacts {
-                                    state.apply_block(mobius::protocol::RenderedBlock {
-                                        capability: "artifacts".into(),
-                                        block: artifact.block,
-                                    });
-                                }
-                            }
                             message => {
                                 if let Some(message) = render_response(&message, &session_id) {
                                     state.push(message, TranscriptTone::Neutral);
@@ -268,7 +257,7 @@ pub(in crate::frontend) async fn run(
                                 state.push(error.to_string(), TranscriptTone::Error);
                             }
                         }
-                        UiAction::Gateway(action) => match prepare(action, &session_id) {
+                        UiAction::Gateway(action) => match prepare(action) {
                             Ok(message) => {
                                 if let Err(error) = sender.send(*message).await {
                                     state.push(error.to_string(), TranscriptTone::Error);
@@ -286,6 +275,21 @@ pub(in crate::frontend) async fn run(
                                 Err(error) => {
                                     state.push(error.to_string(), TranscriptTone::Error);
                                 }
+                            }
+                            dirty = true;
+                        }
+                        UiAction::Extensions => {
+                            let result = extensions::run(
+                                &mut terminal,
+                                &sender,
+                                &mut events,
+                                gateway,
+                            )
+                            .await;
+                            sync_gateway_models(&mut state, &mut catalog, gateway);
+                            sync_session(&mut state, session, gateway);
+                            if let Err(error) = result {
+                                state.push(error.to_string(), TranscriptTone::Error);
                             }
                             dirty = true;
                         }

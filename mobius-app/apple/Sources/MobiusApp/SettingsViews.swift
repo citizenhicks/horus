@@ -40,6 +40,106 @@ struct SettingsInfoButton: View {
     }
 }
 
+struct SettingsStatusAccessory: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.mobiusPalette) private var palette
+    @State private var showsStatus = false
+    @Namespace private var namespace
+    let subject: String
+    let hasChanges: Bool
+    let isSaving: Bool
+    let saveDisabled: Bool
+    let statusLabel: String
+    let statusDetail: String
+    let statusColor: Color
+    let saveLabel: String
+    var secondaryActionLabel: String?
+    var secondaryAction: (() -> Void)?
+    let save: () -> Void
+
+    var body: some View {
+        GlassEffectContainer(spacing: MobiusSpace.xxs) {
+            HStack(spacing: MobiusSpace.xxs) {
+                if hasChanges {
+                    saveButton
+                        .glassEffectID("\(subject)-save", in: namespace)
+                }
+                statusButton
+                    .glassEffectID("\(subject)-status", in: namespace)
+            }
+        }
+        .animation(
+            reduceMotion ? nil : .spring(response: 0.34, dampingFraction: 0.78),
+            value: hasChanges
+        )
+    }
+
+    private var statusButton: some View {
+        Button {
+            showsStatus = true
+        } label: {
+            Label {
+                Text("\(subject) status")
+            } icon: {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 8, height: 8)
+                    .symbolEffect(
+                        .pulse.byLayer,
+                        options: .repeat(.continuous),
+                        isActive: !reduceMotion
+                    )
+            }
+        }
+        .mobiusIconButton()
+        .accessibilityLabel("\(subject) status")
+        .accessibilityValue(statusLabel)
+        .help("\(subject): \(statusLabel)")
+        .popover(isPresented: $showsStatus) {
+            VStack(spacing: MobiusSpace.m) {
+                Text(statusLabel)
+                    .font(MobiusStyle.controlFont.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                Text(statusDetail)
+                    .font(MobiusStyle.bodyFont)
+                    .foregroundStyle(palette.muted)
+                if let secondaryActionLabel, let secondaryAction {
+                    Divider()
+                    Button(secondaryActionLabel) {
+                        showsStatus = false
+                        secondaryAction()
+                    }
+                }
+            }
+            .multilineTextAlignment(.center)
+            .padding(MobiusSpace.l)
+            .frame(width: 280)
+            .presentationCompactAdaptation(.popover)
+        }
+    }
+
+    private var saveButton: some View {
+        Button(action: save) {
+            Label {
+                Text(saveLabel)
+            } icon: {
+                Group {
+                    if isSaving {
+                        MobiusSpinner(size: MobiusStyle.iconSize, foreground: palette.onAccent)
+                    } else {
+                        MobiusIcon(.saveAll, size: MobiusStyle.iconSize, foreground: palette.onAccent)
+                    }
+                }
+            }
+        }
+        .mobiusProminentIconButton()
+        .disabled(saveDisabled)
+        .accessibilityLabel(saveLabel)
+        .help(saveLabel)
+        .sensoryFeedback(.success, trigger: hasChanges) { was, now in was && !now }
+    }
+}
+
 struct GatewayView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.mobiusPalette) private var palette
@@ -110,20 +210,25 @@ struct GatewayView: View {
                 LabeledContent("Wire protocol", value: "v\(gatewayProtocolVersion)")
             }
 
-            MobiusActionRow(collapsesToIcons: true) {
+            HStack(spacing: MobiusSpace.s) {
                 Button("Reconnect", glyph: .arrowClockwise, action: model.reconnect)
+                    .mobiusIconButton()
                 Button("Pair to self-hosted gateway", glyph: .plus) {
                     model.showsPairing = true
                 }
+                .mobiusIconButton()
                 Button("Rename", glyph: .pencilSimple) {
                     renameDraft = model.selectedAccount?.displayName ?? ""
                     showsRename = true
                 }
+                .mobiusIconButton()
                 .disabled(model.selectedAccount == nil)
                 Button("Forget", glyph: .trash, role: .destructive) {
                     confirmsForget = true
                 }
+                .mobiusIconButton()
             }
+            .frame(maxWidth: .infinity)
             .settingsStandaloneRow()
 
             Section("Pair another device") {
@@ -160,12 +265,12 @@ struct GatewayView: View {
                 MobiusCloudOfferButton()
             }
         }
-        .confirmationDialog(
+        .alert(
             "Forget this gateway?",
-            isPresented: $confirmsForget,
-            titleVisibility: .visible
+            isPresented: $confirmsForget
         ) {
             Button("Forget gateway", role: .destructive, action: model.forgetSelectedGateway)
+            Button("Cancel", role: .cancel) {}
         } message: {
             Text("You will need to pair with this gateway again.")
         }

@@ -31,8 +31,9 @@ struct AppShell: View {
                         .padding(MobiusSpace.xl)
                 } else {
                     shell
-                        .inspector(isPresented: $model.showsInspector) {
-                            FilesInspector()
+                        .sheet(isPresented: $model.showsInspector) {
+                            FilesView()
+                                .frame(idealWidth: 720, idealHeight: 720)
                                 .overlay(alignment: .top) {
                                     if horizontalSizeClass == .compact { AppToastOverlay() }
                                 }
@@ -193,9 +194,11 @@ struct AppShell: View {
                                 }
                             }
                         }
+                        .sharedBackgroundVisibility(.hidden)
                     }
                 }
         }
+        .id(model.destination)
     }
 
     private var iPadSidebarButton: some View {
@@ -227,7 +230,9 @@ struct AppShell: View {
         case .gateway: GatewayView()
         case .agent: AgentSettingsView(scope: .gatewayDefault)
         case .providers: ProvidersView()
+        case .extensions: ExtensionsView()
         case .cron: CronView()
+        case .scratchpad: ScratchpadView()
         case .profile: ProfileView()
         case .contribution(let id):
             if let widget = model.navigationWidgets.first(where: { $0.id == id }) {

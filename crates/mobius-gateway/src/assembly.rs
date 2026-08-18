@@ -20,11 +20,11 @@ use mobius::middleware::attachments::Attachments;
 use mobius::middleware::compaction::Compaction;
 use mobius::middleware::context_offloading::ContextOffloading;
 use mobius::middleware::cron::Cron;
+use mobius::middleware::extensions::{Extensions, MANIFEST as EXTENSIONS_MANIFEST};
 use mobius::middleware::instructions::Instructions;
 use mobius::middleware::scratchpad::{Scratchpad, ScratchpadStore};
 use mobius::middleware::session_files::SessionFileStore;
 use mobius::middleware::sessions::Sessions;
-use mobius::middleware::skills::Skills;
 use mobius::middleware::steering::Steering;
 use mobius::middleware::subagents::{SubagentLaunch, SubagentLauncher, Subagents};
 use mobius::middleware::tasks::Tasks;
@@ -37,6 +37,7 @@ use crate::config::{
     GatewayConfig, effective_reasoning_effort, local_user_name, model_route_id,
 };
 use crate::cron::CronStore;
+use crate::extensions::{ExtensionStore, ResolvedExtensions};
 use crate::middleware_manifest::{BuiltinMiddleware, MIDDLEWARE};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{
@@ -98,15 +99,44 @@ pub(crate) async fn assemble(
     } else {
         unavailable_models(&gateway_config, &chat.agent.config.provider)?
     };
-    let gateway_sandbox = Arc::new(GatewaySandbox::new(
-        &chat.workspace,
-        store.state_dir(),
-        gateway_config
-            .tls
-            .as_ref()
-            .map(|tls| tls.private_key.as_path()),
-        COMMAND_TIMEOUT,
-    )?);
+    let resolved_extensions =
+        ExtensionStore::new(store).resolve(&gateway_config, &chat.agent.config.extensions)?;
+    let extensions = (EXTENSIONS_MANIFEST.required
+        || chat.agent.config.middleware.enabled(EXTENSIONS_MANIFEST.id))
+    .then(|| {
+        Extensions::discover_installed(
+            [
+                chat.workspace.join(".agents/skills"),
+                chat.workspace.join(".codex/skills"),
+            ]
+            .into_iter()
+            .chain(resolved_extensions.skill_roots.iter().cloned()),
+        )
+    })
+    .transpose()?;
+    let mut read_roots = extensions
+        .as_ref()
+        .map_or_else(Vec::new, Extensions::resource_roots);
+    if extensions.is_some() {
+        read_roots.extend(
+            resolved_extensions
+                .plugins
+                .iter()
+                .map(|plugin| plugin.root.clone()),
+        );
+    }
+    let gateway_sandbox = Arc::new(
+        GatewaySandbox::new(
+            &chat.workspace,
+            store.state_dir(),
+            gateway_config
+                .tls
+                .as_ref()
+                .map(|tls| tls.private_key.as_path()),
+            COMMAND_TIMEOUT,
+        )?
+        .allow_read_roots(read_roots)?,
+    );
     let backend: Arc<dyn SandboxBackend> = gateway_sandbox.clone();
     let model_choices = models.choices().cloned().collect::<Vec<_>>();
     crate::middleware_manifest::validate_choices(&chat.agent.config.middleware, &model_choices)?;
@@ -134,13 +164,18 @@ pub(crate) async fn assemble(
     )? {
         reviewer = reviewer.model_route(route)?;
     }
-    let sandbox = Arc::new(Sandbox::new(backend, approval_policy).approval_reviewer(reviewer));
+    let sandbox =
+        Arc::new(Sandbox::new(Arc::clone(&backend), approval_policy).approval_reviewer(reviewer));
     let (middleware, template) = build_middleware(
         &chat.agent.config.middleware,
         &chat.workspace,
+        Arc::clone(&gateway),
         cron,
         scratchpad,
         session_files,
+        backend,
+        &resolved_extensions,
+        extensions,
     )?;
     let mut metadata = match session_id.as_deref() {
         Some(session_id) => checkpoints
@@ -233,19 +268,14 @@ pub(crate) fn provider_statuses(
         .iter()
         .map(|definition| {
             let configured_provider = gateway.configured_providers.get(definition.id()).cloned();
-            let configured = if configured_provider.as_ref().is_some_and(|configured| {
-                configured.selection.endpoint_auth == ProviderEndpointAuth::Credentialless
-            }) {
-                true
+            let configured = if let Some(configured) = &configured_provider {
+                credential_is_configured(&configured.selection, store, credentials)?
             } else {
                 match definition.auth() {
                     ProviderAuth::ApiKey(default_env) => {
                         credentials.configured(definition.id())?
-                            || (configured_provider.as_ref().is_none_or(|configured| {
-                                definition
-                                    .uses_default_endpoint(configured.selection.base_url.as_deref())
-                            }) && std::env::var(default_env)
-                                .is_ok_and(|value| !value.trim().is_empty()))
+                            || std::env::var(default_env)
+                                .is_ok_and(|value| !value.trim().is_empty())
                     }
                     ProviderAuth::Browser(auth) => auth.configured(&store.provider_auth_path())?,
                 }
@@ -438,7 +468,7 @@ fn provider_status(
     ProviderStatus {
         provider: definition.id().into(),
         label: definition.label().into(),
-        symbol: definition.symbol().clone(),
+        symbol: definition.symbol(),
         description: definition.description().into(),
         configured,
         selection,
@@ -732,12 +762,20 @@ fn unavailable_models(
     Ok((Arc::new(router), context_window))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the headless composition root keeps middleware dependencies explicit"
+)]
 fn build_middleware(
     settings: &MiddlewareConfig,
     workspace: &std::path::Path,
+    gateway: Arc<Mutex<GatewayConfig>>,
     cron: Arc<CronStore>,
     scratchpad: ScratchpadStore,
     session_files: SessionFileStore,
+    backend: Arc<dyn SandboxBackend>,
+    resolved_extensions: &ResolvedExtensions,
+    mut extensions: Option<Extensions>,
 ) -> Result<(MiddlewareStack, Option<Arc<OnceLock<AgentConfig>>>)> {
     let mut entries: Vec<Arc<dyn Middleware>> = Vec::new();
     let mut subagent_template = None;
@@ -765,10 +803,19 @@ fn build_middleware(
             BuiltinMiddleware::Scratchpad => Arc::new(
                 Scratchpad::new(scratchpad.clone()).agent_enabled(settings.enabled("scratchpad")),
             ),
-            BuiltinMiddleware::Skills => Arc::new(Skills::discover_installed([
-                workspace.join(".agents/skills"),
-                workspace.join(".codex/skills"),
-            ])?),
+            BuiltinMiddleware::Extensions => Arc::new(
+                extensions
+                    .take()
+                    .ok_or_else(|| Error::Config("extensions were not discovered".into()))?
+                    .activate_plugins(
+                        resolved_extensions
+                            .plugins
+                            .iter()
+                            .map(|plugin| plugin.activation(Arc::clone(&gateway))),
+                        workspace,
+                        Arc::clone(&backend),
+                    )?,
+            ),
             BuiltinMiddleware::Tasks => Arc::new(Tasks),
             BuiltinMiddleware::Subagents => {
                 let template = Arc::new(OnceLock::<AgentConfig>::new());

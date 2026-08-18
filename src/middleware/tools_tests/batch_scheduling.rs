@@ -350,18 +350,24 @@ async fn unknown_tools_form_barriers_and_keep_their_error() {
                 name: "parallel".into(),
                 output: "p1".into(),
                 is_error: false,
+                handler_executed: true,
+                additional_input: Vec::new(),
             },
             ToolResult {
                 call_id: "missing-call".into(),
                 name: "missing".into(),
                 output: "unknown tool `missing`".into(),
                 is_error: true,
+                handler_executed: false,
+                additional_input: Vec::new(),
             },
             ToolResult {
                 call_id: "p2".into(),
                 name: "parallel".into(),
                 output: "p2".into(),
                 is_error: false,
+                handler_executed: true,
+                additional_input: Vec::new(),
             },
         ]
     );

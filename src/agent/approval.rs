@@ -29,9 +29,9 @@ use crate::backend::sandbox::ApprovalStrictness;
 use crate::backend::sandbox::SandboxApprovalRequest;
 use crate::backend::sandbox::SandboxPermissions;
 use crate::backend::sandbox::SandboxReview;
+use crate::middleware::PermissionRequestContext;
 use crate::middleware::QueuedInputBaseline;
 use crate::middleware::tools::ToolResult;
-use crate::middleware::{PermissionDecision, PermissionRequestContext};
 use crate::protocol::ApprovalCall;
 use crate::protocol::ApprovalReviewEscalation;
 use crate::protocol::ApprovalReviewStatus;
@@ -243,14 +243,16 @@ impl Runner {
         mut leading_events: Vec<Event>,
     ) -> Result<Option<Vec<ToolResult>>> {
         validate_approval_selection(&calls, &request.call_ids)?;
+        let mut hook_events = Vec::new();
         let decision = {
             let mut context = PermissionRequestContext {
-                session_id: &self.config.session_id,
-                turn_id,
+                turn: self.runtime.turn_identity(turn_id),
                 calls: &calls,
                 requested_call_ids: &request.call_ids,
                 reason: &request.reason,
-                decision: PermissionDecision::Defer,
+                events: &mut hook_events,
+                tools: &self.catalog,
+                decision: None,
             };
             self.config
                 .middleware
@@ -258,7 +260,11 @@ impl Runner {
                 .await?;
             context.decision
         };
-        if !matches!(&decision, PermissionDecision::Defer) && !leading_events.is_empty() {
+        leading_events.extend(hook_events.into_iter().map(|msg| Event {
+            submission_id: Some(submission_id.into()),
+            msg,
+        }));
+        if decision.is_some() && !leading_events.is_empty() {
             self.persist_with_events(std::mem::take(&mut leading_events), None)
                 .await?;
         }
@@ -275,27 +281,11 @@ impl Runner {
             decision_received: false,
         };
         match decision {
-            PermissionDecision::Allow => {
-                self.apply_approval(
-                    commands,
-                    &pending,
-                    ReviewDecision::Approved,
-                    permissions,
-                    submission_id,
-                )
-                .await
+            Some(decision) => {
+                self.apply_approval(commands, &pending, decision, permissions, submission_id)
+                    .await
             }
-            PermissionDecision::Deny(rejection) => {
-                self.apply_approval(
-                    commands,
-                    &pending,
-                    ReviewDecision::Denied { rejection },
-                    permissions,
-                    submission_id,
-                )
-                .await
-            }
-            PermissionDecision::Defer => {
+            None => {
                 self.state.pending_approval = Some(pending.clone());
                 leading_events.push(approval_event(&pending));
                 self.persist_with_events(leading_events, None).await?;

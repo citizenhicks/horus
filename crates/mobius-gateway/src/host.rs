@@ -1,6 +1,7 @@
 //! Per-chat agent ownership, event sequencing, replay, and authenticated operations.
 
 mod catalog;
+mod extensions;
 mod files;
 mod git;
 mod profile;
@@ -22,13 +23,12 @@ use mobius::backend::checkpoint::{
 };
 use mobius::backend::model::ModelRouter;
 use mobius::backend::model::provider::provider;
-use mobius::middleware::FrontendExtensions;
 use mobius::middleware::scratchpad::ScratchpadStore;
 use mobius::middleware::session_files::SessionFileStore;
+use mobius::middleware::{FrontendExtensions, Middleware as _};
 use mobius::protocol::{
-    Event, EventMsg, FrontendBlock, FrontendBlockFormat, FrontendBlockRole, FrontendBlockState,
-    FrontendBlockUpdate, FrontendEvent, FrontendPreviewEvent, ModelStepOutcome, Op, RenderedBlock,
-    ReviewDecision, SessionFileReference, Submission,
+    Event, EventMsg, FrontendContribution, FrontendEvent, FrontendPreviewEvent, ModelStepOutcome,
+    Op, RenderedBlock, ReviewDecision, Submission,
 };
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use uuid::Uuid;
@@ -42,13 +42,14 @@ use crate::config::{
     create_workspace_directory as create_workspace_directory_on_disk,
 };
 use crate::cron::{ActiveCronRun, BeginRun, CronStore};
+use crate::extensions::ExtensionStore;
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{
-    AgentComposition, ArtifactKind, ArtifactRecord, CronRunStatus, GitDiffScope, MAX_FRAME_BYTES,
-    ProfileSnapshot, ProviderConfig, ReadyPayload, RecordedEvent, RenderedEvent, RenderedPreview,
-    RunStats, RunSummary, ServerFrame, ServerMessage, SessionActivity, SessionActivityState,
-    SessionOutcome, SessionReadyPayload, SessionRecord, SessionRunGroup, SessionWidget,
-    VersionedAgentConfig, WorkspaceFileScope, validate_session_id,
+    AgentComposition, CronRunStatus, GitDiffScope, MAX_FRAME_BYTES, ProfileSnapshot,
+    ProviderConfig, ReadyPayload, RecordedEvent, RenderedEvent, RenderedPreview, RunStats,
+    RunSummary, ServerFrame, ServerMessage, SessionActivity, SessionActivityState, SessionOutcome,
+    SessionReadyPayload, SessionRecord, SessionRunGroup, SessionWidget, VersionedAgentConfig,
+    WorkspaceFileScope, validate_session_id,
 };
 use crate::{Error, Result};
 
@@ -72,7 +73,6 @@ const BROADCAST_CAPACITY: usize = 512;
 const REPLAY_CAPACITY: usize = 1024;
 const REPLAY_LOAD_PAGE_SIZE: usize = 8;
 const MAX_REPLAY_BYTES: usize = MAX_FRAME_BYTES;
-const ARTIFACT_CAPACITY: usize = 256;
 const SESSION_PAGE_SIZE: usize = 100;
 const RECENT_RUN_LIMIT: usize = 30;
 pub(crate) const MAX_ACTIVE_SESSIONS: usize = 32;
@@ -94,9 +94,11 @@ struct GatewayState {
     checkpoints: Arc<dyn CheckpointStore>,
     scratchpad: ScratchpadStore,
     session_files: SessionFileStore,
+    contributions: Vec<FrontendContribution>,
     // ponytail: one lock is enough for at most 32 tiny catalog writes.
     catalog_lock: Arc<Mutex<()>>,
     session_mutations: Arc<RwLock<()>>,
+    extension_mutations: Arc<Mutex<()>>,
     provider_epoch: Arc<AtomicU64>,
     activities: SessionActivities,
     provider_login: Arc<StdMutex<Option<String>>>,
@@ -127,6 +129,11 @@ impl GatewayHost {
         credentials: Arc<CredentialStore>,
         cron: Arc<CronStore>,
     ) -> Result<Self> {
+        let extensions = ExtensionStore::new(&store);
+        extensions.prune(&config)?;
+        extensions.verify_installed_snapshots(&config)?;
+        let contributions =
+            vec![mobius::middleware::extensions::Extensions::discover_installed([])?.frontend()];
         let checkpoints: Arc<dyn CheckpointStore> =
             Arc::new(SqliteCheckpoint::new(store.checkpoints_path())?);
         let scratchpad = ScratchpadStore::new(Arc::clone(&checkpoints));
@@ -141,8 +148,10 @@ impl GatewayHost {
                 checkpoints,
                 scratchpad,
                 session_files,
+                contributions,
                 catalog_lock: Arc::new(Mutex::new(())),
                 session_mutations: Arc::new(RwLock::new(())),
+                extension_mutations: Arc::new(Mutex::new(())),
                 provider_epoch: Arc::new(AtomicU64::new(0)),
                 activities: Arc::new(StdMutex::new(HashMap::new())),
                 provider_login: Arc::new(StdMutex::new(None)),

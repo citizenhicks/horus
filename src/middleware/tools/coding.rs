@@ -4,8 +4,8 @@ use serde_json::Value;
 
 use super::patch::{apply_patch_document, parse_patch_document};
 use super::{
-    ApprovalRequirement, ExecutionMode, MAX_MUTATION_BYTES, MAX_TOOL_OUTPUT_BYTES, Tool,
-    ToolContext, text,
+    ApprovalRequirement, ExecutionMode, HookIdentity, MAX_MUTATION_BYTES, MAX_TOOL_OUTPUT_BYTES,
+    Tool, ToolContext, text,
 };
 use crate::backend::model::ToolDefinition;
 use crate::{BoxFuture, Error, Result};
@@ -122,6 +122,27 @@ impl Tool for ApplyPatch {
 
     fn approval(&self) -> ApprovalRequirement {
         ApprovalRequirement::Always
+    }
+
+    fn hook_identity(&self) -> Option<HookIdentity> {
+        Some(HookIdentity {
+            name: "apply_patch",
+            subjects: &["apply_patch", "Edit", "Write"],
+        })
+    }
+
+    fn hook_input(&self, arguments: &Value) -> Value {
+        serde_json::json!({
+            "command": arguments.get("patch").cloned().unwrap_or(Value::Null)
+        })
+    }
+
+    fn rewrite_hook_input(&self, input: Value) -> Result<Value> {
+        let command = input
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Config("hook tool rewrite requires `command`".into()))?;
+        Ok(serde_json::json!({"patch": command}))
     }
 
     fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {

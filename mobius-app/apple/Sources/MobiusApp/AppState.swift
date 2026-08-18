@@ -1,12 +1,14 @@
 import Foundation
 import LocalAuthentication
 
-enum AppDestination: Equatable {
+enum AppDestination: Hashable {
     case chats
     case gateway
     case agent
     case providers
+    case extensions
     case cron
+    case scratchpad
     case profile
     case contribution(String)
 
@@ -16,7 +18,9 @@ enum AppDestination: Equatable {
         case .gateway: .cellTower
         case .agent: .slidersHorizontal
         case .providers: .plugsConnected
+        case .extensions: .squaresFour
         case .cron: .calendarDots
+        case .scratchpad: .brain
         case .profile: .gear
         case .contribution: .squaresFour
         }
@@ -76,6 +80,14 @@ enum ProviderActionState: Equatable {
     case deviceCode(provider: String, url: String, code: String)
     case loginFinished(String)
     case failed(String)
+}
+
+enum ExtensionAction: Equatable {
+    case installing
+    case updating(String)
+    case uninstalling(String)
+    case trusting(String)
+    case untrusting(String)
 }
 
 enum ToastTone: Equatable {

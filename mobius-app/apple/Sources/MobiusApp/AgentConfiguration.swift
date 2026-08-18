@@ -20,6 +20,7 @@ func refreshedAgentDraft(
 struct AgentComposition: Codable, Equatable, Sendable {
     var provider: ProviderConfig
     var middleware: MiddlewareConfig
+    var extensions: Set<String>
     var systemPrompt: String
     var maxModelSteps: UInt64
 }
@@ -28,6 +29,7 @@ extension AgentComposition {
     private enum CodingKeys: String, CodingKey {
         case provider
         case middleware
+        case extensions
         case systemPrompt
         case maxModelSteps
     }
@@ -45,10 +47,40 @@ extension AgentComposition {
         self.init(
             provider: try container.decode(ProviderConfig.self, forKey: .provider),
             middleware: try container.decode(MiddlewareConfig.self, forKey: .middleware),
+            extensions: try container.decode(Set<String>.self, forKey: .extensions),
             systemPrompt: try container.decode(String.self, forKey: .systemPrompt),
             maxModelSteps: maxModelSteps
         )
     }
+}
+
+enum ExtensionKind: String, Decodable, Equatable, Sendable {
+    case skill
+    case plugin
+}
+
+struct ExtensionHookRecord: Decodable, Equatable, Hashable, Sendable {
+    let event: String
+    let matcher: String?
+    let command: String
+    let timeoutSeconds: UInt64
+}
+
+struct ExtensionRecord: Identifiable, Decodable, Equatable, Sendable {
+    let id: String
+    let capability: String
+    let kind: ExtensionKind
+    let name: String
+    let description: String
+    let version: String?
+    let source: String
+    let reference: String?
+    let subdirectory: String?
+    let resolvedRevision: String
+    let digest: String
+    let skills: [String]
+    let hooks: [ExtensionHookRecord]
+    let hooksTrusted: Bool
 }
 
 struct ProviderConfig: Codable, Equatable, Sendable {
@@ -135,17 +167,25 @@ struct FrontendSetting: Identifiable, Decodable, Equatable, Sendable {
     let id: String
     let label: String
     let description: String
+    let composer: Bool
     let kind: FrontendSettingKind
 
-    init(id: String, label: String, description: String, kind: FrontendSettingKind) {
+    init(
+        id: String,
+        label: String,
+        description: String,
+        composer: Bool = false,
+        kind: FrontendSettingKind
+    ) {
         self.id = id
         self.label = label
         self.description = description
+        self.composer = composer
         self.kind = kind
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, label, description, type, min, max, step, options, unsetLabel
+        case id, label, description, composer, type, min, max, step, options, unsetLabel
     }
 
     private enum Kind: String, Decodable {
@@ -158,6 +198,7 @@ struct FrontendSetting: Identifiable, Decodable, Equatable, Sendable {
         id = try container.decode(String.self, forKey: .id)
         label = try container.decode(String.self, forKey: .label)
         description = try container.decode(String.self, forKey: .description)
+        composer = try container.decode(Bool.self, forKey: .composer)
         switch try container.decode(Kind.self, forKey: .type) {
         case .integer:
             let minimum = try container.decode(Int64.self, forKey: .min)
@@ -204,6 +245,24 @@ struct FrontendSettingOption: Identifiable, Decodable, Equatable, Sendable {
     let value: String
     let label: String
     let description: String
+    let symbol: String?
+    let tone: String
+
+    private enum CodingKeys: String, CodingKey {
+        case value, label, description, symbol, tone
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        value = try container.decode(String.self, forKey: .value)
+        label = try container.decode(String.self, forKey: .label)
+        description = try container.decode(String.self, forKey: .description)
+        symbol = try container.decodeIfPresent(String.self, forKey: .symbol)
+        tone = try container.decode(String.self, forKey: .tone)
+        guard ["neutral", "success", "warning", "error"].contains(tone) else {
+            throw GatewayWireError.invalidFrame("frontend setting option has an unknown tone")
+        }
+    }
 }
 
 struct ProviderStatus: Identifiable, Codable, Equatable, Sendable {
@@ -331,23 +390,6 @@ struct DailyUsage: Codable, Equatable, Sendable {
     let unixDay: UInt64
     let provider: String
     let usage: TokenUsage
-}
-
-struct ArtifactRecord: Identifiable, Codable, Equatable, Sendable {
-    let id: String
-    let sessionId: String
-    let kind: ArtifactKind
-    let title: String
-    let block: FrontendBlock
-
-    var file: SessionFileReference? {
-        kind == .file ? block.files.first : nil
-    }
-}
-
-enum ArtifactKind: String, Codable, Equatable, Sendable {
-    case codeDiff = "code_diff"
-    case file
 }
 
 struct CronTask: Identifiable, Codable, Equatable, Sendable {

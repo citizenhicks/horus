@@ -30,7 +30,13 @@ extension GatewayWireTests {
         XCTAssertEqual(payload.models.first?.route, "openai_socket/gpt-5.6-sol")
         XCTAssertEqual(payload.models.first?.supportsImageInput, true)
         XCTAssertEqual(payload.modelProviders["openai_socket/gpt-5.6-sol"], "openai_socket")
-        XCTAssertEqual(payload.middlewareFeatures.first?.id, "skills")
+        XCTAssertEqual(payload.middlewareFeatures.first?.id, "extensions")
+        XCTAssertEqual(payload.extensions.first?.id, "plugin:ponytail")
+        XCTAssertEqual(payload.extensions.first?.capability, "extensions")
+        XCTAssertEqual(payload.extensions.first?.kind, .plugin)
+        XCTAssertEqual(payload.extensions.first?.hooks.first?.timeoutSeconds, 10)
+        XCTAssertEqual(payload.contributions.first?.references.first?.value, "planning")
+        XCTAssertEqual(payload.defaultConfig?.config.extensions, ["plugin:ponytail"])
         XCTAssertEqual(payload.maxActiveSessions, 4)
         XCTAssertEqual(payload.machineName, "snowwhite.local")
         let settings = try XCTUnwrap(payload.middlewareFeatures.first?.settings)
@@ -44,6 +50,8 @@ extension GatewayWireTests {
             return XCTFail("Expected select setting")
         }
         XCTAssertEqual(options.first?.value, "route-a")
+        XCTAssertNil(options.first?.symbol)
+        XCTAssertEqual(options.first?.tone, "neutral")
         XCTAssertEqual(unsetLabel, "Inherit")
 
         let configured = try decodeEnvelope(
@@ -105,7 +113,7 @@ extension GatewayWireTests {
         XCTAssertEqual(payload.runStats.elapsedMs, 9_000)
         XCTAssertEqual(payload.contributions.first?.count, 2)
         XCTAssertEqual(payload.contributions.first?.acceptsFileAttachments, false)
-        XCTAssertEqual(payload.config.config.middleware.enabled, ["cron", "skills", "subagents"])
+        XCTAssertEqual(payload.config.config.middleware.enabled, ["cron", "extensions", "subagents"])
         XCTAssertEqual(payload.config.config.maxModelSteps, 256)
         guard let widget = payload.contributions.first?.widgets.first,
               case .picker(let title, let options) = widget.content,
@@ -228,6 +236,32 @@ extension GatewayWireTests {
         ))
     }
 
+    func testV37RequiresAnExplicitExtensionSelection() {
+        let withoutExtensions = configJSON.replacingOccurrences(
+            of: #","extensions":["plugin:ponytail"]"#,
+            with: ""
+        )
+        let payload = readyPayloadJSON.replacingOccurrences(
+            of: configJSON,
+            with: withoutExtensions
+        )
+
+        XCTAssertThrowsError(try decodeEnvelope(
+            #"{"version":37,"type":"ready","payload":\#(payload)}"#
+        ))
+    }
+
+    func testV37RequiresGatewayContributions() {
+        let payload = readyPayloadJSON.replacingOccurrences(
+            of: #","contributions":[{"capability":"extensions","accepts_file_attachments":false,"count":1,"commands":[],"widgets":[],"references":[{"trigger":"$","value":"planning","description":"Planning skill"}],"active_input":null}]"#,
+            with: ""
+        )
+
+        XCTAssertThrowsError(try decodeEnvelope(
+            #"{"version":37,"type":"ready","payload":\#(payload)}"#
+        ))
+    }
+
     func testV28RequiresAPositiveModelStepLimitWithoutAnUpperPolicyBound() throws {
         let zeroLimit = configJSON.replacingOccurrences(
             of: #""max_model_steps":256"#,
@@ -258,15 +292,15 @@ extension GatewayWireTests {
     func testFrontendIntegerSettingsRejectInvalidBoundsAndStep() {
         let fixtures = [
             (
-                #"{"id":"limit","label":"Limit","description":"Maximum items","type":"integer","min":2,"max":1,"step":1}"#,
+                #"{"id":"limit","label":"Limit","description":"Maximum items","composer":false,"type":"integer","min":2,"max":1,"step":1}"#,
                 "frontend integer setting maximum is below minimum"
             ),
             (
-                #"{"id":"limit","label":"Limit","description":"Maximum items","type":"integer","min":1,"max":2,"step":0}"#,
+                #"{"id":"limit","label":"Limit","description":"Maximum items","composer":false,"type":"integer","min":1,"max":2,"step":0}"#,
                 "frontend integer setting step must be positive"
             ),
             (
-                #"{"id":"limit","label":"Limit","description":"Maximum items","type":"integer","min":1,"max":2,"step":-1}"#,
+                #"{"id":"limit","label":"Limit","description":"Maximum items","composer":false,"type":"integer","min":1,"max":2,"step":-1}"#,
                 "frontend integer setting step must be positive"
             ),
         ]
@@ -281,7 +315,7 @@ extension GatewayWireTests {
     }
 
     func testFrontendSelectSettingsRejectDuplicateOptionValues() {
-        let fixture = #"{"id":"route","label":"Route","description":"Default route","type":"select","options":[{"value":"route-a","label":"Route A","description":"First route"},{"value":"route-a","label":"Route A again","description":"Duplicate route"}]}"#
+        let fixture = #"{"id":"route","label":"Route","description":"Default route","composer":false,"type":"select","options":[{"value":"route-a","label":"Route A","description":"First route","symbol":null,"tone":"neutral"},{"value":"route-a","label":"Route A again","description":"Duplicate route","symbol":null,"tone":"neutral"}]}"#
 
         XCTAssertThrowsError(
             try decoder().decode(FrontendSetting.self, from: Data(fixture.utf8))
@@ -289,6 +323,32 @@ extension GatewayWireTests {
             XCTAssertEqual(
                 error as? GatewayWireError,
                 .invalidFrame("frontend select setting has duplicate option values")
+            )
+        }
+    }
+
+    func testFrontendComposerSettingDecodesSemanticOptions() throws {
+        let fixture = #"{"id":"policy","label":"Access","description":"Execution access","composer":true,"type":"select","options":[{"value":"safe","label":"Safe","description":"Use bounded access","symbol":"shield_check","tone":"neutral"},{"value":"full","label":"Full access","description":"Use host access","symbol":"shield_off","tone":"error"}]}"#
+
+        let setting = try decoder().decode(FrontendSetting.self, from: Data(fixture.utf8))
+
+        XCTAssertTrue(setting.composer)
+        guard case .select(let options, _) = setting.kind else {
+            return XCTFail("Expected select setting")
+        }
+        XCTAssertEqual(options.map(\.symbol), ["shield_check", "shield_off"])
+        XCTAssertEqual(options.map(\.tone), ["neutral", "error"])
+    }
+
+    func testFrontendSettingOptionRejectsUnknownTone() {
+        let fixture = #"{"id":"policy","label":"Access","description":"Execution access","composer":true,"type":"select","options":[{"value":"safe","label":"Safe","description":"Use bounded access","symbol":"shield_check","tone":"loud"}]}"#
+
+        XCTAssertThrowsError(
+            try decoder().decode(FrontendSetting.self, from: Data(fixture.utf8))
+        ) { error in
+            XCTAssertEqual(
+                error as? GatewayWireError,
+                .invalidFrame("frontend setting option has an unknown tone")
             )
         }
     }

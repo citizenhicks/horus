@@ -44,7 +44,6 @@ struct HostState {
     pub(super) replay: VecDeque<ServerFrame>,
     pub(super) replay_bytes: usize,
     pub(super) next_before_sequence: Option<u64>,
-    pub(super) artifacts: VecDeque<ArtifactRecord>,
     pub(super) widgets: SessionWidgets,
     commands: mpsc::Receiver<HostCommand>,
     events: broadcast::Sender<ServerFrame>,
@@ -57,7 +56,6 @@ pub(super) struct LoadedReplay {
     pub(super) replay: VecDeque<ServerFrame>,
     pub(super) replay_bytes: usize,
     pub(super) next_before_sequence: Option<u64>,
-    pub(super) artifacts: VecDeque<ArtifactRecord>,
     pub(super) widgets: SessionWidgets,
 }
 
@@ -147,15 +145,16 @@ pub(super) enum HostCommand {
         base_url: Option<String>,
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
+    RefreshExtension {
+        id: String,
+        reply: oneshot::Sender<std::result::Result<(), Rejection>>,
+    },
     ProviderCutoverStatus {
         reply: oneshot::Sender<ProviderCutoverStatus>,
     },
     CutOverProvider {
         selection: ProviderConfig,
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
-    },
-    Artifacts {
-        reply: oneshot::Sender<std::result::Result<Vec<ArtifactRecord>, Rejection>>,
     },
     RunCron {
         run: ActiveCronRun,
@@ -264,7 +263,6 @@ impl HostHandle {
             replay: loaded.replay,
             replay_bytes: loaded.replay_bytes,
             next_before_sequence: loaded.next_before_sequence,
-            artifacts: loaded.artifacts,
             widgets: loaded.widgets,
             commands: receiver,
             events: events.clone(),
@@ -453,6 +451,13 @@ impl HostHandle {
         receive(receiver).await
     }
 
+    pub(super) async fn refresh_extension(&self, id: String) -> std::result::Result<(), Rejection> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(HostCommand::RefreshExtension { id, reply })
+            .await?;
+        receive(receiver).await
+    }
+
     pub(super) async fn provider_cutover_status(
         &self,
     ) -> std::result::Result<ProviderCutoverStatus, Rejection> {
@@ -472,12 +477,6 @@ impl HostHandle {
             reply,
         })
         .await?;
-        receive(receiver).await
-    }
-
-    pub(crate) async fn artifacts(&self) -> std::result::Result<Vec<ArtifactRecord>, Rejection> {
-        let (reply, receiver) = oneshot::channel();
-        self.send(HostCommand::Artifacts { reply }).await?;
         receive(receiver).await
     }
 

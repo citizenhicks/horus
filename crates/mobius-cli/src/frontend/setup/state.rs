@@ -30,6 +30,7 @@ pub(super) enum ApplyTarget {
 pub(super) enum MiddlewareRow {
     Feature(usize),
     Setting { feature: usize, setting: usize },
+    Extension { feature: usize, extension: usize },
 }
 
 pub(super) struct Progress {
@@ -53,6 +54,9 @@ pub(super) struct SetupState {
     pub(super) reasoning: usize,
     pub(super) web_search: usize,
     pub(super) features: Vec<MiddlewareFeature>,
+    pub(super) available_extensions: Vec<ExtensionRecord>,
+    pub(super) selected_extensions: BTreeSet<String>,
+    pub(super) expanded_features: BTreeSet<String>,
     pub(super) middleware: MiddlewareConfig,
     pub(super) target: ApplyTarget,
     pub(super) default_only: bool,
@@ -73,6 +77,7 @@ impl SetupState {
             mode,
             validated_providers(&gateway.providers)?,
             gateway.middleware_features.clone(),
+            gateway.extensions.clone(),
             original,
             default_only,
         )?;
@@ -86,6 +91,7 @@ impl SetupState {
         mode: SetupMode,
         providers: Vec<ProviderEntry>,
         features: Vec<MiddlewareFeature>,
+        available_extensions: Vec<ExtensionRecord>,
         original: AgentComposition,
         default_only: bool,
     ) -> Result<Self> {
@@ -104,7 +110,27 @@ impl SetupState {
                 ))
             })?;
         validate_active_provider(&providers[provider].status, &original.provider)?;
+        let extension_ids = available_extensions
+            .iter()
+            .map(|extension| extension.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if extension_ids.len() != available_extensions.len() {
+            return Err(Error::Config(
+                "the gateway advertised duplicate extension IDs".into(),
+            ));
+        }
+        if let Some(extension) = available_extensions.iter().find(|extension| {
+            !features
+                .iter()
+                .any(|feature| feature.id == extension.capability)
+        }) {
+            return Err(Error::Config(format!(
+                "extension `{}` targets an unavailable capability",
+                extension.id
+            )));
+        }
         let middleware = original.middleware.clone();
+        let selected_extensions = original.extensions.clone();
         let mut state = Self {
             mode,
             providers,
@@ -123,6 +149,9 @@ impl SetupState {
             reasoning: 0,
             web_search: 0,
             features,
+            available_extensions,
+            selected_extensions,
+            expanded_features: BTreeSet::new(),
             middleware,
             target: if default_only {
                 ApplyTarget::Default
@@ -185,28 +214,69 @@ impl SetupState {
     }
 
     pub(super) fn middleware_row_count(&self) -> usize {
-        self.features
-            .iter()
-            .map(|feature| feature.settings.len() + 1)
-            .sum()
+        self.features.len()
+            + self
+                .features
+                .iter()
+                .filter(|feature| self.expanded_features.contains(&feature.id))
+                .map(|feature| {
+                    feature.settings.len()
+                        + self
+                            .available_extensions
+                            .iter()
+                            .filter(|extension| extension.capability == feature.id)
+                            .count()
+                })
+                .sum::<usize>()
     }
 
     pub(super) fn middleware_row(&self, row: usize) -> Option<MiddlewareRow> {
-        let mut start = 0;
+        let mut current = 0;
         for (feature, definition) in self.features.iter().enumerate() {
-            if row == start {
+            if row == current {
                 return Some(MiddlewareRow::Feature(feature));
             }
-            let settings = start + 1..start + 1 + definition.settings.len();
-            if settings.contains(&row) {
-                return Some(MiddlewareRow::Setting {
-                    feature,
-                    setting: row - start - 1,
-                });
+            current += 1;
+            if !self.expanded_features.contains(&definition.id) {
+                continue;
             }
-            start = settings.end;
+            for setting in 0..definition.settings.len() {
+                if row == current {
+                    return Some(MiddlewareRow::Setting { feature, setting });
+                }
+                current += 1;
+            }
+            for (extension, _) in self
+                .available_extensions
+                .iter()
+                .enumerate()
+                .filter(|(_, extension)| extension.capability == definition.id)
+            {
+                if row == current {
+                    return Some(MiddlewareRow::Extension { feature, extension });
+                }
+                current += 1;
+            }
         }
         None
+    }
+
+    pub(super) fn feature_has_children(&self, feature: usize) -> bool {
+        !self.features[feature].settings.is_empty()
+            || self
+                .available_extensions
+                .iter()
+                .any(|extension| extension.capability == self.features[feature].id)
+    }
+
+    pub(super) fn toggle_feature_expansion(&mut self, feature: usize) {
+        if !self.feature_has_children(feature) {
+            return;
+        }
+        let id = self.features[feature].id.clone();
+        if !self.expanded_features.remove(&id) {
+            self.expanded_features.insert(id);
+        }
     }
 
     pub(super) fn apply_target_for_row(&self) -> Option<ApplyTarget> {
@@ -385,8 +455,29 @@ impl SetupState {
                 };
                 let feature = &self.features[index];
                 if !feature.required {
-                    self.middleware
-                        .set_enabled(&feature.id, !self.middleware.enabled(&feature.id));
+                    let enabled = !self.middleware.enabled(&feature.id);
+                    self.middleware.set_enabled(&feature.id, enabled);
+                    self.error = None;
+                }
+            }
+            KeyCode::Enter | KeyCode::Right
+                if matches!(middleware_row, Some(MiddlewareRow::Feature(_))) =>
+            {
+                let MiddlewareRow::Feature(feature) = middleware_row.expect("guarded feature row")
+                else {
+                    unreachable!()
+                };
+                if !self.expanded_features.contains(&self.features[feature].id) {
+                    self.toggle_feature_expansion(feature);
+                }
+            }
+            KeyCode::Left if matches!(middleware_row, Some(MiddlewareRow::Feature(_))) => {
+                let MiddlewareRow::Feature(feature) = middleware_row.expect("guarded feature row")
+                else {
+                    unreachable!()
+                };
+                if self.expanded_features.contains(&self.features[feature].id) {
+                    self.toggle_feature_expansion(feature);
                 }
             }
             KeyCode::Char(' ') | KeyCode::Right
@@ -396,6 +487,23 @@ impl SetupState {
             }
             KeyCode::Left if matches!(middleware_row, Some(MiddlewareRow::Setting { .. })) => {
                 self.adjust_middleware_setting(middleware_row.expect("guarded setting row"), -1);
+            }
+            KeyCode::Char(' ')
+                if matches!(middleware_row, Some(MiddlewareRow::Extension { .. })) =>
+            {
+                let MiddlewareRow::Extension { feature, extension } =
+                    middleware_row.expect("guarded extension row")
+                else {
+                    unreachable!()
+                };
+                let extension = &self.available_extensions[extension];
+                let id = extension.id.clone();
+                if !self.selected_extensions.remove(&id) {
+                    self.selected_extensions.insert(id);
+                    self.middleware
+                        .set_enabled(&self.features[feature].id, true);
+                }
+                self.error = None;
             }
             KeyCode::Enter | KeyCode::Char(' ') if self.apply_target_for_row().is_some() => {
                 self.target = self
@@ -729,6 +837,7 @@ impl SetupState {
         let mut config = current.clone();
         if self.mode == SetupMode::Agent {
             config.middleware = self.middleware.clone();
+            config.extensions = self.selected_extensions.clone();
             return Ok(config);
         }
         let definition = self.definition();

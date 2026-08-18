@@ -135,8 +135,6 @@ extension PrimitiveButtonStyle where Self == MobiusFeedbackButtonStyle<GlassProm
 
 struct MobiusIconButtonStyle: ButtonStyle {
     var prominent = false
-    /// Draws only the glyph — no glass circle behind it — while keeping the full
-    /// 44pt hit target. `prominent` then tints the glyph instead of the fill.
     var bare = false
 
     func makeBody(configuration: Configuration) -> some View {
@@ -150,8 +148,7 @@ struct MobiusIconButtonStyle: ButtonStyle {
 
     private struct IconButton: View {
         @Environment(\.mobiusPalette) private var palette
-        // A custom style gets no automatic disabled treatment: without this the send button
-        // keeps a full-strength accent glyph on a circle that no longer responds.
+        // A custom style gets no automatic disabled treatment.
         @Environment(\.isEnabled) private var isEnabled
         let label: ButtonStyleConfiguration.Label
         let isPressed: Bool
@@ -163,14 +160,17 @@ struct MobiusIconButtonStyle: ButtonStyle {
                 .font(MobiusStyle.controlFont)
                 .foregroundStyle(foreground)
                 .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
-                // A glass effect adds no hit area, so without this the tap target is the
-                // 16pt glyph, not the 44pt circle: unusable by touch, fine with a cursor.
                 .contentShape(Circle())
             Group {
                 if bare {
                     base
                 } else {
-                    base.mobiusGlass(in: Circle(), interactive: isEnabled, prominent: prominent && isEnabled)
+                    base.mobiusGlass(
+                        in: Circle(),
+                        interactive: isEnabled,
+                        prominent: prominent && isEnabled,
+                        clear: !prominent
+                    )
                 }
             }
             .opacity(isPressed ? 0.72 : 1)
@@ -185,25 +185,16 @@ struct MobiusIconButtonStyle: ButtonStyle {
     }
 }
 
-/// A bar button that leaves the glass chrome to the toolbar and only supplies the glyph.
-///
-/// A custom `buttonStyle` here would draw a second capsule inside the one the bar already
-/// provides, so this stays a plain glyph tinted `.primary` in a full-size hit target — the
-/// treatment every toolbar button in the app shares.
 struct MobiusToolbarIconButton: View {
     let glyph: MobiusGlyph
     let label: String
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            MobiusIcon(glyph, foreground: .primary)
-                .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
-                .contentShape(Rectangle())
-        }
-        .tint(.primary)
-        .accessibilityLabel(label)
-        .help(label)
+        Button(label, glyph: glyph, action: action)
+            .mobiusIconButton()
+            .accessibilityLabel(label)
+            .help(label)
     }
 }
 
@@ -224,6 +215,17 @@ private struct MobiusProminentButton: ViewModifier {
 extension View {
     func mobiusProminentButton() -> some View { modifier(MobiusProminentButton()) }
 
+    func mobiusIconButton() -> some View {
+        labelStyle(.iconOnly)
+            .tint(.primary)
+            .buttonStyle(MobiusIconButtonStyle())
+    }
+
+    func mobiusProminentIconButton() -> some View {
+        labelStyle(.iconOnly)
+            .buttonStyle(MobiusIconButtonStyle(prominent: true))
+    }
+
     /// Lets a row of badges scroll instead of squeezing when it outgrows the width.
     func scrollableRow() -> some View {
         ScrollView(.horizontal) {
@@ -239,9 +241,17 @@ extension View {
     func mobiusGlass<S: Shape>(
         in shape: S,
         interactive: Bool = false,
-        prominent: Bool = false
+        prominent: Bool = false,
+        clear: Bool = false
     ) -> some View {
-        modifier(MobiusGlassModifier(shape: shape, interactive: interactive, prominent: prominent))
+        modifier(
+            MobiusGlassModifier(
+                shape: shape,
+                interactive: interactive,
+                prominent: prominent,
+                clear: clear
+            )
+        )
     }
 
 }
@@ -251,9 +261,10 @@ private struct MobiusGlassModifier<S: Shape>: ViewModifier {
     let shape: S
     let interactive: Bool
     let prominent: Bool
+    let clear: Bool
 
     func body(content: Content) -> some View {
-        let glass = prominent ? Glass.regular.tint(palette.accentFill) : Glass.regular
+        let glass = prominent ? Glass.regular.tint(palette.accentFill) : clear ? Glass.clear : Glass.regular
         if interactive {
             content.glassEffect(glass.interactive(), in: shape)
         } else {

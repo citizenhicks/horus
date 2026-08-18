@@ -3,6 +3,379 @@
 use super::*;
 
 #[tokio::test]
+async fn idle_session_start_stop_does_not_consume_the_next_prompt() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let model = Arc::new(NativeCompactionModel::default());
+    let config = AgentConfig::new(
+        Arc::new(ModelRouter::new("main", model.clone())),
+        Arc::new(Sandbox::new(
+            Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+            ApprovalPolicy::Ask,
+        )),
+        Arc::new(
+            SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+                .expect("checkpoint store"),
+        ),
+        MiddlewareStack::new(vec![Arc::new(StoppingSessionStart)]).expect("middleware"),
+        "test prompt",
+    )
+    .session_id("startup-session-stop");
+    let mut agent = create_agent(config).await.expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "first".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit first input");
+    while !matches!(
+        agent.next_event().await.expect("agent event").msg,
+        EventMsg::TurnComplete(_)
+    ) {}
+
+    assert_eq!(model.responses.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn rejected_prompt_aborts_without_persisting_or_wedging_the_next_turn() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let model = Arc::new(NativeCompactionModel::default());
+    let config = AgentConfig::new(
+        Arc::new(ModelRouter::new("main", model.clone())),
+        Arc::new(Sandbox::new(
+            Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+            ApprovalPolicy::Ask,
+        )),
+        checkpoints.clone(),
+        MiddlewareStack::new(vec![Arc::new(RejectFirstPrompt(AtomicBool::new(false)))])
+            .expect("middleware"),
+        "test prompt",
+    )
+    .session_id("rejected-prompt");
+    let mut agent = create_agent(config).await.expect("create agent");
+    let rejected_submission = agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "do not persist this secret".into(),
+            attachments: vec![SessionFileReference {
+                id: "da913625-36d8-4624-815f-5523eb93b95f".into(),
+                name: "secret.txt".into(),
+                size: 6,
+                media_type: "text/plain".into(),
+            }],
+        })
+        .expect("submit rejected input");
+    let mut events = Vec::new();
+    loop {
+        let event = agent.next_event().await.expect("agent event");
+        if event.submission_id.as_deref() != Some(&rejected_submission) {
+            continue;
+        }
+        let terminal = matches!(event.msg, EventMsg::TurnAborted(_));
+        events.push(event.msg);
+        if terminal {
+            break;
+        }
+    }
+
+    assert!(matches!(events.first(), Some(EventMsg::TurnStarted(_))));
+    assert!(matches!(events.last(), Some(EventMsg::TurnAborted(_))));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        EventMsg::UserMessage(_) | EventMsg::ModelStepStarted(_) | EventMsg::TurnComplete(_)
+    )));
+    let checkpoint = checkpoints
+        .load("rejected-prompt")
+        .await
+        .expect("load checkpoint")
+        .expect("saved checkpoint");
+    let checkpoint = serde_json::to_string(&checkpoint).expect("serialize checkpoint");
+    assert!(!checkpoint.contains("do not persist this secret"));
+    assert!(!checkpoint.contains("da913625-36d8-4624-815f-5523eb93b95f"));
+
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "continue".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit accepted input");
+    while !matches!(
+        agent.next_event().await.expect("agent event").msg,
+        EventMsg::TurnComplete(_)
+    ) {}
+    assert_eq!(model.responses.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn pre_tool_hook_context_is_durable_before_open_call_at_approval() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let model = Arc::new(ScriptedModel {
+        outputs: Mutex::new(VecDeque::from([scripted_tool_call()])),
+        tool_counts: Mutex::new(Vec::new()),
+        inputs: Mutex::new(Vec::new()),
+    });
+    let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
+    let config = AgentConfig::new(
+        Arc::new(ModelRouter::new("main", model)),
+        Arc::new(Sandbox::new(
+            Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+            ApprovalPolicy::Ask,
+        )),
+        checkpoint_store,
+        MiddlewareStack::new(vec![
+            Arc::new(Tools::new(vec![Arc::new(ApprovalRequiredTestTool)])),
+            Arc::new(ToolHookContext),
+        ])
+        .expect("middleware"),
+        "test prompt",
+    )
+    .session_id("pre-tool-hook-approval");
+    let mut agent = create_agent(config).await.expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "run it".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit input");
+    while !matches!(
+        agent.next_event().await.expect("agent event").msg,
+        EventMsg::ExecApprovalRequest(_)
+    ) {}
+
+    let saved = checkpoints
+        .load("pre-tool-hook-approval")
+        .await
+        .expect("load checkpoint")
+        .expect("saved checkpoint");
+    let call = saved
+        .context
+        .iter()
+        .position(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .expect("tool call");
+    let pre = saved
+        .context
+        .iter()
+        .position(|item| internal_message_kind(item) == Some("pre_tool_hook"))
+        .expect("pre-tool context");
+
+    assert_eq!((pre + 1, saved.pending_approval.is_some()), (call, true));
+}
+
+#[tokio::test]
+async fn post_tool_hook_context_follows_only_executed_tool_outputs() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let model = Arc::new(ScriptedModel {
+        outputs: Mutex::new(VecDeque::from([
+            ModelOutput::from_output(
+                vec![
+                    serde_json::json!({
+                        "type": "function_call",
+                        "call_id": "call-1",
+                        "name": "approval_required",
+                        "arguments": "{}"
+                    }),
+                    serde_json::json!({
+                        "type": "function_call",
+                        "call_id": "call-2",
+                        "name": "missing",
+                        "arguments": "{}"
+                    }),
+                    serde_json::json!({
+                        "type": "function_call",
+                        "call_id": "call-3",
+                        "name": "approval_required",
+                        "arguments": "{}"
+                    }),
+                ],
+                false,
+                scripted_usage(),
+            )
+            .expect("tool output"),
+            scripted_message("done"),
+        ])),
+        tool_counts: Mutex::new(Vec::new()),
+        inputs: Mutex::new(Vec::new()),
+    });
+    let config = AgentConfig::new(
+        Arc::new(ModelRouter::new("main", model.clone())),
+        Arc::new(Sandbox::new(
+            Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+            ApprovalPolicy::Allow,
+        )),
+        checkpoints,
+        MiddlewareStack::new(vec![
+            Arc::new(Tools::new(vec![Arc::new(ApprovalRequiredTestTool)])),
+            Arc::new(ToolHookContext),
+        ])
+        .expect("middleware"),
+        "test prompt",
+    )
+    .session_id("tool-hook-context");
+    let mut agent = create_agent(config).await.expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "run it".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit input");
+    while !matches!(
+        agent.next_event().await.expect("agent event").msg,
+        EventMsg::TurnComplete(_)
+    ) {}
+
+    let inputs = model.inputs.lock().expect("model inputs");
+    let second = &inputs[1];
+    let sequence = second
+        .iter()
+        .filter_map(|item| {
+            if let Some(kind) = internal_message_kind(item)
+                && matches!(kind, "pre_tool_hook" | "post_tool_hook")
+            {
+                return Some((kind, None));
+            }
+            match item.get("type").and_then(Value::as_str) {
+                Some(kind @ ("function_call" | "function_call_output")) => {
+                    Some((kind, item.get("call_id").and_then(Value::as_str)))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        sequence,
+        [
+            ("pre_tool_hook", None),
+            ("pre_tool_hook", None),
+            ("pre_tool_hook", None),
+            ("function_call", Some("call-1")),
+            ("function_call", Some("call-2")),
+            ("function_call", Some("call-3")),
+            ("function_call_output", Some("call-1")),
+            ("post_tool_hook", None),
+            ("function_call_output", Some("call-2")),
+            ("function_call_output", Some("call-3")),
+            ("post_tool_hook", None),
+        ]
+    );
+}
+
+async fn assert_compaction_stop(
+    boundary: CompactStop,
+    session_id: &str,
+    expected_compactions: usize,
+    expected_reason: &str,
+) {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let model = Arc::new(NativeCompactionModel::default());
+    let config = AgentConfig::new(
+        Arc::new(ModelRouter::new("main", model.clone())),
+        Arc::new(Sandbox::new(
+            Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
+            ApprovalPolicy::Ask,
+        )),
+        checkpoints.clone(),
+        MiddlewareStack::new(vec![
+            Arc::new(Compaction::new(1).expect("compaction middleware")),
+            Arc::new(StoppingCompaction(boundary)),
+        ])
+        .expect("middleware"),
+        "test prompt",
+    )
+    .session_id(session_id);
+    let mut agent = create_agent(config).await.expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "hello".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit input");
+    let mut reason = None;
+    loop {
+        match agent.next_event().await.expect("agent event").msg {
+            EventMsg::Warning(warning) if warning.message == expected_reason => {
+                reason = Some(warning.message)
+            }
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    let checkpoint = checkpoints
+        .load(session_id)
+        .await
+        .expect("load checkpoint")
+        .expect("saved checkpoint");
+
+    assert_eq!(
+        (
+            model.responses.load(Ordering::SeqCst),
+            model.compactions.load(Ordering::SeqCst),
+            checkpoint.compaction_count,
+            reason.as_deref(),
+        ),
+        (
+            0,
+            expected_compactions,
+            expected_compactions as u64,
+            Some(expected_reason)
+        )
+    );
+}
+
+#[tokio::test]
+async fn pre_compact_stop_completes_before_compaction() {
+    assert_compaction_stop(
+        CompactStop::Before,
+        "pre-compact-stop",
+        0,
+        "pre-compact hook stopped the turn",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn post_compact_stop_completes_after_compaction() {
+    assert_compaction_stop(
+        CompactStop::After,
+        "post-compact-stop",
+        1,
+        "post-compact hook stopped the turn",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn compact_session_start_stop_completes_after_compaction() {
+    assert_compaction_stop(
+        CompactStop::SessionStart,
+        "compact-session-start-stop",
+        1,
+        "session-start hook stopped the turn",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn compaction_marker_survives_transcript_replay() {
     let workspace = tempfile::tempdir().expect("workspace");
     let checkpoints = Arc::new(
@@ -11,7 +384,10 @@ async fn compaction_marker_survives_transcript_replay() {
     );
     let checkpoint_store: Arc<dyn CheckpointStore> = checkpoints.clone();
     let config = AgentConfig::new(
-        Arc::new(ModelRouter::new("main", Arc::new(NativeCompactionModel))),
+        Arc::new(ModelRouter::new(
+            "main",
+            Arc::new(NativeCompactionModel::default()),
+        )),
         Arc::new(Sandbox::new(
             Arc::new(LocalSandbox::new(workspace.path()).expect("local sandbox")),
             ApprovalPolicy::Ask,

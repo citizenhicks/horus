@@ -1,12 +1,13 @@
 //! Gateway sandbox with protected and host-wide command modes.
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use mobius::backend::model::provider::{ProviderAuth, providers};
 use mobius::backend::sandbox::{
-    CommandMode, CommandOutput, CommandOutputSink, NetworkAccess, SandboxBackend, SandboxMode,
-    local::LocalSandbox,
+    CommandAuthorization, CommandMode, CommandOutput, CommandOutputSink, NetworkAccess,
+    SandboxBackend, SandboxMode, local::LocalSandbox,
 };
 use mobius::{BoxFuture, Error, Result};
 
@@ -94,6 +95,16 @@ impl GatewaySandbox {
         })
     }
 
+    pub(crate) fn allow_read_roots(
+        mut self,
+        roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self> {
+        for root in roots {
+            self.delegate = self.delegate.allow_read_root(root)?;
+        }
+        Ok(self)
+    }
+
     pub(crate) async fn execute_git(&self, args: &[&str]) -> Result<CommandOutput> {
         let mut arguments = GIT_ARGUMENTS.to_vec();
         arguments.extend_from_slice(args);
@@ -152,6 +163,29 @@ impl SandboxBackend for GatewaySandbox {
             SandboxMode::DangerFullAccess => &self.full_access_delegate,
         };
         delegate.execute(script, sandbox_mode, network_access, mode, output)
+    }
+
+    fn execute_authorized<'a>(
+        &'a self,
+        script: &'a str,
+        sandbox_mode: SandboxMode,
+        network_access: NetworkAccess,
+        mode: CommandMode,
+        output: CommandOutputSink,
+        authorization: &'a CommandAuthorization,
+    ) -> BoxFuture<'a, Result<Option<CommandOutput>>> {
+        let delegate = match sandbox_mode {
+            SandboxMode::WorkspaceWrite => &self.delegate,
+            SandboxMode::DangerFullAccess => &self.full_access_delegate,
+        };
+        delegate.execute_authorized(
+            script,
+            sandbox_mode,
+            network_access,
+            mode,
+            output,
+            authorization,
+        )
     }
 }
 
@@ -237,6 +271,41 @@ mod tests {
         };
 
         assert!(error.to_string().contains("outside every chat workspace"));
+    }
+
+    #[test]
+    fn gateway_state_cannot_be_added_as_a_read_root() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let sandbox =
+            GatewaySandbox::new(workspace.path(), state.path(), None, Duration::from_secs(5))
+                .expect("gateway sandbox");
+
+        let result = sandbox.allow_read_roots([state.path().to_path_buf()]);
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn configured_read_roots_allow_absolute_file_reads() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let resources = tempfile::tempdir().expect("resources");
+        let resource = resources.path().join("SKILL.md");
+        std::fs::write(&resource, "instructions").expect("resource");
+        let resource = std::fs::canonicalize(resource).expect("canonical resource");
+        let sandbox =
+            GatewaySandbox::new(workspace.path(), state.path(), None, Duration::from_secs(5))
+                .expect("gateway sandbox")
+                .allow_read_roots([resources.path().to_path_buf()])
+                .expect("read root");
+
+        let content = sandbox
+            .read(resource.to_str().expect("UTF-8 resource path"))
+            .await
+            .expect("resource read");
+
+        assert_eq!(content, "instructions");
     }
 
     #[tokio::test]

@@ -42,8 +42,7 @@ struct ChatView: View {
                 Button("Scroll to latest", glyph: .arrowDown) {
                     scrollToBottomRequest += 1
                 }
-                .labelStyle(.iconOnly)
-                .buttonStyle(MobiusIconButtonStyle())
+                .mobiusIconButton()
                 .padding(.bottom, composerHeight + 12)
                 .help("Scroll to latest")
                 .zIndex(2)
@@ -65,6 +64,7 @@ struct ChatView: View {
         }
         .navigationTitle(chatTitle)
         .toolbarTitleDisplayMode(.inline)
+        .toolbarRole(.editor)
         .toolbar {
             // Title changes animate glyphs, so the principal title must be a view the app
             // owns rather than the system's opaque navigation title.

@@ -121,11 +121,11 @@ fn capability_header_is_live_styled_and_transparent() {
     let mut state = state();
     state.transcript.clear();
     state.widgets.push((
-        ("skills".into(), "count".into()),
+        ("extensions".into(), "count".into()),
         FrontendWidget {
             id: "count".into(),
             slot: FrontendSlot::Header,
-            text: "skills 2".into(),
+            text: "extensions 2".into(),
             tone: FrontendTone::Neutral,
             symbol: None,
             icon_only: false,
@@ -139,7 +139,7 @@ fn capability_header_is_live_styled_and_transparent() {
         .draw(|frame| view::render(frame, &mut state, &catalog))
         .expect("live pane draw");
     let live_pane = terminal.backend().to_string();
-    let skill_cell = terminal
+    let extension_cell = terminal
         .backend()
         .buffer()
         .content()
@@ -147,9 +147,9 @@ fn capability_header_is_live_styled_and_transparent() {
         .find(|cell| cell.symbol() == "2")
         .expect("styled capability cell");
 
-    assert!(live_pane.contains("skills 2"));
+    assert!(live_pane.contains("extensions 2"));
     assert_eq!(
-        (skill_cell.fg, skill_cell.bg),
+        (extension_cell.fg, extension_cell.bg),
         (current().color(Role::Neutral), Color::Reset)
     );
 }

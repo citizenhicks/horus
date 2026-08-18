@@ -10,7 +10,6 @@ use super::provider::ProviderBuildConfig;
 use super::provider::ProviderDefinition;
 use crate::Error;
 use crate::Result;
-use crate::protocol::FrontendSymbol;
 
 mod manifest {
     include!(concat!(
@@ -25,7 +24,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "openrouter",
         manifest::PROVIDER_LABEL,
-        FrontendSymbol::Route,
+        "route",
         manifest::PROVIDER_DESCRIPTION,
         ProviderAuth::ApiKey("OPENROUTER_API_KEY"),
         manifest::MODELS,

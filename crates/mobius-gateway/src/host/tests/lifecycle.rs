@@ -1,6 +1,33 @@
 use super::*;
 
 #[tokio::test]
+async fn ready_reuses_the_startup_contributions() {
+    let root = tempfile::tempdir().expect("root");
+    let listen = "127.0.0.1:8741".parse().expect("listen address");
+    let (store, config) =
+        ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
+    let credentials =
+        Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
+    let expected = vec![FrontendContribution {
+        capability: "extensions".into(),
+        references: vec![mobius::protocol::FrontendReference {
+            trigger: '$',
+            value: "cached-skill".into(),
+            description: "Cached once".into(),
+        }],
+        ..FrontendContribution::default()
+    }];
+    gateway.state.lock().await.contributions = expected.clone();
+
+    assert_eq!(
+        gateway.ready().await.expect("ready").contributions,
+        expected
+    );
+}
+
+#[tokio::test]
 async fn durable_event_journal_restores_complete_turn_pages() {
     let root = tempfile::tempdir().expect("root");
     let workspace = root.path().join("workspace");

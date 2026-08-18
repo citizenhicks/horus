@@ -2,7 +2,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    ApprovalRequirement, MAX_COMMAND_BYTES, MAX_TOOL_OUTPUT_BYTES, Tool, ToolContext, text,
+    ApprovalRequirement, HookIdentity, MAX_COMMAND_BYTES, MAX_TOOL_OUTPUT_BYTES, Tool, ToolContext,
+    text,
 };
 use crate::backend::model::ToolDefinition;
 use crate::backend::sandbox::BackgroundCommandPoll;
@@ -31,6 +32,17 @@ impl Tool for Bash {
 
     fn approval(&self) -> ApprovalRequirement {
         ApprovalRequirement::Always
+    }
+
+    fn hook_identity(&self) -> Option<HookIdentity> {
+        Some(HookIdentity {
+            name: "Bash",
+            subjects: &["Bash"],
+        })
+    }
+
+    fn rewrite_hook_input(&self, input: Value) -> Result<Value> {
+        rewrite_command_input(&input)
     }
 
     fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
@@ -67,6 +79,17 @@ impl Tool for StartCommand {
 
     fn approval(&self) -> ApprovalRequirement {
         ApprovalRequirement::Always
+    }
+
+    fn hook_identity(&self) -> Option<HookIdentity> {
+        Some(HookIdentity {
+            name: "Bash",
+            subjects: &["Bash"],
+        })
+    }
+
+    fn rewrite_hook_input(&self, input: Value) -> Result<Value> {
+        rewrite_command_input(&input)
     }
 
     fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {
@@ -144,6 +167,14 @@ fn validate_command(command: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn rewrite_command_input(input: &Value) -> Result<Value> {
+    let command = input
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Config("hook tool rewrite requires `command`".into()))?;
+    Ok(serde_json::json!({"command": command}))
 }
 
 fn validate_command_id(id: &str) -> Result<()> {

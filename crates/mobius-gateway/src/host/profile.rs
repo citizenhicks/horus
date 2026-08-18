@@ -246,6 +246,7 @@ pub(super) async fn gateway_ready(
     let model_providers =
         configured_model_providers(&config, &state.store, &state.credentials).map_err(internal)?;
     let middleware_features = crate::middleware_manifest::features(&models);
+    let extensions = crate::extensions::records(&config);
     Ok(ReadyPayload {
         machine_name: local_machine_name().map_err(internal)?,
         sessions: session_catalog(&state.checkpoints, &state.activities)
@@ -257,6 +258,8 @@ pub(super) async fn gateway_ready(
         model_providers,
         default_config: config.default_agent,
         middleware_features,
+        extensions,
+        contributions: state.contributions.clone(),
         max_active_sessions: MAX_ACTIVE_SESSIONS,
     })
 }

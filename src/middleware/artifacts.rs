@@ -215,6 +215,8 @@ mod tests {
             checkpoints,
             session_id: "session-a".into(),
             model_route: "model".into(),
+            model: "model".into(),
+            approval_policy: crate::backend::sandbox::ApprovalPolicy::Ask,
             session_context: SessionContext::default(),
             metadata: BTreeMap::new(),
             role: crate::agent::AgentRole::Main,

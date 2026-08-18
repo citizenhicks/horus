@@ -59,7 +59,6 @@ use crate::BoxFuture;
 use crate::Error;
 use crate::ProviderError;
 use crate::Result;
-use crate::protocol::FrontendSymbol;
 
 mod connection;
 
@@ -632,7 +631,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "openai_socket",
         manifest::PROVIDER_LABEL,
-        FrontendSymbol::ChatGpt,
+        "chat_gpt",
         manifest::PROVIDER_DESCRIPTION,
         ProviderAuth::ApiKey("OPENAI_API_KEY"),
         MODELS,

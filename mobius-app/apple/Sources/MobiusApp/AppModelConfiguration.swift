@@ -126,7 +126,7 @@ extension AppModel {
         switch tab {
         case .modified: refreshModifiedFiles(modifiedFilesScope)
         case .allFiles: refreshWorkspaceFiles()
-        case .chatFiles: refreshChatFiles()
+        case .chatFiles: refreshSessionUploads()
         }
     }
 
@@ -147,24 +147,26 @@ extension AppModel {
         applyAgentConfiguration(defaultAgentDraft, to: .defaultAgent)
     }
 
-    func setApprovalPolicyForCurrentChat(_ policy: String) {
-        guard let snapshot = agentSnapshot, let draft = agentDraft else { return }
+    func setAgentSettingForCurrentChat(
+        _ value: FrontendSettingValue?,
+        middleware: String,
+        setting: String
+    ) {
+        guard !isApplyingConfiguration,
+              let snapshot = agentSnapshot,
+              var draft = agentDraft
+        else { return }
         guard draft == snapshot.config else {
             showToast(
-                "Apply or reload pending agent/provider edits before changing approval.",
+                "Apply or reload pending agent edits before changing this setting.",
                 tone: .warning
             )
             return
         }
-        guard draft.middleware.settings["sandbox"]?["approval_policy"] != .string(policy) else {
-            return
-        }
-        agentDraft?.middleware.setSetting(
-            .string(policy),
-            middleware: "sandbox",
-            setting: "approval_policy"
-        )
-        changeAgentForCurrentChat()
+        guard draft.middleware.settings[middleware]?[setting] != value else { return }
+        draft.middleware.setSetting(value, middleware: middleware, setting: setting)
+        agentDraft = draft
+        applyAgentConfiguration(draft, to: .session)
     }
 
     func applyAgentConfiguration(

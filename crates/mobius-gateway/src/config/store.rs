@@ -121,6 +121,12 @@ impl ConfigStore {
         &self.state_dir
     }
 
+    /// Returns the owner-managed extension store outside sandbox-masked gateway state.
+    #[must_use]
+    pub(crate) fn extensions_path(&self) -> PathBuf {
+        crate::extensions::extensions_path(&self.state_dir)
+    }
+
     /// Returns the provider credential file path.
     #[must_use]
     pub fn credentials_path(&self) -> PathBuf {

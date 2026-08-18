@@ -136,6 +136,9 @@ impl Middleware for Compaction {
                 return Ok(());
             }
             context.pre_compact().await?;
+            if context.turn_stopped() {
+                return Ok(());
+            }
             let output = if context.model.compaction_endpoint(context.provider)? {
                 let tools = context.tools.definitions();
                 let cache_key = prompt_cache_key(context.session_id);
@@ -173,7 +176,6 @@ impl Middleware for Compaction {
                 .compaction_count
                 .checked_add(1)
                 .ok_or_else(|| Error::Checkpoint("compaction count overflow".into()))?;
-            *context.checkpoint_changed = true;
             context.record_transcript_item(internal_user_message(CONTEXT_COMPACTED_MARKER, ""));
             context.usage.push(output.usage);
             context.events.push(EventMsg::ContextCompacted);

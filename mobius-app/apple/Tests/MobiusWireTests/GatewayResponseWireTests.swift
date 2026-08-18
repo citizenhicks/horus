@@ -81,23 +81,6 @@ extension GatewayWireTests {
         XCTAssertEqual(offset, 0)
         XCTAssertEqual(data, Data([1, 2, 3]))
         XCTAssertNil(finalOffset)
-
-        let artifact = try decodeEnvelope(
-            #"{"version":27,"type":"artifacts","request_id":"artifacts-1","session_id":"chat-1","artifacts":[{"id":"artifact-1","session_id":"chat-1","kind":"file","title":"Scan","block":{"id":"artifacts/file-1","group":null,"update":"replace","state":"complete","role":"artifact","title":"Scan","text":"","symbol":"storage","files":[\#(record)],"format":"plain_text","tone":"neutral"}}],"truncated":true}"#
-        )
-        guard case .artifacts(
-            let artifactRequestID,
-            let artifactSessionID,
-            let records,
-            let truncated
-        ) = artifact else {
-            return XCTFail("Expected artifact list")
-        }
-        XCTAssertEqual(artifactRequestID, "artifacts-1")
-        XCTAssertEqual(artifactSessionID, "chat-1")
-        XCTAssertEqual(records.first?.kind, .file)
-        XCTAssertEqual(records.first?.file?.name, "scan.png")
-        XCTAssertTrue(truncated)
     }
 
     func testFrontendBlockRequiresFilesInV28() {

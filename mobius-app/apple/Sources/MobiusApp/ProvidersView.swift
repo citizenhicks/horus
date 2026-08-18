@@ -134,7 +134,7 @@ struct ProvidersView: View {
             } else {
                 MobiusUnavailable(
                     title: "Providers unavailable",
-                    glyph: .cpu,
+                    glyph: AppDestination.providers.glyph,
                     detail: "Connect to a gateway first."
                 )
             }

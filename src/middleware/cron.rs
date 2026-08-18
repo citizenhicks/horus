@@ -11,7 +11,7 @@ use super::tools::{
 };
 use super::{Middleware, PromptSection, RuntimeContext};
 use crate::backend::model::ToolDefinition;
-use crate::protocol::{EventMsg, FrontendBlock};
+use crate::protocol::{EventMsg, FrontendBlock, FrontendCommand, FrontendContribution};
 use crate::{BoxFuture, Result};
 
 mod text {
@@ -62,6 +62,19 @@ impl Middleware for Cron {
 
     fn prompt_section(&self, _runtime: &RuntimeContext) -> Result<Option<PromptSection>> {
         Ok(Some(self.section()))
+    }
+
+    fn frontend(&self) -> FrontendContribution {
+        FrontendContribution {
+            capability: self.name().into(),
+            commands: vec![FrontendCommand {
+                name: self.name().into(),
+                arguments: text::COMMAND_ARGUMENTS.into(),
+                description: text::COMMAND_DESCRIPTION.into(),
+                requires_idle: false,
+            }],
+            ..FrontendContribution::default()
+        }
     }
 
     fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {

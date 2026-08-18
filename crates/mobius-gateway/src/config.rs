@@ -38,8 +38,8 @@ pub(crate) use self::validation::{effective_reasoning_effort, model_route_id};
 use self::workspace::*;
 pub(crate) use self::workspace::{create_workspace_directory, local_user_name};
 
-const CONFIG_VERSION: u32 = 16;
-const CHAT_SPEC_VERSION: u32 = 7;
+const CONFIG_VERSION: u32 = 17;
+const CHAT_SPEC_VERSION: u32 = 8;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "mobius_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
 const CLOUDFLARE_TOKEN_FILE: &str = "cloudflare-token";
@@ -97,6 +97,7 @@ pub struct GatewayConfig {
     pub cloudflare: Option<CloudflareConfig>,
     pub default_agent: Option<VersionedAgentConfig>,
     pub(crate) configured_providers: BTreeMap<String, ConfiguredProvider>,
+    pub(crate) installed_extensions: BTreeMap<String, crate::extensions::InstalledExtension>,
     usage: UsageHistory,
 }
 
@@ -138,6 +139,7 @@ impl Default for AgentComposition {
                     .expect("default provider web-search manifest"),
             },
             middleware: crate::middleware_manifest::default_config(),
+            extensions: BTreeSet::new(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
             max_model_steps: DEFAULT_MAX_MODEL_STEPS as u64,
         }
@@ -154,6 +156,7 @@ impl GatewayConfig {
             cloudflare: None,
             default_agent: None,
             configured_providers: BTreeMap::new(),
+            installed_extensions: BTreeMap::new(),
             usage: UsageHistory::default(),
         };
         config.validate()?;
@@ -334,6 +337,7 @@ impl GatewayConfig {
             }
             validate_configured_provider(configured)?;
         }
+        crate::extensions::validate_installed(&self.installed_extensions)?;
         validate_custom_model_route_count(&self.configured_providers)?;
         if let Some(default) = &self.default_agent {
             if default.revision == 0 {

@@ -62,3 +62,61 @@ fn only_wholly_interruptible_batches_stop_for_active_input() {
     assert!(!catalog.interrupts_on_active_input(&[call("wait"), call("write"),]));
     assert!(!catalog.interrupts_on_active_input(&[]));
 }
+
+#[test]
+fn registered_tool_owns_its_hook_argument_mapping() {
+    let mut catalog = Catalog::default();
+    catalog
+        .register(Arc::new(ApplyPatch))
+        .expect("register apply patch");
+    let call = ToolCall {
+        call_id: "patch".into(),
+        name: "apply_patch".into(),
+        arguments: serde_json::json!({"patch": "*** Begin Patch"}),
+    };
+
+    let tool = catalog.hook_tool(&call, None);
+    let rewritten = catalog
+        .rewrite_hook_input(
+            &call.name,
+            serde_json::json!({"command": "*** Begin Patch\n*** End Patch"}),
+        )
+        .expect("rewrite hook input");
+
+    assert_eq!(
+        (tool.name, tool.subjects, tool.input, rewritten),
+        (
+            "apply_patch".into(),
+            vec!["apply_patch".into(), "Edit".into(), "Write".into()],
+            serde_json::json!({"command": "*** Begin Patch"}),
+            serde_json::json!({"patch": "*** Begin Patch\n*** End Patch"}),
+        )
+    );
+}
+
+#[test]
+fn custom_tools_keep_their_name_and_object_input_for_hooks() {
+    let mut catalog = Catalog::default();
+    catalog
+        .register(Arc::new(InterruptibleTool {
+            name: "custom",
+            interruptible: false,
+        }))
+        .expect("register custom tool");
+    let call = ToolCall {
+        call_id: "custom".into(),
+        name: "custom".into(),
+        arguments: serde_json::json!({"value": 1}),
+    };
+
+    let tool = catalog.hook_tool(&call, Some("approval reason"));
+
+    assert_eq!(
+        (tool.name, tool.subjects, tool.input),
+        (
+            "custom".into(),
+            vec!["custom".into()],
+            serde_json::json!({"value": 1, "description": "approval reason"}),
+        )
+    );
+}

@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn external_skill_resources_are_loaded_lazily() {
+async fn external_skill_resources_use_the_generic_read_tool() {
     let workspace = TempDir::new().expect("create workspace");
     let skill_root = TempDir::new().expect("create skill root");
     let skill_dir = skill_root.path().join("review");
@@ -16,27 +16,39 @@ async fn external_skill_resources_are_loaded_lazily() {
         "Always inspect every caller.",
     )
     .expect("write skill reference");
+    let skill_file = std::fs::canonicalize(skill_dir.join("SKILL.md")).expect("canonical skill");
+    let details = std::fs::canonicalize(skill_dir.join("references/details.md"))
+        .expect("canonical skill reference");
     let model = Arc::new(ScriptedModel::new(vec![
         tool_response(
             "call-1",
-            "load_skill",
-            serde_json::json!({"name": "review"}),
+            "read_file",
+            serde_json::json!({"path": skill_file}),
         ),
-        tool_response(
-            "call-2",
-            "load_skill",
-            serde_json::json!({"name": "review", "path": "references/details.md"}),
-        ),
+        tool_response("call-2", "read_file", serde_json::json!({"path": details})),
         text_response("review loaded"),
     ]));
-    let skills = Skills::discover([skill_root.path().to_path_buf()])
+    let extensions = Extensions::discover([skill_root.path().to_path_buf()])
         .expect("discover skill")
         .prompt("Load the relevant skill before following its instructions.")
         .expect("custom skill prompt");
-    let mut agent = create_agent(test_config(
-        workspace.path(),
-        Arc::clone(&model),
-        vec![Arc::new(skills)],
+    let route: Arc<dyn Model> = model.clone();
+    let sandbox = Arc::new(Sandbox::new(
+        Arc::new(
+            LocalSandbox::new(workspace.path())
+                .expect("local sandbox")
+                .allow_read_root(&skill_dir)
+                .expect("skill read root"),
+        ),
+        ApprovalPolicy::Ask,
+    ));
+    let mut agent = create_agent(AgentConfig::new(
+        Arc::new(ModelRouter::new("test", route)),
+        sandbox,
+        Arc::new(MemoryCheckpoints::default()),
+        MiddlewareStack::new(vec![Arc::new(Tools::coding()), Arc::new(extensions)])
+            .expect("middleware"),
+        "test system prompt",
     ))
     .await
     .expect("create agent");
@@ -55,6 +67,17 @@ async fn external_skill_resources_are_loaded_lazily() {
         requests[0]
             .instructions
             .contains("Load the relevant skill before following its instructions.")
+    );
+    assert!(
+        requests[0]
+            .instructions
+            .contains(skill_file.to_str().expect("skill path is valid UTF-8"))
+    );
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .all(|definition| definition.name != "load_skill")
     );
     assert!(
         requests[1]

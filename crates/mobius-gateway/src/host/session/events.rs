@@ -76,7 +76,6 @@ impl HostState {
         validate_event_frame(&frame)?;
         if let ServerMessage::AgentEvent { record, .. } = &frame.message {
             update_widgets(&mut self.widgets, &record.event.msg);
-            self.record_artifacts(&record.blocks);
             if let EventMsg::ModelStepCompleted(step) = &record.event.msg
                 && matches!(&step.outcome, ModelStepOutcome::Completed { .. })
             {
@@ -176,27 +175,6 @@ impl HostState {
                 .expect("completion requires an active cron run");
             (active, status, message)
         }))
-    }
-
-    pub(super) fn record_artifacts(&mut self, blocks: &[RenderedBlock]) {
-        for block in blocks {
-            upsert_artifact(&mut self.artifacts, &self.running.session_id, block);
-        }
-    }
-
-    pub(super) async fn list_artifacts(
-        &self,
-    ) -> std::result::Result<Vec<ArtifactRecord>, Rejection> {
-        let stored_files = self
-            .session_files
-            .list_artifacts(&self.running.session_id)
-            .await
-            .map_err(internal)?;
-        Ok(merge_stored_file_artifacts(
-            &self.artifacts,
-            &self.running.session_id,
-            stored_files,
-        ))
     }
 
     pub(super) async fn ready(&self) -> Result<SessionReadyPayload> {

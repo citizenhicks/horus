@@ -20,7 +20,6 @@ use super::{
     ToolDefinition,
 };
 use super::{image_data_url, image_input};
-use crate::protocol::FrontendSymbol;
 
 mod manifest {
     include!(concat!(
@@ -526,7 +525,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "kimi",
         manifest::PROVIDER_LABEL,
-        FrontendSymbol::Kimi,
+        "kimi",
         manifest::PROVIDER_DESCRIPTION,
         ProviderAuth::ApiKey("MOONSHOT_API_KEY"),
         manifest::MODELS,

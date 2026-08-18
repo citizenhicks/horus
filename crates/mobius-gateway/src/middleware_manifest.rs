@@ -17,7 +17,7 @@ pub(crate) enum BuiltinMiddleware {
     Tools,
     Instructions,
     Cron,
-    Skills,
+    Extensions,
     Tasks,
     Subagents,
     Steering,
@@ -58,8 +58,8 @@ pub(crate) const MIDDLEWARE: [MiddlewareRegistration; 14] = [
         manifest: &mobius::middleware::cron::MANIFEST,
     },
     MiddlewareRegistration {
-        kind: BuiltinMiddleware::Skills,
-        manifest: &mobius::middleware::skills::MANIFEST,
+        kind: BuiltinMiddleware::Extensions,
+        manifest: &mobius::middleware::extensions::MANIFEST,
     },
     MiddlewareRegistration {
         kind: BuiltinMiddleware::Tasks,
@@ -263,6 +263,7 @@ mod tests {
         assert!(!config.enabled("tasks"));
         assert!(config.enabled("artifacts"));
         assert!(config.enabled("cron"));
+        assert!(config.enabled("extensions"));
         assert!(config.enabled("context_offloading"));
         assert_eq!(
             integer_setting(&config, "context_offloading", "stale_after_tokens")

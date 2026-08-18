@@ -10,6 +10,8 @@ pub struct ReadyPayload {
     pub models: Vec<ModelChoice>,
     pub model_providers: BTreeMap<String, String>,
     pub middleware_features: Vec<MiddlewareFeature>,
+    pub extensions: Vec<ExtensionRecord>,
+    pub contributions: Vec<FrontendContribution>,
     pub max_active_sessions: usize,
 }
 
@@ -154,8 +156,47 @@ pub struct VersionedAgentConfig {
 pub struct AgentComposition {
     pub provider: ProviderConfig,
     pub middleware: MiddlewareConfig,
+    pub extensions: BTreeSet<String>,
     pub system_prompt: String,
     pub max_model_steps: u64,
+}
+
+/// Package format of one gateway-managed extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionKind {
+    Skill,
+    Plugin,
+}
+
+/// One executable plugin hook shown before digest-bound trust is granted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionHookRecord {
+    pub event: String,
+    pub matcher: Option<String>,
+    pub command: String,
+    pub timeout_seconds: u64,
+}
+
+/// Frontend-safe metadata for one installed extension snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionRecord {
+    pub id: String,
+    pub capability: String,
+    pub kind: ExtensionKind,
+    pub name: String,
+    pub description: String,
+    pub version: Option<String>,
+    pub source: String,
+    pub reference: Option<String>,
+    pub subdirectory: Option<String>,
+    pub resolved_revision: String,
+    pub digest: String,
+    pub skills: Vec<String>,
+    pub hooks: Vec<ExtensionHookRecord>,
+    pub hooks_trusted: bool,
 }
 
 /// Provider and model settings. Credentials are resolved only on the gateway host.
@@ -400,24 +441,6 @@ pub struct DailyUsage {
     pub unix_day: u64,
     pub provider: String,
     pub usage: TokenUsage,
-}
-
-/// A reusable artifact emitted for one session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArtifactRecord {
-    pub id: String,
-    pub session_id: String,
-    pub kind: ArtifactKind,
-    pub title: String,
-    pub block: FrontendBlock,
-}
-
-/// Frontend-neutral artifact category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactKind {
-    CodeDiff,
-    File,
 }
 
 /// One persisted scheduled task owned by its source session.

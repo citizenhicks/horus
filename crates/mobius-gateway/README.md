@@ -97,6 +97,13 @@ then stores its own selected model and runtime recipe beside its durable
 checkpoint; changing one chat never changes the catalog, another chat, or its
 workspace.
 
+The gateway also owns the extension catalog. Clients may install a standalone
+Agent Skill or OpenAI plugin from a credential-free HTTPS Git source. Packages
+are stored as content-addressed snapshots and remain inactive until selected for
+the default agent or a chat. Executable plugin hooks require explicit review for
+the installed package digest. Update and uninstall require deactivation first;
+per-workspace plugin data under `.mobius/extensions` is retained.
+
 Automation may register an OpenRouter-compatible HTTPS endpoint without sending
 provider credentials:
 

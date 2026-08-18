@@ -7,18 +7,31 @@ use super::COMMAND_QUEUE_CAPACITY;
 use super::Runner;
 use super::input::{ActiveRoute, ActiveTurnRouter, Wait};
 use super::unix_timestamp_ms;
-use crate::backend::checkpoint::{ActiveExecution, ExecutionOutcome, QueuedInput};
+use crate::backend::checkpoint::{ActiveExecution, ExecutionOutcome};
 use crate::backend::model::{
     has_prompt_cache_breakpoint, mark_prompt_cache_breakpoint, user_message_with_attachments,
 };
 use crate::middleware::{QueuedInputBaseline, TurnEndContext, UserPromptSubmitContext};
 use crate::protocol::{
     ErrorEvent, Event, EventMsg, MessageTarget, Submission, TokenCountEvent, TokenUsageInfo,
-    TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, WarningEvent,
+    TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
 };
 use crate::{Error, Result};
 
 impl Runner {
+    pub(super) async fn stop_resumed_turn_at_session_start(&mut self) -> Result<()> {
+        let Some(reason) = self.pending_session_start_stop.take() else {
+            return Ok(());
+        };
+        let Some(execution) = self.state.active_execution.as_ref() else {
+            return Ok(());
+        };
+        let submission_id = execution.submission_id.clone();
+        let turn_id = execution.turn_id.clone();
+        self.abort(&submission_id, &turn_id, &reason, ExecutionOutcome::Aborted)
+            .await
+    }
+
     pub(super) async fn ready_or_aborted<T>(
         &mut self,
         wait: Wait<T>,
@@ -73,11 +86,19 @@ impl Runner {
                 "cannot start a turn while another execution is active".into(),
             ));
         }
+        self.state.active_execution = Some(ActiveExecution {
+            submission_id: submission_id.clone(),
+            turn_id: turn_id.clone(),
+            started_at_ms: unix_timestamp_ms()?,
+            model_calls: 0,
+            tool_calls: 0,
+            failed_tool_calls: 0,
+            usage: crate::protocol::TokenUsage::default(),
+        });
         let mut hook_messages = Vec::new();
         let (hook_input, rejection) = {
             let mut context = UserPromptSubmitContext {
-                session_id: &self.config.session_id,
-                turn_id: &turn_id,
+                turn: self.runtime.turn_identity(&turn_id),
                 message: &message,
                 attachments: &attachments,
                 events: &mut hook_messages,
@@ -91,25 +112,28 @@ impl Runner {
             (context.input, context.rejection)
         };
         if let Some(rejection) = rejection {
-            for message in hook_messages {
-                self.emit(&submission_id, message).await?;
-            }
-            self.emit(
+            let mut events = vec![turn_event(
                 &submission_id,
-                EventMsg::Warning(WarningEvent { message: rejection }),
-            )
-            .await?;
-            return Ok(());
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    turn_id: turn_id.clone(),
+                    model_context_window: Some(self.config.context_window),
+                }),
+            )];
+            events.extend(
+                hook_messages
+                    .into_iter()
+                    .map(|message| turn_event(&submission_id, message)),
+            );
+            return self
+                .abort_with_events(
+                    &submission_id,
+                    &turn_id,
+                    &rejection,
+                    ExecutionOutcome::Aborted,
+                    events,
+                )
+                .await;
         }
-        self.state.active_execution = Some(ActiveExecution {
-            submission_id: submission_id.clone(),
-            turn_id: turn_id.clone(),
-            started_at_ms: unix_timestamp_ms()?,
-            model_calls: 0,
-            tool_calls: 0,
-            failed_tool_calls: 0,
-            usage: crate::protocol::TokenUsage::default(),
-        });
         self.state.context.extend(hook_input);
         if self.state.first_user_message.is_none() && !message.trim().is_empty() {
             self.state.first_user_message = Some(message.clone());
@@ -209,13 +233,8 @@ impl Runner {
         mut events: Vec<Event>,
     ) -> Result<()> {
         events.extend(
-            self.turn_end_events(
-                submission_id,
-                turn_id,
-                &self.state.pending_input,
-                ExecutionOutcome::Completed,
-            )
-            .await?,
+            self.turn_end_events(submission_id, turn_id, ExecutionOutcome::Completed)
+                .await?,
         );
         events.push(turn_event(
             submission_id,
@@ -251,7 +270,7 @@ impl Runner {
             .await?;
         self.state.pending_approval = None;
         events.extend(
-            self.turn_end_events(submission_id, turn_id, &self.state.pending_input, outcome)
+            self.turn_end_events(submission_id, turn_id, outcome)
                 .await?,
         );
         self.state.pending_input.clear();
@@ -267,12 +286,15 @@ impl Runner {
     }
 
     async fn turn_end_events(
-        &self,
+        &mut self,
         submission_id: &str,
         turn_id: &str,
-        queued_input: &[QueuedInput],
         outcome: ExecutionOutcome,
     ) -> Result<Vec<Event>> {
+        if self.turn_end_turn_id.as_deref() == Some(turn_id) {
+            return Ok(Vec::new());
+        }
+        self.turn_end_turn_id = Some(turn_id.to_owned());
         let mut messages = Vec::new();
         self.config
             .middleware
@@ -280,7 +302,7 @@ impl Runner {
                 session_id: &self.config.session_id,
                 turn_id,
                 outcome,
-                queued_input,
+                queued_input: &self.state.pending_input,
                 owner: None,
                 events: &mut messages,
             })

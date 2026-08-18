@@ -53,16 +53,15 @@ struct ProfileView: View {
 
 private struct SettingsInformationButton: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.mobiusPalette) private var palette
     @State private var showsInformation = false
 
     var body: some View {
         Button {
             showsInformation = true
         } label: {
-            MobiusIcon(.info, size: MobiusStyle.glyphInline, foreground: palette.muted)
+            MobiusIcon(.info, size: MobiusStyle.glyphInline)
         }
-        .buttonStyle(MobiusIconButtonStyle())
+        .mobiusIconButton()
         .accessibilityLabel("About möbius")
         .accessibilityHint("Shows version, legal, and support information")
         .help("About möbius")

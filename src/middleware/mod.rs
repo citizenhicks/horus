@@ -32,12 +32,12 @@ pub mod compaction;
 mod context;
 pub mod context_offloading;
 pub mod cron;
+pub mod extensions;
 pub mod instructions;
 pub mod manifest;
 pub mod scratchpad;
 pub mod session_files;
 pub mod sessions;
-pub mod skills;
 pub mod steering;
 pub mod subagents;
 pub mod tasks;
@@ -47,9 +47,9 @@ pub(crate) use context::QueuedInputBaseline;
 pub use context::{
     ActiveCommandContext, ActiveSubmissionContext, ActiveSubmissionResult, CompactContext,
     FrontendEventSink, MiddlewareCommandContext, ModelContext, ModelRequestContext,
-    PermissionDecision, PermissionRequestContext, PostToolUseContext, PreToolUseContext,
-    QueuedInputQueue, QueuedInputSnapshot, QueuedInputValue, QueuedInputView, RuntimeContext,
-    SessionStartContext, SessionStartSource, StopContext, TurnEndContext, UserPromptSubmitContext,
+    PermissionRequestContext, PostToolUseContext, PreToolUseContext, QueuedInputQueue,
+    QueuedInputSnapshot, QueuedInputValue, QueuedInputView, RuntimeContext, SessionStartContext,
+    SessionStartSource, StopContext, TurnEndContext, TurnIdentity, UserPromptSubmitContext,
 };
 
 use tools::Catalog;
@@ -259,7 +259,7 @@ pub trait Middleware: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// Observes context immediately before compaction.
+    /// Intercepts context immediately before compaction and may stop the active turn.
     fn pre_compact<'a>(
         &'a self,
         _context: &'a mut CompactContext<'_>,
@@ -267,7 +267,7 @@ pub trait Middleware: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// Observes context after compaction has committed its rewrite.
+    /// Intercepts the committed compacted context and may stop the active turn.
     fn post_compact<'a>(
         &'a self,
         _context: &'a mut CompactContext<'_>,
@@ -359,6 +359,12 @@ impl Middleware for Sandbox {
 #[derive(Clone)]
 pub struct MiddlewareStack {
     entries: Vec<Arc<dyn Middleware>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionStartResult {
+    pub(crate) stop_reason: Option<String>,
+    pub(crate) input_changed: bool,
 }
 
 impl MiddlewareStack {
@@ -514,19 +520,21 @@ impl MiddlewareStack {
         queued_input: &[DurableQueuedInput],
         source: SessionStartSource,
         input: &mut Vec<Value>,
-    ) -> Result<()> {
-        let compact_input_len = (source == SessionStartSource::Compact).then_some(input.len());
+    ) -> Result<SessionStartResult> {
+        let compact_input = (source == SessionStartSource::Compact).then(|| input.clone());
         let mut context = SessionStartContext {
             runtime,
             source,
             queued_input: QueuedInputSnapshot::default(),
             input,
+            input_changed: false,
+            stop_reason: None,
         };
         for (index, entry) in self.entries.iter().enumerate() {
             context.queued_input = QueuedInputSnapshot::for_owner(entry.name(), queued_input);
             if let Err(error) = entry.session_start(&mut context).await {
-                if let Some(input_len) = compact_input_len {
-                    context.input.truncate(input_len);
+                if let Some(input) = compact_input {
+                    *context.input = input;
                     return Err(error);
                 }
                 let mut rollback_error = None;
@@ -546,7 +554,10 @@ impl MiddlewareStack {
                 });
             }
         }
-        Ok(())
+        Ok(SessionStartResult {
+            stop_reason: context.stop_reason,
+            input_changed: context.input_changed,
+        })
     }
 
     pub(crate) async fn user_prompt_submit(
@@ -563,6 +574,9 @@ impl MiddlewareStack {
         for entry in &self.entries {
             context.queued_input.scope(entry.name());
             entry.pre_model(&mut context).await?;
+        }
+        if context.turn_stopped() {
+            return Ok(());
         }
         for entry in &self.entries {
             let mut request = ModelRequestContext {
@@ -602,18 +616,24 @@ impl MiddlewareStack {
         Ok(())
     }
 
-    pub(crate) async fn pre_compact(&self, mut context: CompactContext<'_>) -> Result<()> {
+    pub(crate) async fn pre_compact(
+        &self,
+        mut context: CompactContext<'_>,
+    ) -> Result<Option<String>> {
         for entry in &self.entries {
             entry.pre_compact(&mut context).await?;
         }
-        Ok(())
+        Ok(context.stop_reason)
     }
 
-    pub(crate) async fn post_compact(&self, mut context: CompactContext<'_>) -> Result<()> {
+    pub(crate) async fn post_compact(
+        &self,
+        mut context: CompactContext<'_>,
+    ) -> Result<Option<String>> {
         for entry in &self.entries {
             entry.post_compact(&mut context).await?;
         }
-        Ok(())
+        Ok(context.stop_reason)
     }
 
     pub(crate) async fn stop(&self, context: &mut StopContext<'_>) -> Result<()> {

@@ -101,11 +101,13 @@ impl Middleware for Sessions {
                     name: "resume".into(),
                     arguments: String::new(),
                     description: text::COMMAND_RESUME_DESCRIPTION.into(),
+                    requires_idle: true,
                 },
                 FrontendCommand {
                     name: "fork".into(),
                     arguments: String::new(),
                     description: text::COMMAND_FORK_DESCRIPTION.into(),
+                    requires_idle: true,
                 },
             ],
             widgets: vec![FrontendWidget {

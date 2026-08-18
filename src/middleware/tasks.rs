@@ -86,6 +86,7 @@ impl Middleware for Tasks {
                 name: "tasks".into(),
                 arguments: String::new(),
                 description: text::COMMAND_TASKS_DESCRIPTION.into(),
+                requires_idle: true,
             }],
             ..FrontendContribution::default()
         }
@@ -322,6 +323,8 @@ mod tests {
             checkpoints: Arc::clone(&checkpoints),
             session_id: "session-a".into(),
             model_route: "default".into(),
+            model: "model".into(),
+            approval_policy: crate::backend::sandbox::ApprovalPolicy::Ask,
             session_context: SessionContext::default(),
             metadata: BTreeMap::new(),
             role: crate::agent::AgentRole::Main,

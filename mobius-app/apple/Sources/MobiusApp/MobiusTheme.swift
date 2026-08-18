@@ -13,7 +13,7 @@ enum MobiusSymbol {
         vocabulary[symbol]
     }
 
-    /// One entry per `FrontendSymbol` variant.
+    /// Semantic protocol tokens plus provider artwork known by this client.
     private static let vocabulary: [String: MobiusGlyph] = [
         "agent": .robot,
         "brain": .brain,
@@ -29,6 +29,11 @@ enum MobiusSymbol {
         "promote": .arrowCircleUp,
         "route": .path,
         "search": .magnifyingGlass,
+        "security_review": .aiSecurity02,
+        "shield": .shield02,
+        "shield_alert": .shieldAlert,
+        "shield_check": .shieldCheck,
+        "shield_off": .shieldOff,
         "sparkle": .sparkle,
         "storage": .hardDrives,
         "task": .checkCircle,

@@ -45,12 +45,16 @@ use crate::backend::sandbox::local::LocalSandbox;
 use crate::backend::sandbox::{ApprovalPolicy, ApprovalReviewerConfig};
 use crate::middleware::ActiveSubmissionContext;
 use crate::middleware::ActiveSubmissionResult;
+use crate::middleware::CompactContext;
 use crate::middleware::Middleware;
 use crate::middleware::MiddlewareStack;
 use crate::middleware::ModelContext;
 use crate::middleware::ModelRequestContext;
+use crate::middleware::PostToolUseContext;
+use crate::middleware::PreToolUseContext;
 use crate::middleware::RuntimeContext;
 use crate::middleware::SessionStartContext;
+use crate::middleware::UserPromptSubmitContext;
 use crate::middleware::compaction::Compaction;
 use crate::middleware::steering::Steering;
 use crate::middleware::tools::ApprovalRequirement;
@@ -74,6 +78,7 @@ use crate::protocol::ModelStepContentPhase;
 use crate::protocol::ModelStepOutcome;
 use crate::protocol::Op;
 use crate::protocol::SessionContext;
+use crate::protocol::SessionFileReference;
 use crate::protocol::TokenUsage;
 use crate::protocol::ToolCallEndEvent;
 use crate::protocol::WarningEvent;
@@ -107,7 +112,24 @@ struct InterruptedStreamModel {
     retry_after: Option<String>,
 }
 
-struct NativeCompactionModel;
+#[derive(Default)]
+struct NativeCompactionModel {
+    responses: AtomicUsize,
+    compactions: AtomicUsize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompactStop {
+    Before,
+    After,
+    SessionStart,
+}
+
+struct StoppingCompaction(CompactStop);
+
+struct StoppingSessionStart;
+
+struct RejectFirstPrompt(AtomicBool);
 
 struct ScriptedModel {
     outputs: Mutex<VecDeque<ModelOutput>>,
@@ -122,6 +144,8 @@ struct DurableBeforeModel;
 struct FailingBeforeModel;
 
 struct ApprovalRequiredTestTool;
+
+struct ToolHookContext;
 
 struct SaturatingMiddleware;
 
@@ -337,6 +361,78 @@ impl Middleware for DurableBeforeModel {
     }
 }
 
+impl Middleware for StoppingCompaction {
+    fn name(&self) -> &'static str {
+        "stopping_compaction"
+    }
+
+    fn session_start<'a>(
+        &'a self,
+        context: &'a mut SessionStartContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.0 == CompactStop::SessionStart
+                && context.source() == crate::middleware::SessionStartSource::Compact
+            {
+                context.stop("session-start hook stopped the turn")?;
+            }
+            Ok(())
+        })
+    }
+
+    fn pre_compact<'a>(&'a self, context: &'a mut CompactContext<'_>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.0 == CompactStop::Before {
+                context.stop("pre-compact hook stopped the turn")?;
+            }
+            Ok(())
+        })
+    }
+
+    fn post_compact<'a>(
+        &'a self,
+        context: &'a mut CompactContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.0 == CompactStop::After {
+                context.stop("post-compact hook stopped the turn")?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl Middleware for StoppingSessionStart {
+    fn name(&self) -> &'static str {
+        "stopping_session_start"
+    }
+
+    fn session_start<'a>(
+        &'a self,
+        context: &'a mut SessionStartContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { context.stop("session-start hook stopped the turn") })
+    }
+}
+
+impl Middleware for RejectFirstPrompt {
+    fn name(&self) -> &'static str {
+        "reject_first_prompt"
+    }
+
+    fn user_prompt_submit<'a>(
+        &'a self,
+        context: &'a mut UserPromptSubmitContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if !self.0.swap(true, Ordering::SeqCst) {
+                context.reject("prompt rejected by policy")?;
+            }
+            Ok(())
+        })
+    }
+}
+
 impl Middleware for FailingBeforeModel {
     fn name(&self) -> &'static str {
         "failing_before_model"
@@ -344,6 +440,38 @@ impl Middleware for FailingBeforeModel {
 
     fn pre_model<'a>(&'a self, _context: &'a mut ModelContext<'_>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Err(Error::Provider("later middleware failed".into())) })
+    }
+}
+
+impl Middleware for ToolHookContext {
+    fn name(&self) -> &'static str {
+        "tool_hook_context"
+    }
+
+    fn pre_tool_use<'a>(
+        &'a self,
+        context: &'a mut PreToolUseContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            context.push_input(crate::backend::model::internal_user_message(
+                "pre_tool_hook",
+                "before",
+            ));
+            Ok(())
+        })
+    }
+
+    fn post_tool_use<'a>(
+        &'a self,
+        context: &'a mut PostToolUseContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            context.push_input(crate::backend::model::internal_user_message(
+                "post_tool_hook",
+                "after",
+            ));
+            Ok(())
+        })
     }
 }
 
@@ -425,6 +553,7 @@ impl Model for NativeCompactionModel {
         _request: ModelRequest,
         _events: ModelEventSink,
     ) -> BoxFuture<'a, Result<ModelOutput>> {
+        self.responses.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(scripted_message("done")) })
     }
 
@@ -433,6 +562,7 @@ impl Model for NativeCompactionModel {
     }
 
     fn compact<'a>(&'a self, _request: CompactRequest<'a>) -> BoxFuture<'a, Result<CompactOutput>> {
+        self.compactions.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {
             CompactOutput::from_output(
                 vec![serde_json::json!({

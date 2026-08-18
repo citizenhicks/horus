@@ -28,10 +28,10 @@ use storage::{
     validate_stored_file,
 };
 
-pub const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
-pub const MAX_SESSION_BYTES: u64 = 250 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+pub(crate) const MAX_SESSION_BYTES: u64 = 250 * 1024 * 1024;
 pub const MAX_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
-pub const MAX_READ_CHUNK_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_READ_CHUNK_BYTES: usize = 256 * 1024;
 const MAX_SESSION_FILES: usize = 128;
 const MAX_SESSION_ID_BYTES: usize = 4 * 1024;
 const MAX_VALIDATED_BLOBS: usize = 1_024;

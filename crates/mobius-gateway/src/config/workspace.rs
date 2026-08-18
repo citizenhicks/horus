@@ -96,6 +96,16 @@ fn validate_workspace_boundaries(
             "gateway state directory and chat workspace must not overlap".into(),
         ));
     }
+    let extensions = crate::extensions::extensions_path(&state_dir);
+    if path.starts_with(&extensions)
+        || extensions.starts_with(path)
+        || fs::canonicalize(&extensions)
+            .is_ok_and(|extensions| path.starts_with(&extensions) || extensions.starts_with(path))
+    {
+        return Err(Error::Config(
+            "extension store and chat workspace must not overlap".into(),
+        ));
+    }
     if tls.is_some_and(|tls| {
         fs::canonicalize(&tls.private_key).is_ok_and(|key| key.starts_with(path))
     }) {

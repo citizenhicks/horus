@@ -797,6 +797,8 @@ fn test_context(
         checkpoints,
         session_id: "root".into(),
         model_route: "test".into(),
+        model: "model".into(),
+        approval_policy: crate::backend::sandbox::ApprovalPolicy::Ask,
         session_context: Default::default(),
         metadata: Default::default(),
         role: crate::agent::AgentRole::Main,

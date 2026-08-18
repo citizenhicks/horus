@@ -11,7 +11,7 @@ use super::{
     AgentScope, DEFAULT_WAIT_MS, ForkTurns, MAX_TASK_NAME_BYTES, MAX_WAIT_MS, MIN_WAIT_MS, text,
 };
 use crate::backend::model::ToolDefinition;
-use crate::middleware::tools::{Tool, ToolContext};
+use crate::middleware::tools::{HookIdentity, Tool, ToolContext};
 use crate::protocol::{Op, is_internal_message, strip_attachment_references};
 use crate::{BoxFuture, Error, Result};
 
@@ -62,6 +62,13 @@ impl Tool for SpawnAgent {
                 "additionalProperties": false
             }),
         }
+    }
+
+    fn hook_identity(&self) -> Option<HookIdentity> {
+        Some(HookIdentity {
+            name: "spawn_agent",
+            subjects: &["spawn_agent", "Agent"],
+        })
     }
 
     fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>> {

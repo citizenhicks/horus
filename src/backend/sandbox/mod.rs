@@ -18,6 +18,7 @@ use crate::protocol::EventMsg;
 use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendEvent;
+use crate::protocol::FrontendTone;
 use crate::protocol::ReviewDecision;
 
 mod approval;
@@ -40,26 +41,36 @@ const APPROVAL_POLICIES: &[MiddlewareSettingChoice] = &[
         value: "ask",
         label: text::APPROVAL_POLICY_ASK_LABEL,
         description: text::APPROVAL_POLICY_ASK_DESCRIPTION,
+        symbol: Some("shield_check"),
+        tone: FrontendTone::Neutral,
     },
     MiddlewareSettingChoice {
         value: "allow",
         label: text::APPROVAL_POLICY_ALLOW_LABEL,
         description: text::APPROVAL_POLICY_ALLOW_DESCRIPTION,
+        symbol: Some("shield"),
+        tone: FrontendTone::Warning,
     },
     MiddlewareSettingChoice {
         value: "allow_network",
         label: text::APPROVAL_POLICY_ALLOW_NETWORK_LABEL,
         description: text::APPROVAL_POLICY_ALLOW_NETWORK_DESCRIPTION,
+        symbol: Some("shield_alert"),
+        tone: FrontendTone::Warning,
     },
     MiddlewareSettingChoice {
         value: "auto_approve",
         label: text::APPROVAL_POLICY_AUTO_APPROVE_LABEL,
         description: text::APPROVAL_POLICY_AUTO_APPROVE_DESCRIPTION,
+        symbol: Some("security_review"),
+        tone: FrontendTone::Warning,
     },
     MiddlewareSettingChoice {
         value: "full_access",
         label: text::APPROVAL_POLICY_FULL_ACCESS_LABEL,
         description: text::APPROVAL_POLICY_FULL_ACCESS_DESCRIPTION,
+        symbol: Some("shield_off"),
+        tone: FrontendTone::Error,
     },
 ];
 const REVIEWER_STRICTNESS: &[MiddlewareSettingChoice] = &[
@@ -67,16 +78,22 @@ const REVIEWER_STRICTNESS: &[MiddlewareSettingChoice] = &[
         value: "relaxed",
         label: text::REVIEWER_STRICTNESS_RELAXED_LABEL,
         description: text::REVIEWER_STRICTNESS_RELAXED_DESCRIPTION,
+        symbol: None,
+        tone: FrontendTone::Neutral,
     },
     MiddlewareSettingChoice {
         value: "standard",
         label: text::REVIEWER_STRICTNESS_STANDARD_LABEL,
         description: text::REVIEWER_STRICTNESS_STANDARD_DESCRIPTION,
+        symbol: None,
+        tone: FrontendTone::Neutral,
     },
     MiddlewareSettingChoice {
         value: "strict",
         label: text::REVIEWER_STRICTNESS_STRICT_LABEL,
         description: text::REVIEWER_STRICTNESS_STRICT_DESCRIPTION,
+        symbol: None,
+        tone: FrontendTone::Neutral,
     },
 ];
 const SETTINGS: &[MiddlewareSettingManifest] = &[
@@ -88,6 +105,7 @@ const SETTINGS: &[MiddlewareSettingManifest] = &[
         unset_label: None,
         default: Some(text::DEFAULTS_APPROVAL_POLICY),
         max_bytes: 32,
+        composer: true,
     },
     MiddlewareSettingManifest::Select {
         id: "reviewer_model_route",
@@ -97,6 +115,7 @@ const SETTINGS: &[MiddlewareSettingManifest] = &[
         unset_label: Some(text::SETTING_REVIEWER_MODEL_ROUTE_UNSET_LABEL),
         default: None,
         max_bytes: 4 * 1024,
+        composer: false,
     },
     MiddlewareSettingManifest::Select {
         id: "reviewer_strictness",
@@ -106,6 +125,7 @@ const SETTINGS: &[MiddlewareSettingManifest] = &[
         unset_label: None,
         default: Some(text::DEFAULTS_REVIEWER_STRICTNESS),
         max_bytes: 16,
+        composer: false,
     },
 ];
 
@@ -196,6 +216,13 @@ pub struct CommandOutputSink {
 
 type CommandOutputCallback = dyn Fn(CommandStream, &[u8]) + Send + Sync;
 
+/// Authorizes one command at its process-launch boundary.
+///
+/// Returning without invoking the callback denies the launch. Implementations must invoke it
+/// only while the authoritative authorization state is held.
+pub type CommandAuthorization =
+    Arc<dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()> + Send + Sync>;
+
 impl CommandOutputSink {
     pub(crate) fn new(callback: impl Fn(CommandStream, &[u8]) + Send + Sync + 'static) -> Self {
         Self {
@@ -231,6 +258,21 @@ pub trait SandboxBackend: Send + Sync {
         mode: CommandMode,
         output: CommandOutputSink,
     ) -> BoxFuture<'a, Result<CommandOutput>>;
+
+    /// Runs a shell command only when authorization launches it atomically.
+    ///
+    /// Backends without an atomic launch boundary fail closed.
+    fn execute_authorized<'a>(
+        &'a self,
+        _command: &'a str,
+        _sandbox_mode: SandboxMode,
+        _network_access: NetworkAccess,
+        _mode: CommandMode,
+        _output: CommandOutputSink,
+        _authorization: &'a CommandAuthorization,
+    ) -> BoxFuture<'a, Result<Option<CommandOutput>>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Approval-owning boundary around one execution backend.
@@ -259,6 +301,10 @@ impl Sandbox {
         } else {
             text::PROMPT_OTHER
         }
+    }
+
+    pub(crate) const fn approval_policy(&self) -> ApprovalPolicy {
+        self.approval.policy()
     }
 
     /// Configures the isolated model reviewer used by automatic approval.
@@ -505,6 +551,26 @@ pub(crate) struct SandboxApprovalRequest {
 mod tests {
     use super::*;
     use crate::backend::sandbox::local::LocalSandbox;
+    use crate::protocol::{FrontendSettingKind, FrontendSymbol};
+
+    #[test]
+    fn approval_policy_advertises_its_composer_presentation() {
+        let feature = MANIFEST.feature(&[]);
+        let setting = feature
+            .settings
+            .iter()
+            .find(|setting| setting.composer)
+            .expect("composer setting");
+        let FrontendSettingKind::Select { options, .. } = &setting.kind else {
+            panic!("composer setting must be a select");
+        };
+
+        assert_eq!(setting.id, "approval_policy");
+        assert_eq!(options[0].symbol, Some(FrontendSymbol::ShieldCheck));
+        assert_eq!(options[3].symbol, Some(FrontendSymbol::SecurityReview));
+        assert_eq!(options[4].symbol, Some(FrontendSymbol::ShieldOff));
+        assert_eq!(options[4].tone, FrontendTone::Error);
+    }
 
     #[tokio::test]
     async fn mutation_fails_closed_without_per_call_authority() {

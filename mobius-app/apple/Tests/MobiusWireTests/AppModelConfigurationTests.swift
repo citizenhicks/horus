@@ -40,6 +40,8 @@ extension AppModelTests {
             models: [],
             modelProviders: [:],
             middlewareFeatures: [],
+            extensions: [],
+            contributions: [],
             maxActiveSessions: 4
         ))
 
@@ -80,6 +82,7 @@ extension AppModelTests {
                     "context_offloading": ["stale_after_tokens": .integer(50_000)]
                 ]
             ),
+            extensions: [],
             systemPrompt: "Test",
             maxModelSteps: 256
         )
@@ -319,11 +322,12 @@ extension AppModelTests {
                 webSearch: .cached
             ),
             middleware: MiddlewareConfig(
-                enabled: ["skills"],
+                enabled: ["extensions"],
                 settings: [
                     "context_offloading": ["stale_after_tokens": .integer(50_000)]
                 ]
             ),
+            extensions: [],
             systemPrompt: "Active",
             maxModelSteps: 256
         )
@@ -344,6 +348,8 @@ extension AppModelTests {
             models: [],
             modelProviders: [:],
             middlewareFeatures: [],
+            extensions: [],
+            contributions: [],
             maxActiveSessions: 4
         ))
 
@@ -384,59 +390,35 @@ extension AppModelTests {
         XCTAssertEqual(model.defaultAgentApplyState, .failed("Default failure"))
     }
 
-    func testApprovalPolicyConfiguresTheActiveChatThroughMiddleware() async throws {
+    func testComposerSettingConfiguresTheActiveChatWithoutCapabilityLogic() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model { request in await recorder.record(request) }
         var active = composition()
         active.middleware.setSetting(
-            .string("ask"),
-            middleware: "sandbox",
-            setting: "approval_policy"
+            .string("safe"),
+            middleware: "example",
+            setting: "access"
         )
         model.selectedSessionID = "chat-1"
         model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
         model.agentDraft = active
 
-        model.setApprovalPolicyForCurrentChat("allow_network")
+        model.setAgentSettingForCurrentChat(
+            .string("broader"),
+            middleware: "example",
+            setting: "access"
+        )
         try await Task.sleep(for: .milliseconds(20))
 
         let requests = await recorder.requests()
         let request = try XCTUnwrap(requests.first)
         guard case .configureSession(_, _, let expectedRevision, let config) = request else {
-            return XCTFail("Expected approval policy to configure the active chat")
+            return XCTFail("Expected composer setting to configure the active chat")
         }
         XCTAssertEqual(expectedRevision, 3)
         XCTAssertEqual(
-            config.middleware.settings["sandbox"]?["approval_policy"],
-            .string("allow_network")
-        )
-    }
-
-    func testFullAccessPolicyConfiguresTheActiveChatThroughMiddleware() async throws {
-        let recorder = GatewayRequestRecorder()
-        let model = try model { request in await recorder.record(request) }
-        var active = composition()
-        active.middleware.setSetting(
-            .string("ask"),
-            middleware: "sandbox",
-            setting: "approval_policy"
-        )
-        model.selectedSessionID = "chat-1"
-        model.agentSnapshot = VersionedAgentConfig(revision: 3, config: active)
-        model.agentDraft = active
-
-        model.setApprovalPolicyForCurrentChat("full_access")
-        try await Task.sleep(for: .milliseconds(20))
-
-        let requests = await recorder.requests()
-        let request = try XCTUnwrap(requests.first)
-        guard case .configureSession(_, _, let expectedRevision, let config) = request else {
-            return XCTFail("Expected approval policy to configure the active chat")
-        }
-        XCTAssertEqual(expectedRevision, 3)
-        XCTAssertEqual(
-            config.middleware.settings["sandbox"]?["approval_policy"],
-            .string("full_access")
+            config.middleware.settings["example"]?["access"],
+            .string("broader")
         )
     }
 
@@ -604,6 +586,126 @@ extension AppModelTests {
         XCTAssertEqual(model.defaultAgentDraft, laterDefaultDraft)
         XCTAssertEqual(model.defaultAgentApplyState, .applied)
         XCTAssertEqual(model.chatAgentApplyState, .idle)
+    }
+
+    func testInstallingAnExtensionUsesTheGatewayRefreshAsItsResult() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        model.connectionState = .ready
+
+        model.extensionInstallSource = " https://github.com/DietrichGebert/ponytail.git "
+        model.installExtension()
+
+        let request = await recorder.firstRequest(after: 0) {
+            if case .installExtension = $0 { return true }
+            return false
+        }
+        guard case .installExtension(
+            let requestID,
+            let source,
+            let reference,
+            let subdirectory
+        ) = try XCTUnwrap(request) else {
+            return XCTFail("Expected an extension install request")
+        }
+        XCTAssertEqual(source, "https://github.com/DietrichGebert/ponytail.git")
+        XCTAssertNil(reference)
+        XCTAssertNil(subdirectory)
+        XCTAssertEqual(model.extensionAction, .installing)
+
+        let installed = extensionRecord()
+        let response = ready(
+            defaultConfig: VersionedAgentConfig(revision: 1, config: composition()),
+            extensions: [installed]
+        )
+        model.applyGatewayConfigurationResponse(requestID: requestID, payload: response)
+
+        XCTAssertEqual(model.extensions, [installed])
+        XCTAssertNil(model.extensionAction)
+        XCTAssertTrue(model.extensionInstallSource.isEmpty)
+        XCTAssertEqual(model.toast?.message, "Extension installed.")
+    }
+
+    func testHookTrustChangesAreBoundToTheInstalledDigest() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        model.connectionState = .ready
+
+        let untrusted = extensionRecord(hooksTrusted: false)
+        model.trustHooks(for: untrusted)
+
+        let trust = await recorder.firstRequest(after: 0) {
+            if case .trustExtensionHooks = $0 { return true }
+            return false
+        }
+        guard case .trustExtensionHooks(
+            let trustRequestID,
+            let trustID,
+            let trustDigest
+        ) = try XCTUnwrap(trust) else {
+            return XCTFail("Expected a hook trust request")
+        }
+        XCTAssertEqual(trustID, untrusted.id)
+        XCTAssertEqual(trustDigest, untrusted.digest)
+        XCTAssertEqual(model.extensionAction, .trusting(untrusted.name))
+
+        model.completeExtensionAction(requestID: trustRequestID)
+        XCTAssertEqual(model.toast?.message, "\(untrusted.name) hooks trusted.")
+        let trusted = extensionRecord()
+        model.untrustHooks(for: trusted)
+
+        let untrust = await recorder.firstRequest(after: 1) {
+            if case .revokeExtensionHooksTrust = $0 { return true }
+            return false
+        }
+        guard case .revokeExtensionHooksTrust(
+            _,
+            let untrustID,
+            let untrustDigest
+        ) = try XCTUnwrap(untrust) else {
+            return XCTFail("Expected a hook trust revocation request")
+        }
+        XCTAssertEqual(untrustID, trusted.id)
+        XCTAssertEqual(untrustDigest, trusted.digest)
+        XCTAssertEqual(model.extensionAction, .untrusting(trusted.name))
+    }
+
+    func testCatalogRefreshPreservesStableMissingExtensionReferences() throws {
+        let model = try model()
+        let snapshot = VersionedAgentConfig(revision: 1, config: composition())
+        var unsavedDefault = snapshot.config
+        unsavedDefault.extensions = ["plugin:ponytail"]
+        var unsavedChat = snapshot.config
+        unsavedChat.extensions = ["plugin:ponytail"]
+        model.defaultAgentSnapshot = snapshot
+        model.defaultAgentDraft = unsavedDefault
+        model.agentDraft = unsavedChat
+
+        model.applyGatewayCatalog(ready(defaultConfig: snapshot))
+
+        XCTAssertEqual(model.defaultAgentDraft?.extensions, ["plugin:ponytail"])
+        XCTAssertEqual(model.agentDraft?.extensions, ["plugin:ponytail"])
+    }
+
+    func testFatalGatewayErrorClearsAnExtensionAction() throws {
+        let model = try model { _ in }
+        model.connectionState = .ready
+        model.extensionInstallSource = "https://github.com/DietrichGebert/ponytail.git"
+        model.installExtension()
+        XCTAssertEqual(model.extensionAction, .installing)
+
+        model.handle(.error(GatewayFailure(
+            code: "internal",
+            message: "Gateway failed.",
+            fatal: true
+        )))
+
+        XCTAssertNil(model.extensionAction)
+        XCTAssertNil(model.extensionRequestID)
+        XCTAssertEqual(
+            model.extensionInstallSource,
+            "https://github.com/DietrichGebert/ponytail.git"
+        )
     }
 
 }

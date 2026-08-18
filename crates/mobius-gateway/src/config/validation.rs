@@ -12,6 +12,7 @@ pub fn validate_agent_composition(config: &AgentComposition) -> Result<()> {
             "system prompt must be 1–{MAX_SYSTEM_PROMPT_BYTES} bytes"
         )));
     }
+    crate::extensions::validate_ids(&config.extensions)?;
     validate_provider_config(&config.provider)?;
     crate::middleware_manifest::validate(&config.middleware)
 }

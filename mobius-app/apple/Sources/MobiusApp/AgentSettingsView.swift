@@ -7,10 +7,9 @@ enum AgentSettingsScope: Equatable {
 
 struct AgentSettingsView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.mobiusPalette) private var palette
-    @State private var showsAgentStatus = false
-    @Namespace private var agentAccessoryNamespace
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var editingCapability: MiddlewareFeature?
     let scope: AgentSettingsScope
 
     var body: some View {
@@ -25,7 +24,7 @@ struct AgentSettingsView: View {
                     // page you write prose into, and it should feel like the other one.
                     TextField("System prompt", text: systemPrompt, axis: .vertical)
                         .font(MobiusStyle.bodyFont)
-                        .lineLimit(3...)
+                        .lineLimit(3...8)
                         .textFieldStyle(.plain)
                         .labelsHidden()
                         .accessibilityLabel("System prompt")
@@ -65,11 +64,7 @@ struct AgentSettingsView: View {
 
                 Section("Capabilities") {
                     ForEach(model.middlewareFeatures, id: \.id) { feature in
-                        capabilityToggle(feature)
-                        ForEach(feature.settings) { setting in
-                            middlewareSetting(feature, setting)
-                                .padding(.leading, MobiusSpace.m)
-                        }
+                        capabilityRow(feature)
                     }
                 }
                 .toggleStyle(.switch)
@@ -81,83 +76,26 @@ struct AgentSettingsView: View {
                 )
             }
         }
+        .listSectionSpacing(.compact)
+        .sheet(item: $editingCapability) { feature in
+            capabilityEditor(feature)
+        }
     }
 
-    /// The status dot, with the save control splitting out of it once the draft diverges.
-    ///
-    /// A shared `glassEffectID` namespace is what makes the second glass shape grow out of
-    /// the first rather than fade in beside it, so the toolbar reads as one control that
-    /// gained an action — and it is the only save affordance on the page, which is why it
-    /// stays visible while the form scrolls.
     private var agentStatusAccessory: some View {
-        // The container's spacing is a merge threshold, not a gap: at 6 it matched the stack
-        // spacing, so the two circles fused into one capsule with an outline drawn round the
-        // pair. Zero keeps them separate shapes that still morph from the shared namespace.
-        GlassEffectContainer(spacing: 0) {
-            // Save sits before the dot: this accessory is pinned to the trailing edge, so
-            // growing rightwards would shove the dot inward and the status would appear to
-            // move. Leading-side growth leaves the dot where the reader last saw it.
-            HStack(spacing: MobiusSpace.s) {
-                if hasChanges {
-                    agentSaveButton
-                        .glassEffect(
-                            .regular.tint(palette.accentFill).interactive(),
-                            in: .circle
-                        )
-                        .glassEffectID("agent-save", in: agentAccessoryNamespace)
-                }
-                agentStatusButton
-                    .glassEffect(.regular.interactive(), in: .circle)
-                    .glassEffectID("agent-status", in: agentAccessoryNamespace)
-            }
-        }
-        .animation(
-            reduceMotion ? nil : .spring(response: 0.34, dampingFraction: 0.78),
-            value: hasChanges
+        SettingsStatusAccessory(
+            subject: "Agent",
+            hasChanges: hasChanges,
+            isSaving: model.isApplyingConfiguration,
+            saveDisabled: model.isApplyingConfiguration,
+            statusLabel: agentStatusLabel,
+            statusDetail: agentStatusDetail,
+            statusColor: agentStatusColor,
+            saveLabel: applyTitle,
+            secondaryActionLabel: reloadActionLabel,
+            secondaryAction: reloadAction,
+            save: applyConfiguration
         )
-    }
-
-    private var agentStatusButton: some View {
-        Button {
-            showsAgentStatus = true
-        } label: {
-            Circle()
-                .fill(agentStatusColor)
-                .frame(width: 8, height: 8)
-                .symbolEffect(
-                    .pulse.byLayer,
-                    options: .repeat(.continuous),
-                    isActive: !reduceMotion
-                )
-                .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
-                .contentShape(Circle())
-        }
-        .buttonStyle(.mobiusPlain)
-        .accessibilityLabel("Agent status")
-        .accessibilityValue(agentStatusLabel)
-        .help("Agent: \(agentStatusLabel)")
-        .popover(isPresented: $showsAgentStatus) {
-            agentStatusDetails
-        }
-    }
-
-    private var agentSaveButton: some View {
-        Button(action: applyConfiguration) {
-            Group {
-                if model.isApplyingConfiguration {
-                    MobiusSpinner(size: MobiusStyle.iconSize, foreground: palette.onAccent)
-                } else {
-                    MobiusIcon(.saveAll, size: MobiusStyle.iconSize, foreground: palette.onAccent)
-                }
-            }
-            .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
-            .contentShape(Circle())
-        }
-        .buttonStyle(.mobiusPlain)
-        .disabled(model.isApplyingConfiguration)
-        .accessibilityLabel(applyTitle)
-        .help(applyTitle)
-        .sensoryFeedback(.success, trigger: hasChanges) { was, now in was && !now }
     }
 
     private var applyTitle: String {
@@ -172,28 +110,6 @@ struct AgentSettingsView: View {
         case .currentChat: model.changeAgentForCurrentChat()
         case .gatewayDefault: model.saveAgentAsDefault()
         }
-    }
-
-    private var agentStatusDetails: some View {
-        VStack(spacing: MobiusSpace.m) {
-            Text(agentStatusLabel)
-                .font(MobiusStyle.controlFont.weight(.semibold))
-                .foregroundStyle(agentStatusColor)
-            Text(agentStatusDetail)
-                .font(MobiusStyle.bodyFont)
-                .foregroundStyle(palette.muted)
-            if case .conflict = applyState {
-                Divider()
-                Button("Reload") {
-                    showsAgentStatus = false
-                    reloadDraft()
-                }
-            }
-        }
-        .multilineTextAlignment(.center)
-        .padding(MobiusSpace.l)
-        .frame(width: 280)
-        .presentationCompactAdaptation(.popover)
     }
 
     private var agentStatusLabel: String {
@@ -238,12 +154,192 @@ struct AgentSettingsView: View {
         }
     }
 
-    private func capabilityToggle(_ feature: MiddlewareFeature) -> some View {
-        HStack(spacing: MobiusSpace.xs) {
+    @ViewBuilder
+    private func capabilityRow(_ feature: MiddlewareFeature) -> some View {
+        if capabilityHasDetails(feature) {
+            HStack(spacing: MobiusSpace.s) {
+                Button {
+                    editingCapability = feature
+                } label: {
+                    HStack(spacing: MobiusSpace.s) {
+                        VStack(alignment: .leading, spacing: MobiusSpace.xxs) {
+                            Text(feature.label)
+                            Text(capabilitySummary(feature))
+                                .font(MobiusStyle.captionFont)
+                                .foregroundStyle(palette.muted)
+                                .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        MobiusIcon(
+                            .caretRight,
+                            size: MobiusStyle.glyphMark,
+                            foreground: palette.muted
+                        )
+                        .accessibilityHidden(true)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(feature.label) settings")
+                .accessibilityValue(capabilitySummary(feature))
+                .accessibilityHint("\(feature.description). Opens settings")
+                .help("Edit \(feature.label) settings")
+
+                Toggle(feature.label, isOn: middleware(feature))
+                    .labelsHidden()
+                    .disabled(feature.required)
+                    .accessibilityHint(feature.description)
+            }
+        } else {
             Toggle(feature.label, isOn: middleware(feature))
                 .disabled(feature.required)
-            SettingsInfoButton(title: feature.label, detail: feature.description)
+                .accessibilityHint(feature.description)
+                .help(feature.description)
         }
+    }
+
+    private func capabilityEditor(_ feature: MiddlewareFeature) -> some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Toggle("Enabled", isOn: middleware(feature))
+                        .disabled(feature.required)
+                } footer: {
+                    Text(feature.description)
+                }
+
+                if !feature.settings.isEmpty {
+                    Section("Settings") {
+                        ForEach(feature.settings) { setting in
+                            middlewareSetting(feature, setting)
+                        }
+                    }
+                }
+
+                let availableExtensions = extensions(for: feature)
+                if !availableExtensions.isEmpty {
+                    Section("Extensions") {
+                        ForEach(availableExtensions) { extensionRecord in
+                            extensionActivation(feature, extensionRecord)
+                        }
+                    }
+                }
+            }
+            .navigationTitle(feature.label)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { editingCapability = nil }
+                }
+            }
+        }
+    }
+
+    private func capabilityHasDetails(_ feature: MiddlewareFeature) -> Bool {
+        !feature.settings.isEmpty || !extensions(for: feature).isEmpty
+    }
+
+    private func capabilitySummary(_ feature: MiddlewareFeature) -> String {
+        let settings = feature.settings.map { settingSummary(feature, $0) }
+        let availableExtensions = extensions(for: feature)
+        guard !availableExtensions.isEmpty else { return settings.joined(separator: " · ") }
+        let active = availableExtensions.filter { draft?.extensions.contains($0.id) == true }
+        let extensionSummary = active.isEmpty
+            ? "No extensions active"
+            : active.map(\.name).joined(separator: ", ")
+        return (settings + [extensionSummary]).joined(separator: " · ")
+    }
+
+    private func settingSummary(
+        _ feature: MiddlewareFeature,
+        _ setting: FrontendSetting
+    ) -> String {
+        switch setting.kind {
+        case .integer(let minimum, let maximum, _):
+            let value = integerSetting(
+                feature,
+                setting,
+                minimum: minimum,
+                maximum: maximum
+            ).wrappedValue
+            return "\(setting.label): \(value.formatted())"
+        case .select(let options, let unsetLabel):
+            guard let selected = selectSetting(feature, setting).wrappedValue else {
+                return unsetLabel ?? "Not set"
+            }
+            if let choice = model.modelChoices.first(where: { $0.route == selected }) {
+                return model.modelLabel(for: choice)
+            }
+            return options.first { $0.value == selected }?.label ?? selected
+        }
+    }
+
+    private var reloadActionLabel: String? {
+        if case .conflict = applyState { "Reload" } else { nil }
+    }
+
+    private var reloadAction: (() -> Void)? {
+        guard reloadActionLabel != nil else { return nil }
+        return { reloadDraft() }
+    }
+
+    private func extensions(for feature: MiddlewareFeature) -> [ExtensionRecord] {
+        model.extensions.filter { $0.capability == feature.id }
+    }
+
+    private func extensionActivation(
+        _ feature: MiddlewareFeature,
+        _ extensionRecord: ExtensionRecord
+    ) -> some View {
+        let selection = extensionSelection(extensionRecord)
+        return HStack(spacing: MobiusSpace.xs) {
+            VStack(alignment: .leading, spacing: MobiusSpace.xxs) {
+                Text(extensionRecord.name)
+                Text(extensionMetadata(extensionRecord))
+                    .font(MobiusStyle.captionFont)
+                    .foregroundStyle(
+                        extensionRecord.hooksTrusted ? palette.muted : palette.warning
+                    )
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityHidden(true)
+            SettingsInfoButton(
+                title: extensionRecord.name,
+                detail: extensionDetail(extensionRecord)
+            )
+            Toggle(extensionRecord.name, isOn: selection)
+                .labelsHidden()
+                .accessibilityHint(extensionMetadata(extensionRecord))
+                .disabled(!middlewareEnabled(feature) && !selection.wrappedValue)
+        }
+    }
+
+    private func extensionSelection(_ extensionRecord: ExtensionRecord) -> Binding<Bool> {
+        Binding(
+            get: { draft?.extensions.contains(extensionRecord.id) ?? false },
+            set: { isEnabled in
+                updateDraft { draft in
+                    if isEnabled { draft.extensions.insert(extensionRecord.id) }
+                    else { draft.extensions.remove(extensionRecord.id) }
+                }
+            }
+        )
+    }
+
+    private func extensionMetadata(_ extensionRecord: ExtensionRecord) -> String {
+        var metadata = [extensionRecord.kind == .plugin ? "Plugin" : "Skill"]
+        if let version = extensionRecord.version { metadata.append(version) }
+        if !extensionRecord.hooks.isEmpty && !extensionRecord.hooksTrusted {
+            metadata.append("Hooks disabled until trusted")
+        }
+        return metadata.joined(separator: " · ")
+    }
+
+    private func extensionDetail(_ extensionRecord: ExtensionRecord) -> String {
+        guard !extensionRecord.hooksTrusted else { return extensionRecord.description }
+        return extensionRecord.description
+            + " Its skills can be active now; executable hooks remain disabled until trusted on the Extensions page."
     }
 
     @ViewBuilder

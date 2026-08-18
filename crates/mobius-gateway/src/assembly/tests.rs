@@ -10,7 +10,7 @@ fn provider_status_uses_manifest_defaults() {
 
     assert_eq!(status.provider, "openai_socket");
     assert_eq!(status.label, "OpenAI");
-    assert_eq!(status.symbol, FrontendSymbol::ChatGpt);
+    assert_eq!(status.symbol, FrontendSymbol::Custom("chat_gpt".into()));
     assert_eq!(status.models[0].id, "gpt-5.6-sol");
     assert_eq!(
         status.default_api_key_env.as_deref(),
@@ -40,6 +40,44 @@ fn provider_status_uses_manifest_defaults() {
         openrouter.default_base_url.as_deref(),
         Some("https://openrouter.ai/api/v1")
     );
+}
+
+#[test]
+fn configured_provider_status_requires_the_selected_credential_endpoint() {
+    let root = tempfile::tempdir().expect("root");
+    let (store, config) = ConfigStore::initialize(
+        root.path().join("state"),
+        "127.0.0.1:8741".parse().expect("listen address"),
+        None,
+    )
+    .expect("config");
+    let credentials = CredentialStore::open(store.credentials_path()).expect("credential store");
+    credentials
+        .set(
+            "openrouter",
+            "openrouter-secret",
+            Some("https://other.example/v1"),
+        )
+        .expect("mismatched credential");
+    let selection = ProviderConfig {
+        provider: "openrouter".into(),
+        model: "openai/gpt-5.6-luna".into(),
+        base_url: Some("https://openrouter.ai/api/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
+        reasoning_effort: None,
+        web_search: HostedWebSearch::Off,
+    };
+    let config = config
+        .registering_provider(selection, vec!["openai/gpt-5.6-luna".into()], Vec::new())
+        .expect("register provider");
+
+    let status = provider_statuses(&config, &store, &credentials)
+        .expect("provider statuses")
+        .into_iter()
+        .find(|status| status.provider == "openrouter")
+        .expect("OpenRouter status");
+
+    assert!(!status.configured);
 }
 
 #[test]
@@ -247,6 +285,13 @@ async fn updating_the_chat_recipe_preserves_capability_metadata() {
     let root = tempfile::tempdir().expect("root");
     let workspace = root.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
+    let skill = workspace.join(".agents/skills/fixture/SKILL.md");
+    std::fs::create_dir_all(skill.parent().expect("skill directory")).expect("skill directory");
+    std::fs::write(
+        &skill,
+        "---\nname: fixture\ndescription: Fixture skill.\n---\n",
+    )
+    .expect("skill");
     let (store, gateway) = ConfigStore::initialize(
         root.path().join("state"),
         "127.0.0.1:8741".parse().expect("listen address"),
@@ -312,6 +357,15 @@ async fn updating_the_chat_recipe_preserves_capability_metadata() {
     )
     .await
     .expect("assemble chat");
+    let skill = std::fs::canonicalize(skill).expect("canonical skill");
+    assert_eq!(
+        built
+            .gateway_sandbox
+            .read(skill.to_str().expect("UTF-8 skill path"))
+            .await
+            .expect("read skill"),
+        "---\nname: fixture\ndescription: Fixture skill.\n---\n"
+    );
     assert!(Arc::ptr_eq(&reusable_router, &built.model_router));
     let scratchpad = built
         .agent
@@ -341,4 +395,163 @@ async fn updating_the_chat_recipe_preserves_capability_metadata() {
     assert_eq!(saved.agent.revision, 2);
     assert!(!saved.agent.config.middleware.enabled("cron"));
     assert_eq!(saved.agent.config.system_prompt, "updated instructions");
+}
+
+#[test]
+fn selected_trusted_plugin_snapshot_reaches_extensions_assembly_only_when_active() {
+    use std::collections::BTreeSet;
+
+    use mobius::backend::sandbox::local::LocalSandbox;
+
+    use crate::extensions::{ExtensionSource, InstalledExtension};
+    use crate::wire::{ExtensionHookRecord, ExtensionKind};
+
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let (store, mut gateway) = ConfigStore::initialize(
+        root.path().join("state"),
+        "127.0.0.1:8741".parse().expect("listen address"),
+        None,
+    )
+    .expect("config");
+    let package = root.path().join("package");
+    std::fs::create_dir_all(package.join(".codex-plugin")).expect("manifest directory");
+    std::fs::create_dir_all(package.join("skills/review")).expect("skill directory");
+    std::fs::write(
+        package.join(".codex-plugin/plugin.json"),
+        r#"{"name":"fixture","description":"Fixture plugin","skills":"./skills","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"true"}]}]}}"#,
+    )
+    .expect("plugin manifest");
+    std::fs::write(
+        package.join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: Review fixture code.\n---\n",
+    )
+    .expect("skill manifest");
+    let inspected = mobius::middleware::extensions::inspect_package(&package).expect("package");
+    assert!(!inspected.hooks.is_empty());
+    let extension_store = ExtensionStore::new(&store);
+    let digest = extension_store
+        .commit_test_snapshot(&package)
+        .expect("snapshot");
+    gateway.installed_extensions.insert(
+        "plugin:fixture".into(),
+        InstalledExtension {
+            kind: ExtensionKind::Plugin,
+            name: inspected.name,
+            description: inspected.description,
+            version: inspected.version,
+            source: ExtensionSource {
+                url: "https://example.com/fixture.git".into(),
+                reference: None,
+                subdirectory: None,
+            },
+            resolved_revision: "a".repeat(40),
+            digest: digest.clone(),
+            skills: inspected.skills,
+            hooks: inspected
+                .hooks
+                .into_iter()
+                .map(|hook| ExtensionHookRecord {
+                    event: hook.event,
+                    matcher: hook.matcher,
+                    command: hook.command,
+                    timeout_seconds: hook.timeout_seconds,
+                })
+                .collect(),
+            trusted_hook_digest: Some(digest.clone()),
+        },
+    );
+    let active = extension_store
+        .resolve(&gateway, &BTreeSet::from(["plugin:fixture".into()]))
+        .expect("active extension");
+    let inactive = extension_store
+        .resolve(&gateway, &BTreeSet::new())
+        .expect("inactive extensions");
+    let gateway = Arc::new(Mutex::new(gateway));
+    let mut settings = crate::middleware_manifest::default_config();
+    for feature in &MIDDLEWARE {
+        if !feature.manifest.required {
+            settings.set_enabled(feature.manifest.id, false);
+        }
+    }
+    settings.set_enabled("extensions", true);
+    let checkpoints: Arc<dyn CheckpointStore> =
+        Arc::new(SqliteCheckpoint::new(store.checkpoints_path()).expect("checkpoints"));
+    let scratchpad = ScratchpadStore::new(Arc::clone(&checkpoints));
+    let session_files = SessionFileStore::new(store.state_dir());
+    let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+    let backend: Arc<dyn SandboxBackend> =
+        Arc::new(LocalSandbox::new(&workspace).expect("sandbox"));
+    let discover = |resolved: &ResolvedExtensions| {
+        Extensions::discover_installed(
+            [
+                workspace.join(".agents/skills"),
+                workspace.join(".codex/skills"),
+            ]
+            .into_iter()
+            .chain(resolved.skill_roots.iter().cloned()),
+        )
+        .expect("extensions")
+    };
+    let active_extensions = discover(&active);
+    let inactive_extensions = discover(&inactive);
+    let (active, _) = build_middleware(
+        &settings,
+        &workspace,
+        Arc::clone(&gateway),
+        Arc::clone(&cron),
+        scratchpad.clone(),
+        session_files.clone(),
+        Arc::clone(&backend),
+        &active,
+        Some(active_extensions),
+    )
+    .expect("active middleware");
+    let (inactive, _) = build_middleware(
+        &settings,
+        &workspace,
+        gateway,
+        cron,
+        scratchpad,
+        session_files,
+        backend,
+        &inactive,
+        Some(inactive_extensions),
+    )
+    .expect("inactive middleware");
+    let active = active
+        .frontend()
+        .expect("active frontend")
+        .into_iter()
+        .find(|contribution| contribution.capability == "extensions")
+        .expect("active extensions");
+    let inactive = inactive
+        .frontend()
+        .expect("inactive frontend")
+        .into_iter()
+        .find(|contribution| contribution.capability == "extensions")
+        .expect("inactive extensions");
+
+    assert_eq!(
+        active.count,
+        inactive.count.map(|count| count + 1),
+        "the selected plugin adds exactly one skill"
+    );
+    assert!(
+        active
+            .references
+            .iter()
+            .any(|reference| reference.value == "fixture:review")
+    );
+    assert!(
+        inactive
+            .references
+            .iter()
+            .all(|reference| reference.value != "fixture:review")
+    );
+
+    extension_store
+        .remove_snapshot(&digest)
+        .expect("remove snapshot");
 }

@@ -20,8 +20,8 @@ use super::ProcessGroupGuard;
 use super::SandboxBackend;
 use super::SandboxMode;
 use super::{
-    CommandMode, CommandOutput, CommandOutputSink, CommandStream, MAX_BINARY_FILE_BYTES,
-    MAX_FILE_BYTES,
+    CommandAuthorization, CommandMode, CommandOutput, CommandOutputSink, CommandStream,
+    MAX_BINARY_FILE_BYTES, MAX_FILE_BYTES,
 };
 #[cfg(target_os = "macos")]
 use super::{MACOS_COMMAND_WRAPPER, MACOS_SEATBELT_BASE_POLICY, MACOS_SEATBELT_NETWORK_POLICY};
@@ -65,6 +65,7 @@ const SEATBELT_POLICY_SUFFIX: &str = r#"
 pub struct LocalSandbox {
     root: PathBuf,
     root_dir: Dir,
+    read_roots: Vec<ReadRoot>,
     temp: tempfile::TempDir,
     command_timeout: Duration,
     denied_reads: Vec<DeniedRead>,
@@ -75,6 +76,11 @@ pub struct LocalSandbox {
 struct DeniedRead {
     path: PathBuf,
     directory: bool,
+}
+
+struct ReadRoot {
+    path: PathBuf,
+    directory: Dir,
 }
 
 enum Invocation<'a> {
@@ -115,6 +121,7 @@ enum WorkspaceAccess {
 struct CommandIsolation {
     sandbox_mode: SandboxMode,
     network_access: NetworkAccess,
+    workspace_access: WorkspaceAccess,
 }
 
 impl LocalSandbox {
@@ -142,6 +149,7 @@ impl LocalSandbox {
             Ok(Self {
                 root,
                 root_dir,
+                read_roots: Vec::new(),
                 temp,
                 command_timeout: DEFAULT_COMMAND_TIMEOUT,
                 denied_reads: Vec::new(),
@@ -168,6 +176,15 @@ impl LocalSandbox {
                 "sandbox root and denied read path must not overlap".into(),
             ));
         }
+        if self
+            .read_roots
+            .iter()
+            .any(|root| paths_overlap(&root.path, &path))
+        {
+            return Err(Error::Config(
+                "read root and denied read path must not overlap".into(),
+            ));
+        }
         let metadata = std::fs::metadata(&path)?;
         if !metadata.is_dir() && !metadata.is_file() {
             return Err(Error::Config(format!(
@@ -190,6 +207,33 @@ impl LocalSandbox {
             path,
             directory: metadata.is_dir(),
         });
+        Ok(self)
+    }
+
+    /// Allows file tools to read one additional canonical directory without granting writes.
+    pub fn allow_read_root(mut self, path: impl AsRef<Path>) -> Result<Self> {
+        let path = std::fs::canonicalize(path)?;
+        if !path.is_dir() {
+            return Err(Error::Config(format!(
+                "read root is not a directory: {}",
+                path.display()
+            )));
+        }
+        if self
+            .denied_reads
+            .iter()
+            .any(|denied| paths_overlap(&path, &denied.path))
+        {
+            return Err(Error::Config(
+                "read root and denied read path must not overlap".into(),
+            ));
+        }
+        if self.read_roots.iter().any(|root| root.path == path) {
+            return Ok(self);
+        }
+        let directory = Dir::open_ambient_dir(&path, ambient_authority())?;
+        validate_root(&path, &directory)?;
+        self.read_roots.push(ReadRoot { path, directory });
         Ok(self)
     }
 
@@ -223,13 +267,15 @@ impl LocalSandbox {
             CommandIsolation {
                 sandbox_mode: SandboxMode::WorkspaceWrite,
                 network_access: NetworkAccess::Denied,
+                workspace_access: WorkspaceAccess::ReadOnly,
             },
             CommandMode::Foreground,
             CommandOutputSink::default(),
             environment,
-            WorkspaceAccess::ReadOnly,
+            None,
         )
-        .await
+        .await?
+        .ok_or_else(|| Error::Sandbox("command launch was unexpectedly denied".into()))
     }
 
     /// Reads one bounded binary range through the sandbox's pinned workspace root.
@@ -270,13 +316,15 @@ impl LocalSandbox {
             CommandIsolation {
                 sandbox_mode: SandboxMode::WorkspaceWrite,
                 network_access: NetworkAccess::Denied,
+                workspace_access: WorkspaceAccess::Writable,
             },
             CommandMode::Foreground,
             CommandOutputSink::default(),
             environment,
-            WorkspaceAccess::Writable,
+            None,
         )
-        .await
+        .await?
+        .ok_or_else(|| Error::Sandbox("command launch was unexpectedly denied".into()))
     }
 
     fn relative(&self, path: &str) -> Result<PathBuf> {
@@ -289,6 +337,28 @@ impl LocalSandbox {
             return Err(Error::Sandbox(path.display().to_string()));
         }
         Ok(path.to_path_buf())
+    }
+
+    fn read_target(&self, path: &str) -> Result<(Dir, PathBuf)> {
+        let requested = Path::new(path);
+        if !requested.is_absolute() {
+            validate_root(&self.root, &self.root_dir)?;
+            return Ok((self.root_dir.try_clone()?, self.relative(path)?));
+        }
+        for root in &self.read_roots {
+            let Ok(relative) = requested.strip_prefix(&root.path) else {
+                continue;
+            };
+            if relative
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+            {
+                break;
+            }
+            validate_root(&root.path, &root.directory)?;
+            return Ok((root.directory.try_clone()?, relative.to_path_buf()));
+        }
+        Err(Error::Sandbox(path.into()))
     }
 
     fn find_executable(&self, name: &str) -> Result<PathBuf> {
@@ -550,13 +620,13 @@ impl LocalSandbox {
         mode: CommandMode,
         output_sink: CommandOutputSink,
         environment: &[(&str, &str)],
-        workspace_access: WorkspaceAccess,
-    ) -> Result<CommandOutput> {
+        authorization: Option<&CommandAuthorization>,
+    ) -> Result<Option<CommandOutput>> {
         if matches!(&invocation, Invocation::Shell(script) if script.trim().is_empty()) {
             return Err(Error::Sandbox("command is empty".into()));
         }
         validate_root(&self.root, &self.root_dir)?;
-        let output_limit = if workspace_access == WorkspaceAccess::ReadOnly {
+        let output_limit = if isolation.workspace_access == WorkspaceAccess::ReadOnly {
             MAX_READ_ONLY_OUTPUT_BYTES
         } else {
             MAX_COMMAND_OUTPUT_BYTES
@@ -564,9 +634,11 @@ impl LocalSandbox {
         async {
             validate_root(&self.root, &self.root_dir)?;
             let mut command = match isolation.sandbox_mode {
-                SandboxMode::WorkspaceWrite => {
-                    self.sandboxed_command(&invocation, isolation.network_access, workspace_access)?
-                }
+                SandboxMode::WorkspaceWrite => self.sandboxed_command(
+                    &invocation,
+                    isolation.network_access,
+                    isolation.workspace_access,
+                )?,
                 SandboxMode::DangerFullAccess if self.denied_reads.is_empty() => {
                     self.host_command(&invocation)
                 }
@@ -612,7 +684,24 @@ impl LocalSandbox {
             if uses_process_group {
                 command.process_group(0);
             }
-            let mut child = command.spawn()?;
+            let mut child = None;
+            {
+                let mut launch = || {
+                    if child.is_some() {
+                        return Err(Error::Sandbox("command was launched more than once".into()));
+                    }
+                    child = Some(command.spawn()?);
+                    Ok(())
+                };
+                if let Some(authorization) = authorization {
+                    authorization(&mut launch)?;
+                } else {
+                    launch()?;
+                }
+            }
+            let Some(mut child) = child else {
+                return Ok(None);
+            };
             #[cfg(target_os = "macos")]
             let cleanup_lease =
                 if uses_cleanup_lease {
@@ -690,7 +779,7 @@ impl LocalSandbox {
             if let Some(process_group) = &mut process_group {
                 process_group.kill();
             }
-            output
+            output.map(Some)
         }
         .await
     }
@@ -699,9 +788,7 @@ impl LocalSandbox {
 impl SandboxBackend for LocalSandbox {
     fn read<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
-            validate_root(&self.root, &self.root_dir)?;
-            let root = self.root_dir.try_clone()?;
-            let relative = self.relative(path)?;
+            let (root, relative) = self.read_target(path)?;
             let requested = path.to_string();
             tokio::task::spawn_blocking(move || read_file(root, &relative, &requested))
                 .await
@@ -716,9 +803,7 @@ impl SandboxBackend for LocalSandbox {
                     "binary file read size must be 1–{MAX_BINARY_FILE_BYTES} bytes"
                 )));
             }
-            validate_root(&self.root, &self.root_dir)?;
-            let root = self.root_dir.try_clone()?;
-            let relative = self.relative(path)?;
+            let (root, relative) = self.read_target(path)?;
             let requested = path.to_string();
             tokio::task::spawn_blocking(move || {
                 read_binary_file(root, &relative, &requested, max_bytes)
@@ -752,16 +837,44 @@ impl SandboxBackend for LocalSandbox {
         mode: CommandMode,
         output_sink: CommandOutputSink,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
+        Box::pin(async move {
+            self.execute_invocation(
+                Invocation::Shell(script),
+                CommandIsolation {
+                    sandbox_mode,
+                    network_access,
+                    workspace_access: WorkspaceAccess::Writable,
+                },
+                mode,
+                output_sink,
+                &[],
+                None,
+            )
+            .await?
+            .ok_or_else(|| Error::Sandbox("command launch was unexpectedly denied".into()))
+        })
+    }
+
+    fn execute_authorized<'a>(
+        &'a self,
+        script: &'a str,
+        sandbox_mode: SandboxMode,
+        network_access: NetworkAccess,
+        mode: CommandMode,
+        output_sink: CommandOutputSink,
+        authorization: &'a CommandAuthorization,
+    ) -> BoxFuture<'a, Result<Option<CommandOutput>>> {
         Box::pin(self.execute_invocation(
             Invocation::Shell(script),
             CommandIsolation {
                 sandbox_mode,
                 network_access,
+                workspace_access: WorkspaceAccess::Writable,
             },
             mode,
             output_sink,
             &[],
-            WorkspaceAccess::Writable,
+            Some(authorization),
         ))
     }
 }

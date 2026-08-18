@@ -13,10 +13,12 @@ use mobius::protocol::{
 };
 use mobius::{Error, Result};
 use mobius_gateway::client::{GatewayEvents, GatewaySender, MAX_PENDING_FRAMES};
+#[cfg(test)]
+use mobius_gateway::wire::ExtensionHookRecord;
 use mobius_gateway::wire::{
-    AgentComposition, ClientMessage, MiddlewareConfig, ProviderAuthKind, ProviderConfig,
-    ProviderEndpointAuth, ProviderStatus, ReadyPayload, ServerFrame, ServerMessage,
-    SessionReadyPayload,
+    AgentComposition, ClientMessage, ExtensionKind, ExtensionRecord, MiddlewareConfig,
+    ProviderAuthKind, ProviderConfig, ProviderEndpointAuth, ProviderStatus, ReadyPayload,
+    ServerFrame, ServerMessage, SessionReadyPayload,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -209,7 +211,8 @@ mod tests {
         }
         original.middleware.set_enabled("plain", true);
         original.middleware.set_enabled("configured", true);
-        SetupState::from_parts(mode, providers, features(), original, false).expect("setup state")
+        SetupState::from_parts(mode, providers, features(), Vec::new(), original, false)
+            .expect("setup state")
     }
 
     fn features() -> Vec<MiddlewareFeature> {
@@ -231,6 +234,7 @@ mod tests {
                         id: "limit".into(),
                         label: "Limit".into(),
                         description: "An advertised integer".into(),
+                        composer: false,
                         kind: FrontendSettingKind::Integer {
                             min: 1,
                             max: Some(100),
@@ -241,11 +245,14 @@ mod tests {
                         id: "route".into(),
                         label: "Route".into(),
                         description: "An advertised selection".into(),
+                        composer: false,
                         kind: FrontendSettingKind::Select {
                             options: vec![FrontendSettingOption {
                                 value: "route-a".into(),
                                 label: "Route A".into(),
                                 description: "First route".into(),
+                                symbol: None,
+                                tone: mobius::protocol::FrontendTone::Neutral,
                             }],
                             unset_label: Some("Inherit".into()),
                         },
@@ -273,7 +280,19 @@ mod tests {
             .expect("feature row")
     }
 
-    fn setting_row(state: &SetupState, feature_id: &str, setting_id: &str) -> usize {
+    fn expand_feature(state: &mut SetupState, id: &str) {
+        let feature = state
+            .features
+            .iter()
+            .position(|feature| feature.id == id)
+            .expect("feature");
+        if !state.expanded_features.contains(id) {
+            state.toggle_feature_expansion(feature);
+        }
+    }
+
+    fn setting_row(state: &mut SetupState, feature_id: &str, setting_id: &str) -> usize {
+        expand_feature(state, feature_id);
         (0..state.middleware_row_count())
             .find(|row| {
                 matches!(
@@ -284,6 +303,25 @@ mod tests {
                 )
             })
             .expect("setting row")
+    }
+
+    fn extension(capability: &str) -> ExtensionRecord {
+        ExtensionRecord {
+            id: "plugin-a".into(),
+            capability: capability.into(),
+            kind: ExtensionKind::Plugin,
+            name: "Plugin A".into(),
+            description: "An installed plugin".into(),
+            version: Some("1.0.0".into()),
+            source: "https://github.com/example/plugin-a".into(),
+            reference: None,
+            subdirectory: None,
+            resolved_revision: "abc123".into(),
+            digest: "sha256:plugin-a".into(),
+            skills: vec!["plugin-a".into()],
+            hooks: Vec::new(),
+            hooks_trusted: false,
+        }
     }
 
     #[test]
@@ -340,9 +378,15 @@ mod tests {
         let mut original = AgentComposition::default();
         original.provider.provider = "responses".into();
         original.provider.base_url = providers[0].status.default_base_url.clone();
-        let mut state =
-            SetupState::from_parts(SetupMode::Login, providers, features(), original, false)
-                .expect("setup state");
+        let mut state = SetupState::from_parts(
+            SetupMode::Login,
+            providers,
+            features(),
+            Vec::new(),
+            original,
+            false,
+        )
+        .expect("setup state");
 
         state.select_provider("kimi").expect("select Kimi");
 
@@ -423,9 +467,88 @@ mod tests {
     }
 
     #[test]
+    fn agent_capability_children_are_collapsed_until_opened() {
+        let mut state = state(SetupMode::Agent, "openai_socket", true);
+        assert_eq!(state.middleware_row_count(), state.features.len());
+        state.row = feature_row(&state, "configured");
+
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            state.middleware_row_count(),
+            state.features.len() + state.features[1].settings.len()
+        );
+        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(state.middleware_row_count(), state.features.len());
+    }
+
+    #[test]
+    fn agent_activates_installed_children_through_their_advertised_capability() {
+        let mut state = state(SetupMode::Agent, "openai_socket", true);
+        state.available_extensions.push(extension("plain"));
+        state.middleware.set_enabled("plain", false);
+        state.row = feature_row(&state, "plain");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let extension_row = (0..state.middleware_row_count())
+            .find(|row| {
+                matches!(
+                    state.middleware_row(*row),
+                    Some(MiddlewareRow::Extension { feature, extension })
+                        if state.features[feature].id == "plain"
+                            && state.available_extensions[extension].id == "plugin-a"
+                )
+            })
+            .expect("capability child row");
+        state.row = extension_row;
+
+        state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        let configured = state
+            .agent_composition(&state.original)
+            .expect("agent composition");
+        assert!(configured.extensions.contains("plugin-a"));
+        assert!(configured.middleware.enabled("plain"));
+
+        state.row = feature_row(&state, "plain");
+        state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(state.selected_extensions.contains("plugin-a"));
+        assert!(!state.middleware.enabled("plain"));
+    }
+
+    #[test]
+    fn agent_activates_untrusted_plugin_skills_without_authorizing_hooks() {
+        let mut state = state(SetupMode::Agent, "openai_socket", true);
+        let mut untrusted = extension("plain");
+        untrusted.hooks.push(ExtensionHookRecord {
+            event: "PreToolUse".into(),
+            matcher: None,
+            command: "review-hook".into(),
+            timeout_seconds: 10,
+        });
+        state.available_extensions.push(untrusted);
+        state.row = feature_row(&state, "plain");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.row = (0..state.middleware_row_count())
+            .find(|row| {
+                matches!(
+                    state.middleware_row(*row),
+                    Some(MiddlewareRow::Extension { extension, .. })
+                        if state.available_extensions[extension].id == "plugin-a"
+                )
+            })
+            .expect("extension row");
+
+        state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        assert!(state.selected_extensions.contains("plugin-a"));
+        assert_eq!(state.error, None);
+    }
+
+    #[test]
     fn agent_edits_an_advertised_select_without_knowing_the_middleware() {
         let mut state = state(SetupMode::Agent, "openai_socket", true);
-        state.row = setting_row(&state, "configured", "route");
+        let row = setting_row(&mut state, "configured", "route");
+        state.row = row;
 
         state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
 
@@ -447,7 +570,8 @@ mod tests {
             "limit",
             Some(FrontendSettingValue::Integer(50)),
         );
-        state.row = setting_row(&state, "configured", "limit");
+        let row = setting_row(&mut state, "configured", "limit");
+        state.row = row;
 
         state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
 
@@ -463,7 +587,8 @@ mod tests {
 
     #[test]
     fn agent_setting_rows_style_inherited_explicit_and_focused_values() {
-        let inherited = state(SetupMode::Agent, "openai_socket", true);
+        let mut inherited = state(SetupMode::Agent, "openai_socket", true);
+        expand_feature(&mut inherited, "configured");
         let mut inherited_lines = Vec::new();
         render_page(&mut inherited_lines, &inherited, 82);
         let inherited_route = inherited_lines
@@ -482,6 +607,7 @@ mod tests {
             "limit",
             Some(FrontendSettingValue::Integer(50)),
         );
+        expand_feature(&mut explicit, "configured");
         let mut explicit_lines = Vec::new();
         render_page(&mut explicit_lines, &explicit, 82);
         let explicit_route = explicit_lines
@@ -493,7 +619,8 @@ mod tests {
             .find(|line| line.to_string().contains("Limit  ‹ 50 ›"))
             .expect("explicit integer row");
 
-        explicit.row = setting_row(&explicit, "configured", "route");
+        let row = setting_row(&mut explicit, "configured", "route");
+        explicit.row = row;
         let mut focused_lines = Vec::new();
         render_page(&mut focused_lines, &explicit, 82);
         let focused_route = focused_lines
@@ -539,6 +666,7 @@ mod tests {
         }
 
         let mut state = state(SetupMode::Agent, "openai_socket", true);
+        expand_feature(&mut state, "configured");
         let layout = agent_layout(&state, 70);
         let column = layout.description_column.expect("wide inline layout");
         state.features[0].description =
@@ -656,6 +784,7 @@ mod tests {
                 SetupMode::Login,
                 validated_providers(&[status]).expect("provider manifest"),
                 features(),
+                Vec::new(),
                 original,
                 false,
             ) {

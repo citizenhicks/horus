@@ -15,6 +15,8 @@ pub struct FrontendCommand {
     pub name: String,
     pub arguments: String,
     pub description: String,
+    /// Whether the frontend must wait for the current turn to finish before submitting this command.
+    pub requires_idle: bool,
 }
 
 /// UI metadata exported by one capability.
@@ -47,6 +49,8 @@ pub struct FrontendSetting {
     pub id: String,
     pub label: String,
     pub description: String,
+    /// Whether thin frontends should expose this setting beside the message composer.
+    pub composer: bool,
     #[serde(flatten)]
     pub kind: FrontendSettingKind,
 }
@@ -74,6 +78,8 @@ pub struct FrontendSettingOption {
     pub value: String,
     pub label: String,
     pub description: String,
+    pub symbol: Option<FrontendSymbol>,
+    pub tone: FrontendTone,
 }
 
 /// Scalar value accepted by the generic setting controls.
@@ -452,30 +458,26 @@ impl EventMsg {
 ///
 /// A gateway does not know whether the frontend draws SF Symbols, terminal glyphs, or
 /// SVGs, so it names what a glyph stands for and each frontend supplies its own artwork.
-/// Most variants are roles. The rest are provider identity, where no role applies: some
-/// name the vendor outright (`ChatGpt`, `Claude`, `Deepseek`, `Kimi`) and the others name
-/// what the mark depicts (`Moon`, `Sparkle`) where a frontend has no vendor artwork to draw.
-///
 /// [`Self::Custom`] carries anything outside this list so a plugin can still ship a glyph
 /// this enum has never heard of. It is explicitly best-effort: a frontend that cannot
-/// resolve the name falls back to a placeholder, which is why everything shipped in-tree
-/// should earn a variant instead.
+/// resolve the name falls back to a placeholder. Provider manifests use it for their own
+/// brand tokens so adding a provider does not expand this semantic enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrontendSymbol {
     Agent,
     Brain,
     Branch,
     Chat,
-    ChatGpt,
-    Claude,
-    Deepseek,
     Delete,
     Edit,
-    Kimi,
-    Moon,
     Promote,
     Route,
     Search,
+    SecurityReview,
+    Shield,
+    ShieldAlert,
+    ShieldCheck,
+    ShieldOff,
     Sparkle,
     Storage,
     Task,
@@ -490,16 +492,16 @@ impl FrontendSymbol {
             Self::Brain => "brain",
             Self::Branch => "branch",
             Self::Chat => "chat",
-            Self::ChatGpt => "chat_gpt",
-            Self::Claude => "claude",
-            Self::Deepseek => "deepseek",
             Self::Delete => "delete",
             Self::Edit => "edit",
-            Self::Kimi => "kimi",
-            Self::Moon => "moon",
             Self::Promote => "promote",
             Self::Route => "route",
             Self::Search => "search",
+            Self::SecurityReview => "security_review",
+            Self::Shield => "shield",
+            Self::ShieldAlert => "shield_alert",
+            Self::ShieldCheck => "shield_check",
+            Self::ShieldOff => "shield_off",
             Self::Sparkle => "sparkle",
             Self::Storage => "storage",
             Self::Task => "task",
@@ -509,22 +511,22 @@ impl FrontendSymbol {
 
     /// Unknown names become [`Self::Custom`] rather than an error: a frontend rendering a
     /// placeholder is a better outcome than a gateway refusing to decode a whole frame.
-    fn from_wire(name: &str) -> Self {
+    pub(crate) fn from_wire(name: &str) -> Self {
         match name {
             "agent" => Self::Agent,
             "brain" => Self::Brain,
             "branch" => Self::Branch,
             "chat" => Self::Chat,
-            "chat_gpt" => Self::ChatGpt,
-            "claude" => Self::Claude,
-            "deepseek" => Self::Deepseek,
             "delete" => Self::Delete,
             "edit" => Self::Edit,
-            "kimi" => Self::Kimi,
-            "moon" => Self::Moon,
             "promote" => Self::Promote,
             "route" => Self::Route,
             "search" => Self::Search,
+            "security_review" => Self::SecurityReview,
+            "shield" => Self::Shield,
+            "shield_alert" => Self::ShieldAlert,
+            "shield_check" => Self::ShieldCheck,
+            "shield_off" => Self::ShieldOff,
             "sparkle" => Self::Sparkle,
             "storage" => Self::Storage,
             "task" => Self::Task,

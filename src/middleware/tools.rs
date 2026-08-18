@@ -87,6 +87,15 @@ pub struct ToolContext {
     pub turn_id: String,
 }
 
+/// External identity used when a tool participates in extension hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HookIdentity {
+    /// Tool name exposed to hook matchers and payloads.
+    pub name: &'static str,
+    /// Matcher subjects checked in declaration order.
+    pub subjects: &'static [&'static str],
+}
+
 /// A named tool Adapter registered by middleware.
 pub trait Tool: Send + Sync {
     /// Returns the provider-facing tool schema.
@@ -107,8 +116,30 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Declares an external hook alias and matcher subjects.
+    fn hook_identity(&self) -> Option<HookIdentity> {
+        None
+    }
+
+    /// Maps provider-facing arguments into the extension hook payload.
+    fn hook_input(&self, arguments: &Value) -> Value {
+        arguments.clone()
+    }
+
+    /// Maps a hook rewrite back into provider-facing arguments.
+    fn rewrite_hook_input(&self, input: Value) -> Result<Value> {
+        object_hook_input(input)
+    }
+
     /// Executes one validated provider call.
     fn call<'a>(&'a self, context: ToolContext, arguments: Value) -> BoxFuture<'a, Result<String>>;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HookTool {
+    pub(crate) name: String,
+    pub(crate) input: Value,
+    pub(crate) subjects: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -175,8 +206,57 @@ impl Catalog {
             })
     }
 
+    pub(crate) fn hook_tool(&self, call: &ToolCall, description: Option<&str>) -> HookTool {
+        let registered = self.get(&call.name);
+        let identity = registered.and_then(|tool| tool.handler.hook_identity());
+        let name = identity.map_or_else(|| call.name.clone(), |identity| identity.name.into());
+        let subjects = identity.map_or_else(
+            || vec![call.name.clone()],
+            |identity| {
+                identity
+                    .subjects
+                    .iter()
+                    .map(|subject| (*subject).into())
+                    .collect()
+            },
+        );
+        let mut input = registered.map_or_else(
+            || call.arguments.clone(),
+            |tool| tool.handler.hook_input(&call.arguments),
+        );
+        if let Some(description) = description
+            && let Some(input) = input.as_object_mut()
+        {
+            input
+                .entry("description")
+                .or_insert_with(|| Value::String(description.into()));
+        }
+        HookTool {
+            name,
+            input,
+            subjects,
+        }
+    }
+
+    pub(crate) fn rewrite_hook_input(&self, name: &str, input: Value) -> Result<Value> {
+        match self.get(name) {
+            Some(tool) => tool.handler.rewrite_hook_input(input),
+            None => object_hook_input(input),
+        }
+    }
+
     fn get(&self, name: &str) -> Option<&RegisteredTool> {
         self.tools.get(name)
+    }
+}
+
+fn object_hook_input(input: Value) -> Result<Value> {
+    if input.is_object() {
+        Ok(input)
+    } else {
+        Err(Error::Config(
+            "hook tool rewrite must be a JSON object".into(),
+        ))
     }
 }
 
@@ -187,6 +267,8 @@ pub struct ToolResult {
     pub name: String,
     pub output: String,
     pub is_error: bool,
+    pub(crate) handler_executed: bool,
+    pub(crate) additional_input: Vec<Value>,
 }
 
 impl ToolResult {
@@ -196,6 +278,8 @@ impl ToolResult {
             name: call.name.clone(),
             output: capped(output.as_ref(), MAX_TOOL_OUTPUT_BYTES),
             is_error: true,
+            handler_executed: false,
+            additional_input: Vec::new(),
         }
     }
 
@@ -287,18 +371,24 @@ async fn execute_call(
             name,
             output: capped(&output, MAX_TOOL_OUTPUT_BYTES),
             is_error: false,
+            handler_executed: true,
+            additional_input: Vec::new(),
         },
         Ok(Err(error)) => ToolResult {
             call_id,
             name,
             output: capped(&error.to_string(), MAX_TOOL_OUTPUT_BYTES),
             is_error: true,
+            handler_executed: true,
+            additional_input: Vec::new(),
         },
         Err(_) => ToolResult {
             call_id,
             name,
             output: "tool panicked".into(),
             is_error: true,
+            handler_executed: true,
+            additional_input: Vec::new(),
         },
     }
 }

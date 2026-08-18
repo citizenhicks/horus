@@ -4,7 +4,6 @@ import HighlightSwift
 
 struct FilesView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.mobiusPalette) private var palette
 
     // A NavigationStack for the title and, more to the point, for `.searchable`: the search
     // field only renders inside a navigation container.
@@ -18,20 +17,19 @@ struct FilesView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            // The same step under the canvas the sidebar sits on: the inspector is the other
-            // column flanking the page, so it reads as a pair with it rather than as more page.
-            .background { palette.recessed.ignoresSafeArea() }
+            .background(MobiusBackdrop())
             .navigationTitle(navigationTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .principal) {
                     FilesNavigationTitle()
                 }
-                ToolbarItem(placement: .confirmationAction) {
+                ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { model.showsInspector = false }
                 }
             }
         }
+        .presentationDragIndicator(.visible)
     }
 
     private var navigationTitle: String {
@@ -385,36 +383,8 @@ private struct FileTreeRow: View {
 private struct ChatFileList: View {
     @Environment(AppModel.self) private var model
 
-    private var artifactFiles: [SessionFileReference] {
-        model.artifacts.compactMap(\.file)
-    }
-
     var body: some View {
         List {
-            Section("Artifacts") {
-                if model.isLoadingArtifacts {
-                    InspectorSectionLoadingRow(title: "Loading artifacts")
-                } else if artifactFiles.isEmpty {
-                    InspectorEmptyRow(
-                        title: "No artifacts",
-                        glyph: .fileAxisThreeD
-                    )
-                } else {
-                    ForEach(artifactFiles) { file in
-                        SessionFileInspectorRow(
-                            file: file,
-                            accessibilityLabel: "Open artifact \(file.name)"
-                        )
-                    }
-                }
-                if model.artifactsTruncated {
-                    Text("Some older artifacts are not shown.")
-                        .font(MobiusStyle.metadataFont)
-                        .foregroundStyle(.secondary)
-                        .inspectorFileListRow()
-                }
-            }
-
             Section("Uploads") {
                 if model.isLoadingSessionUploads {
                     InspectorSectionLoadingRow(title: "Loading uploads")

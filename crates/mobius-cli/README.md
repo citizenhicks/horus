@@ -93,6 +93,16 @@ The selected chat workspace—not the CLI process—is the command and file boun
 prompt aborts a headless run, so scheduled work that edits files or runs commands needs an
 appropriate chat approval policy.
 
+Manage the gateway extension catalog without creating or opening a chat:
+
+```sh
+mobius extensions
+```
+
+The same lifecycle screen is available as `/extensions` from an idle chat. Installation accepts
+an HTTPS Git URL or a GitHub tree URL; update, uninstall, and digest-bound hook trust operate on
+the selected installed extension.
+
 Inside the TUI, `/cron new [task]` starts the model-assisted setup when scheduling is enabled for
 the chat. The model asks for missing task or frequency details, then an approval-required gateway
 tool saves and registers the final task. Ordinary chat cannot create schedules. `/cron` also
@@ -132,12 +142,12 @@ The TUI is a thin subscriber to the framework capability catalog:
 
 - Capabilities own their commands, status widgets, references, and capability-specific rendering.
 - `/` opens both CLI shell commands and commands contributed by framework capabilities.
-- `$` references are contributed by skills middleware.
+- `$` references are contributed by the Extensions middleware.
 - `@` workspace-file completion is available for a local plaintext gateway; TLS gateways do not
   scan similarly named paths on the client machine.
 
-The CLI owns only shell lifecycle and presentation commands: `/help`, `/gateway`, `/agent`,
-`/login`, `/pair`, `/profile`, `/artifacts`, `/new`, `/clear`, `/model`,
+The CLI owns only shell lifecycle and presentation commands: `/help`, `/gateway`, `/extensions`,
+`/agent`, `/login`, `/pair`, `/profile`, `/artifacts`, `/new`, `/clear`, `/model`,
 `/reasoning`, `/cron`, `/status`, `/interrupt`, and `/exit`. The menu changes with the installed
 gateway capabilities. The gateway always contributes `/resume` as the single saved-chat picker;
 it lists chats across every workspace.

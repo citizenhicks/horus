@@ -467,11 +467,14 @@ struct Runner {
     review_session_id: String,
     transcript_delta: Vec<Value>,
     deferred: VecDeque<Submission>,
+    pending_session_start_stop: Option<String>,
+    turn_end_turn_id: Option<String>,
     events: EventRecorder,
 }
 
 impl Runner {
     async fn run(&mut self, mut commands: mpsc::Receiver<Submission>) -> Result<()> {
+        self.stop_resumed_turn_at_session_start().await?;
         if let Some(pending) = self.state.pending_approval.clone() {
             let submission_id = pending.submission_id.clone();
             if let Err(error) = self.resume_pending(&mut commands, pending).await {
@@ -566,6 +569,7 @@ impl Runner {
             }
         };
         let active_route = choice.route.clone();
+        let active_model = choice.model.clone();
         self.state.model_route = Some(choice.route.clone());
         self.persist_with_events(
             vec![Event {
@@ -581,6 +585,7 @@ impl Runner {
         )
         .await?;
         self.runtime.model_route = active_route;
+        self.runtime.model = active_model;
         Ok(())
     }
 

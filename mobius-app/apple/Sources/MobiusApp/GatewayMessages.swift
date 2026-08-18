@@ -32,6 +32,16 @@ enum GatewayRequest: Encodable, Sendable {
         expectedRevision: UInt64,
         config: AgentComposition
     )
+    case installExtension(
+        requestID: String,
+        source: String,
+        reference: String?,
+        subdirectory: String?
+    )
+    case updateExtension(requestID: String, id: String)
+    case uninstallExtension(requestID: String, id: String)
+    case trustExtensionHooks(requestID: String, id: String, expectedDigest: String)
+    case revokeExtensionHooksTrust(requestID: String, id: String, expectedDigest: String)
     case getGitDiff(requestID: String, sessionID: String, scope: GitDiffScope)
     case listWorkspaceFiles(requestID: String, sessionID: String, scope: WorkspaceFileScope)
     case readWorkspaceFile(
@@ -83,7 +93,6 @@ enum GatewayRequest: Encodable, Sendable {
     case createPairingCode(requestID: String)
     case startProviderLogin(requestID: String, provider: String)
     case getProfile(requestID: String)
-    case listArtifacts(requestID: String, sessionID: String)
     case startCronSetup(requestID: String, sessionID: String, task: String?)
     case listCron(requestID: String, sessionID: String)
     case rescheduleCron(requestID: String, sessionID: String, id: String, schedule: String)
@@ -157,6 +166,30 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(requestID, forKey: "requestId")
             try container.encode(expectedRevision, forKey: "expectedRevision")
             try container.encode(config, forKey: "config")
+        case .installExtension(let requestID, let source, let reference, let subdirectory):
+            try container.encode("install_extension", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(source, forKey: "source")
+            try container.encode(reference, forKey: "reference")
+            try container.encode(subdirectory, forKey: "subdirectory")
+        case .updateExtension(let requestID, let id):
+            try container.encode("update_extension", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(id, forKey: "id")
+        case .uninstallExtension(let requestID, let id):
+            try container.encode("uninstall_extension", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(id, forKey: "id")
+        case .trustExtensionHooks(let requestID, let id, let expectedDigest):
+            try container.encode("trust_extension_hooks", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(id, forKey: "id")
+            try container.encode(expectedDigest, forKey: "expectedDigest")
+        case .revokeExtensionHooksTrust(let requestID, let id, let expectedDigest):
+            try container.encode("revoke_extension_hooks_trust", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(id, forKey: "id")
+            try container.encode(expectedDigest, forKey: "expectedDigest")
         case .getGitDiff(let requestID, let sessionID, let scope):
             try container.encode("get_git_diff", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -247,10 +280,6 @@ enum GatewayRequest: Encodable, Sendable {
         case .getProfile(let requestID):
             try container.encode("get_profile", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
-        case .listArtifacts(let requestID, let sessionID):
-            try container.encode("list_artifacts", forKey: "type")
-            try container.encode(requestID, forKey: "requestId")
-            try container.encode(sessionID, forKey: "sessionId")
         case .startCronSetup(let requestID, let sessionID, let task):
             try container.encode("start_cron_setup", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -318,12 +347,6 @@ enum GatewayEnvelope: Decodable, Sendable {
     )
     case providerLoginFinished(requestID: String, loginID: String, provider: String)
     case profile(requestID: String, profile: ProfileSnapshot)
-    case artifacts(
-        requestID: String,
-        sessionID: String,
-        artifacts: [ArtifactRecord],
-        truncated: Bool
-    )
     case gitDiff(requestID: String, sessionID: String, scope: GitDiffScope, diff: String)
     case workspaceFiles(
         requestID: String,
@@ -472,13 +495,6 @@ enum GatewayEnvelope: Decodable, Sendable {
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 profile: try container.decode(ProfileSnapshot.self, forKey: "profile")
             )
-        case "artifacts":
-            self = .artifacts(
-                requestID: try container.decode(String.self, forKey: "requestId"),
-                sessionID: try container.decode(String.self, forKey: "sessionId"),
-                artifacts: try container.decode([ArtifactRecord].self, forKey: "artifacts"),
-                truncated: try container.decode(Bool.self, forKey: "truncated")
-            )
         case "git_diff":
             self = .gitDiff(
                 requestID: try container.decode(String.self, forKey: "requestId"),
@@ -583,6 +599,8 @@ struct ReadyPayload: Decodable, Sendable {
     let models: [ModelChoice]
     let modelProviders: [String: String]
     let middlewareFeatures: [MiddlewareFeature]
+    let extensions: [ExtensionRecord]
+    let contributions: [FrontendContribution]
     let maxActiveSessions: Int
 }
 

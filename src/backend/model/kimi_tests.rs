@@ -3,10 +3,11 @@ use serde_json::json;
 use super::*;
 use crate::backend::model::PromptCacheIdentity;
 use crate::backend::model::user_message;
+use crate::protocol::FrontendSymbol;
 
 #[test]
 fn provider_advertises_kimi_identity() {
-    assert_eq!(provider().symbol(), &FrontendSymbol::Kimi);
+    assert_eq!(provider().symbol(), FrontendSymbol::Custom("kimi".into()));
 }
 
 #[test]

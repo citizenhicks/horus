@@ -187,6 +187,10 @@ impl Approval {
         self
     }
 
+    pub(super) const fn policy(&self) -> ApprovalPolicy {
+        self.default_policy
+    }
+
     pub(super) fn frontend(&self) -> FrontendContribution {
         FrontendContribution {
             capability: CAPABILITY.into(),
@@ -452,7 +456,9 @@ mod tests {
             ("auto_approve", ApprovalPolicy::AutoApprove),
             ("full_access", ApprovalPolicy::FullAccess),
         ] {
-            assert_eq!(value.parse::<ApprovalPolicy>().expect("policy"), expected);
+            let policy = value.parse::<ApprovalPolicy>().expect("policy");
+            assert_eq!(policy, expected);
+            assert_eq!(Approval::new(policy).policy(), policy);
         }
     }
 

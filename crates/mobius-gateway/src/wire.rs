@@ -13,9 +13,9 @@ use mobius::backend::checkpoint::{SessionSummary, StreamMetrics};
 use mobius::backend::model::ModelChoice;
 use mobius::backend::model::provider::HostedWebSearch;
 use mobius::protocol::{
-    Event, EventMsg, FrontendBlock, FrontendContribution, FrontendPreviewUpdate,
-    FrontendSettingValue, FrontendSymbol, FrontendWidget, MiddlewareFeature, Op, RenderedBlock,
-    SessionConfiguredEvent, SessionFileReference, Submission, TokenUsage,
+    Event, EventMsg, FrontendContribution, FrontendPreviewUpdate, FrontendSettingValue,
+    FrontendSymbol, FrontendWidget, MiddlewareFeature, Op, RenderedBlock, SessionConfiguredEvent,
+    SessionFileReference, Submission, TokenUsage,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
@@ -57,7 +57,7 @@ mod base64_bytes {
 }
 
 /// Current gateway protocol version.
-pub const PROTOCOL_VERSION: u16 = 31;
+pub const PROTOCOL_VERSION: u16 = 37;
 /// Maximum encoded JSON payload accepted in one frame.
 pub const MAX_FRAME_BYTES: usize = 50 * 1024 * 1024;
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);

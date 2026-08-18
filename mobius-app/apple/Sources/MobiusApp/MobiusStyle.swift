@@ -112,7 +112,6 @@ struct MobiusGlyph: Hashable {
     static let chatCircle = Self("hi.chatCircle")
     static let chatDots = Self("hi.chatDots")
     static let chatGpt = Self("hi.chatGpt")
-    static let chatsCircle = Self("hi.chatsCircle")
     static let check = Self("hi.check")
     static let checkCircle = Self("hi.checkCircle")
     static let claude = Self("hi.claude")
@@ -122,7 +121,6 @@ struct MobiusGlyph: Hashable {
     static let clock = Self("hi.clock")
     static let combine = Self("hi.combine")
     static let copy = Self("hi.copy")
-    static let cpu = Self("hi.cpu")
     static let csv = Self("hi.csv")
     static let deepseek = Self("hi.deepseek")
     static let doc = Self("hi.doc")
@@ -490,8 +488,7 @@ struct MobiusLabel: View {
     }
 }
 
-/// Row of capsule actions. Rows of several actions drop their labels on a narrow
-/// screen; a single action keeps its label and goes full width instead.
+/// Row of capsule actions. Optional compact rows drop their labels on a narrow screen.
 struct MobiusActionRow<Content: View>: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     var collapsesToIcons = false
@@ -503,10 +500,12 @@ struct MobiusActionRow<Content: View>: View {
                 HStack(spacing: MobiusSpace.s) { content }
                     .labelStyle(.iconOnly)
                     .buttonBorderShape(.circle)
+            } else if collapsesToIcons {
+                HStack(spacing: MobiusSpace.s) { content }
+                    .buttonSizing(.flexible)
             } else {
-                // Full width keeps the label: measuring for a horizontal fit either
-                // hyphenates or truncates it away.
-                VStack(spacing: MobiusSpace.s) { content }.buttonSizing(.flexible)
+                VStack(spacing: MobiusSpace.s) { content }
+                    .buttonSizing(.flexible)
             }
         }
         .frame(maxWidth: .infinity)
@@ -554,9 +553,5 @@ extension Button where Label == MobiusLabel {
 /// Draws the gateway's `FrontendSymbol` vocabulary in HugeIcons.
 ///
 /// The protocol names what a glyph stands for and leaves the artwork to each frontend, so
-/// this table is the iOS client's half of that contract: one entry per `FrontendSymbol`
-/// variant, and the gateway never names an icon itself. Keep it in step with the enum in
-/// `src/protocol/mod.rs` — a variant with no entry here falls back to `placeholder`.
-///
-/// `FrontendSymbol::Custom` has no entry by definition. It carries a name from outside the
-/// protocol's vocabulary, which this app has no artwork for, so it draws the placeholder.
+/// this table is the iOS client's half of that contract: semantic protocol tokens and any
+/// custom provider tokens for which the app ships artwork. Unknown names use `placeholder`.

@@ -106,12 +106,16 @@ async fn each_call_receives_its_own_permissions() {
                 name: "permission_echo".into(),
                 output: "first:false".into(),
                 is_error: false,
+                handler_executed: true,
+                additional_input: Vec::new(),
             },
             ToolResult {
                 call_id: "allowed".into(),
                 name: "permission_echo".into(),
                 output: "second:true".into(),
                 is_error: false,
+                handler_executed: true,
+                additional_input: Vec::new(),
             },
         ]
     );
@@ -148,6 +152,8 @@ async fn parallel_tool_panic_preserves_call_identity() {
             name: "panicking".into(),
             output: "tool panicked".into(),
             is_error: true,
+            handler_executed: true,
+            additional_input: Vec::new(),
         }]
     );
 }
@@ -179,6 +185,12 @@ async fn approval_required_handler_cannot_run_without_exact_call_authority() {
         .pop()
         .expect("tool result");
 
-    assert!(result.is_error);
-    assert_eq!(result.output, "tool call is not authorized to mutate state");
+    assert_eq!(
+        (
+            result.is_error,
+            result.handler_executed,
+            result.output.as_str()
+        ),
+        (true, false, "tool call is not authorized to mutate state")
+    );
 }

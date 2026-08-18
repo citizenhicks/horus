@@ -2,6 +2,10 @@
 label = "Scheduling"
 description = "Schedule recurring agent work"
 
+[command]
+arguments = "[new [task]|list|reschedule <id> <schedule>|delete <id>|run <id>|history [id]]"
+description = "Create or manage scheduled tasks"
+
 [prompt]
 main = "Use `schedule_task` only during an explicit recurring-task setup. During setup, ask only for missing task or timing details, then call it once with standalone task instructions and a five-field cron expression in the host's local time. Outside explicit setup, never call it."
 

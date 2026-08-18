@@ -36,48 +36,6 @@ pub(super) fn encoded_frame_fits(frame: &ServerFrame) -> Result<bool> {
     Ok(serde_json::to_vec(frame)?.len() <= MAX_FRAME_BYTES)
 }
 
-pub(super) fn bounded_artifacts_frame(
-    request_id: String,
-    session_id: String,
-    artifacts: Vec<ArtifactRecord>,
-) -> Result<ServerFrame> {
-    let artifact_count = artifacts.len();
-    let mut encoded_len = artifacts_frame_base_len(&request_id, &session_id)?;
-    let mut retained = Vec::new();
-    for artifact in artifacts.into_iter().rev() {
-        let artifact_len = serde_json::to_vec(&artifact)?.len();
-        let separator_len = usize::from(!retained.is_empty());
-        let candidate_len = encoded_len
-            .saturating_add(separator_len)
-            .saturating_add(artifact_len);
-        if candidate_len > MAX_FRAME_BYTES {
-            break;
-        }
-        encoded_len = candidate_len;
-        retained.push(artifact);
-    }
-    let truncated = retained.len() < artifact_count;
-    retained.reverse();
-    Ok(ServerFrame::new(ServerMessage::Artifacts {
-        request_id,
-        session_id,
-        artifacts: retained,
-        truncated,
-    }))
-}
-
-pub(super) fn artifacts_frame_base_len(request_id: &str, session_id: &str) -> Result<usize> {
-    Ok(
-        serde_json::to_vec(&ServerFrame::new(ServerMessage::Artifacts {
-            request_id: request_id.into(),
-            session_id: session_id.into(),
-            artifacts: Vec::new(),
-            truncated: false,
-        }))?
-        .len(),
-    )
-}
-
 pub(super) async fn write_client_inventory(
     writer: &mut (impl AsyncWrite + Unpin),
     request_id: String,
@@ -193,6 +151,26 @@ pub(super) async fn write_result(
             write_frame(
                 writer,
                 &ServerFrame::new(ServerMessage::Accepted { request_id }),
+            )
+            .await
+        }
+        Err(rejection) => write_rejection(writer, request_id, rejection).await,
+    }
+}
+
+pub(super) async fn write_gateway_result(
+    writer: &mut (impl AsyncWrite + Unpin),
+    request_id: String,
+    result: std::result::Result<crate::wire::ReadyPayload, Rejection>,
+) -> Result<()> {
+    match result {
+        Ok(payload) => {
+            write_frame(
+                writer,
+                &ServerFrame::new(ServerMessage::GatewayConfigured {
+                    request_id,
+                    payload,
+                }),
             )
             .await
         }

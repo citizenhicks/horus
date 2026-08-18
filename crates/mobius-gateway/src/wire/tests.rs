@@ -669,6 +669,41 @@ fn directory_listing_request_uses_a_gateway_host_path() {
 }
 
 #[test]
+fn extension_lifecycle_requests_are_gateway_scoped() {
+    let frames = [
+        ClientMessage::InstallExtension {
+            request_id: "install".into(),
+            source: "https://github.com/DietrichGebert/ponytail".into(),
+            reference: Some("main".into()),
+            subdirectory: None,
+        },
+        ClientMessage::UpdateExtension {
+            request_id: "update".into(),
+            id: "plugin:ponytail".into(),
+        },
+        ClientMessage::UninstallExtension {
+            request_id: "uninstall".into(),
+            id: "plugin:ponytail".into(),
+        },
+        ClientMessage::TrustExtensionHooks {
+            request_id: "trust".into(),
+            id: "plugin:ponytail".into(),
+            expected_digest: "a".repeat(64),
+        },
+        ClientMessage::RevokeExtensionHooksTrust {
+            request_id: "revoke-trust".into(),
+            id: "plugin:ponytail".into(),
+            expected_digest: "a".repeat(64),
+        },
+    ];
+
+    for frame in frames.map(ClientFrame::new) {
+        let encoded = serde_json::to_value(frame).expect("encode lifecycle request");
+        assert!(encoded.get("session_id").is_none());
+    }
+}
+
+#[test]
 fn gateway_ready_contains_no_selected_session() {
     let frame = ServerFrame::new(ServerMessage::Ready {
         payload: ReadyPayload {
@@ -682,6 +717,16 @@ fn gateway_ready_contains_no_selected_session() {
             models: Vec::new(),
             model_providers: BTreeMap::new(),
             middleware_features: Vec::new(),
+            extensions: Vec::new(),
+            contributions: vec![FrontendContribution {
+                capability: "extensions".into(),
+                references: vec![mobius::protocol::FrontendReference {
+                    trigger: '$',
+                    value: "review".into(),
+                    description: "Review code.".into(),
+                }],
+                ..FrontendContribution::default()
+            }],
             max_active_sessions: 32,
         },
     });
@@ -692,10 +737,17 @@ fn gateway_ready_contains_no_selected_session() {
         (
             encoded["payload"]["max_active_sessions"].as_u64(),
             encoded["payload"]["machine_name"].as_str(),
+            encoded["payload"]["contributions"][0]["references"][0]["value"].as_str(),
             encoded["payload"].get("session"),
             encoded["payload"].get("workspace"),
         ),
-        (Some(32), Some("snowwhite.local"), None, None)
+        (
+            Some(32),
+            Some("snowwhite.local"),
+            Some("review"),
+            None,
+            None
+        )
     );
 }
 
@@ -778,12 +830,13 @@ fn server_frame_decodes_session_opened_with_a_widget_action_tag() {
                     },
                     "middleware": {
                         "enabled": [
-                            "compaction", "context_offloading", "cron", "skills", "subagents"
+                            "compaction", "context_offloading", "cron", "extensions", "subagents"
                         ],
                         "settings": {
                             "context_offloading": {"stale_after_tokens": 50000}
                         }
                     },
+                    "extensions": [],
                     "system_prompt": "test",
                     "max_model_steps": 256
                 }
@@ -921,12 +974,4 @@ fn daily_usage_carries_its_provider_on_the_wire() {
 
     assert_eq!(encoded["provider"], "openai_socket");
     assert_eq!(decoded, usage);
-}
-
-#[test]
-fn file_artifact_kind_has_a_stable_wire_value() {
-    assert_eq!(
-        serde_json::to_value(ArtifactKind::File).expect("encode artifact kind"),
-        serde_json::json!("file")
-    );
 }

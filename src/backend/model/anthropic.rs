@@ -34,7 +34,6 @@ use super::usage_i64;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
-use crate::protocol::FrontendSymbol;
 use crate::protocol::ModelStepAnnotation;
 use crate::protocol::ModelStepContent;
 use crate::protocol::ModelStepContentPhase;
@@ -851,7 +850,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "anthropic",
         manifest::PROVIDER_LABEL,
-        FrontendSymbol::Claude,
+        "claude",
         manifest::PROVIDER_DESCRIPTION,
         ProviderAuth::ApiKey("ANTHROPIC_API_KEY"),
         manifest::MODELS,

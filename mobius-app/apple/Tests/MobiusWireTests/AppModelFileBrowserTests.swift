@@ -147,15 +147,10 @@ extension AppModelTests {
 
         requestCount = await recorder.requestCount()
         model.selectFilesInspectorTab(.chatFiles)
-        let artifactRequest = await recorder.firstRequest(after: requestCount) {
-            if case .listArtifacts(_, "chat-1") = $0 { return true }
-            return false
-        }
         let uploadRequest = await recorder.firstRequest(after: requestCount) {
             if case .listSessionUploads(_, "chat-1") = $0 { return true }
             return false
         }
-        XCTAssertNotNil(artifactRequest)
         XCTAssertNotNil(uploadRequest)
     }
 
@@ -198,69 +193,6 @@ extension AppModelTests {
         XCTAssertEqual(model.workspaceFiles, [file])
         XCTAssertTrue(model.workspaceFilesTruncated)
         XCTAssertFalse(model.isLoadingWorkspaceFiles)
-    }
-
-    func testArtifactListIgnoresAResponseForAnotherSession() async throws {
-        let recorder = GatewayRequestRecorder()
-        let model = try model(requestSender: { request in
-            await recorder.record(request)
-        })
-        model.connectionState = .ready
-        model.selectedSessionID = "chat-1"
-        let file = SessionFileReference(
-            id: "file-1",
-            name: "diagram.svg",
-            size: 3,
-            mediaType: "image/svg+xml"
-        )
-        let artifact = ArtifactRecord(
-            id: "artifact-1",
-            sessionId: "chat-1",
-            kind: .file,
-            title: "Architecture diagram",
-            block: FrontendBlock(
-                id: "artifacts/file-1",
-                group: nil,
-                update: .replace,
-                state: .complete,
-                role: .artifact,
-                title: "Architecture diagram",
-                text: "",
-                symbol: "storage",
-                format: "plain_text",
-                tone: "neutral",
-                files: [file]
-            )
-        )
-
-        model.showFiles(.chatFiles)
-        try await Task.sleep(for: .milliseconds(20))
-        let requests = await recorder.requests()
-        guard let request = requests.last(where: {
-            if case .listArtifacts = $0 { return true }
-            return false
-        }), case .listArtifacts(let requestID, _) = request
-        else { return XCTFail("Expected artifact list request") }
-
-        model.handle(.artifacts(
-            requestID: requestID,
-            sessionID: "chat-2",
-            artifacts: [artifact],
-            truncated: true
-        ))
-        XCTAssertTrue(model.artifacts.isEmpty)
-        XCTAssertFalse(model.artifactsTruncated)
-        XCTAssertTrue(model.isLoadingArtifacts)
-
-        model.handle(.artifacts(
-            requestID: requestID,
-            sessionID: "chat-1",
-            artifacts: [artifact],
-            truncated: true
-        ))
-        XCTAssertEqual(model.artifacts, [artifact])
-        XCTAssertTrue(model.artifactsTruncated)
-        XCTAssertFalse(model.isLoadingArtifacts)
     }
 
     func testWorkspaceReferencesUseCLIFuzzyRankingAndReplacement() throws {

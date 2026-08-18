@@ -38,7 +38,6 @@ use super::usage_i64;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
-use crate::protocol::FrontendSymbol;
 
 mod manifest {
     include!(concat!(
@@ -546,7 +545,7 @@ pub(super) const fn generic_provider() -> ProviderDefinition {
     ProviderDefinition::new(
         "responses",
         manifest::PROVIDER_LABEL,
-        FrontendSymbol::Storage,
+        "storage",
         manifest::PROVIDER_DESCRIPTION,
         ProviderAuth::ApiKey("OPENAI_API_KEY"),
         manifest::MODELS,

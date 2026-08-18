@@ -133,6 +133,30 @@ pub enum ClientMessage {
         expected_revision: u64,
         config: AgentComposition,
     },
+    InstallExtension {
+        request_id: String,
+        source: String,
+        reference: Option<String>,
+        subdirectory: Option<String>,
+    },
+    UpdateExtension {
+        request_id: String,
+        id: String,
+    },
+    UninstallExtension {
+        request_id: String,
+        id: String,
+    },
+    TrustExtensionHooks {
+        request_id: String,
+        id: String,
+        expected_digest: String,
+    },
+    RevokeExtensionHooksTrust {
+        request_id: String,
+        id: String,
+        expected_digest: String,
+    },
     GetGitDiff {
         request_id: String,
         session_id: String,
@@ -187,10 +211,6 @@ pub enum ClientMessage {
     },
     GetProfile {
         request_id: String,
-    },
-    ListArtifacts {
-        request_id: String,
-        session_id: String,
     },
     StartCronSetup {
         request_id: String,
@@ -366,12 +386,6 @@ pub enum ServerMessage {
     Profile {
         request_id: String,
         profile: ProfileSnapshot,
-    },
-    Artifacts {
-        request_id: String,
-        session_id: String,
-        artifacts: Vec<ArtifactRecord>,
-        truncated: bool,
     },
     GitDiff {
         request_id: String,

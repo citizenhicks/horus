@@ -176,6 +176,50 @@ extension AppModelTests {
         XCTAssertEqual(suggestions.matches.first?.replacement, "$planning")
     }
 
+    func testExtensionSkillReferencesCombineGatewayAndSessionContributions() throws {
+        let model = try model()
+        var config = composition()
+        config.extensions.insert("plugin:ponytail")
+        model.applyGatewayCatalog(ready(
+            defaultConfig: VersionedAgentConfig(revision: 1, config: config),
+            extensions: [extensionRecord()],
+            contributions: [FrontendContribution(
+                capability: "gateway-skills",
+                acceptsFileAttachments: false,
+                count: 2,
+                commands: [],
+                widgets: [],
+                references: [
+                    FrontendReference(trigger: "$", value: "global", description: "Global"),
+                    FrontendReference(trigger: "$", value: "workspace", description: "Duplicate")
+                ],
+                activeInput: nil
+            )]
+        ))
+        model.agentSnapshot = VersionedAgentConfig(revision: 1, config: config)
+        model.contributions = [FrontendContribution(
+            capability: "session-skills",
+            acceptsFileAttachments: false,
+            count: 3,
+            commands: [],
+            widgets: [],
+            references: [
+                FrontendReference(trigger: "$", value: "ponytail", description: "Managed"),
+                FrontendReference(trigger: "$", value: "workspace", description: "Workspace"),
+                FrontendReference(trigger: "$", value: "project", description: "Project")
+            ],
+            activeInput: nil
+        )]
+
+        XCTAssertEqual(
+            model.extensionSkillReferences.map(\.value),
+            ["global", "workspace", "project"]
+        )
+
+        model.resetGatewayState(preservingDrafts: false)
+        XCTAssertTrue(model.gatewayContributions.isEmpty)
+    }
+
     func testSessionSnapshotKeepsStaticWidgetsAndUpsertsDynamicWidgets() throws {
         let model = try model()
         model.selectedSessionID = "chat-1"

@@ -23,7 +23,8 @@ use mobius_gateway::wire::{
 use tokio::process::{Child, Command};
 use uuid::Uuid;
 
-const USAGE: &str = "usage: mobius [run <task-file> | pair <endpoint> <one-time-code>]";
+const USAGE: &str =
+    "usage: mobius [extensions | run <task-file> | pair <endpoint> <one-time-code>]";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(40);
 const DEFAULT_LOCAL_ENDPOINT: &str = "tcp://127.0.0.1:8741";
@@ -46,6 +47,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 return Err(Error::Config(USAGE.into()).into());
             }
             pair(text(&endpoint, "endpoint")?, text(&code, "one-time code")?).await?;
+        }
+        Some(command) if command == OsStr::new("extensions") => {
+            if args.next().is_some() {
+                return Err(Error::Config(USAGE.into()).into());
+            }
+            run_extensions().await?;
         }
         Some(command) if command == OsStr::new("--help") || command == OsStr::new("-h") => {
             println!("{USAGE}");
@@ -139,6 +146,11 @@ async fn run_task(task_file: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn run_extensions() -> Result<()> {
+    let (sender, events, gateway, _, _) = connect_gateway().await?;
+    frontend::run_extensions(sender, events, gateway).await
+}
+
 fn print_output(value: &str) {
     println!("{}", output_text(value, std::io::stdout().is_terminal()));
 }
@@ -174,21 +186,7 @@ async fn connect(
     bool,
     Endpoint,
 )> {
-    let endpoint = configured_endpoint().map_err(gateway_error)?;
-    // ponytail: TLS gateways skip local `@` scanning; use a gateway-backed inventory if needed.
-    let local_gateway = endpoint.is_plaintext();
-    let token = configured_token(&endpoint).map_err(gateway_error)?;
-    let connected = if automatically_manage_local_gateway(&endpoint) {
-        connect_local(&endpoint, token).await
-    } else {
-        match token {
-            Some(token) => GatewayClient::connect(&endpoint, token, ClientKind::Cli).await,
-            None => Err(missing_token(&endpoint)),
-        }
-    };
-    let client = connected.map_err(gateway_error)?;
-    let (sender, mut events) = client.into_parts();
-    let mut gateway = wait_gateway_ready(&mut events).await?;
+    let (sender, mut events, mut gateway, local_gateway, endpoint) = connect_gateway().await?;
     let (session, disposable_session) = match selected.filter(|(previous, _)| previous == &endpoint)
     {
         Some((_, session_id)) => {
@@ -227,6 +225,25 @@ async fn connect(
         local_gateway,
         endpoint,
     ))
+}
+
+async fn connect_gateway() -> Result<(GatewaySender, GatewayEvents, ReadyPayload, bool, Endpoint)> {
+    let endpoint = configured_endpoint().map_err(gateway_error)?;
+    // ponytail: TLS gateways skip local `@` scanning; use a gateway-backed inventory if needed.
+    let local_gateway = endpoint.is_plaintext();
+    let token = configured_token(&endpoint).map_err(gateway_error)?;
+    let connected = if automatically_manage_local_gateway(&endpoint) {
+        connect_local(&endpoint, token).await
+    } else {
+        match token {
+            Some(token) => GatewayClient::connect(&endpoint, token, ClientKind::Cli).await,
+            None => Err(missing_token(&endpoint)),
+        }
+    };
+    let client = connected.map_err(gateway_error)?;
+    let (sender, mut events) = client.into_parts();
+    let gateway = wait_gateway_ready(&mut events).await?;
+    Ok((sender, events, gateway, local_gateway, endpoint))
 }
 
 fn automatically_manage_local_gateway(endpoint: &Endpoint) -> bool {

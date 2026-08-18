@@ -85,7 +85,8 @@ extension GatewayWireTests {
         XCTAssertEqual(encodedConfig["max_model_steps"] as? Int, 256)
         let middleware = try XCTUnwrap(encodedConfig["middleware"] as? [String: Any])
         let enabled = try XCTUnwrap(middleware["enabled"] as? [String])
-        XCTAssertEqual(Set(enabled), ["cron", "skills", "subagents"])
+        XCTAssertEqual(Set(enabled), ["cron", "extensions", "subagents"])
+        XCTAssertEqual(encodedConfig["extensions"] as? [String], ["plugin:ponytail"])
         let settings = try XCTUnwrap(middleware["settings"] as? [String: Any])
         let subagents = try XCTUnwrap(settings["subagents"] as? [String: Any])
         XCTAssertEqual(subagents["model_route"] as? String, "openai_socket/gpt-5.6-sol")
@@ -173,12 +174,6 @@ extension GatewayWireTests {
         XCTAssertEqual(read["type"] as? String, "read_session_file")
         XCTAssertEqual(read["file_id"] as? String, "file-1")
         XCTAssertEqual(read["max_bytes"] as? Int, 262_144)
-
-        let artifacts = try requestObject(.listArtifacts(
-            requestID: "artifacts-1",
-            sessionID: "chat-1"
-        ))
-        XCTAssertEqual(artifacts["type"] as? String, "list_artifacts")
     }
 
     func testWorkspaceViewerRequestsMatchV28() throws {

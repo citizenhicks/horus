@@ -14,9 +14,10 @@ use crate::backend::checkpoint::{
     QueuedInput as DurableQueuedInput,
 };
 use crate::backend::model::{ModelRouter, ToolCall};
+use crate::backend::sandbox::ApprovalPolicy;
 use crate::protocol::{
-    EventMsg, FrontendEvent, MAX_CAPABILITY_INPUT_BYTES, MessageTarget, SessionContext,
-    SessionFileReference, TokenUsage,
+    EventMsg, FrontendEvent, MAX_CAPABILITY_INPUT_BYTES, MessageTarget, ReviewDecision,
+    SessionContext, SessionFileReference, TokenUsage,
 };
 use crate::{Error, Result};
 
@@ -266,10 +267,32 @@ pub struct RuntimeContext {
     pub checkpoints: Arc<dyn CheckpointStore>,
     pub session_id: String,
     pub model_route: String,
+    pub model: String,
+    pub approval_policy: ApprovalPolicy,
     pub session_context: SessionContext,
     pub metadata: BTreeMap<String, Value>,
     pub role: AgentRole,
     pub frontend: FrontendEventSink,
+}
+
+impl RuntimeContext {
+    pub(crate) fn turn_identity<'a>(&'a self, turn_id: &'a str) -> TurnIdentity<'a> {
+        TurnIdentity {
+            session_id: &self.session_id,
+            turn_id,
+            model: &self.model,
+            approval_policy: self.approval_policy,
+        }
+    }
+}
+
+/// Stable facts shared by hooks that run within one active turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnIdentity<'a> {
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+    pub model: &'a str,
+    pub approval_policy: ApprovalPolicy,
 }
 
 /// Why [`Middleware::session_start`](super::Middleware::session_start) is running.
@@ -286,6 +309,8 @@ pub struct SessionStartContext<'a> {
     pub(crate) source: SessionStartSource,
     pub(crate) queued_input: QueuedInputSnapshot,
     pub(crate) input: &'a mut Vec<Value>,
+    pub(crate) input_changed: bool,
+    pub(crate) stop_reason: Option<String>,
 }
 
 impl SessionStartContext<'_> {
@@ -302,13 +327,30 @@ impl SessionStartContext<'_> {
     /// Appends hidden provider context produced while the session starts.
     pub fn push_input(&mut self, item: Value) {
         self.input.push(item);
+        self.input_changed = true;
+    }
+
+    pub(crate) fn retain_input(&mut self, mut keep: impl FnMut(&Value) -> bool) {
+        let input_len = self.input.len();
+        self.input.retain(&mut keep);
+        self.input_changed |= self.input.len() != input_len;
+    }
+
+    /// Stops the active turn after session-start processing completes.
+    pub fn stop(&mut self, reason: impl Into<String>) -> Result<()> {
+        set_stop_reason(&mut self.stop_reason, "session-start stop", reason)
+    }
+
+    /// Returns the first stop requested by the ordered middleware chain.
+    #[must_use]
+    pub fn stop_reason(&self) -> Option<&str> {
+        self.stop_reason.as_deref()
     }
 }
 
 /// Mutable state exposed before a submitted user prompt enters durable context.
 pub struct UserPromptSubmitContext<'a> {
-    pub session_id: &'a str,
-    pub turn_id: &'a str,
+    pub turn: TurnIdentity<'a>,
     pub message: &'a str,
     pub attachments: &'a [SessionFileReference],
     pub events: &'a mut Vec<EventMsg>,
@@ -350,13 +392,14 @@ pub struct ModelContext<'a> {
     pub(crate) context_epoch: &'a mut u64,
     pub(crate) compaction_count: &'a mut u64,
     pub(crate) rewrite_reasons: &'a mut Vec<ContextRewriteReason>,
+    pub(crate) turn_stop: &'a mut Option<String>,
     pub queued_input: QueuedInputQueue<'a>,
     pub last_usage: Option<&'a TokenUsage>,
     pub tools: &'a Catalog,
     pub events: &'a mut Vec<EventMsg>,
     pub usage: &'a mut Vec<TokenUsage>,
     /// Set when this hook changes durable checkpoint state.
-    pub checkpoint_changed: &'a mut bool,
+    pub(crate) checkpoint_changed: &'a mut bool,
     pub(crate) runtime: &'a RuntimeContext,
     pub(crate) hooks: &'a MiddlewareStack,
 }
@@ -428,31 +471,37 @@ impl ModelContext<'_> {
 
     pub(crate) async fn pre_compact(&mut self) -> Result<()> {
         let hooks = self.hooks;
-        hooks
+        let stop_reason = hooks
             .pre_compact(CompactContext {
                 session_id: self.session_id,
                 turn_id: self.turn_id,
-                model_step: self.model_step,
-                compaction_count: *self.compaction_count,
+                model: &self.runtime.model,
                 input: self.durable_input,
                 events: self.events,
+                stop_reason: None,
             })
-            .await
+            .await?;
+        set_first(self.turn_stop, stop_reason);
+        Ok(())
     }
 
     pub(crate) async fn post_compact(&mut self) -> Result<()> {
         let hooks = self.hooks;
-        hooks
+        let stop_reason = hooks
             .post_compact(CompactContext {
                 session_id: self.session_id,
                 turn_id: self.turn_id,
-                model_step: self.model_step,
-                compaction_count: *self.compaction_count,
+                model: &self.runtime.model,
                 input: self.durable_input,
                 events: self.events,
+                stop_reason: None,
             })
             .await?;
-        hooks
+        set_first(self.turn_stop, stop_reason);
+        if self.turn_stop.is_some() {
+            return Ok(());
+        }
+        let start = hooks
             .session_start(
                 self.runtime,
                 self.queued_input.items,
@@ -460,8 +509,14 @@ impl ModelContext<'_> {
                 self.durable_input,
             )
             .await?;
+        set_first(self.turn_stop, start.stop_reason);
         self.request_input.clone_from(self.durable_input);
         Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn turn_stopped(&self) -> bool {
+        self.turn_stop.is_some()
     }
 }
 
@@ -490,9 +545,11 @@ impl ModelRequestContext<'_> {
 
 /// Mutable policy boundary for one normalized model-requested tool call.
 pub struct PreToolUseContext<'a> {
-    pub session_id: &'a str,
-    pub turn_id: &'a str,
+    pub turn: TurnIdentity<'a>,
+    pub events: &'a mut Vec<EventMsg>,
+    pub(crate) tools: &'a Catalog,
     pub(crate) call: &'a mut ToolCall,
+    pub(crate) input: Vec<Value>,
     pub(crate) denial: Option<String>,
 }
 
@@ -506,6 +563,11 @@ impl PreToolUseContext<'_> {
     /// Replaces the tool name and arguments while preserving the provider call ID.
     pub fn replace(&mut self, name: impl Into<String>, arguments: Value) -> Result<()> {
         self.call.replace(name.into(), arguments)
+    }
+
+    /// Adds durable provider-neutral context before this call at a tool-complete boundary.
+    pub fn push_input(&mut self, item: Value) {
+        self.input.push(item);
     }
 
     /// Denies the call. Later middleware may observe but cannot undo the denial.
@@ -524,43 +586,36 @@ impl PreToolUseContext<'_> {
     }
 }
 
-/// Aggregate decision made immediately before the sandbox would ask the user.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PermissionDecision {
-    Defer,
-    Allow,
-    Deny(String),
-}
-
 /// Mutable policy boundary for a sandbox approval request.
 pub struct PermissionRequestContext<'a> {
-    pub session_id: &'a str,
-    pub turn_id: &'a str,
+    pub turn: TurnIdentity<'a>,
     pub calls: &'a [ToolCall],
     pub requested_call_ids: &'a [String],
     pub reason: &'a str,
-    pub(crate) decision: PermissionDecision,
+    pub events: &'a mut Vec<EventMsg>,
+    pub(crate) tools: &'a Catalog,
+    pub(crate) decision: Option<ReviewDecision>,
 }
 
 impl PermissionRequestContext<'_> {
     /// Returns the decision accumulated from earlier middleware.
     #[must_use]
-    pub fn decision(&self) -> &PermissionDecision {
-        &self.decision
+    pub fn decision(&self) -> Option<&ReviewDecision> {
+        self.decision.as_ref()
     }
 
     /// Allows this request unless an earlier middleware denied it.
     pub fn allow(&mut self) {
-        if !matches!(self.decision, PermissionDecision::Deny(_)) {
-            self.decision = PermissionDecision::Allow;
+        if !matches!(self.decision, Some(ReviewDecision::Denied { .. })) {
+            self.decision = Some(ReviewDecision::Approved);
         }
     }
 
     /// Denies this request. The decision cannot be weakened by later middleware.
     pub fn deny(&mut self, reason: impl Into<String>) -> Result<()> {
         let reason = hook_message("permission denial", reason)?;
-        if !matches!(self.decision, PermissionDecision::Deny(_)) {
-            self.decision = PermissionDecision::Deny(reason);
+        if !matches!(self.decision, Some(ReviewDecision::Denied { .. })) {
+            self.decision = Some(ReviewDecision::Denied { rejection: reason });
         }
         Ok(())
     }
@@ -568,9 +623,10 @@ impl PermissionRequestContext<'_> {
 
 /// Mutable model-visible result exposed after an executed tool call.
 pub struct PostToolUseContext<'a> {
-    pub session_id: &'a str,
-    pub turn_id: &'a str,
+    pub turn: TurnIdentity<'a>,
     pub call: &'a ToolCall,
+    pub events: &'a mut Vec<EventMsg>,
+    pub(crate) tools: &'a Catalog,
     pub(crate) result: &'a mut ToolResult,
 }
 
@@ -585,23 +641,39 @@ impl PostToolUseContext<'_> {
     pub fn replace(&mut self, output: impl Into<String>) {
         self.result.replace(output.into());
     }
+
+    /// Adds provider-neutral context immediately after this tool output.
+    pub fn push_input(&mut self, item: Value) {
+        self.result.additional_input.push(item);
+    }
 }
 
-/// Read-only state exposed immediately before or after context compaction.
+/// State exposed immediately before or after context compaction.
 pub struct CompactContext<'a> {
     pub session_id: &'a str,
     pub turn_id: &'a str,
-    pub model_step: usize,
-    pub compaction_count: u64,
+    pub model: &'a str,
     pub input: &'a [Value],
     pub events: &'a mut Vec<EventMsg>,
+    pub(crate) stop_reason: Option<String>,
+}
+
+impl CompactContext<'_> {
+    /// Stops the active turn at this compaction boundary.
+    pub fn stop(&mut self, reason: impl Into<String>) -> Result<()> {
+        set_stop_reason(&mut self.stop_reason, "compaction stop", reason)
+    }
+
+    /// Returns the first stop requested by the ordered middleware chain.
+    #[must_use]
+    pub fn stop_reason(&self) -> Option<&str> {
+        self.stop_reason.as_deref()
+    }
 }
 
 /// Mutable policy boundary immediately before normal turn completion.
 pub struct StopContext<'a> {
-    pub session_id: &'a str,
-    pub turn_id: &'a str,
-    pub model_step: usize,
+    pub turn: TurnIdentity<'a>,
     pub events: &'a mut Vec<EventMsg>,
     pub(crate) role: &'a AgentRole,
     pub(crate) stop_hook_active: bool,
@@ -652,6 +724,24 @@ fn hook_message(name: &str, value: impl Into<String>) -> Result<String> {
         return Err(Error::Config(format!("{name} is empty or too long")));
     }
     Ok(value)
+}
+
+fn set_stop_reason(
+    target: &mut Option<String>,
+    name: &str,
+    reason: impl Into<String>,
+) -> Result<()> {
+    let reason = hook_message(name, reason)?;
+    if target.is_none() {
+        *target = Some(reason);
+    }
+    Ok(())
+}
+
+fn set_first(target: &mut Option<String>, value: Option<String>) {
+    if target.is_none() {
+        *target = value;
+    }
 }
 
 pub(super) fn provisional_message_target(

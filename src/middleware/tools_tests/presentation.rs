@@ -64,11 +64,11 @@ fn generic_tool_renderer_does_not_infer_coding_presentation() {
         &EventMsg::ToolCallEnd(crate::protocol::ToolCallEndEvent {
             turn_id: "turn".into(),
             call_id: "call".into(),
-            name: "load_skill".into(),
+            name: "example_tool".into(),
             output: diff.into(),
             is_error: false,
         }),
-        |name| name == "load_skill",
+        |name| name == "example_tool",
         |_, _| String::new().into(),
     )
     .expect("generic rendering");

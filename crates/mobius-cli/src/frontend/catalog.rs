@@ -55,17 +55,16 @@ struct UiCommand {
 enum CommandHandler {
     Help,
     GatewaySettings,
+    Extensions,
     Agent,
     Workspace,
     Login,
     Pair,
     Profile,
-    Artifacts,
     New,
     Clear,
     Model,
     Reasoning,
-    Cron,
     Status,
     Interrupt,
     Exit,
@@ -91,6 +90,7 @@ pub(crate) enum CommandAction {
     Submit(Op),
     Gateway(GatewayAction),
     GatewaySettings,
+    Extensions,
     Setup {
         mode: SetupMode,
         provider: Option<String>,
@@ -108,8 +108,6 @@ pub(crate) enum GatewayAction {
     Workspace(String),
     Pair,
     Profile,
-    Artifacts,
-    Cron(String),
 }
 
 impl UiCatalog {
@@ -127,7 +125,7 @@ impl UiCatalog {
                 name: command.name.clone(),
                 arguments: command.arguments.clone(),
                 description: command.description.clone(),
-                requires_idle: true,
+                requires_idle: command.requires_idle,
                 handler: CommandHandler::Capability {
                     capability: contribution.capability.clone(),
                 },
@@ -312,10 +310,7 @@ impl UiCatalog {
                 "unknown command `{COMMAND_PREFIX}{name}`"
             )));
         };
-        let cron_setup_busy = matches!(command.handler, CommandHandler::Cron)
-            && arguments.split_ascii_whitespace().next() == Some("new")
-            && context.active_turn.is_some();
-        if (command.requires_idle && context.active_turn.is_some()) || cron_setup_busy {
+        if command.requires_idle && context.active_turn.is_some() {
             return Some(CommandAction::Print(format!(
                 "`{COMMAND_PREFIX}{}` is available when the agent is idle",
                 command.name
@@ -327,6 +322,8 @@ impl UiCatalog {
                 CommandAction::GatewaySettings
             }
             CommandHandler::GatewaySettings => CommandAction::Print("usage: /gateway".into()),
+            CommandHandler::Extensions if arguments.is_empty() => CommandAction::Extensions,
+            CommandHandler::Extensions => CommandAction::Print("usage: /extensions".into()),
             CommandHandler::Agent if arguments.is_empty() => CommandAction::Setup {
                 mode: SetupMode::Agent,
                 provider: None,
@@ -344,12 +341,10 @@ impl UiCatalog {
             CommandHandler::Login => CommandAction::Print("usage: /login [provider]".into()),
             CommandHandler::Pair => CommandAction::Gateway(GatewayAction::Pair),
             CommandHandler::Profile => CommandAction::Gateway(GatewayAction::Profile),
-            CommandHandler::Artifacts => CommandAction::Gateway(GatewayAction::Artifacts),
             CommandHandler::New => CommandAction::New,
             CommandHandler::Clear => CommandAction::Clear,
             CommandHandler::Model => model_picker(&self.model_choices),
             CommandHandler::Reasoning => reasoning_picker(context.model_route, &self.model_choices),
-            CommandHandler::Cron => CommandAction::Gateway(GatewayAction::Cron(arguments.into())),
             CommandHandler::Status => CommandAction::Print(context.status.to_string()),
             CommandHandler::Interrupt => context.active_turn.map_or_else(
                 || CommandAction::Print("no active turn to interrupt".into()),
@@ -407,6 +402,12 @@ fn cli_commands() -> Vec<UiCommand> {
             true,
             CommandHandler::GatewaySettings,
         ),
+        command(
+            "extensions",
+            "install, update, trust, or remove extensions",
+            true,
+            CommandHandler::Extensions,
+        ),
         UiCommand {
             name: "agent".into(),
             arguments: String::new(),
@@ -440,12 +441,6 @@ fn cli_commands() -> Vec<UiCommand> {
             false,
             CommandHandler::Pair,
         ),
-        command(
-            "artifacts",
-            "show session artifacts",
-            false,
-            CommandHandler::Artifacts,
-        ),
         command("new", "start a new chat", true, CommandHandler::New),
         command(
             "clear",
@@ -465,15 +460,6 @@ fn cli_commands() -> Vec<UiCommand> {
             true,
             CommandHandler::Reasoning,
         ),
-        UiCommand {
-            name: "cron".into(),
-            arguments:
-                "[new [task]|list|reschedule <id> <schedule>|delete <id>|run <id>|history [id]]"
-                    .into(),
-            description: "create or manage scheduled tasks".into(),
-            requires_idle: false,
-            handler: CommandHandler::Cron,
-        },
         command(
             "status",
             "show turn, token, and capability status",
@@ -746,6 +732,7 @@ mod tests {
                 name: command.into(),
                 arguments: String::new(),
                 description: "test command".into(),
+                requires_idle: true,
             }],
             widgets: Vec::new(),
             references: Vec::new(),
@@ -809,9 +796,43 @@ mod tests {
     }
 
     #[test]
-    fn cron_setup_waits_for_idle_but_management_does_not() {
+    fn extensions_command_opens_the_gateway_catalog_only_when_idle() {
         let workspace = tempfile::tempdir().expect("workspace");
         let catalog = UiCatalog::build(&[], &[], workspace.path()).expect("catalog");
+        let idle = CommandContext {
+            active_turn: None,
+            status: "idle",
+            model_route: "kimi",
+        };
+
+        assert_eq!(
+            catalog.dispatch("/extensions", idle),
+            Some(CommandAction::Extensions)
+        );
+        assert_eq!(
+            catalog.dispatch("/extensions extra", idle),
+            Some(CommandAction::Print("usage: /extensions".into()))
+        );
+        assert!(matches!(
+            catalog.dispatch(
+                "/extensions",
+                CommandContext {
+                    active_turn: Some("turn"),
+                    status: "working",
+                    model_route: "kimi",
+                },
+            ),
+            Some(CommandAction::Print(message)) if message.contains("agent is idle")
+        ));
+    }
+
+    #[test]
+    fn active_capability_command_dispatch_is_declared_data() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut cron = contribution("cron");
+        cron.capability = "cron".into();
+        cron.commands[0].requires_idle = false;
+        let catalog = UiCatalog::build(&[cron], &[], workspace.path()).expect("catalog");
         let context = CommandContext {
             active_turn: Some("turn"),
             status: "working",
@@ -820,11 +841,14 @@ mod tests {
 
         assert!(matches!(
             catalog.dispatch("/cron new review pull requests", context),
-            Some(CommandAction::Print(message)) if message.contains("agent is idle")
-        ));
-        assert!(matches!(
-            catalog.dispatch("/cron list", context),
-            Some(CommandAction::Gateway(GatewayAction::Cron(arguments))) if arguments == "list"
+            Some(CommandAction::Submit(Op::CapabilityCommand {
+                capability,
+                command,
+                arguments,
+                ..
+            })) if capability == "cron"
+                && command == "cron"
+                && arguments == "new review pull requests"
         ));
     }
 
@@ -850,15 +874,19 @@ mod tests {
         std::fs::create_dir(workspace.path().join("target")).expect("target directory");
         std::fs::write(workspace.path().join(".git/config"), "").expect("git file");
         std::fs::write(workspace.path().join("target/artifact"), "").expect("artifact");
-        let mut contribution = contribution("inspect");
-        contribution.references.push(FrontendReference {
+        let mut inspect = contribution("inspect");
+        inspect.references.push(FrontendReference {
             trigger: '@',
             value: "middleware".into(),
             description: "middleware reference".into(),
         });
 
-        let catalog =
-            UiCatalog::build(&[contribution], &model_choices(), workspace.path()).expect("catalog");
+        let catalog = UiCatalog::build(
+            &[inspect, contribution("cron")],
+            &model_choices(),
+            workspace.path(),
+        )
+        .expect("catalog");
         catalog
             .start_workspace_inventory(true)
             .await
@@ -872,7 +900,6 @@ mod tests {
                 && commands.contains("/workspace")
                 && commands.contains("/cron")
                 && commands.contains("/pair")
-                && commands.contains("/artifacts")
                 && references
                     .iter()
                     .any(|item| item.value == "\"source file.rs\"")

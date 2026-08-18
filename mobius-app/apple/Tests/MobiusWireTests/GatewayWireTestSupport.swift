@@ -32,7 +32,7 @@ final class GatewayWireTests: XCTestCase {
     }
 
     var configJSON: String {
-        #"{"revision":4,"config":{"provider":{"provider":"openai_socket","model":"gpt-5.6-sol","endpoint_auth":"provider_default","reasoning_effort":"high","web_search":"cached"},"middleware":{"enabled":["cron","skills","subagents"],"settings":{"context_offloading":{"stale_after_tokens":50000},"subagents":{"model_route":"openai_socket/gpt-5.6-sol"}}},"system_prompt":"Stay focused.","max_model_steps":256}}"#
+        #"{"revision":4,"config":{"provider":{"provider":"openai_socket","model":"gpt-5.6-sol","endpoint_auth":"provider_default","reasoning_effort":"high","web_search":"cached"},"middleware":{"enabled":["cron","extensions","subagents"],"settings":{"context_offloading":{"stale_after_tokens":50000},"subagents":{"model_route":"openai_socket/gpt-5.6-sol"}}},"extensions":["plugin:ponytail"],"system_prompt":"Stay focused.","max_model_steps":256}}"#
     }
 
     var usageJSON: String {
@@ -52,7 +52,7 @@ final class GatewayWireTests: XCTestCase {
     }
 
     var readyPayloadJSON: String {
-        #"{"machine_name":"snowwhite.local","sessions":[\#(sessionRecordJSON)],"providers":[{"provider":"openai_socket","label":"OpenAI","symbol":"chat_gpt","description":"Persistent Responses API","configured":true,"auth":"api_key","default_base_url":null,"default_api_key_env":"OPENAI_API_KEY","models":[{"id":"gpt-5.6-sol","label":"Sol","description":"Frontier capability for complex work","context_window":1050000,"reasoning":[{"id":"medium","label":"Medium","description":"Balanced reasoning and latency"}],"default_reasoning":"medium"}],"model_ids":[],"reasoning_efforts":[],"model_ids_configurable":false,"web_search":["off","cached","live"]}],"default_config":\#(configJSON),"models":[{"route":"openai_socket/gpt-5.6-sol","group":"OpenAI","model":"gpt-5.6-sol","reasoning_effort":"medium","context_window":200000,"supports_image_input":true}],"model_providers":{"openai_socket/gpt-5.6-sol":"openai_socket"},"middleware_features":[{"id":"skills","label":"Skills","description":"Load focused instructions.","required":false,"settings":[{"id":"limit","label":"Limit","description":"Maximum items","type":"integer","min":1,"step":10},{"id":"route","label":"Route","description":"Default route","type":"select","options":[{"value":"route-a","label":"Route A","description":"First route"}],"unset_label":"Inherit"}]}],"max_active_sessions":4}"#
+        #"{"machine_name":"snowwhite.local","sessions":[\#(sessionRecordJSON)],"providers":[{"provider":"openai_socket","label":"OpenAI","symbol":"chat_gpt","description":"Persistent Responses API","configured":true,"auth":"api_key","default_base_url":null,"default_api_key_env":"OPENAI_API_KEY","models":[{"id":"gpt-5.6-sol","label":"Sol","description":"Frontier capability for complex work","context_window":1050000,"reasoning":[{"id":"medium","label":"Medium","description":"Balanced reasoning and latency"}],"default_reasoning":"medium"}],"model_ids":[],"reasoning_efforts":[],"model_ids_configurable":false,"web_search":["off","cached","live"]}],"default_config":\#(configJSON),"models":[{"route":"openai_socket/gpt-5.6-sol","group":"OpenAI","model":"gpt-5.6-sol","reasoning_effort":"medium","context_window":200000,"supports_image_input":true}],"model_providers":{"openai_socket/gpt-5.6-sol":"openai_socket"},"middleware_features":[{"id":"extensions","label":"Extensions","description":"Load installed skills and plugins.","required":false,"settings":[{"id":"limit","label":"Limit","description":"Maximum items","composer":false,"type":"integer","min":1,"step":10},{"id":"route","label":"Route","description":"Default route","composer":false,"type":"select","options":[{"value":"route-a","label":"Route A","description":"First route","symbol":null,"tone":"neutral"}],"unset_label":"Inherit"}]}],"extensions":[{"id":"plugin:ponytail","capability":"extensions","kind":"plugin","name":"ponytail","description":"Minimal coding guidance.","version":"4.9.0","source":"https://github.com/DietrichGebert/ponytail.git","reference":"main","subdirectory":null,"resolved_revision":"0123456789abcdef","digest":"abcdef0123456789","skills":["ponytail"],"hooks":[{"event":"pre_tool_use","matcher":"shell","command":"bin/review","timeout_seconds":10}],"hooks_trusted":true}],"contributions":[{"capability":"extensions","accepts_file_attachments":false,"count":1,"commands":[],"widgets":[],"references":[{"trigger":"$","value":"planning","description":"Planning skill"}],"active_input":null}],"max_active_sessions":4}"#
     }
 
     var sessionReadyPayloadJSON: String {
@@ -69,12 +69,13 @@ final class GatewayWireTests: XCTestCase {
                 webSearch: .cached
             ),
             middleware: MiddlewareConfig(
-                enabled: ["cron", "skills", "subagents"],
+                enabled: ["cron", "extensions", "subagents"],
                 settings: [
                     "context_offloading": ["stale_after_tokens": .integer(50_000)],
                     "subagents": ["model_route": .string("openai_socket/gpt-5.6-sol")]
                 ]
             ),
+            extensions: ["plugin:ponytail"],
             systemPrompt: "Stay focused.",
             maxModelSteps: 256
         )

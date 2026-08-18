@@ -21,8 +21,7 @@ struct PairingView: View {
                             model.showsPairing = false
                             dismiss()
                         }
-                        .labelStyle(.iconOnly)
-                        .buttonStyle(MobiusIconButtonStyle())
+                        .mobiusIconButton()
                         .help("Close")
                     }
                 }
@@ -44,14 +43,7 @@ struct PairingView: View {
                                             model.applyPairingSetup(value)
                                         }
                                     }
-                                    .labelStyle(.iconOnly)
-                                    .buttonStyle(.glass)
-                                    .buttonBorderShape(.circle)
-                                    .controlSize(.large)
-                                    .frame(
-                                        width: MobiusStyle.iconButtonSize,
-                                        height: MobiusStyle.iconButtonSize
-                                    )
+                                    .mobiusIconButton()
                                     .accessibilityLabel("Paste pairing setup")
                                     .help("Paste pairing setup")
                                 }

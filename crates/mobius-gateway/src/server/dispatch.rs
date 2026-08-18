@@ -41,6 +41,12 @@ pub(super) async fn handle_message(
         session_files,
         uploads,
     } = connection;
+    let message = match normalize_capability_command(message, selected) {
+        Ok(message) => message,
+        Err((request_id, rejection)) => {
+            return write_rejection(writer, request_id, rejection).await;
+        }
+    };
     match message {
         ClientMessage::Pair { .. } | ClientMessage::Authenticate { .. } => {
             write_server_error(
@@ -431,22 +437,65 @@ pub(super) async fn handle_message(
             request_id,
             expected_revision,
             config,
-        } => match gateway
-            .configure_default_agent(expected_revision, config)
+        } => {
+            write_gateway_result(
+                writer,
+                request_id,
+                gateway
+                    .configure_default_agent(expected_revision, config)
+                    .await,
+            )
             .await
-        {
-            Ok(payload) => {
-                write_frame(
-                    writer,
-                    &ServerFrame::new(ServerMessage::GatewayConfigured {
-                        request_id,
-                        payload,
-                    }),
-                )
-                .await
-            }
-            Err(rejection) => write_rejection(writer, request_id, rejection).await,
-        },
+        }
+        ClientMessage::InstallExtension {
+            request_id,
+            source,
+            reference,
+            subdirectory,
+        } => {
+            write_gateway_result(
+                writer,
+                request_id,
+                gateway
+                    .install_extension(source, reference, subdirectory)
+                    .await,
+            )
+            .await
+        }
+        ClientMessage::UpdateExtension { request_id, id } => {
+            write_gateway_result(writer, request_id, gateway.update_extension(id).await).await
+        }
+        ClientMessage::UninstallExtension { request_id, id } => {
+            write_gateway_result(writer, request_id, gateway.uninstall_extension(id).await).await
+        }
+        ClientMessage::TrustExtensionHooks {
+            request_id,
+            id,
+            expected_digest,
+        } => {
+            write_gateway_result(
+                writer,
+                request_id,
+                gateway
+                    .set_extension_hooks_trusted(id, expected_digest, true)
+                    .await,
+            )
+            .await
+        }
+        ClientMessage::RevokeExtensionHooksTrust {
+            request_id,
+            id,
+            expected_digest,
+        } => {
+            write_gateway_result(
+                writer,
+                request_id,
+                gateway
+                    .set_extension_hooks_trusted(id, expected_digest, false)
+                    .await,
+            )
+            .await
+        }
         ClientMessage::GetGitDiff {
             request_id,
             session_id,
@@ -612,27 +661,21 @@ pub(super) async fn handle_message(
             model_ids,
             reasoning_efforts,
             replace_existing_selections,
-        } => match gateway
-            .register_provider(
-                config,
-                model_ids,
-                reasoning_efforts,
-                replace_existing_selections,
+        } => {
+            write_gateway_result(
+                writer,
+                request_id,
+                gateway
+                    .register_provider(
+                        config,
+                        model_ids,
+                        reasoning_efforts,
+                        replace_existing_selections,
+                    )
+                    .await,
             )
             .await
-        {
-            Ok(payload) => {
-                write_frame(
-                    writer,
-                    &ServerFrame::new(ServerMessage::GatewayConfigured {
-                        request_id,
-                        payload,
-                    }),
-                )
-                .await
-            }
-            Err(rejection) => write_rejection(writer, request_id, rejection).await,
-        },
+        }
         ClientMessage::CreatePairingCode { request_id } => match auth.create_pairing_code() {
             Ok(grant) => {
                 write_frame(
@@ -672,22 +715,6 @@ pub(super) async fn handle_message(
                 .await
             }
             Err(rejection) => write_rejection(writer, request_id, rejection).await,
-        },
-        ClientMessage::ListArtifacts {
-            request_id,
-            session_id,
-        } => match require_selected(selected, &session_id) {
-            Err(rejection) => write_rejection(writer, request_id, rejection).await,
-            Ok(host) => match host.artifacts().await {
-                Ok(artifacts) => {
-                    write_frame(
-                        writer,
-                        &bounded_artifacts_frame(request_id, session_id, artifacts)?,
-                    )
-                    .await
-                }
-                Err(rejection) => write_rejection(writer, request_id, rejection).await,
-            },
         },
         ClientMessage::StartCronSetup {
             request_id,
@@ -764,4 +791,63 @@ pub(super) async fn handle_message(
             Err(error) => write_rejection(writer, request_id, cron_rejection(error)).await,
         },
     }
+}
+
+fn normalize_capability_command(
+    message: ClientMessage,
+    selected: &Option<SelectedChat>,
+) -> std::result::Result<ClientMessage, (String, Rejection)> {
+    let (session_id, submission) = match message {
+        ClientMessage::Submit {
+            session_id,
+            submission,
+        } => (session_id, submission),
+        message => return Ok(message),
+    };
+    let Op::CapabilityCommand {
+        capability,
+        command,
+        arguments,
+        input,
+        target,
+    } = &submission.op
+    else {
+        return Ok(ClientMessage::Submit {
+            session_id,
+            submission,
+        });
+    };
+    let request_id = submission.id.clone();
+    if capability != mobius::middleware::cron::MANIFEST.id
+        || command != mobius::middleware::cron::MANIFEST.id
+    {
+        return Ok(ClientMessage::Submit {
+            session_id,
+            submission,
+        });
+    }
+    validate_submission(&submission).map_err(|error| {
+        (
+            request_id.clone(),
+            Rejection {
+                code: "invalid_submission",
+                message: error.to_string(),
+                fatal: false,
+            },
+        )
+    })?;
+    require_selected(selected, &session_id).map_err(|rejection| (request_id.clone(), rejection))?;
+    if input.is_some() || target.is_some() {
+        return Err((
+            request_id,
+            Rejection {
+                code: "invalid_submission",
+                message: "gateway capability commands do not accept input or a message target"
+                    .into(),
+                fatal: false,
+            },
+        ));
+    }
+    crate::cron::command_message(request_id.clone(), session_id, arguments)
+        .map_err(|error| (request_id, cron_rejection(error)))
 }

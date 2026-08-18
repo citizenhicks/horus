@@ -110,19 +110,31 @@ impl Runner {
             return Ok(Wait::Ready(results));
         }
         let raw_results = results.clone();
+        let mut hook_events = Vec::new();
         for result in &mut results {
             let call = calls
                 .iter()
                 .find(|call| call.call_id == result.call_id)
                 .ok_or_else(|| Error::Tool("tool result has no matching call".into()))?;
+            if !result.handler_executed {
+                continue;
+            }
             let mut context = PostToolUseContext {
-                session_id: &self.config.session_id,
-                turn_id,
+                turn: self.runtime.turn_identity(turn_id),
                 call,
+                events: &mut hook_events,
+                tools: &self.catalog,
                 result,
             };
             if let Err(error) = self.config.middleware.post_tool_use(&mut context).await {
                 self.persist_tool_results(submission_id, turn_id, raw_results)
+                    .await?;
+                return Err(error);
+            }
+        }
+        for message in hook_events {
+            if let Err(error) = self.emit(submission_id, message).await {
+                self.persist_tool_results(submission_id, turn_id, results)
                     .await?;
                 return Err(error);
             }
@@ -160,12 +172,13 @@ impl Runner {
         self.state
             .pending_tools
             .retain(|call| !completed.contains(call.call_id.as_str()));
-        for result in results {
+        for mut result in results {
             self.push_context(tool_output(
                 &result.call_id,
                 &result.output,
                 result.is_error,
             ));
+            self.extend_context(std::mem::take(&mut result.additional_input));
         }
         Ok(())
     }

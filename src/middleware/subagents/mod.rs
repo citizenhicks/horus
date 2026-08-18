@@ -94,6 +94,7 @@ const SETTINGS: &[MiddlewareSettingManifest] = &[
         unset_label: Some(text::SETTING_MODEL_ROUTE_UNSET_LABEL),
         default: None,
         max_bytes: 4 * 1024,
+        composer: false,
     },
     MiddlewareSettingManifest::Integer {
         id: "max_depth",
@@ -573,6 +574,7 @@ impl Middleware for Subagents {
                 name: "subagents".into(),
                 arguments: String::new(),
                 description: text::COMMAND_DESCRIPTION.into(),
+                requires_idle: true,
             }],
             widgets: Vec::new(),
             references: Vec::new(),
@@ -673,9 +675,6 @@ impl Middleware for Subagents {
                     &acknowledged,
                 )
                 .await?;
-            if !mail.is_empty() {
-                *context.checkpoint_changed = true;
-            }
             for mail in mail {
                 context.push_input(internal_user_message(&mail.internal_kind(), &mail.render()))?;
             }

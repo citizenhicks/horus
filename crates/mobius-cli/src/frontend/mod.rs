@@ -8,6 +8,7 @@ use mobius_gateway::wire::{ReadyPayload, SessionReadyPayload};
 mod catalog;
 mod cloudflare_setup;
 mod dashboard;
+mod extensions;
 mod gateway;
 mod gateway_actions;
 mod headless;
@@ -23,6 +24,14 @@ pub use tui::terminal_text;
 pub use cloudflare_setup::{CloudflareInit, run as run_cloudflare_setup};
 pub use dashboard::{run as run_gateway_dashboard, run_provider as run_gateway_provider};
 pub use reinitialize::confirm as confirm_gateway_reinitialize;
+
+pub async fn run_extensions(
+    sender: GatewaySender,
+    events: GatewayEvents,
+    gateway: ReadyPayload,
+) -> Result<()> {
+    extensions::standalone(sender, events, gateway).await
+}
 
 fn block_text(block: &FrontendBlock) -> String {
     let mut text = block.title.clone();

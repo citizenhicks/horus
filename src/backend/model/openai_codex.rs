@@ -13,7 +13,6 @@ use super::provider::ProviderAuth;
 use super::provider::ProviderBuildConfig;
 use super::provider::ProviderDefinition;
 use crate::Result;
-use crate::protocol::FrontendSymbol;
 
 #[path = "openai_codex_auth.rs"]
 mod auth;
@@ -33,7 +32,7 @@ pub(super) const fn provider() -> ProviderDefinition {
     ProviderDefinition::new(
         PROVIDER_ID,
         manifest::PROVIDER_LABEL,
-        FrontendSymbol::ChatGpt,
+        "chat_gpt",
         manifest::PROVIDER_DESCRIPTION,
         ProviderAuth::Browser(&BROWSER_AUTH),
         MODELS,

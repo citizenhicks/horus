@@ -213,8 +213,10 @@ struct SidebarView: View {
                     navigationButton("Gateway", destination: .gateway)
                     navigationButton("Providers", destination: .providers)
                     navigationButton("Default agent", destination: .agent)
+                    navigationButton("Extensions", destination: .extensions)
                     navigationButton("Cron", destination: .cron)
-                    ForEach(model.navigationWidgets) { widget in
+                    navigationButton("Scratchpad", destination: .scratchpad)
+                    ForEach(model.navigationWidgets.filter { $0.capability != "scratchpad" }) { widget in
                         contributionNavigationButton(widget)
                     }
                 }
@@ -240,8 +242,7 @@ struct SidebarView: View {
         Button("Settings", glyph: AppDestination.profile.glyph) {
             showDetail(.profile)
         }
-        .labelStyle(.iconOnly)
-        .buttonStyle(MobiusIconButtonStyle(prominent: model.destination == .profile))
+        .mobiusIconButton()
         .help("Settings")
     }
 

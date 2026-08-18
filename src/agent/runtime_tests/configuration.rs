@@ -2,6 +2,73 @@
 
 use super::*;
 
+struct FailFirstTurnEnd(Arc<Mutex<Vec<ExecutionOutcome>>>);
+
+impl Middleware for FailFirstTurnEnd {
+    fn name(&self) -> &'static str {
+        "fail_first_turn_end"
+    }
+
+    fn turn_end<'a>(
+        &'a self,
+        context: &'a mut crate::middleware::TurnEndContext<'_>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let mut outcomes = self.0.lock().expect("turn-end outcomes lock");
+            let first = outcomes.is_empty();
+            outcomes.push(context.outcome());
+            drop(outcomes);
+            if first {
+                Err(Error::Stopped("turn-end hook failed".into()))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn failing_turn_end_hook_runs_once_with_the_original_outcome() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(
+        SqliteCheckpoint::new(workspace.path().join("checkpoints.sqlite3"))
+            .expect("checkpoint store"),
+    );
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let model = Arc::new(ScriptedModel {
+        outputs: Mutex::new(VecDeque::from([scripted_message("done")])),
+        tool_counts: Mutex::new(Vec::new()),
+        inputs: Mutex::new(Vec::new()),
+    });
+    let mut agent_config = config_with_model(
+        workspace.path(),
+        checkpoints,
+        "turn-end-at-most-once",
+        "main",
+        model,
+    );
+    agent_config.middleware =
+        MiddlewareStack::new(vec![Arc::new(FailFirstTurnEnd(Arc::clone(&outcomes)))])
+            .expect("middleware");
+    let mut agent = create_agent(agent_config).await.expect("create agent");
+    agent
+        .sender()
+        .submit(Op::UserInput {
+            text: "hello".into(),
+            attachments: Vec::new(),
+        })
+        .expect("submit input");
+    while !matches!(
+        agent.next_event().await.expect("agent event").msg,
+        EventMsg::TurnAborted(_)
+    ) {}
+
+    assert_eq!(
+        outcomes.lock().expect("turn-end outcomes lock").as_slice(),
+        [ExecutionOutcome::Completed]
+    );
+}
+
 #[tokio::test]
 async fn middleware_event_saturation_fails_agent_creation_instead_of_dropping_updates() {
     let workspace = tempfile::tempdir().expect("workspace");

@@ -1,8 +1,5 @@
 use futures_util::SinkExt as _;
-use mobius::protocol::{
-    Event, EventMsg, FrontendBlock, FrontendBlockFormat, FrontendBlockRole, FrontendBlockState,
-    FrontendBlockUpdate, FrontendTone, Op, SessionFileReference, Submission,
-};
+use mobius::protocol::{Event, EventMsg, Op, SessionFileReference, Submission};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -10,7 +7,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use uuid::Uuid;
 
 use crate::client::{Endpoint, GatewayClient, GatewayEvents, GatewaySender};
-use crate::wire::{ArtifactKind, SessionActivity, SessionActivityState};
+use crate::wire::{SessionActivity, SessionActivityState};
 
 use super::*;
 

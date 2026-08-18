@@ -39,6 +39,77 @@ async fn background_commands_do_not_use_the_foreground_deadline() {
     assert_eq!(output.exit_code, 0);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authorization_holds_the_catalog_lock_through_process_spawn() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let sandbox = local_sandbox(workspace.path());
+    let allowed = Arc::new(Mutex::new(true));
+    let checked = Arc::new(Barrier::new(2));
+    let attempting_cutover = Arc::new(Barrier::new(2));
+    let cutover_finished = Arc::new(AtomicBool::new(false));
+    let authorization: CommandAuthorization = {
+        let allowed = Arc::clone(&allowed);
+        let checked = Arc::clone(&checked);
+        let attempting_cutover = Arc::clone(&attempting_cutover);
+        let cutover_finished = Arc::clone(&cutover_finished);
+        Arc::new(move |launch| {
+            let Ok(allowed) = allowed.lock() else {
+                return Ok(());
+            };
+            if *allowed {
+                checked.wait();
+                attempting_cutover.wait();
+                launch()?;
+                assert!(!cutover_finished.load(Ordering::SeqCst));
+            }
+            Ok(())
+        })
+    };
+    let writer = {
+        let allowed = Arc::clone(&allowed);
+        let checked = Arc::clone(&checked);
+        let attempting_cutover = Arc::clone(&attempting_cutover);
+        let cutover_finished = Arc::clone(&cutover_finished);
+        std::thread::spawn(move || {
+            checked.wait();
+            attempting_cutover.wait();
+            *allowed.lock().expect("authorization catalog") = false;
+            cutover_finished.store(true, Ordering::SeqCst);
+        })
+    };
+
+    let first = sandbox
+        .execute_authorized(
+            "true",
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Denied,
+            CommandMode::Foreground,
+            CommandOutputSink::default(),
+            &authorization,
+        )
+        .await
+        .expect("authorized command");
+    writer.join().expect("catalog writer");
+    let second = sandbox
+        .execute_authorized(
+            "true",
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Denied,
+            CommandMode::Foreground,
+            CommandOutputSink::default(),
+            &authorization,
+        )
+        .await
+        .expect("revoked command");
+
+    assert!(first.is_some());
+    assert!(second.is_none());
+}
+
 #[cfg(target_os = "macos")]
 async fn assert_timeout_reaps_daemonized_descendants(
     sandbox: LocalSandbox,
@@ -144,6 +215,102 @@ async fn protected_full_access_cleanup_reaps_daemonized_descendants() {
 
 fn local_sandbox(workspace: &Path) -> LocalSandbox {
     LocalSandbox::new(workspace).expect("sandbox")
+}
+
+#[tokio::test]
+async fn absolute_reads_are_confined_to_explicit_read_roots() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let resources = tempfile::tempdir().expect("resources");
+    let outside = tempfile::tempdir().expect("outside");
+    let resource = resources.path().join("resource.txt");
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&resource, "resource").expect("resource");
+    std::fs::write(&secret, "secret").expect("secret");
+    let resource = std::fs::canonicalize(resource).expect("canonical resource");
+    let secret = std::fs::canonicalize(secret).expect("canonical secret");
+    let sandbox = local_sandbox(workspace.path())
+        .allow_read_root(resources.path())
+        .expect("read root");
+
+    assert_eq!(
+        sandbox
+            .read(resource.to_str().expect("UTF-8 resource path"))
+            .await
+            .expect("allowed resource"),
+        "resource"
+    );
+    assert!(
+        sandbox
+            .read(secret.to_str().expect("UTF-8 secret path"))
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn read_roots_cannot_overlap_denied_paths() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let protected = tempfile::tempdir().expect("protected");
+    let sandbox = local_sandbox(workspace.path())
+        .deny_read(protected.path())
+        .expect("denied read");
+
+    let result = sandbox.allow_read_root(protected.path());
+
+    assert!(result.is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn absolute_read_roots_reject_symlink_escapes() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let resources = tempfile::tempdir().expect("resources");
+    let outside = tempfile::tempdir().expect("outside");
+    let secret = outside.path().join("secret.txt");
+    let link = resources.path().join("link.txt");
+    std::fs::write(&secret, "secret").expect("secret");
+    symlink(&secret, &link).expect("resource symlink");
+    let link = std::fs::canonicalize(resources.path())
+        .expect("canonical resources")
+        .join("link.txt");
+    let sandbox = local_sandbox(workspace.path())
+        .allow_read_root(resources.path())
+        .expect("read root");
+
+    assert!(
+        sandbox
+            .read(link.to_str().expect("UTF-8 link path"))
+            .await
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn absolute_read_roots_reject_replaced_roots() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let parent = tempfile::tempdir().expect("parent");
+    let resources = parent.path().join("resources");
+    let displaced = parent.path().join("displaced");
+    std::fs::create_dir(&resources).expect("resources");
+    let requested = std::fs::canonicalize(&resources)
+        .expect("canonical resources")
+        .join("bait.txt");
+    let sandbox = local_sandbox(workspace.path())
+        .allow_read_root(&resources)
+        .expect("read root");
+    std::fs::rename(&resources, &displaced).expect("displace resources");
+    std::fs::create_dir(&resources).expect("replacement resources");
+    std::fs::write(resources.join("bait.txt"), "replacement").expect("replacement file");
+
+    assert!(
+        sandbox
+            .read(requested.to_str().expect("UTF-8 resource path"))
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -306,6 +473,7 @@ async fn denied_environment_is_removed_from_full_access_commands() {
             CommandIsolation {
                 sandbox_mode: SandboxMode::DangerFullAccess,
                 network_access: NetworkAccess::Allowed,
+                workspace_access: WorkspaceAccess::Writable,
             },
             CommandMode::Foreground,
             CommandOutputSink::default(),
@@ -313,10 +481,11 @@ async fn denied_environment_is_removed_from_full_access_commands() {
                 ("MOBIUS_TEST_SECRET", "secret"),
                 ("MOBIUS_TEST_VISIBLE", "visible"),
             ],
-            WorkspaceAccess::Writable,
+            None,
         )
         .await
-        .expect("full access command");
+        .expect("full access command")
+        .expect("command launch");
 
     assert_eq!(output.exit_code, 0, "{}", output.stderr);
     assert_eq!(output.stdout, "unset:visible");

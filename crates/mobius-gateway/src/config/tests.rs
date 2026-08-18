@@ -59,22 +59,22 @@ fn quick_cloudflare_config_round_trips_without_a_token() {
 }
 
 #[test]
-fn gateway_config_rejects_v15_without_migration() {
+fn gateway_config_rejects_v16_without_migration() {
     let root = tempfile::tempdir().expect("temporary directory");
     let state = root.path().join("state");
     ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
     let path = state.join(CONFIG_FILE);
     let contents = fs::read_to_string(&path)
         .expect("read gateway config")
-        .replacen("version = 16", "version = 15", 1);
-    fs::write(&path, contents).expect("write v15 config");
+        .replacen("version = 17", "version = 16", 1);
+    fs::write(&path, contents).expect("write v16 config");
 
-    let error = ConfigStore::open(state).expect_err("v15 must be rejected");
+    let error = ConfigStore::open(state).expect_err("v16 must be rejected");
 
     assert!(
         error
             .to_string()
-            .contains("unsupported gateway config version 15")
+            .contains("unsupported gateway config version 16")
     );
 }
 
@@ -105,11 +105,65 @@ fn generated_toml_round_trips_manifest_settings() {
     let contents = fs::read_to_string(state.join(CONFIG_FILE)).expect("read config");
     let (_, restored) = ConfigStore::open(state).expect("open config");
 
-    assert!(contents.starts_with("version = 16"));
+    assert!(contents.starts_with("version = 17"));
     assert!(contents.contains("max_model_steps = 256"));
     assert!(contents.contains("[default_agent.config.middleware.settings.context_offloading]"));
     assert!(contents.contains("[default_agent.config.middleware.settings.sessions]"));
     assert_eq!(restored, config);
+}
+
+#[test]
+fn extension_selection_is_a_stable_optional_reference() {
+    use crate::extensions::{ExtensionSource, InstalledExtension};
+    use crate::wire::{ExtensionHookRecord, ExtensionKind};
+
+    let mut config = GatewayConfig::new(DEFAULT_LISTEN, None)
+        .expect("gateway config")
+        .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
+        .expect("register provider");
+    let id = "plugin:ponytail".to_string();
+    config
+        .default_agent
+        .as_mut()
+        .expect("default")
+        .config
+        .extensions
+        .insert(id.clone());
+    config.validate().expect("missing extension is disabled");
+
+    let digest = "a".repeat(64);
+    config.installed_extensions.insert(
+        id.clone(),
+        InstalledExtension {
+            kind: ExtensionKind::Plugin,
+            name: "ponytail".into(),
+            description: "Minimal coding workflows".into(),
+            version: Some("4.9.0".into()),
+            source: ExtensionSource {
+                url: "https://github.com/DietrichGebert/ponytail".into(),
+                reference: Some("main".into()),
+                subdirectory: None,
+            },
+            resolved_revision: "b".repeat(40),
+            digest: digest.clone(),
+            skills: vec!["ponytail:ponytail".into()],
+            hooks: vec![ExtensionHookRecord {
+                event: "SessionStart".into(),
+                matcher: Some("startup".into()),
+                command: "node hooks/activate.js".into(),
+                timeout_seconds: 5,
+            }],
+            trusted_hook_digest: None,
+        },
+    );
+    config.validate().expect("untrusted extension is disabled");
+
+    config
+        .installed_extensions
+        .get_mut(&id)
+        .expect("installed extension")
+        .trusted_hook_digest = Some(digest);
+    config.validate().expect("trusted extension selection");
 }
 
 #[test]

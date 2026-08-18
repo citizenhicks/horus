@@ -32,8 +32,7 @@ struct CronView: View {
                     Text("Tasks")
                     Spacer()
                     Button("Refresh", glyph: .arrowClockwise) { model.refreshCron() }
-                        .labelStyle(.iconOnly)
-                        .buttonStyle(MobiusIconButtonStyle())
+                        .mobiusIconButton()
                         .help("Refresh schedules")
                 }
             }

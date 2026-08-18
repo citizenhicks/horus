@@ -318,6 +318,8 @@ mod tests {
             checkpoints,
             session_id: "session".into(),
             model_route: "model".into(),
+            model: "model".into(),
+            approval_policy: crate::backend::sandbox::ApprovalPolicy::Ask,
             session_context: SessionContext::default(),
             metadata: BTreeMap::new(),
             role: crate::agent::AgentRole::Main,
@@ -570,6 +572,7 @@ mod tests {
         let mut context_epoch = 0;
         let mut compaction_count = 0;
         let mut rewrite_reasons = Vec::new();
+        let mut turn_stop = None;
         let mut events = Vec::new();
         let mut usage = Vec::new();
         let mut checkpoint_changed = false;
@@ -581,6 +584,8 @@ mod tests {
             ),
             session_id: "session-1".into(),
             model_route: "unused".into(),
+            model: "model".into(),
+            approval_policy: crate::backend::sandbox::ApprovalPolicy::Ask,
             session_context: session_context.clone(),
             metadata: metadata.clone(),
             role: crate::agent::AgentRole::Main,
@@ -606,6 +611,7 @@ mod tests {
                 context_epoch: &mut context_epoch,
                 compaction_count: &mut compaction_count,
                 rewrite_reasons: &mut rewrite_reasons,
+                turn_stop: &mut turn_stop,
                 queued_input: queue(&mut queued),
                 last_usage: None,
                 tools: &tools,

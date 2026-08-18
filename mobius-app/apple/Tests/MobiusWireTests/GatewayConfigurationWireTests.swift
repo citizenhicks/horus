@@ -2,6 +2,48 @@ import Foundation
 import XCTest
 
 extension GatewayWireTests {
+    func testExtensionLifecycleRequestsMatchV33() throws {
+        let install = try requestObject(.installExtension(
+            requestID: "extension-1",
+            source: "https://github.com/DietrichGebert/ponytail.git",
+            reference: "main",
+            subdirectory: "packages/ponytail"
+        ))
+        XCTAssertEqual(install["type"] as? String, "install_extension")
+        XCTAssertEqual(install["request_id"] as? String, "extension-1")
+        XCTAssertEqual(install["reference"] as? String, "main")
+        XCTAssertEqual(install["subdirectory"] as? String, "packages/ponytail")
+
+        let update = try requestObject(.updateExtension(
+            requestID: "extension-2",
+            id: "plugin:ponytail"
+        ))
+        XCTAssertEqual(update["type"] as? String, "update_extension")
+        XCTAssertEqual(update["id"] as? String, "plugin:ponytail")
+
+        let uninstall = try requestObject(.uninstallExtension(
+            requestID: "extension-3",
+            id: "plugin:ponytail"
+        ))
+        XCTAssertEqual(uninstall["type"] as? String, "uninstall_extension")
+
+        let trust = try requestObject(.trustExtensionHooks(
+            requestID: "extension-4",
+            id: "plugin:ponytail",
+            expectedDigest: "abcdef0123456789"
+        ))
+        XCTAssertEqual(trust["type"] as? String, "trust_extension_hooks")
+        XCTAssertEqual(trust["expected_digest"] as? String, "abcdef0123456789")
+
+        let untrust = try requestObject(.revokeExtensionHooksTrust(
+            requestID: "extension-5",
+            id: "plugin:ponytail",
+            expectedDigest: "abcdef0123456789"
+        ))
+        XCTAssertEqual(untrust["type"] as? String, "revoke_extension_hooks_trust")
+        XCTAssertEqual(untrust["expected_digest"] as? String, "abcdef0123456789")
+    }
+
     func testProviderAndUtilityRequestsMatchV28() throws {
         let credential = try requestObject(.setProviderCredential(
             requestID: "credential-1",
@@ -66,6 +108,7 @@ extension GatewayWireTests {
         XCTAssertNil(request["session_id"])
         let config = try XCTUnwrap(request["config"] as? [String: Any])
         XCTAssertEqual(config["max_model_steps"] as? Int, 256)
+        XCTAssertEqual(config["extensions"] as? [String], ["plugin:ponytail"])
         let middleware = try XCTUnwrap(config["middleware"] as? [String: Any])
         let settings = try XCTUnwrap(middleware["settings"] as? [String: Any])
         let subagents = try XCTUnwrap(settings["subagents"] as? [String: Any])

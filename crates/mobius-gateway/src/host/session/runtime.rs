@@ -8,7 +8,7 @@ impl HostState {
             .try_read_owned()
             .map_err(|_| Rejection {
                 code: "gateway_busy",
-                message: "retry after the gateway provider update finishes".into(),
+                message: "retry after the gateway update finishes".into(),
                 fatal: false,
             })
     }
@@ -269,6 +269,10 @@ impl HostState {
                 .await;
                 let _ = reply.send(result);
             }
+            HostCommand::RefreshExtension { id, reply } => {
+                let result = self.refresh_extension(&id).await;
+                let _ = reply.send(result);
+            }
             HostCommand::ProviderCutoverStatus { reply } => {
                 let _ = reply.send(ProviderCutoverStatus {
                     selection: self.spec.agent.config.provider.clone(),
@@ -279,9 +283,6 @@ impl HostState {
             HostCommand::CutOverProvider { selection, reply } => {
                 let result = self.cut_over_provider(&selection).await;
                 let _ = reply.send(result);
-            }
-            HostCommand::Artifacts { reply } => {
-                let _ = reply.send(self.list_artifacts().await);
             }
             HostCommand::RunCron { run, input, reply } => {
                 let result = self
@@ -738,6 +739,20 @@ impl HostState {
         {
             return Ok(());
         }
+        self.refresh_runtime().await
+    }
+
+    pub(super) async fn refresh_extension(
+        &mut self,
+        id: &str,
+    ) -> std::result::Result<(), Rejection> {
+        if !self.spec.agent.config.extensions.contains(id) {
+            return Ok(());
+        }
+        self.refresh_runtime().await
+    }
+
+    async fn refresh_runtime(&mut self) -> std::result::Result<(), Rejection> {
         if self.pending_turns > 0 || self.approval_active {
             self.restart_after_turn = true;
             return Ok(());

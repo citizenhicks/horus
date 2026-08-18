@@ -134,9 +134,6 @@ final class AppModel {
     var composerAttachments: [ComposerAttachment] = []
     var sessionUploads: [SessionFileReference] = []
     var isLoadingSessionUploads = false
-    var artifacts: [ArtifactRecord] = []
-    var artifactsTruncated = false
-    var isLoadingArtifacts = false
     var previewURL: URL?
     var textFilePreview: TextFilePreview?
     var sessionFileShareItem: SessionFileShareItem?
@@ -152,6 +149,9 @@ final class AppModel {
     var modelChoices: [ModelChoice] = []
     var modelProviders: [String: String] = [:]
     var middlewareFeatures: [MiddlewareFeature] = []
+    var extensions: [ExtensionRecord] = []
+    var gatewayContributions: [FrontendContribution] = []
+    var extensionInstallSource = ""
     var selectedModelRoute = ""
     private(set) var contributionsRevision = 0
     var contributions: [FrontendContribution] = [] {
@@ -233,6 +233,7 @@ final class AppModel {
     var providerModelIDsText = ""
     var providerReasoningEffortsText = ""
     var providerActionState: ProviderActionState = .idle
+    var extensionAction: ExtensionAction?
     var pairingCodeInfo: PairingCodeInfo?
 
     var showsPairing = false
@@ -311,7 +312,6 @@ final class AppModel {
     @ObservationIgnored var committedGitDiffRequestID: String?
     @ObservationIgnored var workspaceFilesRequestID: String?
     @ObservationIgnored var sessionUploadsRequestID: String?
-    @ObservationIgnored var artifactListRequestID: String?
     @ObservationIgnored var sessionFileUploadRequests: [String: SessionFileUploadRequest] = [:]
     @ObservationIgnored var sessionFileData: [UUID: Data] = [:]
     @ObservationIgnored var attachmentImportReservations = 0
@@ -327,6 +327,7 @@ final class AppModel {
     @ObservationIgnored var pairingCodeExpiryTask: Task<Void, Never>?
     @ObservationIgnored var providerLoginRequestID: String?
     @ObservationIgnored var providerRegistrationRequestID: String?
+    @ObservationIgnored var extensionRequestID: String?
     @ObservationIgnored var cronRequestIDs: Set<String> = []
     @ObservationIgnored var toastDismissTask: Task<Void, Never>?
     @ObservationIgnored var isChatVisible = false
@@ -403,6 +404,7 @@ final class AppModel {
         case "gateway": destination = .gateway
         case "providers": destination = .providers
         case "agent": destination = .agent
+        case "extensions": destination = .extensions
         case "cron": destination = .cron
         case "profile": destination = .profile
         default: break
@@ -892,6 +894,21 @@ final class AppModel {
             contribution.references.map {
                 MountedReference(capability: contribution.capability, reference: $0)
             }
+        }
+    }
+
+    var extensionSkillReferences: [FrontendReference] {
+        let selected = agentSnapshot?.config.extensions
+            ?? defaultAgentSnapshot?.config.extensions
+            ?? []
+        var seen = Set(extensions
+            .filter { selected.contains($0.id) }
+            .flatMap(\.skills))
+        let references = (gatewayContributions + contributions)
+            .flatMap(\.references)
+            .filter { $0.trigger == "$" }
+        return references.filter {
+            seen.insert($0.value).inserted
         }
     }
 

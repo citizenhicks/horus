@@ -304,6 +304,7 @@ impl Middleware for Scratchpad {
                 name: "scratchpad".into(),
                 arguments: text::COMMAND_ARGUMENTS.into(),
                 description: text::COMMAND_DESCRIPTION.into(),
+                requires_idle: true,
             }],
             widgets: surface_widgets(&Snapshot::default()),
             references: Vec::new(),

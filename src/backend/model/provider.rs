@@ -214,7 +214,7 @@ type ProviderBuilder = fn(ProviderBuildConfig) -> Result<Arc<dyn Model>>;
 pub struct ProviderDefinition {
     id: &'static str,
     label: &'static str,
-    symbol: FrontendSymbol,
+    symbol: &'static str,
     description: &'static str,
     auth: ProviderAuth,
     models: &'static [ModelPreset],
@@ -234,7 +234,7 @@ impl ProviderDefinition {
     pub(crate) const fn new(
         id: &'static str,
         label: &'static str,
-        symbol: FrontendSymbol,
+        symbol: &'static str,
         description: &'static str,
         auth: ProviderAuth,
         models: &'static [ModelPreset],
@@ -288,8 +288,8 @@ impl ProviderDefinition {
     }
 
     #[must_use]
-    pub const fn symbol(&self) -> &FrontendSymbol {
-        &self.symbol
+    pub fn symbol(&self) -> FrontendSymbol {
+        FrontendSymbol::from_wire(self.symbol)
     }
 
     #[must_use]
