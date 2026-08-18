@@ -260,9 +260,11 @@ struct GatewayView: View {
             }
             .settingsStandaloneRow()
 
-            Section("möbius Cloud") {
-                SettingsCaption("Let möbius provision and manage a private gateway for you.")
-                MobiusCloudOfferButton()
+            if !model.selectedGatewayIsMobiusCloud {
+                Section("möbius Cloud") {
+                    SettingsCaption("Let möbius provision and manage a private gateway for you.")
+                    MobiusCloudOfferButton()
+                }
             }
         }
         .alert(

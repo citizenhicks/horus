@@ -106,9 +106,11 @@ extension AppModel {
                 pairingCode = ""
                 showsPairing = false
                 showToast("Gateway paired.", tone: .success)
+                completeCloudPairing(.success(()))
             } catch {
                 pairingError = error.localizedDescription
                 showToast(error.localizedDescription, tone: .error)
+                completeCloudPairing(.failure(error))
             }
         case .authenticated:
             connectionState = .loading
@@ -292,8 +294,12 @@ extension AppModel {
             cronRequestIDs.remove(requestID)
             cronRuns = runs
         case .error(let failure):
-            if pendingPairingAccount != nil { pairingError = failure.message }
-            if failure.code == "unauthorized", pendingPairingAccount == nil {
+            let wasPairing = pendingPairingAccount != nil
+            if wasPairing { pairingError = failure.message }
+            if cloudPairingContinuation != nil {
+                completeCloudPairing(.failure(MobiusCloudError.provisioningFailed))
+            }
+            if failure.code == "unauthorized", !wasPairing {
                 automaticReconnectBlocked = true
                 cancelReconnect()
                 repairSelectedGateway()
@@ -447,8 +453,11 @@ extension AppModel {
     }
 
     func applyGatewayCatalog(_ payload: ReadyPayload) {
-        gatewayMachineName = payload.machineName
-        rememberGatewayMachineName(payload.machineName)
+        let machineName = selectedGatewayIsMobiusCloud
+            ? mobiusCloudGatewayDisplayName
+            : payload.machineName
+        gatewayMachineName = machineName
+        rememberGatewayMachineName(machineName)
         let previousDefault = defaultAgentSnapshot
         let pendingDefaultDraft: AgentComposition? = if defaultConfigRequestID != nil
             || providerRegistrationRequestID != nil {

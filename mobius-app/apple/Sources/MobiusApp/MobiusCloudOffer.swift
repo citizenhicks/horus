@@ -4,7 +4,6 @@ import SwiftUI
 
 struct MobiusCloudOfferButton: View {
     @Environment(\.mobiusPalette) private var palette
-    @State private var product: Product?
     @State private var showsOffer = false
 
     // A centred label and no chevron: with a leading glyph, a spacer and a caret this read
@@ -15,7 +14,7 @@ struct MobiusCloudOfferButton: View {
             showsOffer = true
         } label: {
             Label {
-                title
+                Text("Connect to möbius Cloud")
                     // Glass takes a tint from its own material, not from the button's, so
                     // the accent has to be carried by the label for it to read at all.
                     .foregroundStyle(palette.accent)
@@ -35,23 +34,11 @@ struct MobiusCloudOfferButton: View {
         .buttonBorderShape(.capsule)
         .controlSize(.large)
         .buttonSizing(.flexible)
-        .task { await loadProduct() }
         .sheet(isPresented: $showsOffer) {
             MobiusCloudOfferSheet()
                 .presentationDragIndicator(.visible)
         }
         .accessibilityHint("Explains the managed möbius Cloud subscription")
-    }
-
-    private var title: Text {
-        guard let product else { return Text("Connect to möbius Cloud") }
-        return Text("Connect to möbius Cloud for \(product.displayPrice) per month")
-    }
-
-    @MainActor
-    private func loadProduct() async {
-        guard product == nil else { return }
-        product = try? await Product.products(for: [mobiusCloudMonthlyProductID]).first
     }
 }
 
@@ -92,10 +79,10 @@ private struct MobiusCloudOfferSheet: View {
         }
         .interactiveDismissDisabled(model.cloudAction.isRunning)
         .task { await loadProduct() }
+        .task { await model.refreshCloudAccount() }
     }
 
-    /// One voice per line: a mark, the promise, and the shape of the offer. The price is not
-    /// here — it belongs beside the button that charges it, not at the top in accent.
+    /// One voice per line: a mark, the promise, and the shape of the offer.
     private var hero: some View {
         VStack(alignment: .leading, spacing: MobiusSpace.l) {
             // The app's own mark, not a stock globe.
@@ -153,21 +140,19 @@ private struct MobiusCloudOfferSheet: View {
                 .font(MobiusStyle.bodyFont)
                 .foregroundStyle(palette.muted)
                 .fixedSize(horizontal: false, vertical: true)
+            billingDescription
+                .font(MobiusStyle.controlFont)
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    /// Pricing stays with the action so the terms remain visible wherever the page is scrolled.
-    ///
     /// Sign in with Apple is a branded control: Apple's guidelines allow black, white, or
     /// outlined only, so it cannot wear the app's accent. White is the variant meant for a
     /// dark background. The fade underneath is not a bar — it only keeps the last line of
     /// text from colliding with the capsule as the page scrolls past it.
     private var signupBoundary: some View {
         VStack(spacing: MobiusSpace.m) {
-            billingDescription
-                .font(MobiusStyle.bodyFont)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
             if let cloudError = model.cloudError {
                 Text(cloudError)
                     .font(MobiusStyle.captionFont)
@@ -183,25 +168,47 @@ private struct MobiusCloudOfferSheet: View {
                 .font(MobiusStyle.controlFont)
                 .frame(maxWidth: .infinity, minHeight: 50)
                 .accessibilityElement(children: .combine)
-            } else if let product {
-                if model.hasCloudAccount {
-                    Button("Subscribe for \(product.displayPrice) a month") {
-                        Task {
-                            if await model.purchaseCloud(product) { dismiss() }
-                        }
+            } else if model.cloudAccount?.subscribed == true {
+                Button("Connect gateway") {
+                    Task {
+                        if await model.connectCloudGateway() { dismiss() }
                     }
-                    .buttonStyle(.borderedProminent)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.extraLarge)
+                .frame(maxWidth: .infinity)
+            } else if !model.hasCloudAccount {
+                SignInWithAppleButton(.continue) { request in
+                    configureAppleRequest(request)
+                } onCompletion: { result in
+                    completeAppleSignIn(result, product: product)
+                }
+                .signInWithAppleButtonStyle(.white)
+                .frame(maxWidth: .infinity, minHeight: 50, maxHeight: 50)
+            } else if model.hasCloudAccount, model.cloudAccount == nil {
+                if model.cloudError == nil {
+                    Button("Checking subscription…") {}
+                        .buttonStyle(.bordered)
+                        .controlSize(.extraLarge)
+                        .disabled(true)
+                        .frame(maxWidth: .infinity)
+                } else {
+                    Button("Retry subscription check") {
+                        Task { await model.refreshCloudAccount() }
+                    }
+                    .buttonStyle(.bordered)
                     .controlSize(.extraLarge)
                     .frame(maxWidth: .infinity)
-                } else {
-                    SignInWithAppleButton(.continue) { request in
-                        configureAppleRequest(request)
-                    } onCompletion: { result in
-                        completeAppleSignIn(result, product: product)
-                    }
-                    .signInWithAppleButtonStyle(.white)
-                    .frame(maxWidth: .infinity, minHeight: 50)
                 }
+            } else if let product {
+                Button("Subscribe") {
+                    Task {
+                        if await model.purchaseCloud(product) { dismiss() }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.extraLarge)
+                .frame(maxWidth: .infinity)
             } else if productLoadFailed {
                 VStack(spacing: MobiusSpace.s) {
                     Text("The App Store price could not be loaded.")
@@ -274,7 +281,7 @@ private struct MobiusCloudOfferSheet: View {
 
     private func completeAppleSignIn(
         _ result: Result<ASAuthorization, Error>,
-        product: Product
+        product: Product?
     ) {
         switch result {
         case .failure(let error):

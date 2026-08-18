@@ -435,11 +435,6 @@ extension AppModel {
         settingsDefaults.set(theme.rawValue, forKey: "theme")
     }
 
-    func setSharesMobiusDiagnostics(_ sharesDiagnostics: Bool) {
-        sharesMobiusDiagnostics = sharesDiagnostics
-        settingsDefaults.set(sharesDiagnostics, forKey: sharesMobiusDiagnosticsKey)
-    }
-
     func refreshAppLockAuthenticationMethod() {
         appLockAuthenticationMethod = appLockAuthenticator.method
     }

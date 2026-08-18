@@ -147,7 +147,7 @@ extension AppModel {
     func openWorkspaceBrowser() {
         guard canCreateSession else { return }
         showsWorkspaceBrowser = true
-        loadDirectory(workspace?.path ?? "/")
+        loadDirectory(workspace?.path ?? (selectedGatewayIsMobiusCloud ? "." : "/"))
     }
 
     func loadDirectory(_ path: String) {

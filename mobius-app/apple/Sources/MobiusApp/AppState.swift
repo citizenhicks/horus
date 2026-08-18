@@ -407,7 +407,6 @@ struct AppLockAuthenticator {
 }
 
 let appLockEnabledKey = "app-lock-enabled"
-let sharesMobiusDiagnosticsKey = "shares-mobius-diagnostics"
 let maximumAttachmentBytes = 50 * 1024 * 1024
 let maximumComposerAttachmentBytes: Int64 = 100 * 1024 * 1024
 let maximumPresentedFileBytes = 50 * 1024 * 1024

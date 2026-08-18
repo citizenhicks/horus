@@ -71,6 +71,38 @@ extension AppModelTests {
         XCTAssertNotNil(request)
     }
 
+    func testNewWorkspaceBrowserUsesCloudWorkingDirectoryOnly() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        model.connectionState = .ready
+
+        let requestCount = await recorder.requestCount()
+        model.openWorkspaceBrowser()
+
+        let localRequest = await recorder.firstRequest(after: requestCount) { request in
+            guard case .listDirectories(_, "/", false) = request else { return false }
+            return true
+        }
+        XCTAssertNotNil(localRequest)
+
+        let cloudAccount = GatewayAccount(
+            endpoint: try GatewayEndpoint("wss://cloud-test.sprites.app"),
+            displayName: "möbius Cloud"
+        )
+        model.accounts = [cloudAccount]
+        model.selectedAccountID = cloudAccount.id
+        model.cloudSession = MobiusCloudSession(userID: UUID(), expiresAt: .distantFuture)
+
+        let cloudRequestCount = await recorder.requestCount()
+        model.openWorkspaceBrowser()
+
+        let cloudRequest = await recorder.firstRequest(after: cloudRequestCount) { request in
+            guard case .listDirectories(_, ".", false) = request else { return false }
+            return true
+        }
+        XCTAssertNotNil(cloudRequest)
+    }
+
     func testCreatingWorkspaceDirectoryUsesCurrentListingAndEntersCreatedFolder() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model { request in await recorder.record(request) }

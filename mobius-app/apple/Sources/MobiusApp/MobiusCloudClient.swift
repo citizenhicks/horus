@@ -9,6 +9,12 @@ struct MobiusCloudSession: Equatable, Sendable {
     let expiresAt: Date
 }
 
+struct MobiusCloudAccount: Equatable, Sendable {
+    let email: String?
+    let subscribed: Bool
+    let sharesDiagnostics: Bool
+}
+
 struct MobiusCloudPairingGrant: Equatable, Sendable {
     let setup: GatewayPairingSetup
     let expiresAt: Date
@@ -43,6 +49,7 @@ struct MobiusCloudAppleNonce: Equatable, Sendable {
 
 enum MobiusCloudError: LocalizedError {
     case authenticationRequired
+    case invalidAccountResponse
     case invalidAuthenticationResponse
     case invalidAuthorization
     case invalidGatewayResponse
@@ -54,11 +61,13 @@ enum MobiusCloudError: LocalizedError {
     case secureRandomUnavailable
     case server(Int)
     case sessionExpired
+    case subscriptionRequired
     case unverifiedTransaction
 
     var errorDescription: String? {
         switch self {
         case .authenticationRequired: "Sign in with Apple to continue."
+        case .invalidAccountResponse: "möbius Cloud returned invalid account information."
         case .invalidAuthenticationResponse: "möbius Cloud returned an invalid sign-in response."
         case .invalidAuthorization: "Apple sign-in could not be completed."
         case .invalidGatewayResponse: "möbius Cloud returned an invalid gateway response."
@@ -73,6 +82,7 @@ enum MobiusCloudError: LocalizedError {
                 ? "Your Cloud sign-in expired. Sign in with Apple again."
                 : "möbius Cloud is temporarily unavailable."
         case .sessionExpired: "Your Cloud sign-in expired. Sign in with Apple again."
+        case .subscriptionRequired: "An active Cloud subscription is required."
         case .unverifiedTransaction: "The App Store could not verify this transaction."
         }
     }
@@ -192,6 +202,16 @@ final class MobiusCloudClient {
         let signedTransaction: String
     }
 
+    private struct AccountResponse: Decodable {
+        let email: String?
+        let subscribed: Bool
+        let sharesDiagnostics: Bool
+    }
+
+    private struct AccountUpdateRequest: Encodable {
+        let sharesDiagnostics: Bool
+    }
+
     private struct GatewayStatusResponse: Decodable {
         let status: MobiusCloudGatewayStatus
     }
@@ -203,6 +223,7 @@ final class MobiusCloudClient {
     }
 
     private static let authenticationURL = cloudURL("api/mobile/auth/apple")
+    private static let accountURL = cloudURL("api/mobile/account")
     private static let subscriptionURL = cloudURL("api/mobile/subscription")
     private static let gatewayURL = cloudURL("api/mobile/gateway")
     private static let maximumResponseBytes = 64 * 1024
@@ -283,6 +304,39 @@ final class MobiusCloudClient {
         }
         try store.save(credential)
         return credential.session
+    }
+
+    func account() async throws -> MobiusCloudAccount {
+        let data = try await send(
+            url: Self.accountURL,
+            method: "GET",
+            authenticated: true
+        )
+        let response: AccountResponse
+        do {
+            response = try decoder.decode(AccountResponse.self, from: data)
+        } catch {
+            throw MobiusCloudError.invalidAccountResponse
+        }
+        guard response.email.map(Self.isValidEmail) ?? true else {
+            throw MobiusCloudError.invalidAccountResponse
+        }
+        return MobiusCloudAccount(
+            email: response.email,
+            subscribed: response.subscribed,
+            sharesDiagnostics: response.sharesDiagnostics
+        )
+    }
+
+    func updateSharesDiagnostics(_ sharesDiagnostics: Bool) async throws {
+        _ = try await send(
+            url: Self.accountURL,
+            method: "PUT",
+            body: try encoder.encode(AccountUpdateRequest(
+                sharesDiagnostics: sharesDiagnostics
+            )),
+            authenticated: true
+        )
     }
 
     func submitSubscription(signedTransaction: String) async throws {
@@ -385,5 +439,13 @@ final class MobiusCloudClient {
             fatalError("Invalid möbius Cloud URL")
         }
         return url
+    }
+
+    private static func isValidEmail(_ email: String) -> Bool {
+        email.utf8.count <= 254
+            && email.range(
+                of: #"^[^\s@]+@[^\s@]+\.[^\s@]+$"#,
+                options: .regularExpression
+            ) != nil
     }
 }

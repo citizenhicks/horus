@@ -33,8 +33,10 @@ final class AppModel {
     }
     var sessions: [SessionRecord] = []
     var cloudSession: MobiusCloudSession?
+    var cloudAccount: MobiusCloudAccount?
     var cloudAction: MobiusCloudAction = .idle
     var cloudError: String?
+    var isUpdatingCloudDiagnostics = false
     var hasCloudAccount: Bool { cloudSession != nil }
 
     var gatewayMachineName = ""
@@ -241,7 +243,6 @@ final class AppModel {
     var pairingCode = ""
     var pairingError: String?
     var theme: ThemePreference
-    var sharesMobiusDiagnostics: Bool
     var appLockEnabled: Bool
     var isAppLocked: Bool
     var isAppLockAuthenticating = false
@@ -262,6 +263,7 @@ final class AppModel {
     @ObservationIgnored var reconnectTask: Task<Void, Never>?
     @ObservationIgnored var reconnectAttempt = 0
     @ObservationIgnored var automaticReconnectBlocked = false
+    @ObservationIgnored var cloudPairingContinuation: CheckedContinuation<Void, Error>?
     @ObservationIgnored var deltaFlushTask: Task<Void, Never>?
     @ObservationIgnored var awaitingInitialUserTurnID: String?
     @ObservationIgnored var bufferedDeltas:
@@ -386,11 +388,23 @@ final class AppModel {
         self.accounts = store.loadAccounts()
         self.selectedAccountID = store.selectedAccountID()
         self.theme = ThemePreference(rawValue: settingsDefaults.string(forKey: "theme") ?? "") ?? .system
-        self.sharesMobiusDiagnostics = settingsDefaults.bool(forKey: sharesMobiusDiagnosticsKey)
         self.appLockEnabled = appLockEnabled
         self.isAppLocked = appLockEnabled
         self.appLockAuthenticationMethod = appLockAuthenticator.method
         if selectedAccountID == nil { selectedAccountID = accounts.first?.id }
+        if cloudSession != nil,
+           let selectedAccountID,
+           let index = accounts.firstIndex(where: { $0.id == selectedAccountID }),
+           isMobiusCloudSpriteEndpoint(accounts[index].endpoint) {
+            if accounts[index].displayName != mobiusCloudGatewayDisplayName,
+               let renamed = try? store.rename(accounts[index], to: mobiusCloudGatewayDisplayName) {
+                accounts[index] = renamed
+            }
+            if accounts[index].machineName != mobiusCloudGatewayDisplayName {
+                try? store.recordMachineName(mobiusCloudGatewayDisplayName, for: accounts[index])
+                accounts[index].machineName = mobiusCloudGatewayDisplayName
+            }
+        }
         showsPairing = accounts.isEmpty
         #if DEBUG
         let environment = ProcessInfo.processInfo.environment
@@ -424,6 +438,12 @@ final class AppModel {
 
     var selectedAccount: GatewayAccount? {
         accounts.first { $0.id == selectedAccountID }
+    }
+
+    var selectedGatewayIsMobiusCloud: Bool {
+        guard hasCloudAccount, let selectedAccount else { return false }
+        return selectedAccount.displayName == mobiusCloudGatewayDisplayName
+            || isMobiusCloudSpriteEndpoint(selectedAccount.endpoint)
     }
 
     var presentedChatSessionID: String? {

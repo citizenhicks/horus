@@ -17,8 +17,18 @@ struct ProfileView: View {
         ) {
             // Settings first, the dashboard last: this page is opened to change something,
             // and usage is the one section here nobody comes to act on.
-            Section("Account") {
+            Section {
                 CloudAccountSettings()
+                    .task(id: model.cloudSession?.userID) {
+                        await model.refreshCloudAccount()
+                    }
+            } header: {
+                HStack(spacing: MobiusSpace.xs) {
+                    Text("möbius Cloud account")
+                    if model.selectedGatewayIsMobiusCloud {
+                        MobiusCloudBadge()
+                    }
+                }
             }
             .listRowSeparator(.hidden)
             Section("Appearance") {
@@ -27,10 +37,6 @@ struct ProfileView: View {
             .listRowSeparator(.hidden)
             Section("Security") {
                 AppLockSettings()
-            }
-            .listRowSeparator(.hidden)
-            Section("Data & Privacy") {
-                DataPrivacySettings()
             }
             .listRowSeparator(.hidden)
             Section("Usage") {
@@ -152,6 +158,30 @@ private struct CloudAccountSettings: View {
     /// until there is a Cloud session to authenticate them.
     var body: some View {
         if model.hasCloudAccount {
+            LabeledContent("Email") {
+                if let email = model.cloudAccount?.email {
+                    Text(verbatim: email)
+                } else if model.cloudAccount == nil {
+                    ProgressView()
+                } else {
+                    Text("Unavailable")
+                }
+            }
+            if model.cloudAccount != nil {
+                Toggle("Help improve möbius", isOn: Binding(
+                    get: { model.cloudAccount?.sharesDiagnostics ?? false },
+                    set: { sharesDiagnostics in
+                        Task { await model.setCloudSharesDiagnostics(sharesDiagnostics) }
+                    }
+                ))
+                .toggleStyle(.switch)
+                .disabled(model.isUpdatingCloudDiagnostics)
+
+                Text("Off by default. Saved to your Cloud account.")
+                    .font(MobiusStyle.captionFont)
+                    .foregroundStyle(palette.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Button("Manage subscription", glyph: .sealCheck) {
                 showsSubscriptionManagement = true
             }
@@ -171,24 +201,6 @@ private struct CloudAccountSettings: View {
                 .fixedSize(horizontal: false, vertical: true)
             MobiusCloudOfferButton()
         }
-    }
-}
-
-private struct DataPrivacySettings: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.mobiusPalette) private var palette
-
-    var body: some View {
-        Toggle("Help improve möbius", isOn: Binding(
-            get: { model.sharesMobiusDiagnostics },
-            set: { model.setSharesMobiusDiagnostics($0) }
-        ))
-        .toggleStyle(.switch)
-
-        Text("Off by default, and stored on this device.")
-            .font(MobiusStyle.captionFont)
-            .foregroundStyle(palette.muted)
-            .fixedSize(horizontal: false, vertical: true)
     }
 }
 

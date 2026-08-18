@@ -119,6 +119,7 @@ struct MobiusGlyph: Hashable {
     static let circleDot = Self("hi.circleDot")
     static let circleDotDashed = Self("hi.circleDotDashed")
     static let clock = Self("hi.clock")
+    static let cloudServer = Self("hi.cloudServer")
     static let combine = Self("hi.combine")
     static let copy = Self("hi.copy")
     static let csv = Self("hi.csv")
@@ -235,6 +236,23 @@ struct MobiusIcon: View {
         } else {
             icon
         }
+    }
+}
+
+struct MobiusCloudBadge: View {
+    @Environment(\.mobiusPalette) private var palette
+
+    var body: some View {
+        MobiusIcon(
+            .cloudServer,
+            size: MobiusStyle.glyphInline,
+            foreground: palette.accent,
+            gutter: false
+        )
+        .padding(.horizontal, MobiusSpace.xs)
+        .padding(.vertical, MobiusSpace.xxs)
+        .background(palette.accentSoft, in: Capsule())
+        .accessibilityHidden(true)
     }
 }
 

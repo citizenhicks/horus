@@ -23,6 +23,9 @@ extension AppModel {
         discardFilePresentation()
         restorePendingDrafts()
         if pendingPairingAccount != nil { pairingError = message }
+        if cloudPairingContinuation != nil {
+            completeCloudPairing(.failure(MobiusCloudError.provisioningFailed))
+        }
         if reconnectAttempt == 0 { showToast(message, tone: .error) }
         scheduleReconnect()
     }
@@ -66,6 +69,9 @@ extension AppModel {
         preservingDrafts: Bool,
         preservingSession: Bool = false
     ) -> UUID {
+        if cloudPairingContinuation != nil {
+            completeCloudPairing(.failure(CancellationError()))
+        }
         if !preservingSession { changeComposerDraftOwner(to: nil) }
         if preservingSession { flushStreamDeltas() }
         connectionGeneration = UUID()

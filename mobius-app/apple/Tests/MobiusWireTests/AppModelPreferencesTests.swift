@@ -67,31 +67,6 @@ extension AppModelTests {
         XCTAssertEqual(defaults.string(forKey: "theme"), ThemePreference.light.rawValue)
     }
 
-    func testMobiusDiagnosticsConsentDefaultsOffAndPersists() throws {
-        let suiteName = UUID().uuidString
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let model = AppModel(
-            client: GatewayClient(),
-            store: GatewayStore(defaults: defaults),
-            settingsDefaults: defaults
-        )
-
-        XCTAssertFalse(model.sharesMobiusDiagnostics)
-
-        model.setSharesMobiusDiagnostics(true)
-
-        let relaunched = AppModel(
-            client: GatewayClient(),
-            store: GatewayStore(defaults: defaults),
-            settingsDefaults: defaults
-        )
-        XCTAssertTrue(relaunched.sharesMobiusDiagnostics)
-
-        relaunched.setSharesMobiusDiagnostics(false)
-        XCTAssertFalse(defaults.bool(forKey: "shares-mobius-diagnostics"))
-    }
-
     func testGitBranchSwitchUsesAnAdvertisedBranch() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
