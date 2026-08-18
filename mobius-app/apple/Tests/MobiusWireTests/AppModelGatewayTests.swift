@@ -3,6 +3,64 @@ import XCTest
 
 @MainActor
 extension AppModelTests {
+    func testConnectionStateUsesWarningToneWhileConnecting() {
+        let expectations: [(ConnectionState, ToastTone)] = [
+            (.disconnected, .error),
+            (.connecting, .warning),
+            (.authenticating, .warning),
+            (.loading, .warning),
+            (.ready, .success),
+            (.failed("unavailable"), .error),
+        ]
+
+        for (state, tone) in expectations {
+            XCTAssertEqual(state.tone, tone)
+        }
+    }
+
+    func testCloudConnectionRetriesFailureAndSilentWarmupUntilReady() async throws {
+        let suiteName = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GatewayStore(defaults: defaults)
+        let account = GatewayAccount(endpoint: try GatewayEndpoint(
+            "wss://mobius-test-org.sprites.app"
+        ))
+        try store.save(account, token: "test-token")
+        addTeardownBlock { try await store.remove(account) }
+        let payload = ready(
+            defaultConfig: VersionedAgentConfig(revision: 1, config: composition())
+        )
+        var attempts = 0
+        let model = AppModel(
+            client: GatewayClient(),
+            store: store,
+            settingsDefaults: defaults,
+            requestSender: { _ in },
+            connectionOpener: { _ in
+                attempts += 1
+                return AsyncThrowingStream { continuation in
+                    if attempts == 1 {
+                        continuation.finish(throwing: GatewayWireError.disconnected)
+                        return
+                    }
+                    guard attempts > 2 else { return }
+                    continuation.yield(.authenticated)
+                    continuation.yield(.ready(payload))
+                }
+            },
+            reconnectDelay: { _ in .milliseconds(20) }
+        )
+        model.cloudSession = MobiusCloudSession(userID: UUID(), expiresAt: .distantFuture)
+        await model.appDidBecomeActive()
+
+        model.start()
+
+        let becameReady = await eventually { model.connectionState.isReady }
+        XCTAssertTrue(becameReady)
+        XCTAssertEqual(attempts, 3)
+    }
+
     func testAttachmentsCanBeImportedWhileATurnIsActive() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in

@@ -59,6 +59,14 @@ enum ConnectionState: Equatable {
     }
 
     var isReady: Bool { self == .ready }
+
+    var tone: ToastTone {
+        switch self {
+        case .ready: .success
+        case .connecting, .authenticating, .loading: .warning
+        case .disconnected, .failed: .error
+        }
+    }
 }
 
 enum ApplyState: Equatable {

@@ -3,6 +3,7 @@ import Foundation
 extension AppModel {
     func connectionEnded(generation: UUID, message: String) {
         guard connectionGeneration == generation else { return }
+        cancelReconnect()
         connectionGeneration = UUID()
         transcriptLoadGeneration = UUID()
         eventTask = nil
@@ -30,7 +31,7 @@ extension AppModel {
         scheduleReconnect()
     }
 
-    private func scheduleReconnect() {
+    func scheduleReconnect() {
         guard reconnectTask == nil,
               !automaticReconnectBlocked,
               pendingPairingAccount == nil,

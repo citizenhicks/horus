@@ -191,7 +191,7 @@ struct GatewayView: View {
                 LabeledContent("Status") {
                     HStack(spacing: MobiusSpace.s) {
                         Circle()
-                            .fill(model.connectionState.isReady ? palette.signal : palette.danger)
+                            .fill(model.connectionState.tone.color(in: palette))
                             .frame(width: 7, height: 7)
                         Text(model.connectionState.label)
                     }

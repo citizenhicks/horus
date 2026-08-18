@@ -193,7 +193,7 @@ struct SidebarView: View {
                         // A solid dot, not an icon: HugeIcons is a stroked set with no
                         // filled circle, and an outlined ring reads as a control here.
                         Circle()
-                            .fill(model.connectionState.isReady ? palette.signal : palette.danger)
+                            .fill(model.connectionState.tone.color(in: palette))
                             .frame(width: 8, height: 8)
                             .symbolEffect(
                                 .pulse.byLayer,
@@ -255,7 +255,7 @@ struct SidebarView: View {
         VStack(spacing: MobiusSpace.m) {
             Text(model.connectionState.label)
                 .font(MobiusStyle.controlFont.weight(.semibold))
-                .foregroundStyle(model.connectionState.isReady ? palette.signal : palette.danger)
+                .foregroundStyle(model.connectionState.tone.color(in: palette))
 
             if let account = model.selectedAccount {
                 Text(account.displayName)

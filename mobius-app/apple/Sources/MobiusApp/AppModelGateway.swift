@@ -69,6 +69,7 @@ extension AppModel {
                         self?.connectionEnded(generation: generation, message: error.localizedDescription)
                     }
                 }
+                if self.selectedGatewayIsMobiusCloud { self.scheduleReconnect() }
                 try await authenticate()
             } catch {
                 self.connectionEnded(generation: generation, message: error.localizedDescription)
