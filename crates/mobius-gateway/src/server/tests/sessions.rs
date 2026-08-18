@@ -309,21 +309,21 @@ async fn paired_client_uploads_lists_reads_and_submits_a_session_file() {
     };
 
     sender
-        .send(ClientMessage::ListSessionUploads {
-            request_id: "list-session-uploads".into(),
+        .send(ClientMessage::ListSessionFiles {
+            request_id: "list-session-files".into(),
             session_id: session_id.clone(),
         })
         .await
-        .expect("list session uploads");
+        .expect("list session files");
     loop {
-        if let ServerMessage::SessionUploads {
-            request_id,
-            uploads,
-            ..
+        if let ServerMessage::SessionFiles {
+            request_id, files, ..
         } = next_gateway_message(&mut events).await
-            && request_id == "list-session-uploads"
+            && request_id == "list-session-files"
         {
-            assert_eq!(uploads, std::slice::from_ref(&file));
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].origin, mobius::protocol::SessionFileOrigin::User);
+            assert_eq!(files[0].file, file);
             break;
         }
     }

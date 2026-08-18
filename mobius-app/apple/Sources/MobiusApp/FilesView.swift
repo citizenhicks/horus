@@ -383,28 +383,53 @@ private struct FileTreeRow: View {
 private struct ChatFileList: View {
     @Environment(AppModel.self) private var model
 
+    private var agentFiles: [SessionFileRecord] {
+        model.sessionFiles.filter { $0.origin == .agent }
+    }
+
+    private var userFiles: [SessionFileRecord] {
+        model.sessionFiles.filter { $0.origin == .user }
+    }
+
     var body: some View {
         List {
-            Section("Uploads") {
-                if model.isLoadingSessionUploads {
-                    InspectorSectionLoadingRow(title: "Loading uploads")
-                } else if model.sessionUploads.isEmpty {
-                    InspectorEmptyRow(
-                        title: "No uploads",
-                        glyph: .fileUpload
-                    )
-                } else {
-                    ForEach(model.sessionUploads) { file in
-                        SessionFileInspectorRow(
-                            file: file,
-                            accessibilityLabel: "Open uploaded file \(file.name)"
-                        )
-                    }
-                }
-            }
+            fileSection(
+                "Agent files",
+                records: agentFiles,
+                emptyGlyph: .robot,
+                accessibilityOrigin: "agent"
+            )
+            fileSection(
+                "User uploads",
+                records: userFiles,
+                emptyGlyph: .fileUpload,
+                accessibilityOrigin: "user-uploaded"
+            )
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
+    }
+
+    private func fileSection(
+        _ title: String,
+        records: [SessionFileRecord],
+        emptyGlyph: MobiusGlyph,
+        accessibilityOrigin: String
+    ) -> some View {
+        Section(title) {
+            if model.isLoadingSessionFiles {
+                InspectorSectionLoadingRow(title: "Loading files")
+            } else if records.isEmpty {
+                InspectorEmptyRow(title: "No \(title.lowercased())", glyph: emptyGlyph)
+            } else {
+                ForEach(records) { record in
+                    SessionFileInspectorRow(
+                        file: record.file,
+                        accessibilityLabel: "Open \(accessibilityOrigin) file \(record.file.name)"
+                    )
+                }
+            }
+        }
     }
 }
 

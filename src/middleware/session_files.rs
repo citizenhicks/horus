@@ -11,7 +11,9 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
-use crate::protocol::SessionFileReference;
+use crate::protocol::{
+    SessionFileOrigin as ProtocolFileOrigin, SessionFileRecord, SessionFileReference,
+};
 use crate::{Error, Result};
 
 mod storage;
@@ -168,6 +170,25 @@ impl SessionFileStore {
     pub async fn list_artifacts(&self, session_id: &str) -> Result<Vec<SessionFileReference>> {
         self.list_origin(session_id, SessionFileOrigin::Artifact)
             .await
+    }
+
+    /// Lists every completed file together with the side that produced it.
+    pub async fn list_files(&self, session_id: &str) -> Result<Vec<SessionFileRecord>> {
+        validate_session_id(session_id)?;
+        self.ensure_initialized().await?;
+        Ok(
+            list_completed(&self.session_dir(session_id), &self.blob_dir())
+                .await?
+                .into_iter()
+                .map(|record| SessionFileRecord {
+                    origin: match record.origin {
+                        SessionFileOrigin::Upload => ProtocolFileOrigin::User,
+                        SessionFileOrigin::Artifact => ProtocolFileOrigin::Agent,
+                    },
+                    file: record.file,
+                })
+                .collect(),
+        )
     }
 
     pub(crate) async fn register_attachment_workspace(

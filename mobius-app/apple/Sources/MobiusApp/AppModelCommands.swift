@@ -615,15 +615,15 @@ extension AppModel {
         startNextSessionFileUpload()
     }
 
-    func refreshSessionUploads() {
+    func refreshSessionFiles() {
         guard connectionState.isReady, let sessionID = selectedSessionID else { return }
-        let id = requestID("session-uploads")
-        sessionUploadsRequestID = id
-        isLoadingSessionUploads = true
-        transmit(.listSessionUploads(requestID: id, sessionID: sessionID)) { [weak self] _ in
-            guard self?.sessionUploadsRequestID == id else { return }
-            self?.sessionUploadsRequestID = nil
-            self?.isLoadingSessionUploads = false
+        let id = requestID("session-files")
+        sessionFilesRequestID = id
+        isLoadingSessionFiles = true
+        transmit(.listSessionFiles(requestID: id, sessionID: sessionID)) { [weak self] _ in
+            guard self?.sessionFilesRequestID == id else { return }
+            self?.sessionFilesRequestID = nil
+            self?.isLoadingSessionFiles = false
         }
     }
 

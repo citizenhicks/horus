@@ -126,7 +126,7 @@ extension AppModel {
         switch tab {
         case .modified: refreshModifiedFiles(modifiedFilesScope)
         case .allFiles: refreshWorkspaceFiles()
-        case .chatFiles: refreshSessionUploads()
+        case .chatFiles: refreshSessionFiles()
         }
     }
 

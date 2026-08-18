@@ -359,21 +359,21 @@ pub(super) async fn handle_message(
                 }
             }
         }
-        ClientMessage::ListSessionUploads {
+        ClientMessage::ListSessionFiles {
             request_id,
             session_id,
         } => {
             if let Err(rejection) = require_selected(selected, &session_id) {
                 return write_rejection(writer, request_id, rejection).await;
             }
-            match session_files.list_uploads(&session_id).await {
+            match session_files.list_files(&session_id).await {
                 Ok(items) => {
                     write_frame(
                         writer,
-                        &ServerFrame::new(ServerMessage::SessionUploads {
+                        &ServerFrame::new(ServerMessage::SessionFiles {
                             request_id,
                             session_id,
-                            uploads: items,
+                            files: items,
                         }),
                     )
                     .await

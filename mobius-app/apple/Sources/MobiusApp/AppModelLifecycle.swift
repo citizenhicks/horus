@@ -9,8 +9,8 @@ extension AppModel {
         connectionState = .failed(message)
         sessionFileUploadRequests.removeAll()
         activeSessionFileUpload = nil
-        sessionUploadsRequestID = nil
-        isLoadingSessionUploads = false
+        sessionFilesRequestID = nil
+        isLoadingSessionFiles = false
         gitDiffRequestID = nil
         isLoadingGitDiff = false
         stagedGitDiffRequestID = nil
@@ -129,8 +129,8 @@ extension AppModel {
             isLoadingCommittedGitDiff = false
             workspaceFilesRequestID = nil
             isLoadingWorkspaceFiles = false
-            sessionUploadsRequestID = nil
-            isLoadingSessionUploads = false
+            sessionFilesRequestID = nil
+            isLoadingSessionFiles = false
             sessionFileUploadRequests.removeAll()
             activeSessionFileUpload = nil
             discardFilePresentation()
@@ -199,9 +199,9 @@ extension AppModel {
         modifiedFilesScope = .unstaged
         gitBranchRequestID = nil
         discardComposerAttachments()
-        sessionUploads = []
-        sessionUploadsRequestID = nil
-        isLoadingSessionUploads = false
+        sessionFiles = []
+        sessionFilesRequestID = nil
+        isLoadingSessionFiles = false
         sessionFileUploadRequests.removeAll()
         activeSessionFileUpload = nil
         discardFilePresentation()

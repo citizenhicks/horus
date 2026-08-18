@@ -47,6 +47,18 @@ struct SessionFileReference: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+enum SessionFileOrigin: String, Codable, Hashable, Sendable {
+    case user
+    case agent
+}
+
+struct SessionFileRecord: Identifiable, Codable, Hashable, Sendable {
+    let origin: SessionFileOrigin
+    let file: SessionFileReference
+
+    var id: String { file.id }
+}
+
 struct MessageTarget: Codable, Hashable, Sendable {
     let checkpointSequence: UInt64
     let batchItemCount: Int

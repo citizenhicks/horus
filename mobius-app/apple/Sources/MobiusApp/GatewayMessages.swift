@@ -66,7 +66,7 @@ enum GatewayRequest: Encodable, Sendable {
         data: Data
     )
     case finishSessionFileUpload(requestID: String, sessionID: String, uploadID: String)
-    case listSessionUploads(requestID: String, sessionID: String)
+    case listSessionFiles(requestID: String, sessionID: String)
     case readSessionFile(
         requestID: String,
         sessionID: String,
@@ -226,8 +226,8 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
             try container.encode(uploadID, forKey: "uploadId")
-        case .listSessionUploads(let requestID, let sessionID):
-            try container.encode("list_session_uploads", forKey: "type")
+        case .listSessionFiles(let requestID, let sessionID):
+            try container.encode("list_session_files", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(sessionID, forKey: "sessionId")
         case .readSessionFile(let requestID, let sessionID, let fileID, let offset, let maxBytes):
@@ -379,7 +379,7 @@ enum GatewayEnvelope: Decodable, Sendable {
         sessionID: String,
         file: SessionFileReference
     )
-    case sessionUploads(requestID: String, sessionID: String, uploads: [SessionFileReference])
+    case sessionFiles(requestID: String, sessionID: String, files: [SessionFileRecord])
     case sessionFileChunk(
         requestID: String,
         sessionID: String,
@@ -538,11 +538,11 @@ enum GatewayEnvelope: Decodable, Sendable {
                 sessionID: try container.decode(String.self, forKey: "sessionId"),
                 file: try container.decode(SessionFileReference.self, forKey: "file")
             )
-        case "session_uploads":
-            self = .sessionUploads(
+        case "session_files":
+            self = .sessionFiles(
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 sessionID: try container.decode(String.self, forKey: "sessionId"),
-                uploads: try container.decode([SessionFileReference].self, forKey: "uploads")
+                files: try container.decode([SessionFileRecord].self, forKey: "files")
             )
         case "session_file_chunk":
             self = .sessionFileChunk(

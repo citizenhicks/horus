@@ -120,7 +120,7 @@ extension AppModelTests {
             sessionID: "chat-1",
             file: attachment
         ))
-        XCTAssertEqual(model.sessionUploads, [attachment])
+        XCTAssertEqual(model.sessionFiles, [SessionFileRecord(origin: .user, file: attachment)])
         XCTAssertTrue(model.canSendComposer)
 
         model.contributions = []

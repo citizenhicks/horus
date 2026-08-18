@@ -36,6 +36,22 @@ pub struct SessionFileReference {
     pub media_type: String,
 }
 
+/// Which side of a session produced one stored file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionFileOrigin {
+    User,
+    Agent,
+}
+
+/// One stored session file together with its producer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionFileRecord {
+    pub origin: SessionFileOrigin,
+    pub file: SessionFileReference,
+}
+
 /// A command submitted by a frontend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Submission {

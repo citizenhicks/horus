@@ -256,11 +256,11 @@ extension AppModel {
                 sessionID: sessionID,
                 file: file
             )
-        case .sessionUploads(let requestID, let sessionID, let uploads):
-            guard requestID == sessionUploadsRequestID, sessionID == selectedSessionID else { break }
-            sessionUploadsRequestID = nil
-            isLoadingSessionUploads = false
-            sessionUploads = uploads
+        case .sessionFiles(let requestID, let sessionID, let files):
+            guard requestID == sessionFilesRequestID, sessionID == selectedSessionID else { break }
+            sessionFilesRequestID = nil
+            isLoadingSessionFiles = false
+            sessionFiles = files
         case .sessionFileChunk(
             let requestID,
             let sessionID,
@@ -667,7 +667,7 @@ extension AppModel {
     private func requestSessionData() {
         guard selectedSessionID != nil else { return }
         refreshWorkspaceChanges()
-        refreshSessionUploads()
+        refreshSessionFiles()
         refreshCron()
     }
 
@@ -761,9 +761,9 @@ extension AppModel {
             return
         }
         failSessionFileUploadRequest(rejection.requestId, message: rejection.message, showsToast: false)
-        if rejection.requestId == sessionUploadsRequestID {
-            sessionUploadsRequestID = nil
-            isLoadingSessionUploads = false
+        if rejection.requestId == sessionFilesRequestID {
+            sessionFilesRequestID = nil
+            isLoadingSessionFiles = false
         }
         if rejection.requestId == sessionFileDownload?.requestID {
             sessionFileDownload = nil

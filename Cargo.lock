@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "mobius"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "base64",
  "cap-std",
@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "mobius-cli"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "diffy",
  "mobius",
@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "mobius-gateway"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "base64",
  "chrono",

@@ -41,6 +41,27 @@ fn session_file_bytes_use_standard_base64_and_round_trip() {
     assert_eq!(decoded, expected);
 }
 
+#[test]
+fn session_file_list_carries_the_file_origin() {
+    let frame = ServerFrame::new(ServerMessage::SessionFiles {
+        request_id: "request-list".into(),
+        session_id: "session-a".into(),
+        files: vec![SessionFileRecord {
+            origin: mobius::protocol::SessionFileOrigin::Agent,
+            file: SessionFileReference {
+                id: "file-a".into(),
+                name: "report.txt".into(),
+                size: 6,
+                media_type: "text/plain".into(),
+            },
+        }],
+    });
+
+    let encoded = serde_json::to_value(frame).expect("encode session files");
+
+    assert_eq!(encoded["files"][0]["origin"], "agent");
+}
+
 #[tokio::test]
 async fn websocket_bridge_rejects_text_messages() {
     let incoming = futures_util::stream::iter([Ok(Message::Text("{}".into()))]);

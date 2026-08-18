@@ -158,11 +158,11 @@ extension GatewayWireTests {
         ))
         XCTAssertEqual(finish["type"] as? String, "finish_session_file_upload")
 
-        let list = try requestObject(.listSessionUploads(
+        let list = try requestObject(.listSessionFiles(
             requestID: "list-1",
             sessionID: "chat-1"
         ))
-        XCTAssertEqual(list["type"] as? String, "list_session_uploads")
+        XCTAssertEqual(list["type"] as? String, "list_session_files")
 
         let read = try requestObject(.readSessionFile(
             requestID: "read-1",

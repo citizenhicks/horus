@@ -751,7 +751,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CODE_SIGN_ENTITLEMENTS = Sources/MobiusApp/MobiusApp.entitlements;
-				CURRENT_PROJECT_VERSION = 125;
+				CURRENT_PROJECT_VERSION = 148;
 				DEVELOPMENT_TEAM = 3T68GZFAR6;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -769,7 +769,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.9.0;
+				MARKETING_VERSION = 0.9.1;
 				PRODUCT_BUNDLE_IDENTIFIER = app.mobius.client;
 				PRODUCT_NAME = Mobius;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -789,7 +789,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CODE_SIGN_ENTITLEMENTS = Sources/MobiusApp/MobiusApp.entitlements;
-				CURRENT_PROJECT_VERSION = 125;
+				CURRENT_PROJECT_VERSION = 148;
 				DEVELOPMENT_TEAM = 3T68GZFAR6;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/MobiusApp/Info.plist;
@@ -806,7 +806,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.9.0;
+				MARKETING_VERSION = 0.9.1;
 				PRODUCT_BUNDLE_IDENTIFIER = app.mobius.client;
 				PRODUCT_NAME = Mobius;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";

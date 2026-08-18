@@ -147,11 +147,25 @@ extension AppModelTests {
 
         requestCount = await recorder.requestCount()
         model.selectFilesInspectorTab(.chatFiles)
-        let uploadRequest = await recorder.firstRequest(after: requestCount) {
-            if case .listSessionUploads(_, "chat-1") = $0 { return true }
+        let filesRequest = await recorder.firstRequest(after: requestCount) {
+            if case .listSessionFiles(_, "chat-1") = $0 { return true }
             return false
         }
-        XCTAssertNotNil(uploadRequest)
+        XCTAssertNotNil(filesRequest)
+
+        requestCount = await recorder.requestCount()
+        model.reduce(
+            event: AgentEventRecord(submissionId: nil, msg: .object([
+                "type": .string("task_complete")
+            ])),
+            blocks: [],
+            preview: nil
+        )
+        let refreshedFilesRequest = await recorder.firstRequest(after: requestCount) {
+            if case .listSessionFiles(_, "chat-1") = $0 { return true }
+            return false
+        }
+        XCTAssertNotNil(refreshedFilesRequest)
     }
 
     func testIPadLayoutAndSidebarTogglePolicies() {

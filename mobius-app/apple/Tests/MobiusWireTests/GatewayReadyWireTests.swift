@@ -236,7 +236,7 @@ extension GatewayWireTests {
         ))
     }
 
-    func testV37RequiresAnExplicitExtensionSelection() {
+    func testV38RequiresAnExplicitExtensionSelection() {
         let withoutExtensions = configJSON.replacingOccurrences(
             of: #","extensions":["plugin:ponytail"]"#,
             with: ""
@@ -247,18 +247,18 @@ extension GatewayWireTests {
         )
 
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":37,"type":"ready","payload":\#(payload)}"#
+            #"{"version":38,"type":"ready","payload":\#(payload)}"#
         ))
     }
 
-    func testV37RequiresGatewayContributions() {
+    func testV38RequiresGatewayContributions() {
         let payload = readyPayloadJSON.replacingOccurrences(
             of: #","contributions":[{"capability":"extensions","accepts_file_attachments":false,"count":1,"commands":[],"widgets":[],"references":[{"trigger":"$","value":"planning","description":"Planning skill"}],"active_input":null}]"#,
             with: ""
         )
 
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":37,"type":"ready","payload":\#(payload)}"#
+            #"{"version":38,"type":"ready","payload":\#(payload)}"#
         ))
     }
 

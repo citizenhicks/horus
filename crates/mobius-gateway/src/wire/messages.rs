@@ -111,7 +111,7 @@ pub enum ClientMessage {
         session_id: String,
         upload_id: String,
     },
-    ListSessionUploads {
+    ListSessionFiles {
         request_id: String,
         session_id: String,
     },
@@ -328,10 +328,10 @@ pub enum ServerMessage {
         session_id: String,
         file: SessionFileReference,
     },
-    SessionUploads {
+    SessionFiles {
         request_id: String,
         session_id: String,
-        uploads: Vec<SessionFileReference>,
+        files: Vec<SessionFileRecord>,
     },
     SessionFileChunk {
         request_id: String,

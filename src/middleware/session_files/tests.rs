@@ -54,6 +54,32 @@ async fn upload_round_trip_is_session_scoped_and_atomic() {
 }
 
 #[tokio::test]
+async fn file_list_identifies_user_uploads_and_agent_artifacts() {
+    let state = tempfile::tempdir().expect("state");
+    let store = SessionFileStore::new(state.path());
+    let mut upload = store
+        .begin_upload("session", "input.txt".into(), 1, "text/plain".into())
+        .await
+        .expect("begin upload");
+    upload.append(0, b"u").await.expect("append upload");
+    upload.finish().await.expect("finish upload");
+    store
+        .publish_artifact("session", "output.txt".into(), "text/plain".into(), b"a")
+        .await
+        .expect("publish artifact");
+
+    let files = store.list_files("session").await.expect("list files");
+
+    assert!(
+        files.iter().any(|record| {
+            record.origin == ProtocolFileOrigin::User && record.file.name == "input.txt"
+        }) && files.iter().any(|record| {
+            record.origin == ProtocolFileOrigin::Agent && record.file.name == "output.txt"
+        })
+    );
+}
+
+#[tokio::test]
 async fn delete_session_removes_only_that_sessions_files() {
     let state = tempfile::tempdir().expect("state");
     let store = SessionFileStore::new(state.path());

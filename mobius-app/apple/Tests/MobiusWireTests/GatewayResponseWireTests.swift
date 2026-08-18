@@ -68,11 +68,11 @@ extension GatewayWireTests {
         }
         XCTAssertEqual(file.mediaType, "image/png")
 
-        let listed = try decodeEnvelope(#"{"version":27,"type":"session_uploads","request_id":"list-1","session_id":"chat-1","uploads":[\#(record)]}"#)
-        guard case .sessionUploads(_, _, let uploads) = listed else {
-            return XCTFail("Expected session upload list")
+        let listed = try decodeEnvelope(#"{"version":27,"type":"session_files","request_id":"list-1","session_id":"chat-1","files":[{"origin":"user","file":\#(record)},{"origin":"agent","file":\#(record)}]}"#)
+        guard case .sessionFiles(_, _, let files) = listed else {
+            return XCTFail("Expected session file list")
         }
-        XCTAssertEqual(uploads.first?.name, "scan.png")
+        XCTAssertEqual(files.map(\.origin), [.user, .agent])
 
         let chunk = try decodeEnvelope(#"{"version":27,"type":"session_file_chunk","request_id":"read-1","session_id":"chat-1","file_id":"file-1","offset":0,"data":"AQID","next_offset":null}"#)
         guard case .sessionFileChunk(_, _, _, let offset, let data, let finalOffset) = chunk else {

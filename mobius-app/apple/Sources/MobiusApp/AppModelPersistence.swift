@@ -174,7 +174,7 @@ extension AppModel {
         composerAttachments[index].state = .uploaded(file)
         sessionFileData[localID] = nil
         activeSessionFileUpload = nil
-        upsertSessionUpload(file)
+        upsertSessionFile(SessionFileRecord(origin: .user, file: file))
         startNextSessionFileUpload()
     }
 
@@ -207,11 +207,11 @@ extension AppModel {
         startNextSessionFileUpload()
     }
 
-    private func upsertSessionUpload(_ file: SessionFileReference) {
-        if let index = sessionUploads.firstIndex(where: { $0.id == file.id }) {
-            sessionUploads[index] = file
+    private func upsertSessionFile(_ record: SessionFileRecord) {
+        if let index = sessionFiles.firstIndex(where: { $0.id == record.id }) {
+            sessionFiles[index] = record
         } else {
-            sessionUploads.append(file)
+            sessionFiles.append(record)
         }
     }
 

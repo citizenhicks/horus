@@ -177,6 +177,7 @@ extension AppModel {
             activeTurnID = nil
             if replayRequestID == nil { runStats.active = nil }
             refreshWorkspaceChanges()
+            if filesInspectorTab == .chatFiles { refreshSessionFiles() }
             pendingApproval = nil
             approvalRequestID = nil
         case "web_search_begin":
@@ -197,6 +198,7 @@ extension AppModel {
             activeTurnID = nil
             if replayRequestID == nil { runStats.active = nil }
             refreshWorkspaceChanges()
+            if filesInspectorTab == .chatFiles { refreshSessionFiles() }
             pendingApproval = nil
             approvalRequestID = nil
             if !wasRendered { finishPendingTranscriptEntries() }

@@ -132,8 +132,8 @@ final class AppModel {
     /// outside it that needs the keyboard gone asks rather than reaching in.
     private(set) var composerBlurRequest = 0
     var composerAttachments: [ComposerAttachment] = []
-    var sessionUploads: [SessionFileReference] = []
-    var isLoadingSessionUploads = false
+    var sessionFiles: [SessionFileRecord] = []
+    var isLoadingSessionFiles = false
     var previewURL: URL?
     var textFilePreview: TextFilePreview?
     var sessionFileShareItem: SessionFileShareItem?
@@ -311,7 +311,7 @@ final class AppModel {
     @ObservationIgnored var stagedGitDiffRequestID: String?
     @ObservationIgnored var committedGitDiffRequestID: String?
     @ObservationIgnored var workspaceFilesRequestID: String?
-    @ObservationIgnored var sessionUploadsRequestID: String?
+    @ObservationIgnored var sessionFilesRequestID: String?
     @ObservationIgnored var sessionFileUploadRequests: [String: SessionFileUploadRequest] = [:]
     @ObservationIgnored var sessionFileData: [UUID: Data] = [:]
     @ObservationIgnored var attachmentImportReservations = 0
