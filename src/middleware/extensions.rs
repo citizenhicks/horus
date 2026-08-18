@@ -1453,7 +1453,8 @@ mod tests {
         use crate::backend::sandbox::local::LocalSandbox;
         use crate::protocol::SessionContext;
 
-        let temporary = tempfile::tempdir().expect("temporary extensions");
+        let temporary = tempfile::tempdir_in(std::env::current_dir().expect("current directory"))
+            .expect("temporary extensions");
         let workspace = temporary.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
         let plugin = temporary.path().join("ponytail");
