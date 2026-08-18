@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import Security
 
-let mobiusCloudMonthlyProductID = "app.mobius.client.cloud.monthly"
+let mobiusCloudMonthlyProductID = "app.mobius.client.cloud.monthly.v2"
 
 struct MobiusCloudSession: Equatable, Sendable {
     let userID: UUID

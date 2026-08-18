@@ -28,7 +28,7 @@ option in the gateway guide.
 
 ## möbius Cloud beta
 
-The cloud offer requests `app.mobius.client.cloud.monthly` from StoreKit and
+The cloud offer requests `app.mobius.client.cloud.monthly.v2` from StoreKit and
 renders its storefront-localized `displayPrice`. Configure that product in App
 Store Connect as a one-month auto-renewable subscription with a seven-day free
 introductory offer before distributing through TestFlight. Sign in with Apple
