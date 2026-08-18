@@ -4,6 +4,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use std::ffi::OsStr;
+
 use mobius::backend::model::provider::{ProviderAuth, providers};
 use mobius::backend::sandbox::{
     CommandAuthorization, CommandMode, CommandOutput, CommandOutputSink, NetworkAccess,
@@ -29,6 +32,20 @@ const GIT_ARGUMENTS: [&str; 5] = [
 ];
 const GATEWAY_CREDENTIAL_ENVIRONMENT: [&str; 3] =
     ["MOBIUS_GATEWAY_TOKEN", "TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"];
+#[cfg(target_os = "linux")]
+const SANDBOX_PROC_ENVIRONMENT: &str = "MOBIUS_GATEWAY_SANDBOX_PROC";
+
+#[cfg(target_os = "linux")]
+fn empty_proc_configured(value: Option<&OsStr>) -> Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "private" => Ok(false),
+        Some(value) if value == "empty" => Ok(true),
+        Some(_) => Err(Error::Config(format!(
+            "{SANDBOX_PROC_ENVIRONMENT} must be `private` or `empty`"
+        ))),
+    }
+}
 
 fn provider_credential_environment() -> impl Iterator<Item = &'static str> {
     providers()
@@ -82,6 +99,11 @@ impl GatewaySandbox {
             .deny_read(&state_dir)?
             .deny_read(&tls_key)?;
         let mut full_access_delegate = LocalSandbox::new(&root)?.command_timeout(timeout)?;
+        #[cfg(target_os = "linux")]
+        if empty_proc_configured(std::env::var_os(SANDBOX_PROC_ENVIRONMENT).as_deref())? {
+            delegate = delegate.empty_proc();
+            full_access_delegate = full_access_delegate.empty_proc();
+        }
         for environment in GATEWAY_CREDENTIAL_ENVIRONMENT
             .into_iter()
             .chain(provider_credential_environment())
@@ -194,6 +216,24 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_proc_environment_accepts_only_private_or_empty() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        assert!(!empty_proc_configured(None).expect("default procfs"));
+        assert!(!empty_proc_configured(Some(OsStr::new("private"))).expect("private procfs"));
+        assert!(empty_proc_configured(Some(OsStr::new("empty"))).expect("empty proc"));
+        for invalid in [
+            OsStr::new(""),
+            OsStr::new("hidden"),
+            OsStr::from_bytes(&[0xff]),
+        ] {
+            let error = empty_proc_configured(Some(invalid)).expect_err("invalid proc mode");
+            assert!(error.to_string().contains(SANDBOX_PROC_ENVIRONMENT));
+        }
+    }
 
     #[test]
     fn every_provider_api_key_environment_is_hidden_from_commands() {

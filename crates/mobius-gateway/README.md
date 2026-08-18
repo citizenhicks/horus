@@ -86,6 +86,11 @@ the host-side recovery flow for a stopped gateway.
 
 By default, owner-only state is stored under `~/.mobius/gateway`. Set
 `MOBIUS_GATEWAY_STATE_DIR` or pass `--state-dir` to use another location.
+On Linux, run the gateway account without permitted or ambient capabilities;
+Bubblewrap rejects a non-root caller that retains them. Hosts that allow user,
+PID, mount, and network namespaces but forbid mounting procfs inside a child PID
+namespace can set `MOBIUS_GATEWAY_SANDBOX_PROC=empty`. This keeps PID isolation
+and mounts an empty `/proc`; the default `private` mode mounts a private procfs.
 Provider credential APIs are write-only and never return stored secret values.
 Full-access shell commands can use the host filesystem and network while file tools
 remain workspace-scoped. Those shell commands can access gateway state, TLS credentials,

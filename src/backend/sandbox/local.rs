@@ -71,6 +71,8 @@ pub struct LocalSandbox {
     denied_reads: Vec<DeniedRead>,
     denied_environment: BTreeSet<String>,
     isolated_home: bool,
+    #[cfg(target_os = "linux")]
+    empty_proc: bool,
 }
 
 struct DeniedRead {
@@ -155,6 +157,8 @@ impl LocalSandbox {
                 denied_reads: Vec::new(),
                 denied_environment: BTreeSet::new(),
                 isolated_home: false,
+                #[cfg(target_os = "linux")]
+                empty_proc: false,
             })
         }
     }
@@ -248,6 +252,14 @@ impl LocalSandbox {
     #[must_use]
     pub fn isolated_home(mut self) -> Self {
         self.isolated_home = true;
+        self
+    }
+
+    /// Uses an empty `/proc` mount while retaining PID namespace isolation.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn empty_proc(mut self) -> Self {
+        self.empty_proc = true;
         self
     }
 
@@ -417,7 +429,9 @@ impl LocalSandbox {
         if network_access == NetworkAccess::Denied {
             command.arg("--unshare-net");
         }
-        command.args(["--proc", "/proc", "--chdir"]);
+        command
+            .arg(if self.empty_proc { "--tmpfs" } else { "--proc" })
+            .args(["/proc", "--chdir"]);
         command.arg(&self.root);
         command.arg("--");
         append_invocation(&mut command, invocation, self.isolated_home);
@@ -469,13 +483,10 @@ impl LocalSandbox {
                 command.arg("--ro-bind").arg("/dev/null").arg(&denied.path);
             }
         }
-        command.args([
-            "--unshare-user",
-            "--unshare-pid",
-            "--proc",
-            "/proc",
-            "--chdir",
-        ]);
+        command.args(["--unshare-user", "--unshare-pid"]);
+        command
+            .arg(if self.empty_proc { "--tmpfs" } else { "--proc" })
+            .args(["/proc", "--chdir"]);
         command.arg(&self.root).arg("--");
         append_invocation(&mut command, invocation, self.isolated_home);
         Ok(command)

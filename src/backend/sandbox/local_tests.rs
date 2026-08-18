@@ -671,6 +671,79 @@ async fn network_policy_changes_command_isolation() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn empty_proc_keeps_pid_isolation_in_both_bubblewrap_commands() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let protected = tempfile::tempdir().expect("protected");
+    let default = local_sandbox(workspace.path());
+    let empty = local_sandbox(workspace.path())
+        .deny_read(protected.path())
+        .expect("protected path")
+        .empty_proc();
+    let default_command = default
+        .sandboxed_command(
+            &Invocation::Shell("true"),
+            NetworkAccess::Denied,
+            WorkspaceAccess::Writable,
+        )
+        .expect("default command");
+    let empty_commands = [
+        empty
+            .sandboxed_command(
+                &Invocation::Shell("true"),
+                NetworkAccess::Denied,
+                WorkspaceAccess::Writable,
+            )
+            .expect("sandboxed command"),
+        empty
+            .protected_full_access_command(&Invocation::Shell("true"))
+            .expect("protected full-access command"),
+    ];
+    let mounts_proc = |command: &Command, option: &str| {
+        command
+            .as_std()
+            .get_args()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair == [OsStr::new(option), OsStr::new("/proc")])
+    };
+
+    assert!(mounts_proc(&default_command, "--proc"));
+    for command in empty_commands {
+        assert!(
+            command
+                .as_std()
+                .get_args()
+                .any(|argument| argument == OsStr::new("--unshare-pid"))
+        );
+        assert!(mounts_proc(&command, "--tmpfs"));
+        assert!(!mounts_proc(&command, "--proc"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn empty_proc_hides_host_processes() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let sandbox = local_sandbox(workspace.path()).empty_proc();
+    let output = sandbox
+        .execute(
+            &format!(
+                "test ! -e /proc/self/status && ! kill -0 {} 2>/dev/null",
+                std::process::id()
+            ),
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Denied,
+            CommandMode::Foreground,
+            CommandOutputSink::default(),
+        )
+        .await
+        .expect("sandboxed command");
+
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn filesystem_handles_reject_symlink_escapes_and_aliases() {
