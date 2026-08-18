@@ -246,12 +246,13 @@ struct MobiusCloudBadge: View {
         MobiusIcon(
             .cloudServer,
             size: MobiusStyle.glyphInline,
-            foreground: palette.accent,
+            foreground: palette.onAccent,
             gutter: false
         )
         .padding(.horizontal, MobiusSpace.xs)
         .padding(.vertical, MobiusSpace.xxs)
-        .background(palette.accentSoft, in: Capsule())
+        .mobiusGlass(in: Capsule(), prominent: true)
+        .shadow(color: palette.accent.opacity(0.35), radius: 4, y: 2)
         .accessibilityHidden(true)
     }
 }
