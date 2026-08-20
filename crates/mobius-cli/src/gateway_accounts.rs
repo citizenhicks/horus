@@ -229,9 +229,6 @@ fn secure(file: &tempfile::NamedTempFile) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt as _;
-
     use super::*;
 
     fn accounts(path: &Path) -> GatewayAccounts {

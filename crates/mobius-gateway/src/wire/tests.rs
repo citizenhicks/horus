@@ -1,4 +1,4 @@
-use tokio::io::{AsyncWriteExt as _, duplex};
+use tokio::io::duplex;
 
 use super::*;
 
