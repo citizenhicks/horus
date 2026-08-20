@@ -288,7 +288,13 @@ mod tests {
         let (store, config) =
             ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
         let mut config = config
-            .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
+            .registering_provider(
+                AgentComposition::default().provider,
+                "Test".into(),
+                Default::default(),
+                Vec::new(),
+                Vec::new(),
+            )
             .expect("provider");
         config
             .default_agent

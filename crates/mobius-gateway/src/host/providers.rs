@@ -9,8 +9,11 @@ use uuid::Uuid;
 use crate::Error;
 use crate::assembly::{configured_model_choices, credential_is_configured};
 use crate::config::{ChatSpec, GatewayConfig};
-use crate::wire::{AgentComposition, ProviderConfig, ReadyPayload, ServerFrame, ServerMessage};
+use crate::wire::{
+    AgentComposition, ProviderConfig, ProviderTint, ReadyPayload, ServerFrame, ServerMessage,
+};
 
+use super::session::ProviderRefresh;
 use super::{GatewayHost, Rejection, gateway_ready, internal, invalid_config};
 
 impl GatewayHost {
@@ -44,6 +47,7 @@ impl GatewayHost {
 
     pub(crate) async fn set_credential(
         &self,
+        instance: String,
         provider_id: String,
         api_key: String,
         base_url: Option<String>,
@@ -61,11 +65,11 @@ impl GatewayHost {
                 .map_err(invalid_config)?;
             state
                 .credentials
-                .set(&provider_id, &api_key, base_url.as_deref())
+                .set(&instance, &provider_id, &api_key, base_url.as_deref())
                 .map_err(invalid_config)?;
             base_url
         };
-        self.refresh_provider_sessions(&provider_id, base_url.as_deref())
+        self.refresh_provider_sessions(ProviderRefresh::Instance { instance, base_url })
             .await
     }
 
@@ -154,7 +158,9 @@ impl GatewayHost {
             });
             return;
         }
-        let refresh = self.refresh_provider_sessions(&provider, None).await;
+        let refresh = self
+            .refresh_provider_sessions(ProviderRefresh::Provider(provider.clone()))
+            .await;
         self.broadcast(ServerMessage::ProviderLoginFinished {
             request_id,
             login_id,
@@ -171,8 +177,7 @@ impl GatewayHost {
 
     async fn refresh_provider_sessions(
         &self,
-        provider: &str,
-        base_url: Option<&str>,
+        scope: ProviderRefresh,
     ) -> std::result::Result<(), Rejection> {
         let sessions = self
             .state
@@ -184,10 +189,7 @@ impl GatewayHost {
             .collect::<Vec<_>>();
         let mut failure = None;
         for host in sessions {
-            if let Err(rejection) = host
-                .refresh_provider(provider.into(), base_url.map(str::to_owned))
-                .await
-            {
+            if let Err(rejection) = host.refresh_provider(scope.clone()).await {
                 failure.get_or_insert(rejection);
             }
         }
@@ -201,6 +203,8 @@ impl GatewayHost {
     pub(crate) async fn register_provider(
         &self,
         selection: ProviderConfig,
+        label: String,
+        tint: ProviderTint,
         model_ids: Vec<String>,
         reasoning_efforts: Vec<String>,
         replace_existing_selections: bool,
@@ -224,6 +228,8 @@ impl GatewayHost {
         let next = provider_registration(
             &current,
             &selection,
+            &label,
+            tint,
             &model_ids,
             &reasoning_efforts,
             replace_existing_selections,
@@ -247,7 +253,7 @@ impl GatewayHost {
                 .iter()
                 .filter(|resident| {
                     resident.status.provider_epoch != target_epoch
-                        || (resident.status.selection.provider == selection.provider
+                        || (resident.status.selection.instance == selection.instance
                             && resident.status.selection != selection)
                 })
                 .map(|resident| (resident.session_id.clone(), resident.host.clone()))
@@ -274,6 +280,8 @@ impl GatewayHost {
         let commit = commit_provider_registration(
             &state,
             &selection,
+            &label,
+            tint,
             &model_ids,
             &reasoning_efforts,
             replace_existing_selections,
@@ -309,17 +317,79 @@ impl GatewayHost {
         let _ = self.events.send(frame);
         Ok(payload)
     }
+
+    pub(crate) async fn remove_provider(
+        &self,
+        instance: String,
+    ) -> std::result::Result<ReadyPayload, Rejection> {
+        let mut state = self.state.lock().await;
+        let mutation_gate = Arc::clone(&state.session_mutations);
+        let _mutation = mutation_gate.write_owned().await;
+        state
+            .config
+            .lock()
+            .map_err(|_| internal("gateway configuration lock is poisoned"))?
+            .removing_provider(&instance)
+            .map_err(invalid_config)?;
+        let target_epoch = state
+            .provider_epoch
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or_else(|| internal("provider catalog epoch overflow"))?;
+        let residents = provider_cutover_residents(&mut state).await?;
+        if residents.iter().any(|resident| !resident.status.idle) {
+            return Err(Rejection {
+                code: "agent_busy",
+                message: "finish or interrupt active turns before removing a gateway provider"
+                    .into(),
+                fatal: false,
+            });
+        }
+        commit_provider_removal(&state, &instance).map_err(internal)?;
+        state.provider_epoch.store(target_epoch, Ordering::Release);
+        let mut reload_failures = Vec::new();
+        for resident in residents {
+            if let Err(error) = resident.host.reload_provider_catalog().await {
+                if !resident.host.stop_if_idle().await {
+                    return Err(internal(
+                        "chat became busy after provider removal was committed",
+                    ));
+                }
+                state.sessions.remove(&resident.session_id);
+                reload_failures.push(format!("{}: {}", resident.session_id, error.message));
+            }
+        }
+        let payload = gateway_ready(&state).await?;
+        let _ = self.events.send(ServerFrame::new(ServerMessage::Ready {
+            payload: payload.clone(),
+        }));
+        if !reload_failures.is_empty() {
+            let _ = self.events.send(ServerFrame::new(ServerMessage::Error {
+                code: "provider_reload".into(),
+                message: format!(
+                    "provider removed; reopen chats that could not reload: {}",
+                    reload_failures.join(", ")
+                ),
+                fatal: false,
+            }));
+        }
+        Ok(payload)
+    }
 }
 
 fn provider_registration(
     current: &GatewayConfig,
     selection: &ProviderConfig,
+    label: &str,
+    tint: ProviderTint,
     model_ids: &[String],
     reasoning_efforts: &[String],
     replace_existing_selections: bool,
 ) -> crate::Result<GatewayConfig> {
     let registered = current.registering_provider(
         selection.clone(),
+        label.to_owned(),
+        tint,
         model_ids.to_vec(),
         reasoning_efforts.to_vec(),
     )?;
@@ -333,6 +403,8 @@ fn provider_registration(
 fn commit_provider_registration(
     state: &super::GatewayState,
     selection: &ProviderConfig,
+    label: &str,
+    tint: ProviderTint,
     model_ids: &[String],
     reasoning_efforts: &[String],
     replace_existing_selections: bool,
@@ -344,6 +416,8 @@ fn commit_provider_registration(
     let next = provider_registration(
         &current,
         selection,
+        label,
+        tint,
         model_ids,
         reasoning_efforts,
         replace_existing_selections,
@@ -352,6 +426,25 @@ fn commit_provider_registration(
     state.store.save(&next)?;
     *current = next;
     Ok(catalog_changed)
+}
+
+fn commit_provider_removal(state: &super::GatewayState, instance: &str) -> crate::Result<()> {
+    let mut current = state
+        .config
+        .lock()
+        .map_err(|_| Error::Config("gateway configuration lock is poisoned".into()))?;
+    let next = current.removing_provider(instance)?;
+    state.store.save(&next)?;
+    if let Err(error) = state.credentials.remove(instance) {
+        if let Err(rollback) = state.store.save(&current) {
+            return Err(Error::Config(format!(
+                "{error}; failed to roll back provider configuration: {rollback}"
+            )));
+        }
+        return Err(error);
+    }
+    *current = next;
+    Ok(())
 }
 
 struct ProviderCheckpointReplacement {
@@ -550,13 +643,370 @@ fn release_provider_login(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
+
+    use mobius::protocol::FrontendSettingValue;
+    use tokio::sync::{broadcast, mpsc};
 
     use crate::config::{ConfigStore, CredentialStore};
     use crate::cron::CronStore;
 
-    use super::super::provider_credential_matches;
+    use super::super::HostHandle;
+    use super::super::session::{
+        HostCommand, HostInner, ProviderCutoverStatus, ProviderRefresh, provider_refresh_matches,
+    };
     use super::*;
+
+    fn provider_removal_gateway(
+        root: &tempfile::TempDir,
+    ) -> (
+        GatewayHost,
+        Arc<CredentialStore>,
+        ProviderConfig,
+        ProviderConfig,
+    ) {
+        let state_dir = root.path().join("state");
+        let listen = "127.0.0.1:8741".parse().expect("listen address");
+        let (store, config) = ConfigStore::initialize(state_dir, listen, None).expect("config");
+        let primary = ProviderConfig {
+            instance: "openrouter".into(),
+            provider: "openrouter".into(),
+            model: "openai/gpt-5".into(),
+            base_url: Some("https://connector.example/v1".into()),
+            endpoint_auth: crate::wire::ProviderEndpointAuth::Credentialless,
+            reasoning_effort: None,
+            web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+        };
+        let removable = ProviderConfig {
+            instance: "kimi-unused".into(),
+            provider: "kimi".into(),
+            model: "kimi-k3".into(),
+            base_url: Some("https://api.moonshot.ai/v1".into()),
+            endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
+            reasoning_effort: Some("max".into()),
+            web_search: mobius::backend::model::provider::HostedWebSearch::Off,
+        };
+        let route = crate::config::model_route_id(
+            &removable.instance,
+            &removable.model,
+            removable.reasoning_effort.as_deref(),
+        );
+        let config = config
+            .registering_provider(
+                primary.clone(),
+                "Primary".into(),
+                Default::default(),
+                vec![primary.model.clone()],
+                Vec::new(),
+            )
+            .and_then(|config| {
+                config.registering_provider(
+                    removable.clone(),
+                    "Unused".into(),
+                    Default::default(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            })
+            .expect("provider catalog");
+        let mut default = config
+            .default_agent
+            .as_ref()
+            .expect("default")
+            .config
+            .clone();
+        default.middleware.set_setting(
+            "subagents",
+            "model_route",
+            Some(FrontendSettingValue::String(route.clone())),
+        );
+        let config = config
+            .replacing_default_agent(1, default)
+            .expect("middleware route default");
+        store.save(&config).expect("save provider catalog");
+        let credentials =
+            Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
+        credentials
+            .set(
+                &removable.instance,
+                &removable.provider,
+                "unused-secret",
+                removable.base_url.as_deref(),
+            )
+            .expect("removable credential");
+        let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
+        let gateway =
+            GatewayHost::start(store, config, Arc::clone(&credentials), cron).expect("gateway");
+        (gateway, credentials, primary, removable)
+    }
+
+    #[tokio::test]
+    async fn provider_removal_rejects_the_primary_default_without_changes() {
+        let root = tempfile::tempdir().expect("root");
+        let (gateway, credentials, primary, removable) = provider_removal_gateway(&root);
+        let before = gateway
+            .state
+            .lock()
+            .await
+            .config
+            .lock()
+            .expect("gateway config")
+            .clone();
+
+        let error = gateway
+            .remove_provider(primary.instance)
+            .await
+            .expect_err("the primary default must remain configured");
+
+        assert_eq!(error.code, "invalid_config");
+        assert_eq!(
+            *gateway
+                .state
+                .lock()
+                .await
+                .config
+                .lock()
+                .expect("gateway config"),
+            before
+        );
+        assert_eq!(
+            credentials
+                .get(
+                    &removable.instance,
+                    &removable.provider,
+                    removable.base_url.as_deref(),
+                )
+                .expect("credential"),
+            Some("unused-secret".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_removal_reloads_idle_chat_and_deletes_credential() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let (gateway, credentials, primary, removable) = provider_removal_gateway(&root);
+        let host = gateway.create_session(&workspace).await.expect("chat");
+        let before = host.snapshot(None).await.expect("snapshot").ready.config;
+        let mut composition = before.config;
+        composition.provider = removable.clone();
+        host.configure(before.revision, composition)
+            .await
+            .expect("select removable provider");
+        let mut events = host.subscribe();
+        let mut gateway_events = gateway.subscribe();
+        let host_id = host.session_id().to_owned();
+
+        let ready = gateway
+            .remove_provider(removable.instance.clone())
+            .await
+            .expect("remove unused provider");
+
+        assert!(host.is_alive());
+        assert!(Arc::ptr_eq(
+            &gateway.state.lock().await.sessions[&host_id].inner,
+            &host.inner
+        ));
+        let config = host
+            .snapshot(None)
+            .await
+            .expect("reloaded chat")
+            .ready
+            .config;
+        assert_eq!(config.config.provider, primary);
+        assert_eq!(
+            config.config.middleware.setting("subagents", "model_route"),
+            None
+        );
+        assert!(
+            ready
+                .provider_instances
+                .iter()
+                .all(|provider| provider.selection.instance != removable.instance)
+        );
+        assert_eq!(
+            ready
+                .default_config
+                .as_ref()
+                .expect("gateway default")
+                .config
+                .middleware
+                .setting("subagents", "model_route"),
+            None
+        );
+        assert_eq!(
+            credentials
+                .get(
+                    &removable.instance,
+                    &removable.provider,
+                    removable.base_url.as_deref(),
+                )
+                .expect("credential"),
+            None
+        );
+        assert!(matches!(
+            events.recv().await.expect("reload event").message,
+            ServerMessage::SessionChanged { .. }
+        ));
+        assert!(matches!(
+            gateway_events.recv().await.expect("ready event").message,
+            ServerMessage::Ready { payload } if payload == ready
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_chat_blocks_provider_removal_without_changes() {
+        let root = tempfile::tempdir().expect("root");
+        let (gateway, credentials, _, removable) = provider_removal_gateway(&root);
+        let before = gateway
+            .state
+            .lock()
+            .await
+            .config
+            .lock()
+            .expect("gateway config")
+            .clone();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let busy_selection = removable.clone();
+        tokio::spawn(async move {
+            if let Some(HostCommand::ProviderCutoverStatus { reply }) = receiver.recv().await {
+                let _ = reply.send(ProviderCutoverStatus {
+                    selection: busy_selection,
+                    provider_epoch: 0,
+                    idle: false,
+                });
+            }
+        });
+        let (events, _) = broadcast::channel(1);
+        gateway.state.lock().await.sessions.insert(
+            "busy".into(),
+            HostHandle {
+                inner: Arc::new(HostInner {
+                    session_id: "busy".into(),
+                    commands,
+                    events,
+                    accepts_file_attachments: Arc::new(AtomicBool::new(false)),
+                    alive: Arc::new(AtomicBool::new(true)),
+                }),
+            },
+        );
+
+        let error = gateway
+            .remove_provider(removable.instance.clone())
+            .await
+            .expect_err("active chat must block provider removal");
+
+        assert_eq!(error.code, "agent_busy");
+        assert_eq!(
+            *gateway
+                .state
+                .lock()
+                .await
+                .config
+                .lock()
+                .expect("gateway config"),
+            before
+        );
+        assert_eq!(
+            credentials
+                .get(
+                    &removable.instance,
+                    &removable.provider,
+                    removable.base_url.as_deref(),
+                )
+                .expect("credential"),
+            Some("unused-secret".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn dormant_chat_falls_back_when_removed_provider_is_reopened() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let (gateway, _, primary, removable) = provider_removal_gateway(&root);
+        let host = gateway.create_session(&workspace).await.expect("chat");
+        let before = host.snapshot(None).await.expect("snapshot").ready.config;
+        let mut composition = before.config;
+        composition.provider = removable.clone();
+        host.configure(before.revision, composition)
+            .await
+            .expect("select removable provider");
+        let session_id = host.session_id().to_owned();
+        assert!(host.stop_if_idle().await);
+        while host.is_alive() {
+            tokio::task::yield_now().await;
+        }
+        gateway.state.lock().await.sessions.remove(&session_id);
+
+        gateway
+            .remove_provider(removable.instance)
+            .await
+            .expect("remove dormant provider");
+        let reopened = gateway
+            .open_session(&session_id)
+            .await
+            .expect("reopen chat");
+        let config = reopened
+            .snapshot(None)
+            .await
+            .expect("snapshot")
+            .ready
+            .config;
+
+        assert_eq!(config.config.provider, primary);
+        assert_eq!(
+            config.config.middleware.setting("subagents", "model_route"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_removal_save_failure_keeps_resident_alive() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let (gateway, credentials, _, removable) = provider_removal_gateway(&root);
+        let host = gateway.create_session(&workspace).await.expect("chat");
+        let session_id = host.session_id().to_owned();
+        let config_path = root.path().join("state").join("gateway.toml");
+        std::fs::remove_file(&config_path).expect("remove gateway config");
+        std::fs::create_dir(&config_path).expect("block gateway config save");
+
+        gateway
+            .remove_provider(removable.instance.clone())
+            .await
+            .expect_err("gateway config save must fail");
+
+        assert!(host.is_alive());
+        assert!(Arc::ptr_eq(
+            &gateway.state.lock().await.sessions[&session_id].inner,
+            &host.inner
+        ));
+        assert!(
+            gateway
+                .state
+                .lock()
+                .await
+                .config
+                .lock()
+                .expect("gateway config")
+                .configured_providers
+                .contains_key(&removable.instance)
+        );
+        assert_eq!(
+            credentials
+                .get(
+                    &removable.instance,
+                    &removable.provider,
+                    removable.base_url.as_deref(),
+                )
+                .expect("credential"),
+            Some("unused-secret".into())
+        );
+    }
 
     #[tokio::test]
     async fn provider_registration_commits_against_the_latest_usage() {
@@ -570,6 +1020,7 @@ mod tests {
         let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
         let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
         let selection = ProviderConfig {
+            instance: "openrouter".into(),
             provider: "openrouter".into(),
             model: "openai/gpt-5".into(),
             base_url: Some("https://connector.example/v1".into()),
@@ -587,6 +1038,8 @@ mod tests {
         provider_registration(
             &stale,
             &selection,
+            "Test",
+            Default::default(),
             std::slice::from_ref(&selection.model),
             &[],
             true,
@@ -605,6 +1058,8 @@ mod tests {
         commit_provider_registration(
             &state,
             &selection,
+            "Test",
+            Default::default(),
             std::slice::from_ref(&selection.model),
             &[],
             true,
@@ -644,6 +1099,7 @@ mod tests {
         gateway
             .set_credential(
                 "responses".into(),
+                "responses".into(),
                 "custom-secret".into(),
                 Some(custom_endpoint.into()),
             )
@@ -651,7 +1107,8 @@ mod tests {
             .expect("store custom credential");
         let error = gateway
             .set_credential(
-                "kimi".into(),
+                "openai_socket".into(),
+                "openai_socket".into(),
                 "fixed-secret".into(),
                 Some(custom_endpoint.into()),
             )
@@ -660,14 +1117,22 @@ mod tests {
 
         assert_eq!(
             credentials
-                .get("responses", Some(custom_endpoint))
+                .get("responses", "responses", Some(custom_endpoint))
                 .expect("custom credential"),
             Some("custom-secret".into())
+        );
+        assert_eq!(
+            credentials
+                .get("responses", "openrouter", Some(custom_endpoint))
+                .expect("different provider"),
+            None
         );
         assert_eq!(error.code, "invalid_config");
         assert!(error.message.contains("fixed API endpoint"));
         assert_eq!(
-            credentials.get("kimi", None).expect("fixed credential"),
+            credentials
+                .get("openai_socket", "openai_socket", None)
+                .expect("fixed credential"),
             None
         );
     }
@@ -683,20 +1148,28 @@ mod tests {
         let credentials =
             Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
         credentials
-            .set("kimi", "old-secret", None)
+            .set(
+                "kimi",
+                "kimi",
+                "old-secret",
+                Some("https://api.moonshot.ai/v1"),
+            )
             .expect("initial Kimi credential");
         let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
         let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
         gateway
             .register_provider(
                 ProviderConfig {
+                    instance: "kimi".into(),
                     provider: "kimi".into(),
                     model: "kimi-k3".into(),
-                    base_url: None,
+                    base_url: Some("https://api.moonshot.ai/v1".into()),
                     endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
                     reasoning_effort: Some("max".into()),
                     web_search: mobius::backend::model::provider::HostedWebSearch::Off,
                 },
+                "Test".into(),
+                Default::default(),
                 Vec::new(),
                 Vec::new(),
                 false,
@@ -715,7 +1188,12 @@ mod tests {
         let mut second_events = second.subscribe();
 
         gateway
-            .set_credential("kimi".into(), "new-secret".into(), None)
+            .set_credential(
+                "kimi".into(),
+                "kimi".into(),
+                "new-secret".into(),
+                Some("https://api.moonshot.ai/v1".into()),
+            )
             .await
             .expect("replace Kimi credential");
 
@@ -736,8 +1214,9 @@ mod tests {
     }
 
     #[test]
-    fn credential_refresh_matches_only_the_selected_custom_endpoint() {
+    fn credential_refresh_separates_instances_but_shares_a_browser_login() {
         let selection = ProviderConfig {
+            instance: "responses-work".into(),
             provider: "responses".into(),
             model: "custom-model".into(),
             base_url: Some("https://first.example/v1".into()),
@@ -746,15 +1225,46 @@ mod tests {
             web_search: mobius::backend::model::provider::HostedWebSearch::Off,
         };
 
+        // An API key belongs to one instance; a sibling instance keeps its own.
         assert!(
-            provider_credential_matches(&selection, "responses", Some("https://first.example/v1"))
-                .expect("matching endpoint")
-                && !provider_credential_matches(
-                    &selection,
-                    "responses",
-                    Some("https://second.example/v1")
-                )
-                .expect("different endpoint")
+            provider_refresh_matches(
+                &selection,
+                &ProviderRefresh::Instance {
+                    instance: "responses-work".into(),
+                    base_url: Some("https://first.example/v1".into()),
+                }
+            )
+            .expect("matching instance and endpoint")
+        );
+        assert!(
+            !provider_refresh_matches(
+                &selection,
+                &ProviderRefresh::Instance {
+                    instance: "responses-personal".into(),
+                    base_url: Some("https://first.example/v1".into()),
+                }
+            )
+            .expect("different instance")
+        );
+        assert!(
+            !provider_refresh_matches(
+                &selection,
+                &ProviderRefresh::Instance {
+                    instance: "responses-work".into(),
+                    base_url: Some("https://second.example/v1".into()),
+                }
+            )
+            .expect("different endpoint")
+        );
+
+        // A browser login is stored per provider, so every instance of it refreshes.
+        assert!(
+            provider_refresh_matches(&selection, &ProviderRefresh::Provider("responses".into()))
+                .expect("matching provider")
+        );
+        assert!(
+            !provider_refresh_matches(&selection, &ProviderRefresh::Provider("anthropic".into()))
+                .expect("different provider")
         );
     }
 

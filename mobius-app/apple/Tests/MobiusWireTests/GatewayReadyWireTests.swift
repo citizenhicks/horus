@@ -22,14 +22,17 @@ extension GatewayWireTests {
         XCTAssertEqual(payload.providers.first?.models.first?.label, "Sol")
         XCTAssertEqual(payload.providers.first?.models.first?.defaultReasoning, "medium")
         XCTAssertEqual(payload.providers.first?.modelIdsConfigurable, false)
-        XCTAssertEqual(payload.providers.first?.reasoningEfforts, [])
+        XCTAssertEqual(payload.providerInstances.first?.instance, "openai-work")
+        XCTAssertEqual(payload.providerInstances.first?.provider, "openai_socket")
+        XCTAssertEqual(payload.providerInstances.first?.tint, .blue)
+        XCTAssertEqual(payload.providerInstances.first?.reasoningEfforts, [])
         XCTAssertEqual(payload.providers.first?.models.first?.reasoning.first?.description, "Balanced reasoning and latency")
         XCTAssertEqual(payload.providers.first?.webSearch, [.off, .cached, .live])
         XCTAssertEqual(payload.defaultConfig?.revision, 4)
         XCTAssertEqual(payload.defaultConfig?.config.maxModelSteps, 256)
         XCTAssertEqual(payload.models.first?.route, "openai_socket/gpt-5.6-sol")
         XCTAssertEqual(payload.models.first?.supportsImageInput, true)
-        XCTAssertEqual(payload.modelProviders["openai_socket/gpt-5.6-sol"], "openai_socket")
+        XCTAssertEqual(payload.modelProviders["openai_socket/gpt-5.6-sol"], "openai-work")
         XCTAssertEqual(payload.middlewareFeatures.first?.id, "extensions")
         XCTAssertEqual(payload.extensions.first?.id, "plugin:ponytail")
         XCTAssertEqual(payload.extensions.first?.capability, "extensions")
@@ -83,9 +86,9 @@ extension GatewayWireTests {
         ))
     }
 
-    func testV28RequiresProviderReasoningCatalogMetadata() {
+    func testV39RequiresProviderInstanceReasoningCatalogMetadata() {
         let payload = readyPayloadJSON.replacingOccurrences(
-            of: #""reasoning_efforts":[],"#,
+            of: #""reasoning_efforts":[]"#,
             with: ""
         )
 
@@ -236,7 +239,7 @@ extension GatewayWireTests {
         ))
     }
 
-    func testV38RequiresAnExplicitExtensionSelection() {
+    func testV39RequiresAnExplicitExtensionSelection() {
         let withoutExtensions = configJSON.replacingOccurrences(
             of: #","extensions":["plugin:ponytail"]"#,
             with: ""
@@ -247,18 +250,18 @@ extension GatewayWireTests {
         )
 
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":38,"type":"ready","payload":\#(payload)}"#
+            #"{"version":39,"type":"ready","payload":\#(payload)}"#
         ))
     }
 
-    func testV38RequiresGatewayContributions() {
+    func testV39RequiresGatewayContributions() {
         let payload = readyPayloadJSON.replacingOccurrences(
             of: #","contributions":[{"capability":"extensions","accepts_file_attachments":false,"count":1,"commands":[],"widgets":[],"references":[{"trigger":"$","value":"planning","description":"Planning skill"}],"active_input":null}]"#,
             with: ""
         )
 
         XCTAssertThrowsError(try decodeEnvelope(
-            #"{"version":38,"type":"ready","payload":\#(payload)}"#
+            #"{"version":39,"type":"ready","payload":\#(payload)}"#
         ))
     }
 

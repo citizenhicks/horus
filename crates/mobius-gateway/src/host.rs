@@ -22,7 +22,6 @@ use mobius::backend::checkpoint::{
     event_turn_page, sqlite::SqliteCheckpoint,
 };
 use mobius::backend::model::ModelRouter;
-use mobius::backend::model::provider::provider;
 use mobius::middleware::scratchpad::ScratchpadStore;
 use mobius::middleware::session_files::SessionFileStore;
 use mobius::middleware::{FrontendExtensions, Middleware as _};
@@ -35,7 +34,7 @@ use uuid::Uuid;
 
 use crate::assembly::{
     BuiltAgent, assemble, configured_model_choices, configured_model_providers,
-    configured_provider_for_route, provider_statuses,
+    configured_provider_for_route, provider_instances, provider_statuses,
 };
 use crate::config::{
     ChatSpec, ConfigStore, CredentialStore, GatewayConfig,

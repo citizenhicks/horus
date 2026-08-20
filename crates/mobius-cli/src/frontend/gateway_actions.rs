@@ -1,10 +1,13 @@
 use std::path::PathBuf;
 
 use mobius::{Error, Result};
-use mobius_gateway::wire::{ClientMessage, CronRun, CronTask, ProfileSnapshot, ServerMessage};
+use mobius_gateway::wire::{
+    ClientMessage, CronRun, CronTask, ProfileSnapshot, ProviderInstance, ServerMessage,
+};
 use uuid::Uuid;
 
 use super::catalog::GatewayAction;
+use super::provider_instance_label;
 
 pub(super) type PreparedAction = Box<ClientMessage>;
 
@@ -21,6 +24,7 @@ pub(super) fn prepare(action: GatewayAction) -> Result<PreparedAction> {
 pub(super) fn render_response(
     message: &ServerMessage,
     selected_session_id: &str,
+    provider_instances: &[ProviderInstance],
 ) -> Option<String> {
     match message {
         ServerMessage::Accepted { .. } => None,
@@ -44,7 +48,7 @@ pub(super) fn render_response(
         ServerMessage::ProviderLoginFinished { provider, .. } => {
             Some(format!("{provider} login complete"))
         }
-        ServerMessage::Profile { profile, .. } => Some(render_profile(profile)),
+        ServerMessage::Profile { profile, .. } => Some(render_profile(profile, provider_instances)),
         ServerMessage::CronTasks {
             session_id, tasks, ..
         } if session_id == selected_session_id => Some(render_cron_tasks(tasks)),
@@ -80,12 +84,14 @@ fn send(build: impl FnOnce(String) -> ClientMessage) -> PreparedAction {
     Box::new(build(request_id()))
 }
 
-fn render_profile(profile: &ProfileSnapshot) -> String {
+fn render_profile(profile: &ProfileSnapshot, provider_instances: &[ProviderInstance]) -> String {
     let mut lines = vec![profile.user_name.as_deref().unwrap_or("user").into()];
     lines.extend(profile.daily_usage.iter().map(|day| {
+        let provider =
+            provider_instance_label(provider_instances, &day.provider).unwrap_or(&day.provider);
         format!(
             "day {} · {} · {} tokens · {} cached",
-            day.unix_day, day.provider, day.usage.total_tokens, day.usage.cached_input_tokens
+            day.unix_day, provider, day.usage.total_tokens, day.usage.cached_input_tokens
         )
     }));
     lines.join("\n")
@@ -127,17 +133,27 @@ fn render_cron_history(runs: &[CronRun]) -> String {
 #[cfg(test)]
 mod tests {
     use mobius::protocol::TokenUsage;
-    use mobius_gateway::wire::{DailyUsage, RunStats};
+    use mobius_gateway::wire::{AgentComposition, DailyUsage, RunStats};
 
     use super::*;
 
     #[test]
     fn profile_usage_names_each_provider() {
+        let mut selection = AgentComposition::default().provider;
+        selection.instance = "provider-instance".into();
+        let instances = [ProviderInstance {
+            label: "Work".into(),
+            tint: Default::default(),
+            configured: true,
+            selection,
+            model_ids: Vec::new(),
+            reasoning_efforts: Vec::new(),
+        }];
         let profile = ProfileSnapshot {
             user_name: Some("user".into()),
             daily_usage: vec![DailyUsage {
                 unix_day: 7,
-                provider: "openai_socket".into(),
+                provider: "provider-instance".into(),
                 usage: TokenUsage {
                     total_tokens: 11,
                     ..TokenUsage::default()
@@ -148,8 +164,8 @@ mod tests {
         };
 
         assert_eq!(
-            render_profile(&profile),
-            "user\nday 7 · openai_socket · 11 tokens · 0 cached"
+            render_profile(&profile, &instances),
+            "user\nday 7 · Work · 11 tokens · 0 cached"
         );
     }
 
@@ -159,7 +175,7 @@ mod tests {
             request_id: "request".into(),
         };
 
-        assert!(render_response(&accepted, "session-a").is_none());
+        assert!(render_response(&accepted, "session-a", &[]).is_none());
     }
 
     #[test]
@@ -170,7 +186,7 @@ mod tests {
             tasks: Vec::new(),
         };
 
-        assert!(render_response(&tasks, "session-a").is_none());
+        assert!(render_response(&tasks, "session-a", &[]).is_none());
     }
 
     #[test]

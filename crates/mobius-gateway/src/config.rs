@@ -26,7 +26,7 @@ use sha2::Digest as _;
 
 use crate::wire::{
     AgentComposition, DailyUsage, ProfileSnapshot, ProviderConfig, ProviderEndpointAuth,
-    VersionedAgentConfig, WorkspaceInfo,
+    ProviderTint, VersionedAgentConfig, WorkspaceInfo,
 };
 use crate::{Error, Result};
 
@@ -38,8 +38,8 @@ pub(crate) use self::validation::{effective_reasoning_effort, model_route_id};
 use self::workspace::*;
 pub(crate) use self::workspace::{create_workspace_directory, local_user_name};
 
-const CONFIG_VERSION: u32 = 17;
-const CHAT_SPEC_VERSION: u32 = 8;
+const CONFIG_VERSION: u32 = 18;
+const CHAT_SPEC_VERSION: u32 = 9;
 pub(crate) const CHAT_SPEC_METADATA_KEY: &str = "mobius_gateway.chat";
 const CONFIG_FILE: &str = "gateway.toml";
 const CLOUDFLARE_TOKEN_FILE: &str = "cloudflare-token";
@@ -106,6 +106,8 @@ pub struct GatewayConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfiguredProvider {
     pub(crate) selection: ProviderConfig,
+    pub(crate) label: String,
+    pub(crate) tint: ProviderTint,
     pub(crate) model_ids: Vec<String>,
     pub(crate) reasoning_efforts: Vec<String>,
 }
@@ -128,6 +130,7 @@ impl Default for AgentComposition {
             .expect("default model manifest");
         Self {
             provider: ProviderConfig {
+                instance: provider.id().into(),
                 provider: provider.id().into(),
                 model: model.id.into(),
                 base_url: provider.default_base_url().map(str::to_string),
@@ -175,17 +178,29 @@ impl GatewayConfig {
     pub(crate) fn registering_provider(
         &self,
         selection: ProviderConfig,
+        label: String,
+        tint: ProviderTint,
         model_ids: Vec<String>,
         reasoning_efforts: Vec<String>,
     ) -> Result<Self> {
+        if let Some(configured) = self.configured_providers.get(&selection.instance)
+            && configured.selection.provider != selection.provider
+        {
+            return Err(Error::Config(format!(
+                "provider instance `{}` already belongs to `{}`",
+                selection.instance, configured.selection.provider
+            )));
+        }
         let configured = ConfiguredProvider {
             selection: selection.clone(),
+            label,
+            tint,
             model_ids,
             reasoning_efforts,
         };
         let mut next = self.clone();
         next.configured_providers
-            .insert(selection.provider.clone(), configured);
+            .insert(selection.instance.clone(), configured);
         if self.default_agent.is_none() {
             let config = AgentComposition {
                 provider: selection,
@@ -200,6 +215,45 @@ impl GatewayConfig {
         Ok(next)
     }
 
+    /// Removes one non-default provider and lets middleware inherit the primary model.
+    pub(crate) fn removing_provider(&self, instance: &str) -> Result<Self> {
+        if !self.configured_providers.contains_key(instance) {
+            return Err(Error::Config(format!(
+                "provider instance `{instance}` is not configured"
+            )));
+        }
+        if self
+            .default_agent
+            .as_ref()
+            .is_some_and(|default| default.config.provider.instance == instance)
+        {
+            return Err(Error::Config(
+                "choose another gateway default before removing this provider".into(),
+            ));
+        }
+        let mut next = self.clone();
+        next.configured_providers.remove(instance);
+        let mut default_config = next
+            .default_agent
+            .as_ref()
+            .expect("a removable provider cannot be the only configured provider")
+            .config
+            .clone();
+        if clear_missing_model_routes(&mut default_config, &next)? {
+            let default = next
+                .default_agent
+                .as_mut()
+                .expect("a removable provider cannot be the only configured provider");
+            default.config = default_config;
+            default.revision = default
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| Error::Config("configuration revision overflow".into()))?;
+        }
+        next.validate()?;
+        Ok(next)
+    }
+
     /// Replaces a same-provider new-chat default during an explicit fleet cutover.
     pub(crate) fn replacing_provider_default(&self, selection: &ProviderConfig) -> Result<Self> {
         let Some(current) = self.default_agent.as_ref() else {
@@ -207,7 +261,7 @@ impl GatewayConfig {
                 "register a provider before replacing its default".into(),
             ));
         };
-        if current.config.provider.provider != selection.provider
+        if current.config.provider.instance != selection.instance
             || current.config.provider == *selection
         {
             return Ok(self.clone());
@@ -258,7 +312,7 @@ impl GatewayConfig {
         validate_provider_config(selection)?;
         let configured = self
             .configured_providers
-            .get(&selection.provider)
+            .get(&selection.instance)
             .ok_or_else(|| {
                 Error::Config("provider selection must use a configured provider entry".into())
             })?;
@@ -328,11 +382,11 @@ impl GatewayConfig {
                 "the gateway default must exist exactly when a provider is configured".into(),
             ));
         }
-        for (provider_id, configured) in &self.configured_providers {
-            if provider_id != &configured.selection.provider {
+        for (instance, configured) in &self.configured_providers {
+            if instance != &configured.selection.instance {
                 return Err(Error::Config(format!(
-                    "configured provider key `{provider_id}` does not match `{}`",
-                    configured.selection.provider
+                    "configured provider key `{instance}` does not match `{}`",
+                    configured.selection.instance
                 )));
             }
             validate_configured_provider(configured)?;
@@ -456,7 +510,7 @@ impl ChatSpec {
         state_dir: &Path,
         tls: Option<&TlsConfig>,
     ) -> Result<Option<Self>> {
-        if self.agent.config.provider.provider != selection.provider
+        if self.agent.config.provider.instance != selection.instance
             || self.agent.config.provider == *selection
         {
             return Ok(None);
@@ -465,6 +519,38 @@ impl ChatSpec {
         composition.provider = selection.clone();
         self.replacing_agent(self.agent.revision, composition, gateway, state_dir, tls)
             .map(Some)
+    }
+
+    /// Falls back from provider entries removed since this chat last ran.
+    pub(crate) fn normalizing_provider_catalog(
+        &self,
+        gateway: &GatewayConfig,
+        state_dir: &Path,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Self> {
+        if gateway.configured_providers.is_empty() {
+            return Ok(self.clone());
+        }
+        let mut composition = self.agent.config.clone();
+        let mut changed = false;
+        if !gateway
+            .configured_providers
+            .contains_key(&composition.provider.instance)
+        {
+            composition.provider = gateway
+                .default_agent
+                .as_ref()
+                .ok_or_else(|| Error::Config("gateway has no default provider".into()))?
+                .config
+                .provider
+                .clone();
+            changed = true;
+        }
+        changed |= clear_missing_model_routes(&mut composition, gateway)?;
+        if !changed {
+            return Ok(self.clone());
+        }
+        self.replacing_agent(self.agent.revision, composition, gateway, state_dir, tls)
     }
 
     fn validate(&self, state_dir: &Path, tls: Option<&TlsConfig>) -> Result<()> {
@@ -487,6 +573,28 @@ impl ChatSpec {
         }
         validate_agent_composition(&self.agent.config)
     }
+}
+
+fn clear_missing_model_routes(
+    composition: &mut AgentComposition,
+    gateway: &GatewayConfig,
+) -> Result<bool> {
+    let routes = crate::middleware_manifest::configured_model_routes(&composition.middleware)
+        .into_iter()
+        .map(|(middleware, setting, route)| {
+            (middleware.to_owned(), setting.to_owned(), route.to_owned())
+        })
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for (middleware, setting, route) in routes {
+        if !crate::assembly::configured_route_exists(gateway, &route)? {
+            composition
+                .middleware
+                .set_setting(middleware, setting, None);
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 impl TlsConfig {

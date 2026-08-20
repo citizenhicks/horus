@@ -32,12 +32,17 @@ pub(super) const fn provider() -> ProviderDefinition {
         manifest::SEARCH,
         build_provider,
     )
+    .with_base_url(BASE_URL)
+    .with_credentialless_endpoints()
 }
 
 fn build_provider(config: ProviderBuildConfig) -> Result<Arc<dyn Model>> {
-    let api_key = config.credential.into_api_key("deepseek")?;
+    let base_url = config
+        .base_url
+        .ok_or_else(|| Error::Config("DeepSeek requires a base URL".into()))?;
+    let api_key = config.credential.into_optional_api_key("deepseek")?;
     let provider =
-        OpenAi::with_client(api_key, BASE_URL, config.model, config.http)?.without_image_input();
+        OpenAi::with_client(api_key, base_url, config.model, config.http)?.without_image_input();
     let provider = match config.reasoning_effort {
         Some(effort) => provider.with_reasoning_effort(effort)?,
         None => provider,
@@ -68,7 +73,7 @@ mod tests {
                 .build(ProviderBuildConfig {
                     credential: ProviderCredential::ApiKey("test-key".into()),
                     model: definition.default_model().expect("default model").into(),
-                    base_url: None,
+                    base_url: Some(BASE_URL.into()),
                     reasoning_effort: None,
                     web_search,
                     http: reqwest::Client::new(),
@@ -84,7 +89,7 @@ mod tests {
             .build(ProviderBuildConfig {
                 credential: ProviderCredential::ApiKey("test-key".into()),
                 model: "deepseek-v4-flash".into(),
-                base_url: None,
+                base_url: Some(BASE_URL.into()),
                 reasoning_effort: None,
                 web_search: HostedWebSearch::Off,
                 http: reqwest::Client::new(),

@@ -61,7 +61,7 @@ struct SidebarDrawer<Sidebar: View, Detail: View>: View {
                 .mask { pageShape.ignoresSafeArea() }
                 .offset(x: offset)
                 .scrollDisabled(drag != 0)
-            if !isOpen, model.chatNavigationPath.isEmpty {
+            if !isOpen, model.navigationPath.isEmpty {
                 edgeSwipeTarget
             }
         }
@@ -146,7 +146,7 @@ struct SidebarDrawer<Sidebar: View, Detail: View>: View {
 
     private func accepts(_ value: DragGesture.Value) -> Bool {
         guard abs(value.translation.width) > abs(value.translation.height) else { return false }
-        if !isOpen, !model.chatNavigationPath.isEmpty { return false }
+        if !isOpen, !model.navigationPath.isEmpty { return false }
         return isOpen || value.startLocation.x <= SidebarDrawerMetrics.edgeCatch
     }
 
@@ -215,15 +215,20 @@ struct SidebarView: View {
 
                 VStack(alignment: .leading, spacing: MobiusSpace.xxs) {
                     navigationButton("Chats", destination: .chats)
-                    navigationButton("Gateway", destination: .gateway)
-                    navigationButton("Providers", destination: .providers)
-                    navigationButton("Default agent", destination: .agent)
-                    navigationButton("Extensions", destination: .extensions)
                     navigationButton("Cron", destination: .cron)
                     navigationButton("Scratchpad", destination: .scratchpad)
                     ForEach(model.navigationWidgets.filter { $0.capability != "scratchpad" }) { widget in
                         contributionNavigationButton(widget)
                     }
+
+                    // Work above, the gateway's own configuration below.
+                    Divider()
+                        .padding(.vertical, MobiusSpace.xxs)
+
+                    navigationButton("Gateway", destination: .gateway)
+                    navigationButton("Providers", destination: .providers)
+                    navigationButton("Extensions", destination: .extensions)
+                    navigationButton("Default agent", destination: .agent)
                 }
                 .padding(.horizontal, MobiusSpace.m)
                 .padding(.bottom, MobiusSpace.m)

@@ -195,6 +195,16 @@ struct MobiusGlyph: Hashable {
     static let xCircle = Self("hi.xCircle")
 }
 
+extension MobiusGlyph {
+    /// UIKit re-tints menu images, so bake the provider accent into an original image.
+    func menuImage(_ color: Color) -> Image? {
+        guard let base = UIImage(named: asset)?.withRenderingMode(.alwaysTemplate) else {
+            return nil
+        }
+        return Image(uiImage: base.withTintColor(UIColor(color), renderingMode: .alwaysOriginal))
+    }
+}
+
 struct MobiusIcon: View {
     let glyph: MobiusGlyph
     var size = MobiusStyle.iconSize

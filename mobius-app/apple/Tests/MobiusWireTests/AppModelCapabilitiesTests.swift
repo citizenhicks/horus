@@ -563,7 +563,7 @@ extension AppModelTests {
         XCTAssertEqual(model.toast?.sessionID, "chat-1")
 
         model.destination = .chats
-        model.chatRoute = .session("chat-1")
+        model.navigationPath = [.chat(.session("chat-1"))]
         model.setChatVisible(true)
         XCTAssertFalse(model.unreadSessionIDs.contains("chat-1"))
         XCTAssertTrue(model.attentionSessionIDs.isEmpty)
@@ -634,7 +634,7 @@ extension AppModelTests {
         XCTAssertEqual(model.toast?.tone, .error)
 
         model.dismissToast()
-        model.saveProviderCredential(provider: "openai")
+        model.saveProviderCredential()
 
         XCTAssertEqual(model.toast?.message, "Enter an API key. It will be sent once and never read back.")
         XCTAssertEqual(model.toast?.tone, .error)

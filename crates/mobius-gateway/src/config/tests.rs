@@ -59,22 +59,22 @@ fn quick_cloudflare_config_round_trips_without_a_token() {
 }
 
 #[test]
-fn gateway_config_rejects_v16_without_migration() {
+fn gateway_config_rejects_v17_without_migration() {
     let root = tempfile::tempdir().expect("temporary directory");
     let state = root.path().join("state");
     ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
     let path = state.join(CONFIG_FILE);
     let contents = fs::read_to_string(&path)
         .expect("read gateway config")
-        .replacen("version = 17", "version = 16", 1);
-    fs::write(&path, contents).expect("write v16 config");
+        .replacen("version = 18", "version = 17", 1);
+    fs::write(&path, contents).expect("write v17 config");
 
-    let error = ConfigStore::open(state).expect_err("v16 must be rejected");
+    let error = ConfigStore::open(state).expect_err("v17 must be rejected");
 
     assert!(
         error
             .to_string()
-            .contains("unsupported gateway config version 16")
+            .contains("unsupported gateway config version 17")
     );
 }
 
@@ -85,7 +85,13 @@ fn generated_toml_round_trips_manifest_settings() {
     let (store, config) =
         ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize state");
     let mut config = config
-        .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
+        .registering_provider(
+            AgentComposition::default().provider,
+            "Test".into(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
         .expect("register provider");
     let usage = TokenUsage {
         input_tokens: 7,
@@ -105,7 +111,7 @@ fn generated_toml_round_trips_manifest_settings() {
     let contents = fs::read_to_string(state.join(CONFIG_FILE)).expect("read config");
     let (_, restored) = ConfigStore::open(state).expect("open config");
 
-    assert!(contents.starts_with("version = 17"));
+    assert!(contents.starts_with("version = 18"));
     assert!(contents.contains("max_model_steps = 256"));
     assert!(contents.contains("[default_agent.config.middleware.settings.context_offloading]"));
     assert!(contents.contains("[default_agent.config.middleware.settings.sessions]"));
@@ -119,7 +125,13 @@ fn extension_selection_is_a_stable_optional_reference() {
 
     let mut config = GatewayConfig::new(DEFAULT_LISTEN, None)
         .expect("gateway config")
-        .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
+        .registering_provider(
+            AgentComposition::default().provider,
+            "Test".into(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
         .expect("register provider");
     let id = "plugin:ponytail".to_string();
     config
@@ -170,17 +182,25 @@ fn extension_selection_is_a_stable_optional_reference() {
 fn provider_registration_never_silently_changes_existing_defaults() {
     let config = GatewayConfig::new(DEFAULT_LISTEN, None).expect("gateway config");
     let kimi = ProviderConfig {
+        instance: "kimi".into(),
         provider: "kimi".into(),
         model: "kimi-k3".into(),
-        base_url: None,
+        base_url: Some("https://api.moonshot.ai/v1".into()),
         endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
         reasoning_effort: Some("max".into()),
         web_search: mobius::backend::model::provider::HostedWebSearch::Off,
     };
     let first = config
-        .registering_provider(kimi.clone(), Vec::new(), Vec::new())
+        .registering_provider(
+            kimi.clone(),
+            "Test".into(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
         .expect("register Kimi");
     let openrouter = ProviderConfig {
+        instance: "openrouter".into(),
         provider: "openrouter".into(),
         model: "openrouter/pareto-code".into(),
         base_url: Some("https://openrouter.ai/api/v1".into()),
@@ -191,6 +211,8 @@ fn provider_registration_never_silently_changes_existing_defaults() {
     let second = first
         .registering_provider(
             openrouter.clone(),
+            "Test".into(),
+            Default::default(),
             vec![openrouter.model.clone(), "anthropic/claude-opus-4.1".into()],
             Vec::new(),
         )
@@ -213,11 +235,36 @@ fn provider_registration_never_silently_changes_existing_defaults() {
         "kimi"
     );
 
+    let rebound = ProviderConfig {
+        instance: "openrouter".into(),
+        ..AgentComposition::default().provider
+    };
+    let error = second
+        .registering_provider(
+            rebound,
+            "Test".into(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect_err("an existing instance must keep its provider");
+    assert!(
+        error
+            .to_string()
+            .contains("already belongs to `openrouter`")
+    );
+
     let mut updated = kimi.clone();
     updated.model = "kimi-k2.7-code".into();
     updated.reasoning_effort = None;
     let third = second
-        .registering_provider(updated.clone(), Vec::new(), Vec::new())
+        .registering_provider(
+            updated.clone(),
+            "Test".into(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
         .expect("update registered provider");
     assert_eq!(third.configured_providers["kimi"].selection, updated);
     let default = third.default_agent.expect("preserved default");
@@ -225,7 +272,13 @@ fn provider_registration_never_silently_changes_existing_defaults() {
     assert_eq!(default.config.provider, kimi);
 
     let replaced = second
-        .registering_provider(updated.clone(), Vec::new(), Vec::new())
+        .registering_provider(
+            updated.clone(),
+            "Test".into(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
         .expect("update registered provider")
         .replacing_provider_default(&updated)
         .expect("replace same-provider default");
@@ -246,6 +299,7 @@ fn provider_registration_never_silently_changes_existing_defaults() {
 #[test]
 fn configured_custom_provider_keeps_its_endpoint_and_model() {
     let selection = ProviderConfig {
+        instance: "responses".into(),
         provider: "responses".into(),
         model: "vendor/model-opaque".into(),
         base_url: Some("https://example.com/v1".into()),
@@ -257,6 +311,8 @@ fn configured_custom_provider_keeps_its_endpoint_and_model() {
         .expect("gateway config")
         .registering_provider(
             selection.clone(),
+            "Test".into(),
+            Default::default(),
             vec![selection.model.clone()],
             vec!["provider-defined".into()],
         )
@@ -283,6 +339,7 @@ fn configured_custom_provider_keeps_its_endpoint_and_model() {
 #[test]
 fn openrouter_accepts_a_credentialless_custom_https_endpoint() {
     let selection = ProviderConfig {
+        instance: "openrouter".into(),
         provider: "openrouter".into(),
         model: "openai/gpt-5".into(),
         base_url: Some("https://connector.example/v1".into()),
@@ -293,7 +350,13 @@ fn openrouter_accepts_a_credentialless_custom_https_endpoint() {
 
     GatewayConfig::new(DEFAULT_LISTEN, None)
         .expect("gateway config")
-        .registering_provider(selection.clone(), vec![selection.model], Vec::new())
+        .registering_provider(
+            selection.clone(),
+            "Test".into(),
+            Default::default(),
+            vec![selection.model],
+            Vec::new(),
+        )
         .expect("credentialless OpenRouter endpoint");
 }
 
@@ -304,6 +367,7 @@ fn credentialless_endpoint_rejects_openrouter_default_aliases() {
         "https://openrouter.ai/alternate-path",
     ] {
         let selection = ProviderConfig {
+            instance: "openrouter".into(),
             provider: "openrouter".into(),
             model: "openai/gpt-5".into(),
             base_url: Some(base_url.into()),
@@ -314,7 +378,13 @@ fn credentialless_endpoint_rejects_openrouter_default_aliases() {
 
         let error = GatewayConfig::new(DEFAULT_LISTEN, None)
             .expect("gateway config")
-            .registering_provider(selection.clone(), vec![selection.model], Vec::new())
+            .registering_provider(
+                selection.clone(),
+                "Test".into(),
+                Default::default(),
+                vec![selection.model],
+                Vec::new(),
+            )
             .expect_err("default endpoint origin must require provider authentication");
 
         assert!(
@@ -328,6 +398,7 @@ fn credentialless_endpoint_rejects_openrouter_default_aliases() {
 #[test]
 fn credentialless_endpoint_requires_https() {
     let selection = ProviderConfig {
+        instance: "openrouter".into(),
         provider: "openrouter".into(),
         model: "openai/gpt-5".into(),
         base_url: Some("http://127.0.0.1:8080/v1".into()),
@@ -338,7 +409,13 @@ fn credentialless_endpoint_requires_https() {
 
     let error = GatewayConfig::new(DEFAULT_LISTEN, None)
         .expect("gateway config")
-        .registering_provider(selection.clone(), vec![selection.model], Vec::new())
+        .registering_provider(
+            selection.clone(),
+            "Test".into(),
+            Default::default(),
+            vec![selection.model],
+            Vec::new(),
+        )
         .expect_err("credentialless endpoint must require HTTPS");
 
     assert!(error.to_string().contains("must use HTTPS"));
@@ -352,6 +429,7 @@ fn credentialless_endpoint_rejects_secret_bearing_url_components() {
         "https://connector.example/v1#secret",
     ] {
         let selection = ProviderConfig {
+            instance: "openrouter".into(),
             provider: "openrouter".into(),
             model: "openai/gpt-5".into(),
             base_url: Some(base_url.into()),
@@ -362,16 +440,23 @@ fn credentialless_endpoint_rejects_secret_bearing_url_components() {
 
         GatewayConfig::new(DEFAULT_LISTEN, None)
             .expect("gateway config")
-            .registering_provider(selection.clone(), vec![selection.model], Vec::new())
+            .registering_provider(
+                selection.clone(),
+                "Test".into(),
+                Default::default(),
+                vec![selection.model],
+                Vec::new(),
+            )
             .expect_err("secret-bearing endpoint must be rejected");
     }
 }
 
 #[test]
-fn credentialless_endpoint_requires_manifest_support() {
+fn credentialless_endpoint_requires_a_configurable_provider() {
     let selection = ProviderConfig {
-        provider: "responses".into(),
-        model: "custom-model".into(),
+        instance: "openai_socket".into(),
+        provider: "openai_socket".into(),
+        model: "gpt-5.6-luna".into(),
         base_url: Some("https://connector.example/v1".into()),
         endpoint_auth: ProviderEndpointAuth::Credentialless,
         reasoning_effort: None,
@@ -380,19 +465,22 @@ fn credentialless_endpoint_requires_manifest_support() {
 
     let error = GatewayConfig::new(DEFAULT_LISTEN, None)
         .expect("gateway config")
-        .registering_provider(selection.clone(), vec![selection.model], Vec::new())
-        .expect_err("manifest must allow credentialless endpoints");
+        .registering_provider(
+            selection.clone(),
+            "Test".into(),
+            Default::default(),
+            vec![selection.model],
+            Vec::new(),
+        )
+        .expect_err("a fixed-endpoint provider cannot take a credentialless endpoint");
 
-    assert!(
-        error
-            .to_string()
-            .contains("does not support credentialless")
-    );
+    assert!(error.to_string().contains("fixed API endpoint"));
 }
 
 #[test]
 fn custom_provider_registration_validates_its_model_catalog() {
     let selection = ProviderConfig {
+        instance: "openrouter".into(),
         provider: "openrouter".into(),
         model: "anthropic/claude-sonnet-4".into(),
         base_url: Some("https://openrouter.ai/api/v1".into()),
@@ -403,11 +491,19 @@ fn custom_provider_registration_validates_its_model_catalog() {
     let config = GatewayConfig::new(DEFAULT_LISTEN, None).expect("gateway config");
 
     let missing = config
-        .registering_provider(selection.clone(), Vec::new(), Vec::new())
+        .registering_provider(
+            selection.clone(),
+            "Test".into(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
         .expect_err("custom catalog must not be empty");
     let duplicate = config
         .registering_provider(
             selection.clone(),
+            "Test".into(),
+            Default::default(),
             vec![selection.model.clone(), selection.model.clone()],
             Vec::new(),
         )
@@ -415,6 +511,8 @@ fn custom_provider_registration_validates_its_model_catalog() {
     let padded = config
         .registering_provider(
             selection.clone(),
+            "Test".into(),
+            Default::default(),
             vec![" anthropic/claude-sonnet-4".into()],
             Vec::new(),
         )
@@ -422,6 +520,8 @@ fn custom_provider_registration_validates_its_model_catalog() {
     let duplicate_reasoning = config
         .registering_provider(
             selection.clone(),
+            "Test".into(),
+            Default::default(),
             vec![selection.model.clone()],
             vec!["high".into(), "high".into()],
         )
@@ -431,6 +531,8 @@ fn custom_provider_registration_validates_its_model_catalog() {
     let missing_reasoning = config
         .registering_provider(
             missing_reasoning,
+            "Test".into(),
+            Default::default(),
             vec!["anthropic/claude-sonnet-4".into()],
             vec!["medium".into()],
         )
@@ -457,6 +559,7 @@ fn custom_provider_catalogs_accept_opaque_ids_but_reject_ambiguous_routes() {
     config
         .registering_provider(
             ProviderConfig {
+                instance: "openrouter".into(),
                 provider: "openrouter".into(),
                 model: "vendor::model".into(),
                 base_url: Some("https://openrouter.ai/api/v1".into()),
@@ -464,6 +567,8 @@ fn custom_provider_catalogs_accept_opaque_ids_but_reject_ambiguous_routes() {
                 reasoning_effort: None,
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
+            "Test".into(),
+            Default::default(),
             vec!["vendor::model".into()],
             Vec::new(),
         )
@@ -471,6 +576,7 @@ fn custom_provider_catalogs_accept_opaque_ids_but_reject_ambiguous_routes() {
     let collision = config
         .registering_provider(
             ProviderConfig {
+                instance: "openrouter".into(),
                 provider: "openrouter".into(),
                 model: "vendor:".into(),
                 base_url: Some("https://openrouter.ai/api/v1".into()),
@@ -478,6 +584,8 @@ fn custom_provider_catalogs_accept_opaque_ids_but_reject_ambiguous_routes() {
                 reasoning_effort: Some("high".into()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
+            "Test".into(),
+            Default::default(),
             vec!["vendor:".into(), "vendor".into()],
             vec!["high".into(), ":high".into()],
         )
@@ -498,6 +606,7 @@ fn custom_provider_catalogs_bound_the_total_generated_routes() {
         .expect("gateway config")
         .registering_provider(
             ProviderConfig {
+                instance: "openrouter".into(),
                 provider: "openrouter".into(),
                 model: models[0].clone(),
                 base_url: Some("https://openrouter.ai/api/v1".into()),
@@ -505,6 +614,8 @@ fn custom_provider_catalogs_bound_the_total_generated_routes() {
                 reasoning_effort: Some(efforts[0].clone()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
+            "Test".into(),
+            Default::default(),
             models,
             efforts,
         )
@@ -513,6 +624,7 @@ fn custom_provider_catalogs_bound_the_total_generated_routes() {
     let error = config
         .registering_provider(
             ProviderConfig {
+                instance: "responses".into(),
                 provider: "responses".into(),
                 model: "local-model".into(),
                 base_url: Some("http://127.0.0.1:11434/v1".into()),
@@ -520,6 +632,8 @@ fn custom_provider_catalogs_bound_the_total_generated_routes() {
                 reasoning_effort: None,
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
+            "Test".into(),
+            Default::default(),
             vec!["local-model".into()],
             Vec::new(),
         )
@@ -535,6 +649,7 @@ fn provider_registration_rejects_a_catalog_that_invalidates_the_current_default(
         .expect("gateway config")
         .registering_provider(
             ProviderConfig {
+                instance: "openrouter".into(),
                 provider: "openrouter".into(),
                 model: model.clone(),
                 base_url: Some("https://openrouter.ai/api/v1".into()),
@@ -542,6 +657,8 @@ fn provider_registration_rejects_a_catalog_that_invalidates_the_current_default(
                 reasoning_effort: Some("high".into()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
+            "Test".into(),
+            Default::default(),
             vec![model.clone()],
             vec!["high".into(), "medium".into()],
         )
@@ -550,6 +667,7 @@ fn provider_registration_rejects_a_catalog_that_invalidates_the_current_default(
     let error = config
         .registering_provider(
             ProviderConfig {
+                instance: "openrouter".into(),
                 provider: "openrouter".into(),
                 model: model.clone(),
                 base_url: Some("https://openrouter.ai/api/v1".into()),
@@ -557,6 +675,8 @@ fn provider_registration_rejects_a_catalog_that_invalidates_the_current_default(
                 reasoning_effort: Some("medium".into()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
+            "Test".into(),
+            Default::default(),
             vec![model],
             vec!["medium".into()],
         )
@@ -576,6 +696,7 @@ fn default_and_persisted_config_validate_custom_reasoning_membership() {
         .expect("gateway config")
         .registering_provider(
             ProviderConfig {
+                instance: "openrouter".into(),
                 provider: "openrouter".into(),
                 model: model.clone(),
                 base_url: Some("https://openrouter.ai/api/v1".into()),
@@ -583,6 +704,8 @@ fn default_and_persisted_config_validate_custom_reasoning_membership() {
                 reasoning_effort: Some("high".into()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
+            "Test".into(),
+            Default::default(),
             vec![model],
             vec!["high".into(), "medium".into()],
         )
@@ -621,6 +744,7 @@ fn chat_replacement_rejects_out_of_catalog_model_and_reasoning() {
         .expect("gateway config")
         .registering_provider(
             ProviderConfig {
+                instance: "openrouter".into(),
                 provider: "openrouter".into(),
                 model: model.clone(),
                 base_url: Some("https://openrouter.ai/api/v1".into()),
@@ -628,6 +752,8 @@ fn chat_replacement_rejects_out_of_catalog_model_and_reasoning() {
                 reasoning_effort: Some("high".into()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
+            "Test".into(),
+            Default::default(),
             vec![model],
             vec!["high".into(), "medium".into()],
         )
@@ -661,7 +787,13 @@ fn chat_replacement_rejects_out_of_catalog_model_and_reasoning() {
 fn saving_defaults_is_revisioned_and_does_not_change_existing_chat_specs() {
     let registered = GatewayConfig::new(DEFAULT_LISTEN, None)
         .expect("gateway config")
-        .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
+        .registering_provider(
+            AgentComposition::default().provider,
+            "Test".into(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
         .expect("register provider");
     let workspace = tempfile::tempdir().expect("workspace");
     let state = tempfile::tempdir().expect("state");
@@ -1026,10 +1158,19 @@ fn provider_credentials_are_owner_only_and_absent_from_agent_snapshots() {
     credentials
         .set(
             "openrouter",
+            "openrouter",
             "write-only-secret",
             Some("https://openrouter.ai/api/v1"),
         )
         .expect("store credential");
+    let error = credentials
+        .set(
+            "openrouter",
+            "responses",
+            "replacement-secret",
+            Some("https://example.com/v1"),
+        )
+        .expect_err("an existing instance must keep its provider");
 
     let mode = fs::metadata(path)
         .expect("credential metadata")
@@ -1038,6 +1179,21 @@ fn provider_credentials_are_owner_only_and_absent_from_agent_snapshots() {
         & 0o777;
     let snapshot = serde_json::to_string(&AgentComposition::default()).expect("snapshot");
     assert_eq!(mode, 0o600);
+    assert!(
+        error
+            .to_string()
+            .contains("already belongs to `openrouter`")
+    );
+    assert_eq!(
+        credentials
+            .get(
+                "openrouter",
+                "openrouter",
+                Some("https://openrouter.ai/api/v1")
+            )
+            .expect("original credential"),
+        Some("write-only-secret".into())
+    );
     assert!(!snapshot.contains("write-only-secret"));
 }
 

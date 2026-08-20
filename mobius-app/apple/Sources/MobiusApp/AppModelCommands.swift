@@ -83,8 +83,7 @@ extension AppModel {
         connect(to: account)
     }
 
-    func renameSelectedGateway(_ name: String) {
-        guard let account = selectedAccount else { return }
+    func renameGateway(_ account: GatewayAccount, to name: String) {
         do {
             let renamed = try store.rename(account, to: name)
             guard let index = accounts.firstIndex(where: { $0.id == renamed.id }) else { return }
@@ -187,27 +186,32 @@ extension AppModel {
         }
     }
 
-    func forgetSelectedGateway() {
-        guard let account = selectedAccount else { return }
-        cancelReconnect()
-        let pendingDraftIO = composerDraftIOTask
-        discardComposerDraft()
+    /// Removing a gateway only tears down the connection when it is the active one.
+    func forgetGateway(_ account: GatewayAccount) {
+        let isActive = account.id == selectedAccountID
+        let pendingDraftIO = isActive ? composerDraftIOTask : nil
+        if isActive {
+            cancelReconnect()
+            discardComposerDraft()
+        }
         Task { [weak self] in
             guard let self else { return }
             do {
                 await pendingDraftIO?.value
                 try await store.remove(account)
                 accounts.removeAll { $0.id == account.id }
-                selectedAccountID = nil
-                if let next = accounts.first {
-                    connect(to: next)
-                } else {
-                    let generation = resetGatewayState(preservingDrafts: false)
-                    Task { [weak self] in
-                        guard let self, self.connectionGeneration == generation else { return }
-                        await self.client.disconnect()
+                if isActive {
+                    selectedAccountID = nil
+                    if let next = accounts.first {
+                        connect(to: next)
+                    } else {
+                        let generation = resetGatewayState(preservingDrafts: false)
+                        Task { [weak self] in
+                            guard let self, self.connectionGeneration == generation else { return }
+                            await self.client.disconnect()
+                        }
+                        showsPairing = true
                     }
-                    showsPairing = true
                 }
                 showToast("Gateway removed.", tone: .info)
             } catch {
@@ -219,7 +223,7 @@ extension AppModel {
     func openNewSession() {
         guard canCreateSession else { return }
         destination = .chats
-        chatRoute = nil
+        navigationPath = []
         openWorkspaceBrowser()
     }
 
@@ -232,7 +236,7 @@ extension AppModel {
         guard canOpenSession || sessionID == selectedSessionID else { return }
         destination = .chats
         openSession(sessionID)
-        chatRoute = .session(sessionID)
+        navigationPath = [.chat(.session(sessionID))]
     }
 
     func openSession(_ sessionID: String) {
@@ -419,8 +423,7 @@ extension AppModel {
     func deleteSession(_ session: SessionRecord) {
         guard sessionMutationRequestID == nil else { return }
         let deletesSelectedSession = session.sessionId == selectedSessionID
-        let deletesPresentedSession = destination == .chats
-            && chatRoute?.sessionID == session.sessionId
+        let deletesPresentedSession = presentedChatSessionID == session.sessionId
         if let accountID = selectedAccountID {
             enqueueTranscriptIO { [store] in
                 await store.removeTranscript(accountID: accountID, sessionID: session.sessionId)
@@ -447,9 +450,9 @@ extension AppModel {
     func restoreDeletedPresentedSession(_ sessionID: String?) {
         guard let sessionID,
               destination == .chats,
-              chatRoute == nil
+              navigationPath.isEmpty
         else { return }
-        chatRoute = .session(sessionID)
+        navigationPath = [.chat(.session(sessionID))]
         restoreSession(sessionID)
     }
 

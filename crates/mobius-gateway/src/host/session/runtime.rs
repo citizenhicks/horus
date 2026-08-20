@@ -257,14 +257,10 @@ impl HostState {
                 .await;
                 let _ = reply.send(result);
             }
-            HostCommand::RefreshProvider {
-                provider,
-                base_url,
-                reply,
-            } => {
+            HostCommand::RefreshProvider { scope, reply } => {
                 let result = async {
                     let _mutation = self.begin_session_mutation()?;
-                    self.refresh_provider(&provider, base_url.as_deref()).await
+                    self.refresh_provider(&scope).await
                 }
                 .await;
                 let _ = reply.send(result);
@@ -282,6 +278,10 @@ impl HostState {
             }
             HostCommand::CutOverProvider { selection, reply } => {
                 let result = self.cut_over_provider(&selection).await;
+                let _ = reply.send(result);
+            }
+            HostCommand::ReloadProviderCatalog { reply } => {
+                let result = self.reload_provider_catalog().await;
                 let _ = reply.send(result);
             }
             HostCommand::RunCron { run, input, reply } => {
@@ -598,7 +598,7 @@ impl HostState {
             .lock()
             .map_err(|_| internal("gateway configuration lock is poisoned"))?
             .clone();
-        let next = if self.spec.agent.config.provider.provider == selection.provider
+        let next = if self.spec.agent.config.provider.instance == selection.instance
             && self.spec.agent.config.provider != *selection
         {
             let mut composition = self.spec.agent.config.clone();
@@ -618,6 +618,20 @@ impl HostState {
         let models =
             configured_model_choices(&gateway, &self.store, &self.credentials).map_err(internal)?;
         crate::middleware_manifest::validate_choices(&next.agent.config.middleware, &models)
+            .map_err(invalid_config)?;
+        self.replace_running(next, None).await
+    }
+
+    async fn reload_provider_catalog(&mut self) -> std::result::Result<(), Rejection> {
+        self.require_idle()?;
+        let gateway = self
+            .gateway
+            .lock()
+            .map_err(|_| internal("gateway configuration lock is poisoned"))?
+            .clone();
+        let next = self
+            .spec
+            .normalizing_provider_catalog(&gateway, self.store.state_dir(), gateway.tls.as_ref())
             .map_err(invalid_config)?;
         self.replace_running(next, None).await
     }
@@ -716,7 +730,7 @@ impl HostState {
         let mut provider =
             configured_provider_for_route(&gateway, &self.store, &self.credentials, route)
                 .map_err(invalid_config)?;
-        if provider.provider == self.spec.agent.config.provider.provider {
+        if provider.instance == self.spec.agent.config.provider.instance {
             provider.base_url = self.spec.agent.config.provider.base_url.clone();
             provider.web_search = self.spec.agent.config.provider.web_search;
         }
@@ -731,10 +745,9 @@ impl HostState {
 
     pub(super) async fn refresh_provider(
         &mut self,
-        provider_id: &str,
-        base_url: Option<&str>,
+        scope: &ProviderRefresh,
     ) -> std::result::Result<(), Rejection> {
-        if !provider_credential_matches(&self.spec.agent.config.provider, provider_id, base_url)
+        if !provider_refresh_matches(&self.spec.agent.config.provider, scope)
             .map_err(invalid_config)?
         {
             return Ok(());

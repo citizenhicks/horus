@@ -7,8 +7,8 @@ struct ProfileView: View {
 
     var body: some View {
         let usage = model.profile?.dailyUsage ?? []
-        let providerLabels = model.providerStatuses.reduce(into: [String: String]()) {
-            $0[$1.provider] = $1.label
+        let providerLabels = model.providerInstances.reduce(into: [String: String]()) {
+            $0[$1.instance] = $1.label
         }
         PageScaffold(
             title: "Settings",
@@ -153,6 +153,7 @@ private struct CloudAccountSettings: View {
     @Environment(AppModel.self) private var model
     @Environment(\.mobiusPalette) private var palette
     @State private var showsSubscriptionManagement = false
+    @State private var confirmsSignOut = false
 
     /// Signed out, this is an offer; signed in, it is an account. Account actions stay absent
     /// until there is a Cloud session to authenticate them.
@@ -168,19 +169,22 @@ private struct CloudAccountSettings: View {
                 }
             }
             if model.cloudAccount != nil {
-                Toggle("Help improve möbius", isOn: Binding(
-                    get: { model.cloudAccount?.sharesDiagnostics ?? false },
-                    set: { sharesDiagnostics in
-                        Task { await model.setCloudSharesDiagnostics(sharesDiagnostics) }
-                    }
-                ))
-                .toggleStyle(.switch)
-                .disabled(model.isUpdatingCloudDiagnostics)
-
-                Text("Off by default. Saved to your Cloud account.")
-                    .font(MobiusStyle.captionFont)
-                    .foregroundStyle(palette.muted)
-                    .fixedSize(horizontal: false, vertical: true)
+                // The info button sits beside the toggle rather than inside its label,
+                // which would hand its taps to the switch.
+                HStack(spacing: MobiusSpace.xs) {
+                    Toggle("Help improve möbius", isOn: Binding(
+                        get: { model.cloudAccount?.sharesDiagnostics ?? false },
+                        set: { sharesDiagnostics in
+                            Task { await model.setCloudSharesDiagnostics(sharesDiagnostics) }
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .disabled(model.isUpdatingCloudDiagnostics)
+                    SettingsInfoButton(
+                        title: "Help improve möbius",
+                        detail: "Off by default. Saved to your Cloud account."
+                    )
+                }
             }
             Button("Manage subscription", glyph: .sealCheck) {
                 showsSubscriptionManagement = true
@@ -194,6 +198,17 @@ private struct CloudAccountSettings: View {
                 Task { _ = await model.restoreCloudPurchases() }
             }
             .disabled(model.cloudAction.isRunning)
+            Button("Sign out", glyph: .lockOpen, role: .destructive) {
+                confirmsSignOut = true
+            }
+            .disabled(model.cloudAction.isRunning)
+            .accessibilityHint("Forgets this Cloud sign-in on this device")
+            .alert("Sign out of möbius Cloud?", isPresented: $confirmsSignOut) {
+                Button("Sign out", role: .destructive) { model.signOutOfCloud() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This device forgets the Cloud sign-in. Your subscription and your paired gateway are unaffected.")
+            }
         } else {
             Text("möbius works on its own with a gateway you run. Connect möbius Cloud to have one provisioned and managed for you.")
                 .font(MobiusStyle.bodyFont)
@@ -217,15 +232,13 @@ private struct ProfileUsageSection: View {
             result.outputTokens += day.usage.outputTokens
             result.totalTokens += day.usage.totalTokens
         }
-        // Four fixed columns: an adaptive grid drops to three and orphans the last metric.
         // The section header already says "Usage", so the grid needs no heading of its own.
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: MobiusSpace.s), count: 4), spacing: MobiusSpace.l) {
+        UsageMetricGrid {
             UsageMetric(label: "Tokens", value: compact(total.totalTokens))
             UsageMetric(label: "Input", value: compact(total.inputTokens))
             UsageMetric(label: "Output", value: compact(total.outputTokens))
             UsageMetric(label: "Cached", value: cacheHit(total))
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -279,13 +292,40 @@ private struct ProfileUsageHistory: View {
     }
 }
 
+/// Four fixed columns: an adaptive grid drops to three and orphans the last metric.
+/// Every metric block shares this so their columns line up down the page.
+private struct UsageMetricGrid<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        LazyVGrid(
+            columns: Array(
+                repeating: GridItem(.flexible(), spacing: MobiusSpace.s, alignment: .topLeading),
+                count: 4
+            ),
+            alignment: .leading,
+            spacing: MobiusSpace.l
+        ) {
+            content
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 private struct UsageMetric: View {
     @Environment(\.mobiusPalette) private var palette
     let label: String
     let value: String
 
     var body: some View {
+        // Value first: a label that wraps to two lines would otherwise push its number
+        // off the baseline its neighbours sit on, which is what made the grid look ragged.
         VStack(alignment: .leading, spacing: MobiusSpace.xs) {
+            Text(value)
+                .font(MobiusStyle.titleFont)
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
             // Sentence case, not tracked-out monospace caps: the value is the number, and a
             // shouted label competes with it at the same size the number is set in.
             Text(label)
@@ -293,9 +333,6 @@ private struct UsageMetric: View {
                 .foregroundStyle(palette.muted)
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
-            Text(value)
-                .font(MobiusStyle.titleFont)
-                .monospacedDigit()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -305,21 +342,18 @@ private struct ProfileRunStatsSection: View {
     let stats: RunStats
 
     var body: some View {
-        VStack(spacing: MobiusSpace.l) {
-            HStack(spacing: MobiusSpace.s) {
-                UsageMetric(label: "Runs", value: compact(stats.runCount))
-                UsageMetric(label: "Failed", value: compact(stats.failedRunCount))
-                UsageMetric(label: "Aborted", value: compact(stats.abortedRunCount))
-                UsageMetric(label: "Elapsed", value: formatMilliseconds(stats.elapsedMs))
-            }
-            HStack(spacing: MobiusSpace.s) {
-                UsageMetric(label: "Model calls", value: compact(stats.modelCalls))
-                UsageMetric(label: "Tool calls", value: compact(stats.toolCalls))
-                UsageMetric(label: "Tool errors", value: compact(stats.failedToolCalls))
-                UsageMetric(label: "Run tokens", value: compact(stats.usage.totalTokens))
-            }
+        // Two independent HStacks sized their columns separately, so the rows never
+        // lined up with each other or with the usage grid above.
+        UsageMetricGrid {
+            UsageMetric(label: "Runs", value: compact(stats.runCount))
+            UsageMetric(label: "Failed", value: compact(stats.failedRunCount))
+            UsageMetric(label: "Aborted", value: compact(stats.abortedRunCount))
+            UsageMetric(label: "Elapsed", value: formatMilliseconds(stats.elapsedMs))
+            UsageMetric(label: "Model calls", value: compact(stats.modelCalls))
+            UsageMetric(label: "Tool calls", value: compact(stats.toolCalls))
+            UsageMetric(label: "Tool errors", value: compact(stats.failedToolCalls))
+            UsageMetric(label: "Run tokens", value: compact(stats.usage.totalTokens))
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

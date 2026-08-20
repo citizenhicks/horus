@@ -197,6 +197,16 @@ impl ProviderCredential {
         }
     }
 
+    pub(super) fn into_optional_api_key(self, provider: &str) -> Result<Option<String>> {
+        match self {
+            Self::ApiKey(api_key) => Ok(Some(api_key)),
+            Self::Credentialless => Ok(None),
+            Self::Browser(_) => Err(Error::Config(format!(
+                "provider `{provider}` requires an API key or credentialless endpoint"
+            ))),
+        }
+    }
+
     pub fn into_browser<T: Any + Send + Sync>(self, provider: &str) -> Result<Arc<T>> {
         match self {
             Self::Browser(credential) => Arc::downcast(credential)
@@ -623,14 +633,50 @@ mod tests {
     }
 
     #[test]
-    fn only_openrouter_advertises_credentialless_endpoints() {
-        assert!(
-            provider("openrouter")
-                .expect("OpenRouter")
-                .supports_credentialless_endpoints()
+    fn credentialless_providers_build_without_a_credential() {
+        let credentialless = providers()
+            .iter()
+            .filter(|definition| definition.supports_credentialless_endpoints())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            credentialless
+                .iter()
+                .map(|definition| definition.id())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["anthropic", "deepseek", "kimi", "openrouter", "responses"])
         );
-        assert!(providers().iter().all(|definition| {
-            definition.id() == "openrouter" || !definition.supports_credentialless_endpoints()
-        }));
+        let error = provider("openai_socket")
+            .expect("fixed-endpoint provider")
+            .validate_credentialless_endpoint(Some("https://proxy.example/v1"))
+            .expect_err("a provider that does not opt in is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("does not support credentialless")
+        );
+        for definition in credentialless {
+            let base_url = definition
+                .default_base_url()
+                .expect("credentialless provider advertises a default base URL");
+            definition
+                .validate_credentialless_endpoint(Some("https://proxy.example/v1"))
+                .expect("a non-default HTTPS endpoint is accepted");
+            definition
+                .validate_credentialless_endpoint(Some(base_url))
+                .expect_err("the provider's own endpoint still requires authentication");
+            definition
+                .build(ProviderBuildConfig {
+                    credential: ProviderCredential::Credentialless,
+                    model: definition
+                        .default_model()
+                        .unwrap_or("test-model")
+                        .to_string(),
+                    base_url: Some("https://proxy.example/v1".into()),
+                    reasoning_effort: None,
+                    web_search: HostedWebSearch::Off,
+                    http: reqwest::Client::new(),
+                })
+                .expect("credentialless provider builds without a credential");
+        }
     }
 }

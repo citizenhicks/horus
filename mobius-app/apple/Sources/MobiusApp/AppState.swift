@@ -27,6 +27,20 @@ enum AppDestination: Hashable {
     }
 }
 
+/// A detail page pushed from one of the settings sections.
+enum SettingsRoute: Hashable {
+    case gateway(UUID)
+    case provider(String)
+    case extensionPackage(String)
+}
+
+/// Everything the detail column can push. Settings details join the same stack as
+/// chats so the interactive back gesture pops the page instead of the column.
+enum AppRoute: Hashable {
+    case chat(ChatRoute)
+    case settings(SettingsRoute)
+}
+
 enum ChatRoute: Identifiable, Hashable {
     case session(String)
 

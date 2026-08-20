@@ -215,10 +215,11 @@ extension GatewayWireTests {
         }
         XCTAssertEqual(acceptedID, "request-1")
 
-        guard case .providerCredentialSaved(let credentialID, let provider) = try decodeEnvelope(#"{"version":27,"type":"provider_credential_saved","request_id":"credential-1","provider":"openai_socket"}"#) else {
+        guard case .providerCredentialSaved(let credentialID, let instance, let provider) = try decodeEnvelope(#"{"version":27,"type":"provider_credential_saved","request_id":"credential-1","instance":"openai-work","provider":"openai_socket"}"#) else {
             return XCTFail("Expected provider credential saved envelope")
         }
         XCTAssertEqual(credentialID, "credential-1")
+        XCTAssertEqual(instance, "openai-work")
         XCTAssertEqual(provider, "openai_socket")
 
         guard case .pairingCode(let pairingID, let code, let expiresAt) = try decodeEnvelope(#"{"version":27,"type":"pairing_code","request_id":"pairing-1","code":"123456","expires_at":500}"#) else {

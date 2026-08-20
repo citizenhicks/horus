@@ -17,8 +17,8 @@ use mobius_gateway::client::{GatewayEvents, GatewaySender, MAX_PENDING_FRAMES};
 use mobius_gateway::wire::ExtensionHookRecord;
 use mobius_gateway::wire::{
     AgentComposition, ClientMessage, ExtensionKind, ExtensionRecord, MiddlewareConfig,
-    ProviderAuthKind, ProviderConfig, ProviderEndpointAuth, ProviderStatus, ReadyPayload,
-    ServerFrame, ServerMessage, SessionReadyPayload,
+    ProviderAuthKind, ProviderConfig, ProviderEndpointAuth, ProviderInstance, ProviderStatus,
+    ReadyPayload, ServerFrame, ServerMessage, SessionReadyPayload,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -40,6 +40,8 @@ use self::view::*;
 
 const MAX_API_KEY_BYTES: usize = 16 * 1024;
 const MAX_ENDPOINT_BYTES: usize = 4 * 1024;
+// Matches the gateway's provider label bound.
+const MAX_PROVIDER_LABEL_BYTES: usize = 128;
 const MAX_MODEL_IDS_BYTES: usize = 16 * 1024;
 const MIN_INLINE_DESCRIPTION_WIDTH: usize = 20;
 
@@ -112,13 +114,15 @@ pub(crate) async fn run_gateway(
 #[cfg(test)]
 mod tests {
     use mobius::protocol::{FrontendSettingOption, FrontendSymbol};
-    use mobius_gateway::wire::{ProviderAuthKind, ProviderModel, ProviderStatus, ReasoningChoice};
+    use mobius_gateway::wire::{
+        ProviderAuthKind, ProviderInstance, ProviderModel, ProviderStatus, ReasoningChoice,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
 
-    fn status(provider: &str, configured: bool) -> ProviderStatus {
+    fn status(provider: &str) -> ProviderStatus {
         let (auth, default_base_url, default_api_key_env, models, web_search) = match provider {
             "responses" => (
                 ProviderAuthKind::ApiKey,
@@ -148,25 +152,11 @@ mod tests {
             _ => panic!("unknown fixture provider"),
         };
         let model_ids_configurable = models.is_empty();
-        let model_ids = if model_ids_configurable {
-            vec![AgentComposition::default().provider.model]
-        } else {
-            Vec::new()
-        };
-        let reasoning_efforts = if model_ids_configurable {
-            vec!["medium".into()]
-        } else {
-            Vec::new()
-        };
         ProviderStatus {
             provider: provider.into(),
             label: provider.into(),
             symbol: FrontendSymbol::Storage,
             description: format!("{provider} provider"),
-            configured,
-            selection: None,
-            model_ids,
-            reasoning_efforts,
             model_ids_configurable,
             auth,
             default_base_url,
@@ -195,20 +185,42 @@ mod tests {
     }
 
     fn state(mode: SetupMode, provider: &str, configured: bool) -> SetupState {
-        let statuses = vec![status(provider, configured)];
-        let providers = validated_providers(&statuses).expect("validated providers");
+        let statuses = vec![status(provider)];
         let mut original = AgentComposition::default();
+        original.provider.instance = provider.into();
         original.provider.provider = provider.into();
-        if let Some(model) = providers[0].status.models.first() {
+        if let Some(model) = statuses[0].models.first() {
             original.provider.model.clone_from(&model.id);
             original
                 .provider
                 .reasoning_effort
                 .clone_from(&model.default_reasoning);
         }
-        if providers[0].status.configurable_base_url() {
-            original.provider.base_url = providers[0].status.default_base_url.clone();
+        if statuses[0].configurable_base_url() {
+            original.provider.base_url = statuses[0].default_base_url.clone();
         }
+        let instances = vec![ProviderInstance {
+            label: provider.into(),
+            tint: Default::default(),
+            configured,
+            selection: original.provider.clone(),
+            model_ids: if statuses[0].model_ids_configurable {
+                vec![original.provider.model.clone()]
+            } else {
+                Vec::new()
+            },
+            reasoning_efforts: if statuses[0].model_ids_configurable {
+                original
+                    .provider
+                    .reasoning_effort
+                    .clone()
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        }];
+        let providers = validated_providers(&statuses, &instances).expect("validated providers");
         original.middleware.set_enabled("plain", true);
         original.middleware.set_enabled("configured", true);
         SetupState::from_parts(mode, providers, features(), Vec::new(), original, false)
@@ -335,8 +347,12 @@ mod tests {
         );
         assert_eq!(state.page, Page::Authentication);
         state.credential = "secret".into();
+        // Tab walks Name -> API key -> Base URL for a configurable-endpoint provider.
+        assert_eq!(state.auth_field, AuthField::Label);
         state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(state.endpoint_focused);
+        assert_eq!(state.auth_field, AuthField::Credential);
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.auth_field, AuthField::Endpoint);
         assert_eq!(state.page, Page::Authentication);
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -362,6 +378,7 @@ mod tests {
     #[test]
     fn configurable_provider_requires_an_exact_authenticated_endpoint() {
         let mut custom = state(SetupMode::Login, "responses", true);
+        custom.endpoint = "https://other.example/v1".into();
 
         assert!(!custom.has_matching_credential());
         custom.authentication_succeeded();
@@ -372,12 +389,70 @@ mod tests {
     }
 
     #[test]
+    fn empty_api_key_reuse_is_deferred_to_the_gateway() {
+        let mut state = state(SetupMode::Login, "openai_socket", false);
+        state.provider = 1;
+        state.reset_provider_fields();
+
+        assert!(matches!(
+            state.take_authentication().expect("deferred credential"),
+            Authentication::Reuse
+        ));
+    }
+
+    #[test]
+    fn device_login_is_reused_across_same_provider_instances() {
+        let mut state = state(SetupMode::Login, "kimi", true);
+        for entry in &mut state.providers {
+            entry.status.auth = ProviderAuthKind::DeviceCode;
+        }
+        state.provider = 1;
+        state.reset_provider_fields();
+
+        assert!(state.has_matching_credential());
+        assert!(matches!(
+            state.take_authentication().expect("shared provider login"),
+            Authentication::Reuse
+        ));
+    }
+
+    #[test]
     fn configured_fixed_provider_can_be_selected_from_another_provider() {
-        let providers = validated_providers(&[status("responses", false), status("kimi", true)])
-            .expect("validated providers");
+        let statuses = [status("responses"), status("kimi")];
         let mut original = AgentComposition::default();
+        original.provider.instance = "responses".into();
         original.provider.provider = "responses".into();
-        original.provider.base_url = providers[0].status.default_base_url.clone();
+        original.provider.base_url = statuses[0].default_base_url.clone();
+        let mut kimi = original.provider.clone();
+        kimi.instance = "kimi".into();
+        kimi.provider = "kimi".into();
+        kimi.base_url = None;
+        kimi.model = "kimi-k3".into();
+        kimi.reasoning_effort = Some("max".into());
+        let instances = vec![
+            ProviderInstance {
+                label: "responses".into(),
+                tint: Default::default(),
+                configured: false,
+                selection: original.provider.clone(),
+                model_ids: vec![original.provider.model.clone()],
+                reasoning_efforts: original
+                    .provider
+                    .reasoning_effort
+                    .clone()
+                    .into_iter()
+                    .collect(),
+            },
+            ProviderInstance {
+                label: "kimi".into(),
+                tint: Default::default(),
+                configured: true,
+                selection: kimi,
+                model_ids: Vec::new(),
+                reasoning_efforts: Vec::new(),
+            },
+        ];
+        let providers = validated_providers(&statuses, &instances).expect("validated providers");
         let mut state = SetupState::from_parts(
             SetupMode::Login,
             providers,
@@ -391,6 +466,21 @@ mod tests {
         state.select_provider("kimi").expect("select Kimi");
 
         assert!(state.has_matching_credential());
+    }
+
+    #[test]
+    fn new_provider_reuses_one_opaque_instance_id() {
+        let mut state = state(SetupMode::Login, "kimi", true);
+        state.provider = 1;
+        state.reset_provider_fields();
+
+        let instance = state.target_instance();
+        let config = state
+            .agent_composition(&state.original)
+            .expect("new provider config");
+
+        assert!(Uuid::parse_str(&instance).is_ok());
+        assert_eq!(config.provider.instance, instance);
     }
 
     #[test]
@@ -750,10 +840,10 @@ mod tests {
 
     #[test]
     fn provider_validation_rejects_an_incomplete_manifest() {
-        let mut advertised = status("openai_socket", false);
+        let mut advertised = status("openai_socket");
         advertised.web_search.clear();
 
-        let error = match validated_providers(&[advertised]) {
+        let error = match validated_providers(&[advertised], &[]) {
             Ok(_) => panic!("incomplete provider manifest must fail"),
             Err(error) => error,
         };
@@ -763,9 +853,9 @@ mod tests {
 
     #[test]
     fn provider_validation_rejects_duplicate_ids() {
-        let advertised = status("openai_socket", false);
+        let advertised = status("openai_socket");
 
-        let error = match validated_providers(&[advertised.clone(), advertised]) {
+        let error = match validated_providers(&[advertised.clone(), advertised], &[]) {
             Ok(_) => panic!("duplicate providers must fail"),
             Err(error) => error,
         };
@@ -775,14 +865,30 @@ mod tests {
 
     #[test]
     fn setup_rejects_active_provider_values_outside_the_manifest() {
-        let reject = |status: ProviderStatus, config: ProviderConfig| {
+        let reject = |status: ProviderStatus, config: ProviderConfig, catalog: Vec<String>| {
+            let instances = catalog.is_empty().then(Vec::new).unwrap_or_else(|| {
+                vec![ProviderInstance {
+                    label: config.instance.clone(),
+                    tint: Default::default(),
+                    configured: true,
+                    selection: config.clone(),
+                    model_ids: vec![config.model.clone()],
+                    reasoning_efforts: catalog.clone(),
+                }]
+            });
             let original = AgentComposition {
                 provider: config,
                 ..AgentComposition::default()
             };
+            // An invalid selection is caught either while validating the advertised
+            // instances or while seeding setup state from them.
+            let providers = match validated_providers(&[status], &instances) {
+                Ok(providers) => providers,
+                Err(error) => return error.to_string(),
+            };
             match SetupState::from_parts(
                 SetupMode::Login,
-                validated_providers(&[status]).expect("provider manifest"),
+                providers,
                 features(),
                 Vec::new(),
                 original,
@@ -794,8 +900,9 @@ mod tests {
         };
 
         let missing_provider = reject(
-            status("kimi", true),
+            status("kimi"),
             ProviderConfig {
+                instance: "missing".into(),
                 provider: "missing".into(),
                 model: "model".into(),
                 base_url: None,
@@ -803,12 +910,14 @@ mod tests {
                 reasoning_effort: None,
                 web_search: HostedWebSearch::Off,
             },
+            Vec::new(),
         );
         assert!(missing_provider.contains("active provider"));
 
         let missing_model = reject(
-            status("openai_socket", true),
+            status("openai_socket"),
             ProviderConfig {
+                instance: "openai_socket".into(),
                 provider: "openai_socket".into(),
                 model: "missing".into(),
                 base_url: None,
@@ -816,12 +925,14 @@ mod tests {
                 reasoning_effort: None,
                 web_search: HostedWebSearch::Off,
             },
+            Vec::new(),
         );
         assert!(missing_model.contains("unadvertised model"));
 
         let missing_search = reject(
-            status("kimi", true),
+            status("kimi"),
             ProviderConfig {
+                instance: "kimi".into(),
                 provider: "kimi".into(),
                 model: "kimi-k3".into(),
                 base_url: None,
@@ -829,12 +940,14 @@ mod tests {
                 reasoning_effort: Some("max".into()),
                 web_search: HostedWebSearch::Live,
             },
+            Vec::new(),
         );
         assert!(missing_search.contains("unadvertised web-search"));
 
         let missing_reasoning = reject(
-            status("openai_socket", true),
+            status("openai_socket"),
             ProviderConfig {
+                instance: "openai_socket".into(),
                 provider: "openai_socket".into(),
                 model: "gpt-5.6-sol".into(),
                 base_url: None,
@@ -842,12 +955,14 @@ mod tests {
                 reasoning_effort: Some("missing".into()),
                 web_search: HostedWebSearch::Off,
             },
+            Vec::new(),
         );
         assert!(missing_reasoning.contains("unadvertised reasoning"));
 
         let missing_custom_reasoning = reject(
-            status("responses", true),
+            status("responses"),
             ProviderConfig {
+                instance: "responses".into(),
                 provider: "responses".into(),
                 model: AgentComposition::default().provider.model,
                 base_url: Some("https://api.openai.com/v1".into()),
@@ -855,6 +970,7 @@ mod tests {
                 reasoning_effort: Some("missing".into()),
                 web_search: HostedWebSearch::Off,
             },
+            vec!["medium".into()],
         );
         assert!(missing_custom_reasoning.contains("unconfigured reasoning"));
     }
@@ -874,9 +990,47 @@ mod tests {
     fn credential_entry_is_masked_and_supports_backspace() {
         let mut state = state(SetupMode::Login, "openai_socket", false);
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // The name field takes focus first; tab moves to the key.
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.auth_field, AuthField::Credential);
         state.paste("abc123\n");
         state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
 
         assert_eq!(masked_credential(&state.credential), "•••••");
+    }
+
+    #[test]
+    fn credential_response_matches_instance_and_provider() {
+        let expected = ExpectedResponse::Credential {
+            instance: "work",
+            provider: "responses",
+        };
+
+        assert!(expected.matches_credential("work", "responses"));
+        assert!(!expected.matches_credential("personal", "responses"));
+        assert!(!expected.matches_credential("work", "openrouter"));
+    }
+
+    #[test]
+    fn provider_removal_requires_a_configured_row_and_confirmation() {
+        let mut state = state(SetupMode::Login, "kimi", true);
+        state.provider = 1;
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+            Flow::Continue
+        );
+        assert!(state.remove_confirmation.is_none());
+
+        state.provider = 0;
+        state.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(state.remove_confirmation.is_some());
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Flow::Continue
+        );
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Flow::Remove("kimi".into())
+        );
     }
 }

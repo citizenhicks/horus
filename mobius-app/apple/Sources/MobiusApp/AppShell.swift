@@ -43,7 +43,7 @@ struct AppShell: View {
                                 .frame(maxWidth: 560)
                                 .padding(MobiusSpace.xl)
                                 .overlay(alignment: .top) { AppToastOverlay() }
-                                .presentationDetents([.medium, .large])
+                                .presentationDetents([.large])
                         }
                         .sheet(isPresented: $model.showsWorkspaceBrowser) {
                             WorkspaceBrowserView()
@@ -106,8 +106,8 @@ struct AppShell: View {
         .onChange(of: chatIsVisible, initial: true) { _, visible in
             model.setChatVisible(visible)
         }
-        .onChange(of: model.chatRoute) { _, route in
-            guard route != nil, horizontalSizeClass == .compact else { return }
+        .onChange(of: model.presentedChatSessionID) { _, sessionID in
+            guard sessionID != nil, horizontalSizeClass == .compact else { return }
             withAnimation(SidebarDrawerMetrics.animation) { sidebarIsOpen = false }
         }
         .onChange(of: model.toast?.id) { _, _ in
@@ -165,11 +165,14 @@ struct AppShell: View {
 
     private var detailNavigation: some View {
         @Bindable var model = model
-        return NavigationStack(path: $model.chatNavigationPath) {
+        return NavigationStack(path: $model.navigationPath) {
             destination
-                .navigationDestination(for: ChatRoute.self) { route in
+                .navigationDestination(for: AppRoute.self) { route in
                     switch route {
-                    case .session: ChatView()
+                    case .chat: ChatView()
+                    case .settings(.gateway(let id)): GatewayDetailView(id: id)
+                    case .settings(.provider(let instance)): ProviderDetailView(instance: instance)
+                    case .settings(.extensionPackage(let id)): ExtensionDetailView(id: id)
                     }
                 }
                 .toolbar {
@@ -180,7 +183,7 @@ struct AppShell: View {
                     }
                     if !usesIPadLayout,
                        horizontalSizeClass == .compact,
-                       model.chatNavigationPath.isEmpty {
+                       model.navigationPath.isEmpty {
                         ToolbarItem(placement: .topBarLeading) {
                             MobiusToolbarIconButton(
                                 glyph: .menu,
@@ -268,13 +271,13 @@ struct AppShell: View {
         // round trip through `.sidebar` here to re-fire a transition; nothing pushes now.
         if horizontalSizeClass == .compact {
             withAnimation(SidebarDrawerMetrics.animation) {
-                model.chatRoute = nil
+                model.navigationPath = []
                 model.destination = destination
                 sidebarIsOpen = false
             }
             return
         }
-        model.chatRoute = nil
+        model.navigationPath = []
         model.destination = destination
         compactColumn = .detail
     }
@@ -282,7 +285,7 @@ struct AppShell: View {
     private var chatIsVisible: Bool {
         guard !model.accounts.isEmpty,
               model.destination == .chats,
-              !model.chatNavigationPath.isEmpty,
+              !model.navigationPath.isEmpty,
               scenePhase == .active,
               !model.isAppLocked,
               !model.showsPairing,

@@ -296,6 +296,19 @@ extension AppModel {
         continuation.resume(with: result)
     }
 
+    func signOutOfCloud() {
+        do {
+            try cloudClient.signOut()
+        } catch {
+            showToast(error.localizedDescription, tone: .error)
+            return
+        }
+        cloudSession = nil
+        cloudAccount = nil
+        cloudError = nil
+        showToast("Signed out of möbius Cloud.", tone: .info)
+    }
+
     private func reportCloud(_ error: Error) {
         if let cloudError = error as? MobiusCloudError {
             switch cloudError {

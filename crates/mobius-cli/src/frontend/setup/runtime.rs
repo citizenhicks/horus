@@ -34,9 +34,30 @@ pub(super) async fn edit(
             match flow {
                 Flow::Continue => {}
                 Flow::Authenticate => {
-                    authenticate(terminal, state, sender, events, gateway).await?;
+                    authenticate(terminal, state, sender, events).await?;
                     state.authentication_succeeded();
                     break;
+                }
+                Flow::Remove(instance) => {
+                    state.set_progress("Removing provider", "Updating the gateway catalog…");
+                    draw(terminal, state)?;
+                    let request_id = Uuid::new_v4().to_string();
+                    sender
+                        .send(ClientMessage::RemoveProvider {
+                            request_id: request_id.clone(),
+                            instance,
+                        })
+                        .await
+                        .map_err(gateway_error)?;
+                    *gateway = wait_gateway_configured(
+                        terminal,
+                        state,
+                        events,
+                        &request_id,
+                        "removing a provider",
+                    )
+                    .await?;
+                    return Ok(false);
                 }
                 Flow::Finish => return Ok(true),
                 Flow::Cancel => return Ok(false),
@@ -50,10 +71,7 @@ pub(super) async fn authenticate(
     state: &mut SetupState,
     sender: &GatewaySender,
     events: &mut GatewayEvents,
-    gateway: &mut ReadyPayload,
 ) -> Result<()> {
-    let provider = state.definition().provider.clone();
-    let base_url = state.selected_base_url();
     match state.take_authentication()? {
         Authentication::Reuse => {}
         Authentication::ApiKey(api_key) => {
@@ -62,23 +80,12 @@ pub(super) async fn authenticate(
                 "Sending the key securely to the gateway…",
             );
             draw(terminal, state)?;
-            set_credential(
-                terminal,
-                state,
-                sender,
-                events,
-                provider.clone(),
-                base_url,
-                api_key,
-            )
-            .await?;
-            mark_provider_configured(gateway, &provider);
+            set_credential(terminal, state, sender, events, api_key).await?;
         }
         Authentication::DeviceCode => {
             state.set_progress("Starting device login", "Requesting a one-time login code…");
             draw(terminal, state)?;
-            device_login(terminal, state, sender, events, provider.clone()).await?;
-            mark_provider_configured(gateway, &provider);
+            device_login(terminal, state, sender, events).await?;
         }
     }
     Ok(())
@@ -186,12 +193,18 @@ pub(super) async fn register_provider(
     config: ProviderConfig,
 ) -> Result<ReadyPayload> {
     let model_ids = state.configured_model_ids()?;
-    let reasoning_efforts = state.definition().reasoning_efforts.clone();
+    let reasoning_efforts = state.instance_reasoning_efforts().to_vec();
+    let label = state.effective_label();
     let request_id = Uuid::new_v4().to_string();
     sender
         .send(ClientMessage::RegisterProvider {
             request_id: request_id.clone(),
             config,
+            label,
+            tint: state
+                .instance()
+                .map(|instance| instance.tint)
+                .unwrap_or_default(),
             model_ids,
             reasoning_efforts,
             replace_existing_selections: false,
@@ -276,19 +289,21 @@ pub(super) async fn set_credential(
     state: &mut SetupState,
     sender: &GatewaySender,
     events: &mut GatewayEvents,
-    provider: String,
-    base_url: Option<String>,
     api_key: String,
 ) -> Result<()> {
+    let instance = state.target_instance();
+    let provider = state.definition().provider.clone();
     let request_id = Uuid::new_v4().to_string();
-    let message = match base_url {
+    let message = match state.selected_base_url() {
         None => ClientMessage::SetProviderCredential {
             request_id: request_id.clone(),
+            instance: instance.clone(),
             provider: provider.clone(),
             api_key,
         },
         Some(base_url) => ClientMessage::SetProviderEndpointCredential {
             request_id: request_id.clone(),
+            instance: instance.clone(),
             provider: provider.clone(),
             base_url,
             api_key,
@@ -300,7 +315,10 @@ pub(super) async fn set_credential(
         state,
         events,
         &request_id,
-        ExpectedResponse::Credential(&provider),
+        ExpectedResponse::Credential {
+            instance: &instance,
+            provider: &provider,
+        },
     )
     .await?;
     Ok(())
@@ -311,8 +329,8 @@ pub(super) async fn device_login(
     state: &mut SetupState,
     sender: &GatewaySender,
     events: &mut GatewayEvents,
-    provider: String,
 ) -> Result<()> {
+    let provider = state.definition().provider.clone();
     let request_id = Uuid::new_v4().to_string();
     sender
         .send(ClientMessage::StartProviderLogin {
@@ -367,9 +385,27 @@ pub(super) async fn configure_session(
 
 #[derive(Clone, Copy)]
 pub(super) enum ExpectedResponse<'a> {
-    Credential(&'a str),
+    Credential {
+        instance: &'a str,
+        provider: &'a str,
+    },
     Login(&'a str),
-    Configure { session_id: &'a str, revision: u64 },
+    Configure {
+        session_id: &'a str,
+        revision: u64,
+    },
+}
+
+impl ExpectedResponse<'_> {
+    pub(super) fn matches_credential(&self, instance: &str, provider: &str) -> bool {
+        matches!(
+            self,
+            Self::Credential {
+                instance: expected_instance,
+                provider: expected_provider,
+            } if instance == *expected_instance && provider == *expected_provider
+        )
+    }
 }
 
 pub(super) async fn wait_for_response(
@@ -379,7 +415,7 @@ pub(super) async fn wait_for_response(
     request_id: &str,
     expected: ExpectedResponse<'_>,
 ) -> Result<Option<SessionReadyPayload>> {
-    let mut accepted = matches!(expected, ExpectedResponse::Credential(_));
+    let mut accepted = matches!(expected, ExpectedResponse::Credential { .. });
     let mut completed = matches!(expected, ExpectedResponse::Configure { .. });
     let mut deferred = Vec::new();
     let mut snapshot = None;
@@ -415,10 +451,9 @@ pub(super) async fn wait_for_response(
             }
             ServerMessage::ProviderCredentialSaved {
                 request_id: actual,
+                instance,
                 provider,
-            } if actual == request_id
-                && matches!(expected, ExpectedResponse::Credential(expected) if provider == expected) =>
-            {
+            } if actual == request_id && expected.matches_credential(instance, provider) => {
                 completed = true;
                 false
             }
@@ -496,16 +531,6 @@ pub(super) async fn wait_for_response(
     }
     events.prepend(deferred).map_err(gateway_error)?;
     result
-}
-
-pub(super) fn mark_provider_configured(gateway: &mut ReadyPayload, provider: &str) {
-    if let Some(status) = gateway
-        .providers
-        .iter_mut()
-        .find(|status| status.provider == provider)
-    {
-        status.configured = true;
-    }
 }
 
 pub(super) async fn next_frame(

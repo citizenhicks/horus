@@ -77,9 +77,15 @@ enum GatewayRequest: Encodable, Sendable {
     case switchGitBranch(requestID: String, sessionID: String, branch: String)
     case listDirectories(requestID: String, path: String, includeFiles: Bool)
     case createWorkspaceDirectory(requestID: String, parent: String, name: String)
-    case setProviderCredential(requestID: String, provider: String, apiKey: String)
+    case setProviderCredential(
+        requestID: String,
+        instance: String,
+        provider: String,
+        apiKey: String
+    )
     case setProviderEndpointCredential(
         requestID: String,
+        instance: String,
         provider: String,
         baseURL: String,
         apiKey: String
@@ -87,9 +93,12 @@ enum GatewayRequest: Encodable, Sendable {
     case registerProvider(
         requestID: String,
         config: ProviderConfig,
+        label: String,
+        tint: ProviderTint,
         modelIds: [String],
         reasoningEfforts: [String]
     )
+    case removeProvider(requestID: String, instance: String)
     case createPairingCode(requestID: String)
     case startProviderLogin(requestID: String, provider: String)
     case getProfile(requestID: String)
@@ -252,24 +261,45 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(requestID, forKey: "requestId")
             try container.encode(parent, forKey: "parent")
             try container.encode(name, forKey: "name")
-        case .setProviderCredential(let requestID, let provider, let apiKey):
+        case .setProviderCredential(let requestID, let instance, let provider, let apiKey):
             try container.encode("set_provider_credential", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
+            try container.encode(instance, forKey: "instance")
             try container.encode(provider, forKey: "provider")
             try container.encode(apiKey, forKey: "apiKey")
-        case .setProviderEndpointCredential(let requestID, let provider, let baseURL, let apiKey):
+        case .setProviderEndpointCredential(
+            let requestID,
+            let instance,
+            let provider,
+            let baseURL,
+            let apiKey
+        ):
             try container.encode("set_provider_endpoint_credential", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
+            try container.encode(instance, forKey: "instance")
             try container.encode(provider, forKey: "provider")
             try container.encode(baseURL, forKey: "baseUrl")
             try container.encode(apiKey, forKey: "apiKey")
-        case .registerProvider(let requestID, let config, let modelIds, let reasoningEfforts):
+        case .registerProvider(
+            let requestID,
+            let config,
+            let label,
+            let tint,
+            let modelIds,
+            let reasoningEfforts
+        ):
             try container.encode("register_provider", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
             try container.encode(config, forKey: "config")
+            try container.encode(label, forKey: "label")
+            try container.encode(tint, forKey: "tint")
             try container.encode(modelIds, forKey: "modelIds")
             try container.encode(reasoningEfforts, forKey: "reasoningEfforts")
             try container.encode(false, forKey: "replaceExistingSelections")
+        case .removeProvider(let requestID, let instance):
+            try container.encode("remove_provider", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(instance, forKey: "instance")
         case .createPairingCode(let requestID):
             try container.encode("create_pairing_code", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -336,7 +366,7 @@ enum GatewayEnvelope: Decodable, Sendable {
     )
     case sessions(requestID: String?, sessions: [SessionRecord])
     case clients(requestID: String, currentClientID: String, clients: [ClientStatus])
-    case providerCredentialSaved(requestID: String, provider: String)
+    case providerCredentialSaved(requestID: String, instance: String, provider: String)
     case pairingCode(requestID: String, code: String, expiresAt: Int64)
     case providerLoginStarted(
         requestID: String,
@@ -468,6 +498,7 @@ enum GatewayEnvelope: Decodable, Sendable {
         case "provider_credential_saved":
             self = .providerCredentialSaved(
                 requestID: try container.decode(String.self, forKey: "requestId"),
+                instance: try container.decode(String.self, forKey: "instance"),
                 provider: try container.decode(String.self, forKey: "provider")
             )
         case "pairing_code":
@@ -595,6 +626,7 @@ struct ReadyPayload: Decodable, Sendable {
     let machineName: String
     let sessions: [SessionRecord]
     let providers: [ProviderStatus]
+    let providerInstances: [ProviderInstance]
     let defaultConfig: VersionedAgentConfig?
     let models: [ModelChoice]
     let modelProviders: [String: String]

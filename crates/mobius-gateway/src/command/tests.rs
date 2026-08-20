@@ -319,6 +319,8 @@ fn parse_register_provider_accepts_credentialless_endpoint_configuration() {
         Command::RegisterProvider(RegisterProviderOptions {
             state_dir,
             provider,
+            instance: None,
+            label: None,
             model,
             base_url: Some(base_url),
             credentialless: true,
@@ -366,31 +368,57 @@ async fn register_provider_command_is_idempotent() {
         .lock()
         .expect("register-provider test client lock") = Some((endpoint, identity.token));
 
-    for _ in 0..2 {
-        register_provider_command(
-            RegisterProviderOptions {
-                state_dir: state.clone(),
-                provider: "openrouter".into(),
-                model: "openai/gpt-5".into(),
-                base_url: Some("https://connector.example/v1".into()),
-                credentialless: true,
-            },
-            load_register_provider_test_client,
-        )
-        .await
-        .expect("register provider");
-    }
+    register_provider_command(
+        RegisterProviderOptions {
+            state_dir: state.clone(),
+            provider: "openrouter".into(),
+            instance: None,
+            label: Some("Work".into()),
+            model: "openai/gpt-5".into(),
+            base_url: Some("https://connector.example/v1".into()),
+            credentialless: true,
+        },
+        load_register_provider_test_client,
+    )
+    .await
+    .expect("register provider");
+    let (store, mut persisted) = ConfigStore::open(state.clone()).expect("registered provider");
+    persisted
+        .configured_providers
+        .get_mut("openrouter")
+        .expect("OpenRouter instance")
+        .tint = crate::wire::ProviderTint::Purple;
+    store.save(&persisted).expect("custom provider tint");
+
+    register_provider_command(
+        RegisterProviderOptions {
+            state_dir: state.clone(),
+            provider: "openrouter".into(),
+            instance: None,
+            label: None,
+            model: "openai/gpt-5".into(),
+            base_url: Some("https://connector.example/v1".into()),
+            credentialless: true,
+        },
+        load_register_provider_test_client,
+    )
+    .await
+    .expect("register provider again");
 
     let (_, config) = ConfigStore::open(state).expect("persisted gateway config");
     let configured = &config.configured_providers["openrouter"];
     assert_eq!(
         (
             config.configured_providers.len(),
+            configured.label.as_str(),
+            configured.tint,
             configured.selection.endpoint_auth,
             configured.model_ids.as_slice(),
         ),
         (
             1,
+            "Work",
+            crate::wire::ProviderTint::Purple,
             crate::wire::ProviderEndpointAuth::Credentialless,
             ["openai/gpt-5".to_string()].as_slice(),
         )

@@ -229,7 +229,8 @@ struct ComposerOptionsView: View {
                 text: currentChoice.map { model.modelLabel(for: $0) } ?? "Model",
                 glyph: providerGlyph,
                 detail: currentChoice?.reasoningEffort?.capitalized,
-                glyphSize: MobiusStyle.glyphLead
+                glyphSize: MobiusStyle.glyphLead,
+                glyphColor: providerTint?.color
             )
                 .frame(minHeight: MobiusStyle.iconButtonSize)
                 .contentShape(Rectangle())
@@ -245,8 +246,9 @@ struct ComposerOptionsView: View {
         Picker("Model", selection: modelPickerSelection) {
             ForEach(distinctModels, id: \.route) { choice in
                 modelMenuOptionLabel(
-                    model.modelLabel(for: choice),
-                    providerSymbol: model.providerSymbol(for: choice)
+                    choice.group,
+                    providerSymbol: model.providerSymbol(for: choice),
+                    tint: model.providerTint(for: choice)
                 )
                 .tag(choice.route)
             }
@@ -267,15 +269,14 @@ struct ComposerOptionsView: View {
 
     private func modelMenuOptionLabel(
         _ title: String,
-        providerSymbol: String?
+        providerSymbol: String?,
+        tint: ProviderTint
     ) -> some View {
         Group {
             if let providerSymbol,
-               let glyph = MobiusSymbol.knownGlyph(for: providerSymbol) {
-                MobiusLabel(
-                    title: title,
-                    glyph: glyph
-                )
+               let glyph = MobiusSymbol.knownGlyph(for: providerSymbol),
+               let image = glyph.menuImage(tint.color) {
+                Label { Text(title) } icon: { image }
             } else {
                 Text(title)
             }
@@ -368,16 +369,13 @@ struct ComposerOptionsView: View {
     private var modelPickerSelection: Binding<String> {
         Binding {
             guard let currentChoice else { return "" }
-            return distinctModels.first {
-                $0.group == currentChoice.group && $0.model == currentChoice.model
-            }?.route ?? currentChoice.route
+            return distinctModels.first { model.sameModel($0, currentChoice) }?.route
+                ?? currentChoice.route
         } set: { route in
             guard let choice = distinctModels.first(where: { $0.route == route }) else { return }
             let effort = currentChoice?.reasoningEffort
             let target = model.modelChoices.first {
-                $0.group == choice.group
-                    && $0.model == choice.model
-                    && $0.reasoningEffort == effort
+                model.sameModel($0, choice) && $0.reasoningEffort == effort
             } ?? choice
             model.selectModel(target.route)
         }
@@ -392,15 +390,12 @@ struct ComposerOptionsView: View {
     }
 
     private var distinctModels: [ModelChoice] {
-        var seen = Set<String>()
-        return model.modelChoices.filter { seen.insert("\($0.group)\u{0}\($0.model)").inserted }
+        model.distinctModels(in: model.modelChoices)
     }
 
     private var reasoningChoices: [ModelChoice] {
         guard let currentChoice else { return [] }
-        return model.modelChoices.filter {
-            $0.group == currentChoice.group && $0.model == currentChoice.model
-        }
+        return model.modelChoices(matching: currentChoice, in: model.modelChoices)
     }
 
     private var composerSettings: [ComposerSettingItem] {
@@ -422,6 +417,10 @@ struct ComposerOptionsView: View {
     private var modelLabel: String {
         guard let currentChoice else { return "Model" }
         return "\(model.modelLabel(for: currentChoice)) · \(currentChoice.reasoningEffort?.capitalized ?? "Default")"
+    }
+
+    private var providerTint: ProviderTint? {
+        currentChoice.map { model.providerTint(for: $0) }
     }
 
     private var providerGlyph: MobiusGlyph? {

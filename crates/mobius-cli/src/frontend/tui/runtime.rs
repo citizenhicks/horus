@@ -177,7 +177,11 @@ pub(in crate::frontend) async fn run(
                                 }
                             }
                             message => {
-                                if let Some(message) = render_response(&message, &session_id) {
+                                if let Some(message) = render_response(
+                                    &message,
+                                    &session_id,
+                                    &gateway.provider_instances,
+                                ) {
                                     state.push(message, TranscriptTone::Neutral);
                                 }
                             }
@@ -370,10 +374,10 @@ fn sync_session(state: &mut TuiState, session: &SessionReadyPayload, gateway: &R
 
 fn agent_summary(gateway: &ReadyPayload, session: &SessionReadyPayload) -> String {
     let providers = gateway
-        .providers
+        .provider_instances
         .iter()
-        .filter(|provider| provider.configured)
-        .map(|provider| provider.label.as_str())
+        .filter(|entry| entry.configured)
+        .map(|entry| entry.label.as_str())
         .collect::<Vec<_>>()
         .join(", ");
     let middleware = gateway

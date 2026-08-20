@@ -84,25 +84,21 @@ impl OpenAi {
         base_url: impl Into<String>,
         model: impl Into<String>,
     ) -> Result<Self> {
-        Self::with_client(api_key, base_url, model, streaming_client()?)
+        Self::with_client(Some(api_key.into()), base_url, model, streaming_client()?)
     }
 
     pub(super) fn with_client(
-        api_key: impl Into<String>,
+        api_key: Option<String>,
         base_url: impl Into<String>,
         model: impl Into<String>,
         client: Client,
     ) -> Result<Self> {
-        let api_key = api_key.into();
-        if api_key.trim().is_empty() {
+        if api_key.as_deref().is_some_and(|key| key.trim().is_empty()) {
             return Err(Error::Config("OPENAI_API_KEY is empty".into()));
         }
-        Self::with_authorization(
-            Arc::new(ApiKeyAuthorization::new(api_key)),
-            base_url.into(),
-            model.into(),
-            client,
-        )
+        let auth = api_key
+            .map(|key| Arc::new(ApiKeyAuthorization::new(key)) as Arc<dyn OpenAiAuthorization>);
+        Self::from_parts(auth, base_url, model, client)
     }
 
     pub(super) fn with_authorization(
@@ -112,14 +108,6 @@ impl OpenAi {
         client: Client,
     ) -> Result<Self> {
         Self::from_parts(Some(auth), base_url, model, client)
-    }
-
-    pub(super) fn without_authorization(
-        base_url: impl Into<String>,
-        model: impl Into<String>,
-        client: Client,
-    ) -> Result<Self> {
-        Self::from_parts(None, base_url, model, client)
     }
 
     fn from_parts(
@@ -555,13 +543,14 @@ pub(super) const fn generic_provider() -> ProviderDefinition {
     )
     .with_image_input()
     .with_base_url(DEFAULT_BASE_URL)
+    .with_credentialless_endpoints()
 }
 
 fn build_generic(config: ProviderBuildConfig) -> Result<std::sync::Arc<dyn Model>> {
-    let api_key = config.credential.into_api_key("responses")?;
     let base_url = config
         .base_url
         .ok_or_else(|| Error::Config("Responses provider requires a base URL".into()))?;
+    let api_key = config.credential.into_optional_api_key("responses")?;
     let provider = OpenAi::with_client(api_key, base_url, config.model, config.http)?;
     let provider = match config.reasoning_effort {
         Some(effort) => provider.with_reasoning_effort(effort)?,

@@ -1,7 +1,7 @@
 use mobius::backend::model::provider::{HostedWebSearch, provider};
 
 use super::*;
-use crate::wire::{ProviderConfig, ProviderEndpointAuth};
+use crate::wire::{ProviderConfig, ProviderEndpointAuth, ProviderTint};
 
 pub(super) async fn register_provider_command(
     options: RegisterProviderOptions,
@@ -15,7 +15,15 @@ pub(super) async fn register_provider_command(
     let base_url = options
         .base_url
         .or_else(|| definition.default_base_url().map(str::to_owned));
+    let instance = options.instance.unwrap_or_else(|| options.provider.clone());
+    let existing = config.configured_providers.get(&instance);
+    let label = options
+        .label
+        .or_else(|| existing.map(|configured| configured.label.clone()))
+        .unwrap_or_else(|| definition.label().to_owned());
+    let tint = existing.map_or_else(ProviderTint::default, |configured| configured.tint);
     let selection = ProviderConfig {
+        instance,
         provider: options.provider,
         model: options.model,
         base_url,
@@ -32,7 +40,8 @@ pub(super) async fn register_provider_command(
     } else {
         Vec::new()
     };
-    request_provider_registration(&endpoint, &token, selection.clone(), model_ids).await?;
+    request_provider_registration(&endpoint, &token, selection.clone(), label, tint, model_ids)
+        .await?;
     println!("{}", register_provider_json(&selection.provider)?);
     Ok(())
 }
@@ -45,6 +54,8 @@ async fn request_provider_registration(
     endpoint: &Endpoint,
     token: &str,
     config: ProviderConfig,
+    label: String,
+    tint: ProviderTint,
     model_ids: Vec<String>,
 ) -> Result<()> {
     let client = GatewayClient::connect(endpoint, token, ClientKind::GatewayDashboard).await?;
@@ -54,6 +65,8 @@ async fn request_provider_registration(
         .send(ClientMessage::RegisterProvider {
             request_id: request_id.clone(),
             config,
+            label,
+            tint,
             model_ids,
             reasoning_efforts: Vec::new(),
             replace_existing_selections: true,

@@ -35,8 +35,8 @@ use uuid::Uuid;
 
 use super::setup::{self, SetupMode};
 use super::terminal::{INPUT_POLL, MAX_INPUT_BATCH, TerminalGuard, poll_event};
-use super::terminal_text;
 use super::theme::{Role, current};
+use super::{provider_instance_label, terminal_text};
 use crate::gateway_accounts::configured_token;
 
 use self::runtime::*;

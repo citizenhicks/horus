@@ -529,27 +529,18 @@ pub(super) fn render_chats(frame: &mut ratatui::Frame<'_>, area: Rect, state: &m
 }
 
 pub(super) fn render_providers(frame: &mut ratatui::Frame<'_>, area: Rect, state: &DashboardState) {
-    let configured = state
-        .gateway
-        .providers
-        .iter()
-        .filter_map(|status| {
-            status
-                .selection
-                .as_ref()
-                .map(|selection| (status, selection))
-        })
-        .collect::<Vec<_>>();
-    let lines = if configured.is_empty() {
+    let lines = if state.gateway.provider_instances.is_empty() {
         empty("No providers configured · press p")
     } else {
-        configured
-            .into_iter()
-            .map(|(status, selection)| {
+        state
+            .gateway
+            .provider_instances
+            .iter()
+            .map(|instance| {
                 Line::from(format!(
                     " ● {} · {}",
-                    terminal_text(&status.label),
-                    terminal_text(&selection.model)
+                    terminal_text(&instance.label),
+                    terminal_text(&instance.selection.model)
                 ))
             })
             .collect()
@@ -567,6 +558,11 @@ pub(super) fn render_defaults(frame: &mut ratatui::Frame<'_>, area: Rect, state:
         || empty("No defaults · configure a provider first"),
         |default| {
             let config = &default.config;
+            let provider = provider_instance_label(
+                &state.gateway.provider_instances,
+                &config.provider.instance,
+            )
+            .unwrap_or(&config.provider.provider);
             let enabled = state
                 .gateway
                 .middleware_features
@@ -576,7 +572,7 @@ pub(super) fn render_defaults(frame: &mut ratatui::Frame<'_>, area: Rect, state:
             vec![
                 Line::from(format!(
                     " Model      {} / {}",
-                    terminal_text(&config.provider.provider),
+                    terminal_text(provider),
                     terminal_text(&config.provider.model)
                 )),
                 Line::from(format!(

@@ -135,7 +135,7 @@ extension AppModelTests {
         let store = GatewayStore(defaults: defaults)
         let model = AppModel(client: GatewayClient(), store: store)
 
-        model.renameSelectedGateway("Home gateway")
+        model.renameGateway(account, to: "Home gateway")
 
         XCTAssertEqual(model.selectedAccount?.displayName, "Home gateway")
         XCTAssertEqual(store.loadAccounts().first?.displayName, "Home gateway")
@@ -166,7 +166,7 @@ extension AppModelTests {
         model.selectedAccountID = account.id
         model.selectedSessionID = "chat-1"
         model.destination = .chats
-        model.chatRoute = .session("chat-1")
+        model.navigationPath = [.chat(.session("chat-1"))]
         model.connectionState = .ready
 
         model.setSceneActive(true)
@@ -177,7 +177,7 @@ extension AppModelTests {
 
         XCTAssertEqual(model.connectionState, .connecting)
         XCTAssertEqual(model.selectedSessionID, "chat-1")
-        XCTAssertEqual(model.chatRoute, .session("chat-1"))
+        XCTAssertEqual(model.navigationPath, [.chat(.session("chat-1"))])
     }
 
     func testReactivationFromChatCatalogDoesNotPreserveSelectedSession() throws {
@@ -187,7 +187,7 @@ extension AppModelTests {
         model.selectedAccountID = account.id
         model.selectedSessionID = "chat-1"
         model.destination = .chats
-        model.chatRoute = nil
+        model.navigationPath = []
         model.connectionState = .ready
 
         model.setSceneActive(true)
@@ -196,7 +196,7 @@ extension AppModelTests {
 
         XCTAssertEqual(model.connectionState, .connecting)
         XCTAssertNil(model.selectedSessionID)
-        XCTAssertNil(model.chatRoute)
+        XCTAssertTrue(model.navigationPath.isEmpty)
     }
 
     func testAutomaticReconnectRestoresDraftWithoutReplayingSubmission() async throws {

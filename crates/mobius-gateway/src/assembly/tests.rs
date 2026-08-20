@@ -6,7 +6,7 @@ use super::*;
 
 #[test]
 fn provider_status_uses_manifest_defaults() {
-    let status = provider_status(provider("openai_socket").expect("provider"), false, None);
+    let status = provider_status(provider("openai_socket").expect("provider"));
 
     assert_eq!(status.provider, "openai_socket");
     assert_eq!(status.label, "OpenAI");
@@ -22,18 +22,16 @@ fn provider_status_uses_manifest_defaults() {
     );
     assert_eq!(status.web_search[0], HostedWebSearch::Off);
 
-    let custom = provider_status(provider("responses").expect("provider"), false, None);
+    let custom = provider_status(provider("responses").expect("provider"));
     assert!(custom.models.is_empty());
     assert!(custom.model_ids_configurable);
-    assert!(custom.model_ids.is_empty());
-    assert!(custom.reasoning_efforts.is_empty());
     assert_eq!(
         custom.default_base_url.as_deref(),
         Some("https://api.openai.com/v1")
     );
     assert_eq!(custom.default_api_key_env, None);
 
-    let openrouter = provider_status(provider("openrouter").expect("provider"), false, None);
+    let openrouter = provider_status(provider("openrouter").expect("provider"));
     assert!(openrouter.models.is_empty());
     assert!(openrouter.model_ids_configurable);
     assert_eq!(
@@ -55,11 +53,13 @@ fn configured_provider_status_requires_the_selected_credential_endpoint() {
     credentials
         .set(
             "openrouter",
+            "openrouter",
             "openrouter-secret",
             Some("https://other.example/v1"),
         )
         .expect("mismatched credential");
     let selection = ProviderConfig {
+        instance: "openrouter".into(),
         provider: "openrouter".into(),
         model: "openai/gpt-5.6-luna".into(),
         base_url: Some("https://openrouter.ai/api/v1".into()),
@@ -68,16 +68,22 @@ fn configured_provider_status_requires_the_selected_credential_endpoint() {
         web_search: HostedWebSearch::Off,
     };
     let config = config
-        .registering_provider(selection, vec!["openai/gpt-5.6-luna".into()], Vec::new())
+        .registering_provider(
+            selection,
+            "Test".into(),
+            Default::default(),
+            vec!["openai/gpt-5.6-luna".into()],
+            Vec::new(),
+        )
         .expect("register provider");
 
-    let status = provider_statuses(&config, &store, &credentials)
-        .expect("provider statuses")
+    let instance = provider_instances(&config, &store, &credentials)
+        .expect("provider instances")
         .into_iter()
-        .find(|status| status.provider == "openrouter")
-        .expect("OpenRouter status");
+        .find(|entry| entry.selection.provider == "openrouter")
+        .expect("OpenRouter instance");
 
-    assert!(!status.configured);
+    assert!(!instance.configured);
 }
 
 #[test]
@@ -92,20 +98,32 @@ fn configured_catalog_resolves_manifest_and_opaque_custom_routes() {
     .expect("config");
     let credentials = CredentialStore::open(store.credentials_path()).expect("credential store");
     credentials
-        .set("kimi", "kimi-secret", None)
+        .set(
+            "kimi",
+            "kimi",
+            "kimi-secret",
+            Some("https://api.moonshot.ai/v1"),
+        )
         .expect("Kimi credential");
     credentials
-        .set("responses", "custom-secret", Some("https://example.com/v1"))
+        .set(
+            "responses",
+            "responses",
+            "custom-secret",
+            Some("https://example.com/v1"),
+        )
         .expect("custom credential");
     let kimi = ProviderConfig {
+        instance: "kimi".into(),
         provider: "kimi".into(),
         model: "kimi-k3".into(),
-        base_url: None,
+        base_url: Some("https://api.moonshot.ai/v1".into()),
         endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
         reasoning_effort: Some("max".into()),
         web_search: HostedWebSearch::Off,
     };
     let custom = ProviderConfig {
+        instance: "responses".into(),
         provider: "responses".into(),
         model: "vendor/model-opaque".into(),
         base_url: Some("https://example.com/v1".into()),
@@ -115,10 +133,18 @@ fn configured_catalog_resolves_manifest_and_opaque_custom_routes() {
     };
     let alternate_model = "vendor/model-alternate".to_string();
     let config = config
-        .registering_provider(kimi, Vec::new(), Vec::new())
+        .registering_provider(
+            kimi,
+            "Test".into(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
         .and_then(|config| {
             config.registering_provider(
                 custom.clone(),
+                "Test".into(),
+                Default::default(),
                 vec![custom.model.clone(), alternate_model.clone()],
                 vec!["provider-defined".into(), "minimal".into()],
             )
@@ -147,13 +173,70 @@ fn configured_catalog_resolves_manifest_and_opaque_custom_routes() {
     assert!(choices.iter().any(|choice| {
         choice.model == alternate_model && choice.reasoning_effort.as_deref() == Some("minimal")
     }));
-    assert_eq!(
-        custom_route.group,
-        format!(
-            "{} · {}",
-            provider("responses").expect("provider").label(),
-            custom.model
+    assert_eq!(custom_route.group, format!("Test · {}", custom.model));
+}
+
+#[test]
+fn same_provider_instances_have_distinct_routes_and_models() {
+    let root = tempfile::tempdir().expect("root");
+    let (store, config) = ConfigStore::initialize(
+        root.path().join("state"),
+        "127.0.0.1:8741".parse().expect("listen address"),
+        None,
+    )
+    .expect("config");
+    let credentials = CredentialStore::open(store.credentials_path()).expect("credential store");
+    let work = ProviderConfig {
+        instance: "responses-work".into(),
+        provider: "responses".into(),
+        model: "work-model".into(),
+        base_url: Some("https://work.example/v1".into()),
+        endpoint_auth: crate::wire::ProviderEndpointAuth::Credentialless,
+        reasoning_effort: None,
+        web_search: HostedWebSearch::Off,
+    };
+    let personal = ProviderConfig {
+        instance: "responses-personal".into(),
+        model: "personal-model".into(),
+        base_url: Some("https://personal.example/v1".into()),
+        ..work.clone()
+    };
+    let config = config
+        .registering_provider(
+            work.clone(),
+            "Work".into(),
+            Default::default(),
+            vec![work.model.clone()],
+            Vec::new(),
         )
+        .and_then(|config| {
+            config.registering_provider(
+                personal.clone(),
+                "Personal".into(),
+                Default::default(),
+                vec![personal.model.clone()],
+                Vec::new(),
+            )
+        })
+        .expect("register providers");
+
+    let choices = configured_model_choices(&config, &store, &credentials).expect("catalog");
+
+    assert_eq!(
+        choices
+            .into_iter()
+            .map(|choice| (choice.route, choice.model))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "responses-work::work-model::default".into(),
+                "work-model".into(),
+            ),
+            (
+                "responses-personal::personal-model::default".into(),
+                "personal-model".into(),
+            ),
+        ]
     );
 }
 
@@ -197,11 +280,13 @@ fn custom_selection_without_reasoning_uses_the_first_configured_effort() {
     credentials
         .set(
             "responses",
+            "responses",
             "custom-secret",
             Some("http://127.0.0.1:11434/v1"),
         )
         .expect("custom credential");
     let selection = ProviderConfig {
+        instance: "responses".into(),
         provider: "responses".into(),
         model: "local-model".into(),
         base_url: Some("http://127.0.0.1:11434/v1".into()),
@@ -212,6 +297,8 @@ fn custom_selection_without_reasoning_uses_the_first_configured_effort() {
     let config = config
         .registering_provider(
             selection.clone(),
+            "Test".into(),
+            Default::default(),
             vec![selection.model.clone()],
             vec!["high".into(), "medium".into()],
         )
@@ -239,6 +326,7 @@ fn custom_responses_requires_an_endpoint_bound_stored_credential() {
     .expect("config");
     let credentials = CredentialStore::open(store.credentials_path()).expect("credential store");
     let selection = ProviderConfig {
+        instance: "responses".into(),
         provider: "responses".into(),
         model: "custom-model".into(),
         base_url: Some("https://example.com/v1".into()),
@@ -248,6 +336,7 @@ fn custom_responses_requires_an_endpoint_bound_stored_credential() {
     };
 
     let error = resolve_credential(
+        "responses",
         provider("responses").expect("provider"),
         selection.base_url.as_deref(),
         &store,
@@ -265,12 +354,14 @@ fn custom_responses_requires_an_endpoint_bound_stored_credential() {
     credentials
         .set(
             "responses",
+            "responses",
             "official-secret",
             Some("https://api.openai.com/v1"),
         )
         .expect("store endpoint-bound credential");
     assert!(
         resolve_credential(
+            "responses",
             provider("responses").expect("provider"),
             selection.base_url.as_deref(),
             &store,
@@ -301,6 +392,8 @@ async fn updating_the_chat_recipe_preserves_capability_metadata() {
     let gateway = gateway
         .registering_provider(
             crate::wire::AgentComposition::default().provider,
+            "Test".into(),
+            Default::default(),
             Vec::new(),
             Vec::new(),
         )

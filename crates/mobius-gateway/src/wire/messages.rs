@@ -186,11 +186,13 @@ pub enum ClientMessage {
     },
     SetProviderCredential {
         request_id: String,
+        instance: String,
         provider: String,
         api_key: String,
     },
     SetProviderEndpointCredential {
         request_id: String,
+        instance: String,
         provider: String,
         base_url: String,
         api_key: String,
@@ -198,9 +200,15 @@ pub enum ClientMessage {
     RegisterProvider {
         request_id: String,
         config: ProviderConfig,
+        label: String,
+        tint: ProviderTint,
         model_ids: Vec<String>,
         reasoning_efforts: Vec<String>,
         replace_existing_selections: bool,
+    },
+    RemoveProvider {
+        request_id: String,
+        instance: String,
     },
     CreatePairingCode {
         request_id: String,
@@ -364,6 +372,7 @@ pub enum ServerMessage {
     },
     ProviderCredentialSaved {
         request_id: String,
+        instance: String,
         provider: String,
     },
     PairingCode {

@@ -1,5 +1,6 @@
 use super::*;
 use crate::backend::model::provider::ProviderCredential;
+use crate::backend::model::transport::capture_http_request;
 use crate::backend::model::user_message;
 
 #[test]
@@ -10,7 +11,7 @@ fn advertised_web_search_modes_build() {
             .build(ProviderBuildConfig {
                 credential: ProviderCredential::ApiKey("test-key".into()),
                 model: definition.default_model().expect("default model").into(),
-                base_url: None,
+                base_url: Some(DEFAULT_BASE_URL.into()),
                 reasoning_effort: None,
                 web_search,
                 http: reqwest::Client::new(),
@@ -19,9 +20,31 @@ fn advertised_web_search_modes_build() {
     }
 }
 
+#[tokio::test]
+async fn credentialless_post_uses_custom_path_and_omits_api_key() {
+    let (address, server) = capture_http_request().await;
+    let provider = Anthropic::with_client(
+        None,
+        format!("http://{address}/proxy"),
+        "test-model",
+        reqwest::Client::new(),
+    )
+    .expect("credentialless provider");
+
+    provider
+        .post(&serde_json::json!({}))
+        .await
+        .expect("credentialless request");
+
+    let request = server.await.expect("HTTP server").to_ascii_lowercase();
+    assert!(request.starts_with("post /proxy/messages http/1.1\r\n"));
+    assert!(!request.contains("x-api-key:"));
+}
+
 #[test]
 fn anthropic_reports_provider_owned_cache_pricing() {
-    let provider = Anthropic::new("test-key", "claude-haiku-4-5").expect("provider");
+    let provider =
+        Anthropic::new("test-key", DEFAULT_BASE_URL, "claude-haiku-4-5").expect("provider");
     let usage = TokenUsage {
         input_tokens: 1_000_000,
         cached_input_tokens: 200_000,
@@ -69,7 +92,8 @@ fn sonnet_5_pricing_changes_at_the_standard_rate_date() {
 
 #[test]
 fn explicit_prompt_cache_breakpoint_is_sent_on_the_marked_content_block() {
-    let provider = Anthropic::new("test-key", "claude-sonnet-5").expect("provider");
+    let provider =
+        Anthropic::new("test-key", DEFAULT_BASE_URL, "claude-sonnet-5").expect("provider");
     let mut input = user_message("stable prefix");
     assert!(crate::backend::model::mark_prompt_cache_breakpoint(
         &mut input

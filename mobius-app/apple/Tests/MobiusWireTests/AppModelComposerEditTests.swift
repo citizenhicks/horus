@@ -388,7 +388,7 @@ extension AppModelTests {
         } onChange: {
             gatewayForgotten.fulfill()
         }
-        model.forgetSelectedGateway()
+        model.forgetGateway(first)
         await fulfillment(of: [gatewayForgotten], timeout: 1)
         model.selectedAccountID = second.id
         model.selectedSessionID = "chat-1"

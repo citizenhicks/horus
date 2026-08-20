@@ -6,6 +6,7 @@ pub struct ReadyPayload {
     pub machine_name: String,
     pub sessions: Vec<SessionRecord>,
     pub providers: Vec<ProviderStatus>,
+    pub provider_instances: Vec<ProviderInstance>,
     pub default_config: Option<VersionedAgentConfig>,
     pub models: Vec<ModelChoice>,
     pub model_providers: BTreeMap<String, String>,
@@ -203,6 +204,9 @@ pub struct ExtensionRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
+    /// Stable identity of one configured setup of `provider`. A gateway may hold
+    /// several instances of the same provider with separate credentials.
+    pub instance: String,
     pub provider: String,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,16 +232,37 @@ pub struct ProviderStatus {
     pub label: String,
     pub symbol: FrontendSymbol,
     pub description: String,
-    pub configured: bool,
-    pub selection: Option<ProviderConfig>,
-    pub model_ids: Vec<String>,
-    pub reasoning_efforts: Vec<String>,
     pub model_ids_configurable: bool,
     pub auth: ProviderAuthKind,
     pub default_base_url: Option<String>,
     pub default_api_key_env: Option<String>,
     pub models: Vec<ProviderModel>,
     pub web_search: Vec<HostedWebSearch>,
+}
+
+/// User-chosen accent for distinguishing provider instances in model selectors.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTint {
+    #[default]
+    Blue,
+    Teal,
+    Green,
+    Yellow,
+    Orange,
+    Red,
+    Purple,
+}
+
+/// One durable setup of a provider. Several may share one `provider`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderInstance {
+    pub label: String,
+    pub tint: ProviderTint,
+    pub configured: bool,
+    pub selection: ProviderConfig,
+    pub model_ids: Vec<String>,
+    pub reasoning_efforts: Vec<String>,
 }
 
 /// Frontend type attached to one authenticated connection.

@@ -2,6 +2,16 @@ use super::*;
 
 pub(super) struct ProviderEntry {
     pub(super) status: ProviderStatus,
+    /// The configured setup this row edits, or `None` when it starts a new one.
+    pub(super) instance: Option<ProviderInstance>,
+}
+
+/// The editable fields of the authentication page, in tab order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AuthField {
+    Label,
+    Credential,
+    Endpoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,10 +22,11 @@ pub(super) enum Page {
     Agent,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Flow {
     Continue,
     Authenticate,
+    Remove(String),
     Finish,
     Cancel,
 }
@@ -45,9 +56,11 @@ pub(super) struct SetupState {
     pub(super) original: AgentComposition,
     pub(super) page: Page,
     pub(super) provider: usize,
+    pub(super) new_instance: String,
     pub(super) credential: String,
     pub(super) endpoint: String,
-    pub(super) endpoint_focused: bool,
+    pub(super) label: String,
+    pub(super) auth_field: AuthField,
     pub(super) authenticated: Option<(String, Option<String>)>,
     pub(super) model: usize,
     pub(super) custom_model: String,
@@ -63,6 +76,7 @@ pub(super) struct SetupState {
     pub(super) row: usize,
     pub(super) error: Option<String>,
     pub(super) progress: Option<Progress>,
+    pub(super) remove_confirmation: Option<String>,
 }
 
 impl SetupState {
@@ -75,7 +89,7 @@ impl SetupState {
     ) -> Result<Self> {
         let mut state = Self::from_parts(
             mode,
-            validated_providers(&gateway.providers)?,
+            validated_providers(&gateway.providers, &gateway.provider_instances)?,
             gateway.middleware_features.clone(),
             gateway.extensions.clone(),
             original,
@@ -102,14 +116,27 @@ impl SetupState {
         }
         let provider = providers
             .iter()
-            .position(|entry| entry.status.provider == original.provider.provider)
+            .position(|entry| {
+                entry.instance.as_ref().is_some_and(|instance| {
+                    instance.selection.instance == original.provider.instance
+                })
+            })
+            .or_else(|| {
+                providers
+                    .iter()
+                    .position(|entry| entry.status.provider == original.provider.provider)
+            })
             .ok_or_else(|| {
                 Error::Config(format!(
                     "the gateway did not advertise the active provider `{}`",
                     original.provider.provider
                 ))
             })?;
-        validate_active_provider(&providers[provider].status, &original.provider)?;
+        validate_active_provider(
+            &providers[provider].status,
+            providers[provider].instance.as_ref(),
+            &original.provider,
+        )?;
         let extension_ids = available_extensions
             .iter()
             .map(|extension| extension.id.as_str())
@@ -140,9 +167,11 @@ impl SetupState {
                 SetupMode::Agent => Page::Agent,
             },
             provider,
+            new_instance: Uuid::new_v4().to_string(),
             credential: String::new(),
             endpoint: String::new(),
-            endpoint_focused: false,
+            label: String::new(),
+            auth_field: AuthField::Label,
             authenticated: None,
             model: 0,
             custom_model: String::new(),
@@ -162,6 +191,7 @@ impl SetupState {
             row: 0,
             error: None,
             progress: None,
+            remove_confirmation: None,
         };
         state.reset_provider_fields();
         Ok(state)
@@ -173,6 +203,63 @@ impl SetupState {
 
     pub(super) fn definition(&self) -> &ProviderStatus {
         &self.entry().status
+    }
+
+    /// Fields the active provider actually offers, in tab order.
+    pub(super) fn auth_fields(&self) -> Vec<AuthField> {
+        let mut fields = vec![AuthField::Label];
+        if self.definition().auth == ProviderAuthKind::ApiKey {
+            fields.push(AuthField::Credential);
+        }
+        if self.definition().configurable_base_url() {
+            fields.push(AuthField::Endpoint);
+        }
+        fields
+    }
+
+    fn cycle_auth_field(&mut self, forward: bool) {
+        let fields = self.auth_fields();
+        let current = fields
+            .iter()
+            .position(|field| *field == self.auth_field)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % fields.len()
+        } else {
+            (current + fields.len() - 1) % fields.len()
+        };
+        self.auth_field = fields[next];
+    }
+
+    /// The label the setup will be registered under, defaulting to the manifest name.
+    pub(super) fn effective_label(&self) -> String {
+        let label = self.label.trim();
+        if label.is_empty() {
+            self.definition().label.clone()
+        } else {
+            label.to_string()
+        }
+    }
+
+    pub(super) fn target_instance(&self) -> String {
+        self.instance().map_or_else(
+            || self.new_instance.clone(),
+            |entry| entry.selection.instance.clone(),
+        )
+    }
+
+    pub(super) fn instance(&self) -> Option<&ProviderInstance> {
+        self.entry().instance.as_ref()
+    }
+
+    /// The configured model catalog of the edited setup, empty while adding one.
+    pub(super) fn instance_model_ids(&self) -> &[String] {
+        self.instance().map_or(&[], |entry| &entry.model_ids)
+    }
+
+    pub(super) fn instance_reasoning_efforts(&self) -> &[String] {
+        self.instance()
+            .map_or(&[], |entry| &entry.reasoning_efforts)
     }
 
     pub(super) fn select_provider(&mut self, provider: &str) -> Result<()> {
@@ -333,6 +420,16 @@ impl SetupState {
         {
             return Flow::Cancel;
         }
+        if let Some(instance) = self.remove_confirmation.take() {
+            return match key.code {
+                KeyCode::Char('y' | 'Y') => Flow::Remove(instance),
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => Flow::Continue,
+                _ => {
+                    self.remove_confirmation = Some(instance);
+                    Flow::Continue
+                }
+            };
+        }
         match self.page {
             Page::Provider => self.handle_provider_key(key),
             Page::Authentication => self.handle_authentication_key(key),
@@ -346,9 +443,16 @@ impl SetupState {
             KeyCode::Esc => return Flow::Cancel,
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
+            KeyCode::Char('x') | KeyCode::Delete => {
+                self.remove_confirmation = self
+                    .instance()
+                    .map(|instance| instance.selection.instance.clone());
+            }
             KeyCode::Enter => {
-                self.endpoint_focused = self.definition().configurable_base_url()
-                    && self.definition().auth == ProviderAuthKind::DeviceCode;
+                self.label = self
+                    .instance()
+                    .map_or_else(String::new, |instance| instance.label.clone());
+                self.auth_field = AuthField::Label;
                 self.page = Page::Authentication;
                 self.error = None;
             }
@@ -363,11 +467,8 @@ impl SetupState {
                 self.page = Page::Provider;
                 self.error = None;
             }
-            KeyCode::Tab | KeyCode::BackTab
-                if self.definition().configurable_base_url()
-                    && self.definition().auth == ProviderAuthKind::ApiKey =>
-            {
-                self.endpoint_focused = !self.endpoint_focused;
+            KeyCode::Tab | KeyCode::BackTab if self.auth_fields().len() > 1 => {
+                self.cycle_auth_field(key.code == KeyCode::Tab);
                 self.error = None;
             }
             KeyCode::Enter => {
@@ -379,11 +480,11 @@ impl SetupState {
                 return Flow::Authenticate;
             }
             KeyCode::Backspace if self.authentication_is_editable() => {
-                if self.endpoint_focused {
-                    self.endpoint.pop();
-                } else {
-                    self.credential.pop();
-                }
+                match self.auth_field {
+                    AuthField::Label => self.label.pop(),
+                    AuthField::Endpoint => self.endpoint.pop(),
+                    AuthField::Credential => self.credential.pop(),
+                };
                 self.error = None;
             }
             KeyCode::Char(character)
@@ -629,7 +730,8 @@ impl SetupState {
     }
 
     pub(super) fn authentication_is_editable(&self) -> bool {
-        self.endpoint_focused || self.definition().auth == ProviderAuthKind::ApiKey
+        self.auth_field != AuthField::Credential
+            || self.definition().auth == ProviderAuthKind::ApiKey
     }
 
     pub(super) fn paste(&mut self, text: &str) {
@@ -645,14 +747,14 @@ impl SetupState {
     }
 
     pub(super) fn push_text(&mut self, text: &str) {
-        let custom = self.page == Page::Models;
-        let endpoint = self.page == Page::Authentication && self.endpoint_focused;
-        let (target, limit) = if custom {
+        let (target, limit) = if self.page == Page::Models {
             (&mut self.custom_model, MAX_MODEL_IDS_BYTES)
-        } else if endpoint {
-            (&mut self.endpoint, MAX_ENDPOINT_BYTES)
         } else {
-            (&mut self.credential, MAX_API_KEY_BYTES)
+            match self.auth_field {
+                AuthField::Label => (&mut self.label, MAX_PROVIDER_LABEL_BYTES),
+                AuthField::Endpoint => (&mut self.endpoint, MAX_ENDPOINT_BYTES),
+                AuthField::Credential => (&mut self.credential, MAX_API_KEY_BYTES),
+            }
         };
         let mut rejected = false;
         for character in text.chars().filter(|character| !character.is_control()) {
@@ -670,8 +772,10 @@ impl SetupState {
         self.authenticated = None;
         let definition = self.entry().status.clone();
         let current = &self.original.provider;
-        let same_provider = current.provider == definition.provider;
-        self.endpoint = if same_provider {
+        let same_instance = self
+            .instance()
+            .is_some_and(|instance| instance.selection.instance == current.instance);
+        self.endpoint = if same_instance {
             current
                 .base_url
                 .as_deref()
@@ -683,7 +787,7 @@ impl SetupState {
         .into();
         self.model = if definition.model_ids_configurable {
             0
-        } else if same_provider {
+        } else if same_instance {
             definition
                 .models
                 .iter()
@@ -693,15 +797,15 @@ impl SetupState {
             0
         };
         self.custom_model = if definition.model_ids_configurable {
-            let mut model_ids = definition.model_ids.clone();
-            if same_provider && !model_ids.contains(&current.model) {
+            let mut model_ids = self.instance_model_ids().to_vec();
+            if same_instance && !model_ids.contains(&current.model) {
                 model_ids.insert(0, current.model.clone());
             }
             model_ids.join(", ")
         } else {
             String::new()
         };
-        let reasoning = if same_provider {
+        let reasoning = if same_instance {
             current.reasoning_effort.as_deref()
         } else {
             definition
@@ -721,7 +825,7 @@ impl SetupState {
                 })
             })
             .map_or(0, |index| index + 1);
-        self.web_search = if same_provider {
+        self.web_search = if same_instance {
             definition
                 .web_search
                 .iter()
@@ -730,7 +834,7 @@ impl SetupState {
         } else {
             0
         };
-        self.endpoint_focused = false;
+        self.auth_field = AuthField::Label;
         self.row = self.model;
         self.error = None;
     }
@@ -776,16 +880,18 @@ impl SetupState {
     pub(super) fn has_matching_credential(&self) -> bool {
         let target = self.authentication_target();
         self.authenticated.as_ref() == Some(&target)
-            || !self.definition().configurable_base_url() && self.entry().status.configured
-            || self
-                .entry()
-                .status
-                .selection
-                .as_ref()
-                .is_some_and(|selection| {
-                    selection.endpoint_auth == ProviderEndpointAuth::Credentialless
-                        && selection.provider == target.0.as_str()
-                        && selection.base_url.as_deref() == target.1.as_deref()
+            || self.instance().is_some_and(|entry| {
+                entry.configured
+                    && entry.selection.provider == target.0.as_str()
+                    && entry.selection.base_url.as_deref() == target.1.as_deref()
+            })
+            || self.definition().auth == ProviderAuthKind::DeviceCode
+                && self.providers.iter().any(|entry| {
+                    entry.status.provider == target.0
+                        && entry
+                            .instance
+                            .as_ref()
+                            .is_some_and(|instance| instance.configured)
                 })
     }
 
@@ -800,16 +906,7 @@ impl SetupState {
         {
             return Err(Error::Config("Base URL is required".into()));
         }
-        match self.definition().auth {
-            ProviderAuthKind::ApiKey
-                if self.credential.trim().is_empty() && !self.has_matching_credential() =>
-            {
-                Err(Error::Config(
-                    "Paste an API key or configure this provider on the gateway".into(),
-                ))
-            }
-            ProviderAuthKind::ApiKey | ProviderAuthKind::DeviceCode => Ok(()),
-        }
+        Ok(())
     }
 
     pub(super) fn take_authentication(&mut self) -> Result<Authentication> {
@@ -851,7 +948,7 @@ impl SetupState {
                 .checked_sub(1)
                 .and_then(|index| model.reasoning.get(index))
                 .map(|preset| preset.id.to_string())
-        } else if current.provider.provider == definition.provider
+        } else if current.provider.instance == self.target_instance()
             && current.provider.model == model
         {
             current.provider.reasoning_effort.clone()
@@ -864,7 +961,7 @@ impl SetupState {
             .copied()
             .ok_or_else(|| Error::Config("Hosted web-search selection is invalid".into()))?;
         let base_url = self.selected_base_url();
-        let endpoint_auth = if current.provider.provider == definition.provider
+        let endpoint_auth = if current.provider.instance == self.target_instance()
             && current.provider.base_url.as_deref() == base_url.as_deref()
         {
             current.provider.endpoint_auth
@@ -875,6 +972,7 @@ impl SetupState {
             return Err(Error::Config("Model is required".into()));
         }
         config.provider = ProviderConfig {
+            instance: self.target_instance(),
             provider: definition.provider.clone(),
             model: model.into(),
             base_url,
@@ -908,9 +1006,13 @@ pub(super) enum Authentication {
     DeviceCode,
 }
 
-pub(super) fn validated_providers(statuses: &[ProviderStatus]) -> Result<Vec<ProviderEntry>> {
+/// Rows are every configured setup first, then one "add setup" row per definition.
+pub(super) fn validated_providers(
+    statuses: &[ProviderStatus],
+    instances: &[ProviderInstance],
+) -> Result<Vec<ProviderEntry>> {
     let mut seen = BTreeSet::new();
-    statuses
+    let definitions = statuses
         .iter()
         .map(|status| {
             if status.provider.trim().is_empty() || !seen.insert(status.provider.as_str()) {
@@ -923,23 +1025,52 @@ pub(super) fn validated_providers(statuses: &[ProviderStatus]) -> Result<Vec<Pro
                 || status.description.trim().is_empty()
                 || status.web_search.first() != Some(&HostedWebSearch::Off)
                 || status.model_ids_configurable != status.models.is_empty()
-                || !status.model_ids_configurable && !status.model_ids.is_empty()
-                || !status.model_ids_configurable && !status.reasoning_efforts.is_empty()
             {
                 return Err(Error::Config(format!(
                     "gateway advertised an incomplete manifest for `{}`",
                     status.provider
                 )));
             }
-            Ok(ProviderEntry {
-                status: status.clone(),
-            })
+            Ok(status.clone())
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut seen_instances = BTreeSet::new();
+    let mut rows = Vec::with_capacity(instances.len() + definitions.len());
+    for instance in instances {
+        if instance.selection.instance.trim().is_empty()
+            || !seen_instances.insert(instance.selection.instance.as_str())
+        {
+            return Err(Error::Config(format!(
+                "gateway advertised invalid or duplicate provider instance `{}`",
+                instance.selection.instance
+            )));
+        }
+        let status = definitions
+            .iter()
+            .find(|status| status.provider == instance.selection.provider)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "gateway advertised instance `{}` for unknown provider `{}`",
+                    instance.selection.instance, instance.selection.provider
+                ))
+            })?;
+        validate_active_provider(status, Some(instance), &instance.selection)?;
+        rows.push(ProviderEntry {
+            status: status.clone(),
+            instance: Some(instance.clone()),
+        });
+    }
+    rows.extend(definitions.into_iter().map(|status| ProviderEntry {
+        status,
+        instance: None,
+    }));
+    Ok(rows)
 }
 
 pub(super) fn validate_active_provider(
     status: &ProviderStatus,
+    instance: Option<&ProviderInstance>,
     config: &ProviderConfig,
 ) -> Result<()> {
     if !status.web_search.contains(&config.web_search) {
@@ -955,17 +1086,16 @@ pub(super) fn validate_active_provider(
         )));
     }
     if status.model_ids_configurable {
-        if !status.model_ids.iter().any(|model| model == &config.model) {
+        let model_ids = instance.map_or(&[][..], |entry| &entry.model_ids);
+        let reasoning_efforts = instance.map_or(&[][..], |entry| &entry.reasoning_efforts);
+        if !model_ids.iter().any(|model| model == &config.model) {
             return Err(Error::Config(format!(
                 "gateway active provider `{}` has unconfigured model `{}`",
                 status.provider, config.model
             )));
         }
         if let Some(effort) = config.reasoning_effort.as_deref()
-            && !status
-                .reasoning_efforts
-                .iter()
-                .any(|choice| choice == effort)
+            && !reasoning_efforts.iter().any(|choice| choice == effort)
         {
             return Err(Error::Config(format!(
                 "gateway active provider `{}` has unconfigured reasoning `{effort}`",

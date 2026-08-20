@@ -59,6 +59,8 @@ pub(super) struct ConnectOptions {
 pub(super) struct RegisterProviderOptions {
     pub(super) state_dir: PathBuf,
     pub(super) provider: String,
+    pub(super) instance: Option<String>,
+    pub(super) label: Option<String>,
     pub(super) model: String,
     pub(super) base_url: Option<String>,
     pub(super) credentialless: bool,
@@ -93,6 +95,8 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<Command> {
 pub(super) fn parse_register_provider(arguments: Vec<OsString>) -> Result<RegisterProviderOptions> {
     let mut configured_state_dir = None;
     let mut provider = None;
+    let mut instance = None;
+    let mut label = None;
     let mut model = None;
     let mut base_url = None;
     let mut credentialless = false;
@@ -122,6 +126,22 @@ pub(super) fn parse_register_provider(arguments: Vec<OsString>) -> Result<Regist
                     .map_err(|_| Error::Config("--provider is not valid UTF-8".into()))?,
                 "--provider",
             )?;
+        } else if flag == "--instance" {
+            set_once(
+                &mut instance,
+                value
+                    .into_string()
+                    .map_err(|_| Error::Config("--instance is not valid UTF-8".into()))?,
+                "--instance",
+            )?;
+        } else if flag == "--label" {
+            set_once(
+                &mut label,
+                value
+                    .into_string()
+                    .map_err(|_| Error::Config("--label is not valid UTF-8".into()))?,
+                "--label",
+            )?;
         } else if flag == "--model" {
             set_once(
                 &mut model,
@@ -145,6 +165,8 @@ pub(super) fn parse_register_provider(arguments: Vec<OsString>) -> Result<Regist
     Ok(RegisterProviderOptions {
         state_dir: configured_state_dir.map_or_else(state_dir, Ok)?,
         provider: provider.ok_or_else(|| Error::Config("--provider is required".into()))?,
+        instance,
+        label,
         model: model.ok_or_else(|| Error::Config("--model is required".into()))?,
         base_url,
         credentialless,

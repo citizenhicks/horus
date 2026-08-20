@@ -612,11 +612,12 @@ pub(super) async fn handle_message(
         }
         ClientMessage::SetProviderCredential {
             request_id,
+            instance,
             provider,
             api_key,
         } => {
             match gateway
-                .set_credential(provider.clone(), api_key, None)
+                .set_credential(instance.clone(), provider.clone(), api_key, None)
                 .await
             {
                 Ok(()) => {
@@ -624,6 +625,7 @@ pub(super) async fn handle_message(
                         writer,
                         &ServerFrame::new(ServerMessage::ProviderCredentialSaved {
                             request_id,
+                            instance,
                             provider,
                         }),
                     )
@@ -634,12 +636,13 @@ pub(super) async fn handle_message(
         }
         ClientMessage::SetProviderEndpointCredential {
             request_id,
+            instance,
             provider,
             base_url,
             api_key,
         } => {
             match gateway
-                .set_credential(provider.clone(), api_key, Some(base_url))
+                .set_credential(instance.clone(), provider.clone(), api_key, Some(base_url))
                 .await
             {
                 Ok(()) => {
@@ -647,6 +650,7 @@ pub(super) async fn handle_message(
                         writer,
                         &ServerFrame::new(ServerMessage::ProviderCredentialSaved {
                             request_id,
+                            instance,
                             provider,
                         }),
                     )
@@ -658,6 +662,8 @@ pub(super) async fn handle_message(
         ClientMessage::RegisterProvider {
             request_id,
             config,
+            label,
+            tint,
             model_ids,
             reasoning_efforts,
             replace_existing_selections,
@@ -668,6 +674,8 @@ pub(super) async fn handle_message(
                 gateway
                     .register_provider(
                         config,
+                        label,
+                        tint,
                         model_ids,
                         reasoning_efforts,
                         replace_existing_selections,
@@ -675,6 +683,12 @@ pub(super) async fn handle_message(
                     .await,
             )
             .await
+        }
+        ClientMessage::RemoveProvider {
+            request_id,
+            instance,
+        } => {
+            write_gateway_result(writer, request_id, gateway.remove_provider(instance).await).await
         }
         ClientMessage::CreatePairingCode { request_id } => match auth.create_pairing_code() {
             Ok(grant) => {

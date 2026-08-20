@@ -3,187 +3,455 @@ import SwiftUI
 struct ProvidersView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.mobiusPalette) private var palette
+    @State private var isAdding = false
 
     var body: some View {
+        let status = catalogStatus
         PageScaffold(
             title: "Providers",
-            detail: ""
+            detail: pageDetail,
+            headerAccessory: {
+                HStack(spacing: MobiusSpace.xxs) {
+                    Button {
+                        isAdding = true
+                    } label: {
+                        MobiusIcon(.plus, gutter: false)
+                    }
+                    .mobiusProminentIconButton()
+                    .disabled(!model.connectionState.isReady)
+                    .accessibilityLabel("Add provider")
+                    .accessibilityHint("Opens the provider setup")
+                    .help("Add provider")
+                    SettingsStatusAccessory(
+                        subject: "Providers",
+                        hasChanges: false,
+                        isSaving: model.isApplyingConfiguration,
+                        saveDisabled: !model.connectionState.isReady,
+                        statusLabel: status.label,
+                        statusDetail: status.detail,
+                        statusColor: status.color,
+                        saveLabel: "Add provider",
+                        save: { isAdding = true }
+                    )
+                }
+                .fixedSize()
+            }
         ) {
-            if model.providerDraft != nil {
-                Section {
-                    if configuredProviders.isEmpty {
-                        Text("No provider configured on this gateway.")
-                            .foregroundStyle(palette.muted)
-                    } else {
-                        ForEach(configuredProviders) { status in
-                            LabeledContent(model.providerLabel(for: status.provider)) {
-                                Text("Configured")
-                                    .foregroundStyle(palette.signal)
+            Section("Configured") {
+                if model.providerInstances.isEmpty {
+                    Text("No provider configured yet.")
+                        .font(MobiusStyle.captionFont)
+                        .foregroundStyle(palette.muted)
+                } else {
+                    ForEach(model.providerInstances) { instance in
+                        configuredRow(instance)
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $isAdding) { AddProviderSheet() }
+    }
+
+    private var pageDetail: String {
+        model.connectionState.isReady
+            ? "Model services this gateway can reach. Add one setup per account or endpoint."
+            : "Connect to a gateway to manage providers."
+    }
+
+    private var catalogStatus: (label: String, detail: String, color: Color) {
+        switch model.connectionState {
+        case .ready:
+            let ready = model.providerInstances.filter(\.configured).count
+            return (
+                "Catalog up to date",
+                "\(model.providerInstances.count) configured · \(ready) ready",
+                palette.signal
+            )
+        case .failed(let message):
+            return ("Needs attention", message, palette.danger)
+        default:
+            return (
+                model.connectionState.label,
+                "Connect to a gateway to manage its providers.",
+                palette.warning
+            )
+        }
+    }
+
+    private func configuredRow(_ instance: ProviderInstance) -> some View {
+        HStack(spacing: MobiusSpace.s) {
+            Button {
+                model.editProviderInstance(instance)
+                model.navigationPath = [.settings(.provider(instance.instance))]
+            } label: {
+                ConfiguredProviderLabel(instance: instance)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Shows provider settings")
+
+            if !instance.configured {
+                MobiusIcon(.key, size: MobiusStyle.glyphMark, foreground: palette.warning)
+                    .accessibilityLabel("\(instance.label) needs a credential")
+            }
+
+            MobiusIcon(
+                .caretRight,
+                size: MobiusStyle.glyphMark,
+                foreground: palette.muted
+            )
+            .accessibilityHidden(true)
+        }
+    }
+}
+
+private struct ConfiguredProviderLabel: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.mobiusPalette) private var palette
+    let instance: ProviderInstance
+
+    var body: some View {
+        HStack(spacing: MobiusSpace.s) {
+            ProviderMark(symbol: definition?.symbol, tint: instance.tint)
+            VStack(alignment: .leading, spacing: MobiusSpace.xxs) {
+                Text(verbatim: instance.label)
+                    .lineLimit(1)
+                Text(verbatim: definition?.label ?? instance.provider)
+                    .font(MobiusStyle.captionFont)
+                    .foregroundStyle(palette.muted)
+                    .lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var definition: ProviderStatus? {
+        model.providerStatuses.first { $0.provider == instance.provider }
+    }
+}
+
+/// The provider's glyph drawn in the setup's chosen accent.
+struct ProviderMark: View {
+    let symbol: String?
+    let tint: ProviderTint
+
+    private var glyph: MobiusGlyph {
+        guard let symbol, let known = MobiusSymbol.knownGlyph(for: symbol) else { return .hardDrives }
+        return known
+    }
+
+    var body: some View {
+        MobiusIcon(glyph, size: MobiusStyle.glyphLead, foreground: tint.color)
+        .accessibilityHidden(true)
+    }
+}
+
+// MARK: - Add
+
+private struct AddProviderSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var provider: String?
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if let provider, model.providerDraft != nil {
+                    ProviderFormSections(provider: provider, isNew: true)
+                } else {
+                    Section {
+                        ForEach(model.providerStatuses) { status in
+                            Button {
+                                model.addProviderInstance(status.provider)
+                                provider = status.provider
+                            } label: {
+                                ProviderDefinitionLabel(status: status)
+                                    .contentShape(Rectangle())
                             }
+                            .buttonStyle(.plain)
+                        }
+                    } header: {
+                        Text("Provider")
+                    } footer: {
+                        Text("Pick a service, then name this setup. Adding a second setup of the same service keeps both, each with its own credential.")
+                    }
+                }
+            }
+            .navigationTitle(provider == nil ? "Add provider" : "New setup")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                if provider != nil {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Save", action: model.registerProvider)
+                            .disabled(model.isApplyingConfiguration)
+                    }
+                }
+            }
+            .onChange(of: model.providerInstances.map(\.instance)) { _, instances in
+                guard let instance = model.providerDraft?.instance,
+                      instances.contains(instance)
+                else { return }
+                dismiss()
+            }
+        }
+    }
+}
+
+private struct ProviderDefinitionLabel: View {
+    @Environment(\.mobiusPalette) private var palette
+    let status: ProviderStatus
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: MobiusSpace.xxs) {
+            Text(verbatim: status.label)
+                .lineLimit(1)
+            Text(verbatim: status.description)
+                .font(MobiusStyle.captionFont)
+                .foregroundStyle(palette.muted)
+                .lineLimit(2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+// MARK: - Detail
+
+struct ProviderDetailView: View {
+    @Environment(AppModel.self) private var model
+    @State private var confirmsRemoval = false
+    let instance: String
+
+    var body: some View {
+        if let record = model.providerInstances.first(where: { $0.instance == instance }) {
+            PageScaffold(
+                title: record.label,
+                detail: "",
+                headerAccessory: {
+                    HStack(spacing: MobiusSpace.xxs) {
+                        Button {
+                            model.registerProvider()
+                        } label: {
+                            MobiusIcon(.floppyDisk, gutter: false)
+                        }
+                        .mobiusProminentIconButton()
+                        .disabled(model.isApplyingConfiguration)
+                        .accessibilityLabel("Save to gateway")
+                        .help("Save to gateway")
+                    }
+                    .fixedSize()
+                }
+            ) {
+                ProviderFormSections(provider: record.provider, isNew: false)
+                Section {
+                    MobiusActionRow {
+                        Button(
+                            "Remove provider",
+                            glyph: .trash,
+                            role: .destructive
+                        ) {
+                            confirmsRemoval = true
                         }
                     }
-                } header: {
+                    .disabled(model.isApplyingConfiguration || !model.connectionState.isReady)
+                }
+            }
+            .toolbarRole(.editor)
+            .confirmationDialog(
+                "Remove \(record.label)?",
+                isPresented: $confirmsRemoval,
+                titleVisibility: .visible
+            ) {
+                Button("Remove provider", role: .destructive) {
+                    model.removeProvider(record.instance)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This removes the provider setup from the gateway. This cannot be undone.")
+            }
+        } else {
+            MobiusUnavailable(
+                title: "Provider unavailable",
+                glyph: AppDestination.providers.glyph,
+                detail: "It is no longer configured on this gateway."
+            )
+            .navigationTitle("Provider")
+            .toolbarRole(.editor)
+            .background(MobiusBackdrop())
+        }
+    }
+}
+
+// MARK: - Shared form
+
+/// The editable body of one setup. Every field, credential included, can be replaced.
+private struct ProviderFormSections: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.mobiusPalette) private var palette
+    let provider: String
+    let isNew: Bool
+
+    var body: some View {
+        @Bindable var model = model
+        if let status = definition {
+            Section("Setup") {
+                LabeledContent {
+                    TextField(status.label, text: $model.providerLabelDraft)
+                        .settingsField()
+                } label: {
                     HStack(spacing: MobiusSpace.xs) {
-                        Text("Configured")
+                        Text("Name")
                         SettingsInfoButton(
-                            title: "Editing configured providers",
-                            detail: "Edit provider details by selecting a configured provider below. When saved to the gateway, all supplied information overrides the existing configuration."
+                            title: "Name",
+                            detail: "Shown in model pickers and usage. Name setups for what they are, like Work or Personal."
                         )
                     }
                 }
+                // The service a setup talks to is fixed; only its presentation is editable.
+                LabeledContent("Provider") {
+                    HStack(spacing: MobiusSpace.xs) {
+                        ProviderMark(symbol: status.symbol, tint: model.providerTintDraft)
+                        Text(verbatim: status.label)
+                    }
+                    .font(MobiusStyle.controlFont)
+                }
+                LabeledContent("Colour") {
+                    ProviderTintPicker(selection: $model.providerTintDraft)
+                }
+            }
 
-                // Model and reasoning are picked per chat in the composer; this page only
-                // manages what the gateway itself has configured.
-                Section("Provider") {
+            Section("Model") {
+                if status.modelIdsConfigurable {
                     LabeledContent {
-                        Picker("Provider", selection: providerID) {
-                            ForEach(model.providerStatuses) { status in
-                                Text(model.providerLabel(for: status.provider)).tag(status.provider)
-                            }
-                        }
-                        .labelsHidden()
-                        .settingsPickerStyle()
-                        .sensoryFeedback(.selection, trigger: providerID.wrappedValue)
+                        TextField("model-a, model-b", text: providerModelIDs)
+                            .settingsField()
                     } label: {
                         HStack(spacing: MobiusSpace.xs) {
-                            Text("Provider")
+                            Text("Model ID(s)")
                             SettingsInfoButton(
-                                title: selectedStatus.map { model.providerLabel(for: $0.provider) }
-                                    ?? "Provider",
-                                detail: selectedStatus?.description
-                                    ?? "Selects the model service configured on this gateway."
+                                title: "Model ID(s)",
+                                detail: "Enter one or more exact provider model IDs separated by commas. Whitespace, empty entries, and duplicates are ignored."
                             )
                         }
                     }
-
-                    if let status = selectedStatus {
-                        if status.modelIdsConfigurable {
-                            LabeledContent {
-                                TextField("model-a, model-b", text: providerModelIDs)
-                                    .settingsField()
-                            } label: {
-                                HStack(spacing: MobiusSpace.xs) {
-                                    Text("Model ID(s)")
-                                    SettingsInfoButton(
-                                        title: "Model ID(s)",
-                                        detail: "Enter one or more exact provider model IDs separated by commas. Whitespace, empty entries, and duplicates are ignored."
-                                    )
-                                }
-                            }
-
-                            LabeledContent {
-                                TextField("low, medium, high", text: providerReasoningEfforts)
-                                    .settingsField()
-                            } label: {
-                                HStack(spacing: MobiusSpace.xs) {
-                                    Text("Reasoning effort(s)")
-                                    SettingsInfoButton(
-                                        title: "Reasoning effort(s)",
-                                        detail: "Enter the exact reasoning efforts supported by these models, separated by commas. Whitespace, empty entries, and duplicates are ignored. Leave empty to use the provider default."
-                                    )
-                                }
-                            }
+                    LabeledContent {
+                        TextField("low, medium, high", text: providerReasoningEfforts)
+                            .settingsField()
+                    } label: {
+                        HStack(spacing: MobiusSpace.xs) {
+                            Text("Reasoning effort(s)")
+                            SettingsInfoButton(
+                                title: "Reasoning effort(s)",
+                                detail: "Enter the exact reasoning efforts supported by these models, separated by commas. Leave empty to use the provider default."
+                            )
                         }
-
-                        if status.defaultBaseUrl != nil {
-                            LabeledContent("Base URL") {
-                                TextField("Provider endpoint", text: providerBaseURL)
-                                    .textContentType(.URL)
-                                    .settingsField()
-                            }
+                    }
+                } else {
+                    ForEach(status.models) { entry in
+                        LabeledContent(entry.label) {
+                            Text(verbatim: entry.id)
+                                .font(MobiusStyle.captionFont)
+                                .foregroundStyle(palette.muted)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
                         }
+                    }
+                    Text("Every model above is available. Pick one per chat in the composer.")
+                        .font(MobiusStyle.captionFont)
+                        .foregroundStyle(palette.muted)
+                }
 
-                        Picker("Hosted web search", selection: providerWebSearch) {
-                            ForEach(status.webSearch) { search in
-                                Text(search.label).tag(search)
-                            }
-                        }
-                        .settingsPickerStyle()
-                        .sensoryFeedback(.selection, trigger: providerWebSearch.wrappedValue)
-                        .disabled(status.webSearch.count == 1)
-                        .accessibilityHint(
-                            status.webSearch.count == 1
-                                ? "This provider does not offer another web search mode."
-                                : "Selects the provider-hosted web search mode."
-                        )
+                if status.defaultBaseUrl != nil {
+                    LabeledContent("Base URL") {
+                        TextField("Provider endpoint", text: providerBaseURL)
+                            .textContentType(.URL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .settingsField()
                     }
                 }
 
-                if selectedStatus != nil {
-                    Section("Credential") {
-                        credentialControls
+                Picker("Hosted web search", selection: providerWebSearch) {
+                    ForEach(status.webSearch) { search in
+                        Text(search.label).tag(search)
                     }
                 }
+                .settingsPickerStyle()
+                .sensoryFeedback(.selection, trigger: providerWebSearch.wrappedValue)
+                .disabled(status.webSearch.count == 1)
+            }
 
-                providerActionStatus
+            Section("Credential") {
+                credentialControls(status)
+            }
 
-                MobiusActionRow {
-                    Button(
-                        "Save to gateway",
-                        glyph: .floppyDisk,
-                        action: model.saveProviderAsDefault
+            providerActionStatus
+            credentialAction(status)
+        }
+    }
+
+    private var definition: ProviderStatus? {
+        model.providerStatuses.first { $0.provider == provider }
+    }
+
+    @ViewBuilder
+    private func credentialControls(_ status: ProviderStatus) -> some View {
+        @Bindable var model = model
+        if !isNew {
+            LabeledContent("Status") {
+                Text(isConfigured ? "Configured on gateway" : "Not configured")
+                    .font(MobiusStyle.controlFont)
+                    .foregroundStyle(isConfigured ? palette.signal : palette.warning)
+            }
+        }
+        if status.auth == .apiKey {
+            LabeledContent {
+                SecureField("API key", text: $model.providerAPIKey)
+                    .textContentType(.password)
+                    .settingsField()
+            } label: {
+                HStack(spacing: MobiusSpace.xs) {
+                    Text("API key")
+                    SettingsInfoButton(
+                        title: "API key",
+                        detail: "Sent once to the gateway and never returned to this app. Sending a new one replaces the stored key for this setup."
                     )
-                        .mobiusProminentButton()
-                        .disabled(
-                            !hasDefaultChanges
-                                || !providerConfigurationValid
-                                || model.isApplyingConfiguration
-                        )
                 }
-                .settingsStandaloneRow()
-            } else {
-                MobiusUnavailable(
-                    title: "Providers unavailable",
-                    glyph: AppDestination.providers.glyph,
-                    detail: "Connect to a gateway first."
-                )
             }
         }
     }
 
+    /// The credential action stands under the form rather than inside the Credential
+    /// card, so the page ends on one full-width accent button.
     @ViewBuilder
-    private var credentialControls: some View {
-        if let status = selectedStatus {
-            LabeledContent("Status") {
-                Text(status.configured ? "Configured on gateway" : "Not configured")
-                    .font(MobiusStyle.controlFont)
-                    .foregroundStyle(status.configured ? palette.signal : palette.warning)
+    private func credentialAction(_ status: ProviderStatus) -> some View {
+        if status.auth == .apiKey {
+            MobiusActionRow {
+                Button("Send key to gateway", glyph: .key) {
+                    model.saveProviderCredential()
+                }
+                .mobiusProminentButton()
+                .disabled(model.providerAPIKey.isEmpty)
             }
-
-            if status.auth == .apiKey {
-                @Bindable var model = model
-                LabeledContent {
-                    SecureField("New API key", text: $model.providerAPIKey)
-                        .textContentType(.password)
-                        .settingsField()
-                } label: {
-                    HStack(spacing: MobiusSpace.xs) {
-                        Text("API key")
-                        SettingsInfoButton(
-                            title: "API key",
-                            detail: "Sent once to the gateway and never returned to this app."
-                        )
-                    }
+            .settingsStandaloneRow()
+        } else if status.auth == .deviceCode {
+            MobiusActionRow {
+                Button("Start device sign-in", glyph: .signIn) {
+                    model.startProviderLogin()
                 }
-                MobiusActionRow {
-                    Button("Send key to gateway", glyph: .key) {
-                        model.saveProviderCredential(provider: status.provider)
-                    }
-                    .mobiusProminentButton()
-                    .disabled(model.providerAPIKey.isEmpty)
-                }
-            } else if status.auth == .deviceCode {
-                MobiusActionRow {
-                    Button(
-                        "Start device sign-in",
-                        glyph: .signIn
-                    ) {
-                        model.startProviderLogin(provider: status.provider)
-                    }
-                    .mobiusProminentButton()
-                }
+                .mobiusProminentButton()
             }
+            .settingsStandaloneRow()
         }
+    }
+
+    private var isConfigured: Bool {
+        guard let instance = model.providerDraft?.instance else { return false }
+        return model.providerInstances.first { $0.instance == instance }?.configured ?? false
     }
 
     @ViewBuilder
@@ -210,39 +478,18 @@ struct ProvidersView: View {
                     .textSelection(.enabled)
                     .padding(MobiusSpace.m)
                     .background(palette.raised, in: MobiusStyle.controlShape)
-                deviceCodeActions(url: url, code: code)
+                MobiusActionRow {
+                    if let destination = URL(string: url) {
+                        Link("Open verification page", destination: destination)
+                    }
+                    ShareLink("Copy or share code", item: code)
+                }
             }
         case .loginFinished(let provider):
             StatusBanner(tone: .success, title: "Sign-in complete", detail: "\(model.providerLabel(for: provider)) is ready on the gateway.")
         case .failed(let message):
             StatusBanner(tone: .error, title: "Provider action failed", detail: message)
         }
-    }
-
-    @ViewBuilder
-    private func deviceCodeActions(url: String, code: String) -> some View {
-        MobiusActionRow {
-            if let destination = URL(string: url) {
-                Link("Open verification page", destination: destination)
-            }
-            ShareLink("Copy or share code", item: code)
-        }
-    }
-
-    private var selectedStatus: ProviderStatus? {
-        guard let provider = model.providerDraft?.provider else { return nil }
-        return model.providerStatuses.first { $0.provider == provider }
-    }
-
-    private var configuredProviders: [ProviderStatus] {
-        model.providerStatuses.filter(\.configured)
-    }
-
-    private var providerID: Binding<String> {
-        Binding(
-            get: { model.providerDraft?.provider ?? "" },
-            set: { model.selectProvider($0) }
-        )
     }
 
     private var providerBaseURL: Binding<String> {
@@ -272,34 +519,34 @@ struct ProvidersView: View {
             set: { model.providerDraft?.webSearch = $0 }
         )
     }
+}
 
-    private var selectedProviderModel: ProviderModel? {
-        guard let status = selectedStatus,
-              let modelID = model.providerDraft?.model
-        else { return nil }
-        return status.models.first { $0.id == modelID }
-    }
+/// The accent swatches one setup can be marked with.
+private struct ProviderTintPicker: View {
+    @Environment(\.mobiusPalette) private var palette
+    @Binding var selection: ProviderTint
 
-    private var hasDefaultChanges: Bool {
-        guard let draft = model.providerDraft else { return false }
-        if model.defaultAgentSnapshot?.config.provider != draft { return true }
-        guard let status = selectedStatus, status.modelIdsConfigurable else { return false }
-        return model.providerModelIDs != status.modelIds
-            || model.providerReasoningEfforts != status.reasoningEfforts
-    }
-
-    private var providerConfigurationValid: Bool {
-        guard let provider = model.providerDraft,
-              let status = selectedStatus,
-              status.configured,
-              status.webSearch.contains(provider.webSearch)
-        else { return false }
-        if status.modelIdsConfigurable { return !model.providerModelIDs.isEmpty }
-        guard !provider.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !status.models.isEmpty
-        else { return false }
-        guard let providerModel = selectedProviderModel else { return false }
-        return provider.reasoningEffort == nil
-            || providerModel.reasoning.contains { $0.id == provider.reasoningEffort }
+    var body: some View {
+        HStack(spacing: MobiusSpace.xs) {
+            ForEach(ProviderTint.allCases) { tint in
+                Button {
+                    selection = tint
+                } label: {
+                    Circle()
+                        .fill(tint.color)
+                        .frame(width: 18, height: 18)
+                        .overlay(
+                            Circle().strokeBorder(
+                                palette.onAccent,
+                                lineWidth: selection == tint ? 2 : 0
+                            )
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(tint.label)
+                .accessibilityAddTraits(selection == tint ? [.isSelected] : [])
+            }
+        }
+        .sensoryFeedback(.selection, trigger: selection)
     }
 }

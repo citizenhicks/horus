@@ -261,6 +261,7 @@ final class MobiusCloudTests: XCTestCase {
             machineName: "opaque-sprite-machine",
             sessions: [],
             providers: [],
+            providerInstances: [],
             defaultConfig: nil,
             models: [],
             modelProviders: [:],

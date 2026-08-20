@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use super::MAX_TOOL_CALLS;
 use super::REPLAY_REASONING_FIELD;
-use super::provider::{ProviderAuth, ProviderBuildConfig, ProviderDefinition};
+use super::provider::{ProviderAuth, ProviderBuildConfig, ProviderDefinition, validate_base_url};
 use super::transport::MAX_SSE_FRAME_BYTES;
 use super::transport::frame_data;
 use super::transport::push_sse_chunk;
@@ -31,31 +31,38 @@ use crate::protocol::ModelEvent;
 use crate::protocol::TokenUsage;
 use crate::{BoxFuture, Error, Result};
 
-const API_URL: &str = "https://api.moonshot.ai/v1/chat/completions";
+const DEFAULT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 
 /// Kimi's native Chat Completions provider.
 pub struct Kimi {
     client: Client,
-    api_key: String,
+    api_key: Option<String>,
+    base_url: String,
     model: String,
     reasoning_effort: Option<String>,
 }
 
 impl Kimi {
-    /// Creates a provider for Moonshot's fixed Kimi endpoint.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Result<Self> {
-        Self::with_client(api_key, model, streaming_client()?)
+    /// Creates a provider for a Moonshot Kimi endpoint.
+    pub fn new(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Result<Self> {
+        Self::with_client(Some(api_key.into()), base_url, model, streaming_client()?)
     }
 
     fn with_client(
-        api_key: impl Into<String>,
+        api_key: Option<String>,
+        base_url: impl Into<String>,
         model: impl Into<String>,
         client: Client,
     ) -> Result<Self> {
-        let api_key = api_key.into();
-        if api_key.trim().is_empty() {
+        if api_key.as_deref().is_some_and(|key| key.trim().is_empty()) {
             return Err(Error::Config("MOONSHOT_API_KEY is empty".into()));
         }
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        validate_base_url(&base_url)?;
         let model = model.into();
         if model.trim().is_empty() {
             return Err(Error::Config("Kimi model is empty".into()));
@@ -63,6 +70,7 @@ impl Kimi {
         Ok(Self {
             client,
             api_key,
+            base_url,
             model,
             reasoning_effort: None,
         })
@@ -135,13 +143,13 @@ impl Kimi {
     }
 
     async fn post(&self, body: &Value) -> Result<reqwest::Response> {
-        let response = self
+        let mut request = self
             .client
-            .post(API_URL)
-            .bearer_auth(&self.api_key)
-            .json(body)
-            .send()
-            .await?;
+            .post(format!("{}/chat/completions", self.base_url));
+        if let Some(api_key) = &self.api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request.json(body).send().await?;
         if !response.status().is_success() {
             return Err(status_error(response, "Kimi").await);
         }
@@ -534,11 +542,16 @@ pub(super) const fn provider() -> ProviderDefinition {
         build_provider,
     )
     .with_image_input()
+    .with_base_url(DEFAULT_BASE_URL)
+    .with_credentialless_endpoints()
 }
 
 fn build_provider(config: ProviderBuildConfig) -> Result<Arc<dyn Model>> {
-    let api_key = config.credential.into_api_key("kimi")?;
-    let provider = Kimi::with_client(api_key, config.model, config.http)?;
+    let base_url = config
+        .base_url
+        .ok_or_else(|| Error::Config("Kimi requires a base URL".into()))?;
+    let api_key = config.credential.into_optional_api_key("kimi")?;
+    let provider = Kimi::with_client(api_key, base_url, config.model, config.http)?;
     let provider = match config.reasoning_effort {
         Some(effort) => provider.with_reasoning_effort(effort)?,
         None => provider,

@@ -16,6 +16,7 @@ pub struct CredentialStore {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredCredential {
+    provider: String,
     api_key: String,
     base_url: Option<String>,
 }
@@ -232,8 +233,15 @@ impl CredentialStore {
         })
     }
 
-    /// Atomically replaces one API key after provider and size validation.
-    pub fn set(&self, provider_id: &str, api_key: &str, base_url: Option<&str>) -> Result<()> {
+    /// Atomically replaces one instance's API key after provider and size validation.
+    pub fn set(
+        &self,
+        instance: &str,
+        provider_id: &str,
+        api_key: &str,
+        base_url: Option<&str>,
+    ) -> Result<()> {
+        super::validation::validate_instance_id(instance)?;
         let definition = provider(provider_id)?;
         if !matches!(definition.auth(), ProviderAuth::ApiKey(_)) {
             return Err(Error::Config(format!(
@@ -254,10 +262,19 @@ impl CredentialStore {
             .values
             .lock()
             .map_err(|_| Error::Config("provider credential lock is poisoned".into()))?;
+        if let Some(credential) = values.get(instance)
+            && credential.provider != provider_id
+        {
+            return Err(Error::Config(format!(
+                "provider instance `{instance}` already belongs to `{}`",
+                credential.provider
+            )));
+        }
         let mut next = values.clone();
         next.insert(
-            provider_id.into(),
+            instance.into(),
             StoredCredential {
+                provider: provider_id.into(),
                 api_key: api_key.into(),
                 base_url: base_url.map(str::to_owned),
             },
@@ -267,25 +284,40 @@ impl CredentialStore {
         Ok(())
     }
 
-    /// Resolves a credential for model assembly without exposing it to clients.
-    pub fn get(&self, provider_id: &str, base_url: Option<&str>) -> Result<Option<String>> {
+    /// Resolves one instance's credential for model assembly without exposing it to clients.
+    pub fn get(
+        &self,
+        instance: &str,
+        provider_id: &str,
+        base_url: Option<&str>,
+    ) -> Result<Option<String>> {
         let values = self
             .values
             .lock()
             .map_err(|_| Error::Config("provider credential lock is poisoned".into()))?;
         Ok(values
-            .get(provider_id)
-            .filter(|credential| credential.base_url.as_deref() == base_url)
+            .get(instance)
+            .filter(|credential| {
+                credential.provider == provider_id && credential.base_url.as_deref() == base_url
+            })
             .map(|credential| credential.api_key.clone()))
     }
 
-    /// Reports whether an API key is stored for one provider.
-    pub fn configured(&self, provider_id: &str) -> Result<bool> {
-        let values = self
+    /// Atomically removes one instance-scoped API-key credential.
+    pub fn remove(&self, instance: &str) -> Result<bool> {
+        super::validation::validate_instance_id(instance)?;
+        let mut values = self
             .values
             .lock()
             .map_err(|_| Error::Config("provider credential lock is poisoned".into()))?;
-        Ok(values.contains_key(provider_id))
+        if !values.contains_key(instance) {
+            return Ok(false);
+        }
+        let mut next = values.clone();
+        next.remove(instance);
+        save_private_map(&self.path, &next)?;
+        *values = next;
+        Ok(true)
     }
 }
 

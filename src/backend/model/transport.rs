@@ -27,6 +27,33 @@ fn streaming_client_with_idle_timeout(idle_timeout: Duration) -> Result<Client> 
         .build()?)
 }
 
+#[cfg(test)]
+pub(super) async fn capture_http_request() -> (std::net::SocketAddr, tokio::task::JoinHandle<String>)
+{
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("HTTP listener");
+    let address = listener.local_addr().expect("HTTP address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("HTTP connection");
+        let mut request = Vec::new();
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut chunk = [0; 1_024];
+            let count = stream.read(&mut chunk).await.expect("HTTP request");
+            assert_ne!(count, 0, "request ended before its headers");
+            request.extend_from_slice(&chunk[..count]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .await
+            .expect("HTTP response");
+        String::from_utf8(request).expect("request UTF-8")
+    });
+    (address, server)
+}
+
 pub(super) fn account_stream_bytes(total: &mut usize, added: usize, provider: &str) -> Result<()> {
     *total = total
         .checked_add(added)

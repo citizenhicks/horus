@@ -150,7 +150,7 @@ extension AppModel {
             sessions = []
             gatewayMachineName = ""
             selectedSessionID = nil
-            chatRoute = nil
+            navigationPath = []
             sessionToRename = nil
             sessionRenameDraft = ""
             sessionToDelete = nil
@@ -162,18 +162,20 @@ extension AppModel {
             extensions = []
             gatewayContributions = []
             providerStatuses = []
+            providerInstances = []
             defaultAgentSnapshot = nil
             defaultAgentDraft = nil
-            setupProviderDraft = nil
+            providerDraft = nil
         }
         providerAPIKey = ""
         providerModelIDsText = ""
         providerReasoningEffortsText = ""
         providerActionState = .idle
         extensionAction = nil
-        credentialRequestID = nil
+        pendingProviderCredential = nil
         providerLoginRequestID = nil
         providerRegistrationRequestID = nil
+        pendingProviderRemoval = nil
         extensionRequestID = nil
         pairingCodeRequestID = nil
         pairingCodeExpiryTask?.cancel()

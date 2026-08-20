@@ -193,7 +193,13 @@ async fn replacement_ready_precedes_every_reconciled_startup_event() {
     let (store, config) =
         ConfigStore::initialize(root.path().join("state"), listen, None).expect("config");
     let config = config
-        .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
+        .registering_provider(
+            AgentComposition::default().provider,
+            "Test".into(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
         .expect("register provider");
     let credentials =
         Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
@@ -284,6 +290,7 @@ async fn provider_replacement_cuts_over_defaults_and_every_chat_before_ack() {
     let listen = "127.0.0.1:8741".parse().expect("listen address");
     let (store, config) = ConfigStore::initialize(state_dir.clone(), listen, None).expect("config");
     let old = ProviderConfig {
+        instance: "openrouter".into(),
         provider: "openrouter".into(),
         model: "openai/gpt-5".into(),
         base_url: Some("https://old.example/v1".into()),
@@ -292,7 +299,13 @@ async fn provider_replacement_cuts_over_defaults_and_every_chat_before_ack() {
         web_search: mobius::backend::model::provider::HostedWebSearch::Off,
     };
     let config = config
-        .registering_provider(old.clone(), vec![old.model.clone()], Vec::new())
+        .registering_provider(
+            old.clone(),
+            "Test".into(),
+            Default::default(),
+            vec![old.model.clone()],
+            Vec::new(),
+        )
         .expect("register old provider route");
     store.save(&config).expect("save old provider route");
     let credentials =
@@ -343,6 +356,8 @@ async fn provider_replacement_cuts_over_defaults_and_every_chat_before_ack() {
     let ready = gateway
         .register_provider(
             replacement.clone(),
+            "Test".into(),
+            Default::default(),
             vec![replacement.model.clone()],
             Vec::new(),
             true,
@@ -401,6 +416,8 @@ async fn provider_replacement_cuts_over_defaults_and_every_chat_before_ack() {
     gateway
         .register_provider(
             replacement.clone(),
+            "Test".into(),
+            Default::default(),
             vec![replacement.model.clone()],
             Vec::new(),
             true,
@@ -432,6 +449,7 @@ async fn provider_replacement_rejects_before_mutation_when_a_chat_is_busy() {
     let listen = "127.0.0.1:8741".parse().expect("listen address");
     let (store, config) = ConfigStore::initialize(state_dir.clone(), listen, None).expect("config");
     let old = ProviderConfig {
+        instance: "openrouter".into(),
         provider: "openrouter".into(),
         model: "openai/gpt-5".into(),
         base_url: Some("https://old.example/v1".into()),
@@ -440,7 +458,13 @@ async fn provider_replacement_rejects_before_mutation_when_a_chat_is_busy() {
         web_search: mobius::backend::model::provider::HostedWebSearch::Off,
     };
     let config = config
-        .registering_provider(old.clone(), vec![old.model.clone()], Vec::new())
+        .registering_provider(
+            old.clone(),
+            "Test".into(),
+            Default::default(),
+            vec![old.model.clone()],
+            Vec::new(),
+        )
         .expect("register old provider route");
     store.save(&config).expect("save old provider route");
     let credentials =
@@ -491,7 +515,14 @@ async fn provider_replacement_rejects_before_mutation_when_a_chat_is_busy() {
     };
 
     let error = gateway
-        .register_provider(replacement, vec![old.model.clone()], Vec::new(), true)
+        .register_provider(
+            replacement,
+            "Test".into(),
+            Default::default(),
+            vec![old.model.clone()],
+            Vec::new(),
+            true,
+        )
         .await
         .expect_err("busy chat must block provider replacement");
 
@@ -550,14 +581,16 @@ async fn provider_cutover_gate_rejects_a_concurrent_route_change() {
     let listen = "127.0.0.1:8741".parse().expect("listen address");
     let (store, config) = ConfigStore::initialize(state_dir, listen, None).expect("config");
     let current = ProviderConfig {
+        instance: "kimi".into(),
         provider: "kimi".into(),
         model: "kimi-k3".into(),
-        base_url: None,
+        base_url: Some("https://api.moonshot.ai/v1".into()),
         endpoint_auth: crate::wire::ProviderEndpointAuth::ProviderDefault,
         reasoning_effort: Some("max".into()),
         web_search: mobius::backend::model::provider::HostedWebSearch::Off,
     };
     let retiring = ProviderConfig {
+        instance: "openrouter".into(),
         provider: "openrouter".into(),
         model: "openai/gpt-5".into(),
         base_url: Some("https://old.example/v1".into()),
@@ -566,15 +599,32 @@ async fn provider_cutover_gate_rejects_a_concurrent_route_change() {
         web_search: mobius::backend::model::provider::HostedWebSearch::Off,
     };
     let config = config
-        .registering_provider(current.clone(), Vec::new(), Vec::new())
+        .registering_provider(
+            current.clone(),
+            "Test".into(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
         .expect("register current provider")
-        .registering_provider(retiring.clone(), vec![retiring.model.clone()], Vec::new())
+        .registering_provider(
+            retiring.clone(),
+            "Test".into(),
+            Default::default(),
+            vec![retiring.model.clone()],
+            Vec::new(),
+        )
         .expect("register retiring route");
     store.save(&config).expect("save providers");
     let credentials =
         Arc::new(CredentialStore::open(store.credentials_path()).expect("credentials"));
     credentials
-        .set("kimi", "test-secret", None)
+        .set(
+            "kimi",
+            "kimi",
+            "test-secret",
+            Some("https://api.moonshot.ai/v1"),
+        )
         .expect("Kimi credential");
     let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
     let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
@@ -622,6 +672,7 @@ async fn provider_replacement_save_failure_keeps_resident_chats_available() {
     let listen = "127.0.0.1:8741".parse().expect("listen address");
     let (store, config) = ConfigStore::initialize(state_dir.clone(), listen, None).expect("config");
     let old = ProviderConfig {
+        instance: "openrouter".into(),
         provider: "openrouter".into(),
         model: "openai/gpt-5".into(),
         base_url: Some("https://old.example/v1".into()),
@@ -630,7 +681,13 @@ async fn provider_replacement_save_failure_keeps_resident_chats_available() {
         web_search: mobius::backend::model::provider::HostedWebSearch::Off,
     };
     let config = config
-        .registering_provider(old.clone(), vec![old.model.clone()], Vec::new())
+        .registering_provider(
+            old.clone(),
+            "Test".into(),
+            Default::default(),
+            vec![old.model.clone()],
+            Vec::new(),
+        )
         .expect("register old provider route");
     store.save(&config).expect("save old provider route");
     let credentials =
@@ -661,7 +718,14 @@ async fn provider_replacement_save_failure_keeps_resident_chats_available() {
     };
 
     gateway
-        .register_provider(replacement, vec![old.model.clone()], Vec::new(), true)
+        .register_provider(
+            replacement,
+            "Test".into(),
+            Default::default(),
+            vec![old.model.clone()],
+            Vec::new(),
+            true,
+        )
         .await
         .expect_err("gateway config save must fail");
 
@@ -707,6 +771,7 @@ async fn provider_replacement_retry_migrates_a_stale_resident_router() {
     let listen = "127.0.0.1:8741".parse().expect("listen address");
     let (store, config) = ConfigStore::initialize(state_dir, listen, None).expect("config");
     let old = ProviderConfig {
+        instance: "openrouter".into(),
         provider: "openrouter".into(),
         model: "openai/gpt-5".into(),
         base_url: Some("https://old.example/v1".into()),
@@ -715,7 +780,13 @@ async fn provider_replacement_retry_migrates_a_stale_resident_router() {
         web_search: mobius::backend::model::provider::HostedWebSearch::Off,
     };
     let config = config
-        .registering_provider(old.clone(), vec![old.model.clone()], Vec::new())
+        .registering_provider(
+            old.clone(),
+            "Test".into(),
+            Default::default(),
+            vec![old.model.clone()],
+            Vec::new(),
+        )
         .expect("register old provider route");
     store.save(&config).expect("save old provider route");
     let credentials =
@@ -774,6 +845,8 @@ async fn provider_replacement_retry_migrates_a_stale_resident_router() {
     gateway
         .register_provider(
             replacement.clone(),
+            "Test".into(),
+            Default::default(),
             vec![old.model.clone()],
             Vec::new(),
             true,
@@ -781,7 +854,14 @@ async fn provider_replacement_retry_migrates_a_stale_resident_router() {
         .await
         .expect_err("first actor migration must fail");
     gateway
-        .register_provider(replacement, vec![old.model], Vec::new(), true)
+        .register_provider(
+            replacement,
+            "Test".into(),
+            Default::default(),
+            vec![old.model],
+            Vec::new(),
+            true,
+        )
         .await
         .expect("retry must revisit the stale resident router");
 
@@ -1103,7 +1183,13 @@ async fn chats_keep_independent_workspace_and_agent_configuration() {
     let listen = "127.0.0.1:8741".parse().expect("listen address");
     let (store, config) = ConfigStore::initialize(state, listen, None).expect("config");
     let config = config
-        .registering_provider(AgentComposition::default().provider, Vec::new(), Vec::new())
+        .registering_provider(
+            AgentComposition::default().provider,
+            "Test".into(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
         .expect("register provider");
     let credentials =
         Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
@@ -1197,7 +1283,7 @@ async fn model_selection_updates_only_the_chat_and_new_chats_keep_the_gateway_de
     let credentials =
         Arc::new(CredentialStore::open(store.credentials_path()).expect("credential store"));
     credentials
-        .set("openai_socket", "test-secret", None)
+        .set("openai_socket", "openai_socket", "test-secret", None)
         .expect("OpenAI credential");
     let cron = Arc::new(CronStore::open(store.state_dir()).expect("cron"));
     let gateway = GatewayHost::start(store, config, credentials, cron).expect("gateway");
@@ -1205,6 +1291,7 @@ async fn model_selection_updates_only_the_chat_and_new_chats_keep_the_gateway_de
     let ready = gateway
         .register_provider(
             ProviderConfig {
+                instance: "openai_socket".into(),
                 provider: "openai_socket".into(),
                 model: "gpt-5.6-sol".into(),
                 base_url: None,
@@ -1212,6 +1299,8 @@ async fn model_selection_updates_only_the_chat_and_new_chats_keep_the_gateway_de
                 reasoning_effort: Some("medium".into()),
                 web_search: mobius::backend::model::provider::HostedWebSearch::Off,
             },
+            "Test".into(),
+            Default::default(),
             Vec::new(),
             Vec::new(),
             false,

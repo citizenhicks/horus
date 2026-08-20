@@ -126,6 +126,7 @@ fn connection_handshakes_have_no_session_replay_cursor() {
 #[test]
 fn saved_provider_credential_has_no_impossible_status_flag() {
     let frame = ServerFrame::new(ServerMessage::ProviderCredentialSaved {
+        instance: "kimi".into(),
         request_id: "credential-1".into(),
         provider: "openai_socket".into(),
     });
@@ -309,6 +310,7 @@ fn provider_registration_is_gateway_scoped() {
     let frame = ClientFrame::new(ClientMessage::RegisterProvider {
         request_id: "request-provider".into(),
         config: ProviderConfig {
+            instance: "kimi".into(),
             provider: "kimi".into(),
             model: "kimi-k3".into(),
             base_url: None,
@@ -316,6 +318,8 @@ fn provider_registration_is_gateway_scoped() {
             reasoning_effort: Some("max".into()),
             web_search: HostedWebSearch::Off,
         },
+        label: "Kimi".into(),
+        tint: Default::default(),
         model_ids: Vec::new(),
         reasoning_efforts: Vec::new(),
         replace_existing_selections: false,
@@ -333,18 +337,40 @@ fn provider_registration_is_gateway_scoped() {
 }
 
 #[test]
+fn provider_removal_is_gateway_scoped() {
+    let encoded = serde_json::to_value(ClientFrame::new(ClientMessage::RemoveProvider {
+        request_id: "request-provider".into(),
+        instance: "kimi-work".into(),
+    }))
+    .expect("encode provider removal");
+
+    assert_eq!(
+        encoded,
+        serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "type": "remove_provider",
+            "request_id": "request-provider",
+            "instance": "kimi-work"
+        })
+    );
+}
+
+#[test]
 fn provider_registration_requires_a_reasoning_catalog() {
     let frame = serde_json::json!({
         "version": PROTOCOL_VERSION,
         "type": "register_provider",
         "request_id": "request-provider",
         "config": {
+            "instance": "openrouter",
             "provider": "openrouter",
             "model": "openai/gpt-5",
             "endpoint_auth": "provider_default",
             "reasoning_effort": "high",
             "web_search": "off"
         },
+        "label": "OpenRouter",
+        "tint": "blue",
         "model_ids": ["openai/gpt-5"],
         "replace_existing_selections": false
     });
@@ -731,6 +757,7 @@ fn gateway_ready_contains_no_selected_session() {
             machine_name: "snowwhite.local".into(),
             sessions: Vec::new(),
             providers: Vec::new(),
+            provider_instances: Vec::new(),
             default_config: Some(VersionedAgentConfig {
                 revision: 1,
                 config: AgentComposition::default(),
@@ -843,6 +870,7 @@ fn server_frame_decodes_session_opened_with_a_widget_action_tag() {
                 "revision": 1,
                 "config": {
                     "provider": {
+                        "instance": "openai_codex",
                         "provider": "openai_codex",
                         "model": "model-a",
                         "endpoint_auth": "provider_default",

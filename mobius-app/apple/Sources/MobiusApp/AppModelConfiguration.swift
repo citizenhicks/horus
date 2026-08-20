@@ -22,7 +22,7 @@ extension AppModel {
         return modelChoices.first { choice in
             choice.model == provider.model
                 && choice.reasoningEffort == provider.reasoningEffort
-                && providerStatus(for: choice)?.provider == provider.provider
+                && modelProviders[choice.route] == provider.instance
         }?.route
     }
 
@@ -39,8 +39,10 @@ extension AppModel {
         selectingModelRoute route: String
     ) -> AgentComposition? {
         guard let choice = modelChoices.first(where: { $0.route == route }),
-              let status = providerStatus(for: choice),
-              var provider = status.selection,
+              let instance = modelProviders[choice.route],
+              var provider = providerInstances
+                  .first(where: { $0.instance == instance })?
+                  .selection,
               var draft = currentDraft
         else { return currentDraft }
         provider.model = choice.model
@@ -54,29 +56,71 @@ extension AppModel {
     }
 
     func modelLabel(provider: String?, modelID: String) -> String {
-        guard let provider else { return modelID }
-        return providerStatuses
-            .first { $0.provider == provider }?
+        guard let instance = provider else { return modelID }
+        return providerStatus(forInstance: instance)?
             .models.first { $0.id == modelID }?
             .label ?? modelID
     }
 
-    func providerLabel(for provider: String) -> String {
-        providerStatuses.first { $0.provider == provider }?.label ?? provider
+    /// The user-facing name of one setup, so two setups of a provider stay distinguishable.
+    func providerLabel(for instance: String) -> String {
+        if providerDraft?.instance == instance {
+            let label = providerLabelDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !label.isEmpty { return label }
+        }
+        return providerInstances.first { $0.instance == instance }?.label
+            ?? providerStatuses.first { $0.provider == instance }?.label
+            ?? instance
     }
 
     func providerLabel(for choice: ModelChoice) -> String {
-        guard let provider = modelProviders[choice.route] else { return choice.group }
-        return providerLabel(for: provider)
+        guard let instance = modelProviders[choice.route] else { return choice.group }
+        return providerLabel(for: instance)
     }
 
     func providerSymbol(for choice: ModelChoice) -> String? {
         providerStatus(for: choice)?.symbol
     }
 
+    /// The accent of the setup behind one route, so two setups of a provider differ.
+    func providerTint(for choice: ModelChoice) -> ProviderTint {
+        guard let instance = modelProviders[choice.route] else { return .blue }
+        return providerInstances.first { $0.instance == instance }?.tint ?? .blue
+    }
+
     private func providerStatus(for choice: ModelChoice) -> ProviderStatus? {
-        guard let provider = modelProviders[choice.route] else { return nil }
-        return providerStatuses.first { $0.provider == provider }
+        guard let instance = modelProviders[choice.route] else { return nil }
+        return providerStatus(forInstance: instance)
+    }
+
+    /// The definition backing one configured setup.
+    func providerStatus(forInstance instance: String) -> ProviderStatus? {
+        guard let entry = providerInstances.first(where: { $0.instance == instance }) else {
+            return nil
+        }
+        return providerStatuses.first { $0.provider == entry.provider }
+    }
+
+    func distinctModels(in choices: [ModelChoice]) -> [ModelChoice] {
+        var seen = Set<String>()
+        return choices.filter { choice in
+            let instance = modelProviders[choice.route] ?? choice.route
+            return seen.insert("\(instance)\u{0}\(choice.model)").inserted
+        }
+    }
+
+    func modelChoices(
+        matching selected: ModelChoice,
+        in choices: [ModelChoice]
+    ) -> [ModelChoice] {
+        choices.filter { sameModel($0, selected) }
+    }
+
+    func sameModel(_ lhs: ModelChoice, _ rhs: ModelChoice) -> Bool {
+        guard let lhsInstance = modelProviders[lhs.route],
+              let rhsInstance = modelProviders[rhs.route]
+        else { return lhs.route == rhs.route }
+        return lhsInstance == rhsInstance && lhs.model == rhs.model
     }
 
     func interrupt() {
@@ -228,20 +272,35 @@ extension AppModel {
         showToast("Default agent draft reloaded.", tone: .info)
     }
 
-    func selectProvider(_ provider: String) {
+    /// Starts a new setup of `provider` with the identity used by credentials and registration.
+    func addProviderInstance(_ provider: String) {
         guard let status = providerStatuses.first(where: { $0.provider == provider }),
               let webSearch = status.webSearch.first
         else { return }
         let selectedModel = status.models.first
-        providerDraft = status.selection ?? ProviderConfig(
+        providerLabelDraft = status.label
+        providerTintDraft = .blue
+        providerDraft = ProviderConfig(
+            instance: UUID().uuidString.lowercased(),
             provider: status.provider,
-            model: selectedModel?.id ?? status.modelIds.first ?? "",
+            model: selectedModel?.id ?? "",
             baseUrl: status.defaultBaseUrl,
             reasoningEffort: selectedModel?.defaultReasoning,
             webSearch: webSearch
         )
-        providerModelIDsText = status.modelIds.joined(separator: ", ")
-        providerReasoningEffortsText = status.reasoningEfforts.joined(separator: ", ")
+        providerModelIDsText = ""
+        providerReasoningEffortsText = ""
+        providerAPIKey = ""
+        providerActionState = .idle
+    }
+
+    /// Loads an existing setup for editing. Every field, including the key, is replaceable.
+    func editProviderInstance(_ instance: ProviderInstance) {
+        providerLabelDraft = instance.label
+        providerTintDraft = instance.tint
+        providerDraft = instance.selection
+        providerModelIDsText = instance.modelIds.joined(separator: ", ")
+        providerReasoningEffortsText = instance.reasoningEfforts.joined(separator: ", ")
         providerAPIKey = ""
         providerActionState = .idle
     }
@@ -276,77 +335,89 @@ extension AppModel {
         providerDraft?.reasoningEffort = providerReasoningEfforts.first
     }
 
-    func selectProviderModel(_ modelID: String) {
-        guard let status = providerStatuses.first(where: {
-            $0.provider == providerDraft?.provider
-        }) else { return }
-        providerDraft?.model = modelID
-        providerDraft?.reasoningEffort = status.models
-            .first(where: { $0.id == modelID })?
-            .defaultReasoning
-    }
-
-    func saveProviderCredential(provider: String) {
+    func saveProviderCredential() {
         let key = providerAPIKey
-        guard !key.isEmpty else {
+        guard let config = providerDraft, !key.isEmpty else {
             let message = "Enter an API key. It will be sent once and never read back."
             providerActionState = .failed(message)
             showToast(message, tone: .error)
             return
         }
         let id = requestID("credential")
-        credentialRequestID = id
-        providerActionState = .savingCredential(provider)
+        pendingProviderCredential = (
+            requestID: id,
+            instance: config.instance,
+            provider: config.provider
+        )
+        providerActionState = .savingCredential(config.instance)
         let request: GatewayRequest
-        if let baseURL = providerDraft?.baseUrl {
+        if let baseURL = config.baseUrl {
             request = .setProviderEndpointCredential(
                 requestID: id,
-                provider: provider,
+                instance: config.instance,
+                provider: config.provider,
                 baseURL: baseURL,
                 apiKey: key
             )
         } else {
-            request = .setProviderCredential(requestID: id, provider: provider, apiKey: key)
+            request = .setProviderCredential(
+                requestID: id,
+                instance: config.instance,
+                provider: config.provider,
+                apiKey: key
+            )
         }
         transmit(request) { [weak self] message in
-            self?.providerActionState = .failed(message)
+            guard let self, self.pendingProviderCredential?.requestID == id else { return }
+            self.pendingProviderCredential = nil
+            self.providerActionState = .failed(message)
         }
-    }
-
-    func saveProviderAsDefault() {
-        registerProvider()
     }
 
     func registerProvider() {
-        guard var config = defaultAgentDraft?.provider ?? setupProviderDraft,
+        guard var config = providerDraft,
               let status = providerStatuses.first(where: { $0.provider == config.provider })
         else { return }
-        let modelIDs = status.modelIdsConfigurable ? providerModelIDs : status.modelIds
-        let reasoningEfforts = status.modelIdsConfigurable
-            ? providerReasoningEfforts
-            : status.reasoningEfforts
+        let modelIDs = status.modelIdsConfigurable ? providerModelIDs : []
+        let reasoningEfforts = status.modelIdsConfigurable ? providerReasoningEfforts : []
         if status.modelIdsConfigurable {
             guard let first = modelIDs.first else { return }
             config.model = first
             config.reasoningEffort = reasoningEfforts.first
         }
-        defaultAgentDraft?.provider = config
         let id = requestID("provider")
         providerRegistrationRequestID = id
-        defaultAgentApplyState = .applying
         transmit(.registerProvider(
             requestID: id,
             config: config,
+            label: providerLabelDraft.trimmingCharacters(in: .whitespacesAndNewlines),
+            tint: providerTintDraft,
             modelIds: modelIDs,
             reasoningEfforts: reasoningEfforts
         )) { [weak self] message in
             guard self?.providerRegistrationRequestID == id else { return }
             self?.providerRegistrationRequestID = nil
-            self?.defaultAgentApplyState = .failed(message)
+            self?.providerActionState = .failed(message)
         }
     }
 
-    func startProviderLogin(provider: String) {
+    func removeProvider(_ instance: String) {
+        guard !isApplyingConfiguration,
+              connectionState.isReady,
+              providerInstances.contains(where: { $0.instance == instance })
+        else { return }
+        let id = requestID("provider-remove")
+        pendingProviderRemoval = (requestID: id, instance: instance)
+        providerActionState = .idle
+        transmit(.removeProvider(requestID: id, instance: instance)) { [weak self] message in
+            guard self?.pendingProviderRemoval?.requestID == id else { return }
+            self?.pendingProviderRemoval = nil
+            self?.providerActionState = .failed(message)
+        }
+    }
+
+    func startProviderLogin() {
+        guard let provider = providerDraft?.provider else { return }
         let id = requestID("login")
         providerLoginRequestID = id
         providerActionState = .startingLogin(provider)

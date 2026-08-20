@@ -180,7 +180,7 @@ extension AppModelTests {
 
         XCTAssertEqual(model.sessions.map(\.sessionId), ["chat-1", "chat-2"])
         XCTAssertNil(model.selectedSessionID)
-        XCTAssertNil(model.chatRoute)
+        XCTAssertTrue(model.navigationPath.isEmpty)
         let requests = await recorder.requests()
         XCTAssertFalse(requests.contains { request in
             if case .openSession = request { return true }
@@ -198,8 +198,7 @@ extension AppModelTests {
         model.openChat("chat-2")
 
         XCTAssertEqual(model.destination, .chats)
-        XCTAssertEqual(model.chatRoute, .session("chat-2"))
-        XCTAssertTrue(model.chatNavigationPath.isEmpty)
+        XCTAssertEqual(model.navigationPath, [.chat(.session("chat-2"))])
         let request = await recorder.firstRequest(after: requestCount) { request in
             guard case .openSession(_, "chat-2", _) = request else { return false }
             return true
@@ -211,7 +210,7 @@ extension AppModelTests {
             requestID: requestID,
             payload: sessionReady(latestSequence: 0, sessionID: "chat-2")
         ))
-        XCTAssertEqual(model.chatNavigationPath, [.session("chat-2")])
+        XCTAssertEqual(model.navigationPath, [.chat(.session("chat-2"))])
         try await Task.sleep(for: .milliseconds(30))
         let requests = await recorder.requests()
         let opens = requests.dropFirst(requestCount).filter { request in
@@ -221,16 +220,16 @@ extension AppModelTests {
         XCTAssertEqual(opens.count, 1)
     }
 
-    func testPoppingChatNavigationPathClearsPresentedChat() throws {
+    func testPoppingNavigationPathClearsPresentedChat() throws {
         let model = try model()
         model.selectedSessionID = "chat-1"
-        model.chatRoute = .session("chat-1")
+        model.navigationPath = [.chat(.session("chat-1"))]
 
-        XCTAssertEqual(model.chatNavigationPath, [.session("chat-1")])
+        XCTAssertEqual(model.navigationPath, [.chat(.session("chat-1"))])
 
-        model.chatNavigationPath = []
+        model.navigationPath = []
 
-        XCTAssertNil(model.chatRoute)
+        XCTAssertNil(model.presentedChatSessionID)
     }
 
     func testCreatedSessionPresentsChatOnlyAfterGatewayOpensIt() async throws {
@@ -248,7 +247,7 @@ extension AppModelTests {
             return XCTFail("Expected a create-session request")
         }
         XCTAssertEqual(path, "/srv/mobius")
-        XCTAssertNil(model.chatRoute)
+        XCTAssertTrue(model.navigationPath.isEmpty)
 
         model.handle(.sessionOpened(
             requestID: requestID,
@@ -257,7 +256,7 @@ extension AppModelTests {
 
         XCTAssertEqual(model.destination, .chats)
         XCTAssertEqual(model.selectedSessionID, "chat-created")
-        XCTAssertEqual(model.chatRoute, .session("chat-created"))
+        XCTAssertEqual(model.navigationPath, [.chat(.session("chat-created"))])
     }
 
     func testDeletingPresentedChatReturnsToCatalogWithoutOpeningAnother() async throws {
@@ -269,13 +268,13 @@ extension AppModelTests {
         model.sessions = [selected, remaining]
         model.selectedSessionID = selected.sessionId
         model.destination = .chats
-        model.chatRoute = .session(selected.sessionId)
+        model.navigationPath = [.chat(.session(selected.sessionId))]
 
         let requestCount = await recorder.requestCount()
         model.deleteSession(selected)
 
         XCTAssertNil(model.selectedSessionID)
-        XCTAssertNil(model.chatRoute)
+        XCTAssertTrue(model.navigationPath.isEmpty)
         let request = await recorder.firstRequest(after: requestCount) { request in
             guard case .deleteSession(_, "chat-1") = request else { return false }
             return true
@@ -303,7 +302,7 @@ extension AppModelTests {
         model.sessions = [selected]
         model.selectedSessionID = selected.sessionId
         model.destination = .chats
-        model.chatRoute = .session(selected.sessionId)
+        model.navigationPath = [.chat(.session(selected.sessionId))]
 
         model.deleteSession(selected)
         let deleteRequest = await recorder.firstRequest(after: 0) { request in
@@ -323,7 +322,7 @@ extension AppModelTests {
         )))
 
         XCTAssertEqual(model.destination, .chats)
-        XCTAssertEqual(model.chatRoute, .session("chat-1"))
+        XCTAssertEqual(model.navigationPath, [.chat(.session("chat-1"))])
         let openRequest = await recorder.firstRequest(after: requestCount) { request in
             guard case .openSession(_, "chat-1", _) = request else { return false }
             return true
@@ -342,7 +341,7 @@ extension AppModelTests {
         model.sessions = [selected]
         model.selectedSessionID = selected.sessionId
         model.destination = .chats
-        model.chatRoute = .session(selected.sessionId)
+        model.navigationPath = [.chat(.session(selected.sessionId))]
         model.activeTurnID = "turn-1"
         model.activeOperation = "steer"
         model.composer = "Keep working"
@@ -359,7 +358,7 @@ extension AppModelTests {
         model.deleteSession(selected)
 
         XCTAssertNil(model.selectedSessionID)
-        XCTAssertNil(model.chatRoute)
+        XCTAssertTrue(model.navigationPath.isEmpty)
         let openRequest = await recorder.firstRequest(after: requestCount) { request in
             guard case .openSession(_, "chat-1", _) = request else { return false }
             return true
@@ -367,7 +366,7 @@ extension AppModelTests {
 
         XCTAssertNotNil(openRequest)
         XCTAssertEqual(model.destination, .chats)
-        XCTAssertEqual(model.chatRoute, .session("chat-1"))
+        XCTAssertEqual(model.navigationPath, [.chat(.session("chat-1"))])
     }
 
     func testTaskCompleteFlushesPendingReasoning() throws {

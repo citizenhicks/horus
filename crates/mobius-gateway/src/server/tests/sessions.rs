@@ -12,6 +12,8 @@ async fn paired_client_uploads_lists_reads_and_submits_a_session_file() {
     let config = config
         .registering_provider(
             crate::wire::AgentComposition::default().provider,
+            "Test".into(),
+            Default::default(),
             Vec::new(),
             Vec::new(),
         )

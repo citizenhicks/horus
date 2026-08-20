@@ -47,6 +47,7 @@ extension GatewayWireTests {
     func testProviderAndUtilityRequestsMatchV28() throws {
         let credential = try requestObject(.setProviderCredential(
             requestID: "credential-1",
+            instance: "openai-work",
             provider: "openai_socket",
             apiKey: "secret"
         ))
@@ -55,6 +56,7 @@ extension GatewayWireTests {
 
         let endpointCredential = try requestObject(.setProviderEndpointCredential(
             requestID: "endpoint-1",
+            instance: "responses-local",
             provider: "openai_compatible",
             baseURL: "https://models.example/v1",
             apiKey: "secret"
@@ -64,6 +66,8 @@ extension GatewayWireTests {
         let registered = try requestObject(.registerProvider(
             requestID: "register-1",
             config: composition.provider,
+            label: "Work",
+            tint: .purple,
             modelIds: ["gpt-5.6-sol", "gpt-5.6-mini"],
             reasoningEfforts: ["medium", "high"]
         ))
@@ -74,6 +78,8 @@ extension GatewayWireTests {
         XCTAssertEqual(registered["model_ids"] as? [String], ["gpt-5.6-sol", "gpt-5.6-mini"])
         XCTAssertEqual(registered["reasoning_efforts"] as? [String], ["medium", "high"])
         XCTAssertEqual(registered["replace_existing_selections"] as? Bool, false)
+        XCTAssertEqual(registered["label"] as? String, "Work")
+        XCTAssertEqual(registered["tint"] as? String, "purple")
 
         let directory = try requestObject(.createWorkspaceDirectory(
             requestID: "create-directory-1",
@@ -93,6 +99,17 @@ extension GatewayWireTests {
         for (request, type) in requests {
             XCTAssertEqual(try requestObject(request)["type"] as? String, type)
         }
+    }
+
+    func testRemoveProviderRequestUsesInstanceIdentity() throws {
+        let request = try requestObject(.removeProvider(
+            requestID: "remove-provider-1",
+            instance: "openai-work"
+        ))
+
+        XCTAssertEqual(request["type"] as? String, "remove_provider")
+        XCTAssertEqual(request["request_id"] as? String, "remove-provider-1")
+        XCTAssertEqual(request["instance"] as? String, "openai-work")
     }
 
     func testConfigureDefaultAgentUsesDefaultRevisionWithoutSessionScope() throws {

@@ -84,6 +84,8 @@ struct ExtensionRecord: Identifiable, Decodable, Equatable, Sendable {
 }
 
 struct ProviderConfig: Codable, Equatable, Sendable {
+    /// Identifies one configured setup.
+    var instance: String = ""
     var provider: String
     var model: String
     var baseUrl: String?
@@ -265,6 +267,7 @@ struct FrontendSettingOption: Identifiable, Decodable, Equatable, Sendable {
     }
 }
 
+/// One provider the gateway can be set up with. Several setups may share one.
 struct ProviderStatus: Identifiable, Codable, Equatable, Sendable {
     var id: String { provider }
 
@@ -272,16 +275,27 @@ struct ProviderStatus: Identifiable, Codable, Equatable, Sendable {
     let label: String
     let symbol: String
     let description: String
-    var configured: Bool
-    let selection: ProviderConfig?
     let auth: ProviderAuthKind
     let defaultBaseUrl: String?
     let defaultApiKeyEnv: String?
     let models: [ProviderModel]
-    let modelIds: [String]
-    let reasoningEfforts: [String]
     let modelIdsConfigurable: Bool
     let webSearch: [HostedWebSearch]
+
+}
+
+/// One durable setup of a provider, named by the user.
+struct ProviderInstance: Identifiable, Codable, Equatable, Sendable {
+    var id: String { instance }
+    var instance: String { selection.instance }
+    var provider: String { selection.provider }
+
+    let label: String
+    let tint: ProviderTint
+    var configured: Bool
+    let selection: ProviderConfig
+    let modelIds: [String]
+    let reasoningEfforts: [String]
 }
 
 enum GatewayClientKind: String, Codable, Sendable {

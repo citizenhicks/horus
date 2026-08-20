@@ -143,122 +143,79 @@ struct SettingsStatusAccessory: View {
 struct GatewayView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.mobiusPalette) private var palette
-    @State private var confirmsForget = false
-    @State private var renameDraft = ""
-    @State private var showsRename = false
+    @State private var forgetting: GatewayAccount?
 
     var body: some View {
+        let status = gatewayStatus
         PageScaffold(
             title: "Gateway",
-            detail: "Manage the selected gateway and pair another device."
+            detail: "Gateways this device is paired with. Chats run on the selected one.",
+            headerAccessory: {
+                HStack(spacing: MobiusSpace.xxs) {
+                    Button {
+                        model.showsPairing = true
+                    } label: {
+                        MobiusIcon(.plus, gutter: false)
+                    }
+                    .mobiusProminentIconButton()
+                    .accessibilityLabel("Pair gateway")
+                    .accessibilityHint("Opens pairing with a self-hosted gateway")
+                    .help("Pair gateway")
+                    SettingsStatusAccessory(
+                        subject: "Gateway",
+                        hasChanges: false,
+                        isSaving: false,
+                        saveDisabled: false,
+                        statusLabel: status.label,
+                        statusDetail: status.detail,
+                        statusColor: status.color,
+                        saveLabel: "Pair gateway",
+                        save: { model.showsPairing = true }
+                    )
+                }
+                .fixedSize()
+            }
         ) {
-            Section {
+            if !model.accounts.isEmpty {
+                Section("Active") {
+                    // The same control as the chats header, so switching does not
+                    // require stepping into a gateway's detail page.
+                    Picker("Gateway", selection: Binding(
+                        get: { model.selectedAccountID },
+                        set: { model.selectAccount($0) }
+                    )) {
+                        ForEach(model.accounts) { account in
+                            Text(account.machineName)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .tag(Optional(account.id))
+                        }
+                    }
+                    .settingsPickerStyle()
+                    .sensoryFeedback(.selection, trigger: model.selectedAccountID)
+                    LabeledContent("Status") {
+                        HStack(spacing: MobiusSpace.s) {
+                            Circle()
+                                .fill(model.connectionState.tone.color(in: palette))
+                                .frame(width: 7, height: 7)
+                            Text(model.connectionState.label)
+                        }
+                        .font(MobiusStyle.controlFont)
+                    }
+                }
+            }
+
+            Section("Paired") {
                 if model.accounts.isEmpty {
-                    Text("No gateway configured on this device.")
+                    Text("No gateway paired on this device.")
+                        .font(MobiusStyle.captionFont)
                         .foregroundStyle(palette.muted)
                 } else {
                     ForEach(model.accounts) { account in
-                        LabeledContent(account.machineName) {
-                            Text("Configured")
-                                .foregroundStyle(palette.signal)
-                        }
+                        pairedRow(account)
                     }
                 }
-            } header: {
-                HStack(spacing: MobiusSpace.xs) {
-                    Text("Configured")
-                    SettingsInfoButton(
-                        title: "Configured gateways",
-                        detail: "Paired gateways are listed by the machine name they report after authentication."
-                    )
-                }
             }
-
-            Section("Gateway") {
-                Picker("Gateway", selection: Binding(
-                    get: { model.selectedAccountID },
-                    set: { model.selectAccount($0) }
-                )) {
-                    ForEach(model.accounts) { account in
-                        Text(account.machineName)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .tag(Optional(account.id))
-                    }
-                }
-                .settingsPickerStyle()
-                .sensoryFeedback(.selection, trigger: model.selectedAccountID)
-                LabeledContent("Status") {
-                    HStack(spacing: MobiusSpace.s) {
-                        Circle()
-                            .fill(model.connectionState.tone.color(in: palette))
-                            .frame(width: 7, height: 7)
-                        Text(model.connectionState.label)
-                    }
-                    .font(MobiusStyle.controlFont)
-                }
-                HStack(spacing: MobiusSpace.m) {
-                    Text("Endpoint")
-                    Spacer(minLength: MobiusSpace.s)
-                    Text(model.selectedAccount?.endpoint.rawValue ?? "—")
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                        .textSelection(.enabled)
-                }
-                LabeledContent("Transport", value: transportName)
-                LabeledContent("Wire protocol", value: "v\(gatewayProtocolVersion)")
-            }
-
-            HStack(spacing: MobiusSpace.s) {
-                Button("Reconnect", glyph: .arrowClockwise, action: model.reconnect)
-                    .mobiusIconButton()
-                Button("Pair to self-hosted gateway", glyph: .plus) {
-                    model.showsPairing = true
-                }
-                .mobiusIconButton()
-                Button("Rename", glyph: .pencilSimple) {
-                    renameDraft = model.selectedAccount?.displayName ?? ""
-                    showsRename = true
-                }
-                .mobiusIconButton()
-                .disabled(model.selectedAccount == nil)
-                Button("Forget", glyph: .trash, role: .destructive) {
-                    confirmsForget = true
-                }
-                .mobiusIconButton()
-            }
-            .frame(maxWidth: .infinity)
-            .settingsStandaloneRow()
-
-            Section("Pair another device") {
-                SettingsCaption("Ask this gateway for a short-lived code, then enter it with the same gateway address on the other device.")
-                if let pairing = model.pairingCodeInfo {
-                    Text(pairing.code)
-                        .font(.system(.title2, design: .monospaced, weight: .bold))
-                        .tracking(3)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                    LabeledContent("Expires") {
-                        Text(pairing.expiresAt, style: .relative)
-                    }
-                    .foregroundStyle(palette.muted)
-                }
-            }
-
-            MobiusActionRow {
-                if let pairing = model.pairingCodeInfo {
-                    ShareLink("Copy or share", item: pairing.code)
-                } else {
-                    Button(
-                        "Create one-time code",
-                        glyph: .key,
-                        action: model.createPairingCode
-                    )
-                        .mobiusProminentButton()
-                }
-            }
-            .settingsStandaloneRow()
 
             if !model.selectedGatewayIsMobiusCloud {
                 Section("möbius Cloud") {
@@ -269,25 +226,229 @@ struct GatewayView: View {
         }
         .alert(
             "Forget this gateway?",
-            isPresented: $confirmsForget
+            isPresented: Binding(
+                get: { forgetting != nil },
+                set: { if !$0 { forgetting = nil } }
+            )
         ) {
-            Button("Forget gateway", role: .destructive, action: model.forgetSelectedGateway)
-            Button("Cancel", role: .cancel) {}
+            Button("Forget gateway", role: .destructive) {
+                forgetting.map(model.forgetGateway)
+                forgetting = nil
+            }
+            Button("Cancel", role: .cancel) { forgetting = nil }
         } message: {
             Text("You will need to pair with this gateway again.")
         }
-        .alert("Rename gateway", isPresented: $showsRename) {
-            TextField("Gateway name", text: $renameDraft)
-            Button("Cancel", role: .cancel) {}
-            Button("Rename") { model.renameSelectedGateway(renameDraft) }
-                .disabled(renameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    private var gatewayStatus: (label: String, detail: String, color: Color) {
+        switch model.connectionState {
+        case .ready:
+            return (
+                model.connectionState.label,
+                "\(model.accounts.count) paired · \(model.selectedAccount?.machineName ?? "none") selected",
+                palette.signal
+            )
+        case .failed(let message):
+            return ("Needs attention", message, palette.danger)
+        default:
+            return (
+                model.connectionState.label,
+                "Pair a gateway to run chats on it.",
+                palette.warning
+            )
         }
     }
 
-    private var transportName: String {
-        guard let endpoint = model.selectedAccount?.endpoint else { return "—" }
-        if endpoint.usesWebSocket { return "WebSocket TLS" }
-        return endpoint.usesTLS ? "TLS" : "Loopback TCP"
+    private func pairedRow(_ account: GatewayAccount) -> some View {
+        HStack(spacing: MobiusSpace.s) {
+            Button {
+                model.navigationPath = [.settings(.gateway(account.id))]
+            } label: {
+                PairedGatewayLabel(account: account)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Shows this gateway's settings")
+
+            if account.id == model.selectedAccountID {
+                MobiusIcon(.check, size: MobiusStyle.glyphMark, foreground: palette.signal)
+                    .accessibilityLabel("Selected")
+            }
+
+            MobiusIcon(
+                .caretRight,
+                size: MobiusStyle.glyphMark,
+                foreground: palette.muted
+            )
+            .accessibilityHidden(true)
+        }
+        .swipeActions(edge: .trailing) {
+            Button {
+                forgetting = account
+            } label: {
+                MobiusIcon(.trash, foreground: palette.danger)
+            }
+            .tint(palette.panel)
+            .accessibilityLabel("Forget \(account.machineName)")
+        }
+    }
+}
+
+private struct PairedGatewayLabel: View {
+    let account: GatewayAccount
+
+    var body: some View {
+        Text(verbatim: account.machineName)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+    }
+}
+
+struct GatewayDetailView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.mobiusPalette) private var palette
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirmsForget = false
+    @State private var showsRename = false
+    @State private var renameDraft = ""
+    let id: UUID
+
+    var body: some View {
+        if let account = model.accounts.first(where: { $0.id == id }) {
+            detail(account)
+                .toolbarRole(.editor)
+                .alert("Forget this gateway?", isPresented: $confirmsForget) {
+                    Button("Forget gateway", role: .destructive) {
+                        model.forgetGateway(account)
+                        dismiss()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("You will need to pair with this gateway again.")
+                }
+                .alert("Rename gateway", isPresented: $showsRename) {
+                    TextField("Gateway name", text: $renameDraft)
+                    Button("Cancel", role: .cancel) {}
+                    Button("Rename") { model.renameGateway(account, to: renameDraft) }
+                        .disabled(
+                            renameDraft
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                                .isEmpty
+                        )
+                }
+        } else {
+            MobiusUnavailable(
+                title: "Gateway unavailable",
+                glyph: AppDestination.gateway.glyph,
+                detail: "It is no longer paired on this device."
+            )
+            .navigationTitle("Gateway")
+            .toolbarRole(.editor)
+            .background(MobiusBackdrop())
+        }
+    }
+
+    private func detail(_ account: GatewayAccount) -> some View {
+        let isActive = account.id == model.selectedAccountID
+        return PageScaffold(
+            title: account.displayName,
+            detail: "",
+            headerAccessory: {
+                HStack(spacing: MobiusSpace.xxs) {
+                    if isActive {
+                        Button(action: model.reconnect) {
+                            MobiusIcon(.arrowClockwise, gutter: false)
+                        }
+                        .mobiusProminentIconButton()
+                        .accessibilityLabel("Reconnect")
+                        .help("Reconnect")
+                    }
+                    Button {
+                        renameDraft = account.displayName
+                        showsRename = true
+                    } label: {
+                        MobiusIcon(.pencilSimple, gutter: false)
+                    }
+                    .mobiusIconButton()
+                    .accessibilityLabel("Rename gateway")
+                    .help("Rename gateway")
+                    Button {
+                        confirmsForget = true
+                    } label: {
+                        MobiusIcon(.trash, gutter: false)
+                    }
+                    .mobiusIconButton()
+                    .accessibilityLabel("Forget gateway")
+                    .help("Forget gateway")
+                }
+                .fixedSize()
+            }
+        ) {
+            Section("Connection") {
+                if isActive {
+                    LabeledContent("Status") {
+                        HStack(spacing: MobiusSpace.s) {
+                            Circle()
+                                .fill(model.connectionState.tone.color(in: palette))
+                                .frame(width: 7, height: 7)
+                            Text(model.connectionState.label)
+                        }
+                        .font(MobiusStyle.controlFont)
+                    }
+                }
+                HStack(spacing: MobiusSpace.m) {
+                    Text("Endpoint")
+                    Spacer(minLength: MobiusSpace.s)
+                    Text(account.endpoint.rawValue)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .textSelection(.enabled)
+                }
+                LabeledContent("Transport", value: transportName(account))
+                LabeledContent("Machine", value: account.machineName)
+                LabeledContent("Wire protocol", value: "v\(gatewayProtocolVersion)")
+            }
+
+            if isActive {
+                Section("Pair another device") {
+                    SettingsCaption("Ask this gateway for a short-lived code, then enter it with the same gateway address on the other device.")
+                    if let pairing = model.pairingCodeInfo {
+                        Text(pairing.code)
+                            .font(.system(.title2, design: .monospaced, weight: .bold))
+                            .tracking(3)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                        LabeledContent("Expires") {
+                            Text(pairing.expiresAt, style: .relative)
+                        }
+                        .foregroundStyle(palette.muted)
+                    }
+                }
+
+                MobiusActionRow {
+                    if let pairing = model.pairingCodeInfo {
+                        ShareLink("Copy or share", item: pairing.code)
+                    } else {
+                        Button(
+                            "Create one-time code",
+                            glyph: .key,
+                            action: model.createPairingCode
+                        )
+                        .mobiusProminentButton()
+                    }
+                }
+                .settingsStandaloneRow()
+            }
+        }
+    }
+
+    private func transportName(_ account: GatewayAccount) -> String {
+        if account.endpoint.usesWebSocket { return "WebSocket TLS" }
+        return account.endpoint.usesTLS ? "TLS" : "Loopback TCP"
     }
 }
 

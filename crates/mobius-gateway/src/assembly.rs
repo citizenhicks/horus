@@ -41,8 +41,8 @@ use crate::extensions::{ExtensionStore, ResolvedExtensions};
 use crate::middleware_manifest::{BuiltinMiddleware, MIDDLEWARE};
 use crate::sandbox::GatewaySandbox;
 use crate::wire::{
-    MiddlewareConfig, ProviderAuthKind, ProviderConfig, ProviderEndpointAuth, ProviderModel,
-    ProviderStatus, ReasoningChoice, validate_session_id,
+    MiddlewareConfig, ProviderAuthKind, ProviderConfig, ProviderEndpointAuth, ProviderInstance,
+    ProviderModel, ProviderStatus, ReasoningChoice, validate_session_id,
 };
 use crate::{Error, Result};
 
@@ -259,28 +259,27 @@ fn persist_usage(
     Ok(())
 }
 
-pub(crate) fn provider_statuses(
+pub(crate) fn provider_statuses() -> Vec<ProviderStatus> {
+    providers().iter().map(provider_status).collect()
+}
+
+pub(crate) fn provider_instances(
     gateway: &GatewayConfig,
     store: &ConfigStore,
     credentials: &CredentialStore,
-) -> Result<Vec<ProviderStatus>> {
-    providers()
-        .iter()
-        .map(|definition| {
-            let configured_provider = gateway.configured_providers.get(definition.id()).cloned();
-            let configured = if let Some(configured) = &configured_provider {
-                credential_is_configured(&configured.selection, store, credentials)?
-            } else {
-                match definition.auth() {
-                    ProviderAuth::ApiKey(default_env) => {
-                        credentials.configured(definition.id())?
-                            || std::env::var(default_env)
-                                .is_ok_and(|value| !value.trim().is_empty())
-                    }
-                    ProviderAuth::Browser(auth) => auth.configured(&store.provider_auth_path())?,
-                }
-            };
-            Ok(provider_status(definition, configured, configured_provider))
+) -> Result<Vec<ProviderInstance>> {
+    gateway
+        .configured_providers
+        .values()
+        .map(|configured| {
+            Ok(ProviderInstance {
+                label: configured.label.clone(),
+                tint: configured.tint,
+                configured: credential_is_configured(&configured.selection, store, credentials)?,
+                selection: configured.selection.clone(),
+                model_ids: configured.model_ids.clone(),
+                reasoning_efforts: configured.reasoning_efforts.clone(),
+            })
         })
         .collect()
 }
@@ -307,7 +306,7 @@ pub(crate) fn configured_model_providers(
 ) -> Result<BTreeMap<String, String>> {
     Ok(configured_model_routes(gateway, store, credentials)?
         .into_iter()
-        .map(|route| (route.choice.route, route.provider.provider))
+        .map(|route| (route.choice.route, route.provider.instance))
         .collect())
 }
 
@@ -348,16 +347,15 @@ fn configured_model_routes(
     credentials: &CredentialStore,
 ) -> Result<Vec<CatalogRoute>> {
     let mut routes = Vec::new();
-    let default_provider = gateway
+    let default_instance = gateway
         .default_agent
         .as_ref()
-        .map(|default| default.config.provider.provider.as_str());
-    let mut definitions = providers().iter().collect::<Vec<_>>();
-    definitions.sort_by_key(|definition| Some(definition.id()) != default_provider);
-    for definition in definitions {
-        let Some(configured) = gateway.configured_providers.get(definition.id()) else {
-            continue;
-        };
+        .map(|default| default.config.provider.instance.as_str());
+    let mut configured = gateway.configured_providers.values().collect::<Vec<_>>();
+    configured
+        .sort_by_key(|configured| Some(configured.selection.instance.as_str()) != default_instance);
+    for configured in configured {
+        let definition = provider(&configured.selection.provider)?;
         if credential_is_configured(&configured.selection, store, credentials)? {
             routes.extend(catalog_routes(
                 definition,
@@ -415,13 +413,13 @@ fn catalog_routes(
             let mut provider = selection.clone();
             provider.model = model.into();
             provider.reasoning_effort = effort.map(str::to_string);
-            let route = model_route_id(definition.id(), model, effort);
+            let route = model_route_id(&selection.instance, model, effort);
             routes.push(CatalogRoute {
                 choice: ModelChoice {
                     route,
                     group: format!(
                         "{} · {}",
-                        definition.label(),
+                        configured.label,
                         preset.map_or(model, |preset| preset.label)
                     ),
                     model: model.into(),
@@ -443,11 +441,7 @@ struct CatalogRoute {
     provider: ProviderConfig,
 }
 
-fn provider_status(
-    definition: &ProviderDefinition,
-    configured: bool,
-    configured_provider: Option<ConfiguredProvider>,
-) -> ProviderStatus {
+fn provider_status(definition: &ProviderDefinition) -> ProviderStatus {
     let (auth, default_api_key_env) = match definition.auth() {
         ProviderAuth::ApiKey(default_env) => (
             ProviderAuthKind::ApiKey,
@@ -455,25 +449,11 @@ fn provider_status(
         ),
         ProviderAuth::Browser(_) => (ProviderAuthKind::DeviceCode, None),
     };
-    let (selection, model_ids, reasoning_efforts) = configured_provider.map_or_else(
-        || (None, Vec::new(), Vec::new()),
-        |configured| {
-            (
-                Some(configured.selection),
-                configured.model_ids,
-                configured.reasoning_efforts,
-            )
-        },
-    );
     ProviderStatus {
         provider: definition.id().into(),
         label: definition.label().into(),
         symbol: definition.symbol(),
         description: definition.description().into(),
-        configured,
-        selection,
-        model_ids,
-        reasoning_efforts,
         model_ids_configurable: definition.models().is_empty(),
         auth,
         default_base_url: definition.default_base_url().map(str::to_string),
@@ -532,15 +512,15 @@ fn build_models(
     let definition = provider(&selection.provider)?;
     let configured = gateway
         .configured_providers
-        .get(&selection.provider)
+        .get(&selection.instance)
         .ok_or_else(|| Error::Config("active provider is not in the configured catalog".into()))?;
     let effort = effective_reasoning_effort(definition, configured, selection);
-    let selected_route = model_route_id(&selection.provider, &selection.model, effort);
+    let selected_route = model_route_id(&selection.instance, &selection.model, effort);
     let mut catalog = catalog_routes(definition, configured, selection);
     catalog.extend(
         configured_model_routes(gateway, store, credentials)?
             .into_iter()
-            .filter(|route| route.provider.provider != selection.provider),
+            .filter(|route| route.provider.instance != selection.instance),
     );
     catalog.sort_by_key(|route| route.choice.route != selected_route);
     if catalog.first().map(|route| route.choice.route.as_str()) != Some(selected_route.as_str()) {
@@ -589,12 +569,18 @@ fn instantiate_routes(
         let credential = if route.provider.endpoint_auth == ProviderEndpointAuth::Credentialless {
             ProviderCredential::Credentialless
         } else {
-            match provider_credentials.get(definition.id()) {
+            match provider_credentials.get(route.provider.instance.as_str()) {
                 Some(credential) => credential.clone(),
                 None => {
-                    let credential =
-                        resolve_credential(definition, base_url.as_deref(), store, credentials)?;
-                    provider_credentials.insert(definition.id().into(), credential.clone());
+                    let credential = resolve_credential(
+                        &route.provider.instance,
+                        definition,
+                        base_url.as_deref(),
+                        store,
+                        credentials,
+                    )?;
+                    provider_credentials
+                        .insert(route.provider.instance.clone(), credential.clone());
                     credential
                 }
             }
@@ -605,6 +591,7 @@ fn instantiate_routes(
 }
 
 fn resolve_credential(
+    instance: &str,
     definition: &ProviderDefinition,
     base_url: Option<&str>,
     store: &ConfigStore,
@@ -612,7 +599,7 @@ fn resolve_credential(
 ) -> Result<ProviderCredential> {
     match definition.auth() {
         ProviderAuth::ApiKey(default_env) => {
-            if let Some(value) = credentials.get(definition.id(), base_url)? {
+            if let Some(value) = credentials.get(instance, definition.id(), base_url)? {
                 return Ok(ProviderCredential::ApiKey(value));
             }
             if !definition.uses_default_endpoint(base_url) {
@@ -655,7 +642,10 @@ pub(crate) fn credential_is_configured(
     };
     match definition.auth() {
         ProviderAuth::ApiKey(default_env) => {
-            if credentials.get(definition.id(), base_url)?.is_some() {
+            if credentials
+                .get(&selection.instance, definition.id(), base_url)?
+                .is_some()
+            {
                 return Ok(true);
             }
             if !definition.uses_default_endpoint(base_url) {
@@ -731,7 +721,7 @@ fn unavailable_models(
     let context_window = definition
         .model(&selection.model)
         .map_or(DEFAULT_CONTEXT_WINDOW, |preset| preset.context_window);
-    let effort = match gateway.configured_providers.get(&selection.provider) {
+    let effort = match gateway.configured_providers.get(&selection.instance) {
         Some(configured) => {
             gateway.validate_provider_selection(selection)?;
             effective_reasoning_effort(definition, configured, selection).map(str::to_string)
@@ -742,7 +732,7 @@ fn unavailable_models(
                 .and_then(|preset| preset.default_reasoning.map(str::to_string))
         }),
     };
-    let route = model_route_id(&selection.provider, &selection.model, effort.as_deref());
+    let route = model_route_id(&selection.instance, &selection.model, effort.as_deref());
     let model: Arc<dyn Model> = Arc::new(UnavailableModel {
         info: ModelInfo {
             model: selection.model.clone(),

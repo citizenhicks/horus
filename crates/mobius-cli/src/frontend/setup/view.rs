@@ -157,14 +157,17 @@ pub(super) fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState, wi
     match state.page {
         Page::Provider => {
             for (index, entry) in state.providers.iter().enumerate() {
-                let configured = if entry.status.configured {
-                    "configured"
-                } else {
-                    "login required"
+                let configured = match &entry.instance {
+                    Some(instance) if instance.configured => "configured",
+                    Some(_) => "login required",
+                    None => "add setup",
                 };
                 choice(
                     lines,
-                    &entry.status.label,
+                    entry
+                        .instance
+                        .as_ref()
+                        .map_or(&entry.status.label, |instance| &instance.label),
                     &format!("{} · {configured}", entry.status.description),
                     index == state.provider,
                     if index == state.provider {
@@ -176,9 +179,28 @@ pub(super) fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState, wi
             }
         }
         Page::Authentication => {
+            {
+                let focused = state.auth_field == AuthField::Label;
+                lines.push(Line::styled(
+                    format!(
+                        "{} Name  {}▏",
+                        if focused { "›" } else { " " },
+                        terminal_text(&state.label)
+                    ),
+                    theme.style(if focused { Role::Selection } else { Role::Text }),
+                ));
+                lines.push(Line::styled(
+                    format!(
+                        "    Shown in model pickers. Empty uses `{}`.",
+                        state.definition().label
+                    ),
+                    theme.style(Role::Muted),
+                ));
+                lines.push(Line::from(""));
+            }
             match state.definition().auth {
                 ProviderAuthKind::ApiKey => {
-                    let focused = !state.endpoint_focused;
+                    let focused = state.auth_field == AuthField::Credential;
                     lines.push(Line::styled(
                         format!(
                             "{} API key  {}▏",
@@ -217,7 +239,7 @@ pub(super) fn render_page(lines: &mut Vec<Line<'static>>, state: &SetupState, wi
                 }
             }
             if state.definition().configurable_base_url() {
-                let focused = state.endpoint_focused;
+                let focused = state.auth_field == AuthField::Endpoint;
                 lines.push(Line::from(""));
                 lines.push(Line::styled(
                     format!(
@@ -766,21 +788,15 @@ pub(super) fn masked_credential(credential: &str) -> String {
 }
 
 pub(super) fn footer(state: &SetupState) -> &'static str {
+    if state.remove_confirmation.is_some() {
+        return "  Remove selected provider? · y confirm · n cancel";
+    }
     match state.page {
-        Page::Provider => "  ↑↓ select · enter continue · esc cancel",
-        Page::Authentication
-            if state.definition().configurable_base_url()
-                && state.definition().auth == ProviderAuthKind::ApiKey =>
-        {
-            "  type/paste · tab switch field · enter continue · esc back"
+        Page::Provider if state.instance().is_some() => {
+            "  ↑↓ select · enter edit · x remove · esc cancel"
         }
-        Page::Authentication if state.definition().auth == ProviderAuthKind::ApiKey => {
-            "  type/paste · enter continue · esc back"
-        }
-        Page::Authentication if state.definition().configurable_base_url() => {
-            "  type/paste endpoint · enter continue · esc back"
-        }
-        Page::Authentication => "  enter continue · esc back",
+        Page::Provider => "  ↑↓ select · enter add · esc cancel",
+        Page::Authentication => "  type/paste · tab switch field · enter continue · esc back",
         Page::Models => "  ↑↓ move · space select · enter activate · esc back",
         Page::Agent => {
             "  ↑↓ move · space change · ←→ close/open/adjust · enter open/apply · esc cancel"

@@ -2,6 +2,7 @@ mod events;
 mod runtime;
 
 use super::*;
+use mobius::backend::model::provider::provider;
 
 pub(super) type SessionWidgets = Vec<((String, String), mobius::protocol::FrontendWidget)>;
 
@@ -141,8 +142,7 @@ pub(super) enum HostCommand {
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
     RefreshProvider {
-        provider: String,
-        base_url: Option<String>,
+        scope: ProviderRefresh,
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
     RefreshExtension {
@@ -154,6 +154,9 @@ pub(super) enum HostCommand {
     },
     CutOverProvider {
         selection: ProviderConfig,
+        reply: oneshot::Sender<std::result::Result<(), Rejection>>,
+    },
+    ReloadProviderCatalog {
         reply: oneshot::Sender<std::result::Result<(), Rejection>>,
     },
     RunCron {
@@ -209,6 +212,13 @@ impl HostHandle {
         session_id: String,
         origin_label: &str,
     ) -> Result<Self> {
+        let spec = {
+            let config = gateway
+                .lock()
+                .map_err(|_| Error::Config("gateway configuration lock is poisoned".into()))?
+                .clone();
+            spec.normalizing_provider_catalog(&config, store.state_dir(), config.tls.as_ref())?
+        };
         let running = start_agent(
             Arc::clone(&gateway),
             &spec,
@@ -438,16 +448,11 @@ impl HostHandle {
 
     pub(super) async fn refresh_provider(
         &self,
-        provider: String,
-        base_url: Option<String>,
+        scope: ProviderRefresh,
     ) -> std::result::Result<(), Rejection> {
         let (reply, receiver) = oneshot::channel();
-        self.send(HostCommand::RefreshProvider {
-            provider,
-            base_url,
-            reply,
-        })
-        .await?;
+        self.send(HostCommand::RefreshProvider { scope, reply })
+            .await?;
         receive(receiver).await
     }
 
@@ -477,6 +482,13 @@ impl HostHandle {
             reply,
         })
         .await?;
+        receive(receiver).await
+    }
+
+    pub(super) async fn reload_provider_catalog(&self) -> std::result::Result<(), Rejection> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(HostCommand::ReloadProviderCatalog { reply })
+            .await?;
         receive(receiver).await
     }
 
@@ -535,25 +547,41 @@ impl HostHandle {
     }
 }
 
-pub(super) fn provider_credential_matches(
+/// Which configured setups one credential change invalidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ProviderRefresh {
+    /// One API-key credential, stored against a single instance.
+    Instance {
+        instance: String,
+        base_url: Option<String>,
+    },
+    /// One browser login, shared by every instance of that provider.
+    Provider(String),
+}
+
+pub(super) fn provider_refresh_matches(
     selection: &ProviderConfig,
-    provider_id: &str,
-    base_url: Option<&str>,
+    scope: &ProviderRefresh,
 ) -> Result<bool> {
-    if selection.provider != provider_id {
-        return Ok(false);
+    match scope {
+        ProviderRefresh::Instance { instance, base_url } => {
+            if selection.instance != *instance {
+                return Ok(false);
+            }
+            let definition = provider(&selection.provider)?;
+            let selected_base_url = definition
+                .configurable_base_url()
+                .then(|| {
+                    selection
+                        .base_url
+                        .as_deref()
+                        .or_else(|| definition.default_base_url())
+                })
+                .flatten();
+            Ok(selected_base_url == base_url.as_deref())
+        }
+        ProviderRefresh::Provider(provider) => Ok(selection.provider == *provider),
     }
-    let definition = provider(provider_id)?;
-    let selected_base_url = definition
-        .configurable_base_url()
-        .then(|| {
-            selection
-                .base_url
-                .as_deref()
-                .or_else(|| definition.default_base_url())
-        })
-        .flatten();
-    Ok(selected_base_url == base_url)
 }
 
 pub(super) fn fail_active_cron(

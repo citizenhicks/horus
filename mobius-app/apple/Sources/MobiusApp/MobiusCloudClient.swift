@@ -269,6 +269,12 @@ final class MobiusCloudClient {
         return credential.session
     }
 
+    /// Forgets the stored bearer. The gateway pairing is a separate trust domain and
+    /// is deliberately left alone, so signing out never drops a paired chat.
+    func signOut() throws {
+        try store.remove()
+    }
+
     func authenticate(authorizationCode: String, nonce: String) async throws -> MobiusCloudSession {
         guard !authorizationCode.isEmpty,
               authorizationCode.utf8.count <= 2_048,

@@ -8,15 +8,7 @@ final class AppModel {
     var selectedAccountID: UUID?
     var connectionState: ConnectionState = .disconnected
     var destination: AppDestination? = .chats
-    var chatRoute: ChatRoute?
-    /// Keeps the one supported chat destination in sync with SwiftUI's stack path.
-    var chatNavigationPath: [ChatRoute] {
-        get {
-            guard let chatRoute, chatRoute.sessionID == selectedSessionID else { return [] }
-            return [chatRoute]
-        }
-        set { chatRoute = newValue.last }
-    }
+    var navigationPath: [AppRoute] = []
     var workspace: WorkspaceInfo?
     var gitStatus: GitStatus?
     private(set) var gitDiffRevision = 0
@@ -227,11 +219,14 @@ final class AppModel {
     var defaultAgentSnapshot: VersionedAgentConfig?
     var agentDraft: AgentComposition?
     var defaultAgentDraft: AgentComposition?
-    var setupProviderDraft: ProviderConfig?
+    var providerDraft: ProviderConfig?
     var chatAgentApplyState: ApplyState = .idle
     var defaultAgentApplyState: ApplyState = .idle
     var providerStatuses: [ProviderStatus] = []
+    var providerInstances: [ProviderInstance] = []
     var providerAPIKey = ""
+    var providerLabelDraft = ""
+    var providerTintDraft: ProviderTint = .blue
     var providerModelIDsText = ""
     var providerReasoningEffortsText = ""
     var providerActionState: ProviderActionState = .idle
@@ -324,11 +319,16 @@ final class AppModel {
     @ObservationIgnored var filePresentationGeneration = UUID()
     @ObservationIgnored var previewTemporaryDirectory: URL?
     var gitBranchRequestID: String?
-    @ObservationIgnored var credentialRequestID: String?
+    @ObservationIgnored var pendingProviderCredential: (
+        requestID: String,
+        instance: String,
+        provider: String
+    )?
     @ObservationIgnored var pairingCodeRequestID: String?
     @ObservationIgnored var pairingCodeExpiryTask: Task<Void, Never>?
     @ObservationIgnored var providerLoginRequestID: String?
     @ObservationIgnored var providerRegistrationRequestID: String?
+    var pendingProviderRemoval: (requestID: String, instance: String)?
     @ObservationIgnored var extensionRequestID: String?
     @ObservationIgnored var cronRequestIDs: Set<String> = []
     @ObservationIgnored var toastDismissTask: Task<Void, Never>?
@@ -447,8 +447,10 @@ final class AppModel {
     }
 
     var presentedChatSessionID: String? {
-        guard destination == .chats else { return nil }
-        return chatRoute?.sessionID
+        guard destination == .chats,
+              case .chat(let route) = navigationPath.last
+        else { return nil }
+        return route.sessionID
     }
 
     var canOpenSession: Bool {
@@ -569,25 +571,11 @@ final class AppModel {
         configRequestID != nil
             || defaultConfigRequestID != nil
             || providerRegistrationRequestID != nil
+            || pendingProviderRemoval != nil
             || chatAgentApplyState == .applying
             || chatAgentApplyState == .restarting
             || defaultAgentApplyState == .applying
             || defaultAgentApplyState == .restarting
-    }
-
-    var providerDraft: ProviderConfig? {
-        get { defaultAgentDraft?.provider ?? setupProviderDraft }
-        set {
-            guard let newValue else {
-                setupProviderDraft = nil
-                return
-            }
-            if defaultAgentDraft != nil {
-                defaultAgentDraft?.provider = newValue
-            } else {
-                setupProviderDraft = newValue
-            }
-        }
     }
 
     var contextFillFraction: Double {

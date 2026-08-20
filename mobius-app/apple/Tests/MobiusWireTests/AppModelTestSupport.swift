@@ -175,6 +175,7 @@ final class AppModelTests: XCTestCase {
     func composition(systemPrompt: String = "Test") -> AgentComposition {
         AgentComposition(
             provider: ProviderConfig(
+                instance: "openai-work",
                 provider: "openai_socket",
                 model: "gpt-5.6-sol",
                 baseUrl: nil,
@@ -206,14 +207,10 @@ final class AppModelTests: XCTestCase {
             label: label,
             symbol: "chat_gpt",
             description: "Test provider",
-            configured: true,
-            selection: config,
             auth: .apiKey,
             defaultBaseUrl: config.baseUrl,
             defaultApiKeyEnv: "OPENAI_API_KEY",
             models: models,
-            modelIds: [],
-            reasoningEfforts: [],
             modelIdsConfigurable: false,
             webSearch: [config.webSearch]
         )
@@ -229,6 +226,7 @@ final class AppModelTests: XCTestCase {
             machineName: "snowwhite.local",
             sessions: sessions ?? [session(state: .idle)],
             providers: [],
+            providerInstances: [],
             defaultConfig: defaultConfig,
             models: [],
             modelProviders: [:],

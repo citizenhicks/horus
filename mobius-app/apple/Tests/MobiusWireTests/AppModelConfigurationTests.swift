@@ -14,8 +14,6 @@ extension AppModelTests {
                 label: "OpenAI",
                 symbol: "chat_gpt",
                 description: "Persistent Responses API",
-                configured: true,
-                selection: nil,
                 auth: .apiKey,
                 defaultBaseUrl: nil,
                 defaultApiKeyEnv: "OPENAI_API_KEY",
@@ -31,11 +29,10 @@ extension AppModelTests {
                     )],
                     defaultReasoning: "high"
                 )],
-                modelIds: [],
-                reasoningEfforts: [],
                 modelIdsConfigurable: false,
                 webSearch: [.off, .cached, .live]
             )],
+            providerInstances: [],
             defaultConfig: nil,
             models: [],
             modelProviders: [:],
@@ -47,15 +44,34 @@ extension AppModelTests {
 
         XCTAssertNil(model.selectedSessionID)
         XCTAssertNil(model.agentDraft)
+        model.addProviderInstance("openai_socket")
         XCTAssertEqual(model.providerDraft?.model, "gpt-5.6-sol")
+        let instance = try XCTUnwrap(model.providerDraft?.instance)
+        XCTAssertFalse(instance.isEmpty)
 
-        model.saveProviderAsDefault()
+        model.providerAPIKey = "secret"
+        model.saveProviderCredential()
+        model.registerProvider()
         try await Task.sleep(for: .milliseconds(20))
 
         let requests = await recorder.requests()
-        guard case .registerProvider(_, let provider, let modelIDs, let reasoningEfforts) = try XCTUnwrap(requests.first) else {
+        guard case .setProviderCredential(_, let credentialInstance, _, _) = try XCTUnwrap(
+            requests.first
+        ) else {
+            return XCTFail("Expected first-provider credential")
+        }
+        XCTAssertEqual(credentialInstance, instance)
+        guard case .registerProvider(
+            _,
+            let provider,
+            _,
+            _,
+            let modelIDs,
+            let reasoningEfforts
+        ) = try XCTUnwrap(requests.last) else {
             return XCTFail("Expected first-provider registration")
         }
+        XCTAssertEqual(provider.instance, instance)
         XCTAssertEqual(provider, model.providerDraft)
         XCTAssertTrue(modelIDs.isEmpty)
         XCTAssertTrue(reasoningEfforts.isEmpty)
@@ -64,6 +80,161 @@ extension AppModelTests {
         model.applyGatewayCatalog(ready(defaultConfig: defaultConfig))
         XCTAssertNil(model.agentDraft)
         XCTAssertEqual(model.defaultAgentDraft, defaultConfig.config)
+    }
+
+    func testProviderCredentialResponseMustMatchSubmittedTarget() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let target = ProviderConfig(
+            instance: "openai-new",
+            provider: "openai_socket",
+            model: "gpt-5.6-sol",
+            baseUrl: nil,
+            reasoningEffort: "high",
+            webSearch: .cached
+        )
+        let sibling = ProviderConfig(
+            instance: "openai-other",
+            provider: target.provider,
+            model: target.model,
+            baseUrl: nil,
+            reasoningEffort: target.reasoningEffort,
+            webSearch: target.webSearch
+        )
+        model.providerDraft = target
+        model.providerLabelDraft = "Personal"
+        model.providerInstances = [target, sibling].map { config in
+            ProviderInstance(
+                label: "Setup",
+                tint: .blue,
+                configured: false,
+                selection: config,
+                modelIds: [],
+                reasoningEfforts: []
+            )
+        }
+        model.providerAPIKey = "secret"
+
+        model.saveProviderCredential()
+        let request = await recorder.firstRequest(after: 0) { request in
+            if case .setProviderCredential = request { return true }
+            return false
+        }
+        guard case .setProviderCredential(let requestID, _, _, _) = try XCTUnwrap(request)
+        else { return XCTFail("Expected provider credential request") }
+
+        model.handle(.providerCredentialSaved(
+            requestID: "stale",
+            instance: sibling.instance,
+            provider: sibling.provider
+        ))
+        model.handle(.providerCredentialSaved(
+            requestID: requestID,
+            instance: sibling.instance,
+            provider: sibling.provider
+        ))
+        model.handle(.providerCredentialSaved(
+            requestID: requestID,
+            instance: target.instance,
+            provider: "kimi"
+        ))
+
+        XCTAssertEqual(model.providerInstances.map(\.configured), [false, false])
+        XCTAssertEqual(model.providerAPIKey, "secret")
+        XCTAssertEqual(model.providerActionState, .savingCredential(target.instance))
+
+        model.handle(.providerCredentialSaved(
+            requestID: requestID,
+            instance: target.instance,
+            provider: target.provider
+        ))
+
+        XCTAssertEqual(model.providerInstances.map(\.configured), [true, false])
+        XCTAssertEqual(model.providerAPIKey, "")
+        XCTAssertEqual(model.providerActionState, .credentialSaved(target.instance))
+        XCTAssertEqual(model.toast?.message, "Personal credential saved.")
+    }
+
+    func testProviderRemovalKeepsDetailUntilConfirmedCatalogRefresh() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model { request in await recorder.record(request) }
+        let selection = composition().provider
+        let record = ProviderInstance(
+            label: "Work",
+            tint: .purple,
+            configured: true,
+            selection: selection,
+            modelIds: [],
+            reasoningEfforts: []
+        )
+        model.connectionState = .ready
+
+        var newDraft = selection
+        newDraft.instance = "new-draft"
+        model.providerDraft = newDraft
+        model.removeProvider(newDraft.instance)
+        let draftRequestCount = await recorder.requestCount()
+        XCTAssertEqual(draftRequestCount, 0)
+
+        model.providerInstances = [record]
+        model.editProviderInstance(record)
+        model.navigationPath = [.settings(.provider(record.instance))]
+        model.removeProvider(record.instance)
+
+        let firstRequest = await recorder.firstRequest(after: 0) { request in
+            if case .removeProvider = request { return true }
+            return false
+        }
+        guard case .removeProvider(let firstRequestID, let instance) = try XCTUnwrap(firstRequest)
+        else { return XCTFail("Expected provider removal request") }
+        XCTAssertEqual(instance, record.instance)
+        XCTAssertEqual(model.navigationPath, [.settings(.provider(record.instance))])
+        XCTAssertTrue(model.isApplyingConfiguration)
+
+        model.handle(.rejected(GatewayRejection(
+            requestId: firstRequestID,
+            code: "provider_in_use",
+            message: "Provider is still in use",
+            fatal: false
+        )))
+
+        XCTAssertEqual(model.navigationPath, [.settings(.provider(record.instance))])
+        XCTAssertEqual(model.providerActionState, .failed("Provider is still in use"))
+        XCTAssertEqual(model.toast?.message, "Provider is still in use")
+        XCTAssertNil(model.pendingProviderRemoval)
+
+        let requestCount = await recorder.requestCount()
+        model.removeProvider(record.instance)
+        let retry = await recorder.firstRequest(after: requestCount) { request in
+            if case .removeProvider = request { return true }
+            return false
+        }
+        guard case .removeProvider(let retryRequestID, _) = try XCTUnwrap(retry)
+        else { return XCTFail("Expected provider removal retry") }
+
+        model.handle(.gatewayConfigured(
+            requestID: retryRequestID,
+            payload: ReadyPayload(
+                machineName: "snowwhite.local",
+                sessions: [],
+                providers: [providerStatus(for: selection)],
+                providerInstances: [],
+                defaultConfig: nil,
+                models: [],
+                modelProviders: [:],
+                middlewareFeatures: [],
+                extensions: [],
+                contributions: [],
+                maxActiveSessions: 4
+            )
+        ))
+
+        XCTAssertTrue(model.navigationPath.isEmpty)
+        XCTAssertTrue(model.providerInstances.isEmpty)
+        XCTAssertNil(model.providerDraft)
+        XCTAssertNil(model.pendingProviderRemoval)
+        XCTAssertEqual(model.providerActionState, .idle)
+        XCTAssertEqual(model.toast?.message, "Work removed.")
     }
 
     func testProviderSelectionUsesGatewayManifestDefaults() throws {
@@ -91,9 +262,7 @@ extension AppModelTests {
             label: "Kimi",
             symbol: "kimi",
             description: "Kimi Chat Completions API",
-            configured: true,
-            selection: nil,
-            auth: .apiKey,
+                auth: .apiKey,
             defaultBaseUrl: nil,
             defaultApiKeyEnv: "MOONSHOT_API_KEY",
             models: [
@@ -118,58 +287,48 @@ extension AppModelTests {
                     defaultReasoning: nil
                 )
             ],
-            modelIds: [],
-            reasoningEfforts: [],
             modelIdsConfigurable: false,
             webSearch: [.off]
         )]
 
-        model.selectProvider("kimi")
+        model.addProviderInstance("kimi")
 
-        XCTAssertEqual(model.defaultAgentDraft?.provider.model, "kimi-k3")
-        XCTAssertEqual(model.defaultAgentDraft?.provider.reasoningEffort, "max")
-        XCTAssertEqual(model.defaultAgentDraft?.provider.webSearch, .off)
-
-        model.selectProviderModel("kimi-k2.7-code")
-
-        XCTAssertEqual(model.defaultAgentDraft?.provider.model, "kimi-k2.7-code")
-        XCTAssertNil(model.defaultAgentDraft?.provider.reasoningEffort)
+        XCTAssertEqual(model.providerDraft?.model, "kimi-k3")
+        XCTAssertEqual(model.providerDraft?.reasoningEffort, "max")
+        XCTAssertEqual(model.providerDraft?.webSearch, .off)
     }
 
     func testConfigurableProviderCanonicalizesAndSavesModelAndReasoningCatalogs() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model { request in await recorder.record(request) }
         let selection = ProviderConfig(
+            instance: "responses-local",
             provider: "responses",
             model: "old-model",
             baseUrl: "http://localhost:8080/v1",
             reasoningEffort: nil,
             webSearch: .off
         )
-        model.defaultAgentDraft = composition()
         model.providerStatuses = [ProviderStatus(
             provider: selection.provider,
             label: "Local",
             symbol: "storage",
             description: "OpenAI-compatible endpoint",
-            configured: true,
-            selection: selection,
             auth: .apiKey,
             defaultBaseUrl: "http://localhost:8080/v1",
             defaultApiKeyEnv: nil,
             models: [],
-            modelIds: ["old-model"],
-            reasoningEfforts: ["medium"],
             modelIdsConfigurable: true,
             webSearch: [.off]
         )]
-        model.selectProvider(selection.provider)
+        model.providerDraft = selection
+        model.providerLabelDraft = "Local"
         model.updateProviderModelIDs(" model-a, model-b, , model-a ")
         model.updateProviderReasoningEfforts(" high, medium, , high ")
 
         XCTAssertEqual(model.providerModelIDs, ["model-a", "model-b"])
         XCTAssertEqual(model.providerReasoningEfforts, ["high", "medium"])
-        model.saveProviderAsDefault()
+        model.registerProvider()
         try await Task.sleep(for: .milliseconds(20))
 
         let requests = await recorder.requests()
@@ -177,6 +336,8 @@ extension AppModelTests {
         guard case .registerProvider(
             _,
             let config,
+            _,
+            _,
             let modelIDs,
             let reasoningEfforts
         ) = request else {
@@ -191,6 +352,7 @@ extension AppModelTests {
     func testScopedModelSelectionUsesGatewayProviderIdentity() throws {
         let model = try model()
         let target = ProviderConfig(
+            instance: "kimi-work",
             provider: "kimi",
             model: "kimi-k3",
             baseUrl: nil,
@@ -211,8 +373,16 @@ extension AppModelTests {
         model.agentDraft = original
         model.defaultAgentDraft = original
         model.modelChoices = [choice]
-        model.modelProviders = [choice.route: target.provider]
+        model.modelProviders = [choice.route: target.instance]
         model.providerStatuses = [providerStatus(for: target)]
+        model.providerInstances = [ProviderInstance(
+            label: "Work",
+            tint: .blue,
+            configured: true,
+            selection: target,
+            modelIds: [],
+            reasoningEfforts: []
+        )]
 
         model.selectAgentDraftModel(choice.route)
 
@@ -229,9 +399,76 @@ extension AppModelTests {
         XCTAssertEqual(model.agentDraft, original)
     }
 
+    func testModelChoicesKeepSiblingProviderInstancesSeparate() throws {
+        let model = try model()
+        let work = ProviderConfig(
+            instance: "openai-work",
+            provider: "openai_socket",
+            model: "gpt-5.6-sol",
+            baseUrl: nil,
+            reasoningEffort: "medium",
+            webSearch: .cached
+        )
+        let personal = ProviderConfig(
+            instance: "openai-personal",
+            provider: work.provider,
+            model: work.model,
+            baseUrl: nil,
+            reasoningEffort: "medium",
+            webSearch: .cached
+        )
+        let choices = [
+            ModelChoice(
+                route: "work-medium",
+                group: "Work · Sol",
+                model: work.model,
+                reasoningEffort: "medium",
+                contextWindow: nil,
+                supportsImageInput: true
+            ),
+            ModelChoice(
+                route: "work-high",
+                group: "Work · Sol",
+                model: work.model,
+                reasoningEffort: "high",
+                contextWindow: nil,
+                supportsImageInput: true
+            ),
+            ModelChoice(
+                route: "personal-medium",
+                group: "Personal · Sol",
+                model: personal.model,
+                reasoningEffort: "medium",
+                contextWindow: nil,
+                supportsImageInput: true
+            ),
+        ]
+        model.modelChoices = choices
+        model.modelProviders = [
+            "work-medium": work.instance,
+            "work-high": work.instance,
+            "personal-medium": personal.instance,
+        ]
+
+        XCTAssertEqual(
+            model.distinctModels(in: choices).map(\.route),
+            ["work-medium", "personal-medium"]
+        )
+        XCTAssertEqual(
+            model.modelChoices(matching: choices[0], in: choices).map(\.route),
+            ["work-medium", "work-high"]
+        )
+
+        var draft = composition()
+        draft.provider = personal
+        model.defaultAgentDraft = draft
+        XCTAssertEqual(model.defaultAgentDraftModelRoute, "personal-medium")
+    }
+
     func testModelLabelUsesProviderFriendlyName() throws {
         let model = try model()
         let config = ProviderConfig(
+            instance: "openai-work",
             provider: "openai_socket",
             model: "gpt-5.6-sol",
             baseUrl: nil,
@@ -246,7 +483,7 @@ extension AppModelTests {
             contextWindow: 128_000,
             supportsImageInput: true
         )
-        model.modelProviders = [choice.route: config.provider]
+        model.modelProviders = [choice.route: config.instance]
         model.providerStatuses = [providerStatus(for: config, models: [ProviderModel(
             id: config.model,
             label: "Sol",
@@ -255,6 +492,14 @@ extension AppModelTests {
             reasoning: [],
             defaultReasoning: "high"
         )])]
+        model.providerInstances = [ProviderInstance(
+            label: "Work",
+            tint: .teal,
+            configured: true,
+            selection: config,
+            modelIds: [],
+            reasoningEfforts: []
+        )]
 
         XCTAssertEqual(model.modelLabel(for: choice), "Sol")
         XCTAssertEqual(model.modelLabel(
@@ -299,6 +544,13 @@ extension AppModelTests {
         XCTAssertEqual(model.providerLabel(for: "openai_codex"), "Codex")
         XCTAssertEqual(model.providerLabel(for: "openai_socket"), "OpenAI")
         XCTAssertEqual(model.providerLabel(for: "responses"), "Local")
+
+        var newSetup = codex
+        newSetup.instance = "new-setup-uuid"
+        model.providerDraft = newSetup
+        model.providerLabelDraft = "Personal"
+        XCTAssertEqual(model.providerLabel(for: newSetup.instance), "Personal")
+        XCTAssertEqual(model.providerLabel(for: newSetup.provider), "Codex")
     }
 
     func testMiddlewareSettingsSetAndClearWithoutCapabilityLogic() {
@@ -344,6 +596,7 @@ extension AppModelTests {
             machineName: "snowwhite.local",
             sessions: [],
             providers: [],
+            providerInstances: [],
             defaultConfig: VersionedAgentConfig(revision: 8, config: gatewayDefault),
             models: [],
             modelProviders: [:],
@@ -422,7 +675,7 @@ extension AppModelTests {
         )
     }
 
-    func testProviderRegistrationChainsIntoDefaultConfiguration() async throws {
+    func testProviderRegistrationDoesNotConfigureDefaultAgent() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in
             await recorder.record(request)
@@ -436,16 +689,20 @@ extension AppModelTests {
             revision: 8,
             config: previousDefault
         )
-        model.defaultAgentDraft = draft
+        model.defaultAgentDraft = previousDefault
         model.providerStatuses = [providerStatus(for: draft.provider)]
+        model.providerDraft = draft.provider
+        model.providerLabelDraft = "Work"
 
-        model.saveProviderAsDefault()
+        model.registerProvider()
         try await Task.sleep(for: .milliseconds(20))
 
         let registrationRequests = await recorder.requests()
         let registration = try XCTUnwrap(
             registrationRequests.lazy.compactMap { request -> String? in
-                guard case .registerProvider(let requestID, _, _, _) = request else { return nil }
+                guard case .registerProvider(let requestID, _, _, _, _, _) = request else {
+                    return nil
+                }
                 return requestID
             }.first
         )
@@ -453,24 +710,16 @@ extension AppModelTests {
             revision: 8,
             config: previousDefault
         ))
-        model.handle(.ready(response))
-        XCTAssertEqual(model.defaultAgentDraft, draft)
         model.applyGatewayConfigurationResponse(requestID: registration, payload: response)
         try await Task.sleep(for: .milliseconds(20))
 
         let requests = await recorder.requests()
-        guard let configured = requests.first(where: {
+        XCTAssertFalse(requests.contains {
             if case .configureDefaultAgent = $0 { return true }
             return false
-        }), case .configureDefaultAgent(
-            _,
-            let expectedRevision,
-            let config
-        ) = configured else {
-            return XCTFail("Expected provider registration to configure the gateway default")
-        }
-        XCTAssertEqual(expectedRevision, 8)
-        XCTAssertEqual(config, draft)
+        })
+        XCTAssertEqual(model.defaultAgentDraft, previousDefault)
+        XCTAssertEqual(model.agentDraft?.systemPrompt, "Active chat")
     }
 
     func testSavingDefaultLeavesActiveChatUntouched() async throws {

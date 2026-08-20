@@ -63,6 +63,8 @@ struct MobiusMenuLabel: View {
     /// The composer sizes its mark up to `glyphLead` to sit level with the icon buttons
     /// beside it; inline in a header the glyph stays on the text's own step.
     var glyphSize = MobiusStyle.glyphInline
+    /// Tints only the mark without recolouring the label text.
+    var glyphColor: Color?
     /// A settings row reads at body size beside its label; the composer and the file header
     /// carry the badge step so the label sits under the text it belongs to.
     var font = MobiusStyle.badgeFont
@@ -70,7 +72,12 @@ struct MobiusMenuLabel: View {
     var body: some View {
         HStack(spacing: MobiusSpace.s) {
             if let glyph {
-                MobiusIcon(glyph, size: glyphSize, foreground: palette.accent, gutter: false)
+                MobiusIcon(
+                    glyph,
+                    size: glyphSize,
+                    foreground: glyphColor ?? palette.accent,
+                    gutter: false
+                )
             }
             Text(text)
                 .font(font)

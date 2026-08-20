@@ -18,6 +18,7 @@ pub fn validate_agent_composition(config: &AgentComposition) -> Result<()> {
 }
 
 pub(super) fn validate_provider_config(config: &ProviderConfig) -> Result<()> {
+    validate_instance_id(&config.instance)?;
     if config.provider.trim().is_empty() || config.provider.len() > 256 {
         return Err(Error::Config("provider ID must be 1–256 bytes".into()));
     }
@@ -49,6 +50,7 @@ fn validate_provider_endpoint_auth(
 
 pub(super) fn validate_configured_provider(configured: &ConfiguredProvider) -> Result<()> {
     validate_provider_config(&configured.selection)?;
+    validate_provider_label(&configured.label)?;
     let definition = provider(&configured.selection.provider)?;
     if definition.models().is_empty() {
         validate_model_ids(&configured.model_ids)?;
@@ -66,7 +68,9 @@ pub(super) fn validate_configured_provider_selection(
     configured: &ConfiguredProvider,
     selection: &ProviderConfig,
 ) -> Result<()> {
-    if selection.provider != configured.selection.provider {
+    if selection.instance != configured.selection.instance
+        || selection.provider != configured.selection.provider
+    {
         return Err(Error::Config(
             "provider selection does not match its configured provider entry".into(),
         ));
@@ -109,12 +113,12 @@ pub(super) fn validate_custom_model_route_count(
         }
         for model in &configured.model_ids {
             if configured.reasoning_efforts.is_empty() {
-                routes.insert(model_route_id(&configured.selection.provider, model, None));
+                routes.insert(model_route_id(&configured.selection.instance, model, None));
                 continue;
             }
             for effort in &configured.reasoning_efforts {
                 if !routes.insert(model_route_id(
-                    &configured.selection.provider,
+                    &configured.selection.instance,
                     model,
                     Some(effort),
                 )) {
@@ -187,8 +191,39 @@ fn validate_catalog_entries(
     Ok(())
 }
 
-pub(crate) fn model_route_id(provider: &str, model: &str, effort: Option<&str>) -> String {
-    format!("{provider}::{model}::{}", effort.unwrap_or("default"))
+pub(crate) fn model_route_id(instance: &str, model: &str, effort: Option<&str>) -> String {
+    format!("{instance}::{model}::{}", effort.unwrap_or("default"))
+}
+
+/// An instance ID names one durable provider setup and appears in model route IDs.
+pub(super) fn validate_instance_id(instance: &str) -> Result<()> {
+    if instance.is_empty() || instance.len() > 256 {
+        return Err(Error::Config(
+            "provider instance ID must be 1–256 bytes".into(),
+        ));
+    }
+    if !instance
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(Error::Config(
+            "provider instance ID accepts only letters, digits, `_`, `-`, and `.`".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A label is the user-facing name of one provider instance.
+pub(super) fn validate_provider_label(label: &str) -> Result<()> {
+    if label.trim().is_empty() || label.len() > 128 {
+        return Err(Error::Config("provider label must be 1–128 bytes".into()));
+    }
+    if label.chars().any(char::is_control) {
+        return Err(Error::Config(
+            "provider label must not contain control characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn effective_reasoning_effort<'a>(

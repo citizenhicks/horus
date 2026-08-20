@@ -25,8 +25,9 @@ struct ModelRoutePicker: View {
                     }
                     ForEach(distinctModels, id: \.route) { choice in
                         optionLabel(
-                            model.modelLabel(for: choice),
-                            symbol: model.providerSymbol(for: choice)
+                            choice.group,
+                            symbol: model.providerSymbol(for: choice),
+                            tint: model.providerTint(for: choice)
                         )
                         .tag(Optional(choice.route))
                     }
@@ -70,14 +71,25 @@ struct ModelRoutePicker: View {
     }
 
     private func menuLabel(_ text: String, glyph: MobiusGlyph?) -> some View {
-        MobiusMenuLabel(text: text, glyph: glyph, font: MobiusStyle.bodyFont)
-            .foregroundStyle(palette.accent)
+        MobiusMenuLabel(
+            text: text,
+            glyph: glyph,
+            glyphColor: selectedTint?.color,
+            font: MobiusStyle.bodyFont
+        )
+        .foregroundStyle(palette.accent)
+    }
+
+    private var selectedTint: ProviderTint? {
+        selected.map { model.providerTint(for: $0) }
     }
 
     @ViewBuilder
-    private func optionLabel(_ title: String, symbol: String?) -> some View {
-        if let symbol, let glyph = MobiusSymbol.knownGlyph(for: symbol) {
-            MobiusLabel(title: title, glyph: glyph)
+    private func optionLabel(_ title: String, symbol: String?, tint: ProviderTint) -> some View {
+        if let symbol,
+           let glyph = MobiusSymbol.knownGlyph(for: symbol),
+           let image = glyph.menuImage(tint.color) {
+            Label { Text(title) } icon: { image }
         } else {
             Text(title)
         }
@@ -103,13 +115,12 @@ struct ModelRoutePicker: View {
     }
 
     private var distinctModels: [ModelChoice] {
-        var seen = Set<String>()
-        return choices.filter { seen.insert("\($0.group)\u{0}\($0.model)").inserted }
+        model.distinctModels(in: choices)
     }
 
     private var reasoningChoices: [ModelChoice] {
         guard let selected else { return [] }
-        return choices.filter { $0.group == selected.group && $0.model == selected.model }
+        return model.modelChoices(matching: selected, in: choices)
     }
 
     /// Switching model keeps the effort when the new model offers the same one, so changing
@@ -117,9 +128,7 @@ struct ModelRoutePicker: View {
     private var modelSelection: Binding<String?> {
         Binding {
             guard let selected else { return nil }
-            return distinctModels.first {
-                $0.group == selected.group && $0.model == selected.model
-            }?.route ?? selected.route
+            return distinctModels.first { model.sameModel($0, selected) }?.route ?? selected.route
         } set: { newRoute in
             guard let newRoute, let choice = choices.first(where: { $0.route == newRoute }) else {
                 route = nil
@@ -127,9 +136,7 @@ struct ModelRoutePicker: View {
             }
             let effort = selected?.reasoningEffort
             route = choices.first {
-                $0.group == choice.group
-                    && $0.model == choice.model
-                    && $0.reasoningEffort == effort
+                model.sameModel($0, choice) && $0.reasoningEffort == effort
             }?.route ?? choice.route
         }
     }

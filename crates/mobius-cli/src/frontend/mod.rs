@@ -3,7 +3,7 @@
 use mobius::Result;
 use mobius::protocol::FrontendBlock;
 use mobius_gateway::client::{GatewayEvents, GatewaySender};
-use mobius_gateway::wire::{ReadyPayload, SessionReadyPayload};
+use mobius_gateway::wire::{ProviderInstance, ReadyPayload, SessionReadyPayload};
 
 mod catalog;
 mod cloudflare_setup;
@@ -51,6 +51,16 @@ fn block_text(block: &FrontendBlock) -> String {
         ));
     }
     text
+}
+
+fn provider_instance_label<'a>(
+    instances: &'a [ProviderInstance],
+    instance: &str,
+) -> Option<&'a str> {
+    instances
+        .iter()
+        .find(|entry| entry.selection.instance == instance)
+        .map(|entry| entry.label.as_str())
 }
 
 pub async fn run(

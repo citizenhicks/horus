@@ -124,6 +124,9 @@ private extension Color {
     static let nord11 = Color(red: 0.749, green: 0.380, blue: 0.416)
     static let nord13 = Color(red: 0.922, green: 0.796, blue: 0.545)
     static let nord14 = Color(red: 0.639, green: 0.745, blue: 0.549)
+    static let nord7 = Color(red: 0.561, green: 0.737, blue: 0.733)
+    static let nord12 = Color(red: 0.816, green: 0.529, blue: 0.439)
+    static let nord15 = Color(red: 0.706, green: 0.557, blue: 0.678)
 }
 
 extension EnvironmentValues {
@@ -152,4 +155,32 @@ struct MobiusBackdrop: View {
             .ignoresSafeArea()
             .accessibilityHidden(true)
     }
+}
+
+/// A user-chosen accent telling two setups of one provider apart. The gateway sends
+/// hues; this app maps them onto its own Nord palette.
+enum ProviderTint: String, Codable, CaseIterable, Identifiable, Sendable {
+    case blue
+    case teal
+    case green
+    case yellow
+    case orange
+    case red
+    case purple
+
+    var id: String { rawValue }
+
+    var color: Color {
+        switch self {
+        case .blue: .nord10
+        case .teal: .nord7
+        case .green: .nord14
+        case .yellow: .nord13
+        case .orange: .nord12
+        case .red: .nord11
+        case .purple: .nord15
+        }
+    }
+
+    var label: String { rawValue.capitalized }
 }

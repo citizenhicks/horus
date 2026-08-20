@@ -4,7 +4,6 @@ struct ExtensionsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.mobiusPalette) private var palette
     @State private var isInstalling = false
-    @State private var detailExtensionID: String?
     @State private var uninstalling: ExtensionRecord?
 
     var body: some View {
@@ -67,16 +66,6 @@ struct ExtensionsView: View {
             }
         }
         .sheet(isPresented: $isInstalling) { InstallExtensionSheet() }
-        .navigationDestination(
-            isPresented: Binding(
-                get: { detailExtensionID != nil },
-                set: { if !$0 { detailExtensionID = nil } }
-            )
-        ) {
-            if let detailExtensionID {
-                ExtensionDetailView(id: detailExtensionID)
-            }
-        }
         .alert(
             "Uninstall this extension?",
             isPresented: Binding(
@@ -136,7 +125,7 @@ struct ExtensionsView: View {
     private func installedRow(_ record: ExtensionRecord) -> some View {
         HStack(spacing: MobiusSpace.s) {
             Button {
-                detailExtensionID = record.id
+                model.navigationPath = [.settings(.extensionPackage(record.id))]
             } label: {
                 InstalledExtensionLabel(record: record)
                 .contentShape(Rectangle())
@@ -145,19 +134,8 @@ struct ExtensionsView: View {
             .accessibilityHint("Shows extension details")
 
             if record.needsHookTrust {
-                Button {
-                    detailExtensionID = record.id
-                } label: {
-                    MobiusBadge(
-                        text: "Hooks disabled",
-                        tone: "warning",
-                        glyph: .shieldAlert,
-                        interactive: true
-                    )
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Review hooks for \(record.name)")
-                .accessibilityHint("Shows every hook command and the trust action")
+                MobiusIcon(.shieldAlert, size: MobiusStyle.glyphMark, foreground: palette.warning)
+                    .accessibilityLabel("\(record.name) has disabled hooks")
             }
 
             MobiusIcon(
@@ -168,12 +146,24 @@ struct ExtensionsView: View {
             .accessibilityHidden(true)
         }
         .swipeActions(edge: .trailing) {
-            Button("Uninstall", glyph: .trash, role: .destructive) { uninstalling = record }
-                .disabled(!model.canMutateExtensions)
+            Button {
+                uninstalling = record
+            } label: {
+                MobiusIcon(.trash, foreground: palette.danger)
+            }
+            .tint(palette.panel)
+            .disabled(!model.canMutateExtensions)
+            .accessibilityLabel("Uninstall \(record.name)")
         }
         .swipeActions(edge: .leading) {
-            Button("Update", glyph: .arrowClockwise) { model.updateExtension(record) }
-                .disabled(!model.canMutateExtensions)
+            Button {
+                model.updateExtension(record)
+            } label: {
+                MobiusIcon(.arrowClockwise, foreground: palette.accent)
+            }
+            .tint(palette.panel)
+            .disabled(!model.canMutateExtensions)
+            .accessibilityLabel("Update \(record.name)")
         }
     }
 }
@@ -233,7 +223,7 @@ private struct InstallExtensionSheet: View {
 
 // MARK: - Detail
 
-private struct ExtensionDetailView: View {
+struct ExtensionDetailView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var confirmsUninstall = false
@@ -242,7 +232,6 @@ private struct ExtensionDetailView: View {
     var body: some View {
         if let record = model.extensions.first(where: { $0.id == id }) {
             detail(record)
-                .navigationTitle(record.name)
                 .toolbarRole(.editor)
         } else {
             MobiusUnavailable(
@@ -257,7 +246,56 @@ private struct ExtensionDetailView: View {
     }
 
     private func detail(_ record: ExtensionRecord) -> some View {
-        Form {
+        PageScaffold(
+            title: record.name,
+            detail: "",
+            headerAccessory: {
+                HStack(spacing: MobiusSpace.xxs) {
+                    if !record.hooks.isEmpty {
+                        if record.needsHookTrust {
+                            Button {
+                                model.trustHooks(for: record)
+                            } label: {
+                                MobiusIcon(.shieldCheck, gutter: false)
+                            }
+                            .mobiusIconButton()
+                            .disabled(!model.canMutateExtensions)
+                            .accessibilityLabel("Trust hooks")
+                            .help("Trusts only the displayed package digest")
+                        } else {
+                            Button {
+                                model.untrustHooks(for: record)
+                            } label: {
+                                MobiusIcon(.shieldOff, gutter: false)
+                            }
+                            .mobiusIconButton()
+                            .disabled(!model.canMutateExtensions)
+                            .accessibilityLabel("Untrust hooks")
+                            .help("Untrust hooks")
+                        }
+                    }
+                    Button {
+                        model.updateExtension(record)
+                    } label: {
+                        MobiusIcon(.arrowClockwise, gutter: false)
+                    }
+                    .mobiusProminentIconButton()
+                    .disabled(!model.canMutateExtensions)
+                    .accessibilityLabel("Update extension")
+                    .help("Update extension")
+                    Button {
+                        confirmsUninstall = true
+                    } label: {
+                        MobiusIcon(.trash, gutter: false)
+                    }
+                    .mobiusIconButton()
+                    .disabled(!model.canMutateExtensions)
+                    .accessibilityLabel("Uninstall extension")
+                    .help("Uninstall extension")
+                }
+                .fixedSize()
+            }
+        ) {
             if !record.description.isEmpty {
                 Section { Text(record.description) }
             }
@@ -290,37 +328,7 @@ private struct ExtensionDetailView: View {
                 ExtensionHooksSection(record: record)
             }
 
-            HStack(spacing: MobiusSpace.s) {
-                Button("Update", glyph: .arrowClockwise) { model.updateExtension(record) }
-                    .mobiusIconButton()
-                    .disabled(!model.canMutateExtensions)
-                if !record.hooks.isEmpty {
-                    if record.needsHookTrust {
-                        Button("Trust hooks", glyph: .shieldCheck) {
-                            model.trustHooks(for: record)
-                        }
-                        .mobiusIconButton()
-                        .disabled(!model.canMutateExtensions)
-                        .accessibilityHint("Trusts only the displayed package digest")
-                    } else {
-                        Button("Untrust hooks", glyph: .shieldOff, role: .destructive) {
-                            model.untrustHooks(for: record)
-                        }
-                        .mobiusIconButton()
-                        .disabled(!model.canMutateExtensions)
-                    }
-                }
-                Button("Uninstall", glyph: .trash, role: .destructive) { confirmsUninstall = true }
-                    .mobiusIconButton()
-                    .disabled(!model.canMutateExtensions)
-            }
-            .frame(maxWidth: .infinity)
-            .settingsStandaloneRow()
         }
-        .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
-        .toolbarTitleDisplayMode(.inline)
-        .background(MobiusBackdrop())
         .alert(
             "Uninstall \(record.name)?",
             isPresented: $confirmsUninstall

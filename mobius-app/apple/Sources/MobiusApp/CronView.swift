@@ -8,7 +8,19 @@ struct CronView: View {
         // Creating a schedule needs a live chat, so that action lives in the chat menu.
         PageScaffold(
             title: "Schedules",
-            detail: "Run durable möbius tasks on the gateway workspace, even when this app is closed."
+            detail: "Run durable möbius tasks on the gateway workspace, even when this app is closed.",
+            headerAccessory: {
+                Button {
+                    model.refreshCron()
+                } label: {
+                    MobiusIcon(.arrowClockwise, gutter: false)
+                }
+                .mobiusProminentIconButton()
+                .disabled(!model.connectionState.isReady)
+                .accessibilityLabel("Refresh schedules")
+                .help("Refresh schedules")
+                .fixedSize()
+            }
         ) {
             if let error = model.cronError {
                 StatusBanner(tone: .error, title: "Schedule rejected", detail: error)
@@ -28,13 +40,7 @@ struct CronView: View {
                     CronTaskRow(task: task)
                 }
             } header: {
-                HStack {
-                    Text("Tasks")
-                    Spacer()
-                    Button("Refresh", glyph: .arrowClockwise) { model.refreshCron() }
-                        .mobiusIconButton()
-                        .help("Refresh schedules")
-                }
+                Text("Tasks")
             }
 
             Section("Run history") {

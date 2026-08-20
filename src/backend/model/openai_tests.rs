@@ -1,6 +1,7 @@
 use super::*;
 use crate::backend::model::PromptCacheIdentity;
 use crate::backend::model::REPLAY_REASONING_FIELD;
+use crate::backend::model::transport::capture_http_request;
 
 fn model_request() -> ModelRequest<'static> {
     ModelRequest {
@@ -893,29 +894,9 @@ async fn http_unauthorized_refreshes_and_retries_once() {
 
 #[tokio::test]
 async fn credentialless_http_omits_authorization() {
-    use tokio::io::AsyncReadExt as _;
-    use tokio::io::AsyncWriteExt as _;
-
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("HTTP listener");
-    let address = listener.local_addr().expect("HTTP address");
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("HTTP connection");
-        let mut request = Vec::new();
-        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-            let mut chunk = [0; 1_024];
-            let count = stream.read(&mut chunk).await.expect("HTTP request");
-            assert_ne!(count, 0, "request ended before its headers");
-            request.extend_from_slice(&chunk[..count]);
-        }
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-            .await
-            .expect("HTTP response");
-        String::from_utf8(request).expect("request UTF-8")
-    });
-    let provider = OpenAi::without_authorization(
+    let (address, server) = capture_http_request().await;
+    let provider = OpenAi::with_client(
+        None,
         format!("http://{address}"),
         "test-model",
         reqwest::Client::new(),

@@ -2,6 +2,7 @@ use serde_json::json;
 
 use super::*;
 use crate::backend::model::PromptCacheIdentity;
+use crate::backend::model::transport::capture_http_request;
 use crate::backend::model::user_message;
 use crate::protocol::FrontendSymbol;
 
@@ -10,9 +11,30 @@ fn provider_advertises_kimi_identity() {
     assert_eq!(provider().symbol(), FrontendSymbol::Custom("kimi".into()));
 }
 
+#[tokio::test]
+async fn credentialless_post_uses_custom_path_and_omits_authorization() {
+    let (address, server) = capture_http_request().await;
+    let provider = Kimi::with_client(
+        None,
+        format!("http://{address}/proxy"),
+        "test-model",
+        reqwest::Client::new(),
+    )
+    .expect("credentialless provider");
+
+    provider
+        .post(&json!({}))
+        .await
+        .expect("credentialless request");
+
+    let request = server.await.expect("HTTP server").to_ascii_lowercase();
+    assert!(request.starts_with("post /proxy/chat/completions http/1.1\r\n"));
+    assert!(!request.contains("authorization:"));
+}
+
 #[test]
 fn responses_history_becomes_kimi_messages_and_tools() {
-    let provider = Kimi::new("test-key", "kimi-k3")
+    let provider = Kimi::new("test-key", DEFAULT_BASE_URL, "kimi-k3")
         .expect("provider")
         .with_reasoning_effort("high")
         .expect("reasoning");

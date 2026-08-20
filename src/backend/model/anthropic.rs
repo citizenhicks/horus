@@ -24,6 +24,7 @@ use super::provider::HostedWebSearch;
 use super::provider::ProviderAuth;
 use super::provider::ProviderBuildConfig;
 use super::provider::ProviderDefinition;
+use super::provider::validate_base_url;
 use super::transport::MAX_SSE_FRAME_BYTES;
 use super::transport::frame_data;
 use super::transport::push_sse_chunk;
@@ -48,7 +49,7 @@ use crate::protocol::ModelEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::WebSearchAction;
 
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
+const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 const API_VERSION: &str = "2023-06-01";
 const MAX_OUTPUT_TOKENS: u64 = 64_000;
 const MAX_CONTENT_BLOCKS: usize = 1_024;
@@ -77,27 +78,34 @@ pub(super) fn anthropic_model_pricing_at(model: &str, unix_seconds: u64) -> Opti
 /// Anthropic's native Messages API provider.
 pub struct Anthropic {
     client: Client,
-    api_key: String,
+    api_key: Option<String>,
+    base_url: String,
     model: String,
     reasoning_effort: Option<String>,
     web_search: bool,
 }
 
 impl Anthropic {
-    /// Creates a provider for Anthropic's fixed Messages API endpoint.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Result<Self> {
-        Self::with_client(api_key, model, streaming_client()?)
+    /// Creates a provider for an Anthropic Messages API endpoint.
+    pub fn new(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Result<Self> {
+        Self::with_client(Some(api_key.into()), base_url, model, streaming_client()?)
     }
 
     fn with_client(
-        api_key: impl Into<String>,
+        api_key: Option<String>,
+        base_url: impl Into<String>,
         model: impl Into<String>,
         client: Client,
     ) -> Result<Self> {
-        let api_key = api_key.into();
-        if api_key.trim().is_empty() {
+        if api_key.as_deref().is_some_and(|key| key.trim().is_empty()) {
             return Err(Error::Config("ANTHROPIC_API_KEY is empty".into()));
         }
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        validate_base_url(&base_url)?;
         let model = model.into();
         if model.trim().is_empty() {
             return Err(Error::Config("Anthropic model is empty".into()));
@@ -105,6 +113,7 @@ impl Anthropic {
         Ok(Self {
             client,
             api_key,
+            base_url,
             model,
             reasoning_effort: None,
             web_search: false,
@@ -199,14 +208,14 @@ impl Anthropic {
     }
 
     async fn post(&self, body: &Value) -> Result<reqwest::Response> {
-        let response = self
+        let mut request = self
             .client
-            .post(API_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .json(body)
-            .send()
-            .await?;
+            .post(format!("{}/messages", self.base_url))
+            .header("anthropic-version", API_VERSION);
+        if let Some(api_key) = &self.api_key {
+            request = request.header("x-api-key", api_key);
+        }
+        let response = request.json(body).send().await?;
         if response.status().is_success() {
             Ok(response)
         } else {
@@ -859,11 +868,16 @@ pub(super) const fn provider() -> ProviderDefinition {
         build_provider,
     )
     .with_image_input()
+    .with_base_url(DEFAULT_BASE_URL)
+    .with_credentialless_endpoints()
 }
 
 fn build_provider(config: ProviderBuildConfig) -> Result<Arc<dyn Model>> {
-    let api_key = config.credential.into_api_key("anthropic")?;
-    let provider = Anthropic::with_client(api_key, config.model, config.http)?;
+    let base_url = config
+        .base_url
+        .ok_or_else(|| Error::Config("Anthropic requires a base URL".into()))?;
+    let api_key = config.credential.into_optional_api_key("anthropic")?;
+    let provider = Anthropic::with_client(api_key, base_url, config.model, config.http)?;
     let provider = match config.reasoning_effort {
         Some(effort) => provider.with_reasoning_effort(effort)?,
         None => provider,

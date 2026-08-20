@@ -165,16 +165,20 @@ extension AppModel {
             applySessions(sessions)
         case .clients:
             break
-        case .providerCredentialSaved(let requestID, let provider):
-            if let index = providerStatuses.firstIndex(where: { $0.provider == provider }) {
-                providerStatuses[index].configured = true
+        case .providerCredentialSaved(let requestID, let instance, let provider):
+            guard let pending = pendingProviderCredential,
+                  requestID == pending.requestID,
+                  instance == pending.instance,
+                  provider == pending.provider
+            else { break }
+            // An API key belongs to the one setup that received it.
+            if let index = providerInstances.firstIndex(where: { $0.instance == instance }) {
+                providerInstances[index].configured = true
             }
-            if requestID == credentialRequestID {
-                credentialRequestID = nil
-                providerAPIKey = ""
-                providerActionState = .credentialSaved(provider)
-                showToast("\(provider) credential saved.", tone: .success)
-            }
+            pendingProviderCredential = nil
+            providerAPIKey = ""
+            providerActionState = .credentialSaved(instance)
+            showToast("\(providerLabel(for: instance)) credential saved.", tone: .success)
         case .pairingCode(let requestID, let code, let expiresAt):
             guard requestID == pairingCodeRequestID else { break }
             pairingCodeRequestID = nil
@@ -195,8 +199,10 @@ extension AppModel {
                 providerActionState = .loginFinished(provider)
                 showToast("Signed in to \(provider).", tone: .success)
             }
-            if let index = providerStatuses.firstIndex(where: { $0.provider == provider }) {
-                providerStatuses[index].configured = true
+            // A browser login is shared by every setup of that provider.
+            for index in providerInstances.indices
+            where providerInstances[index].provider == provider {
+                providerInstances[index].configured = true
             }
         case .profile(_, let profile):
             self.profile = profile
@@ -426,18 +432,28 @@ extension AppModel {
         requestID: String,
         payload: ReadyPayload
     ) {
-        let registeredProviderDraft = requestID == providerRegistrationRequestID
-            ? defaultAgentDraft
-            : nil
+        let removedProvider = pendingProviderRemoval.flatMap {
+            $0.requestID == requestID ? $0 : nil
+        }
+        let removedProviderLabel = removedProvider.flatMap { removal in
+            providerInstances.first { $0.instance == removal.instance }?.label
+        }
         let editedDefaultDraft = requestID == defaultConfigRequestID
             ? defaultAgentDraft
             : nil
         applyGatewayReady(payload)
-        if requestID == providerRegistrationRequestID {
+        if let removedProvider {
+            pendingProviderRemoval = nil
+            if providerDraft?.instance == removedProvider.instance { providerDraft = nil }
+            if navigationPath.last == .settings(.provider(removedProvider.instance)) {
+                navigationPath.removeLast()
+            }
+            providerActionState = .idle
+            showToast("\(removedProviderLabel ?? "Provider") removed.", tone: .success)
+        } else if requestID == providerRegistrationRequestID {
             providerRegistrationRequestID = nil
-            defaultAgentApplyState = .idle
-            if let registeredProviderDraft { defaultAgentDraft = registeredProviderDraft }
-            applyAgentConfiguration(defaultAgentDraft, to: .defaultAgent)
+            providerActionState = .idle
+            showToast("Provider saved.", tone: .success)
         } else if requestID == defaultConfigRequestID {
             defaultConfigRequestID = nil
             if let editedDefaultDraft,
@@ -460,13 +476,13 @@ extension AppModel {
         gatewayMachineName = machineName
         rememberGatewayMachineName(machineName)
         let previousDefault = defaultAgentSnapshot
-        let pendingDefaultDraft: AgentComposition? = if defaultConfigRequestID != nil
-            || providerRegistrationRequestID != nil {
+        let pendingDefaultDraft: AgentComposition? = if defaultConfigRequestID != nil {
             defaultAgentDraft
         } else {
             nil
         }
         providerStatuses = payload.providers
+        providerInstances = payload.providerInstances
         modelChoices = payload.models
         modelProviders = payload.modelProviders
         middlewareFeatures = payload.middlewareFeatures
@@ -480,8 +496,8 @@ extension AppModel {
                 incomingSnapshot: incomingSnapshot
             )
         }
-        if providerDraft == nil, let provider = providerStatuses.first {
-            selectProvider(provider.provider)
+        if providerDraft == nil, let instance = providerInstances.first {
+            editProviderInstance(instance)
         }
     }
 
@@ -547,7 +563,7 @@ extension AppModel {
         selectedSessionID = payload.session.sessionId
         if createdByThisClient {
             destination = .chats
-            chatRoute = .session(payload.session.sessionId)
+            navigationPath = [.chat(.session(payload.session.sessionId))]
             prepareChatTitle(for: payload.session.sessionId)
         }
         if isChatVisible {
@@ -687,7 +703,7 @@ extension AppModel {
         sessionOpenCursor = nil
         sessionToRestoreID = nil
         selectedSessionID = nil
-        chatRoute = nil
+        navigationPath = []
         resetSessionState()
         connectionState = .ready
     }
@@ -846,17 +862,21 @@ extension AppModel {
         if rejection.requestId == gitBranchRequestID {
             gitBranchRequestID = nil
         }
-        if rejection.requestId == credentialRequestID {
+        if rejection.requestId == pendingProviderCredential?.requestID {
             providerActionState = .failed(rejection.message)
-            credentialRequestID = nil
+            pendingProviderCredential = nil
         }
         if rejection.requestId == providerLoginRequestID {
             providerActionState = .failed(rejection.message)
             providerLoginRequestID = nil
         }
         if rejection.requestId == providerRegistrationRequestID {
-            defaultAgentApplyState = .failed(rejection.message)
+            providerActionState = .failed(rejection.message)
             providerRegistrationRequestID = nil
+        }
+        if rejection.requestId == pendingProviderRemoval?.requestID {
+            providerActionState = .failed(rejection.message)
+            pendingProviderRemoval = nil
         }
         rejectExtensionAction(requestID: rejection.requestId)
         if rejection.requestId == pairingCodeRequestID {
