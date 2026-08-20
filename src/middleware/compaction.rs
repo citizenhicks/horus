@@ -92,7 +92,9 @@ impl Compaction {
         Ok(Self { at_tokens })
     }
 
-    fn trigger_tokens(&self, context_window: i64) -> i64 {
+    /// Returns the effective trigger after reserving response space.
+    #[must_use]
+    pub fn trigger_tokens(&self, context_window: i64) -> i64 {
         self.at_tokens
             .min(context_window.saturating_sub(COMPACTION_RESERVE_TOKENS))
             .max(1)

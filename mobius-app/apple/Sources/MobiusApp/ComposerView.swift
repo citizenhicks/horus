@@ -336,14 +336,14 @@ private struct SessionStatsBadge: View {
                 .buttonStyle(.mobiusPlain)
                 .accessibilityLabel("Session observability")
                 .accessibilityValue(
-                    "\(model.contextFillPercent) percent context, \(formatDuration(elapsed)) elapsed"
+                    "\(model.contextFillPercent) percent context used, \(formatDuration(elapsed)) elapsed"
                 )
                 .sensoryFeedback(.selection, trigger: showsDetail)
                 .popover(isPresented: $showsDetail, arrowEdge: .bottom) {
                     BadgePopover(title: "Session") {
                         BadgeStat(
                             label: "Context",
-                            value: "\(model.contextTokens.formatted()) · \(model.contextFillPercent)%"
+                            value: "\(model.contextFillPercent)% used · \(model.contextTokens.formatted()) / \(model.contextLimitTokens?.formatted() ?? "—")"
                         )
                         BadgeStat(
                             label: "Compactions",

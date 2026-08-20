@@ -188,35 +188,37 @@ extension AppModel {
 
     /// Removing a gateway only tears down the connection when it is the active one.
     func forgetGateway(_ account: GatewayAccount) {
+        Task { [weak self] in
+            _ = await self?.removeGateway(account)
+        }
+    }
+
+    func removeGateway(_ account: GatewayAccount) async -> Bool {
         let isActive = account.id == selectedAccountID
         let pendingDraftIO = isActive ? composerDraftIOTask : nil
         if isActive {
             cancelReconnect()
             discardComposerDraft()
         }
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                await pendingDraftIO?.value
-                try await store.remove(account)
-                accounts.removeAll { $0.id == account.id }
-                if isActive {
-                    selectedAccountID = nil
-                    if let next = accounts.first {
-                        connect(to: next)
-                    } else {
-                        let generation = resetGatewayState(preservingDrafts: false)
-                        Task { [weak self] in
-                            guard let self, self.connectionGeneration == generation else { return }
-                            await self.client.disconnect()
-                        }
-                        showsPairing = true
-                    }
+        do {
+            await pendingDraftIO?.value
+            try await store.remove(account)
+            accounts.removeAll { $0.id == account.id }
+            if isActive {
+                selectedAccountID = nil
+                if let next = accounts.first {
+                    connect(to: next)
+                } else {
+                    resetGatewayState(preservingDrafts: false)
+                    await client.disconnect()
+                    showsPairing = true
                 }
-                showToast("Gateway removed.", tone: .info)
-            } catch {
-                showToast(error.localizedDescription, tone: .error)
             }
+            showToast("Gateway removed.", tone: .info)
+            return true
+        } catch {
+            showToast(error.localizedDescription, tone: .error)
+            return false
         }
     }
 

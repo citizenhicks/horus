@@ -181,6 +181,11 @@ final class MobiusCloudSessionStore {
             throw MobiusCloudError.keychain(status)
         }
     }
+
+    fileprivate func remove(ifTokenMatches token: String) throws {
+        guard try load()?.token == token else { return }
+        try remove()
+    }
 }
 
 @MainActor
@@ -269,8 +274,7 @@ final class MobiusCloudClient {
         return credential.session
     }
 
-    /// Forgets the stored bearer. The gateway pairing is a separate trust domain and
-    /// is deliberately left alone, so signing out never drops a paired chat.
+    /// Forgets the stored bearer. AppModel owns the paired-gateway cleanup.
     func signOut() throws {
         try store.remove()
     }
@@ -413,6 +417,7 @@ final class MobiusCloudClient {
         authenticated: Bool = false
     ) async throws -> Data {
         var request = URLRequest(url: url)
+        var bearer: String?
         request.httpMethod = method
         request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -428,13 +433,16 @@ final class MobiusCloudClient {
                 try store.remove()
                 throw MobiusCloudError.sessionExpired
             }
+            bearer = credential.token
             request.setValue("Bearer \(credential.token)", forHTTPHeaderField: "Authorization")
         }
 
         let (data, response) = try await transport(request)
         guard data.count <= Self.maximumResponseBytes else { throw MobiusCloudError.oversizedResponse }
         guard (200..<300).contains(response.statusCode) else {
-            if response.statusCode == 401 { try? store.remove() }
+            if response.statusCode == 401, let bearer {
+                try? store.remove(ifTokenMatches: bearer)
+            }
             throw MobiusCloudError.server(response.statusCode)
         }
         return data

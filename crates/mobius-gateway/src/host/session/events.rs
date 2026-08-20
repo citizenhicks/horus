@@ -188,6 +188,21 @@ impl HostState {
             .active_execution
             .as_ref()
             .map(|active| active_run_summary(&checkpoint.session_id, active));
+        let context_limit_tokens = match self.running.session.model.model_context_window {
+            Some(context_window) if self.spec.agent.config.middleware.enabled("compaction") => {
+                Some(
+                    mobius::middleware::compaction::Compaction::new(
+                        crate::middleware_manifest::integer_setting(
+                            &self.spec.agent.config.middleware,
+                            "compaction",
+                            "at_tokens",
+                        )?,
+                    )?
+                    .trigger_tokens(context_window),
+                )
+            }
+            context_window => context_window,
+        };
         Ok(SessionReadyPayload {
             latest_sequence: self.sequence,
             next_before_sequence: self.next_before_sequence,
@@ -205,6 +220,7 @@ impl HostState {
                 .collect(),
             tool_count: self.running.tool_count,
             compaction_count: checkpoint.compaction_count,
+            context_limit_tokens,
             run_stats,
             config: self.spec.agent.clone(),
         })

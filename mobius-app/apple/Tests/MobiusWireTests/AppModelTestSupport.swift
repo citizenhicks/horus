@@ -370,6 +370,7 @@ final class AppModelTests: XCTestCase {
             widgets: widgets,
             toolCount: 0,
             compactionCount: compactionCount,
+            contextLimitTokens: 200_000,
             runStats: runStats,
             config: VersionedAgentConfig(revision: 1, config: composition())
         )

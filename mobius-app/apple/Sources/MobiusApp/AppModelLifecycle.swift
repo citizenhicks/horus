@@ -249,6 +249,7 @@ extension AppModel {
         contextTokens = 0
         sessionCompactionCount = 0
         modelContextWindow = nil
+        contextLimitTokens = nil
         pendingApproval = nil
         approvalRequestID = nil
         pendingPicker = nil

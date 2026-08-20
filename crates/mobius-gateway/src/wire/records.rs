@@ -28,6 +28,7 @@ pub struct SessionReadyPayload {
     pub widgets: Vec<SessionWidget>,
     pub tool_count: usize,
     pub compaction_count: u64,
+    pub context_limit_tokens: Option<i64>,
     pub run_stats: RunStats,
     pub config: VersionedAgentConfig,
 }

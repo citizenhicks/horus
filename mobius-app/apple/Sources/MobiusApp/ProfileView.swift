@@ -202,12 +202,14 @@ private struct CloudAccountSettings: View {
                 confirmsSignOut = true
             }
             .disabled(model.cloudAction.isRunning)
-            .accessibilityHint("Forgets this Cloud sign-in on this device")
+            .accessibilityHint("Forgets this Cloud sign-in and its paired gateway")
             .alert("Sign out of möbius Cloud?", isPresented: $confirmsSignOut) {
-                Button("Sign out", role: .destructive) { model.signOutOfCloud() }
+                Button("Sign out", role: .destructive) {
+                    Task { await model.signOutOfCloud() }
+                }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("This device forgets the Cloud sign-in. Your subscription and your paired gateway are unaffected.")
+                Text("This device forgets the Cloud sign-in and removes its paired gateway. Your subscription is unaffected.")
             }
         } else {
             Text("möbius works on its own with a gateway you run. Connect möbius Cloud to have one provisioned and managed for you.")

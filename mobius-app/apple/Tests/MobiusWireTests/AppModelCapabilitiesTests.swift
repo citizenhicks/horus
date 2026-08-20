@@ -468,6 +468,23 @@ extension AppModelTests {
         XCTAssertEqual(model.modelContextWindow, 200)
     }
 
+    func testContextFillUsesSessionLimit() throws {
+        let model = try model()
+        model.contextTokens = 100_000
+        model.modelContextWindow = 1_000_000
+        model.contextLimitTokens = 250_000
+
+        XCTAssertEqual(model.contextLimitTokens, 250_000)
+        XCTAssertEqual(model.contextFillFraction, 0.4, accuracy: 0.000_001)
+        XCTAssertEqual(model.contextFillPercent, 40)
+
+        model.contextLimitTokens = model.modelContextWindow
+
+        XCTAssertEqual(model.contextLimitTokens, 1_000_000)
+        XCTAssertEqual(model.contextFillFraction, 0.1, accuracy: 0.000_001)
+        XCTAssertEqual(model.contextFillPercent, 10)
+    }
+
     func testLiveCanonicalAssistantBackfillsTurnIDBeforeTaskCompletion() throws {
         let model = try model()
         model.activeTurnID = nil

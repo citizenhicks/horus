@@ -98,8 +98,12 @@ extension GatewayWireTests {
     }
 
     func testSessionOpenedAndChangedDecodeSessionReadyPayload() throws {
+        let payloadJSON = sessionReadyPayloadJSON.replacingOccurrences(
+            of: #""compaction_count":2"#,
+            with: #""compaction_count":2,"context_limit_tokens":200000"#
+        )
         let opened = try decodeEnvelope(
-            #"{"version":28,"type":"session_opened","request_id":"open-1","payload":\#(sessionReadyPayloadJSON)}"#
+            #"{"version":28,"type":"session_opened","request_id":"open-1","payload":\#(payloadJSON)}"#
         )
         guard case .sessionOpened(let requestID, let payload) = opened else {
             return XCTFail("Expected session opened envelope")
@@ -108,6 +112,7 @@ extension GatewayWireTests {
         XCTAssertEqual(payload.latestSequence, 7)
         XCTAssertEqual(payload.nextBeforeSequence, 2)
         XCTAssertEqual(payload.compactionCount, 2)
+        XCTAssertEqual(payload.contextLimitTokens, 200_000)
         XCTAssertEqual(payload.workspace.path, "/srv/mobius")
         XCTAssertEqual(payload.git?.currentBranch, "main")
         XCTAssertEqual(payload.git?.branches, ["feature", "main"])
@@ -136,7 +141,7 @@ extension GatewayWireTests {
         XCTAssertNil(target)
 
         let changed = try decodeEnvelope(
-            #"{"version":28,"type":"session_changed","payload":\#(sessionReadyPayloadJSON)}"#
+            #"{"version":28,"type":"session_changed","payload":\#(payloadJSON)}"#
         )
         guard case .sessionChanged(let changedPayload) = changed else {
             return XCTFail("Expected session changed envelope")

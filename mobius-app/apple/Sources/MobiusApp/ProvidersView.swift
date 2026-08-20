@@ -4,6 +4,7 @@ struct ProvidersView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.mobiusPalette) private var palette
     @State private var isAdding = false
+    @State private var removing: ProviderInstance?
 
     var body: some View {
         let status = catalogStatus
@@ -50,6 +51,23 @@ struct ProvidersView: View {
             }
         }
         .sheet(isPresented: $isAdding) { AddProviderSheet() }
+        .confirmationDialog(
+            removing.map { "Remove \($0.label)?" } ?? "Remove provider?",
+            isPresented: Binding(
+                get: { removing != nil },
+                set: { if !$0 { removing = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: removing
+        ) { instance in
+            Button("Remove provider", role: .destructive) {
+                model.removeProvider(instance.instance)
+                removing = nil
+            }
+            Button("Cancel", role: .cancel) { removing = nil }
+        } message: { _ in
+            Text("This removes the provider setup from the gateway. This cannot be undone.")
+        }
     }
 
     private var pageDetail: String {
@@ -101,6 +119,16 @@ struct ProvidersView: View {
                 foreground: palette.muted
             )
             .accessibilityHidden(true)
+        }
+        .swipeActions(edge: .trailing) {
+            Button {
+                removing = instance
+            } label: {
+                MobiusIcon(.trash, foreground: palette.danger)
+            }
+            .tint(palette.panel)
+            .disabled(model.isApplyingConfiguration || !model.connectionState.isReady)
+            .accessibilityLabel("Remove \(instance.label)")
         }
     }
 }
@@ -242,23 +270,22 @@ struct ProviderDetailView: View {
                         .disabled(model.isApplyingConfiguration)
                         .accessibilityLabel("Save to gateway")
                         .help("Save to gateway")
+                        Button {
+                            confirmsRemoval = true
+                        } label: {
+                            MobiusIcon(.trash, gutter: false)
+                        }
+                        .mobiusIconButton()
+                        .disabled(
+                            model.isApplyingConfiguration || !model.connectionState.isReady
+                        )
+                        .accessibilityLabel("Remove provider")
+                        .help("Remove provider")
                     }
                     .fixedSize()
                 }
             ) {
                 ProviderFormSections(provider: record.provider, isNew: false)
-                Section {
-                    MobiusActionRow {
-                        Button(
-                            "Remove provider",
-                            glyph: .trash,
-                            role: .destructive
-                        ) {
-                            confirmsRemoval = true
-                        }
-                    }
-                    .disabled(model.isApplyingConfiguration || !model.connectionState.isReady)
-                }
             }
             .toolbarRole(.editor)
             .confirmationDialog(

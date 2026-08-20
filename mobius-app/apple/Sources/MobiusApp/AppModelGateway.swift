@@ -571,6 +571,7 @@ extension AppModel {
         }
         selectedModelRoute = payload.session.model.route
         modelContextWindow = payload.session.model.modelContextWindow
+        contextLimitTokens = payload.contextLimitTokens ?? modelContextWindow
         contributions = payload.contributions
         mountedWidgets = payload.contributions.flatMap { contribution in
             contribution.widgets.map {

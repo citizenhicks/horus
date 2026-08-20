@@ -42,6 +42,7 @@ extension AppModel {
         } catch is CancellationError {
             return
         } catch {
+            guard cloudSession?.userID == userID else { return }
             reportCloud(error)
         }
     }
@@ -67,6 +68,7 @@ extension AppModel {
         } catch is CancellationError {
             return
         } catch {
+            guard cloudSession?.userID == userID else { return }
             reportCloud(error)
         }
     }
@@ -296,7 +298,9 @@ extension AppModel {
         continuation.resume(with: result)
     }
 
-    func signOutOfCloud() {
+    func signOutOfCloud() async {
+        let cloudGateway = (selectedGatewayIsMobiusCloud ? selectedAccount : nil)
+            ?? accounts.first { $0.machineName == mobiusCloudGatewayDisplayName }
         do {
             try cloudClient.signOut()
         } catch {
@@ -306,6 +310,7 @@ extension AppModel {
         cloudSession = nil
         cloudAccount = nil
         cloudError = nil
+        if let cloudGateway, !(await removeGateway(cloudGateway)) { return }
         showToast("Signed out of möbius Cloud.", tone: .info)
     }
 

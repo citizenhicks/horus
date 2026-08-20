@@ -107,6 +107,7 @@ pub(in crate::frontend) async fn run(
         model_route,
         agent_summary(gateway, session),
     );
+    state.context_limit = session.context_limit_tokens;
     let mut tick = tokio::time::interval(INPUT_POLL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut elapsed = tokio::time::interval(ELAPSED_INTERVAL);
@@ -370,6 +371,8 @@ fn sync_session(state: &mut TuiState, session: &SessionReadyPayload, gateway: &R
         .map(super::terminal_text);
     state.model_route.clone_from(&session.session.model.route);
     state.agent_summary = agent_summary(gateway, session);
+    state.context_limit = session.context_limit_tokens;
+    state.usage.apply_context_limit(state.context_limit);
 }
 
 fn agent_summary(gateway: &ReadyPayload, session: &SessionReadyPayload) -> String {

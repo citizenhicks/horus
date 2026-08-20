@@ -128,6 +128,70 @@ final class MobiusCloudTests: XCTestCase {
         }
     }
 
+    func testStaleUnauthorizedResponseDoesNotClearNewCloudSignIn() async throws {
+        let firstUserID = UUID()
+        let secondUserID = UUID()
+        let firstToken = String(repeating: "a", count: 43)
+        let secondToken = String(repeating: "b", count: 43)
+        let service = "app.mobius.cloud.tests.\(UUID())"
+        let sessionStore = MobiusCloudSessionStore(service: service)
+        defer { try? sessionStore.remove() }
+        let staleRequestStarted = expectation(description: "Stale request started")
+        var staleContinuation: CheckedContinuation<(Data, HTTPURLResponse), Never>?
+        var staleResponse: (Data, HTTPURLResponse)?
+        var requestCount = 0
+        let client = MobiusCloudClient(store: sessionStore) { request in
+            requestCount += 1
+            switch requestCount {
+            case 1:
+                return try self.response(
+                    for: request,
+                    json: #"{"token":"\#(firstToken)","userId":"\#(firstUserID.uuidString)","expiresAt":"2099-01-01T00:00:00Z"}"#
+                )
+            case 2:
+                staleResponse = try self.response(for: request, status: 401, json: "{}")
+                return await withCheckedContinuation { continuation in
+                    staleContinuation = continuation
+                    staleRequestStarted.fulfill()
+                }
+            case 3:
+                return try self.response(
+                    for: request,
+                    json: #"{"token":"\#(secondToken)","userId":"\#(secondUserID.uuidString)","expiresAt":"2099-01-01T00:00:00Z"}"#
+                )
+            default:
+                return try self.response(for: request, status: 500, json: "{}")
+            }
+        }
+        _ = try await client.authenticate(
+            authorizationCode: "first-code",
+            nonce: String(repeating: "n", count: 43)
+        )
+
+        let suiteName = "app.mobius.cloud.tests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let model = AppModel(
+            store: GatewayStore(defaults: defaults),
+            settingsDefaults: defaults,
+            cloudClient: client
+        )
+        let staleRefresh = Task { await model.refreshCloudAccount() }
+        await fulfillment(of: [staleRequestStarted], timeout: 1)
+
+        let secondSession = try await client.authenticate(
+            authorizationCode: "second-code",
+            nonce: String(repeating: "n", count: 43)
+        )
+        model.cloudSession = secondSession
+        staleContinuation?.resume(returning: try XCTUnwrap(staleResponse))
+        await staleRefresh.value
+
+        XCTAssertEqual(model.cloudSession?.userID, secondUserID)
+        XCTAssertEqual(try client.loadSession()?.userID, secondUserID)
+        XCTAssertNil(model.cloudError)
+    }
+
     func testSubscribedSignInConnectsWithoutProductOrSubmittingAnotherTransaction() async throws {
         let userID = UUID()
         let token = String(repeating: "t", count: 43)
@@ -279,6 +343,78 @@ final class MobiusCloudTests: XCTestCase {
             "existing-gateway-token"
         )
         try await gatewayStore.remove(try XCTUnwrap(repaired.selectedAccount))
+    }
+
+    func testCloudSignOutForgetsCloudGatewayAndClearsPresentedSession() async throws {
+        let suiteName = "app.mobius.cloud.tests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let gatewayStore = GatewayStore(
+            defaults: defaults,
+            transcriptDirectory: root.appendingPathComponent("Transcripts"),
+            draftDirectory: root.appendingPathComponent("Drafts")
+        )
+        let gateway = GatewayAccount(
+            endpoint: try GatewayEndpoint("wss://gateway.example"),
+            displayName: "Renamed Cloud gateway",
+            machineName: mobiusCloudGatewayDisplayName
+        )
+        try gatewayStore.save(gateway, token: "gateway-token")
+
+        let service = "app.mobius.cloud.tests.\(UUID())"
+        let sessionStore = MobiusCloudSessionStore(service: service)
+        defer { try? sessionStore.remove() }
+        let client = MobiusCloudClient(store: sessionStore) { request in
+            try self.response(
+                for: request,
+                json: #"{"token":"ttttttttttttttttttttttttttttttttttttttttttt","userId":"00000000-0000-0000-0000-000000000001","expiresAt":"2099-01-01T00:00:00Z"}"#
+            )
+        }
+        _ = try await client.authenticate(
+            authorizationCode: "apple-code",
+            nonce: String(repeating: "n", count: 43)
+        )
+        let model = AppModel(
+            store: gatewayStore,
+            settingsDefaults: defaults,
+            requestSender: { _ in },
+            connectionOpener: { _ in AsyncThrowingStream { _ in } },
+            cloudClient: client
+        )
+        model.cloudAccount = MobiusCloudAccount(
+            email: "private@privaterelay.appleid.com",
+            subscribed: true,
+            sharesDiagnostics: false
+        )
+        model.connectionState = .ready
+        model.selectedSessionID = "chat-1"
+        model.destination = .chats
+        model.navigationPath = [.chat(.session("chat-1"))]
+
+        await model.signOutOfCloud()
+
+        XCTAssertNil(model.cloudSession)
+        XCTAssertNil(model.cloudAccount)
+        XCTAssertNil(try client.loadSession())
+        XCTAssertTrue(model.accounts.isEmpty)
+        XCTAssertTrue(gatewayStore.loadAccounts().isEmpty)
+        XCTAssertNil(model.selectedAccountID)
+        XCTAssertNil(gatewayStore.selectedAccountID())
+        XCTAssertNil(model.selectedSessionID)
+        XCTAssertTrue(model.navigationPath.isEmpty)
+        XCTAssertEqual(model.connectionState, .disconnected)
+        XCTAssertTrue(model.showsPairing)
+        XCTAssertThrowsError(try gatewayStore.token(for: gateway)) { error in
+            guard case GatewayStore.StoreError.missingToken = error else {
+                return XCTFail("Expected the gateway token to be removed")
+            }
+        }
     }
 
     func testRestoreConnectsSubscribedAccountWithoutSubmittingTransaction() async throws {

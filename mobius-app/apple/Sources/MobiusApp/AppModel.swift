@@ -139,6 +139,7 @@ final class AppModel {
     var contextTokens = 0
     var sessionCompactionCount: UInt64 = 0
     var modelContextWindow: Int64?
+    var contextLimitTokens: Int64?
     var pendingApproval: PendingApproval?
     var modelChoices: [ModelChoice] = []
     var modelProviders: [String: String] = [:]
@@ -579,8 +580,8 @@ final class AppModel {
     }
 
     var contextFillFraction: Double {
-        guard let modelContextWindow, modelContextWindow > 0 else { return 0 }
-        return min(max(Double(contextTokens) / Double(modelContextWindow), 0), 1)
+        guard let contextLimitTokens, contextLimitTokens > 0 else { return 0 }
+        return min(max(Double(contextTokens) / Double(contextLimitTokens), 0), 1)
     }
 
     var contextFillPercent: Int {

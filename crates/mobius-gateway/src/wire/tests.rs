@@ -848,6 +848,7 @@ fn server_frame_decodes_session_opened_with_a_widget_action_tag() {
             "widgets": [],
             "tool_count": 3,
             "compaction_count": 2,
+            "context_limit_tokens": 250000,
             "run_stats": {
                 "run_count": 0,
                 "failed_run_count": 0,
@@ -908,9 +909,10 @@ fn server_frame_decodes_session_opened_with_a_widget_action_tag() {
             payload.session.session_id.as_str(),
             payload.next_before_sequence,
             payload.compaction_count,
+            payload.context_limit_tokens,
             payload.contributions[0].widgets[0].action.is_some(),
         ),
-        ("request-open", "session-a", Some(2), 2, true)
+        ("request-open", "session-a", Some(2), 2, Some(250_000), true)
     );
 }
 

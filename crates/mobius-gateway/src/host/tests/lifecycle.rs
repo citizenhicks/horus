@@ -164,6 +164,16 @@ async fn initial_snapshot_restores_transient_widgets_without_replaying_them() {
 
     let snapshot = host.snapshot(None).await.expect("session snapshot");
 
+    let context_window = snapshot
+        .ready
+        .session
+        .model
+        .model_context_window
+        .expect("model context window");
+    assert_eq!(
+        snapshot.ready.context_limit_tokens,
+        Some(mobius::middleware::compaction::Compaction::default().trigger_tokens(context_window))
+    );
     assert!(!snapshot.ready.widgets.is_empty());
     assert!(snapshot.replay.iter().all(|frame| {
         !matches!(

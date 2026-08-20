@@ -661,6 +661,7 @@ struct SessionReadyPayload: Decodable, Sendable {
     let widgets: [SessionWidget]
     let toolCount: Int
     let compactionCount: UInt64
+    let contextLimitTokens: Int64?
     let runStats: RunStats
     let config: VersionedAgentConfig
 }

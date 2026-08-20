@@ -615,7 +615,7 @@ fn footer_line(state: &TuiState, width: u16) -> Line<'static> {
     let reasoning = state.model.reasoning_effort.as_deref().unwrap_or("—");
     let context = state
         .usage
-        .context_remaining
+        .context_fill
         .map_or_else(|| "—".into(), |value| format!("{value:.1}%"));
     let cache = state
         .usage

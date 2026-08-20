@@ -142,7 +142,7 @@ impl TuiState {
             EventMsg::ExecApprovalReview(_) => {}
             EventMsg::TokenCount(tokens) => {
                 if let Some(info) = tokens.info {
-                    self.usage = usage_status(&info);
+                    self.usage = usage_status(&info, self.context_limit);
                 }
             }
             EventMsg::ModelChanged(changed) => {
@@ -151,7 +151,7 @@ impl TuiState {
                 self.model.reasoning_effort = changed
                     .reasoning_effort
                     .map(|effort| terminal_text(&effort));
-                self.usage.context_remaining = None;
+                self.usage.context_fill = None;
             }
             EventMsg::SessionResumeRequested(request) => {
                 self.requested_resume = Some(request);
@@ -257,15 +257,28 @@ fn percentage(part: i64, whole: i64) -> Option<f64> {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct UsageStatus {
-    pub(super) context_remaining: Option<f64>,
+    pub(super) context_fill: Option<f64>,
     pub(super) cache_hit: Option<f64>,
+    context_used: i64,
+    context_window: i64,
 }
 
 impl UsageStatus {
+    pub(super) fn apply_context_limit(&mut self, context_limit: Option<i64>) {
+        if self.context_window <= 0 {
+            self.context_fill = None;
+            return;
+        }
+        self.context_fill = percentage(
+            self.context_used,
+            context_limit.unwrap_or(self.context_window),
+        );
+    }
+
     pub(super) fn label(self) -> String {
         format!(
             "context {} · cache {}",
-            self.context_remaining
+            self.context_fill
                 .map_or_else(|| "—".into(), |value| format!("{value:.1}%")),
             self.cache_hit
                 .map_or_else(|| "—".into(), |value| format!("{value:.1}%"))
@@ -349,15 +362,51 @@ fn apply_rendered_event(state: &mut TuiState, rendered: RenderedEvent) {
     state.handle_agent_event(rendered.event, rendered.blocks);
 }
 
-pub(super) fn usage_status(info: &TokenUsageInfo) -> UsageStatus {
+pub(super) fn usage_status(info: &TokenUsageInfo, context_limit: Option<i64>) -> UsageStatus {
     let input = info.last_token_usage.input_tokens.max(0);
     let used = info
         .last_token_usage
         .total_tokens
         .max(input.saturating_add(info.last_token_usage.output_tokens.max(0)));
     let window = info.model_context_window.unwrap_or_default().max(0);
-    UsageStatus {
-        context_remaining: percentage(window.saturating_sub(used), window),
+    let mut status = UsageStatus {
+        context_fill: None,
         cache_hit: percentage(info.last_token_usage.cached_input_tokens, input),
+        context_used: used,
+        context_window: window,
+    };
+    status.apply_context_limit(context_limit);
+    status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mobius::protocol::TokenUsage;
+
+    #[test]
+    fn context_fill_uses_compaction_target_when_enabled() {
+        let usage = TokenUsage {
+            input_tokens: 90_000,
+            output_tokens: 10_000,
+            total_tokens: 100_000,
+            ..TokenUsage::default()
+        };
+        let info = TokenUsageInfo {
+            total_token_usage: usage.clone(),
+            last_token_usage: usage,
+            model_context_window: Some(1_000_000),
+        };
+
+        assert_eq!(usage_status(&info, Some(250_000)).context_fill, Some(40.0));
+        assert_eq!(usage_status(&info, None).context_fill, Some(10.0));
+
+        let mut status = usage_status(&info, Some(250_000));
+        status.apply_context_limit(Some(500_000));
+        assert_eq!(status.context_fill, Some(20.0));
+
+        let mut status = UsageStatus::default();
+        status.apply_context_limit(Some(250_000));
+        assert_eq!(status.context_fill, None);
     }
 }
