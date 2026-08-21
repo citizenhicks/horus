@@ -43,7 +43,9 @@ struct ChatsView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 catalogHeading
-                if displayedSessions.isEmpty {
+                if showsLoadingCatalog {
+                    loadingCatalog
+                } else if displayedSessions.isEmpty {
                     emptyState
                 } else {
                     catalog
@@ -141,6 +143,9 @@ struct ChatsView: View {
         HStack(spacing: MobiusSpace.s) {
             Text(organization.heading)
                 .font(.title2.weight(.semibold))
+            if showsLoadingCatalog {
+                MobiusSpinner(size: MobiusStyle.glyphMark)
+            }
             Spacer()
             Button {
                 showsAttentionOnly.toggle()
@@ -152,6 +157,7 @@ struct ChatsView: View {
             .accessibilityValue(showsAttentionOnly ? "On" : "Off")
             .accessibilityAddTraits(showsAttentionOnly ? .isSelected : [])
             .help(showsAttentionOnly ? "Show all chats" : "Show active and unread chats")
+            .disabled(showsLoadingCatalog)
         }
         .padding(.top, MobiusSpace.l)
         .padding(.bottom, MobiusSpace.s)
@@ -203,6 +209,65 @@ struct ChatsView: View {
         .disabled(!model.canCreateSession)
         .accessibilityHint("Choose a workspace for the new chat")
         .help("New chat")
+    }
+
+    private var showsLoadingCatalog: Bool {
+        model.connectionState.isLoading
+            && model.sessions.isEmpty
+            && !showsAttentionOnly
+            && searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var loadingCatalog: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            loadingWorkspace(
+                "Current project",
+                chats: ["Conversation title", "Another recent chat"]
+            )
+            loadingWorkspace(
+                "Another project",
+                chats: ["Planning notes", "Follow-up conversation", "Recent chat"]
+            )
+        }
+        .mobiusLoadingPlaceholder("Loading chats")
+    }
+
+    private func loadingWorkspace(_ name: String, chats: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 0) {
+                HStack(spacing: MobiusSpace.s) {
+                    MobiusIcon(.folder, foreground: palette.muted)
+                        .unredacted()
+                    Text(name)
+                        .font(MobiusStyle.controlFont)
+                    MobiusIcon(
+                        .caretDown,
+                        size: 12,
+                        foreground: palette.muted
+                    )
+                    .unredacted()
+                }
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: MobiusStyle.iconButtonSize,
+                    alignment: .leading
+                )
+                Color.clear
+                    .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
+            }
+
+            ForEach(chats, id: \.self) { title in
+                Text(title)
+                    .font(MobiusStyle.bodyFont)
+                    .lineLimit(1)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: MobiusStyle.iconButtonSize,
+                        alignment: .leading
+                    )
+                    .padding(.horizontal, MobiusSpace.s)
+            }
+        }
     }
 
     private var displayedSessions: [SessionRecord] {

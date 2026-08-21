@@ -72,6 +72,13 @@ enum ConnectionState: Equatable {
         }
     }
 
+    var isLoading: Bool {
+        switch self {
+        case .connecting, .authenticating, .loading: true
+        case .disconnected, .ready, .failed: false
+        }
+    }
+
     var isReady: Bool { self == .ready }
 
     var tone: ToastTone {

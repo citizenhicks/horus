@@ -22,6 +22,35 @@ final class MobiusCloudTests: XCTestCase {
         XCTAssertEqual(nonce.requestValue, expectedHash)
     }
 
+    func testCloudAccountLoadingStateStopsForDataOrError() throws {
+        let suiteName = "app.mobius.cloud.tests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let cloudStore = MobiusCloudSessionStore(service: suiteName)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? cloudStore.remove()
+        }
+        let model = AppModel(
+            store: GatewayStore(defaults: defaults),
+            settingsDefaults: defaults,
+            cloudClient: MobiusCloudClient(store: cloudStore) { _ in
+                throw URLError(.notConnectedToInternet)
+            }
+        )
+        model.cloudSession = MobiusCloudSession(userID: UUID(), expiresAt: .distantFuture)
+
+        XCTAssertTrue(model.isLoadingCloudAccount)
+        model.cloudError = "Unavailable"
+        XCTAssertFalse(model.isLoadingCloudAccount)
+        model.cloudError = nil
+        model.cloudAccount = MobiusCloudAccount(
+            email: "private@privaterelay.appleid.com",
+            subscribed: true,
+            sharesDiagnostics: false
+        )
+        XCTAssertFalse(model.isLoadingCloudAccount)
+    }
+
     func testClientUsesNativeCloudContractAndBearerFromDeviceOnlyKeychain() async throws {
         let userID = UUID()
         let token = String(repeating: "t", count: 43)

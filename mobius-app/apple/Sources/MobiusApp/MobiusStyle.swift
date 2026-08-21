@@ -322,6 +322,15 @@ extension View {
     func mobiusRunningShimmer(active: Bool) -> some View {
         modifier(MobiusRunningShimmer(active: active))
     }
+
+    func mobiusLoadingPlaceholder(_ accessibilityLabel: String) -> some View {
+        redacted(reason: .placeholder)
+            .mobiusRunningShimmer(active: true)
+            .allowsHitTesting(false)
+            .accessibilityRepresentation {
+                ProgressView { Text(accessibilityLabel) }
+            }
+    }
 }
 
 /// A bright head chasing a fading tail around the app's accent-colored loading track.

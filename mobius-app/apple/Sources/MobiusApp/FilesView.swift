@@ -59,8 +59,14 @@ private struct FilesNavigationTitle: View {
         if model.filesInspectorTab == .modified {
             ModifiedFilesScopePicker()
         } else {
-            Text(model.filesInspectorTab.title)
-                .font(MobiusStyle.titleFont)
+            HStack(spacing: MobiusSpace.xs) {
+                Text(model.filesInspectorTab.title)
+                    .font(MobiusStyle.titleFont)
+                if model.filesInspectorTab == .allFiles && model.isLoadingWorkspaceFiles
+                    || model.filesInspectorTab == .chatFiles && model.isLoadingSessionFiles {
+                    MobiusSpinner(size: MobiusStyle.glyphMark)
+                }
+            }
         }
     }
 }
@@ -284,7 +290,7 @@ private struct WorkspaceFileList: View {
     @ViewBuilder
     private var content: some View {
         if model.isLoadingWorkspaceFiles {
-            InspectorLoadingView(title: "Loading workspace files")
+            WorkspaceFileLoadingList()
         } else if model.workspaceFiles.isEmpty {
             MobiusUnavailable(title: "No workspace files", glyph: .fileMagnifyingGlass)
         } else if !query.isEmpty {
@@ -353,6 +359,26 @@ private struct WorkspaceFileSearchRequest: Equatable {
     let catalogRevision: Int
 }
 
+private struct WorkspaceFileLoadingList: View {
+    private static let nodes = [
+        FileTreeNode(id: "Sources", name: "Sources", size: nil, children: []),
+        FileTreeNode(id: "MobiusApp.swift", name: "MobiusApp.swift", size: 4_096, children: nil),
+        FileTreeNode(id: "README.md", name: "README.md", size: 2_048, children: nil),
+        FileTreeNode(id: "Tests", name: "Tests", size: nil, children: []),
+        FileTreeNode(id: "Package.resolved", name: "Package.resolved", size: 8_192, children: nil),
+    ]
+
+    var body: some View {
+        List(Self.nodes) { node in
+            FileTreeRow(node: node)
+                .inspectorFileListRow()
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .mobiusLoadingPlaceholder("Loading workspace files")
+    }
+}
+
 private struct FileTreeRow: View {
     @Environment(\.mobiusPalette) private var palette
     let node: FileTreeNode
@@ -418,7 +444,7 @@ private struct ChatFileList: View {
     ) -> some View {
         Section(title) {
             if model.isLoadingSessionFiles {
-                InspectorSectionLoadingRow(title: "Loading files")
+                InspectorFileLoadingRows(title: "Loading \(title.lowercased())")
             } else if records.isEmpty {
                 InspectorEmptyRow(title: "No \(title.lowercased())", glyph: emptyGlyph)
             } else {
@@ -473,16 +499,24 @@ private struct SessionFileInspectorRow: View {
     }
 }
 
-private struct InspectorSectionLoadingRow: View {
+private struct InspectorFileLoadingRows: View {
     let title: String
 
     var body: some View {
-        HStack(spacing: MobiusSpace.m) {
-            ProgressView().controlSize(.small)
-            Text(title).foregroundStyle(.secondary)
+        ForEach(0..<2, id: \.self) { index in
+            HStack(spacing: 0) {
+                InspectorFileRow(
+                    name: index == 0 ? "conversation.txt" : "attachment.pdf",
+                    detail: index == 0 ? "text/plain" : "application/pdf",
+                    size: index == 0 ? 2_048 : 8_192,
+                    showsDisclosure: false
+                )
+                Color.clear
+                    .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
+            }
+            .inspectorFileListRow()
         }
-        .frame(minHeight: MobiusStyle.iconButtonSize)
-        .accessibilityElement(children: .combine)
+        .mobiusLoadingPlaceholder(title)
     }
 }
 

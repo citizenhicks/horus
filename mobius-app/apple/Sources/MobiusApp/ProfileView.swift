@@ -25,6 +25,9 @@ struct ProfileView: View {
             } header: {
                 HStack(spacing: MobiusSpace.xs) {
                     Text("möbius Cloud account")
+                    if model.isLoadingCloudAccount {
+                        MobiusSpinner(size: MobiusStyle.glyphMark)
+                    }
                     if model.selectedGatewayIsMobiusCloud {
                         MobiusCloudBadge()
                     }
@@ -158,12 +161,25 @@ private struct CloudAccountSettings: View {
     /// Signed out, this is an offer; signed in, it is an account. Account actions stay absent
     /// until there is a Cloud session to authenticate them.
     var body: some View {
-        if model.hasCloudAccount {
+        if model.isLoadingCloudAccount {
+            Group {
+                LabeledContent("Email") { Text("account@example.com") }
+                Toggle("Help improve möbius", isOn: .constant(false))
+                LabeledContent("Subscriber since") { Text("August 2026") }
+            }
+            .mobiusLoadingPlaceholder("Loading Cloud account")
+        } else if model.hasCloudAccount {
+            if let cloudError = model.cloudError {
+                StatusBanner(
+                    tone: .error,
+                    title: "Cloud account unavailable",
+                    detail: cloudError,
+                    action: ("Retry", { Task { await model.refreshCloudAccount() } })
+                )
+            }
             LabeledContent("Email") {
                 if let email = model.cloudAccount?.email {
                     Text(verbatim: email)
-                } else if model.cloudAccount == nil {
-                    ProgressView()
                 } else {
                     Text("Unavailable")
                 }

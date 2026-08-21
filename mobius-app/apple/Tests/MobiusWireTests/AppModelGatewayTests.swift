@@ -3,18 +3,19 @@ import XCTest
 
 @MainActor
 extension AppModelTests {
-    func testConnectionStateUsesWarningToneWhileConnecting() {
-        let expectations: [(ConnectionState, ToastTone)] = [
-            (.disconnected, .error),
-            (.connecting, .warning),
-            (.authenticating, .warning),
-            (.loading, .warning),
-            (.ready, .success),
-            (.failed("unavailable"), .error),
+    func testConnectionStatePresentation() {
+        let expectations: [(ConnectionState, ToastTone, Bool)] = [
+            (.disconnected, .error, false),
+            (.connecting, .warning, true),
+            (.authenticating, .warning, true),
+            (.loading, .warning, true),
+            (.ready, .success, false),
+            (.failed("unavailable"), .error, false),
         ]
 
-        for (state, tone) in expectations {
+        for (state, tone, isLoading) in expectations {
             XCTAssertEqual(state.tone, tone)
+            XCTAssertEqual(state.isLoading, isLoading)
         }
     }
 

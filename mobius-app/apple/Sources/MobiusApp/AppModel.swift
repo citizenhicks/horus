@@ -30,6 +30,9 @@ final class AppModel {
     var cloudError: String?
     var isUpdatingCloudDiagnostics = false
     var hasCloudAccount: Bool { cloudSession != nil }
+    var isLoadingCloudAccount: Bool {
+        hasCloudAccount && cloudAccount == nil && cloudError == nil
+    }
 
     var gatewayMachineName = ""
     @ObservationIgnored let titleWriter: ChatTitleWriter
