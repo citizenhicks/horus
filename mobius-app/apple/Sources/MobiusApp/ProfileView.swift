@@ -186,23 +186,48 @@ private struct CloudAccountSettings: View {
                     )
                 }
             }
-            Button("Manage subscription", glyph: .sealCheck) {
-                showsSubscriptionManagement = true
+            if let startedAt = model.cloudAccount?.subscriptionStartedAt {
+                LabeledContent("Subscriber since") {
+                    Text(startedAt, format: .dateTime.month(.wide).day().year())
+                }
             }
-            .accessibilityHint("Opens App Store subscription management, where you can unsubscribe")
-            .manageSubscriptionsSheet(isPresented: $showsSubscriptionManagement)
-            Button(
-                model.cloudAction == .restoring ? "Restoring purchases…" : "Restore purchases",
-                glyph: .arrowClockwise
-            ) {
-                Task { _ = await model.restoreCloudPurchases() }
+            VStack(spacing: MobiusSpace.s) {
+                if model.cloudAccount?.subscribed == false {
+                    MobiusCloudOfferButton()
+                } else if model.cloudAccount?.subscribed == true, model.mobiusCloudGateway == nil {
+                    Button("Connect Cloud gateway", glyph: .cloudServer) {
+                        Task { _ = await model.connectCloudGateway() }
+                    }
+                    .mobiusProminentButton()
+                }
+                Button("Manage subscription", glyph: .sealCheck) {
+                    showsSubscriptionManagement = true
+                }
+                .buttonStyle(.mobiusGlass)
+                .tint(palette.accent)
+                .accessibilityHint("Opens App Store subscription management, where you can unsubscribe")
+                .manageSubscriptionsSheet(isPresented: $showsSubscriptionManagement)
+                Button(
+                    model.cloudAction == .restoring ? "Restoring purchases…" : "Restore purchases",
+                    glyph: .arrowClockwise
+                ) {
+                    Task { _ = await model.restoreCloudPurchases() }
+                }
+                .buttonStyle(.mobiusGlass)
+                .tint(palette.signal)
+                .disabled(model.cloudAction.isRunning)
+                Button("Sign out", glyph: .lockOpen, role: .destructive) {
+                    confirmsSignOut = true
+                }
+                .buttonStyle(.mobiusGlassProminent)
+                .tint(palette.danger)
+                .foregroundStyle(.white)
+                .disabled(model.cloudAction.isRunning)
+                .accessibilityHint("Forgets this Cloud sign-in and its paired gateway")
             }
-            .disabled(model.cloudAction.isRunning)
-            Button("Sign out", glyph: .lockOpen, role: .destructive) {
-                confirmsSignOut = true
-            }
-            .disabled(model.cloudAction.isRunning)
-            .accessibilityHint("Forgets this Cloud sign-in and its paired gateway")
+            .buttonBorderShape(.capsule)
+            .buttonSizing(.flexible)
+            .controlSize(.large)
             .alert("Sign out of möbius Cloud?", isPresented: $confirmsSignOut) {
                 Button("Sign out", role: .destructive) {
                     Task { await model.signOutOfCloud() }

@@ -3,6 +3,7 @@ import StoreKit
 import SwiftUI
 
 struct MobiusCloudOfferButton: View {
+    @Environment(AppModel.self) private var model
     @Environment(\.mobiusPalette) private var palette
     @State private var showsOffer = false
 
@@ -14,7 +15,7 @@ struct MobiusCloudOfferButton: View {
             showsOffer = true
         } label: {
             Label {
-                Text("Connect to möbius Cloud")
+                Text(model.hasCloudAccount ? "Subscribe to möbius Cloud" : "Connect to möbius Cloud")
                     // Glass takes a tint from its own material, not from the button's, so
                     // the accent has to be carried by the label for it to read at all.
                     .foregroundStyle(palette.accent)

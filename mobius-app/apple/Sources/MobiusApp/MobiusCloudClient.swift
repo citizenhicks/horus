@@ -13,6 +13,19 @@ struct MobiusCloudAccount: Equatable, Sendable {
     let email: String?
     let subscribed: Bool
     let sharesDiagnostics: Bool
+    let subscriptionStartedAt: Date?
+
+    init(
+        email: String?,
+        subscribed: Bool,
+        sharesDiagnostics: Bool,
+        subscriptionStartedAt: Date? = nil
+    ) {
+        self.email = email
+        self.subscribed = subscribed
+        self.sharesDiagnostics = sharesDiagnostics
+        self.subscriptionStartedAt = subscriptionStartedAt
+    }
 }
 
 struct MobiusCloudPairingGrant: Equatable, Sendable {

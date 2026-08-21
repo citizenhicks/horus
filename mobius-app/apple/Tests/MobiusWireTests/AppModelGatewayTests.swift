@@ -61,6 +61,19 @@ extension AppModelTests {
         XCTAssertEqual(attempts, 3)
     }
 
+    func testCloudAccountRemainsRecognizedWhenAnotherGatewayIsSelected() throws {
+        let model = try model()
+        let cloud = GatewayAccount(endpoint: try GatewayEndpoint("wss://account.sprites.app"))
+        let selfHosted = GatewayAccount(endpoint: try GatewayEndpoint("wss://gateway.example"))
+        model.accounts = [cloud, selfHosted]
+        model.cloudSession = MobiusCloudSession(userID: UUID(), expiresAt: .distantFuture)
+        model.selectedAccountID = selfHosted.id
+
+        XCTAssertEqual(model.mobiusCloudGateway?.id, cloud.id)
+        XCTAssertFalse(model.selectedGatewayIsMobiusCloud)
+        XCTAssertTrue(model.hasCloudAccount)
+    }
+
     func testAttachmentsCanBeImportedWhileATurnIsActive() async throws {
         let recorder = GatewayRequestRecorder()
         let model = try model(requestSender: { request in

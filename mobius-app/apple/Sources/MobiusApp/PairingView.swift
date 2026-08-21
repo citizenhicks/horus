@@ -83,6 +83,9 @@ struct PairingView: View {
         .scrollDismissesKeyboard(.interactively)
         .safeAreaInset(edge: .bottom) { pairAction }
         .onSubmit { model.pair() }
+        .task(id: model.cloudSession?.userID) {
+            await model.refreshCloudAccount()
+        }
     }
 
     /// The two ways in, then the wire detail. The protocol line led this stack before, which
@@ -105,7 +108,30 @@ struct PairingView: View {
                 .buttonBorderShape(.capsule)
                 .controlSize(.large)
                 .buttonSizing(.flexible)
-            MobiusCloudOfferButton()
+            if !model.hasCloudAccount {
+                MobiusCloudOfferButton()
+            } else if model.cloudAccount?.subscribed == true, model.mobiusCloudGateway == nil {
+                Button("Connect Cloud gateway", glyph: .cloudServer) {
+                    Task { _ = await model.connectCloudGateway() }
+                }
+                .buttonStyle(.mobiusGlass)
+                .buttonBorderShape(.capsule)
+                .controlSize(.large)
+                .buttonSizing(.flexible)
+                .tint(palette.accent)
+                .disabled(model.cloudAction.isRunning)
+            } else if model.cloudAccount == nil {
+                Button(model.cloudError == nil ? "Checking Cloud account…" : "Retry Cloud account") {
+                    Task { await model.refreshCloudAccount() }
+                }
+                .buttonStyle(.mobiusGlass)
+                .buttonBorderShape(.capsule)
+                .controlSize(.large)
+                .buttonSizing(.flexible)
+                .disabled(model.cloudError == nil)
+            } else if model.cloudAccount?.subscribed == false {
+                MobiusCloudOfferButton()
+            }
             MobiusLabel(
                 title: "4-byte framed JSON · protocol v\(gatewayProtocolVersion)",
                 glyph: .shieldCheck,

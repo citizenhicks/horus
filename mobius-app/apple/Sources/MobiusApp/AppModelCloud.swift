@@ -36,7 +36,22 @@ extension AppModel {
         cloudError = nil
 
         do {
-            let account = try await cloudClient.account()
+            var account = try await cloudClient.account()
+            if let verification = try await currentCloudEntitlement() {
+                let transaction = try cloudTransaction(from: verification)
+                if !account.subscribed {
+                    try await cloudClient.submitSubscription(
+                        signedTransaction: verification.jwsRepresentation
+                    )
+                    await transaction.finish()
+                }
+                account = MobiusCloudAccount(
+                    email: account.email,
+                    subscribed: true,
+                    sharesDiagnostics: account.sharesDiagnostics,
+                    subscriptionStartedAt: transaction.originalPurchaseDate
+                )
+            }
             guard cloudSession?.userID == userID else { return }
             cloudAccount = account
         } catch is CancellationError {
@@ -63,7 +78,8 @@ extension AppModel {
             cloudAccount = MobiusCloudAccount(
                 email: account.email,
                 subscribed: account.subscribed,
-                sharesDiagnostics: sharesDiagnostics
+                sharesDiagnostics: sharesDiagnostics,
+                subscriptionStartedAt: account.subscriptionStartedAt
             )
         } catch is CancellationError {
             return
@@ -131,7 +147,12 @@ extension AppModel {
 
         do {
             let account = try await cloudClient.account()
-            cloudAccount = account
+            cloudAccount = MobiusCloudAccount(
+                email: account.email,
+                subscribed: account.subscribed,
+                sharesDiagnostics: account.sharesDiagnostics,
+                subscriptionStartedAt: cloudAccount?.subscriptionStartedAt
+            )
             guard account.subscribed else { throw MobiusCloudError.subscriptionRequired }
             return try await provisionCloudGateway()
         } catch is CancellationError {
@@ -178,7 +199,12 @@ extension AppModel {
         }
 
         let account = try await cloudClient.account()
-        cloudAccount = account
+        cloudAccount = MobiusCloudAccount(
+            email: account.email,
+            subscribed: account.subscribed,
+            sharesDiagnostics: account.sharesDiagnostics,
+            subscriptionStartedAt: cloudAccount?.subscriptionStartedAt
+        )
         if account.subscribed {
             return try await provisionCloudGateway()
         }
@@ -217,7 +243,8 @@ extension AppModel {
         cloudAccount = MobiusCloudAccount(
             email: cloudAccount?.email,
             subscribed: true,
-            sharesDiagnostics: cloudAccount?.sharesDiagnostics ?? false
+            sharesDiagnostics: cloudAccount?.sharesDiagnostics ?? false,
+            subscriptionStartedAt: transaction.originalPurchaseDate
         )
     }
 

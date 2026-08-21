@@ -441,10 +441,17 @@ final class AppModel {
         accounts.first { $0.id == selectedAccountID }
     }
 
+    var mobiusCloudGateway: GatewayAccount? {
+        guard hasCloudAccount else { return nil }
+        return accounts.first {
+            $0.displayName == mobiusCloudGatewayDisplayName
+                || isMobiusCloudSpriteEndpoint($0.endpoint)
+        }
+    }
+
     var selectedGatewayIsMobiusCloud: Bool {
-        guard hasCloudAccount, let selectedAccount else { return false }
-        return selectedAccount.displayName == mobiusCloudGatewayDisplayName
-            || isMobiusCloudSpriteEndpoint(selectedAccount.endpoint)
+        guard let cloudGatewayID = mobiusCloudGateway?.id else { return false }
+        return selectedAccountID == cloudGatewayID
     }
 
     var presentedChatSessionID: String? {
@@ -738,7 +745,13 @@ final class AppModel {
     ) {
         let prompt = submittedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let previewTitle = ChatTitleWriter.preview(for: prompt),
-              titleEligibleSessionIDs.contains(sessionID),
+              titleEligibleSessionIDs.contains(sessionID)
+                  || (pendingChatTitles[sessionID] == nil && sessions.contains(where: {
+                      $0.sessionId == sessionID
+                          && $0.explicitTitle == nil
+                          && ($0.firstUserMessage ?? "")
+                              .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  })),
               let accountID = selectedAccountID
         else { return }
         guard sessions.first(where: { $0.sessionId == sessionID })?.explicitTitle == nil

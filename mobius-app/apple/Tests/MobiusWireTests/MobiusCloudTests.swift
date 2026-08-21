@@ -525,6 +525,13 @@ final class MobiusCloudTests: XCTestCase {
             },
             cloudClient: client
         )
+        let subscriptionStartedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        model.cloudAccount = MobiusCloudAccount(
+            email: "private@privaterelay.appleid.com",
+            subscribed: true,
+            sharesDiagnostics: false,
+            subscriptionStartedAt: subscriptionStartedAt
+        )
         model.pairingEndpoint = "wss://stale.example"
         model.pairingCode = "stale-code"
 
@@ -611,6 +618,7 @@ final class MobiusCloudTests: XCTestCase {
         let succeeded = await successfulConnection.value
         XCTAssertTrue(succeeded)
         XCTAssertEqual(model.cloudAction, .idle)
+        XCTAssertEqual(model.cloudAccount?.subscriptionStartedAt, subscriptionStartedAt)
         XCTAssertEqual(
             requests.dropFirst().map { "\($0.httpMethod ?? "") \($0.url?.path ?? "")" },
             [

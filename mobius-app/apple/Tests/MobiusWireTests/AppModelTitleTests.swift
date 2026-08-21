@@ -84,6 +84,37 @@ extension AppModelTests {
         XCTAssertEqual(model.currentSessionTitle, "Generated title")
     }
 
+    func testRestoredUntitledDraftStillGeneratesTitleAfterNavigation() async throws {
+        let recorder = GatewayRequestRecorder()
+        var prompts: [String] = []
+        let model = try model(
+            requestSender: { request in await recorder.record(request) },
+            titleWriter: ChatTitleWriter { prompt in
+                prompts.append(prompt)
+                return "Generated title"
+            }
+        )
+        let account = GatewayAccount(endpoint: try GatewayEndpoint("tcp://localhost:9191"))
+        try await openNewSession(in: model, recorder: recorder, account: account)
+        model.applySessions([session(state: .idle, firstUserMessage: nil)])
+        model.titleEligibleSessionIDs.removeAll()
+        model.composer = "Review the gateway"
+        model.destination = .profile
+        model.navigationPath = []
+        model.destination = .chats
+        model.openChat("chat-1")
+
+        try await submitMessage("Review the gateway", in: model, recorder: recorder)
+        model.startChatTitle(
+            prompt: "Use the second prompt instead",
+            submissionID: "second-submission",
+            sessionID: "chat-1"
+        )
+
+        XCTAssertEqual(prompts, ["Review the gateway"])
+        XCTAssertEqual(model.currentSessionTitle, "Generated title")
+    }
+
     func testGeneratedTitlePersistsWhenTheCatalogTruncatesALongFirstMessage() async throws {
         let recorder = GatewayRequestRecorder()
         let writer = ChatTitleWriter { _ in "Generated title" }
