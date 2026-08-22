@@ -8,6 +8,7 @@ mod profile;
 mod providers;
 mod replay;
 mod session;
+mod ssh;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -47,8 +48,8 @@ use crate::wire::{
     AgentComposition, CronRunStatus, GitDiffScope, MAX_FRAME_BYTES, ProfileSnapshot,
     ProviderConfig, ReadyPayload, RecordedEvent, RenderedEvent, RenderedPreview, RunStats,
     RunSummary, ServerFrame, ServerMessage, SessionActivity, SessionActivityState, SessionOutcome,
-    SessionReadyPayload, SessionRecord, SessionRunGroup, SessionWidget, VersionedAgentConfig,
-    WorkspaceFileScope, validate_session_id,
+    SessionReadyPayload, SessionRecord, SessionRunGroup, SessionWidget, SshIdentityRecord,
+    VersionedAgentConfig, WorkspaceFileScope, validate_session_id,
 };
 use crate::{Error, Result};
 
@@ -60,12 +61,15 @@ use self::files::{
     WorkspaceFiles, WorkspaceRead, list as list_workspace_files, read as read_workspace_file,
 };
 use self::git::{
-    diff as workspace_git_diff, status as git_status, switch_branch as switch_workspace_branch,
+    approve_credential as approve_git_credential_on_host, diff as workspace_git_diff,
+    probe_credential as probe_git_credential_on_host, status as git_status,
+    switch_branch as switch_workspace_branch,
 };
 use self::profile::*;
 use self::replay::*;
 pub(crate) use self::session::HostHandle;
 use self::session::*;
+use self::ssh::{generate as generate_ssh_identity_on_host, identities as ssh_identities_on_host};
 
 const COMMAND_CAPACITY: usize = 128;
 const BROADCAST_CAPACITY: usize = 512;
@@ -98,6 +102,7 @@ struct GatewayState {
     catalog_lock: Arc<Mutex<()>>,
     session_mutations: Arc<RwLock<()>>,
     extension_mutations: Arc<Mutex<()>>,
+    remote_mcp: Arc<crate::remote_mcp::RemoteMcp>,
     provider_epoch: Arc<AtomicU64>,
     activities: SessionActivities,
     provider_login: Arc<StdMutex<Option<String>>>,
@@ -128,6 +133,7 @@ impl GatewayHost {
         credentials: Arc<CredentialStore>,
         cron: Arc<CronStore>,
     ) -> Result<Self> {
+        let remote_mcp = Arc::new(crate::remote_mcp::RemoteMcp::new(store.state_dir()));
         let extensions = ExtensionStore::new(&store);
         extensions.prune(&config)?;
         extensions.verify_installed_snapshots(&config)?;
@@ -151,6 +157,7 @@ impl GatewayHost {
                 catalog_lock: Arc::new(Mutex::new(())),
                 session_mutations: Arc::new(RwLock::new(())),
                 extension_mutations: Arc::new(Mutex::new(())),
+                remote_mcp,
                 provider_epoch: Arc::new(AtomicU64::new(0)),
                 activities: Arc::new(StdMutex::new(HashMap::new())),
                 provider_login: Arc::new(StdMutex::new(None)),
@@ -178,6 +185,36 @@ impl GatewayHost {
         session_catalog(&state.checkpoints, &state.activities)
             .await
             .map_err(internal)
+    }
+
+    pub(crate) async fn probe_git_credential(
+        &self,
+        target: &str,
+    ) -> std::result::Result<bool, Rejection> {
+        probe_git_credential_on_host(target).await
+    }
+
+    pub(crate) async fn approve_git_credential(
+        &self,
+        target: &str,
+        username: &str,
+        token: &str,
+    ) -> std::result::Result<(), Rejection> {
+        approve_git_credential_on_host(target, username, token).await
+    }
+
+    pub(crate) async fn ssh_identities(
+        &self,
+    ) -> std::result::Result<Vec<SshIdentityRecord>, Rejection> {
+        tokio::task::spawn_blocking(ssh_identities_on_host)
+            .await
+            .map_err(internal)?
+    }
+
+    pub(crate) async fn generate_ssh_identity(
+        &self,
+    ) -> std::result::Result<(SshIdentityRecord, String), Rejection> {
+        generate_ssh_identity_on_host().await
     }
 
     pub(crate) async fn create_session(

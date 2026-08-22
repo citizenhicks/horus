@@ -105,6 +105,15 @@ pub struct GitStatus {
     pub branches: Vec<String>,
 }
 
+/// Public metadata for one SSH identity found on the gateway host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshIdentityRecord {
+    pub label: String,
+    pub algorithm: String,
+    pub fingerprint: String,
+}
+
 /// One explicit Git patch selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -199,6 +208,34 @@ pub struct ExtensionRecord {
     pub skills: Vec<String>,
     pub hooks: Vec<ExtensionHookRecord>,
     pub hooks_trusted: bool,
+    pub connection: Option<ExtensionConnectionRecord>,
+}
+
+/// Frontend-safe connection metadata for an extension's remote MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionConnectionRecord {
+    pub kind: ExtensionConnectionKind,
+    pub state: ExtensionConnectionState,
+    pub label: String,
+    pub message: Option<String>,
+}
+
+/// Authentication mechanism declared by an extension's remote MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionConnectionKind {
+    OAuth,
+    ApiKey,
+}
+
+/// Frontend-safe lifecycle state for an authenticated extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionConnectionState {
+    Disconnected,
+    Connected,
+    NeedsAttention,
 }
 
 /// Provider and model settings. Credentials are resolved only on the gateway host.

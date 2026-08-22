@@ -101,19 +101,25 @@ pub(crate) async fn assemble(
     };
     let resolved_extensions =
         ExtensionStore::new(store).resolve(&gateway_config, &chat.agent.config.extensions)?;
-    let extensions = (EXTENSIONS_MANIFEST.required
-        || chat.agent.config.middleware.enabled(EXTENSIONS_MANIFEST.id))
-    .then(|| {
-        Extensions::discover_installed(
-            [
-                chat.workspace.join(".agents/skills"),
-                chat.workspace.join(".codex/skills"),
-            ]
-            .into_iter()
-            .chain(resolved_extensions.skill_roots.iter().cloned()),
-        )
-    })
-    .transpose()?;
+    let extensions_enabled = EXTENSIONS_MANIFEST.required
+        || chat.agent.config.middleware.enabled(EXTENSIONS_MANIFEST.id);
+    let extension_tools = if extensions_enabled {
+        crate::remote_mcp::tools_for(&resolved_extensions.mcp_servers, store.state_dir()).await
+    } else {
+        Vec::new()
+    };
+    let extensions = extensions_enabled
+        .then(|| {
+            Extensions::discover_installed(
+                [
+                    chat.workspace.join(".agents/skills"),
+                    chat.workspace.join(".codex/skills"),
+                ]
+                .into_iter()
+                .chain(resolved_extensions.skill_roots.iter().cloned()),
+            )
+        })
+        .transpose()?;
     let mut read_roots = extensions
         .as_ref()
         .map_or_else(Vec::new, Extensions::resource_roots);
@@ -176,6 +182,7 @@ pub(crate) async fn assemble(
         backend,
         &resolved_extensions,
         extensions,
+        extension_tools,
     )?;
     let mut metadata = match session_id.as_deref() {
         Some(session_id) => checkpoints
@@ -766,6 +773,7 @@ fn build_middleware(
     backend: Arc<dyn SandboxBackend>,
     resolved_extensions: &ResolvedExtensions,
     mut extensions: Option<Extensions>,
+    mut extension_tools: Vec<Arc<dyn mobius::middleware::tools::Tool>>,
 ) -> Result<(MiddlewareStack, Option<Arc<OnceLock<AgentConfig>>>)> {
     let mut entries: Vec<Arc<dyn Middleware>> = Vec::new();
     let mut subagent_template = None;
@@ -804,7 +812,8 @@ fn build_middleware(
                             .map(|plugin| plugin.activation(Arc::clone(&gateway))),
                         workspace,
                         Arc::clone(&backend),
-                    )?,
+                    )?
+                    .with_tools(std::mem::take(&mut extension_tools)),
             ),
             BuiltinMiddleware::Tasks => Arc::new(Tasks),
             BuiltinMiddleware::Subagents => {

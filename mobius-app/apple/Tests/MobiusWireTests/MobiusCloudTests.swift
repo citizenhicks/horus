@@ -820,6 +820,46 @@ final class MobiusCloudTests: XCTestCase {
         }
     }
 
+    func testExtensionCatalogUsesAuthenticatedGenericCloudContract() async throws {
+        let token = String(repeating: "t", count: 43)
+        let service = "app.mobius.cloud.tests.\(UUID())"
+        let store = MobiusCloudSessionStore(service: service)
+        defer { try? store.remove() }
+        var requests: [URLRequest] = []
+        let responses = [
+            #"{"token":"\#(token)","userId":"00000000-0000-0000-0000-000000000001","expiresAt":"2099-01-01T00:00:00Z"}"#,
+            #"{"extensions":[{"id":"ponytail","name":"Ponytail","description":"Prefer the smallest correct implementation.","source":{"url":"https://github.com/DietrichGebert/ponytail.git","reference":"v4.9.0"}}]}"#,
+        ]
+        let client = MobiusCloudClient(store: store) { request in
+            requests.append(request)
+            return try self.response(for: request, json: responses[requests.count - 1])
+        }
+        _ = try await client.authenticate(
+            authorizationCode: "apple-code",
+            nonce: String(repeating: "n", count: 43)
+        )
+
+        let catalog = try await client.extensionCatalog()
+
+        XCTAssertEqual(catalog, [MobiusCloudExtensionCatalogItem(
+            id: "ponytail",
+            name: "Ponytail",
+            description: "Prefer the smallest correct implementation.",
+            icon: nil,
+            source: MobiusCloudExtensionSource(
+                url: "https://github.com/DietrichGebert/ponytail.git",
+                reference: "v4.9.0",
+                subdirectory: nil
+            )
+        )])
+        XCTAssertEqual(requests.last?.url?.path, "/api/mobile/extensions/catalog")
+        XCTAssertEqual(requests.last?.httpMethod, "GET")
+        XCTAssertEqual(
+            requests.last?.value(forHTTPHeaderField: "Authorization"),
+            "Bearer \(token)"
+        )
+    }
+
     func testCloudPairingGrantRejectsUnsafeGatewayFields() async throws {
         let store = MobiusCloudSessionStore(service: "app.mobius.cloud.tests.\(UUID())")
         defer { try? store.remove() }

@@ -24,12 +24,10 @@ struct ProfileView: View {
                     }
             } header: {
                 HStack(spacing: MobiusSpace.xs) {
-                    Text("möbius Cloud account")
+                    MobiusCloudLabel(showsAccount: true)
+                        .textCase(nil)
                     if model.isLoadingCloudAccount {
                         MobiusSpinner(size: MobiusStyle.glyphMark)
-                    }
-                    if model.selectedGatewayIsMobiusCloud {
-                        MobiusCloudBadge()
                     }
                 }
             }

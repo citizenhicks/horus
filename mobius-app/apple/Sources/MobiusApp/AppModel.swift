@@ -11,6 +11,14 @@ final class AppModel {
     var navigationPath: [AppRoute] = []
     var workspace: WorkspaceInfo?
     var gitStatus: GitStatus?
+    var gitCredentialAvailable: Bool?
+    var gitCredentialError: String?
+    var isCheckingGitCredential = false
+    var sshIdentities: [SshIdentityRecord]?
+    var sshIdentityError: String?
+    var isLoadingSshIdentities = false
+    var isGeneratingSshIdentity = false
+    var generatedSshIdentity: GeneratedSshIdentity?
     private(set) var gitDiffRevision = 0
     var gitDiff = "" {
         didSet { gitDiffRevision &+= 1 }
@@ -148,6 +156,9 @@ final class AppModel {
     var modelProviders: [String: String] = [:]
     var middlewareFeatures: [MiddlewareFeature] = []
     var extensions: [ExtensionRecord] = []
+    var availableExtensions: [MobiusCloudExtensionCatalogItem] = []
+    var extensionCatalogError: String?
+    var isLoadingExtensionCatalog = false
     var gatewayContributions: [FrontendContribution] = []
     var extensionInstallSource = ""
     var selectedModelRoute = ""
@@ -235,6 +246,7 @@ final class AppModel {
     var providerReasoningEffortsText = ""
     var providerActionState: ProviderActionState = .idle
     var extensionAction: ExtensionAction?
+    var extensionAuthorizationChallenge: ExtensionAuthorizationChallenge?
     var pairingCodeInfo: PairingCodeInfo?
 
     var showsPairing = false
@@ -311,6 +323,9 @@ final class AppModel {
     @ObservationIgnored var gitDiffRequestID: String?
     @ObservationIgnored var stagedGitDiffRequestID: String?
     @ObservationIgnored var committedGitDiffRequestID: String?
+    @ObservationIgnored var gitCredentialRequestID: String?
+    @ObservationIgnored var isApprovingGitCredential = false
+    @ObservationIgnored var sshIdentityRequestID: String?
     @ObservationIgnored var workspaceFilesRequestID: String?
     @ObservationIgnored var sessionFilesRequestID: String?
     @ObservationIgnored var sessionFileUploadRequests: [String: SessionFileUploadRequest] = [:]

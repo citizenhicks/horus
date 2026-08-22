@@ -10,6 +10,7 @@ pub mod cron;
 mod extensions;
 mod host;
 mod middleware_manifest;
+mod remote_mcp;
 pub mod sandbox;
 pub mod server;
 pub mod wire;
@@ -29,6 +30,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
 }
 
 /// Result type shared by gateway modules.

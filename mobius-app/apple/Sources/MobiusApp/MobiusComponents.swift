@@ -205,6 +205,60 @@ struct MobiusToolbarIconButton: View {
     }
 }
 
+/// Keeps adjacent toolbar actions inside the system's single shared glass surface.
+struct HeaderActionGroup<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        HStack(spacing: 0) { content }
+            .fixedSize()
+    }
+}
+
+struct HeaderOptionsMenu<Content: View>: View {
+    let label: String
+    @ViewBuilder let content: Content
+
+    init(label: String, @ViewBuilder content: () -> Content) {
+        self.label = label
+        self.content = content()
+    }
+
+    var body: some View {
+        Menu { content } label: {
+            MobiusIcon(.dotsThree, foreground: .primary)
+                .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
+                .contentShape(Rectangle())
+        }
+        .labelStyle(.titleAndIcon)
+        .menuIndicator(.hidden)
+        .accessibilityLabel(label)
+        .tint(.primary)
+        .help(label)
+    }
+}
+
+extension View {
+    func groupedHeaderAction(prominent: Bool = false) -> some View {
+        modifier(GroupedHeaderAction(prominent: prominent))
+    }
+}
+
+private struct GroupedHeaderAction: ViewModifier {
+    @Environment(\.mobiusPalette) private var palette
+    let prominent: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .tint(prominent ? palette.accent : .primary)
+            .frame(
+                width: MobiusStyle.iconButtonSize,
+                height: MobiusStyle.iconButtonSize
+            )
+            .contentShape(Rectangle())
+    }
+}
+
 /// A prominent button with a label that stays legible on the accent in both schemes.
 private struct MobiusProminentButton: ViewModifier {
     @Environment(\.mobiusPalette) private var palette

@@ -437,6 +437,85 @@ extension AppModel {
         }
     }
 
+    func probeGitCredential(_ target: String) {
+        guard connectionState.isReady, gitCredentialRequestID == nil else { return }
+        let target = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else {
+            gitCredentialError = "Enter an HTTPS Git host or URL."
+            return
+        }
+        let id = requestID("git-credential")
+        gitCredentialAvailable = nil
+        gitCredentialError = nil
+        gitCredentialRequestID = id
+        isApprovingGitCredential = false
+        isCheckingGitCredential = true
+        transmit(.probeGitCredential(requestID: id, target: target)) { [weak self] message in
+            guard self?.gitCredentialRequestID == id else { return }
+            self?.gitCredentialRequestID = nil
+            self?.isCheckingGitCredential = false
+            self?.gitCredentialError = message
+        }
+    }
+
+    func approveGitCredential(target: String, username: String, token: String) {
+        guard connectionState.isReady, gitCredentialRequestID == nil else { return }
+        let target = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        let username = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty, !username.isEmpty, !token.isEmpty else {
+            gitCredentialError = "Enter the Git host, username, and access token."
+            return
+        }
+        let id = requestID("git-credential")
+        gitCredentialError = nil
+        gitCredentialRequestID = id
+        isApprovingGitCredential = true
+        isCheckingGitCredential = true
+        transmit(.approveGitCredential(
+            requestID: id,
+            target: target,
+            username: username,
+            token: token
+        )) { [weak self] message in
+            guard self?.gitCredentialRequestID == id else { return }
+            self?.gitCredentialRequestID = nil
+            self?.isApprovingGitCredential = false
+            self?.isCheckingGitCredential = false
+            self?.gitCredentialError = message
+        }
+    }
+
+    func listSshIdentities() {
+        guard connectionState.isReady, sshIdentityRequestID == nil else { return }
+        let id = requestID("ssh-list")
+        sshIdentityRequestID = id
+        sshIdentityError = nil
+        isLoadingSshIdentities = true
+        transmit(.listSshIdentities(requestID: id)) { [weak self] message in
+            guard self?.sshIdentityRequestID == id else { return }
+            self?.sshIdentityRequestID = nil
+            self?.isLoadingSshIdentities = false
+            self?.sshIdentityError = message
+        }
+    }
+
+    func generateSshIdentity() {
+        guard connectionState.isReady,
+              sshIdentityRequestID == nil,
+              sshIdentities?.isEmpty == true
+        else { return }
+        let id = requestID("ssh-generate")
+        sshIdentityRequestID = id
+        sshIdentityError = nil
+        isGeneratingSshIdentity = true
+        transmit(.generateSshIdentity(requestID: id)) { [weak self] message in
+            guard self?.sshIdentityRequestID == id else { return }
+            self?.sshIdentityRequestID = nil
+            self?.isGeneratingSshIdentity = false
+            self?.sshIdentityError = message
+        }
+    }
+
     func startCronSetup() {
         guard canStartCronSetup, let sessionID = selectedSessionID else { return }
         let task = cronTaskDraft.trimmingCharacters(in: .whitespacesAndNewlines)

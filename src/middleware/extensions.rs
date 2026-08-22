@@ -1,4 +1,4 @@
-//! Standalone skills and activated OpenAI plugin packages.
+//! Standalone skills and activated Agent Plugin packages.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -27,6 +27,7 @@ use super::SessionStartSource;
 use super::StopContext;
 use super::UserPromptSubmitContext;
 use super::manifest::MiddlewareManifest;
+use super::tools::Tool;
 use crate::BoxFuture;
 use crate::Error;
 use crate::Result;
@@ -36,6 +37,7 @@ use crate::backend::sandbox::ApprovalPolicy;
 use crate::backend::sandbox::CommandAuthorization;
 use crate::backend::sandbox::SandboxBackend;
 use crate::protocol::EventMsg;
+use crate::protocol::FrontendBlock;
 use crate::protocol::FrontendContribution;
 use crate::protocol::FrontendReference;
 use crate::protocol::FrontendSlot;
@@ -58,12 +60,20 @@ const MAX_SKILLS: usize = 64;
 const MAX_SKILL_BYTES: u64 = 40_000;
 const MAX_PLUGINS: usize = 32;
 const MAX_PLUGIN_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_MCP_SERVERS: usize = 8;
+const MAX_MCP_HEADERS: usize = 32;
+const MAX_MCP_VALUE_BYTES: usize = 8 * 1024;
 const MAX_PLUGIN_ID_BYTES: usize = 128;
 const MAX_PLUGIN_VERSION_BYTES: usize = 128;
 const MAX_HOOK_CONTEXT_BYTES: usize = 40_000;
 const MAX_HOOK_NOTICES: usize = 32;
 const SKILL_FILE: &str = "SKILL.md";
-const PLUGIN_MANIFEST: &str = ".codex-plugin/plugin.json";
+const LEGACY_PLUGIN_MANIFEST: &str = ".codex-plugin/plugin.json";
+const AGENT_PLUGIN_MANIFEST: &str = "plugin.json";
+const AGENT_PLUGIN_MCP: &str = "mcp.json";
+const AGENT_PLUGIN_SCHEMA: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
+const AGENT_PLUGIN_MCP_SCHEMA: &str = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
+const MOBIUS_PLUGIN_EXTENSION: &str = "app.mobius";
 const SESSION_HOOK_CONTEXT_KIND: &str = "extension_session_hook";
 
 /// Fail-closed authorization checked immediately before each plugin hook command starts.
@@ -95,6 +105,31 @@ pub struct ExtensionPackage {
     pub description: String,
     pub skills: Vec<String>,
     pub hooks: Vec<ExtensionHook>,
+    pub mcp_servers: Vec<ExtensionMcpServer>,
+}
+
+/// One remote Streamable HTTP MCP server declared by an Agent Plugin package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionMcpServer {
+    pub name: String,
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
+    pub connection: Option<ExtensionConnection>,
+}
+
+/// Frontend-safe setup metadata for one MCP server connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionConnection {
+    pub kind: ExtensionConnectionKind,
+    pub label: String,
+    pub secret_header: Option<String>,
+}
+
+/// Authentication ceremony required by a remote MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionConnectionKind {
+    OAuth,
+    ApiKey,
 }
 
 /// One executable hook shown to an owner before trust is granted.
@@ -106,19 +141,23 @@ pub struct ExtensionHook {
     pub timeout_seconds: u64,
 }
 
-/// Validates and inspects one standalone Agent Skill or OpenAI plugin package.
+/// Validates and inspects one standalone Agent Skill or Agent Plugin package.
 pub fn inspect_package(root: impl AsRef<Path>) -> Result<ExtensionPackage> {
     let root = canonical_plugin_root(root.as_ref())?;
-    let manifest_path = root.join(PLUGIN_MANIFEST);
-    match manifest_path.symlink_metadata() {
-        Ok(_) => inspect_plugin(&root),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => inspect_skill(&root),
-        Err(error) => Err(error.into()),
+    match agent_plugin_schema(&root)? {
+        Some(schema) if schema == AGENT_PLUGIN_SCHEMA => inspect_agent_plugin(&root),
+        Some(_) | None if root.join(LEGACY_PLUGIN_MANIFEST).exists() => {
+            inspect_legacy_plugin(&root)
+        }
+        Some(schema) => Err(Error::Config(format!(
+            "unsupported Agent Plugin schema `{schema}`"
+        ))),
+        None => inspect_skill(&root),
     }
 }
 
-fn inspect_plugin(root: &Path) -> Result<ExtensionPackage> {
-    let manifest = load_plugin_manifest(root)?;
+fn inspect_legacy_plugin(root: &Path) -> Result<ExtensionPackage> {
+    let manifest = load_legacy_plugin_manifest(root)?;
     let mut skills = BTreeMap::new();
     discover_plugin_skills(root, &manifest, &mut skills)?;
     let hooks = hooks::inspect(root, manifest.hooks.as_ref())?;
@@ -135,6 +174,29 @@ fn inspect_plugin(root: &Path) -> Result<ExtensionPackage> {
         description: manifest.description.unwrap_or_default(),
         skills: skills.into_keys().collect(),
         hooks,
+        mcp_servers: Vec::new(),
+    })
+}
+
+fn inspect_agent_plugin(root: &Path) -> Result<ExtensionPackage> {
+    let manifest = load_agent_plugin_manifest(root)?;
+    let mcp_servers = load_agent_plugin_mcp(root, &manifest)?;
+    let mut skills = BTreeMap::new();
+    discover_agent_plugin_skills(root, &manifest.name, &mut skills)?;
+    if skills.is_empty() && mcp_servers.is_empty() {
+        return Err(Error::Config(format!(
+            "plugin `{}` has no supported contributions",
+            manifest.name
+        )));
+    }
+    Ok(ExtensionPackage {
+        kind: ExtensionPackageKind::Plugin,
+        name: manifest.name,
+        version: manifest.version,
+        description: manifest.description.unwrap_or_default(),
+        skills: skills.into_keys().collect(),
+        hooks: Vec::new(),
+        mcp_servers,
     })
 }
 
@@ -143,7 +205,7 @@ fn inspect_skill(root: &Path) -> Result<ExtensionPackage> {
     let content = String::from_utf8(read_bounded_file(&path, MAX_SKILL_BYTES, "skill manifest")?)
         .map_err(|_| Error::Config("skill manifest is not valid UTF-8".into()))?;
     let (name, description) = skill_metadata(&path, &content);
-    if !valid_package_name(&name) {
+    if !valid_legacy_package_name(&name) {
         return Err(Error::Config(format!(
             "skill name `{name}` must be kebab-case"
         )));
@@ -155,6 +217,7 @@ fn inspect_skill(root: &Path) -> Result<ExtensionPackage> {
         version: None,
         description,
         hooks: Vec::new(),
+        mcp_servers: Vec::new(),
     })
 }
 
@@ -177,6 +240,8 @@ pub struct Extensions {
     hooks: Vec<AuthorizedHooks>,
     hook_runtime: Option<hooks::HookRuntime>,
     prompt: String,
+    tools: Vec<Arc<dyn Tool>>,
+    tool_names: BTreeSet<String>,
 }
 
 impl Extensions {
@@ -190,6 +255,8 @@ impl Extensions {
             hooks: Vec::new(),
             hook_runtime: None,
             prompt: text::PROMPT_DEFAULT.into(),
+            tools: Vec::new(),
+            tool_names: BTreeSet::new(),
         })
     }
 
@@ -200,7 +267,7 @@ impl Extensions {
         Ok(discovered)
     }
 
-    /// Activates OpenAI plugin snapshots and their declared contributions.
+    /// Activates plugin snapshots and their declared contributions.
     ///
     /// The optional predicate authorizes command hooks for that snapshot and is checked
     /// immediately before every launch. Bundled skills remain available without it. Callers
@@ -246,29 +313,41 @@ impl Extensions {
                     "plugin snapshot and writable workspace must not overlap".into(),
                 ));
             }
-            let manifest = load_plugin_manifest(&root)?;
-            if !self.plugins.insert(manifest.name.clone()) {
-                return Err(Error::Duplicate(format!("plugin `{}`", manifest.name)));
+            let package = inspect_package(&root)?;
+            if package.kind != ExtensionPackageKind::Plugin {
+                return Err(Error::Config("activated extension is not a plugin".into()));
+            }
+            if !self.plugins.insert(package.name.clone()) {
+                return Err(Error::Duplicate(format!("plugin `{}`", package.name)));
             }
             let skill_count = self.skills.len();
-            discover_plugin_skills(&root, &manifest, &mut self.skills)?;
-            let data = data_root.join(&manifest.name);
-            data_root_dir.create_dir_all(&manifest.name)?;
+            let data = data_root.join(&package.name);
+            data_root_dir.create_dir_all(&package.name)?;
             let data = canonical_directory(&data, "plugin data directory")?;
             if !data.starts_with(&data_root) {
                 return Err(Error::Config(format!(
                     "plugin `{}` data directory escapes its root",
-                    manifest.name
+                    package.name
                 )));
             }
-            let hooks = hooks::HookSet::load(root, data, manifest.hooks.as_ref())?;
-            if self.skills.len() == skill_count && hooks.is_empty() {
+            let hooks = if agent_plugin_schema(&root)?.as_deref() == Some(AGENT_PLUGIN_SCHEMA) {
+                discover_agent_plugin_skills(&root, &package.name, &mut self.skills)?;
+                None
+            } else {
+                let manifest = load_legacy_plugin_manifest(&root)?;
+                discover_plugin_skills(&root, &manifest, &mut self.skills)?;
+                Some(hooks::HookSet::load(root, data, manifest.hooks.as_ref())?)
+            };
+            if self.skills.len() == skill_count
+                && hooks.as_ref().is_none_or(hooks::HookSet::is_empty)
+                && package.mcp_servers.is_empty()
+            {
                 return Err(Error::Config(format!(
                     "plugin `{}` has no supported contributions",
-                    manifest.name
+                    package.name
                 )));
             }
-            if let Some(authorization) = authorization
+            if let (Some(authorization), Some(hooks)) = (authorization, hooks)
                 && !hooks.is_empty()
             {
                 self.hooks.push(AuthorizedHooks {
@@ -281,6 +360,14 @@ impl Extensions {
             self.hook_runtime = Some(hooks::HookRuntime::new(backend, workspace)?);
         }
         Ok(self)
+    }
+
+    /// Adds gateway-resolved remote MCP tools from activated plugin packages.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.tool_names = tools.iter().map(|tool| tool.definition().name).collect();
+        self.tools = tools;
+        self
     }
 
     /// Overrides the instruction placed before discovered skill metadata.
@@ -371,7 +458,7 @@ impl Extensions {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PluginManifest {
+struct LegacyPluginManifest {
     name: String,
     #[serde(default)]
     version: Option<String>,
@@ -389,9 +476,9 @@ struct PluginManifest {
     metadata: BTreeMap<String, Value>,
 }
 
-impl PluginManifest {
+impl LegacyPluginManifest {
     fn validate(&self) -> Result<()> {
-        if !valid_package_name(&self.name) {
+        if !valid_legacy_package_name(&self.name) {
             return Err(Error::Config(format!(
                 "plugin name `{}` must be kebab-case",
                 self.name
@@ -441,9 +528,9 @@ impl PluginManifest {
     }
 }
 
-fn load_plugin_manifest(root: &Path) -> Result<PluginManifest> {
-    let manifest_path = confined_path(root, PLUGIN_MANIFEST, false)?;
-    let manifest: PluginManifest = serde_json::from_slice(&read_bounded_file(
+fn load_legacy_plugin_manifest(root: &Path) -> Result<LegacyPluginManifest> {
+    let manifest_path = confined_path(root, LEGACY_PLUGIN_MANIFEST, false)?;
+    let manifest: LegacyPluginManifest = serde_json::from_slice(&read_bounded_file(
         &manifest_path,
         MAX_PLUGIN_MANIFEST_BYTES,
         "plugin manifest",
@@ -451,16 +538,299 @@ fn load_plugin_manifest(root: &Path) -> Result<PluginManifest> {
     manifest.validate()?;
     if manifest.mcp_servers.is_some() || manifest.apps.is_some() {
         return Err(Error::Config(format!(
-            "plugin `{}` declares an unsupported MCP or app contribution",
+            "legacy plugin `{}` declares an unsupported remote contribution",
             manifest.name
         )));
     }
     Ok(manifest)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentPluginManifest {
+    #[serde(rename = "$schema")]
+    schema: String,
+    name: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    author: Option<AgentPluginAuthor>,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    keywords: Option<Vec<String>>,
+    #[serde(default)]
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentPluginAuthor {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentMcpFile {
+    #[serde(rename = "$schema")]
+    schema: String,
+    #[serde(rename = "mcpServers")]
+    servers: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamableHttpServer {
+    #[serde(rename = "type")]
+    kind: String,
+    url: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MobiusPluginExtension {
+    connection: MobiusConnection,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum MobiusConnection {
+    OAuth {
+        server: String,
+        label: String,
+    },
+    ApiKey {
+        server: String,
+        header: String,
+        label: String,
+    },
+}
+
+fn agent_plugin_schema(root: &Path) -> Result<Option<String>> {
+    let path = root.join(AGENT_PLUGIN_MANIFEST);
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Ok(Some(String::new())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let value = match serde_json::from_slice::<Value>(&read_bounded_file(
+        &path,
+        MAX_PLUGIN_MANIFEST_BYTES,
+        "Agent Plugin manifest",
+    )?) {
+        Ok(value) => value,
+        Err(_) => return Ok(Some(String::new())),
+    };
+    Ok(Some(
+        value
+            .get("$schema")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    ))
+}
+
+fn load_agent_plugin_manifest(root: &Path) -> Result<AgentPluginManifest> {
+    let path = confined_path(root, AGENT_PLUGIN_MANIFEST, false)?;
+    let manifest: AgentPluginManifest = serde_json::from_slice(&read_bounded_file(
+        &path,
+        MAX_PLUGIN_MANIFEST_BYTES,
+        "Agent Plugin manifest",
+    )?)?;
+    if manifest.schema != AGENT_PLUGIN_SCHEMA
+        || manifest.name.len() > 64
+        || !valid_package_name(&manifest.name)
+        || manifest
+            .version
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_PLUGIN_VERSION_BYTES)
+        || manifest
+            .description
+            .as_ref()
+            .is_some_and(|value| value.len() > 4_096)
+        || manifest.extensions.values().any(|value| !value.is_object())
+        || manifest
+            .author
+            .as_ref()
+            .is_some_and(AgentPluginAuthor::is_too_large)
+        || manifest
+            .homepage
+            .as_ref()
+            .into_iter()
+            .chain(manifest.repository.as_ref())
+            .chain(manifest.license.as_ref())
+            .any(|value| value.len() > 4_096)
+        || manifest
+            .keywords
+            .as_ref()
+            .is_some_and(|values| values.len() > 64 || values.iter().any(|value| value.len() > 256))
+    {
+        return Err(Error::Config(format!(
+            "plugin `{}` has an invalid Agent Plugins v1 manifest",
+            manifest.name
+        )));
+    }
+    Ok(manifest)
+}
+
+impl AgentPluginAuthor {
+    fn is_too_large(&self) -> bool {
+        self.name
+            .as_ref()
+            .into_iter()
+            .chain(self.email.as_ref())
+            .chain(self.url.as_ref())
+            .any(|value| value.len() > 4_096)
+    }
+}
+
+fn load_agent_plugin_mcp(
+    root: &Path,
+    manifest: &AgentPluginManifest,
+) -> Result<Vec<ExtensionMcpServer>> {
+    let path = root.join(AGENT_PLUGIN_MCP);
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(Error::Config(
+                "Agent Plugin MCP component is not a file".into(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    }
+    let file: AgentMcpFile = serde_json::from_slice(&read_bounded_file(
+        &path,
+        MAX_PLUGIN_MANIFEST_BYTES,
+        "Agent Plugin MCP component",
+    )?)?;
+    if file.schema != AGENT_PLUGIN_MCP_SCHEMA || file.servers.len() > MAX_MCP_SERVERS {
+        return Err(Error::Config("invalid Agent Plugin MCP component".into()));
+    }
+    let connection = manifest
+        .extensions
+        .get(MOBIUS_PLUGIN_EXTENSION)
+        .map(|value| serde_json::from_value::<MobiusPluginExtension>(value.clone()))
+        .transpose()?;
+    let mut servers = Vec::new();
+    for (name, value) in file.servers {
+        if value.get("type").and_then(Value::as_str) != Some("streamable-http") {
+            continue;
+        }
+        let server: StreamableHttpServer = serde_json::from_value(value)?;
+        if server.kind != "streamable-http" {
+            return Err(Error::Config("invalid Streamable HTTP MCP server".into()));
+        }
+        validate_mcp_server(&name, &server)?;
+        servers.push(ExtensionMcpServer {
+            name,
+            url: server.url,
+            headers: server.headers,
+            connection: None,
+        });
+    }
+    if let Some(connection) = connection {
+        apply_connection(&mut servers, connection.connection)?;
+    }
+    Ok(servers)
+}
+
+fn validate_mcp_server(name: &str, server: &StreamableHttpServer) -> Result<()> {
+    let url = reqwest::Url::parse(&server.url)
+        .map_err(|error| Error::Config(format!("invalid MCP server URL: {error}")))?;
+    if name.is_empty()
+        || name.len() > MAX_PLUGIN_ID_BYTES
+        || name.trim() != name
+        || name.chars().any(char::is_control)
+        || url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || server.headers.len() > MAX_MCP_HEADERS
+        || server.headers.iter().any(|(name, value)| {
+            name.len() > 256
+                || value.len() > MAX_MCP_VALUE_BYTES
+                || reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+                || reqwest::header::HeaderValue::from_str(value).is_err()
+        })
+    {
+        return Err(Error::Config(format!(
+            "MCP server `{name}` has invalid remote transport metadata"
+        )));
+    }
+    Ok(())
+}
+
+fn apply_connection(
+    servers: &mut [ExtensionMcpServer],
+    connection: MobiusConnection,
+) -> Result<()> {
+    let (server_name, label, kind, secret_header) = match connection {
+        MobiusConnection::OAuth { server, label } => {
+            (server, label, ExtensionConnectionKind::OAuth, None)
+        }
+        MobiusConnection::ApiKey {
+            server,
+            header,
+            label,
+        } => {
+            let header = reqwest::header::HeaderName::from_bytes(header.as_bytes())
+                .map_err(|_| Error::Config("plugin API-key header is invalid".into()))?;
+            (
+                server,
+                label,
+                ExtensionConnectionKind::ApiKey,
+                Some(header.as_str().to_owned()),
+            )
+        }
+    };
+    if label.is_empty()
+        || label.len() > 128
+        || label.trim() != label
+        || label.chars().any(char::is_control)
+    {
+        return Err(Error::Config("plugin connection label is invalid".into()));
+    }
+    let server = servers
+        .iter_mut()
+        .find(|server| server.name == server_name)
+        .ok_or_else(|| Error::Config("plugin connection names an unavailable server".into()))?;
+    if secret_header.as_ref().is_some_and(|secret| {
+        server
+            .headers
+            .keys()
+            .any(|header| header.eq_ignore_ascii_case(secret))
+    }) {
+        return Err(Error::Config(
+            "plugin connection conflicts with a declared MCP header".into(),
+        ));
+    }
+    server.connection = Some(ExtensionConnection {
+        kind,
+        label,
+        secret_header,
+    });
+    Ok(())
+}
+
 fn discover_plugin_skills(
     root: &Path,
-    manifest: &PluginManifest,
+    manifest: &LegacyPluginManifest,
     skills: &mut BTreeMap<String, Skill>,
 ) -> Result<()> {
     let Some(path) = manifest.skills.as_deref() else {
@@ -476,9 +846,43 @@ fn discover_plugin_skills(
     discover_roots([root], skills, Some(&manifest.name), false)
 }
 
+fn discover_agent_plugin_skills(
+    root: &Path,
+    plugin_name: &str,
+    skills: &mut BTreeMap<String, Skill>,
+) -> Result<()> {
+    let root = root.join("skills");
+    match root.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            discover_roots([root], skills, Some(plugin_name), false)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Returns whether a package name is canonical for the supported extension formats.
 #[must_use]
 pub fn valid_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_PLUGIN_ID_BYTES
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+        })
+        && name
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && name
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && !name.contains("--")
+        && !name.contains("..")
+}
+
+fn valid_legacy_package_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_PLUGIN_ID_BYTES
         && name.split('-').all(|part| {
@@ -760,6 +1164,31 @@ fn hook_stop_reason(outcome: &hooks::HookOutcome) -> String {
 impl Middleware for Extensions {
     fn name(&self) -> &'static str {
         MANIFEST.id
+    }
+
+    fn register(
+        &self,
+        catalog: &mut super::tools::Catalog,
+        _runtime: &super::RuntimeContext,
+    ) -> Result<()> {
+        for tool in &self.tools {
+            catalog.register(Arc::clone(tool))?;
+        }
+        Ok(())
+    }
+
+    fn render(&self, event: &EventMsg, _session_id: &str) -> Option<FrontendBlock> {
+        super::tools::render_tool_event(
+            event,
+            |name| self.tool_names.contains(name),
+            |name, _| super::tools::ToolHeading {
+                title: name
+                    .strip_prefix("mcp__")
+                    .unwrap_or(name)
+                    .replace("__", " · "),
+                detail: String::new(),
+            },
+        )
     }
 
     fn prompt_section(&self, _runtime: &super::RuntimeContext) -> Result<Option<PromptSection>> {
@@ -1535,35 +1964,92 @@ printf '%s\n' '{"systemMessage":"PONYTAIL:FULL","hookSpecificOutput":{"hookEvent
     }
 
     #[test]
-    fn plugin_rejects_undeclared_runtime_contributions() {
-        use crate::backend::sandbox::local::LocalSandbox;
-
+    fn agent_plugin_accepts_remote_mcp_with_connection_metadata() {
         let temporary = tempfile::tempdir().expect("temporary extensions");
-        let workspace = temporary.path().join("workspace");
-        std::fs::create_dir(&workspace).expect("workspace");
+        let plugin = temporary.path().join("google-maps");
+        std::fs::create_dir(&plugin).expect("plugin directory");
+        std::fs::write(
+            plugin.join("plugin.json"),
+            r#"{
+                "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+                "name": "google-maps",
+                "version": "1.0.0",
+                "description": "Maps",
+                "extensions": {"app.mobius":{"connection":{
+                    "type":"api_key",
+                    "server":"google-maps",
+                    "header":"X-Goog-Api-Key",
+                    "label":"Google Maps API key"
+                }}}
+            }"#,
+        )
+        .expect("plugin manifest");
+        std::fs::write(
+            plugin.join("mcp.json"),
+            r#"{
+                "$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+                "mcpServers":{"google-maps":{
+                    "type":"streamable-http",
+                    "url":"https://mapstools.googleapis.com/mcp"
+                }}
+            }"#,
+        )
+        .expect("MCP manifest");
+
+        let package = inspect_package(plugin).expect("Agent Plugin package");
+        assert_eq!(
+            package.mcp_servers,
+            [ExtensionMcpServer {
+                name: "google-maps".into(),
+                url: "https://mapstools.googleapis.com/mcp".into(),
+                headers: BTreeMap::new(),
+                connection: Some(ExtensionConnection {
+                    kind: ExtensionConnectionKind::ApiKey,
+                    label: "Google Maps API key".into(),
+                    secret_header: Some("x-goog-api-key".into()),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn schema_declared_agent_plugin_wins_over_legacy_manifest() {
+        let temporary = tempfile::tempdir().expect("temporary extensions");
         let plugin = temporary.path().join("remote");
         std::fs::create_dir_all(plugin.join(".codex-plugin")).expect("plugin manifest directory");
         std::fs::write(
             plugin.join(".codex-plugin/plugin.json"),
-            r#"{
-                "name": "remote",
-                "version": "1.0.0",
-                "description": "Unsupported remote tools",
-                "mcpServers": "./.mcp.json"
-            }"#,
+            r#"{"name":"legacy","skills":"./skills"}"#,
         )
-        .expect("plugin manifest");
-        let backend = Arc::new(LocalSandbox::new(&workspace).expect("sandbox"));
+        .expect("legacy manifest");
+        std::fs::write(
+            plugin.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"remote"}"#,
+        )
+        .expect("Agent Plugin manifest");
+        std::fs::write(
+            plugin.join("mcp.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{"remote":{"type":"streamable-http","url":"https://example.com/mcp"}}}"#,
+        )
+        .expect("MCP manifest");
 
-        let error = match Extensions::discover(Vec::<PathBuf>::new())
-            .expect("extensions")
-            .activate_plugins([(plugin, trusted_hooks())], &workspace, backend)
-        {
-            Ok(_) => panic!("MCP is not implemented yet"),
-            Err(error) => error,
-        };
+        let package = inspect_package(plugin).expect("Agent Plugin package");
+        assert_eq!(package.name, "remote");
+    }
 
-        assert!(error.to_string().contains("unsupported MCP or app"));
+    #[test]
+    fn malformed_agent_plugin_mcp_is_not_silently_ignored() {
+        let temporary = tempfile::tempdir().expect("temporary extensions");
+        let plugin = temporary.path().join("remote");
+        std::fs::create_dir(&plugin).expect("plugin directory");
+        std::fs::write(
+            plugin.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"remote"}"#,
+        )
+        .expect("Agent Plugin manifest");
+        std::fs::write(plugin.join("mcp.json"), b"{}").expect("malformed MCP component");
+
+        assert!(inspect_package(plugin).is_err());
     }
 
     #[test]

@@ -245,6 +245,42 @@ extension GatewayWireTests {
         XCTAssertEqual(finishedLoginID, "device-1")
         XCTAssertEqual(finishedProvider, "openai_codex")
 
+        guard case .extensionConnectionStarted(
+            let extensionRequestID,
+            let extensionID,
+            let authorizationURL
+        ) = try decodeEnvelope(#"{"version":44,"type":"extension_connection_started","request_id":"extension-1","id":"plugin:notion","authorization_url":"https://mcp.notion.com/authorize?state=state"}"#) else {
+            return XCTFail("Expected extension connection started envelope")
+        }
+        XCTAssertEqual(extensionRequestID, "extension-1")
+        XCTAssertEqual(extensionID, "plugin:notion")
+        XCTAssertEqual(authorizationURL, "https://mcp.notion.com/authorize?state=state")
+
+        guard case .gitCredentialStatus(let gitCredentialID, let available) = try decodeEnvelope(#"{"version":42,"type":"git_credential_status","request_id":"git-credential-1","available":true}"#) else {
+            return XCTFail("Expected Git credential status")
+        }
+        XCTAssertEqual(gitCredentialID, "git-credential-1")
+        XCTAssertTrue(available)
+
+        guard case .sshIdentities(let sshListID, let identities) = try decodeEnvelope(#"{"version":44,"type":"ssh_identities","request_id":"ssh-list-1","identities":[{"label":"id_ed25519","algorithm":"ssh-ed25519","fingerprint":"SHA256:safe"}]}"#) else {
+            return XCTFail("Expected SSH identities")
+        }
+        XCTAssertEqual(sshListID, "ssh-list-1")
+        XCTAssertEqual(identities.first?.label, "id_ed25519")
+        XCTAssertEqual(identities.first?.algorithm, "ssh-ed25519")
+        XCTAssertEqual(identities.first?.fingerprint, "SHA256:safe")
+
+        guard case .sshIdentityGenerated(
+            let sshGenerateID,
+            let generatedIdentity,
+            let publicKey
+        ) = try decodeEnvelope(#"{"version":44,"type":"ssh_identity_generated","request_id":"ssh-generate-1","identity":{"label":"id_ed25519","algorithm":"ssh-ed25519","fingerprint":"SHA256:new"},"public_key":"ssh-ed25519 AAAA mobius"}"#) else {
+            return XCTFail("Expected generated SSH identity")
+        }
+        XCTAssertEqual(sshGenerateID, "ssh-generate-1")
+        XCTAssertEqual(generatedIdentity.label, "id_ed25519")
+        XCTAssertEqual(publicKey, "ssh-ed25519 AAAA mobius")
+
         let profileFixture = #"{"version":27,"type":"profile","request_id":"profile-1","profile":{"user_name":"Ada","daily_usage":[{"unix_day":100,"provider":"anthropic","usage":\#(usageJSON)},{"unix_day":100,"provider":"openai_socket","usage":\#(usageJSON)}],"run_stats":\#(runStatsJSON),"recent_run_groups":[{"session_id":"chat-1","title":"Thread title","runs":[{"session_id":"agent-1","submission_id":"input-1","turn_id":"turn-1","started_at_ms":1000,"finished_at_ms":10000,"elapsed_ms":9000,"outcome":"completed","model_calls":2,"tool_calls":3,"failed_tool_calls":0,"usage":\#(usageJSON)}]}]}}"#
         guard case .profile(let profileID, let profile) = try decodeEnvelope(profileFixture) else {
             return XCTFail("Expected profile envelope")

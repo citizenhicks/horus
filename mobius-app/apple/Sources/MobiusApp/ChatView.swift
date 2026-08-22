@@ -85,7 +85,7 @@ struct ChatView: View {
             // One item holding both, so the spacing is this stack's rather than the bar's
             // between two items. The 44pt targets still touch; only the slack goes.
             ToolbarItem(placement: .primaryAction) {
-                HStack(spacing: 0) {
+                HeaderActionGroup {
                     newChatButton
                     ChatOptionsMenu(
                         presentedWidget: $presentedWidget,
@@ -112,20 +112,12 @@ struct ChatView: View {
     /// actions, not in the composer beside the controls that shape the message being written.
     private var newChatButton: some View {
         Button(action: model.openNewSessionInCurrentWorkspace) {
-            toolbarGlyph(.notePencil)
+            MobiusIcon(.notePencil, foreground: .primary)
         }
+        .groupedHeaderAction()
         .disabled(model.workspace == nil || !model.canCreateSession)
         .accessibilityLabel("New chat in this folder")
-        .tint(.primary)
         .help("New chat in this folder")
-    }
-
-    /// A bare glyph is a 16pt target; toolbar buttons pad out to a full one the way every
-    /// other icon button in the app does.
-    private func toolbarGlyph(_ glyph: MobiusGlyph) -> some View {
-        MobiusIcon(glyph, foreground: .primary)
-            .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
-            .contentShape(Rectangle())
     }
 
     private var workspaceName: String {
@@ -150,7 +142,7 @@ private struct ChatOptionsMenu: View {
     @Binding var showsAgentSettings: Bool
 
     var body: some View {
-        Menu {
+        HeaderOptionsMenu(label: "Chat options") {
             Section(model.workspace?.path ?? "No chat selected") {
                 if let git = model.gitStatus, !git.currentBranch.isEmpty {
                     Menu {
@@ -254,16 +246,7 @@ private struct ChatOptionsMenu: View {
                     .disabled(!model.canRenameSession)
                 }
             }
-        } label: {
-            MobiusIcon(.dotsThree, foreground: .primary)
-                .frame(width: MobiusStyle.iconButtonSize, height: MobiusStyle.iconButtonSize)
-                .contentShape(Rectangle())
         }
-        .labelStyle(.titleAndIcon)
-        .menuIndicator(.hidden)
-        .accessibilityLabel("Chat options")
-        .tint(.primary)
-        .help("Chat options")
     }
 
     private func activate(_ widget: MountedWidget) {

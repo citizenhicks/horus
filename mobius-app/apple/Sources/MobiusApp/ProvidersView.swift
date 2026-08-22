@@ -11,31 +11,28 @@ struct ProvidersView: View {
         PageScaffold(
             title: "Providers",
             detail: pageDetail,
+            sharesHeaderBackground: true,
             headerAccessory: {
-                HStack(spacing: MobiusSpace.xxs) {
+                HeaderActionGroup {
                     Button {
                         isAdding = true
                     } label: {
                         MobiusIcon(.plus, gutter: false)
                     }
-                    .mobiusProminentIconButton()
+                    .groupedHeaderAction(prominent: true)
                     .disabled(!model.connectionState.isReady)
                     .accessibilityLabel("Add provider")
                     .accessibilityHint("Opens the provider setup")
                     .help("Add provider")
-                    SettingsStatusAccessory(
+                    SettingsStatusButton(
                         subject: "Providers",
-                        hasChanges: false,
-                        isSaving: model.isApplyingConfiguration,
-                        saveDisabled: !model.connectionState.isReady,
                         statusLabel: status.label,
                         statusDetail: status.detail,
-                        statusColor: status.color,
-                        saveLabel: "Add provider",
-                        save: { isAdding = true }
+                        statusColor: status.color
                     )
+                    .labelStyle(.iconOnly)
+                    .groupedHeaderAction()
                 }
-                .fixedSize()
             }
         ) {
             Section("Configured") {
@@ -259,14 +256,15 @@ struct ProviderDetailView: View {
             PageScaffold(
                 title: record.label,
                 detail: "",
+                sharesHeaderBackground: true,
                 headerAccessory: {
-                    HStack(spacing: MobiusSpace.xxs) {
+                    HeaderActionGroup {
                         Button {
                             model.registerProvider()
                         } label: {
                             MobiusIcon(.floppyDisk, gutter: false)
                         }
-                        .mobiusProminentIconButton()
+                        .groupedHeaderAction(prominent: true)
                         .disabled(model.isApplyingConfiguration)
                         .accessibilityLabel("Save to gateway")
                         .help("Save to gateway")
@@ -275,14 +273,13 @@ struct ProviderDetailView: View {
                         } label: {
                             MobiusIcon(.trash, gutter: false)
                         }
-                        .mobiusIconButton()
+                        .groupedHeaderAction()
                         .disabled(
                             model.isApplyingConfiguration || !model.connectionState.isReady
                         )
                         .accessibilityLabel("Remove provider")
                         .help("Remove provider")
                     }
-                    .fixedSize()
                 }
             ) {
                 ProviderFormSections(provider: record.provider, isNew: false)

@@ -139,6 +139,7 @@ struct MobiusGlyph: Hashable {
     static let gitBranch = Self("hi.gitBranch")
     static let globe02 = Self("hi.globe02")
     static let go = Self("hi.go")
+    static let googleMaps = Self("hi.googleMaps")
     static let group01 = Self("hi.group01")
     static let hardDrives = Self("hi.hardDrives")
     static let image01 = Self("hi.image01")
@@ -158,6 +159,7 @@ struct MobiusGlyph: Hashable {
     static let note01 = Self("hi.note01")
     static let notePencil = Self("hi.notePencil")
     static let notificationSquare = Self("hi.notificationSquare")
+    static let notion01 = Self("hi.notion01")
     static let path = Self("hi.path")
     static let pencilSimple = Self("hi.pencilSimple")
     static let playFill = Self("hi.playFill")
@@ -193,6 +195,14 @@ struct MobiusGlyph: Hashable {
     static let warningOctagon = Self("hi.warningOctagon")
     static let x = Self("hi.x")
     static let xCircle = Self("hi.xCircle")
+
+    static func catalog(named name: String?) -> Self {
+        switch name {
+        case "GoogleMapsIcon": .googleMaps
+        case "Notion01Icon": .notion01
+        default: .squaresFour
+        }
+    }
 }
 
 extension MobiusGlyph {
@@ -249,21 +259,17 @@ struct MobiusIcon: View {
     }
 }
 
-struct MobiusCloudBadge: View {
+struct MobiusCloudLabel: View {
     @Environment(\.mobiusPalette) private var palette
+    var showsAccount = false
 
+    @ViewBuilder
     var body: some View {
-        MobiusIcon(
-            .cloudServer,
-            size: MobiusStyle.glyphInline,
-            foreground: palette.onAccent,
-            gutter: false
-        )
-        .padding(.horizontal, MobiusSpace.xs)
-        .padding(.vertical, MobiusSpace.xxs)
-        .mobiusGlass(in: Capsule(), prominent: true)
-        .shadow(color: palette.accent.opacity(0.35), radius: 4, y: 2)
-        .accessibilityHidden(true)
+        if showsAccount {
+            Text("MÖBIUS \(Text("CLOUD").foregroundStyle(palette.muted)) account")
+        } else {
+            Text("MÖBIUS \(Text("CLOUD").foregroundStyle(palette.muted))")
+        }
     }
 }
 

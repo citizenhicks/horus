@@ -14,17 +14,36 @@ use mobius::backend::sandbox::{
 };
 use mobius::{BoxFuture, Error, Result};
 
-const GIT_ENVIRONMENT: [(&str, &str); 7] = [
-    ("GIT_CONFIG_NOSYSTEM", "1"),
-    ("GIT_CONFIG_GLOBAL", "/dev/null"),
-    ("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1"),
+const GIT_ENVIRONMENT: [(&str, &str); 4] = [
     ("GIT_NO_LAZY_FETCH", "1"),
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GIT_OPTIONAL_LOCKS", "0"),
     ("LC_ALL", "C"),
 ];
-const GIT_ARGUMENTS: [&str; 5] = [
+// These variables can redirect Git to an untrusted repository or inject command-scoped settings.
+pub(crate) const REPOSITORY_LOCAL_GIT_ENVIRONMENT: [&str; 17] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+];
+const GIT_ARGUMENTS: [&str; 7] = [
     "--no-pager",
+    "-c",
+    "safe.bareRepository=explicit",
     "-c",
     "core.hooksPath=/dev/null",
     "-c",
@@ -131,7 +150,12 @@ impl GatewaySandbox {
         let mut arguments = GIT_ARGUMENTS.to_vec();
         arguments.extend_from_slice(args);
         self.delegate
-            .execute_read_only("git", &arguments, &GIT_ENVIRONMENT)
+            .execute_read_only_with_environment_removals(
+                "git",
+                &arguments,
+                &GIT_ENVIRONMENT,
+                &REPOSITORY_LOCAL_GIT_ENVIRONMENT,
+            )
             .await
     }
 
@@ -154,7 +178,11 @@ impl GatewaySandbox {
             branch,
         ]);
         self.delegate
-            .execute_git_mutation(&arguments, &GIT_ENVIRONMENT)
+            .execute_git_mutation_with_environment_removals(
+                &arguments,
+                &GIT_ENVIRONMENT,
+                &REPOSITORY_LOCAL_GIT_ENVIRONMENT,
+            )
             .await
     }
 }
@@ -217,6 +245,10 @@ mod tests {
 
     use super::*;
 
+    const WORKSPACE_GIT_TEST_CHILD: &str = "MOBIUS_GATEWAY_WORKSPACE_GIT_TEST_CHILD";
+    const WORKSPACE_GIT_TEST_NAME: &str =
+        "sandbox::tests::workspace_git_inherits_home_config_and_ignores_repository_redirects";
+
     #[cfg(target_os = "linux")]
     #[test]
     fn sandbox_proc_environment_accepts_only_private_or_empty() {
@@ -254,6 +286,22 @@ mod tests {
         assert_eq!(
             GATEWAY_CREDENTIAL_ENVIRONMENT,
             ["MOBIUS_GATEWAY_TOKEN", "TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"]
+        );
+    }
+
+    #[test]
+    fn automatic_git_arguments_pin_repository_execution_policy() {
+        assert_eq!(
+            GIT_ARGUMENTS,
+            [
+                "--no-pager",
+                "-c",
+                "safe.bareRepository=explicit",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+            ]
         );
     }
 
@@ -495,5 +543,88 @@ mod tests {
             .expect("sandboxed command");
 
         assert_eq!(output.stdout, std::env::var("HOME").expect("host HOME"));
+    }
+
+    #[tokio::test]
+    async fn workspace_git_inherits_home_config_and_ignores_repository_redirects() {
+        if std::env::var_os(WORKSPACE_GIT_TEST_CHILD).is_none() {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let state = tempfile::tempdir().expect("state");
+            let redirected = tempfile::tempdir().expect("redirected repository");
+            let home = workspace.path().join("home");
+            std::fs::create_dir(&home).expect("home");
+            for repository in [workspace.path(), redirected.path()] {
+                let mut command = std::process::Command::new("git");
+                command.args(["init", "--quiet"]).current_dir(repository);
+                for name in REPOSITORY_LOCAL_GIT_ENVIRONMENT {
+                    command.env_remove(name);
+                }
+                assert!(
+                    command
+                        .status()
+                        .expect("initialize Git repository")
+                        .success(),
+                    "failed to initialize {}",
+                    repository.display()
+                );
+            }
+            std::fs::write(
+                home.join(".gitconfig"),
+                "[mobius]\n\tworkspaceMarker = inherited\n",
+            )
+            .expect("global Git config");
+
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("locate gateway test binary"),
+            )
+            .args([WORKSPACE_GIT_TEST_NAME, "--exact", "--nocapture"])
+            .env(WORKSPACE_GIT_TEST_CHILD, "1")
+            .env("MOBIUS_GATEWAY_WORKSPACE_GIT_TEST_ROOT", workspace.path())
+            .env("MOBIUS_GATEWAY_WORKSPACE_GIT_TEST_STATE", state.path())
+            .env("HOME", home)
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env_remove("XDG_CONFIG_HOME")
+            .env("GIT_DIR", redirected.path().join(".git"))
+            .env("GIT_WORK_TREE", redirected.path())
+            .env("GIT_INDEX_FILE", redirected.path().join(".git/index"))
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "mobius.workspaceMarker")
+            .env("GIT_CONFIG_VALUE_0", "redirected")
+            .output()
+            .expect("run inherited Git environment test");
+            assert!(
+                output.status.success(),
+                "child failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let workspace = PathBuf::from(
+            std::env::var_os("MOBIUS_GATEWAY_WORKSPACE_GIT_TEST_ROOT").expect("test workspace"),
+        );
+        let state = PathBuf::from(
+            std::env::var_os("MOBIUS_GATEWAY_WORKSPACE_GIT_TEST_STATE").expect("test state"),
+        );
+        let sandbox = GatewaySandbox::new(&workspace, &state, None, Duration::from_secs(5))
+            .expect("gateway sandbox");
+
+        let configured = sandbox
+            .execute_git(&["config", "--get", "mobius.workspaceMarker"])
+            .await
+            .expect("read inherited global Git config");
+        assert_eq!(configured.exit_code, 0, "{}", configured.stderr);
+        assert_eq!(configured.stdout.trim(), "inherited");
+
+        let repository = sandbox
+            .execute_git(&["rev-parse", "--show-toplevel"])
+            .await
+            .expect("resolve workspace repository");
+        assert_eq!(repository.exit_code, 0, "{}", repository.stderr);
+        assert_eq!(
+            PathBuf::from(repository.stdout.trim()),
+            std::fs::canonicalize(workspace).expect("canonical workspace")
+        );
     }
 }

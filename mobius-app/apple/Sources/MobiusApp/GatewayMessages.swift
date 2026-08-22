@@ -42,6 +42,19 @@ enum GatewayRequest: Encodable, Sendable {
     case uninstallExtension(requestID: String, id: String)
     case trustExtensionHooks(requestID: String, id: String, expectedDigest: String)
     case revokeExtensionHooksTrust(requestID: String, id: String, expectedDigest: String)
+    case startExtensionConnection(requestID: String, id: String, redirectURI: String)
+    case finishExtensionConnection(requestID: String, id: String, callbackURL: String)
+    case setExtensionConnectionSecret(requestID: String, id: String, secret: String)
+    case disconnectExtensionConnection(requestID: String, id: String)
+    case probeGitCredential(requestID: String, target: String)
+    case approveGitCredential(
+        requestID: String,
+        target: String,
+        username: String,
+        token: String
+    )
+    case listSshIdentities(requestID: String)
+    case generateSshIdentity(requestID: String)
     case getGitDiff(requestID: String, sessionID: String, scope: GitDiffScope)
     case listWorkspaceFiles(requestID: String, sessionID: String, scope: WorkspaceFileScope)
     case readWorkspaceFile(
@@ -199,6 +212,41 @@ enum GatewayRequest: Encodable, Sendable {
             try container.encode(requestID, forKey: "requestId")
             try container.encode(id, forKey: "id")
             try container.encode(expectedDigest, forKey: "expectedDigest")
+        case .startExtensionConnection(let requestID, let id, let redirectURI):
+            try container.encode("start_extension_connection", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(id, forKey: "id")
+            try container.encode(redirectURI, forKey: "redirectUri")
+        case .finishExtensionConnection(let requestID, let id, let callbackURL):
+            try container.encode("finish_extension_connection", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(id, forKey: "id")
+            try container.encode(callbackURL, forKey: "callbackUrl")
+        case .setExtensionConnectionSecret(let requestID, let id, let secret):
+            try container.encode("set_extension_connection_secret", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(id, forKey: "id")
+            try container.encode(secret, forKey: "secret")
+        case .disconnectExtensionConnection(let requestID, let id):
+            try container.encode("disconnect_extension_connection", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(id, forKey: "id")
+        case .probeGitCredential(let requestID, let target):
+            try container.encode("probe_git_credential", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(target, forKey: "target")
+        case .approveGitCredential(let requestID, let target, let username, let token):
+            try container.encode("approve_git_credential", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+            try container.encode(target, forKey: "target")
+            try container.encode(username, forKey: "username")
+            try container.encode(token, forKey: "token")
+        case .listSshIdentities(let requestID):
+            try container.encode("list_ssh_identities", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
+        case .generateSshIdentity(let requestID):
+            try container.encode("generate_ssh_identity", forKey: "type")
+            try container.encode(requestID, forKey: "requestId")
         case .getGitDiff(let requestID, let sessionID, let scope):
             try container.encode("get_git_diff", forKey: "type")
             try container.encode(requestID, forKey: "requestId")
@@ -376,6 +424,18 @@ enum GatewayEnvelope: Decodable, Sendable {
         userCode: String
     )
     case providerLoginFinished(requestID: String, loginID: String, provider: String)
+    case extensionConnectionStarted(
+        requestID: String,
+        id: String,
+        authorizationURL: String
+    )
+    case gitCredentialStatus(requestID: String, available: Bool)
+    case sshIdentities(requestID: String, identities: [SshIdentityRecord])
+    case sshIdentityGenerated(
+        requestID: String,
+        identity: SshIdentityRecord,
+        publicKey: String
+    )
     case profile(requestID: String, profile: ProfileSnapshot)
     case gitDiff(requestID: String, sessionID: String, scope: GitDiffScope, diff: String)
     case workspaceFiles(
@@ -520,6 +580,28 @@ enum GatewayEnvelope: Decodable, Sendable {
                 requestID: try container.decode(String.self, forKey: "requestId"),
                 loginID: try container.decode(String.self, forKey: "loginId"),
                 provider: try container.decode(String.self, forKey: "provider")
+            )
+        case "extension_connection_started":
+            self = .extensionConnectionStarted(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                id: try container.decode(String.self, forKey: "id"),
+                authorizationURL: try container.decode(String.self, forKey: "authorizationUrl")
+            )
+        case "git_credential_status":
+            self = .gitCredentialStatus(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                available: try container.decode(Bool.self, forKey: "available")
+            )
+        case "ssh_identities":
+            self = .sshIdentities(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                identities: try container.decode([SshIdentityRecord].self, forKey: "identities")
+            )
+        case "ssh_identity_generated":
+            self = .sshIdentityGenerated(
+                requestID: try container.decode(String.self, forKey: "requestId"),
+                identity: try container.decode(SshIdentityRecord.self, forKey: "identity"),
+                publicKey: try container.decode(String.self, forKey: "publicKey")
             )
         case "profile":
             self = .profile(
@@ -701,6 +783,21 @@ struct WorkspaceInfo: Identifiable, Codable, Hashable, Sendable {
 struct GitStatus: Codable, Equatable, Sendable {
     let currentBranch: String
     let branches: [String]
+}
+
+struct SshIdentityRecord: Identifiable, Codable, Hashable, Sendable {
+    var id: String { label }
+
+    let label: String
+    let algorithm: String
+    let fingerprint: String
+}
+
+struct GeneratedSshIdentity: Identifiable, Equatable, Sendable {
+    var id: String { identity.id }
+
+    let identity: SshIdentityRecord
+    let publicKey: String
 }
 
 struct DirectoryListing: Codable, Equatable, Sendable {

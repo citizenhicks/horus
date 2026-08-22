@@ -136,6 +136,25 @@ fn saved_provider_credential_has_no_impossible_status_flag() {
     assert!(encoded.get("configured").is_none());
 }
 
+#[test]
+fn ssh_identity_wire_record_has_no_key_or_path_material() {
+    let frame = ServerFrame::new(ServerMessage::SshIdentities {
+        request_id: "ssh-list".into(),
+        identities: vec![SshIdentityRecord {
+            label: "id_ed25519".into(),
+            algorithm: "ssh-ed25519".into(),
+            fingerprint: "SHA256:safe-summary".into(),
+        }],
+    });
+    let encoded = serde_json::to_value(frame).expect("encode SSH identities");
+
+    assert_eq!(encoded["type"], "ssh_identities");
+    assert!(encoded["identities"][0].get("private_key").is_none());
+    assert!(encoded["identities"][0].get("public_key").is_none());
+    assert!(encoded["identities"][0].get("path").is_none());
+    assert!(encoded["identities"][0].get("comment").is_none());
+}
+
 #[tokio::test]
 async fn framed_reader_retains_a_partial_prefix_when_cancelled() {
     let first = ClientFrame::new(ClientMessage::ListCron {
@@ -522,6 +541,30 @@ fn git_diff_query_has_a_correlated_unified_diff_response() {
 }
 
 #[test]
+fn git_credential_status_never_returns_credential_material() {
+    let request = serde_json::to_value(ClientFrame::new(ClientMessage::ApproveGitCredential {
+        request_id: "request-credential".into(),
+        target: "https://git.example.com".into(),
+        username: "octo".into(),
+        token: "secret".into(),
+    }))
+    .expect("encode Git credential approval");
+    let response = serde_json::to_value(ServerFrame::new(ServerMessage::GitCredentialStatus {
+        request_id: "request-credential".into(),
+        available: true,
+    }))
+    .expect("encode Git credential status");
+
+    assert_eq!(request["type"], "approve_git_credential");
+    assert_eq!(request["token"], "secret");
+    assert_eq!(response["type"], "git_credential_status");
+    assert_eq!(response["available"], true);
+    assert!(response.get("target").is_none());
+    assert!(response.get("username").is_none());
+    assert!(response.get("token").is_none());
+}
+
+#[test]
 fn workspace_file_query_carries_its_scope() {
     let request = serde_json::to_value(ClientFrame::new(ClientMessage::ListWorkspaceFiles {
         request_id: "request-files".into(),
@@ -741,6 +784,25 @@ fn extension_lifecycle_requests_are_gateway_scoped() {
             request_id: "revoke-trust".into(),
             id: "plugin:ponytail".into(),
             expected_digest: "a".repeat(64),
+        },
+        ClientMessage::StartExtensionConnection {
+            request_id: "connect".into(),
+            id: "plugin:notion".into(),
+            redirect_uri: "mobius://extension-auth".into(),
+        },
+        ClientMessage::FinishExtensionConnection {
+            request_id: "finish-connection".into(),
+            id: "plugin:notion".into(),
+            callback_url: "mobius://extension-auth?code=code&state=state".into(),
+        },
+        ClientMessage::SetExtensionConnectionSecret {
+            request_id: "set-secret".into(),
+            id: "plugin:google-maps".into(),
+            secret: "key".into(),
+        },
+        ClientMessage::DisconnectExtensionConnection {
+            request_id: "disconnect".into(),
+            id: "plugin:notion".into(),
         },
     ];
 

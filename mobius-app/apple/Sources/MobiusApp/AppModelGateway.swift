@@ -204,6 +204,40 @@ extension AppModel {
             where providerInstances[index].provider == provider {
                 providerInstances[index].configured = true
             }
+        case .extensionConnectionStarted(let requestID, let id, let authorizationURL):
+            receiveExtensionAuthorization(
+                requestID: requestID,
+                extensionID: id,
+                authorizationURL: authorizationURL
+            )
+        case .gitCredentialStatus(let requestID, let available):
+            guard requestID == gitCredentialRequestID else { break }
+            let approved = isApprovingGitCredential
+            gitCredentialRequestID = nil
+            isApprovingGitCredential = false
+            isCheckingGitCredential = false
+            gitCredentialAvailable = available
+            gitCredentialError = nil
+            if approved, available {
+                showToast("Git credential saved by the gateway host.", tone: .success)
+            }
+        case .sshIdentities(let requestID, let identities):
+            guard requestID == sshIdentityRequestID else { break }
+            sshIdentityRequestID = nil
+            isLoadingSshIdentities = false
+            sshIdentityError = nil
+            sshIdentities = identities
+        case .sshIdentityGenerated(let requestID, let identity, let publicKey):
+            guard requestID == sshIdentityRequestID else { break }
+            sshIdentityRequestID = nil
+            isGeneratingSshIdentity = false
+            sshIdentityError = nil
+            sshIdentities = [identity]
+            generatedSshIdentity = GeneratedSshIdentity(
+                identity: identity,
+                publicKey: publicKey
+            )
+            showToast("SSH identity created on the gateway host.", tone: .success)
         case .profile(_, let profile):
             self.profile = profile
         case .gitDiff(let requestID, let sessionID, let scope, let diff):
@@ -319,8 +353,8 @@ extension AppModel {
                 eventTask?.cancel()
                 eventTask = nil
                 restorePendingDrafts()
-                extensionAction = nil
-                extensionRequestID = nil
+                cancelExtensionAndCredentialRequests()
+                sshIdentityError = failure.message
                 connectionState = .failed(failure.message)
             }
         }
@@ -863,6 +897,18 @@ extension AppModel {
         if rejection.requestId == gitBranchRequestID {
             gitBranchRequestID = nil
         }
+        if rejection.requestId == gitCredentialRequestID {
+            gitCredentialRequestID = nil
+            isApprovingGitCredential = false
+            isCheckingGitCredential = false
+            gitCredentialError = rejection.message
+        }
+        if rejection.requestId == sshIdentityRequestID {
+            sshIdentityRequestID = nil
+            isLoadingSshIdentities = false
+            isGeneratingSshIdentity = false
+            sshIdentityError = rejection.message
+        }
         if rejection.requestId == pendingProviderCredential?.requestID {
             providerActionState = .failed(rejection.message)
             pendingProviderCredential = nil
@@ -899,8 +945,8 @@ extension AppModel {
             eventTask?.cancel()
             eventTask = nil
             restorePendingDrafts()
-            extensionAction = nil
-            extensionRequestID = nil
+            cancelExtensionAndCredentialRequests()
+            sshIdentityError = rejection.message
             connectionState = .failed(rejection.message)
         }
     }

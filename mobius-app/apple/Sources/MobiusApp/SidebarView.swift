@@ -178,14 +178,15 @@ struct SidebarView: View {
                         .frame(width: 28, height: 28)
                         .clipShape(.rect(cornerRadius: 6))
                         .accessibilityHidden(true)
-                    HStack(spacing: MobiusSpace.xs) {
-                        Text("MÖBIUS")
-                            .font(.system(.subheadline, design: .serif, weight: .bold))
-                            .tracking(1.4)
+                    Group {
                         if model.selectedGatewayIsMobiusCloud {
-                            MobiusCloudBadge()
+                            MobiusCloudLabel()
+                        } else {
+                            Text("MÖBIUS")
                         }
                     }
+                    .font(.system(.subheadline, design: .serif, weight: .bold))
+                    .tracking(1.4)
                     Spacer()
                     Button {
                         showsConnectionDetails = true

@@ -18,6 +18,7 @@ extension AppModel {
         isLoadingStagedGitDiff = false
         committedGitDiffRequestID = nil
         isLoadingCommittedGitDiff = false
+        cancelExtensionAndCredentialRequests()
         workspaceFilesRequestID = nil
         isLoadingWorkspaceFiles = false
         discardPendingComposerAttachments()
@@ -171,12 +172,16 @@ extension AppModel {
         providerModelIDsText = ""
         providerReasoningEffortsText = ""
         providerActionState = .idle
-        extensionAction = nil
         pendingProviderCredential = nil
         providerLoginRequestID = nil
         providerRegistrationRequestID = nil
         pendingProviderRemoval = nil
-        extensionRequestID = nil
+        gitCredentialAvailable = nil
+        gitCredentialError = nil
+        sshIdentities = nil
+        sshIdentityError = nil
+        cancelExtensionAndCredentialRequests()
+        generatedSshIdentity = nil
         pairingCodeRequestID = nil
         pairingCodeExpiryTask?.cancel()
         pairingCodeExpiryTask = nil
@@ -186,6 +191,18 @@ extension AppModel {
         if !preservingSession { resetSessionState() }
         if preservingDrafts { restorePendingDrafts() }
         return connectionGeneration
+    }
+
+    func cancelExtensionAndCredentialRequests() {
+        extensionAction = nil
+        extensionAuthorizationChallenge = nil
+        extensionRequestID = nil
+        gitCredentialRequestID = nil
+        isApprovingGitCredential = false
+        isCheckingGitCredential = false
+        sshIdentityRequestID = nil
+        isLoadingSshIdentities = false
+        isGeneratingSshIdentity = false
     }
 
     func resetSessionState() {

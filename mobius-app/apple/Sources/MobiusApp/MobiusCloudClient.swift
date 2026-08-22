@@ -46,6 +46,20 @@ struct MobiusCloudPairingGrant: Equatable, Sendable {
     let expiresAt: Date
 }
 
+struct MobiusCloudExtensionSource: Decodable, Equatable, Sendable {
+    let url: String
+    let reference: String?
+    let subdirectory: String?
+}
+
+struct MobiusCloudExtensionCatalogItem: Decodable, Equatable, Identifiable, Sendable {
+    let id: String
+    let name: String
+    let description: String
+    let icon: String?
+    let source: MobiusCloudExtensionSource
+}
+
 enum MobiusCloudGatewayStatus: String, Decodable, Sendable {
     case waiting
     case ready
@@ -78,6 +92,7 @@ enum MobiusCloudError: LocalizedError {
     case invalidAccountResponse
     case invalidAuthenticationResponse
     case invalidAuthorization
+    case invalidExtensionCatalog
     case invalidGatewayResponse
     case invalidSignedTransaction
     case keychain(OSStatus)
@@ -96,6 +111,7 @@ enum MobiusCloudError: LocalizedError {
         case .invalidAccountResponse: "möbius Cloud returned invalid account information."
         case .invalidAuthenticationResponse: "möbius Cloud returned an invalid sign-in response."
         case .invalidAuthorization: "Apple sign-in could not be completed."
+        case .invalidExtensionCatalog: "möbius Cloud returned an invalid extension catalog."
         case .invalidGatewayResponse: "möbius Cloud returned an invalid gateway response."
         case .invalidSignedTransaction: "The App Store transaction is invalid."
         case .keychain: "The Cloud sign-in could not be saved securely."
@@ -254,10 +270,15 @@ final class MobiusCloudClient {
         let expiresAt: Date
     }
 
+    private struct ExtensionCatalogResponse: Decodable {
+        let extensions: [MobiusCloudExtensionCatalogItem]
+    }
+
     private static let authenticationURL = cloudURL("api/mobile/auth/apple")
     private static let accountURL = cloudURL("api/mobile/account")
     private static let subscriptionURL = cloudURL("api/mobile/subscription")
     private static let gatewayURL = cloudURL("api/mobile/gateway")
+    private static let extensionCatalogURL = cloudURL("api/mobile/extensions/catalog")
     private static let maximumResponseBytes = 64 * 1024
     private static let maximumSignedTransactionBytes = 64 * 1024
 
@@ -444,6 +465,41 @@ final class MobiusCloudClient {
         }
     }
 
+    func extensionCatalog() async throws -> [MobiusCloudExtensionCatalogItem] {
+        let data = try await send(
+            url: Self.extensionCatalogURL,
+            method: "GET",
+            authenticated: true
+        )
+        let items: [MobiusCloudExtensionCatalogItem]
+        do {
+            items = try decoder.decode(ExtensionCatalogResponse.self, from: data).extensions
+        } catch {
+            throw MobiusCloudError.invalidExtensionCatalog
+        }
+        guard items.count <= 100 else { throw MobiusCloudError.invalidExtensionCatalog }
+
+        var ids = Set<String>()
+        guard items.allSatisfy({ item in
+            ids.insert(item.id).inserted
+                && item.id.range(
+                    of: #"^[a-z0-9][a-z0-9._-]{0,127}$"#,
+                    options: .regularExpression
+                ) != nil
+                && !item.name.isEmpty
+                && item.name.utf8.count <= 100
+                && item.description.utf8.count <= 1_000
+                && (item.icon?.range(
+                    of: #"^[A-Za-z][A-Za-z0-9]{0,63}Icon$"#,
+                    options: .regularExpression
+                ) != nil || item.icon == nil)
+                && Self.isValidExtensionSource(item.source)
+        }) else {
+            throw MobiusCloudError.invalidExtensionCatalog
+        }
+        return items
+    }
+
     private func send(
         url: URL,
         method: String,
@@ -495,5 +551,18 @@ final class MobiusCloudClient {
                 of: #"^[^\s@]+@[^\s@]+\.[^\s@]+$"#,
                 options: .regularExpression
             ) != nil
+    }
+
+    private static func isValidExtensionSource(_ source: MobiusCloudExtensionSource) -> Bool {
+        guard source.url.utf8.count <= 2_048,
+              let url = URL(string: source.url),
+              url.scheme?.lowercased() == "https",
+              url.host != nil,
+              url.user == nil,
+              url.password == nil,
+              source.reference.map({ !$0.isEmpty && $0.utf8.count <= 256 }) ?? true,
+              source.subdirectory.map({ !$0.isEmpty && $0.utf8.count <= 1_024 }) ?? true
+        else { return false }
+        return true
     }
 }

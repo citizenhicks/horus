@@ -496,6 +496,126 @@ pub(super) async fn handle_message(
             )
             .await
         }
+        ClientMessage::StartExtensionConnection {
+            request_id,
+            id,
+            redirect_uri,
+        } => {
+            match gateway
+                .start_extension_connection(id.clone(), redirect_uri)
+                .await
+            {
+                Ok(authorization_url) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::ExtensionConnectionStarted {
+                            request_id,
+                            id,
+                            authorization_url,
+                        }),
+                    )
+                    .await
+                }
+                Err(rejection) => write_rejection(writer, request_id, rejection).await,
+            }
+        }
+        ClientMessage::FinishExtensionConnection {
+            request_id,
+            id,
+            callback_url,
+        } => {
+            write_gateway_result(
+                writer,
+                request_id,
+                gateway.finish_extension_connection(id, callback_url).await,
+            )
+            .await
+        }
+        ClientMessage::SetExtensionConnectionSecret {
+            request_id,
+            id,
+            secret,
+        } => {
+            write_gateway_result(
+                writer,
+                request_id,
+                gateway.set_extension_connection_secret(id, secret).await,
+            )
+            .await
+        }
+        ClientMessage::DisconnectExtensionConnection { request_id, id } => {
+            write_gateway_result(
+                writer,
+                request_id,
+                gateway.disconnect_extension_connection(id).await,
+            )
+            .await
+        }
+        ClientMessage::ProbeGitCredential { request_id, target } => {
+            match gateway.probe_git_credential(&target).await {
+                Ok(available) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::GitCredentialStatus {
+                            request_id,
+                            available,
+                        }),
+                    )
+                    .await
+                }
+                Err(rejection) => write_rejection(writer, request_id, rejection).await,
+            }
+        }
+        ClientMessage::ApproveGitCredential {
+            request_id,
+            target,
+            username,
+            token,
+        } => match gateway
+            .approve_git_credential(&target, &username, &token)
+            .await
+        {
+            Ok(()) => {
+                write_frame(
+                    writer,
+                    &ServerFrame::new(ServerMessage::GitCredentialStatus {
+                        request_id,
+                        available: true,
+                    }),
+                )
+                .await
+            }
+            Err(rejection) => write_rejection(writer, request_id, rejection).await,
+        },
+        ClientMessage::ListSshIdentities { request_id } => match gateway.ssh_identities().await {
+            Ok(identities) => {
+                write_frame(
+                    writer,
+                    &ServerFrame::new(ServerMessage::SshIdentities {
+                        request_id,
+                        identities,
+                    }),
+                )
+                .await
+            }
+            Err(rejection) => write_rejection(writer, request_id, rejection).await,
+        },
+        ClientMessage::GenerateSshIdentity { request_id } => {
+            match gateway.generate_ssh_identity().await {
+                Ok((identity, public_key)) => {
+                    write_frame(
+                        writer,
+                        &ServerFrame::new(ServerMessage::SshIdentityGenerated {
+                            request_id,
+                            identity,
+                            public_key,
+                        }),
+                    )
+                    .await
+                }
+                Err(rejection) => write_rejection(writer, request_id, rejection).await,
+            }
+        }
         ClientMessage::GetGitDiff {
             request_id,
             session_id,

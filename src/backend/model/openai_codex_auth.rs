@@ -133,7 +133,7 @@ struct DeviceTokenResponse {
 type AuthFile = BTreeMap<String, OAuthCredential>;
 
 impl ChatGptAuth {
-    fn load(path: impl Into<PathBuf>) -> Result<Self> {
+    pub(super) fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let credential = read_credential(&path)?;
         Ok(Self {

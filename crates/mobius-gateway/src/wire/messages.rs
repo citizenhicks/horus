@@ -157,6 +157,41 @@ pub enum ClientMessage {
         id: String,
         expected_digest: String,
     },
+    StartExtensionConnection {
+        request_id: String,
+        id: String,
+        redirect_uri: String,
+    },
+    FinishExtensionConnection {
+        request_id: String,
+        id: String,
+        callback_url: String,
+    },
+    SetExtensionConnectionSecret {
+        request_id: String,
+        id: String,
+        secret: String,
+    },
+    DisconnectExtensionConnection {
+        request_id: String,
+        id: String,
+    },
+    ProbeGitCredential {
+        request_id: String,
+        target: String,
+    },
+    ApproveGitCredential {
+        request_id: String,
+        target: String,
+        username: String,
+        token: String,
+    },
+    ListSshIdentities {
+        request_id: String,
+    },
+    GenerateSshIdentity {
+        request_id: String,
+    },
     GetGitDiff {
         request_id: String,
         session_id: String,
@@ -391,6 +426,24 @@ pub enum ServerMessage {
         request_id: String,
         login_id: String,
         provider: String,
+    },
+    ExtensionConnectionStarted {
+        request_id: String,
+        id: String,
+        authorization_url: String,
+    },
+    GitCredentialStatus {
+        request_id: String,
+        available: bool,
+    },
+    SshIdentities {
+        request_id: String,
+        identities: Vec<SshIdentityRecord>,
+    },
+    SshIdentityGenerated {
+        request_id: String,
+        identity: SshIdentityRecord,
+        public_key: String,
     },
     Profile {
         request_id: String,

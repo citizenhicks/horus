@@ -1,9 +1,13 @@
 use std::path::{Component, Path};
+use std::process::Stdio;
 use std::time::Duration;
 
 use mobius::backend::sandbox::CommandOutput;
+use tokio::io::AsyncWriteExt as _;
+use tokio::process::Command;
+use url::Url;
 
-use crate::sandbox::GatewaySandbox;
+use crate::sandbox::{GatewaySandbox, REPOSITORY_LOCAL_GIT_ENVIRONMENT};
 use crate::wire::{GitDiffScope, GitStatus, MAX_FRAME_BYTES};
 
 use super::Rejection;
@@ -12,6 +16,156 @@ use super::Rejection;
 const MAX_GIT_DIFF_BYTES: usize = MAX_FRAME_BYTES / 8;
 const TRUNCATION_NOTE: &[u8] = b"[diff truncated]\n";
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CREDENTIAL_TARGET_BYTES: usize = 2 * 1024;
+const MAX_CREDENTIAL_USERNAME_BYTES: usize = 512;
+const MAX_CREDENTIAL_TOKEN_BYTES: usize = 16 * 1024;
+
+pub(super) async fn probe_credential(target: &str) -> std::result::Result<bool, Rejection> {
+    let target = credential_target(target)?;
+    credential_fill(&target, None).await
+}
+
+pub(super) async fn approve_credential(
+    target: &str,
+    username: &str,
+    token: &str,
+) -> std::result::Result<(), Rejection> {
+    let target = credential_target(target)?;
+    let username = credential_field(username, MAX_CREDENTIAL_USERNAME_BYTES, "username")?;
+    let token = credential_field(token, MAX_CREDENTIAL_TOKEN_BYTES, "token")?;
+    let input = credential_input(&target, Some(username), Some(token));
+    if !run_credential("approve", &input).await? {
+        return Err(credential_error(
+            "the host Git credential helper rejected the credential",
+        ));
+    }
+    if !credential_fill(&target, Some(username)).await? {
+        return Err(credential_error(
+            "the host has no usable Git credential helper for this HTTPS target",
+        ));
+    }
+    Ok(())
+}
+
+async fn credential_fill(
+    target: &str,
+    username: Option<&str>,
+) -> std::result::Result<bool, Rejection> {
+    run_credential("fill", &credential_input(target, username, None)).await
+}
+
+async fn run_credential(operation: &str, input: &[u8]) -> std::result::Result<bool, Rejection> {
+    let mut command = Command::new("git");
+    command
+        .args([
+            "--no-pager",
+            "-c",
+            "safe.bareRepository=explicit",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "credential.interactive=never",
+            "credential",
+            operation,
+        ])
+        .current_dir("/")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "/usr/bin/false")
+        .env("SSH_ASKPASS", "/usr/bin/false")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    for name in REPOSITORY_LOCAL_GIT_ENVIRONMENT {
+        command.env_remove(name);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| credential_error("the host Git command is unavailable"))?;
+    let result = tokio::time::timeout(GIT_TIMEOUT, async {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| credential_error("failed to open the host Git credential input"))?;
+        stdin
+            .write_all(input)
+            .await
+            .map_err(|_| credential_error("failed to send the credential to host Git"))?;
+        drop(stdin);
+        child
+            .wait()
+            .await
+            .map_err(|_| credential_error("the host Git credential command failed"))
+    })
+    .await;
+    match result {
+        Ok(status) => Ok(status?.success()),
+        Err(_) => {
+            let _ = child.kill().await;
+            Err(timeout())
+        }
+    }
+}
+
+fn credential_target(value: &str) -> std::result::Result<String, Rejection> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > MAX_CREDENTIAL_TARGET_BYTES
+        || value.contains(['\r', '\n', '\0'])
+    {
+        return Err(invalid_credential("enter a valid HTTPS Git host or URL"));
+    }
+    let candidate = if value.contains("://") {
+        value.to_owned()
+    } else {
+        format!("https://{value}")
+    };
+    let url = Url::parse(&candidate)
+        .map_err(|_| invalid_credential("enter a valid HTTPS Git host or URL"))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid_credential(
+            "Git credentials require an HTTPS host or URL without embedded credentials, query, or fragment",
+        ));
+    }
+    Ok(url.into())
+}
+
+fn credential_field<'a>(
+    value: &'a str,
+    max_bytes: usize,
+    label: &str,
+) -> std::result::Result<&'a str, Rejection> {
+    if value.is_empty() || value.len() > max_bytes || value.contains(['\r', '\n', '\0']) {
+        return Err(invalid_credential(format!("enter a valid Git {label}")));
+    }
+    Ok(value)
+}
+
+fn credential_input(target: &str, username: Option<&str>, token: Option<&str>) -> Vec<u8> {
+    let mut input = format!("url={target}\n").into_bytes();
+    if let Some(username) = username {
+        input.extend_from_slice(b"username=");
+        input.extend_from_slice(username.as_bytes());
+        input.push(b'\n');
+    }
+    if let Some(token) = token {
+        input.extend_from_slice(b"password=");
+        input.extend_from_slice(token.as_bytes());
+        input.push(b'\n');
+    }
+    input.push(b'\n');
+    input
+}
 
 pub(super) async fn status(sandbox: &GatewaySandbox) -> Option<GitStatus> {
     tokio::time::timeout(GIT_TIMEOUT, status_inner(sandbox))
@@ -310,6 +464,22 @@ fn timeout() -> Rejection {
     }
 }
 
+fn invalid_credential(message: impl Into<String>) -> Rejection {
+    Rejection {
+        code: "invalid_git_credential",
+        message: message.into(),
+        fatal: false,
+    }
+}
+
+fn credential_error(message: impl Into<String>) -> Rejection {
+    Rejection {
+        code: "git_credential_error",
+        message: message.into(),
+        fatal: false,
+    }
+}
+
 fn unknown_branch() -> Rejection {
     Rejection {
         code: "unknown_git_branch",
@@ -337,6 +507,24 @@ fn invalid_path() -> Rejection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_credential_protocol_accepts_https_and_rejects_injection() {
+        assert_eq!(
+            credential_target("git.example.com/team/repo").expect("target"),
+            "https://git.example.com/team/repo"
+        );
+        assert!(credential_target("http://git.example.com").is_err());
+        assert!(credential_target("https://user:token@git.example.com").is_err());
+        assert!(credential_target("git.example.com\npassword=leak").is_err());
+        assert!(credential_field("name\npassword=leak", 512, "username").is_err());
+
+        let input = credential_input("https://git.example.com/", Some("octo"), Some("token"));
+        assert_eq!(
+            input,
+            b"url=https://git.example.com/\nusername=octo\npassword=token\n\n"
+        );
+    }
 
     fn run_git(workspace: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")

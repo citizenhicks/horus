@@ -11,33 +11,36 @@ struct ExtensionsView: View {
         PageScaffold(
             title: "Extensions",
             detail: pageDetail,
+            sharesHeaderBackground: true,
             headerAccessory: {
-                HStack(spacing: MobiusSpace.xxs) {
+                HeaderActionGroup {
                     Button {
                         isInstalling = true
                     } label: {
                         MobiusIcon(.plus, gutter: false)
                     }
-                    .mobiusProminentIconButton()
+                    .groupedHeaderAction(prominent: true)
                     .disabled(!model.canMutateExtensions)
                     .accessibilityLabel("Install extension")
                     .accessibilityHint("Opens the extension installer")
                     .help("Install extension")
-                    SettingsStatusAccessory(
+                    SettingsStatusButton(
                         subject: "Extensions",
-                        hasChanges: false,
-                        isSaving: model.extensionAction != nil,
-                        saveDisabled: !model.canMutateExtensions,
                         statusLabel: status.label,
                         statusDetail: status.detail,
-                        statusColor: status.color,
-                        saveLabel: "Install extension",
-                        save: { isInstalling = true }
+                        statusColor: status.color
                     )
+                    .labelStyle(.iconOnly)
+                    .groupedHeaderAction()
                 }
-                .fixedSize()
             }
         ) {
+            if model.hasCloudAccount {
+                Section("Available") {
+                    availableCatalog
+                }
+            }
+
             Section("Installed") {
                 if model.extensions.isEmpty {
                     Text("Nothing installed yet.")
@@ -50,20 +53,6 @@ struct ExtensionsView: View {
                 }
             }
 
-            if !model.extensionSkillReferences.isEmpty {
-                Section {
-                    ForEach(model.extensionSkillReferences, id: \.value) { skill in
-                        DiscoveredSkillRow(
-                            name: skill.value,
-                            description: skill.description
-                        )
-                    }
-                } header: {
-                    Text("Discovered")
-                } footer: {
-                    Text("Skills found in the gateway and workspace skill directories. They are always available and are not managed here.")
-                }
-            }
         }
         .sheet(isPresented: $isInstalling) { InstallExtensionSheet() }
         .alert(
@@ -81,11 +70,80 @@ struct ExtensionsView: View {
         } message: {
             Text("The gateway will uninstall it without changing saved chat selections. Chats that reference it continue with the extension disabled. Per-workspace .mobius/extensions data is retained.")
         }
+        .task(id: model.cloudSession?.userID) {
+            await model.refreshExtensionCatalog()
+        }
+    }
+
+    @ViewBuilder
+    private var availableCatalog: some View {
+        if model.isLoadingExtensionCatalog {
+            ProgressView("Loading extension catalog…")
+        } else if let error = model.extensionCatalogError {
+            VStack(alignment: .leading, spacing: MobiusSpace.s) {
+                Text(error)
+                    .font(MobiusStyle.captionFont)
+                    .foregroundStyle(palette.muted)
+                Button("Retry", glyph: .arrowClockwise) {
+                    Task { await model.refreshExtensionCatalog() }
+                }
+            }
+        } else if installableExtensions.isEmpty {
+            Text(model.availableExtensions.isEmpty
+                ? "No extensions are available right now."
+                : "Every available extension is installed.")
+                .font(MobiusStyle.captionFont)
+                .foregroundStyle(palette.muted)
+        } else {
+            ForEach(installableExtensions) { item in
+                Button {
+                    model.installExtension(item)
+                } label: {
+                    HStack(spacing: MobiusSpace.s) {
+                        MobiusIcon(
+                            .catalog(named: item.icon),
+                            size: MobiusStyle.glyphLead,
+                            foreground: .primary
+                        )
+                        VStack(alignment: .leading, spacing: MobiusSpace.xxs) {
+                            Text(verbatim: item.name)
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            Text(verbatim: item.description)
+                                .font(MobiusStyle.captionFont)
+                                .foregroundStyle(palette.muted)
+                                .lineLimit(2)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        MobiusIcon(
+                            .plus,
+                            size: MobiusStyle.glyphInline,
+                            foreground: palette.accent
+                        )
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!model.canMutateExtensions)
+                .accessibilityLabel("Install \(item.name)")
+                .accessibilityHint(item.description)
+            }
+        }
+    }
+
+    private var installableExtensions: [MobiusCloudExtensionCatalogItem] {
+        model.availableExtensions.filter { item in
+            !model.extensions.contains { record in
+                record.source == item.source.url
+                    && record.reference == item.source.reference
+                    && record.subdirectory == item.source.subdirectory
+            }
+        }
     }
 
     private var pageDetail: String {
         model.connectionState.isReady
-            ? "Skills and plugins installed on the gateway from Git."
+            ? "Extensions installed on the gateway from Git."
             : "Connect to a gateway to manage extensions."
     }
 
@@ -102,13 +160,17 @@ struct ExtensionsView: View {
                 ("Trusting \(name) hooks", "Trust is bound to the reviewed package digest.", palette.accent)
             case .untrusting(let name):
                 ("Disabling \(name) hooks", "The gateway is revoking executable-hook trust.", palette.accent)
+            case .connecting(_, let name):
+                ("Connecting \(name)", "Complete the service's authorization flow.", palette.accent)
+            case .disconnecting(let name):
+                ("Disconnecting \(name)", "The gateway is removing the saved connection.", palette.accent)
             }
         }
         switch model.connectionState {
         case .ready:
             return (
                 "Catalog up to date",
-                "\(model.extensions.count) installed · \(model.extensionSkillReferences.count) discovered",
+                "\(model.extensions.count) installed",
                 palette.signal
             )
         case .failed(let message):
@@ -136,6 +198,15 @@ struct ExtensionsView: View {
             if record.needsHookTrust {
                 MobiusIcon(.shieldAlert, size: MobiusStyle.glyphMark, foreground: palette.warning)
                     .accessibilityLabel("\(record.name) has disabled hooks")
+            }
+
+            if record.needsConnection {
+                MobiusIcon(
+                    .plugsConnected,
+                    size: MobiusStyle.glyphMark,
+                    foreground: palette.warning
+                )
+                .accessibilityLabel("\(record.name) requires a connection")
             }
 
             MobiusIcon(
@@ -227,6 +298,7 @@ struct ExtensionDetailView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var confirmsUninstall = false
+    @State private var showsConnectionSecret = false
     let id: String
 
     var body: some View {
@@ -249,51 +321,62 @@ struct ExtensionDetailView: View {
         PageScaffold(
             title: record.name,
             detail: "",
+            sharesHeaderBackground: true,
             headerAccessory: {
-                HStack(spacing: MobiusSpace.xxs) {
+                HeaderOptionsMenu(label: "Extension actions") {
                     if !record.hooks.isEmpty {
                         if record.needsHookTrust {
                             Button {
                                 model.trustHooks(for: record)
                             } label: {
-                                MobiusIcon(.shieldCheck, gutter: false)
+                                MobiusLabel(title: "Trust hooks", glyph: .shieldCheck)
                             }
-                            .mobiusIconButton()
                             .disabled(!model.canMutateExtensions)
-                            .accessibilityLabel("Trust hooks")
-                            .help("Trusts only the displayed package digest")
                         } else {
                             Button {
                                 model.untrustHooks(for: record)
                             } label: {
-                                MobiusIcon(.shieldOff, gutter: false)
+                                MobiusLabel(title: "Untrust hooks", glyph: .shieldOff)
                             }
-                            .mobiusIconButton()
                             .disabled(!model.canMutateExtensions)
-                            .accessibilityLabel("Untrust hooks")
-                            .help("Untrust hooks")
                         }
                     }
                     Button {
                         model.updateExtension(record)
                     } label: {
-                        MobiusIcon(.arrowClockwise, gutter: false)
+                        MobiusLabel(title: "Update extension", glyph: .arrowClockwise)
                     }
-                    .mobiusProminentIconButton()
                     .disabled(!model.canMutateExtensions)
-                    .accessibilityLabel("Update extension")
-                    .help("Update extension")
-                    Button {
+                    if let connection = record.connection {
+                        switch connection.state {
+                        case .disconnected, .needsAttention:
+                            Button {
+                                switch connection.kind {
+                                case .oauth:
+                                    model.startExtensionConnection(record)
+                                case .apiKey:
+                                    showsConnectionSecret = true
+                                }
+                            } label: {
+                                MobiusLabel(title: "Connect", glyph: .plugsConnected)
+                            }
+                            .disabled(!model.canMutateExtensions)
+                        case .connected:
+                            Button {
+                                model.disconnectExtension(record)
+                            } label: {
+                                MobiusLabel(title: "Disconnect", glyph: .plugsConnected)
+                            }
+                            .disabled(!model.canMutateExtensions)
+                        }
+                    }
+                    Button(role: .destructive) {
                         confirmsUninstall = true
                     } label: {
-                        MobiusIcon(.trash, gutter: false)
+                        MobiusLabel(title: "Uninstall extension", glyph: .trash)
                     }
-                    .mobiusIconButton()
                     .disabled(!model.canMutateExtensions)
-                    .accessibilityLabel("Uninstall extension")
-                    .help("Uninstall extension")
                 }
-                .fixedSize()
             }
         ) {
             if !record.description.isEmpty {
@@ -340,6 +423,9 @@ struct ExtensionDetailView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("The gateway will uninstall it without changing saved chat selections. Chats that reference it continue with the extension disabled. Per-workspace .mobius/extensions data is retained.")
+        }
+        .sheet(isPresented: $showsConnectionSecret) {
+            ExtensionConnectionSecretSheet(record: record)
         }
     }
 }
@@ -434,25 +520,6 @@ private struct InstalledExtensionLabel: View {
     }
 }
 
-private struct DiscoveredSkillRow: View {
-    @Environment(\.mobiusPalette) private var palette
-    let name: String
-    let description: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: MobiusSpace.xxs) {
-            Text(verbatim: name)
-                .lineLimit(1)
-            Text(verbatim: description)
-                .font(MobiusStyle.captionFont)
-                .foregroundStyle(palette.muted)
-                .lineLimit(2)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .combine)
-    }
-}
-
 /// A label over its value, where the value is machine text worth reading character by
 /// character: a digest, a revision, a command.
 private struct MonospacedValue: View {
@@ -484,9 +551,66 @@ private func shellSafe(_ value: String) -> String {
 private extension ExtensionRecord {
     var needsHookTrust: Bool { !hooks.isEmpty && !hooksTrusted }
 
+    var needsConnection: Bool {
+        guard let connection else { return false }
+        return connection.state != .connected
+    }
+
     var qualifiers: String {
         var parts = [kind == .plugin ? "Plugin" : "Skill"]
         if let version { parts.append(version) }
         return parts.joined(separator: " · ")
+    }
+}
+
+private struct ExtensionConnectionSecretSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var secret = ""
+    let record: ExtensionRecord
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    SecureField(record.connection?.label ?? "API key", text: $secret)
+                        .textContentType(.password)
+                        .privacySensitive()
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.done)
+                        .onSubmit(save)
+                } footer: {
+                    Text("The key is saved on this gateway and used only for this extension.")
+                }
+            }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            .navigationTitle("Connect \(record.name)")
+            .toolbarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", role: .cancel) { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save", action: save)
+                        .disabled(!canSave)
+                }
+            }
+            .background(MobiusBackdrop())
+        }
+        .presentationDragIndicator(.visible)
+    }
+
+    private var canSave: Bool {
+        model.canMutateExtensions
+            && !secret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func save() {
+        guard canSave else { return }
+        model.setExtensionConnectionSecret(record, secret: secret)
+        secret = ""
+        dismiss()
     }
 }

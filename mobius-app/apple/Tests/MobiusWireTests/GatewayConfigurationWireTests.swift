@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 
 extension GatewayWireTests {
-    func testExtensionLifecycleRequestsMatchV33() throws {
+    func testExtensionLifecycleRequestsMatchV44() throws {
         let install = try requestObject(.installExtension(
             requestID: "extension-1",
             source: "https://github.com/DietrichGebert/ponytail.git",
@@ -42,6 +42,43 @@ extension GatewayWireTests {
         ))
         XCTAssertEqual(untrust["type"] as? String, "revoke_extension_hooks_trust")
         XCTAssertEqual(untrust["expected_digest"] as? String, "abcdef0123456789")
+
+        let startConnection = try requestObject(.startExtensionConnection(
+            requestID: "extension-6",
+            id: "plugin:notion",
+            redirectURI: "mobius://extension-auth"
+        ))
+        XCTAssertEqual(startConnection["type"] as? String, "start_extension_connection")
+        XCTAssertEqual(startConnection["id"] as? String, "plugin:notion")
+        XCTAssertEqual(startConnection["redirect_uri"] as? String, "mobius://extension-auth")
+        XCTAssertNil(startConnection["callback_url"])
+
+        let finishConnection = try requestObject(.finishExtensionConnection(
+            requestID: "extension-7",
+            id: "plugin:notion",
+            callbackURL: "mobius://extension-auth?code=code&state=state"
+        ))
+        XCTAssertEqual(finishConnection["type"] as? String, "finish_extension_connection")
+        XCTAssertEqual(finishConnection["id"] as? String, "plugin:notion")
+        XCTAssertEqual(
+            finishConnection["callback_url"] as? String,
+            "mobius://extension-auth?code=code&state=state"
+        )
+
+        let setSecret = try requestObject(.setExtensionConnectionSecret(
+            requestID: "extension-8",
+            id: "plugin:google-maps",
+            secret: "maps-secret"
+        ))
+        XCTAssertEqual(setSecret["type"] as? String, "set_extension_connection_secret")
+        XCTAssertEqual(setSecret["secret"] as? String, "maps-secret")
+
+        let disconnect = try requestObject(.disconnectExtensionConnection(
+            requestID: "extension-9",
+            id: "plugin:notion"
+        ))
+        XCTAssertEqual(disconnect["type"] as? String, "disconnect_extension_connection")
+        XCTAssertEqual(disconnect["id"] as? String, "plugin:notion")
     }
 
     func testProviderAndUtilityRequestsMatchV28() throws {
@@ -99,6 +136,35 @@ extension GatewayWireTests {
         for (request, type) in requests {
             XCTAssertEqual(try requestObject(request)["type"] as? String, type)
         }
+    }
+
+    func testGitCredentialRequestsUseOneExactTarget() throws {
+        let probe = try requestObject(.probeGitCredential(
+            requestID: "git-credential-1",
+            target: "https://git.example.com/team/repo"
+        ))
+        XCTAssertEqual(probe["type"] as? String, "probe_git_credential")
+        XCTAssertEqual(probe["target"] as? String, "https://git.example.com/team/repo")
+        XCTAssertNil(probe["username"])
+        XCTAssertNil(probe["token"])
+
+        let approve = try requestObject(.approveGitCredential(
+            requestID: "git-credential-2",
+            target: "git.example.com",
+            username: "octo",
+            token: "secret"
+        ))
+        XCTAssertEqual(approve["type"] as? String, "approve_git_credential")
+        XCTAssertEqual(approve["username"] as? String, "octo")
+        XCTAssertEqual(approve["token"] as? String, "secret")
+
+        let listSSH = try requestObject(.listSshIdentities(requestID: "ssh-list-1"))
+        XCTAssertEqual(listSSH["type"] as? String, "list_ssh_identities")
+        XCTAssertEqual(listSSH["request_id"] as? String, "ssh-list-1")
+
+        let generateSSH = try requestObject(.generateSshIdentity(requestID: "ssh-generate-1"))
+        XCTAssertEqual(generateSSH["type"] as? String, "generate_ssh_identity")
+        XCTAssertEqual(generateSSH["request_id"] as? String, "ssh-generate-1")
     }
 
     func testRemoveProviderRequestUsesInstanceIdentity() throws {

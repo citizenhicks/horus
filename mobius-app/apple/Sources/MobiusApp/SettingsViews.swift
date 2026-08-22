@@ -43,7 +43,6 @@ struct SettingsInfoButton: View {
 struct SettingsStatusAccessory: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.mobiusPalette) private var palette
-    @State private var showsStatus = false
     @Namespace private var namespace
     let subject: String
     let hasChanges: Bool
@@ -75,6 +74,51 @@ struct SettingsStatusAccessory: View {
     }
 
     private var statusButton: some View {
+        SettingsStatusButton(
+            subject: subject,
+            statusLabel: statusLabel,
+            statusDetail: statusDetail,
+            statusColor: statusColor,
+            secondaryActionLabel: secondaryActionLabel,
+            secondaryAction: secondaryAction
+        )
+        .mobiusIconButton()
+    }
+
+    private var saveButton: some View {
+        Button(action: save) {
+            Label {
+                Text(saveLabel)
+            } icon: {
+                Group {
+                    if isSaving {
+                        MobiusSpinner(size: MobiusStyle.iconSize, foreground: palette.onAccent)
+                    } else {
+                        MobiusIcon(.saveAll, size: MobiusStyle.iconSize, foreground: palette.onAccent)
+                    }
+                }
+            }
+        }
+        .mobiusProminentIconButton()
+        .disabled(saveDisabled)
+        .accessibilityLabel(saveLabel)
+        .help(saveLabel)
+        .sensoryFeedback(.success, trigger: hasChanges) { was, now in was && !now }
+    }
+}
+
+struct SettingsStatusButton: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.mobiusPalette) private var palette
+    @State private var showsStatus = false
+    let subject: String
+    let statusLabel: String
+    let statusDetail: String
+    let statusColor: Color
+    var secondaryActionLabel: String?
+    var secondaryAction: (() -> Void)?
+
+    var body: some View {
         Button {
             showsStatus = true
         } label: {
@@ -91,7 +135,6 @@ struct SettingsStatusAccessory: View {
                     )
             }
         }
-        .mobiusIconButton()
         .accessibilityLabel("\(subject) status")
         .accessibilityValue(statusLabel)
         .help("\(subject): \(statusLabel)")
@@ -117,27 +160,6 @@ struct SettingsStatusAccessory: View {
             .presentationCompactAdaptation(.popover)
         }
     }
-
-    private var saveButton: some View {
-        Button(action: save) {
-            Label {
-                Text(saveLabel)
-            } icon: {
-                Group {
-                    if isSaving {
-                        MobiusSpinner(size: MobiusStyle.iconSize, foreground: palette.onAccent)
-                    } else {
-                        MobiusIcon(.saveAll, size: MobiusStyle.iconSize, foreground: palette.onAccent)
-                    }
-                }
-            }
-        }
-        .mobiusProminentIconButton()
-        .disabled(saveDisabled)
-        .accessibilityLabel(saveLabel)
-        .help(saveLabel)
-        .sensoryFeedback(.success, trigger: hasChanges) { was, now in was && !now }
-    }
 }
 
 struct GatewayView: View {
@@ -150,30 +172,27 @@ struct GatewayView: View {
         PageScaffold(
             title: "Gateway",
             detail: "Gateways this device is paired with. Chats run on the selected one.",
+            sharesHeaderBackground: true,
             headerAccessory: {
-                HStack(spacing: MobiusSpace.xxs) {
+                HeaderActionGroup {
                     Button {
                         model.showsPairing = true
                     } label: {
                         MobiusIcon(.plus, gutter: false)
                     }
-                    .mobiusProminentIconButton()
+                    .groupedHeaderAction(prominent: true)
                     .accessibilityLabel("Pair gateway")
                     .accessibilityHint("Opens pairing with a self-hosted gateway")
                     .help("Pair gateway")
-                    SettingsStatusAccessory(
+                    SettingsStatusButton(
                         subject: "Gateway",
-                        hasChanges: false,
-                        isSaving: false,
-                        saveDisabled: false,
                         statusLabel: status.label,
                         statusDetail: status.detail,
-                        statusColor: status.color,
-                        saveLabel: "Pair gateway",
-                        save: { model.showsPairing = true }
+                        statusColor: status.color
                     )
+                    .labelStyle(.iconOnly)
+                    .groupedHeaderAction()
                 }
-                .fixedSize()
             }
         ) {
             if !model.accounts.isEmpty {
@@ -307,16 +326,20 @@ private struct PairedGatewayLabel: View {
     }
 }
 
+private let githubCredentialTarget = "https://github.com"
+
 struct GatewayDetailView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.mobiusPalette) private var palette
     @Environment(\.dismiss) private var dismiss
     @State private var confirmsForget = false
     @State private var showsRename = false
+    @State private var showsGitCredential = false
     @State private var renameDraft = ""
     let id: UUID
 
     var body: some View {
+        @Bindable var model = model
         if let account = model.accounts.first(where: { $0.id == id }) {
             detail(account)
                 .toolbarRole(.editor)
@@ -339,6 +362,24 @@ struct GatewayDetailView: View {
                                 .isEmpty
                         )
                 }
+                .sheet(isPresented: $showsGitCredential) {
+                    GitCredentialSheet()
+                }
+                .sheet(
+                    item: $model.generatedSshIdentity,
+                    content: SshPublicKeySheet.init
+                )
+                .task(id: model.connectionState.isReady) {
+                    guard account.id == model.selectedAccountID,
+                          model.connectionState.isReady
+                    else { return }
+                    if model.gitCredentialAvailable == nil {
+                        model.probeGitCredential(githubCredentialTarget)
+                    }
+                    if model.sshIdentities == nil {
+                        model.listSshIdentities()
+                    }
+                }
         } else {
             MobiusUnavailable(
                 title: "Gateway unavailable",
@@ -356,35 +397,26 @@ struct GatewayDetailView: View {
         return PageScaffold(
             title: account.displayName,
             detail: "",
+            sharesHeaderBackground: true,
             headerAccessory: {
-                HStack(spacing: MobiusSpace.xxs) {
+                HeaderOptionsMenu(label: "Gateway actions") {
                     if isActive {
                         Button(action: model.reconnect) {
-                            MobiusIcon(.arrowClockwise, gutter: false)
+                            MobiusLabel(title: "Reconnect", glyph: .arrowClockwise)
                         }
-                        .mobiusProminentIconButton()
-                        .accessibilityLabel("Reconnect")
-                        .help("Reconnect")
                     }
                     Button {
                         renameDraft = account.displayName
                         showsRename = true
                     } label: {
-                        MobiusIcon(.pencilSimple, gutter: false)
+                        MobiusLabel(title: "Rename gateway", glyph: .pencilSimple)
                     }
-                    .mobiusIconButton()
-                    .accessibilityLabel("Rename gateway")
-                    .help("Rename gateway")
-                    Button {
+                    Button(role: .destructive) {
                         confirmsForget = true
                     } label: {
-                        MobiusIcon(.trash, gutter: false)
+                        MobiusLabel(title: "Forget gateway", glyph: .trash)
                     }
-                    .mobiusIconButton()
-                    .accessibilityLabel("Forget gateway")
-                    .help("Forget gateway")
                 }
-                .fixedSize()
             }
         ) {
             Section("Connection") {
@@ -442,8 +474,150 @@ struct GatewayDetailView: View {
                     }
                 }
                 .settingsStandaloneRow()
+
+                Section("Host credentials") {
+                    if model.gitCredentialAvailable == false {
+                        Button {
+                            showsGitCredential = true
+                        } label: {
+                            gitCredentialRow
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!model.connectionState.isReady)
+                        .accessibilityLabel("Set up GitHub credentials")
+                        .accessibilityValue(gitCredentialSummary)
+                        .accessibilityHint("Adds a GitHub HTTPS credential to this gateway host")
+                    } else {
+                        gitCredentialRow
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel("GitHub credentials")
+                            .accessibilityValue(gitCredentialSummary)
+                    }
+
+                    sshCredentialRow
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("SSH identities")
+                        .accessibilityValue(sshCredentialSummary)
+
+                    if let identities = model.sshIdentities {
+                        ForEach(identities) { identity in
+                            VStack(alignment: .leading, spacing: MobiusSpace.xxs) {
+                                LabeledContent {
+                                    Text(verbatim: identity.algorithm)
+                                        .foregroundStyle(palette.muted)
+                                } label: {
+                                    Text(verbatim: identity.label)
+                                }
+                                Text(verbatim: identity.fingerprint)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(palette.muted)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .textSelection(.enabled)
+                            }
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel(identity.label)
+                            .accessibilityValue(
+                                "\(identity.algorithm), \(identity.fingerprint)"
+                            )
+                        }
+                    }
+                }
+
+                if model.sshIdentities?.isEmpty == true {
+                    MobiusActionRow {
+                        Button(
+                            model.isGeneratingSshIdentity
+                                ? "Generating on host…"
+                                : "Generate SSH key on host",
+                            glyph: .key,
+                            action: model.generateSshIdentity
+                        )
+                        .mobiusProminentButton()
+                        .disabled(
+                            model.isGeneratingSshIdentity
+                                || !model.connectionState.isReady
+                        )
+                    }
+                    .settingsStandaloneRow()
+                }
             }
         }
+    }
+
+    private var gitCredentialRow: some View {
+        HStack(spacing: MobiusSpace.m) {
+            MobiusIcon(.gitBranch, size: MobiusStyle.glyphInline)
+            VStack(alignment: .leading, spacing: MobiusSpace.xxs) {
+                Text("GitHub")
+                    .font(MobiusStyle.controlFont)
+                Text(gitCredentialSummary)
+                    .font(MobiusStyle.captionFont)
+                    .foregroundStyle(palette.muted)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: MobiusSpace.s)
+            if model.isCheckingGitCredential {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityHidden(true)
+            } else {
+                MobiusIcon(
+                    model.gitCredentialAvailable == true ? .checkCircle : .caretRight,
+                    size: MobiusStyle.glyphMark,
+                    foreground: model.gitCredentialAvailable == true
+                        ? palette.signal
+                        : palette.muted
+                )
+                .accessibilityHidden(true)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
+    private var gitCredentialSummary: String {
+        if !model.connectionState.isReady { return "Connect to check this host." }
+        if model.isCheckingGitCredential { return "Checking this host…" }
+        if model.gitCredentialAvailable == true { return "Credential found on this host." }
+        if model.gitCredentialAvailable == false { return "No credential found. Set up GitHub." }
+        return "Couldn’t check this host."
+    }
+
+    private var sshCredentialRow: some View {
+        HStack(spacing: MobiusSpace.m) {
+            MobiusIcon(.fingerprint, size: MobiusStyle.glyphInline)
+            VStack(alignment: .leading, spacing: MobiusSpace.xxs) {
+                Text("SSH")
+                    .font(MobiusStyle.controlFont)
+                Text(sshCredentialSummary)
+                    .font(MobiusStyle.captionFont)
+                    .foregroundStyle(palette.muted)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: MobiusSpace.s)
+            if model.isLoadingSshIdentities || model.isGeneratingSshIdentity {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityHidden(true)
+            } else if model.sshIdentities?.isEmpty == false {
+                MobiusIcon(
+                    .checkCircle,
+                    size: MobiusStyle.glyphMark,
+                    foreground: palette.signal
+                )
+                .accessibilityHidden(true)
+            }
+        }
+    }
+
+    private var sshCredentialSummary: String {
+        if !model.connectionState.isReady { return "Connect to check this host." }
+        if model.isLoadingSshIdentities { return "Checking this host…" }
+        if model.isGeneratingSshIdentity { return "Generating an Ed25519 key on this host…" }
+        if let error = model.sshIdentityError { return error }
+        guard let identities = model.sshIdentities else { return "Couldn’t check this host." }
+        if identities.isEmpty { return "No public identities found." }
+        return "\(identities.count) public \(identities.count == 1 ? "identity" : "identities") found."
     }
 
     private func transportName(_ account: GatewayAccount) -> String {
@@ -452,21 +626,143 @@ struct GatewayDetailView: View {
     }
 }
 
+private struct GitCredentialSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.mobiusPalette) private var palette
+    @State private var username = ""
+    @State private var token = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("GitHub") {
+                    LabeledContent("Host", value: "github.com")
+                }
+
+                if model.gitCredentialAvailable != true {
+                    Section {
+                        TextField("GitHub username", text: $username)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        SecureField("Personal access token", text: $token)
+                            .textContentType(.password)
+                            .privacySensitive()
+                    } header: {
+                        Text("Credential")
+                    } footer: {
+                        Text("Sent once to the host's configured Git helper. Möbius does not store or read it back.")
+                    }
+                }
+
+                if let error = model.gitCredentialError {
+                    Text(error)
+                        .font(MobiusStyle.captionFont)
+                        .foregroundStyle(palette.danger)
+                }
+            }
+            .navigationTitle("GitHub credentials")
+            .toolbarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    actionButton
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        if model.gitCredentialAvailable == true {
+            Button("Done") { dismiss() }
+        } else {
+            Button(model.isCheckingGitCredential ? "Saving…" : "Save") {
+                let value = token
+                token = ""
+                model.approveGitCredential(
+                    target: githubCredentialTarget,
+                    username: username,
+                    token: value
+                )
+            }
+            .disabled(
+                model.isCheckingGitCredential
+                    || username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || token.isEmpty
+            )
+        }
+    }
+}
+
+private struct SshPublicKeySheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.mobiusPalette) private var palette
+    let result: GeneratedSshIdentity
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Created on host") {
+                    LabeledContent("Label", value: result.identity.label)
+                    LabeledContent("Algorithm", value: result.identity.algorithm)
+                    LabeledContent("Fingerprint") {
+                        Text(verbatim: result.identity.fingerprint)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                }
+
+                Section {
+                    Text(verbatim: result.publicKey)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundStyle(palette.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                } header: {
+                    Text("Public key")
+                } footer: {
+                    Text("Add this public key to GitHub or another remote. Creating it does not grant access by itself. The private key stays on the gateway host.")
+                }
+
+                MobiusActionRow {
+                    ShareLink("Copy or share", item: result.publicKey)
+                }
+                .settingsStandaloneRow()
+            }
+            .navigationTitle("SSH key created")
+            .toolbarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done", action: dismiss.callAsFunction)
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
 struct PageScaffold<HeaderAccessory: View, Content: View>: View {
     @Environment(\.mobiusPalette) private var palette
     let title: String
     let detail: String
+    let sharesHeaderBackground: Bool
     let headerAccessory: HeaderAccessory
     let content: Content
 
     init(
         title: String,
         detail: String,
+        sharesHeaderBackground: Bool = false,
         @ViewBuilder headerAccessory: () -> HeaderAccessory,
         @ViewBuilder content: () -> Content
     ) {
         self.title = title
         self.detail = detail
+        self.sharesHeaderBackground = sharesHeaderBackground
         self.headerAccessory = headerAccessory()
         self.content = content()
     }
@@ -490,11 +786,12 @@ struct PageScaffold<HeaderAccessory: View, Content: View>: View {
         .navigationTitle(title)
         .toolbarTitleDisplayMode(.inline)
         .toolbar {
-            // iOS 26 wraps a toolbar item in its own glass capsule. These accessories bring
-            // their own treatment — the agent pages a pair of glass circles, the rest a bare
-            // glyph — and the system's capsule drew a second background around both.
-            ToolbarItem(placement: .topBarTrailing) { headerAccessory }
-                .sharedBackgroundVisibility(.hidden)
+            if sharesHeaderBackground {
+                ToolbarItem(placement: .primaryAction) { headerAccessory }
+            } else {
+                ToolbarItem(placement: .primaryAction) { headerAccessory }
+                    .sharedBackgroundVisibility(.hidden)
+            }
         }
         .background(MobiusBackdrop())
     }
@@ -509,6 +806,7 @@ extension PageScaffold where HeaderAccessory == EmptyView {
         self.init(
             title: title,
             detail: detail,
+            sharesHeaderBackground: false,
             headerAccessory: EmptyView.init,
             content: content
         )

@@ -552,6 +552,7 @@ fn selected_trusted_plugin_snapshot_reaches_extensions_assembly_only_when_active
                     timeout_seconds: hook.timeout_seconds,
                 })
                 .collect(),
+            mcp_servers: Vec::new(),
             trusted_hook_digest: Some(digest.clone()),
         },
     );
@@ -599,6 +600,7 @@ fn selected_trusted_plugin_snapshot_reaches_extensions_assembly_only_when_active
         Arc::clone(&backend),
         &active,
         Some(active_extensions),
+        Vec::new(),
     )
     .expect("active middleware");
     let (inactive, _) = build_middleware(
@@ -611,6 +613,7 @@ fn selected_trusted_plugin_snapshot_reaches_extensions_assembly_only_when_active
         backend,
         &inactive,
         Some(inactive_extensions),
+        Vec::new(),
     )
     .expect("inactive middleware");
     let active = active

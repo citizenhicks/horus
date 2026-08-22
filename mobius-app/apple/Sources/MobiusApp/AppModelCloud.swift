@@ -342,16 +342,22 @@ extension AppModel {
         cloudSession = nil
         cloudAccount = nil
         cloudError = nil
+        availableExtensions = []
+        extensionCatalogError = nil
+        isLoadingExtensionCatalog = false
         if let cloudGateway, !(await removeGateway(cloudGateway)) { return }
         showToast("Signed out of möbius Cloud.", tone: .info)
     }
 
-    private func reportCloud(_ error: Error) {
+    func reportCloud(_ error: Error) {
         if let cloudError = error as? MobiusCloudError {
             switch cloudError {
             case .authenticationRequired, .sessionExpired, .server(401):
                 cloudSession = nil
                 cloudAccount = nil
+                availableExtensions = []
+                extensionCatalogError = nil
+                isLoadingExtensionCatalog = false
             default:
                 break
             }

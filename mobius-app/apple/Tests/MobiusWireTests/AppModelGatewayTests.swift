@@ -125,6 +125,17 @@ extension AppModelTests {
         model.providerAPIKey = "gateway-a-secret"
         model.providerActionState = .credentialSaved("Gateway A")
         model.pairingCodeInfo = PairingCodeInfo(code: "1234", expiresAt: .distantFuture)
+        model.gitCredentialAvailable = true
+        let sshIdentity = SshIdentityRecord(
+            label: "id_ed25519",
+            algorithm: "ssh-ed25519",
+            fingerprint: "SHA256:safe"
+        )
+        model.sshIdentities = [sshIdentity]
+        model.generatedSshIdentity = GeneratedSshIdentity(
+            identity: sshIdentity,
+            publicKey: "ssh-ed25519 AAAA mobius"
+        )
 
         model.selectAccount(second.id)
 
@@ -134,6 +145,42 @@ extension AppModelTests {
         XCTAssertEqual(model.providerAPIKey, "")
         XCTAssertEqual(model.providerActionState, .idle)
         XCTAssertNil(model.pairingCodeInfo)
+        XCTAssertNil(model.gitCredentialAvailable)
+        XCTAssertNil(model.sshIdentities)
+        XCTAssertNil(model.generatedSshIdentity)
+    }
+
+    func testConnectionEndCancelsExtensionAndCredentialRequests() throws {
+        let model = try model()
+        model.connectionState = .ready
+        model.extensionAction = .connecting(id: "notion", name: "Notion")
+        model.extensionRequestID = "extension-request"
+        model.extensionAuthorizationChallenge = ExtensionAuthorizationChallenge(
+            id: "extension-request",
+            extensionID: "notion",
+            authorizationURL: try XCTUnwrap(URL(string: "https://mcp.notion.com/authorize"))
+        )
+        model.gitCredentialRequestID = "git-request"
+        model.isApprovingGitCredential = true
+        model.isCheckingGitCredential = true
+        model.sshIdentityRequestID = "ssh-request"
+        model.isLoadingSshIdentities = true
+        model.isGeneratingSshIdentity = true
+
+        model.connectionEnded(
+            generation: model.connectionGeneration,
+            message: "Gateway disconnected."
+        )
+
+        XCTAssertNil(model.extensionAction)
+        XCTAssertNil(model.extensionRequestID)
+        XCTAssertNil(model.extensionAuthorizationChallenge)
+        XCTAssertNil(model.gitCredentialRequestID)
+        XCTAssertFalse(model.isApprovingGitCredential)
+        XCTAssertFalse(model.isCheckingGitCredential)
+        XCTAssertNil(model.sshIdentityRequestID)
+        XCTAssertFalse(model.isLoadingSshIdentities)
+        XCTAssertFalse(model.isGeneratingSshIdentity)
     }
 
     func testRenamingGatewayPersistsItsFriendlyName() throws {
@@ -313,6 +360,50 @@ extension AppModelTests {
 
         XCTAssertEqual(model.pendingApproval, approval)
         XCTAssertEqual(model.toast?.tone, .error)
+    }
+
+    func testSshIdentitySetupReturnsOnlyTheNewPublicKeyForSharing() async throws {
+        let recorder = GatewayRequestRecorder()
+        let model = try model(requestSender: { request in
+            await recorder.record(request)
+        })
+        model.connectionState = .ready
+
+        model.listSshIdentities()
+        let recordedList = await recorder.firstRequest(after: 0) { request in
+            if case .listSshIdentities = request { return true }
+            return false
+        }
+        let list = try XCTUnwrap(recordedList)
+        guard case .listSshIdentities(let listID) = list else {
+            return XCTFail("Expected SSH identity list request")
+        }
+        model.handle(.sshIdentities(requestID: listID, identities: []))
+
+        let requestCount = await recorder.requestCount()
+        model.generateSshIdentity()
+        let recordedGenerate = await recorder.firstRequest(after: requestCount) { request in
+            if case .generateSshIdentity = request { return true }
+            return false
+        }
+        let generate = try XCTUnwrap(recordedGenerate)
+        guard case .generateSshIdentity(let generateID) = generate else {
+            return XCTFail("Expected SSH identity generation request")
+        }
+        let identity = SshIdentityRecord(
+            label: "id_ed25519",
+            algorithm: "ssh-ed25519",
+            fingerprint: "SHA256:safe"
+        )
+        model.handle(.sshIdentityGenerated(
+            requestID: generateID,
+            identity: identity,
+            publicKey: "ssh-ed25519 AAAA mobius"
+        ))
+
+        XCTAssertEqual(model.sshIdentities, [identity])
+        XCTAssertEqual(model.generatedSshIdentity?.publicKey, "ssh-ed25519 AAAA mobius")
+        XCTAssertFalse(model.isGeneratingSshIdentity)
     }
 
 }

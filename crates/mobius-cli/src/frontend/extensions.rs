@@ -842,6 +842,7 @@ mod tests {
                 timeout_seconds: 10,
             }],
             hooks_trusted: false,
+            connection: None,
         }
     }
 

@@ -2,6 +2,27 @@
 
 use super::*;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn ssh_agent_mount_accepts_only_a_real_socket() {
+    use std::os::unix::net::UnixListener;
+
+    let directory = tempfile::Builder::new()
+        .prefix("mobius-agent-")
+        .tempdir_in("/tmp")
+        .expect("agent directory");
+    let socket = directory.path().join("agent.sock");
+    let _listener = UnixListener::bind(&socket).expect("agent socket");
+    assert_eq!(
+        validated_ssh_agent_socket(Some(socket.as_os_str()), &[]),
+        std::fs::canonicalize(&socket).ok()
+    );
+
+    let regular = directory.path().join("not-a-socket");
+    std::fs::write(&regular, b"not an agent").expect("regular file");
+    assert!(validated_ssh_agent_socket(Some(regular.as_os_str()), &[]).is_none());
+}
+
 #[tokio::test]
 async fn bounded_output_reports_when_the_stream_was_truncated() {
     let output = read_output(
@@ -477,10 +498,13 @@ async fn denied_environment_is_removed_from_full_access_commands() {
             },
             CommandMode::Foreground,
             CommandOutputSink::default(),
-            &[
-                ("MOBIUS_TEST_SECRET", "secret"),
-                ("MOBIUS_TEST_VISIBLE", "visible"),
-            ],
+            (
+                &[
+                    ("MOBIUS_TEST_SECRET", "secret"),
+                    ("MOBIUS_TEST_VISIBLE", "visible"),
+                ],
+                &[],
+            ),
             None,
         )
         .await

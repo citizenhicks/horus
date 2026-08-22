@@ -178,7 +178,7 @@ struct ChatsView: View {
     }
 
     private var organizationMenu: some View {
-        Menu {
+        HeaderOptionsMenu(label: "Organize chats") {
             Section("Organize") {
                 ForEach(ChatOrganization.allCases) { option in
                     Button {
@@ -191,14 +191,8 @@ struct ChatsView: View {
                     }
                 }
             }
-        } label: {
-            MobiusLabel(title: "Organize chats", glyph: .dotsThree)
         }
-        .menuIndicator(.hidden)
-        .mobiusIconButton()
-        .accessibilityLabel("Organize chats")
         .accessibilityValue(organization.title)
-        .help("Organize chats")
     }
 
     private var newChatButton: some View {

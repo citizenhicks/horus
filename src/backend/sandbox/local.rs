@@ -270,6 +270,18 @@ impl LocalSandbox {
         arguments: &[&str],
         environment: &[(&str, &str)],
     ) -> Result<CommandOutput> {
+        self.execute_read_only_with_environment_removals(executable, arguments, environment, &[])
+            .await
+    }
+
+    /// Runs one argv command without selected inherited environment variables.
+    pub async fn execute_read_only_with_environment_removals(
+        &self,
+        executable: &str,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+        removed_environment: &[&str],
+    ) -> Result<CommandOutput> {
         let executable = self.find_executable(executable)?;
         self.execute_invocation(
             Invocation::Argv {
@@ -283,7 +295,7 @@ impl LocalSandbox {
             },
             CommandMode::Foreground,
             CommandOutputSink::default(),
-            environment,
+            (environment, removed_environment),
             None,
         )
         .await?
@@ -319,6 +331,17 @@ impl LocalSandbox {
         arguments: &[&str],
         environment: &[(&str, &str)],
     ) -> Result<CommandOutput> {
+        self.execute_git_mutation_with_environment_removals(arguments, environment, &[])
+            .await
+    }
+
+    /// Runs Git argv without selected inherited environment variables.
+    pub async fn execute_git_mutation_with_environment_removals(
+        &self,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+        removed_environment: &[&str],
+    ) -> Result<CommandOutput> {
         let executable = self.find_executable("git")?;
         self.execute_invocation(
             Invocation::Argv {
@@ -332,7 +355,7 @@ impl LocalSandbox {
             },
             CommandMode::Foreground,
             CommandOutputSink::default(),
-            environment,
+            (environment, removed_environment),
             None,
         )
         .await?
@@ -404,6 +427,22 @@ impl LocalSandbox {
             "/dev",
         ]);
         command.args(["--tmpfs", "/tmp"]);
+        if let Some(socket) = self.ssh_agent_socket()
+            && let Ok(relative) = socket.strip_prefix("/tmp")
+        {
+            let mut directory = PathBuf::from("/tmp");
+            if let Some(parent) = relative.parent() {
+                for component in parent.components() {
+                    let Component::Normal(component) = component else {
+                        continue;
+                    };
+                    directory.push(component);
+                    command.arg("--dir").arg(&directory);
+                }
+            }
+            command.arg("--ro-bind").arg(&socket).arg(&socket);
+            command.env("SSH_AUTH_SOCK", socket);
+        }
         if self.isolated_home {
             command.args(["--dir", ISOLATED_HOME]);
         }
@@ -458,6 +497,15 @@ impl LocalSandbox {
                 command
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ssh_agent_socket(&self) -> Option<PathBuf> {
+        if self.isolated_home || self.denied_environment.contains("SSH_AUTH_SOCK") {
+            return None;
+        }
+        let value = std::env::var_os("SSH_AUTH_SOCK");
+        validated_ssh_agent_socket(value.as_deref(), &self.denied_reads)
     }
 
     #[cfg(target_os = "linux")]
@@ -630,7 +678,7 @@ impl LocalSandbox {
         isolation: CommandIsolation,
         mode: CommandMode,
         output_sink: CommandOutputSink,
-        environment: &[(&str, &str)],
+        environment: (&[(&str, &str)], &[&str]),
         authorization: Option<&CommandAuthorization>,
     ) -> Result<Option<CommandOutput>> {
         if matches!(&invocation, Invocation::Shell(script) if script.trim().is_empty()) {
@@ -663,12 +711,15 @@ impl LocalSandbox {
                 command.env_clear().envs(inherited);
             }
             command
-                .envs(environment.iter().copied())
+                .envs(environment.0.iter().copied())
                 .env("TMPDIR", command_temp(self.temp.path()));
             if self.isolated_home {
                 command
                     .env("HOME", command_home(self.temp.path()))
                     .env("SHELL", "/bin/bash");
+            }
+            for name in environment.1 {
+                command.env_remove(name);
             }
             for name in &self.denied_environment {
                 command.env_remove(name);
@@ -858,7 +909,7 @@ impl SandboxBackend for LocalSandbox {
                 },
                 mode,
                 output_sink,
-                &[],
+                (&[], &[]),
                 None,
             )
             .await?
@@ -884,7 +935,7 @@ impl SandboxBackend for LocalSandbox {
             },
             mode,
             output_sink,
-            &[],
+            (&[], &[]),
             Some(authorization),
         ))
     }
@@ -910,6 +961,23 @@ fn find_executable_in(
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
+}
+
+#[cfg(target_os = "linux")]
+fn validated_ssh_agent_socket(
+    value: Option<&OsStr>,
+    denied_reads: &[DeniedRead],
+) -> Option<PathBuf> {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let path = std::fs::canonicalize(Path::new(value?)).ok()?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    (path.is_absolute()
+        && metadata.file_type().is_socket()
+        && denied_reads
+            .iter()
+            .all(|denied| !path.starts_with(&denied.path)))
+    .then_some(path)
 }
 
 #[cfg(target_os = "linux")]

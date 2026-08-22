@@ -68,15 +68,16 @@ pub(crate) fn create_workspace_directory(
 }
 
 fn initialize_workspace_repository(path: &Path) -> Result<()> {
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .args(["init", "--quiet", "--initial-branch", "main"])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C")
-        .current_dir(path)
-        .output()?;
+        .current_dir(path);
+    for name in crate::sandbox::REPOSITORY_LOCAL_GIT_ENVIRONMENT {
+        command.env_remove(name);
+    }
+    let output = command.output()?;
     if !output.status.success() {
         return Err(Error::Config(
             "failed to initialize workspace Git repository".into(),

@@ -18,6 +18,7 @@ async fn rejected_patch(content: &str, patch: &str) -> String {
             ["patch".into()],
         )
         .for_call("patch"),
+        call_id: "patch".into(),
         turn_id: "turn".into(),
     };
 
@@ -180,6 +181,7 @@ async fn apply_patch_supports_context_headers_and_multiple_changes() {
             ["patch".into()],
         )
         .for_call("patch"),
+        call_id: "patch".into(),
         turn_id: "turn".into(),
     };
 
@@ -315,6 +317,7 @@ async fn apply_patch_cannot_make_a_file_unreadable() {
             ["patch".into()],
         )
         .for_call("patch"),
+        call_id: "patch".into(),
         turn_id: "turn".into(),
     };
 

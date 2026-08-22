@@ -59,22 +59,22 @@ fn quick_cloudflare_config_round_trips_without_a_token() {
 }
 
 #[test]
-fn gateway_config_rejects_v17_without_migration() {
+fn gateway_config_rejects_v18_without_migration() {
     let root = tempfile::tempdir().expect("temporary directory");
     let state = root.path().join("state");
     ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
     let path = state.join(CONFIG_FILE);
     let contents = fs::read_to_string(&path)
         .expect("read gateway config")
-        .replacen("version = 18", "version = 17", 1);
-    fs::write(&path, contents).expect("write v17 config");
+        .replacen("version = 19", "version = 18", 1);
+    fs::write(&path, contents).expect("write v18 config");
 
-    let error = ConfigStore::open(state).expect_err("v17 must be rejected");
+    let error = ConfigStore::open(state).expect_err("v18 must be rejected");
 
     assert!(
         error
             .to_string()
-            .contains("unsupported gateway config version 17")
+            .contains("unsupported gateway config version 18")
     );
 }
 
@@ -111,7 +111,7 @@ fn generated_toml_round_trips_manifest_settings() {
     let contents = fs::read_to_string(state.join(CONFIG_FILE)).expect("read config");
     let (_, restored) = ConfigStore::open(state).expect("open config");
 
-    assert!(contents.starts_with("version = 18"));
+    assert!(contents.starts_with("version = 19"));
     assert!(contents.contains("max_model_steps = 256"));
     assert!(contents.contains("[default_agent.config.middleware.settings.context_offloading]"));
     assert!(contents.contains("[default_agent.config.middleware.settings.sessions]"));
@@ -165,6 +165,7 @@ fn extension_selection_is_a_stable_optional_reference() {
                 command: "node hooks/activate.js".into(),
                 timeout_seconds: 5,
             }],
+            mcp_servers: Vec::new(),
             trusted_hook_digest: None,
         },
     );
