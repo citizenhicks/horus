@@ -101,13 +101,18 @@ impl ConfigStore {
         if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_CONFIG_BYTES {
             return Err(Error::Config("gateway configuration is too large".into()));
         }
-        let config: GatewayConfig = toml::from_slice(&contents).map_err(|error| {
+        let mut config: GatewayConfig = toml::from_slice(&contents).map_err(|error| {
             Error::Config(format!(
                 "gateway state at {} is incompatible with this release; remove that directory and run `mobius` again: {error}",
                 store.state_dir.display()
             ))
         })?;
-        store.validate_config(&config)?;
+        if config.version == MIGRATABLE_CONFIG_VERSION {
+            config.version = CONFIG_VERSION;
+            store.save(&config)?;
+        } else {
+            store.validate_config(&config)?;
+        }
         Ok((store, config))
     }
 

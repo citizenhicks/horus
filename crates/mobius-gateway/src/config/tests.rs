@@ -59,23 +59,70 @@ fn quick_cloudflare_config_round_trips_without_a_token() {
 }
 
 #[test]
-fn gateway_config_rejects_v18_without_migration() {
+fn opening_v18_migrates_installed_extensions_atomically() {
+    use crate::extensions::{ExtensionSource, InstalledExtension};
+    use crate::wire::ExtensionKind;
+
     let root = tempfile::tempdir().expect("temporary directory");
     let state = root.path().join("state");
-    ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
+    let (store, mut config) =
+        ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
+    config.installed_extensions.insert(
+        "plugin:ponytail".into(),
+        InstalledExtension {
+            kind: ExtensionKind::Plugin,
+            name: "ponytail".into(),
+            description: "Minimal coding workflows".into(),
+            version: Some("4.9.0".into()),
+            source: ExtensionSource {
+                url: "https://github.com/DietrichGebert/ponytail".into(),
+                reference: Some("v4.9.0".into()),
+                subdirectory: None,
+            },
+            resolved_revision: "b".repeat(40),
+            digest: "a".repeat(64),
+            skills: Vec::new(),
+            hooks: Vec::new(),
+            mcp_servers: Vec::new(),
+            trusted_hook_digest: None,
+        },
+    );
+    store.save(&config).expect("save current config");
     let path = state.join(CONFIG_FILE);
     let contents = fs::read_to_string(&path)
         .expect("read gateway config")
-        .replacen("version = 19", "version = 18", 1);
+        .replacen("version = 19", "version = 18", 1)
+        .replacen("mcp_servers = []\n", "", 1);
+    assert!(!contents.contains("mcp_servers"));
     fs::write(&path, contents).expect("write v18 config");
 
-    let error = ConfigStore::open(state).expect_err("v18 must be rejected");
+    let (_, opened) = ConfigStore::open(state).expect("migrate v18 config");
+    let persisted = fs::read_to_string(path).expect("read migrated config");
 
-    assert!(
-        error
-            .to_string()
-            .contains("unsupported gateway config version 18")
-    );
+    assert_eq!(opened, config);
+    assert!(persisted.starts_with("version = 19"));
+    assert!(persisted.contains("mcp_servers = []"));
+}
+
+#[test]
+fn opening_unmigratable_versions_never_rewrites_config() {
+    for (version, invalid) in [(17, false), (20, false), (18, true)] {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let state = root.path().join("state");
+        ConfigStore::initialize(state.clone(), DEFAULT_LISTEN, None).expect("initialize gateway");
+        let path = state.join(CONFIG_FILE);
+        let mut contents = fs::read_to_string(&path)
+            .expect("read gateway config")
+            .replacen("version = 19", &format!("version = {version}"), 1);
+        if invalid {
+            contents = contents.replacen("127.0.0.1:8741", "127.0.0.1:0", 1);
+        }
+        fs::write(&path, &contents).expect("write incompatible config");
+
+        ConfigStore::open(state).expect_err("config must be rejected");
+
+        assert_eq!(fs::read_to_string(path).expect("read config"), contents);
+    }
 }
 
 #[test]

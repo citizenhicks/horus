@@ -51,6 +51,7 @@ pub(crate) struct InstalledExtension {
     pub(crate) digest: String,
     pub(crate) skills: Vec<String>,
     pub(crate) hooks: Vec<ExtensionHookRecord>,
+    #[serde(default)]
     pub(crate) mcp_servers: Vec<InstalledMcpServer>,
     pub(crate) trusted_hook_digest: Option<String>,
 }
