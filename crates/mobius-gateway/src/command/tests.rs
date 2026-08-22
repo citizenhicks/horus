@@ -394,6 +394,10 @@ async fn register_provider_command_is_idempotent() {
     .expect("register provider");
     let (_, persisted) = ConfigStore::open(state.clone()).expect("registered provider");
     let default = persisted.default_agent.expect("default agent");
+    assert_eq!(
+        default.config.provider.reasoning_effort.as_deref(),
+        Some("medium")
+    );
     let mut selected = default.config;
     selected.provider.reasoning_effort = Some("high".into());
     let request_id = Uuid::new_v4().to_string();

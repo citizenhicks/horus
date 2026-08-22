@@ -23,6 +23,7 @@ pub(super) async fn register_provider_command(
         .or_else(|| existing.map(|configured| configured.label.clone()))
         .unwrap_or_else(|| definition.label().to_owned());
     let tint = existing.map_or_else(ProviderTint::default, |configured| configured.tint);
+    let reasoning_effort = options.reasoning_efforts.first().cloned();
     let selection = ProviderConfig {
         instance,
         provider: options.provider,
@@ -33,7 +34,7 @@ pub(super) async fn register_provider_command(
         } else {
             ProviderEndpointAuth::ProviderDefault
         },
-        reasoning_effort: None,
+        reasoning_effort,
         web_search: options.web_search,
     };
     let model_ids = if definition.models().is_empty() {
