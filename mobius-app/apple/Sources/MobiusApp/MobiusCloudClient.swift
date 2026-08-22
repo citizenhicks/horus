@@ -9,22 +9,35 @@ struct MobiusCloudSession: Equatable, Sendable {
     let expiresAt: Date
 }
 
+struct MobiusCloudUsageLimit: Decodable, Equatable, Sendable {
+    let creditMicrousd: Int
+    let remainingMicrousd: Int
+    let resetsAt: Date
+
+    var remainingFraction: Double {
+        Double(remainingMicrousd) / Double(creditMicrousd)
+    }
+}
+
 struct MobiusCloudAccount: Equatable, Sendable {
     let email: String?
     let subscribed: Bool
     let sharesDiagnostics: Bool
     let subscriptionStartedAt: Date?
+    let luna: MobiusCloudUsageLimit?
 
     init(
         email: String?,
         subscribed: Bool,
         sharesDiagnostics: Bool,
-        subscriptionStartedAt: Date? = nil
+        subscriptionStartedAt: Date? = nil,
+        luna: MobiusCloudUsageLimit? = nil
     ) {
         self.email = email
         self.subscribed = subscribed
         self.sharesDiagnostics = sharesDiagnostics
         self.subscriptionStartedAt = subscriptionStartedAt
+        self.luna = luna
     }
 }
 
@@ -224,6 +237,7 @@ final class MobiusCloudClient {
         let email: String?
         let subscribed: Bool
         let sharesDiagnostics: Bool
+        let luna: MobiusCloudUsageLimit?
     }
 
     private struct AccountUpdateRequest: Encodable {
@@ -341,13 +355,20 @@ final class MobiusCloudClient {
         } catch {
             throw MobiusCloudError.invalidAccountResponse
         }
-        guard response.email.map(Self.isValidEmail) ?? true else {
+        guard response.email.map(Self.isValidEmail) ?? true,
+              response.luna.map({
+                  response.subscribed &&
+                      $0.creditMicrousd > 0 &&
+                      (0 ... $0.creditMicrousd).contains($0.remainingMicrousd)
+              }) ?? true
+        else {
             throw MobiusCloudError.invalidAccountResponse
         }
         return MobiusCloudAccount(
             email: response.email,
             subscribed: response.subscribed,
-            sharesDiagnostics: response.sharesDiagnostics
+            sharesDiagnostics: response.sharesDiagnostics,
+            luna: response.luna
         )
     }
 

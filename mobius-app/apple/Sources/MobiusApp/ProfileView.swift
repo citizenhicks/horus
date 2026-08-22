@@ -60,6 +60,41 @@ struct ProfileView: View {
     }
 }
 
+private struct CloudAgentUsageLimit: View {
+    @Environment(\.mobiusPalette) private var palette
+    let limit: MobiusCloudUsageLimit
+
+    private static let resetFormat = Date.FormatStyle(
+        date: .abbreviated,
+        time: .omitted,
+        timeZone: .gmt
+    )
+
+    var body: some View {
+        let percentage = limit.remainingFraction.formatted(
+            .percent.precision(.fractionLength(0))
+        )
+        VStack(alignment: .leading, spacing: MobiusSpace.s) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("möbius cloud agent usage limits")
+                Spacer(minLength: MobiusSpace.s)
+                Text("\(percentage) remaining")
+                    .monospacedDigit()
+            }
+            .font(MobiusStyle.controlFont)
+            .accessibilityHidden(true)
+            ProgressView(value: limit.remainingFraction)
+                .progressViewStyle(.linear)
+                .tint(palette.accent)
+                .accessibilityLabel("möbius Cloud agent usage limits")
+                .accessibilityValue("\(percentage) remaining")
+            Text("Resets \(limit.resetsAt.formatted(Self.resetFormat))")
+                .font(MobiusStyle.metadataFont)
+                .foregroundStyle(palette.muted)
+        }
+    }
+}
+
 private struct SettingsInformationButton: View {
     @Environment(AppModel.self) private var model
     @State private var showsInformation = false
@@ -206,6 +241,9 @@ private struct CloudAccountSettings: View {
                 LabeledContent("Subscriber since") {
                     Text(startedAt, format: .dateTime.month(.wide).day().year())
                 }
+            }
+            if let limit = model.cloudAccount?.luna {
+                CloudAgentUsageLimit(limit: limit)
             }
             VStack(spacing: MobiusSpace.s) {
                 if model.cloudAccount?.subscribed == false {

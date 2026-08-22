@@ -49,7 +49,8 @@ extension AppModel {
                     email: account.email,
                     subscribed: true,
                     sharesDiagnostics: account.sharesDiagnostics,
-                    subscriptionStartedAt: transaction.originalPurchaseDate
+                    subscriptionStartedAt: transaction.originalPurchaseDate,
+                    luna: account.luna
                 )
             }
             guard cloudSession?.userID == userID else { return }
@@ -79,7 +80,8 @@ extension AppModel {
                 email: account.email,
                 subscribed: account.subscribed,
                 sharesDiagnostics: sharesDiagnostics,
-                subscriptionStartedAt: account.subscriptionStartedAt
+                subscriptionStartedAt: account.subscriptionStartedAt,
+                luna: account.luna
             )
         } catch is CancellationError {
             return
@@ -151,7 +153,8 @@ extension AppModel {
                 email: account.email,
                 subscribed: account.subscribed,
                 sharesDiagnostics: account.sharesDiagnostics,
-                subscriptionStartedAt: cloudAccount?.subscriptionStartedAt
+                subscriptionStartedAt: cloudAccount?.subscriptionStartedAt,
+                luna: account.luna
             )
             guard account.subscribed else { throw MobiusCloudError.subscriptionRequired }
             return try await provisionCloudGateway()
@@ -203,7 +206,8 @@ extension AppModel {
             email: account.email,
             subscribed: account.subscribed,
             sharesDiagnostics: account.sharesDiagnostics,
-            subscriptionStartedAt: cloudAccount?.subscriptionStartedAt
+            subscriptionStartedAt: cloudAccount?.subscriptionStartedAt,
+            luna: account.luna
         )
         if account.subscribed {
             return try await provisionCloudGateway()
@@ -244,7 +248,8 @@ extension AppModel {
             email: cloudAccount?.email,
             subscribed: true,
             sharesDiagnostics: cloudAccount?.sharesDiagnostics ?? false,
-            subscriptionStartedAt: transaction.originalPurchaseDate
+            subscriptionStartedAt: transaction.originalPurchaseDate,
+            luna: cloudAccount?.luna
         )
     }
 

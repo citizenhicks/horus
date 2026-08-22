@@ -57,10 +57,13 @@ final class MobiusCloudTests: XCTestCase {
         let service = "app.mobius.cloud.tests.\(UUID())"
         let store = MobiusCloudSessionStore(service: service)
         defer { try? store.remove() }
+        let reset = try XCTUnwrap(
+            ISO8601DateFormatter().date(from: "2099-02-01T00:00:00Z")
+        )
         var requests: [URLRequest] = []
         let responses = [
             #"{"token":"\#(token)","userId":"\#(userID.uuidString)","expiresAt":"2099-01-01T00:00:00Z"}"#,
-            #"{"email":"private@privaterelay.appleid.com","subscribed":true,"sharesDiagnostics":true}"#,
+            #"{"email":"private@privaterelay.appleid.com","subscribed":true,"sharesDiagnostics":true,"luna":{"creditMicrousd":2400000,"remainingMicrousd":1992000,"resetsAt":"2099-02-01T00:00:00Z"}}"#,
             #"{}"#,
             #"{"accepted":true}"#,
             #"{"status":"ready"}"#,
@@ -88,9 +91,15 @@ final class MobiusCloudTests: XCTestCase {
             MobiusCloudAccount(
                 email: "private@privaterelay.appleid.com",
                 subscribed: true,
-                sharesDiagnostics: true
+                sharesDiagnostics: true,
+                luna: MobiusCloudUsageLimit(
+                    creditMicrousd: 2_400_000,
+                    remainingMicrousd: 1_992_000,
+                    resetsAt: reset
+                )
             )
         )
+        XCTAssertEqual(account.luna?.remainingFraction ?? 0, 0.83, accuracy: 0.000_001)
         XCTAssertEqual(status, .ready)
         XCTAssertEqual(grant.setup.endpoint.rawValue, "wss://gateway.example")
         XCTAssertEqual(grant.setup.code, "0123456789abcdef")
@@ -150,6 +159,32 @@ final class MobiusCloudTests: XCTestCase {
         do {
             _ = try await client.account()
             XCTFail("Expected invalid account email to be rejected")
+        } catch let error as MobiusCloudError {
+            guard case .invalidAccountResponse = error else {
+                return XCTFail("Expected invalidAccountResponse, got \(error)")
+            }
+        }
+    }
+
+    func testCloudAccountRejectsInvalidUsageLimit() async throws {
+        let store = MobiusCloudSessionStore(service: "app.mobius.cloud.tests.\(UUID())")
+        defer { try? store.remove() }
+        var requestCount = 0
+        let client = MobiusCloudClient(store: store) { request in
+            requestCount += 1
+            let json = requestCount == 1
+                ? #"{"token":"ttttttttttttttttttttttttttttttttttttttttttt","userId":"00000000-0000-0000-0000-000000000001","expiresAt":"2099-01-01T00:00:00Z"}"#
+                : #"{"email":null,"subscribed":true,"sharesDiagnostics":false,"luna":{"creditMicrousd":2400000,"remainingMicrousd":2400001,"resetsAt":"2099-02-01T00:00:00Z"}}"#
+            return try self.response(for: request, json: json)
+        }
+        _ = try await client.authenticate(
+            authorizationCode: "apple-code",
+            nonce: String(repeating: "n", count: 43)
+        )
+
+        do {
+            _ = try await client.account()
+            XCTFail("Expected invalid Cloud usage limit to be rejected")
         } catch let error as MobiusCloudError {
             guard case .invalidAccountResponse = error else {
                 return XCTFail("Expected invalidAccountResponse, got \(error)")
@@ -729,7 +764,7 @@ final class MobiusCloudTests: XCTestCase {
         var requests: [URLRequest] = []
         let responses = [
             (200, #"{"token":"\#(token)","userId":"00000000-0000-0000-0000-000000000001","expiresAt":"2099-01-01T00:00:00Z"}"#),
-            (200, #"{"email":"private@privaterelay.appleid.com","subscribed":true,"sharesDiagnostics":false}"#),
+            (200, #"{"email":"private@privaterelay.appleid.com","subscribed":true,"sharesDiagnostics":false,"luna":{"creditMicrousd":2400000,"remainingMicrousd":1992000,"resetsAt":"2099-02-01T00:00:00Z"}}"#),
             (503, #"{}"#),
             (204, #"{}"#),
         ]
@@ -756,6 +791,7 @@ final class MobiusCloudTests: XCTestCase {
 
         await model.refreshCloudAccount()
         XCTAssertEqual(model.cloudAccount?.sharesDiagnostics, false)
+        let usageLimit = try XCTUnwrap(model.cloudAccount?.luna)
 
         await model.setCloudSharesDiagnostics(true)
         XCTAssertEqual(model.cloudAccount?.sharesDiagnostics, false)
@@ -763,6 +799,7 @@ final class MobiusCloudTests: XCTestCase {
 
         await model.setCloudSharesDiagnostics(true)
         XCTAssertEqual(model.cloudAccount?.sharesDiagnostics, true)
+        XCTAssertEqual(model.cloudAccount?.luna, usageLimit)
         XCTAssertNil(model.cloudError)
         XCTAssertFalse(model.isUpdatingCloudDiagnostics)
         XCTAssertEqual(
