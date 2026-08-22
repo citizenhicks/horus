@@ -77,6 +77,7 @@ pub const USAGE: &str = "usage: mobius-gateway [--state-dir PATH]\n       \
                      mobius-gateway pairing-code [--state-dir PATH] --json\n       \
                      mobius-gateway register-provider [--state-dir PATH] --provider ID \
                      --model ID [--instance ID] [--label TEXT] \
+                     [--reasoning-efforts CSV] [--web-search off|cached|live] \
                      [--base-url URL] \
                      [--credentialless]\n       \
                      mobius-gateway connect [--state-dir PATH] [--endpoint ENDPOINT]\n       \

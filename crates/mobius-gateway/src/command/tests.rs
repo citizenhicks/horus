@@ -1,4 +1,5 @@
 use super::*;
+use mobius::backend::model::provider::HostedWebSearch;
 
 static BOOTSTRAP_TEST_CLIENT: std::sync::Mutex<Option<(Endpoint, String)>> =
     std::sync::Mutex::new(None);
@@ -308,6 +309,10 @@ fn parse_register_provider_accepts_credentialless_endpoint_configuration() {
         "openrouter".into(),
         "--model".into(),
         "openai/gpt-5".into(),
+        "--reasoning-efforts".into(),
+        "medium,none,low,high,xhigh,max".into(),
+        "--web-search".into(),
+        "live".into(),
         "--base-url".into(),
         "https://connector.example/v1".into(),
         "--credentialless".into(),
@@ -322,11 +327,14 @@ fn parse_register_provider_accepts_credentialless_endpoint_configuration() {
             instance: None,
             label: None,
             model,
+            reasoning_efforts,
+            web_search: HostedWebSearch::Live,
             base_url: Some(base_url),
             credentialless: true,
         }) if state_dir == std::path::Path::new("/tmp/mobius")
             && provider == "openrouter"
             && model == "openai/gpt-5"
+            && reasoning_efforts == ["medium", "none", "low", "high", "xhigh", "max"]
             && base_url == "https://connector.example/v1"
     ));
 }
@@ -356,7 +364,7 @@ async fn register_provider_command_is_idempotent() {
     let serving = tokio::spawn(server.serve_until(async move {
         let _ = signal.await;
     }));
-    let (_client, identity) = GatewayClient::pair(
+    let (dashboard, identity) = GatewayClient::pair(
         &endpoint,
         grant.code,
         "provider setup",
@@ -375,6 +383,8 @@ async fn register_provider_command_is_idempotent() {
             instance: None,
             label: Some("Work".into()),
             model: "openai/gpt-5".into(),
+            reasoning_efforts: vec!["medium".into(), "high".into()],
+            web_search: HostedWebSearch::Live,
             base_url: Some("https://connector.example/v1".into()),
             credentialless: true,
         },
@@ -382,7 +392,45 @@ async fn register_provider_command_is_idempotent() {
     )
     .await
     .expect("register provider");
-    let (store, mut persisted) = ConfigStore::open(state.clone()).expect("registered provider");
+    let (_, persisted) = ConfigStore::open(state.clone()).expect("registered provider");
+    let default = persisted.default_agent.expect("default agent");
+    let mut selected = default.config;
+    selected.provider.reasoning_effort = Some("high".into());
+    let request_id = Uuid::new_v4().to_string();
+    let (sender, mut events) = dashboard.into_parts();
+    sender
+        .send(ClientMessage::ConfigureDefaultAgent {
+            request_id: request_id.clone(),
+            expected_revision: default.revision,
+            config: selected,
+        })
+        .await
+        .expect("select high reasoning");
+    let mut saved = false;
+    for _ in 0..MAX_PENDING_FRAMES {
+        let frame = events
+            .next()
+            .await
+            .expect("default-agent response")
+            .expect("gateway connection");
+        match frame.message {
+            ServerMessage::GatewayConfigured {
+                request_id: actual, ..
+            } if actual == request_id => {
+                saved = true;
+                break;
+            }
+            ServerMessage::Rejected {
+                request_id: actual,
+                message,
+                ..
+            } if actual == request_id => panic!("default-agent selection rejected: {message}"),
+            _ => {}
+        }
+    }
+    assert!(saved, "gateway did not confirm the default-agent selection");
+
+    let (store, mut persisted) = ConfigStore::open(state.clone()).expect("configured default");
     persisted
         .configured_providers
         .get_mut("openrouter")
@@ -397,6 +445,8 @@ async fn register_provider_command_is_idempotent() {
             instance: None,
             label: None,
             model: "openai/gpt-5".into(),
+            reasoning_efforts: vec!["medium".into(), "high".into()],
+            web_search: HostedWebSearch::Live,
             base_url: Some("https://connector.example/v1".into()),
             credentialless: true,
         },
@@ -413,14 +463,27 @@ async fn register_provider_command_is_idempotent() {
             configured.label.as_str(),
             configured.tint,
             configured.selection.endpoint_auth,
+            configured.selection.web_search,
             configured.model_ids.as_slice(),
+            configured.reasoning_efforts.as_slice(),
+            config
+                .default_agent
+                .as_ref()
+                .expect("default agent")
+                .config
+                .provider
+                .reasoning_effort
+                .as_deref(),
         ),
         (
             1,
             "Work",
             crate::wire::ProviderTint::Purple,
             crate::wire::ProviderEndpointAuth::Credentialless,
+            HostedWebSearch::Live,
             ["openai/gpt-5".to_string()].as_slice(),
+            ["medium".to_string(), "high".to_string()].as_slice(),
+            Some("high"),
         )
     );
 

@@ -1,6 +1,7 @@
-use mobius::backend::model::provider::{HostedWebSearch, provider};
+use mobius::backend::model::provider::provider;
 
 use super::*;
+use crate::config::ConfiguredProvider;
 use crate::wire::{ProviderConfig, ProviderEndpointAuth, ProviderTint};
 
 pub(super) async fn register_provider_command(
@@ -33,14 +34,26 @@ pub(super) async fn register_provider_command(
             ProviderEndpointAuth::ProviderDefault
         },
         reasoning_effort: None,
-        web_search: HostedWebSearch::Off,
+        web_search: options.web_search,
     };
     let model_ids = if definition.models().is_empty() {
         vec![selection.model.clone()]
     } else {
         Vec::new()
     };
-    request_provider_registration(&endpoint, &token, selection.clone(), label, tint, model_ids)
+    let replace_existing_selections = existing.is_some_and(|configured| {
+        configured.selection != selection
+            || configured.model_ids != model_ids
+            || configured.reasoning_efforts != options.reasoning_efforts
+    });
+    let registration = ConfiguredProvider {
+        selection: selection.clone(),
+        label,
+        tint,
+        model_ids,
+        reasoning_efforts: options.reasoning_efforts,
+    };
+    request_provider_registration(&endpoint, &token, registration, replace_existing_selections)
         .await?;
     println!("{}", register_provider_json(&selection.provider)?);
     Ok(())
@@ -53,10 +66,8 @@ pub(super) fn register_provider_json(provider: &str) -> Result<String> {
 async fn request_provider_registration(
     endpoint: &Endpoint,
     token: &str,
-    config: ProviderConfig,
-    label: String,
-    tint: ProviderTint,
-    model_ids: Vec<String>,
+    registration: ConfiguredProvider,
+    replace_existing_selections: bool,
 ) -> Result<()> {
     let client = GatewayClient::connect(endpoint, token, ClientKind::GatewayDashboard).await?;
     let (sender, mut events) = client.into_parts();
@@ -64,12 +75,12 @@ async fn request_provider_registration(
     sender
         .send(ClientMessage::RegisterProvider {
             request_id: request_id.clone(),
-            config,
-            label,
-            tint,
-            model_ids,
-            reasoning_efforts: Vec::new(),
-            replace_existing_selections: true,
+            config: registration.selection,
+            label: registration.label,
+            tint: registration.tint,
+            model_ids: registration.model_ids,
+            reasoning_efforts: registration.reasoning_efforts,
+            replace_existing_selections,
         })
         .await?;
     for _ in 0..MAX_PENDING_FRAMES {

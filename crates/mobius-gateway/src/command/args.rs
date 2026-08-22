@@ -1,4 +1,5 @@
 use super::*;
+use mobius::backend::model::provider::HostedWebSearch;
 
 #[derive(Debug)]
 pub(super) enum Command {
@@ -62,6 +63,8 @@ pub(super) struct RegisterProviderOptions {
     pub(super) instance: Option<String>,
     pub(super) label: Option<String>,
     pub(super) model: String,
+    pub(super) reasoning_efforts: Vec<String>,
+    pub(super) web_search: HostedWebSearch,
     pub(super) base_url: Option<String>,
     pub(super) credentialless: bool,
 }
@@ -98,6 +101,8 @@ pub(super) fn parse_register_provider(arguments: Vec<OsString>) -> Result<Regist
     let mut instance = None;
     let mut label = None;
     let mut model = None;
+    let mut reasoning_efforts = None;
+    let mut web_search = None;
     let mut base_url = None;
     let mut credentialless = false;
     let mut arguments = arguments.into_iter();
@@ -150,6 +155,30 @@ pub(super) fn parse_register_provider(arguments: Vec<OsString>) -> Result<Regist
                     .map_err(|_| Error::Config("--model is not valid UTF-8".into()))?,
                 "--model",
             )?;
+        } else if flag == "--reasoning-efforts" {
+            let value = value
+                .into_string()
+                .map_err(|_| Error::Config("--reasoning-efforts is not valid UTF-8".into()))?;
+            set_once(
+                &mut reasoning_efforts,
+                value.split(',').map(str::to_owned).collect(),
+                "--reasoning-efforts",
+            )?;
+        } else if flag == "--web-search" {
+            let value = value
+                .into_string()
+                .map_err(|_| Error::Config("--web-search is not valid UTF-8".into()))?;
+            let value = match value.as_str() {
+                "off" => HostedWebSearch::Off,
+                "cached" => HostedWebSearch::Cached,
+                "live" => HostedWebSearch::Live,
+                _ => {
+                    return Err(Error::Config(
+                        "--web-search must be off, cached, or live".into(),
+                    ));
+                }
+            };
+            set_once(&mut web_search, value, "--web-search")?;
         } else if flag == "--base-url" {
             set_once(
                 &mut base_url,
@@ -168,6 +197,8 @@ pub(super) fn parse_register_provider(arguments: Vec<OsString>) -> Result<Regist
         instance,
         label,
         model: model.ok_or_else(|| Error::Config("--model is required".into()))?,
+        reasoning_efforts: reasoning_efforts.unwrap_or_default(),
+        web_search: web_search.unwrap_or_default(),
         base_url,
         credentialless,
     })

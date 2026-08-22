@@ -114,6 +114,8 @@ provider credentials:
 
 ```sh
 mobius-gateway register-provider --provider openrouter --model MODEL \
+  --reasoning-efforts medium,none,low,high,xhigh,max \
+  --web-search live \
   --base-url https://connector.example/v1 --credentialless
 ```
 
